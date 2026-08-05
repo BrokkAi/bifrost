@@ -1065,7 +1065,13 @@ fn evaluate_assertion_policy(
     let mut scope_rows: Vec<&CodeQueryLexicalScope> = Vec::new();
 
     let mut queries: Vec<CodeQuery> = Vec::new();
-    if !occurrence_roles.is_empty() {
+    // No subjects means no occurrences for any assert to address: every
+    // assert holds vacuously and the verdict is the subject query's own
+    // completion. Building the row-family queries anyway would be worse than
+    // wasteful -- an empty exact-path list is an unrestricted seed, so a
+    // subject-less policy would scan every file in the workspace and inherit
+    // completeness verdicts from files it has nothing to say about.
+    if !paths.is_empty() && !occurrence_roles.is_empty() {
         match assertion_occurrence_query(&paths, &occurrence_roles, Vec::new(), budget) {
             Ok(query) => queries.push(query),
             Err(message) => {
@@ -1073,7 +1079,7 @@ fn evaluate_assertion_policy(
             }
         }
     }
-    if !candidate_roles.is_empty() {
+    if !paths.is_empty() && !candidate_roles.is_empty() {
         match assertion_occurrence_query(
             &paths,
             &candidate_roles,
@@ -1086,7 +1092,7 @@ fn evaluate_assertion_policy(
             }
         }
     }
-    if !reaching_roles.is_empty() {
+    if !paths.is_empty() && !reaching_roles.is_empty() {
         match assertion_occurrence_query(
             &paths,
             &reaching_roles,
@@ -1157,12 +1163,15 @@ fn evaluate_assertion_policy(
             .push(value);
     }
     // A reaching binding is an answer about one occurrence, and the row says
-    // which one: the join is that identity, never the binding's name.
-    let mut bindings_by_occurrence: HashMap<&str, Vec<&CodeQueryBinding>> = HashMap::new();
+    // which one: the join is that identity, never the binding's name. The
+    // identity is path-qualified because a canonical AST id repeats verbatim
+    // across files with identical content, and the binding must only join
+    // occurrences of its own file.
+    let mut bindings_by_occurrence: HashMap<(&str, &str), Vec<&CodeQueryBinding>> = HashMap::new();
     for value in binding_rows {
         if let Some(reached_from) = value.reached_from_ast_id.as_deref() {
             bindings_by_occurrence
-                .entry(reached_from)
+                .entry((value.path.as_str(), reached_from))
                 .or_default()
                 .push(value);
         }
@@ -1805,13 +1814,13 @@ fn evaluate_reaching_assert<'rows>(
     assertion: &ReachingAssert,
     subject: &AssertionSubject,
     ast_ids: &[&str],
-    bindings_by_occurrence: &HashMap<&str, Vec<&'rows CodeQueryBinding>>,
+    bindings_by_occurrence: &HashMap<(&str, &str), Vec<&'rows CodeQueryBinding>>,
     scopes_by_index: &HashMap<(&str, u32), &'rows CodeQueryLexicalScope>,
     late_incomplete: &mut Vec<PolicyIncompleteReason>,
 ) -> Option<AssertionViolation<'rows>> {
     let mut reached: Vec<&CodeQueryBinding> = Vec::new();
     for ast_id in ast_ids {
-        if let Some(rows) = bindings_by_occurrence.get(ast_id) {
+        if let Some(rows) = bindings_by_occurrence.get(&(subject.path.as_str(), *ast_id)) {
             reached.extend(rows.iter().copied().filter(|row| !row.shadowed));
         }
     }
@@ -1928,6 +1937,12 @@ fn assertion_occurrence_query(
     steps: Vec<QueryStep>,
     budget: &PolicyBudget,
 ) -> Result<CodeQuery, &'static str> {
+    // An empty exact-path list is an unrestricted seed; a caller with no
+    // subject files must skip the query instead of scanning the workspace.
+    assert!(
+        !paths.is_empty(),
+        "assertion row queries require subject paths"
+    );
     let Ok(seed) = OccurrenceSeed::for_exact_paths(paths.iter().copied(), roles.to_vec()) else {
         return Err("an assertion subject path is not a valid scan pattern");
     };
@@ -1947,6 +1962,10 @@ fn assertion_occurrence_query(
 /// Every scope of the subject files, so a binding's declaring scope index can
 /// be projected to the interval a containment assert compares against.
 fn assertion_scope_query(paths: &[&str], budget: &PolicyBudget) -> Result<CodeQuery, &'static str> {
+    assert!(
+        !paths.is_empty(),
+        "assertion scope queries require subject paths"
+    );
     let Ok(seed) = ScopeSeed::for_exact_paths(paths.iter().copied()) else {
         return Err("an assertion subject path is not a valid scan pattern");
     };

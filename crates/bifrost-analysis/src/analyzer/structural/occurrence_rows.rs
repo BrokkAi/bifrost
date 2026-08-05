@@ -1189,13 +1189,22 @@ mod tests {
             Some(RejectionReason::ShadowedByNearer)
         );
         match &wildcard[0].candidate {
-            // Java's `ImportInfo` carries no parser-derived path, so the route
-            // is named by the wildcard marker rather than by a target it cannot
-            // state without parsing the raw snippet.
-            TraceCandidateRef::ImportBinder { name, .. } => {
+            // An on-demand import binds no single name, so the route keeps the
+            // wildcard marker as its name -- and states the package it pointed
+            // at through the parser-derived target segments (#1600).
+            TraceCandidateRef::ImportBinder {
+                name,
+                target_segments,
+                ..
+            } => {
                 assert_eq!(
                     name,
                     crate::analyzer::usages::get_definition::trace::WILDCARD_ROUTE_NAME
+                );
+                assert_eq!(
+                    target_segments,
+                    &["app".to_string(), "other".to_string()],
+                    "the rejected route names the package its wildcard covered"
                 );
             }
             other => panic!("a rejected import route is an import binder, got {other:?}"),
@@ -1237,6 +1246,167 @@ mod tests {
         assert!(
             !trace.selects_at(PrecedenceTier::NameOnlyFallback),
             "nothing may be selected at the forbidden fallback tier: {:?}",
+            trace.candidates
+        );
+    }
+
+    /// A complete discovery outcome declaring exactly `modules`, in the shape
+    /// the per-language resolvers produce: the identity rides on the artifact
+    /// module for Python and on the evidence module coordinate for npm.
+    fn discovery_declaring(
+        language: &str,
+        modules: &[&str],
+    ) -> crate::analyzer::semantic_model::DependencyDiscoveryOutcome {
+        use crate::analyzer::semantic_model::{
+            CatalogCoordinate, DependencyArtifactRole, DependencyDiscoveryOutcome,
+            ExternalArtifactKind, ResolvedDependency, ResolvedDependencyArtifact,
+            SemanticModelActivationEvidence,
+        };
+        DependencyDiscoveryOutcome::complete(
+            modules
+                .iter()
+                .map(|module| ResolvedDependency {
+                    id: format!("test:distribution:{module}"),
+                    evidence: SemanticModelActivationEvidence {
+                        language: language.to_owned(),
+                        ecosystem: "test".to_owned(),
+                        package: None,
+                        module: Some(CatalogCoordinate {
+                            name: (*module).to_owned(),
+                            version: None,
+                        }),
+                        toolchain: None,
+                        target: None,
+                        configuration: None,
+                        artifact_sha256: None,
+                    },
+                    provenance: Vec::new(),
+                    artifacts: vec![ResolvedDependencyArtifact::module_file(
+                        DependencyArtifactRole::Declarations,
+                        ExternalArtifactKind::PythonStub,
+                        (*module).to_owned(),
+                        PathBuf::from("unused-in-this-test.pyi"),
+                    )],
+                })
+                .collect(),
+        )
+    }
+
+    fn external_boundaries(trace: &ResolutionTraceResult) -> Vec<BoundaryStatus> {
+        let external: Vec<BoundaryStatus> = trace
+            .candidates
+            .iter()
+            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
+            .map(|row| row.boundary)
+            .collect();
+        assert!(
+            !external.is_empty(),
+            "a boundary outcome always reports the route it took: {:?}",
+            trace.candidates
+        );
+        external
+    }
+
+    /// #1601 acceptance: a Python file importing a distribution the workspace
+    /// declares but does not contain reports `external_declared_unindexed`,
+    /// and the dotted attribute read routes through the same declared module.
+    #[test]
+    fn a_python_import_of_a_declared_unindexed_distribution_reports_declared_unindexed() {
+        let source = concat!(
+            "import requests\n",
+            "\n",
+            "def fetch():\n",
+            "    return requests.get\n",
+        );
+        let fixture = Fixture::new(Language::Python, "app/client.py", source);
+        fixture.workspace.retain_dependency_discovery_evidence(
+            &[Language::Python],
+            &discovery_declaring("python", &["requests"]),
+        );
+        let result = fixture.traced_result();
+        let trace = trace_of(&result.rows, fixture.at("requests.get"), "declared read");
+        assert!(
+            external_boundaries(trace)
+                .iter()
+                .all(|boundary| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
+            "the build declares `requests`, so the miss is declared-unindexed: {:?}",
+            trace.candidates
+        );
+    }
+
+    /// #1601 acceptance: a name nothing declares stays `external_unknown`
+    /// even when discovery ran to completion, and a workspace where discovery
+    /// never ran reports `external_unknown` for everything.
+    #[test]
+    fn an_undeclared_python_import_stays_external_unknown() {
+        let source = concat!(
+            "import nonsuch\n",
+            "\n",
+            "def fetch():\n",
+            "    return nonsuch.get\n",
+        );
+        let undiscovered = Fixture::new(Language::Python, "app/client.py", source);
+        let trace_rows = undiscovered.traced_result();
+        let trace = trace_of(
+            &trace_rows.rows,
+            undiscovered.at("nonsuch.get"),
+            "no discovery",
+        );
+        assert!(
+            external_boundaries(trace)
+                .iter()
+                .all(|boundary| *boundary == BoundaryStatus::ExternalUnknown),
+            "no discovery has run, so nothing is known: {:?}",
+            trace.candidates
+        );
+
+        let declared_elsewhere = Fixture::new(Language::Python, "app/client.py", source);
+        declared_elsewhere
+            .workspace
+            .retain_dependency_discovery_evidence(
+                &[Language::Python],
+                &discovery_declaring("python", &["requests"]),
+            );
+        let result = declared_elsewhere.traced_result();
+        let trace = trace_of(
+            &result.rows,
+            declared_elsewhere.at("nonsuch.get"),
+            "undeclared read",
+        );
+        assert!(
+            external_boundaries(trace)
+                .iter()
+                .all(|boundary| *boundary == BoundaryStatus::ExternalUnknown),
+            "a complete discovery declares nothing named `nonsuch`: {:?}",
+            trace.candidates
+        );
+    }
+
+    /// #1601 acceptance for JS/TS: the imported binding's boundary routes
+    /// through the npm module the build declares, read from the usage index's
+    /// import binders rather than from the binding's own spelling.
+    #[test]
+    fn a_typescript_import_of_a_declared_unindexed_package_reports_declared_unindexed() {
+        let source = concat!(
+            "import { debounce } from \"lodash\";\n",
+            "export const wrapped = debounce;\n",
+        );
+        let fixture = Fixture::new(Language::TypeScript, "src/app.ts", source);
+        fixture.workspace.retain_dependency_discovery_evidence(
+            &[Language::JavaScript, Language::TypeScript],
+            &discovery_declaring("typescript", &["lodash"]),
+        );
+        let result = fixture.traced_result();
+        let trace = trace_of(
+            &result.rows,
+            fixture.at("debounce;"),
+            "declared binding use",
+        );
+        assert!(
+            external_boundaries(trace)
+                .iter()
+                .all(|boundary| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
+            "`debounce` is imported from declared `lodash`: {:?}",
             trace.candidates
         );
     }

@@ -243,6 +243,22 @@ impl AnalyzerSnapshotCaches {
     ) -> Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>> {
         self.semantic_models.overlay()
     }
+
+    pub(crate) fn retain_dependency_discovery_evidence(
+        &self,
+        languages: &[crate::analyzer::Language],
+        evidence: crate::analyzer::semantic_model::DependencyDiscoveryEvidence,
+    ) {
+        self.semantic_models
+            .retain_dependency_discovery_evidence(languages, evidence);
+    }
+
+    fn dependency_discovery_evidence(
+        &self,
+        language: crate::analyzer::Language,
+    ) -> Option<Arc<crate::analyzer::semantic_model::DependencyDiscoveryEvidence>> {
+        self.semantic_models.dependency_discovery_evidence(language)
+    }
 }
 
 /// Every workspace file bucketed by basename, captured by one ignore-aware
@@ -807,6 +823,17 @@ pub trait IAnalyzer: Send + Sync + Any {
     ) -> Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>> {
         self.snapshot_caches()
             .and_then(AnalyzerSnapshotCaches::semantic_model_overlay)
+    }
+
+    /// Dependency-discovery evidence a host retained for `language`'s
+    /// ecosystem, if discovery has run against this analyzer at all. This
+    /// reads what the analyzer already holds; it never triggers discovery.
+    fn dependency_discovery_evidence(
+        &self,
+        language: crate::analyzer::Language,
+    ) -> Option<Arc<crate::analyzer::semantic_model::DependencyDiscoveryEvidence>> {
+        self.snapshot_caches()
+            .and_then(|caches| caches.dependency_discovery_evidence(language))
     }
 
     /// Snapshot-owned immutable derived query layers. Concrete analyzers keep

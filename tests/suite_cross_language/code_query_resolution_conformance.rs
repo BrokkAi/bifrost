@@ -452,6 +452,51 @@ fn a_second_wildcard_import_makes_the_wildcard_tier_ambiguous() {
     );
 }
 
+const UTIL_WIDGET: &str =
+    "package util;\n\npublic class Widget {\n    public int size() { return 2; }\n}\n";
+
+const HOST_TWO_WILDCARD_ROUTES: &str = "package app;\n\nimport api.*;\nimport util.*;\n\nclass Host {\n    int run(Widget widget) {\n        return widget.size();\n    }\n}\n";
+
+/// The trace states the same ambiguity the binder rows do (issue #1602). Two
+/// packages both supply `Widget` through the on-demand tier, so the resolver
+/// records both as selected peers instead of silently keeping the first route
+/// it tried; a consumer that requires uniqueness has a peer to compare against.
+#[test]
+fn colliding_wildcard_routes_record_every_peer_on_the_trace() {
+    let ambiguous = complete(
+        &[
+            ("api/Widget.java", API_WIDGET),
+            ("util/Widget.java", UTIL_WIDGET),
+            ("app/Host.java", HOST_TWO_WILDCARD_ROUTES),
+        ],
+        json!({
+            "languages": ["java"],
+            "occurrences": { "role": ["type_operand"] },
+            "steps": [{ "op": "candidates_of", "outcome": ["selected"] }]
+        }),
+    );
+    let mut targets: Vec<String> = rows(&ambiguous)
+        .iter()
+        .map(|row| {
+            assert_eq!(
+                row["tier"],
+                json!("wildcard_import"),
+                "both peers sit on the on-demand tier: {row:#}"
+            );
+            row["candidate"]["unit"]["fq_name"]
+                .as_str()
+                .expect("candidate fq_name")
+                .to_string()
+        })
+        .collect();
+    targets.sort();
+    assert_eq!(
+        targets,
+        vec!["api.Widget".to_string(), "util.Widget".to_string()],
+        "each colliding package is its own selected row: {ambiguous:#}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Scenario 8 -- the authoritative-boundary anti-fallback contract.
 // ---------------------------------------------------------------------------

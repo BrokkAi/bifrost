@@ -227,6 +227,126 @@ void consume(const Values& values) {
 }
 
 #[test]
+fn authoritative_cpp_template_forwarding_overload_selects_by_call_arity() {
+    let header = r#"
+#pragma once
+class Token {
+public:
+    template <size_t count>
+    static bool simpleMatch(const Token *tok, const char (&pattern)[count]) {
+        return simpleMatch(tok, pattern, count - 1);
+    }
+    static bool simpleMatch(const Token *tok, const char pattern[], size_t pattern_len);
+};
+"#;
+    let body = r#"#include "token.h"
+bool Token::simpleMatch(const Token *tok, const char pattern[], size_t pattern_len) {
+    return tok != nullptr && pattern != nullptr && pattern_len != 0;
+}
+"#;
+    let caller = r#"#include "token.h"
+void call(Token *tok) {
+    Token::simpleMatch(tok, "one");
+    Token::simpleMatch(tok, "two", 3);
+    Other::simpleMatch(tok, "other");
+    Token::simpleMatch(tok, "bad", 1, 2);
+}
+"#;
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        ("token.h", header),
+        ("token.cpp", body),
+        ("caller.cpp", caller),
+    ]);
+    let template_target = definition_by(&analyzer, |unit| {
+        unit.fq_name() == "Token.simpleMatch"
+            && unit.source() == &project.file("token.h")
+            && unit
+                .signature()
+                .is_some_and(|signature| signature.starts_with("<size_t count>"))
+    });
+    let body_target = definition_by(&analyzer, |unit| {
+        unit.fq_name() == "Token.simpleMatch"
+            && unit.source() == &project.file("token.cpp")
+            && unit.signature() == Some("(const Token *, const char [], size_t)")
+    });
+    let file = project.file("caller.cpp");
+    let template_call = fixture_token_range(
+        caller,
+        "    Token::simpleMatch(tok, \"one\");",
+        "simpleMatch",
+    );
+    let body_call = fixture_token_range(
+        caller,
+        "    Token::simpleMatch(tok, \"two\", 3);",
+        "simpleMatch",
+    );
+    let unrelated_call = fixture_token_range(
+        caller,
+        "    Other::simpleMatch(tok, \"other\");",
+        "simpleMatch",
+    );
+    let incompatible_call = fixture_token_range(
+        caller,
+        "    Token::simpleMatch(tok, \"bad\", 1, 2);",
+        "simpleMatch",
+    );
+    let template_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&template_target), &file);
+    let body_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&body_target), &file);
+    assert_eq!(template_hits, BTreeSet::from([template_call]));
+    assert_eq!(body_hits, BTreeSet::from([body_call]));
+    assert!(!template_hits.contains(&unrelated_call));
+    assert!(!body_hits.contains(&unrelated_call));
+    assert!(!template_hits.contains(&incompatible_call));
+    assert!(!body_hits.contains(&incompatible_call));
+}
+
+#[test]
+fn authoritative_cpp_fragmented_export_class_field_has_exact_usage() {
+    let header = r#"
+#pragma once
+#define SIMPLECPP_LIB
+namespace simplecpp {
+using TokenString = std::string;
+struct Location { int line{}; };
+class SIMPLECPP_LIB Token {
+public:
+    Token(const TokenString &s, const Location &loc, bool wsahead = false) :
+        whitespaceahead(wsahead), location(loc), string(s) {
+        flags();
+    }
+    TokenString string;
+    bool whitespaceahead;
+    Location location;
+    Token *previous{};
+private:
+    void flags() { whitespaceahead = true; }
+};
+}
+"#;
+    let caller = r#"#include "token.h"
+void assign(simplecpp::Token* token, const simplecpp::Location& loc) {
+    token->location = loc;
+}
+"#;
+    let (project, analyzer) =
+        cpp_analyzer_with_files(&[("token.h", header), ("caller.cpp", caller)]);
+    let target = definition_by(&analyzer, |unit| {
+        unit.is_field()
+            && unit.fq_name() == "simplecpp.Token.location"
+            && unit.source() == &project.file("token.h")
+    });
+    let expected = fixture_token_range(caller, "    token->location = loc;", "location");
+    let hits = authoritative_exact_ranges(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &project.file("caller.cpp"),
+    );
+    assert_eq!(hits, BTreeSet::from([expected]));
+}
+
+#[test]
 fn authoritative_cpp_fragmented_class_siblings_keep_inherited_nested_type_owner() {
     let source = r#"
 struct Analyzer {

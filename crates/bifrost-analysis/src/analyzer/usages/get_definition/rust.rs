@@ -2356,6 +2356,9 @@ fn trace_rejected_units(units: &[CodeUnit], tier: PrecedenceTier, reason: Reject
 }
 
 /// Record an import route that bound the name but could not answer for it.
+/// The resolution outcome this arm reads back does not carry the route's
+/// `ImportInfo`, so the route's target stays unstated (an empty list), not
+/// re-derived.
 fn trace_rejected_import_route(file: &ProjectFile, name: &str, boundary: BoundaryStatus) {
     if !trace::recording() {
         return;
@@ -2366,6 +2369,7 @@ fn trace_rejected_import_route(file: &ProjectFile, name: &str, boundary: Boundar
                 file: file.clone(),
                 node: None,
                 name: name.to_owned(),
+                target_segments: Vec::new(),
             },
             Some(PrecedenceTier::ExplicitImport),
             RejectionReason::BoundaryBlocked,

@@ -878,6 +878,8 @@ pub(super) fn python_import_details(import: &ImportInfo) -> Option<PythonImportD
             module: join_python_import_segments(&path.segments),
             alias: import.alias.clone(),
         }),
+        // Python has no static imports; the variant belongs to Java.
+        StructuredImportPathKind::StaticMember => None,
         StructuredImportPathKind::ImportFrom => {
             let (name, module_segments) = if import.is_wildcard {
                 ("*".to_string(), path.segments.as_slice())
@@ -899,22 +901,29 @@ fn python_namespace_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo
     let mut infos = Vec::new();
     let mut cursor = node.walk();
     for imported in node.children_by_field_name("name", &mut cursor) {
-        let (module_node, alias) = if imported.kind() == "aliased_import" {
+        let (module_node, alias_node) = if imported.kind() == "aliased_import" {
             let Some(name) = imported.child_by_field_name("name") else {
                 continue;
             };
-            let alias = imported
-                .child_by_field_name("alias")
-                .map(|alias| py_node_text(alias, source).trim().to_string())
-                .filter(|alias| !alias.is_empty());
-            (name, alias)
+            (name, imported.child_by_field_name("alias"))
         } else {
             (imported, None)
         };
+        let alias = alias_node
+            .map(|alias| py_node_text(alias, source).trim().to_string())
+            .filter(|alias| !alias.is_empty());
         let segments = python_path_segments(module_node, source);
         if segments.is_empty() {
             continue;
         }
+        // `import a.b` binds `a`: the first segment's own token. A renamed
+        // import binds its alias token instead.
+        let binder_span = alias
+            .is_some()
+            .then_some(alias_node)
+            .flatten()
+            .or_else(|| python_first_segment_node(module_node))
+            .map(crate::analyzer::common::node_span);
         let module = join_python_import_segments(&segments);
         let identifier = alias.clone().or_else(|| segments.first().cloned());
         infos.push(ImportInfo {
@@ -933,6 +942,7 @@ fn python_namespace_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo
                 lexical_scopes: Vec::new(),
                 declaration_start_byte: node.start_byte(),
             }),
+            binder_span,
         });
     }
     infos
@@ -969,6 +979,7 @@ fn python_from_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
                 lexical_scopes: Vec::new(),
                 declaration_start_byte: node.start_byte(),
             }),
+            binder_span: None,
         });
         return infos;
     }
@@ -977,22 +988,33 @@ fn python_from_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
     }
 
     for imported in imported_names {
-        let (name_node, alias) = if imported.kind() == "aliased_import" {
+        let (name_node, alias_node) = if imported.kind() == "aliased_import" {
             let Some(name) = imported.child_by_field_name("name") else {
                 continue;
             };
-            let alias = imported
-                .child_by_field_name("alias")
-                .map(|alias| py_node_text(alias, source).trim().to_string())
-                .filter(|alias| !alias.is_empty());
-            (name, alias)
+            (name, imported.child_by_field_name("alias"))
         } else {
             (imported, None)
         };
+        let alias = alias_node
+            .map(|alias| py_node_text(alias, source).trim().to_string())
+            .filter(|alias| !alias.is_empty());
         let name_segments = python_path_segments(name_node, source);
         if name_segments.is_empty() {
             continue;
         }
+        // `from m import x` binds `x`'s own token; a rename binds the alias
+        // token. A multi-segment imported name binds no single token.
+        let binder_span = alias
+            .is_some()
+            .then_some(alias_node)
+            .flatten()
+            .or_else(|| {
+                (name_segments.len() == 1)
+                    .then(|| python_first_segment_node(name_node))
+                    .flatten()
+            })
+            .map(crate::analyzer::common::node_span);
         let imported_name = join_python_import_segments(&name_segments);
         let mut segments = module_segments.clone();
         segments.extend(name_segments);
@@ -1013,6 +1035,7 @@ fn python_from_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
                 lexical_scopes: Vec::new(),
                 declaration_start_byte: node.start_byte(),
             }),
+            binder_span,
         });
     }
     infos
@@ -1047,6 +1070,21 @@ fn python_module_segments(module: Node<'_>, source: &str) -> Vec<String> {
         return segments;
     }
     python_path_segments(module, source)
+}
+
+/// The token that spells a path's first segment: the identifier itself, or a
+/// dotted name's first identifier. `None` when the shape has no leading
+/// identifier token of its own (e.g. a relative-import prefix).
+fn python_first_segment_node(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "identifier" => Some(node),
+        "dotted_name" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() == "identifier")
+        }
+        _ => None,
+    }
 }
 
 fn python_path_segments(node: Node<'_>, source: &str) -> Vec<String> {

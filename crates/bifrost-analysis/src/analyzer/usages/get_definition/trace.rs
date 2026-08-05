@@ -46,7 +46,9 @@ use std::sync::Arc;
 ///
 /// A candidate is not always a workspace declaration: a lexical binding has no
 /// `CodeUnit`, and an import route that lost to a stronger tier is named by the
-/// binder it introduced rather than by a target the resolver never looked up.
+/// binder it introduced -- plus the parser-derived target path the route
+/// pointed at, where the adapter recorded one -- rather than by a resolution
+/// the resolver never performed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraceCandidateRef {
     /// An indexed workspace declaration.
@@ -66,10 +68,14 @@ pub enum TraceCandidateRef {
     /// An import route. `node` is the binder token's facts-arena node where the
     /// adapter records one; `name` is the local name the import binds, or the
     /// wildcard marker for an on-demand import, which binds no single name.
+    /// `target_segments` is the parser-derived path the route pointed at; an
+    /// empty list is a stated gap (the adapter recorded no structured path),
+    /// never a claim that the import has no target.
     ImportBinder {
         file: ProjectFile,
         node: Option<u32>,
         name: String,
+        target_segments: Vec<String>,
     },
     /// The route out of the workspace a boundary outcome took, named by the
     /// reference spelling. It is a candidate in the sense that matters here:
@@ -488,7 +494,11 @@ fn trace_completeness_for(file: &ProjectFile) -> TraceCompleteness {
 ///   [`BoundaryStatus::ExternalDeclaredUnindexed`]: the build declared artifacts
 ///   the producer could not finish reading, so the name may well be there.
 /// - Python and JS/TS: the activated semantic-model overlay. A symbol of that
-///   name is [`BoundaryStatus::ExternalIndexed`].
+///   name is [`BoundaryStatus::ExternalIndexed`]. On an overlay miss, retained
+///   dependency-discovery evidence (#1601): a name whose module the build
+///   declares, or a miss against a truncated discovery, is
+///   [`BoundaryStatus::ExternalDeclaredUnindexed`]. The trace never triggers
+///   discovery; where none has run, nothing is retained.
 ///
 /// Anything else stays [`BoundaryStatus::ExternalUnknown`]. This function never
 /// changes an outcome; it only sharpens what the trace says about one.
@@ -542,7 +552,7 @@ fn boundary_evidence(
             };
             java.external_boundary_evidence(file, name)
         }
-        Language::Python | Language::JavaScript | Language::TypeScript => {
+        language @ (Language::Python | Language::JavaScript | Language::TypeScript) => {
             let indexed = analyzer.semantic_model_overlay().and_then(|overlay| {
                 overlay
                     .symbols_named(name)
@@ -550,12 +560,78 @@ fn boundary_evidence(
                     .first()
                     .map(|symbol| symbol.id.clone())
             });
-            match indexed {
-                Some(id) => (BoundaryStatus::ExternalIndexed, Some(id)),
-                None => (BoundaryStatus::ExternalUnknown, None),
+            if let Some(id) = indexed {
+                return (BoundaryStatus::ExternalIndexed, Some(id));
+            }
+            // Retained discovery evidence (#1601): the build declares the
+            // module this reference routes through and nothing indexed it, or
+            // discovery could not read everything the build declared, so the
+            // name may well be there. Where no discovery has run, nothing is
+            // retained and `ExternalUnknown` remains the honest answer.
+            let declared = analyzer
+                .dependency_discovery_evidence(language)
+                .is_some_and(|evidence| {
+                    evidence.truncated()
+                        || evidence.declares_module_path(name)
+                        || declared_import_route(analyzer, file, language, name, &evidence)
+                });
+            if declared {
+                (BoundaryStatus::ExternalDeclaredUnindexed, None)
+            } else {
+                (BoundaryStatus::ExternalUnknown, None)
             }
         }
         _ => (BoundaryStatus::ExternalUnknown, None),
+    }
+}
+
+/// Whether the import that binds `name`'s leading segment in `file` routes
+/// through a module the retained discovery evidence declares.
+///
+/// The routes come from the analyzer's structured import layers — Python's
+/// parser-derived [`crate::analyzer::StructuredImportPath`] segments, and the
+/// JS/TS usage index's per-file import binders — never from re-scanning
+/// source text. JS/TS `ImportInfo` records no structured path (the same gap
+/// as Java's, see #1600), which is why the two families read different
+/// layers.
+fn declared_import_route(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    language: crate::analyzer::Language,
+    name: &str,
+    evidence: &crate::analyzer::semantic_model::DependencyDiscoveryEvidence,
+) -> bool {
+    use crate::analyzer::Language;
+
+    // `name` is the resolved reference site's rendered text; its leading
+    // dotted segment is the local binder an import introduced.
+    let Some(leading) = name.split('.').next().filter(|head| !head.is_empty()) else {
+        return false;
+    };
+    match language {
+        Language::Python => {
+            let Some(provider) = analyzer.import_analysis_provider_for_file(file) else {
+                return false;
+            };
+            provider.import_info_of(file).iter().any(|import| {
+                let binds = import.is_wildcard || import.local_name() == Some(leading);
+                binds
+                    && import.path.as_ref().is_some_and(|path| {
+                        evidence.declares_module_path(&path.render_segments("."))
+                    })
+            })
+        }
+        Language::JavaScript | Language::TypeScript => {
+            let Some(index) =
+                crate::analyzer::usages::js_ts_graph::cached_jsts_index(analyzer, language, None)
+            else {
+                return false;
+            };
+            index
+                .import_bindings(file, leading)
+                .any(|binding| evidence.declares_module_path(&binding.module_specifier))
+        }
+        _ => false,
     }
 }
 

@@ -182,6 +182,19 @@ impl<'a> JavaResolutionSession<'a> {
         self.query_optional_row(|| java.resolve_type_name_in_file(file, name))
     }
 
+    /// The full candidate set for a type name, ambiguous wildcard peers
+    /// included. Reference sites use this so colliding on-demand imports
+    /// become an `Ambiguous` outcome; receiver and qualifier lookups keep
+    /// [`Self::resolve_type_name_in_file`], which demands a unique answer.
+    fn resolve_type_name_candidates_in_file(
+        &self,
+        java: &JavaAnalyzer,
+        file: &ProjectFile,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        self.query_rows(|| java.resolve_type_name_candidates_in_file(file, name))
+    }
+
     fn type_name_resolves_with_external(
         &self,
         java: &JavaAnalyzer,
@@ -192,8 +205,12 @@ impl<'a> JavaResolutionSession<'a> {
             .is_some()
     }
 
-    fn import_statements(&self, analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Vec<String> {
-        self.query_rows(|| analyzer.import_statements(file))
+    fn import_infos(
+        &self,
+        java: &JavaAnalyzer,
+        file: &ProjectFile,
+    ) -> Vec<crate::analyzer::ImportInfo> {
+        self.query_rows(|| java.import_info_of(file))
     }
 
     fn ranges(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<Range> {
@@ -767,8 +784,9 @@ fn resolve_java_type_reference(
     {
         return candidates_outcome(vec![unit]);
     }
-    if let Some(unit) = session.resolve_type_name_in_file(java, file, normalized) {
-        return candidates_outcome(vec![unit]);
+    let candidates = session.resolve_type_name_candidates_in_file(java, file, normalized);
+    if !candidates.is_empty() {
+        return candidates_outcome(candidates);
     }
     if let Some(unit) = java_qualified_nested_type(analyzer, java, session, file, source, node) {
         return candidates_outcome(vec![unit]);
@@ -802,8 +820,9 @@ fn java_explicit_scoped_type_reference(
         return None;
     }
 
-    if let Some(unit) = session.resolve_type_name_in_file(java, file, normalized) {
-        return Some(candidates_outcome(vec![unit]));
+    let candidates = session.resolve_type_name_candidates_in_file(java, file, normalized);
+    if !candidates.is_empty() {
+        return Some(candidates_outcome(candidates));
     }
     if let Some(unit) = java_qualified_nested_type(analyzer, java, session, file, source, node) {
         return Some(candidates_outcome(vec![unit]));
@@ -2466,21 +2485,6 @@ fn java_terminal_segment(path: &str) -> Option<String> {
         .filter(|segment| !segment.is_empty())
 }
 
-/// Splits a Java-spelled dotted qualified name into its owner prefix and
-/// final segment (`com.foo.Bar` -> (`com.foo`, `Bar`)), or `None` for a bare
-/// name with no owner. Java identifiers never contain a literal `.`, so
-/// re-tokenizing with the shared structured splitter and rejoining every part
-/// but the last with `.` reproduces `rsplit_once('.')`'s (owner, member)
-/// split exactly.
-fn java_owner_and_member(path: &str) -> Option<(String, String)> {
-    let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Java, path);
-    let (member, owner_parts) = segments.split_last()?;
-    if owner_parts.is_empty() {
-        return None;
-    }
-    Some((owner_parts.join("."), member.clone()))
-}
-
 fn java_member_candidates(
     analyzer: &dyn IAnalyzer,
     session: &JavaResolutionSession<'_>,
@@ -2575,13 +2579,23 @@ fn java_static_import_candidates(
     arity: Option<usize>,
 ) -> DefinitionLookupOutcome {
     let support: &dyn BoundedDefinitionLookup = session;
+    let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
+        return no_definition(
+            "no_java_analyzer",
+            "no Java analyzer is available for static import resolution",
+        );
+    };
     let mut candidates = Vec::new();
     let mut saw_external = false;
-    for import in session.import_statements(analyzer, file) {
-        let Some(path) = java_static_import_path(&import) else {
+    for import in session.import_infos(java, file) {
+        let Some(path) = import.path.as_ref() else {
             continue;
         };
-        if let Some(owner) = path.strip_suffix(".*") {
+        if path.kind != Some(crate::analyzer::StructuredImportPathKind::StaticMember) {
+            continue;
+        }
+        if import.is_wildcard {
+            let owner = path.render_segments(".");
             let mut owner_candidates =
                 java_filter_member_candidates(support.fqn(&format!("{owner}.{member}")), kind);
             if owner_candidates.is_empty() {
@@ -2592,37 +2606,39 @@ fn java_static_import_candidates(
                 );
             }
             if owner_candidates.is_empty()
-                && let Some((outer, leaf)) = java_owner_and_member(owner)
+                && let Some((leaf, outer_segments)) = path.segments.split_last()
+                && !outer_segments.is_empty()
             {
                 // On-demand static imports may land on nested types too.
                 owner_candidates = java_filter_member_candidates(
-                    support.fqn(&format!("{outer}${leaf}.{member}")),
+                    support.fqn(&format!("{}${leaf}.{member}", outer_segments.join("."))),
                     kind,
                 );
             }
-            if owner_candidates.is_empty() && !java_workspace_fqn_exists(support, owner) {
+            if owner_candidates.is_empty() && !java_workspace_fqn_exists(support, &owner) {
                 saw_external = true;
             }
             candidates.extend(owner_candidates);
             continue;
         }
-        let Some((owner, imported_member)) = java_owner_and_member(path) else {
+        let Some((imported_member, owner_segments)) = path.segments.split_last() else {
             continue;
         };
-        if imported_member != member {
+        if owner_segments.is_empty() || imported_member != member {
             continue;
         }
-        let mut imported = java_filter_member_candidates(support.fqn(path), kind);
+        let owner = owner_segments.join(".");
+        let path_fqn = path.render_segments(".");
+        let mut imported = java_filter_member_candidates(support.fqn(&path_fqn), kind);
         if imported.is_empty() {
             // Static imports may also name nested types
             // (`import static com.x.Tacos.Burritos`).
-            imported = java_filter_member_candidates(support.fqn(path), JavaMemberLookupKind::Type);
+            imported =
+                java_filter_member_candidates(support.fqn(&path_fqn), JavaMemberLookupKind::Type);
         }
         if imported.is_empty() {
             // The index keys nested types with `$`, not `.` (tier-4
-            // spoon/mockito static-import claims). `owner`/`imported_member`
-            // are the same (owner, member) split as above — `path` never
-            // changed, so re-splitting it here would just reproduce them.
+            // spoon/mockito static-import claims).
             imported = java_filter_member_candidates(
                 support.fqn(&format!("{owner}${imported_member}")),
                 kind,
@@ -2662,43 +2678,26 @@ fn java_import_boundary_for_type(
     name: &str,
 ) -> bool {
     let support: &dyn BoundedDefinitionLookup = session;
-    for import in session.import_statements(java, file) {
-        let trimmed = import.trim();
-        if trimmed.starts_with("import static ") {
-            continue;
-        }
-        let Some(path) = trimmed
-            .strip_prefix("import ")
-            .and_then(|rest| rest.strip_suffix(';'))
-            .map(str::trim)
-        else {
+    for import in session.import_infos(java, file) {
+        let Some(path) = import.path.as_ref() else {
             continue;
         };
-        if let Some(package) = path.strip_suffix(".*") {
-            if !package.is_empty() && !java_workspace_package_exists(support, package) {
+        if path.kind == Some(crate::analyzer::StructuredImportPathKind::StaticMember) {
+            continue;
+        }
+        if import.is_wildcard {
+            let package = path.render_segments(".");
+            if !package.is_empty() && !java_workspace_package_exists(support, &package) {
                 return true;
             }
             continue;
         }
-        // Java identifiers never contain a literal `.`, so re-tokenizing with
-        // the shared structured splitter and rejoining every part but the
-        // last with `.` reproduces the string's (package, terminal) split
-        // exactly, including the no-owner case (`package` stays empty).
-        let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Java, path);
-        if segments.last().map(String::as_str) == Some(name) {
-            let package = segments[..segments.len().saturating_sub(1)].join(".");
+        if path.segments.last().map(String::as_str) == Some(name) {
+            let package = path.segments[..path.segments.len() - 1].join(".");
             return !java_workspace_package_exists(support, &package);
         }
     }
     false
-}
-
-fn java_static_import_path(import: &str) -> Option<&str> {
-    import
-        .trim()
-        .strip_prefix("import static ")
-        .and_then(|rest| rest.strip_suffix(';'))
-        .map(str::trim)
 }
 
 fn java_workspace_fqn_exists(support: &dyn BoundedDefinitionLookup, fqn: &str) -> bool {

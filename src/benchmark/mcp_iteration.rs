@@ -188,12 +188,18 @@ pub(super) fn transport_phase_report(
     let Some(profile) = profile else {
         return Ok(Vec::new());
     };
-    let measured = artifacts.iter().filter(|artifact| {
-        artifact
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.contains("-measured-"))
-    });
+    let mut measured = artifacts
+        .iter()
+        .filter(|artifact| {
+            artifact
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("-measured-"))
+        })
+        .peekable();
+    if measured.peek().is_none() {
+        return Ok(Vec::new());
+    }
     let mut timings = BTreeMap::<(String, String), Vec<f64>>::new();
     let mut phases = HashSet::new();
     for artifact in measured {
@@ -263,6 +269,17 @@ fn parse_transport_phase_timings(contents: &str) -> Vec<(String, String, f64)> {
 mod tests {
     use super::*;
 
+    fn test_profile(output: &tempfile::TempDir) -> BenchmarkProfile {
+        BenchmarkProfile {
+            output_dir: output.path().to_path_buf(),
+            report_path_prefix: PathBuf::from("profiles"),
+        }
+    }
+
+    fn write_measured_artifact(profile: &BenchmarkProfile, filename: &str, contents: &str) {
+        std::fs::write(profile.output_dir.join(filename), contents).unwrap();
+    }
+
     #[test]
     fn boundary_failure_preserves_the_primary_request_error() {
         let error = preserve_outcome_on_boundary_failure::<()>(
@@ -291,5 +308,69 @@ mod tests {
         );
         assert_eq!(timings[1].0, "execution");
         assert_eq!(timings[1].2, 3456.7);
+    }
+
+    #[test]
+    fn issue_1631_warmup_only_profile_has_no_transport_phase_report() {
+        let output = tempfile::tempdir().unwrap();
+        let profile = test_profile(&output);
+
+        let phases =
+            transport_phase_report(Some(&profile), &[PathBuf::from("case-warmup-1.log")]).unwrap();
+
+        assert!(phases.is_empty());
+    }
+
+    #[test]
+    fn issue_1631_measured_profile_still_requires_all_transport_phases() {
+        let output = tempfile::tempdir().unwrap();
+        let profile = test_profile(&output);
+        let filename = "case-measured-1.log";
+        write_measured_artifact(
+            &profile,
+            filename,
+            "[bifrost-timing] END mcp_request.execution[search_symbols] (1.0 ms)\n\
+             [bifrost-timing] DURATION mcp_request.response_queue_wait[search_symbols] (0.1 ms)\n\
+             [bifrost-timing] END mcp_request.writer_delivery[search_symbols] (0.1 ms)\n",
+        );
+
+        let error = transport_phase_report(Some(&profile), &[PathBuf::from(filename)])
+            .expect_err("measured profile omitted queue_wait");
+
+        assert_eq!(
+            error,
+            "profile artifacts omitted required MCP transport phase `queue_wait`"
+        );
+    }
+
+    #[test]
+    fn issue_1631_complete_measured_profile_reports_all_transport_phases() {
+        let output = tempfile::tempdir().unwrap();
+        let profile = test_profile(&output);
+        let filename = "case-measured-1.log";
+        write_measured_artifact(
+            &profile,
+            filename,
+            "[bifrost-timing] DURATION mcp_request.queue_wait[search_symbols] (0.2 ms)\n\
+             [bifrost-timing] END mcp_request.execution[search_symbols] (1.0 ms)\n\
+             [bifrost-timing] DURATION mcp_request.response_queue_wait[search_symbols] (0.1 ms)\n\
+             [bifrost-timing] END mcp_request.writer_delivery[search_symbols] (0.1 ms)\n",
+        );
+
+        let phases = transport_phase_report(Some(&profile), &[PathBuf::from(filename)]).unwrap();
+        let phase_names = phases
+            .iter()
+            .map(|report| report.phase.as_str())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            phase_names,
+            HashSet::from([
+                "queue_wait",
+                "execution",
+                "response_queue_wait",
+                "writer_delivery",
+            ])
+        );
     }
 }
