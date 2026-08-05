@@ -312,8 +312,9 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
 /// created the DB and holds the writer open for the store's lifetime.
 pub fn open_readonly_connection(db_path: &Path) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
+    let db_path = canonicalize_cache_db_parent(db_path)?;
     let conn = Connection::open_with_flags(
-        db_path,
+        &db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
@@ -331,8 +332,9 @@ pub fn open_readonly_connection(db_path: &Path) -> Result<Connection> {
 /// analyzer queries.
 pub fn open_streaming_readonly_connection(db_path: &Path) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
+    let db_path = canonicalize_cache_db_parent(db_path)?;
     let conn = Connection::open_with_flags(
-        db_path,
+        &db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
@@ -347,6 +349,19 @@ pub fn open_streaming_readonly_connection(db_path: &Path) -> Result<Connection> 
         .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
     conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
     Ok(conn)
+}
+
+fn canonicalize_cache_db_parent(db_path: &Path) -> Result<PathBuf> {
+    let parent = db_path
+        .parent()
+        .ok_or_else(|| format!("cache DB path has no parent: {}", db_path.display()))?;
+    let file_name = db_path
+        .file_name()
+        .ok_or_else(|| format!("cache DB path has no file name: {}", db_path.display()))?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|err| format!("cache DB I/O error: {err}"))?;
+    Ok(parent.join(file_name))
 }
 
 /// Apply the pragmas that matter for a read-only WAL connection. Deliberately
