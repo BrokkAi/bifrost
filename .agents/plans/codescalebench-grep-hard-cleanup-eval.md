@@ -20,7 +20,7 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - [x] (2026-08-05 22:31Z) Ran all 64 valid tasks without Bifrost at concurrency 10 and a 1,800-second task limit.
 - [x] (2026-08-05 22:34Z) Selected 20 high-scoring baseline failures with ready sources and cache data.
 - [x] (2026-08-05 22:43Z) Fixed Bifrost MCP workspace arguments and proved symbol calls in one end-to-end task.
-- [ ] (2026-08-05 22:47Z) Run the selected tasks with symbol tools. The 20-task arm is active at concurrency 10.
+- [ ] (2026-08-05 23:25Z) Run the selected tasks with symbol tools. The first 20-task arm stopped after a linked-worktree fault and a false cache-readiness assumption.
 - [ ] Run the same tasks with symbol and NLP tools.
 - [ ] Add synthetic semantic step zero if natural semantic use is too low.
 - [ ] Produce a paired report and complete the requirement audit.
@@ -51,6 +51,10 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Evidence: Luna passed 2 of 64 tasks. The 58 scorable outputs had a 0.4132 mean and a 0.4676 median composite score. Six tasks produced no valid `answer.json`.
 - Observation: The symbol smoke test started Bifrost in seconds and improved the selected task.
   Evidence: `ccx-dep-trace-273` improved from 0.7727 to 0.8081. Luna completed one `get_summaries` call and one `search_symbols` call.
+- Observation: The first selected set did not satisfy the cache-ready requirement.
+  Evidence: OpenJDK had no readiness record. Its first analyzer call failed because libgit2 could not resolve a moved worktree back-pointer. After that fix, cold setup exceeded 120 seconds.
+- Observation: The old readiness records name the unversioned schema-14 database, not the active schema-15 database.
+  Evidence: Grafana took about 154 seconds to fill missing analyzer rows in schema 15. Its next analyzer build took 1.23 seconds.
 
 ## Decision Log
 
@@ -77,6 +81,9 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Date/Author: 2026-08-05 / Codex
 - Decision: Use the 20 highest-scoring valid baseline failures below 0.8 for paired tool tests.
   Rationale: These tasks are near enough to the solve limit to measure useful localization gains without selecting baseline passes.
+  Date/Author: 2026-08-05 / Codex
+- Decision: Replace the incorrect 20-task set with the 11 valid baseline failures that intersect the existing prewarm campaign.
+  Rationale: Paired arms must not include cold analyzer or embedding work. The active schema-15 cache will receive a fresh readiness check before either arm runs.
   Date/Author: 2026-08-05 / Codex
 
 ## Outcomes & Retrospective

@@ -134,7 +134,13 @@ impl SemanticStore {
     pub fn missing_files(&self, files: &[(String, String)]) -> Result<Vec<(String, String)>> {
         let conn = self.conn.lock().expect("semantic store mutex poisoned");
         let mut existing = HashSet::new();
-        for batch in files.chunks(SQLITE_PAIR_BATCH) {
+        // Large shared CodeScale caches can exceed 29 GiB. Follow the
+        // (blob_oid, rel_path) primary-key order so a cold cache performs an
+        // ordered B-tree walk instead of one random read for each source path.
+        let mut lookup_files: Vec<_> = files.iter().collect();
+        lookup_files.sort_unstable();
+        lookup_files.dedup();
+        for batch in lookup_files.chunks(SQLITE_PAIR_BATCH) {
             let placeholders = std::iter::repeat_n("(?, ?)", batch.len())
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -366,6 +372,7 @@ mod tests {
         assert_eq!(
             store
                 .missing_files(&[
+                    (oid.to_string(), "src/c.rs".to_string()),
                     (oid.to_string(), "src/a.rs".to_string()),
                     (oid.to_string(), "src/c.rs".to_string()),
                 ])

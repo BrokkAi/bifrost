@@ -27,6 +27,7 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 - [x] (2026-08-05) Released the startup OID lock before language projection and parallelized the pure path-to-OID work.
 - [x] (2026-08-05) Reprofiled Apache Camel and ran the focused, workspace, and all-feature lint gates.
 - [x] (2026-08-05) Committed the parallelization and pushed the merged work to `origin/master`.
+- [ ] (2026-08-05) Sort semantic materialization lookups by their SQLite primary key and remeasure cold-cache prewarm.
 
 ## Surprises & Discoveries
 
@@ -69,6 +70,9 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 - Observation: Parallel projection removes the long mutex hold and makes the shared Git identity map available to all language workers.
   Evidence: A release Apache Camel run resolved 37,451 clean tracked identities with zero file hashes. The shared Git scan and small-language projections completed in 673-702 milliseconds. The Java projection completed in 1.38 seconds while the other language workers used the same Rayon pool.
 
+- Observation: Semantic readiness still probes source identities in path order against a blob-first primary key.
+  Evidence: A 19,280-file Django prewarm spent minutes in SQLite B-tree lookup. CPU profiles showed `sqlite3BtreeIndexMoveto`, page-cache fetches, and SQLite VM work. `semantic_files` uses `(blob_oid, rel_path)` as its primary key.
+
 ## Decision Log
 
 - Decision: Correct the identity design instead of adding eager router startup.
@@ -93,6 +97,10 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 
 - Decision: Keep the repository OID map immutable behind `Arc` after its first construction. Run language projection with Rayon after releasing the initialization lock.
   Rationale: The current mutex covers every path conversion and lookup. It serializes language threads and leaves the large Java projection on one core.
+  Date/Author: 2026-08-05 / Codex
+
+- Decision: Sort and deduplicate semantic file identities before batched membership queries.
+  Rationale: This follows the persistent primary-key order and changes random B-tree probes into an ordered walk. The caller still receives missing identities in its original order.
   Date/Author: 2026-08-05 / Codex
 
 ## Outcomes & Retrospective
