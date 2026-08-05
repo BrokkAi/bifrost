@@ -1110,6 +1110,7 @@ struct QueryReadCache {
     /// dropping it, so an insertion in one memo cannot block readers of another.
     analyzed_live_files: Arc<RwLock<Option<Vec<ProjectFile>>>>,
     live_sources: Arc<RwLock<HashMap<ProjectFile, Option<ResolvedLiveSource>>>>,
+    current_sources: Arc<RwLock<HashMap<ProjectFile, Option<String>>>>,
     prepared_sources: Arc<RwLock<HashMap<ProjectFile, Option<ResolvedPreparedSource>>>>,
     file_states: Arc<RwLock<HashMap<FileStateCacheKey, Arc<FileState>>>>,
     prepared_syntax: Arc<RwLock<PreparedSyntaxRequestCache>>,
@@ -1195,6 +1196,7 @@ impl QueryReadCache {
     fn reset_request_caches(&mut self) {
         self.analyzed_live_files = Arc::new(RwLock::new(None));
         self.live_sources = Arc::new(RwLock::new(HashMap::default()));
+        self.current_sources = Arc::new(RwLock::new(HashMap::default()));
         self.prepared_sources = Arc::new(RwLock::new(HashMap::default()));
         self.file_states = Arc::new(RwLock::new(HashMap::default()));
         self.prepared_syntax = Arc::new(RwLock::new(HashMap::default()));
@@ -3378,9 +3380,7 @@ where
     /// The retained source text of an analyzed file. Structural search
     /// re-parses from this instead of touching disk.
     pub(crate) fn file_source(&self, file: &ProjectFile) -> Option<String> {
-        self.fetch_file_state_from_current_source(file)
-            .or_else(|| self.source_snapshot_file_state(file))
-            .or_else(|| self.fetch_file_state(file))
+        self.structural_file_state(file)
             .map(|state| state.source.clone())
             .or_else(|| self.project.read_source(file).ok())
     }
@@ -3716,11 +3716,55 @@ where
         self.fetch_file_state_for_key(file, &key)
     }
 
-    fn fetch_file_state_from_current_source(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
-        let source = self.project.read_source(file).ok()?;
+    fn current_source(&self, file: &ProjectFile) -> Option<String> {
+        let sources = self.active_query_cache_handle(|cache| &cache.current_sources);
+        if let Some(sources) = sources.as_ref()
+            && let Some(source) = sources
+                .read()
+                .expect("query current-source cache read lock poisoned")
+                .get(file)
+                .cloned()
+        {
+            return source;
+        }
+        let source = self.project.read_source(file).ok();
+        if let Some(sources) = sources {
+            sources
+                .write()
+                .expect("query current-source cache write lock poisoned")
+                .insert(file.clone(), source.clone());
+        }
+        source
+    }
+
+    fn structural_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
+        let indexed = self
+            .source_snapshot_file_state(file)
+            .or_else(|| self.fetch_file_state(file));
+        let Some(source) = self.current_source(file) else {
+            return indexed;
+        };
+        if indexed
+            .as_ref()
+            .is_some_and(|state| !Self::same_source_ignoring_crlf(&state.source, &source))
+        {
+            return indexed;
+        }
+        self.fetch_file_state_from_source(file, source).or(indexed)
+    }
+
+    fn fetch_file_state_from_source(
+        &self,
+        file: &ProjectFile,
+        source: String,
+    ) -> Option<Arc<FileState>> {
         let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()?;
         let key = Self::transient_cache_key(oid, file);
         self.fetch_file_state_for_key_with_source(file, &key, Some(&source))
+    }
+
+    fn same_source_ignoring_crlf(left: &str, right: &str) -> bool {
+        left.replace("\r\n", "\n") == right.replace("\r\n", "\n")
     }
 
     /// The declaration-materialization provenance recorded for `file` by its
@@ -8004,8 +8048,7 @@ where
     }
 
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.fetch_file_state_from_current_source(file)
-            .or_else(|| self.fetch_file_state(file))
+        self.structural_file_state(file)
             .map(|state| {
                 state
                     .declarations
@@ -8215,9 +8258,7 @@ where
     }
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
-        self.fetch_file_state_from_current_source(code_unit.source())
-            .or_else(|| self.source_snapshot_file_state(code_unit.source()))
-            .or_else(|| self.fetch_file_state(code_unit.source()))
+        self.structural_file_state(code_unit.source())
             .and_then(|state| state.ranges.get(code_unit).cloned())
             .unwrap_or_default()
     }
