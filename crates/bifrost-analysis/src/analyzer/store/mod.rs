@@ -9649,7 +9649,7 @@ mod tests {
     }
 
     #[test]
-    fn cpp_fragmented_export_constructor_initializer_epoch_invalidates_prior_parsed_blobs() {
+    fn cpp_fragmented_export_sibling_class_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
             temp.path(),
@@ -9671,8 +9671,7 @@ mod tests {
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
         let store = AnalyzerStore::open_in_memory().unwrap();
-        let prior_epoch =
-            epoch::cpp_epoch_before_fragmented_export_constructor_structured_sibling_boundary();
+        let prior_epoch = epoch::cpp_epoch_before_fragmented_export_sibling_class_parent_scope();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
             .unwrap();
