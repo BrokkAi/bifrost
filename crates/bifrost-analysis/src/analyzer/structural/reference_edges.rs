@@ -22,8 +22,9 @@
 //! from two different snapshots.
 
 use super::edges::{EdgeAxis, EdgeProvenance, OwnerRelation, SiteClass};
+use super::kinds::NormalizedKind;
 use super::occurrence_rows::{
-    OccurrenceCompleteness, OccurrenceTarget, OccurrencesCancelled, occurrences_for_file,
+    OccurrenceCompleteness, OccurrenceTarget, OccurrencesCancelled, ast_id, occurrences_for_file,
 };
 use super::search::expansions::{classify_reference_kind, reference_hits_for_target};
 use crate::analyzer::usages::{
@@ -32,6 +33,7 @@ use crate::analyzer::usages::{
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
+use crate::hash::HashMap;
 
 /// Bounds for one inverse derivation. The file bound matches the reference
 /// traversal's scan bound; the hit bound is per seed declaration.
@@ -64,8 +66,9 @@ pub struct ReferenceEdgeRow {
     pub proof: UsageProof,
     pub usage_kind: UsageHitKind,
     pub site_class: SiteClass,
-    /// `Unknown` until the shared owner classifier (Milestone 3) attributes
-    /// the relation; never silently `External`.
+    /// How the site's enclosing declaration relates to the target, computed
+    /// once by [`classify_owner_relation`] for both producers. `Unknown` when
+    /// the classifier cannot relate the owners; never silently `External`.
     pub owner_relation: OwnerRelation,
     pub provenance: EdgeProvenance,
     /// The workspace generation both endpoints were read from. A comparison
@@ -102,14 +105,13 @@ pub enum EdgeIncompleteReason {
     OccurrenceRowsIncomplete,
 }
 
-/// Which axes this derivation layer answers today. `OwnerClassification` is
-/// deliberately absent until the shared owner classifier exists: a complete
-/// result must not claim an axis whose value on every row is `Unknown`.
+/// Which axes this derivation layer answers.
 pub const EDGE_PRODUCER_AXES: &[EdgeAxis] = &[
     EdgeAxis::ForwardProjection,
     EdgeAxis::InverseProjection,
     EdgeAxis::KindClassification,
     EdgeAxis::ProofAttribution,
+    EdgeAxis::OwnerClassification,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,15 +202,107 @@ fn supports_edge_axis(
         .map(|provider| provider.structural_supports_edge_axis(axis))
 }
 
+/// How the declaration enclosing a use site relates to the edge's target.
+/// One computation for both producers, so the classification can never drift
+/// between the forward and inverse surfaces.
+///
+/// The owner of a unit is the unit itself when it is class-like, else its
+/// parent declaration. `Unknown` is the honest answer whenever an owner is
+/// missing, or the owners are distinct classes and no type-hierarchy provider
+/// can rule inheritance in or out; it is never collapsed into `External`.
+pub fn classify_owner_relation(
+    analyzer: &dyn IAnalyzer,
+    site_enclosing: Option<&CodeUnit>,
+    target: &CodeUnit,
+) -> OwnerRelation {
+    let Some(enclosing) = site_enclosing else {
+        return OwnerRelation::Unknown;
+    };
+    if enclosing == target {
+        return OwnerRelation::SelfReference;
+    }
+    let owner_of = |unit: &CodeUnit| {
+        if unit.is_class() {
+            Some(unit.clone())
+        } else {
+            analyzer.parent_of(unit)
+        }
+    };
+    let (Some(site_owner), Some(target_owner)) = (owner_of(enclosing), owner_of(target)) else {
+        return OwnerRelation::Unknown;
+    };
+    if site_owner == target_owner {
+        return OwnerRelation::SameOwner;
+    }
+    if !target_owner.is_class() {
+        return OwnerRelation::External;
+    }
+    if !site_owner.is_class() {
+        return OwnerRelation::External;
+    }
+    match analyzer.type_hierarchy_provider() {
+        Some(hierarchy) => {
+            if hierarchy.get_ancestors(&site_owner).contains(&target_owner) {
+                OwnerRelation::InheritedOwner
+            } else {
+                OwnerRelation::External
+            }
+        }
+        None => OwnerRelation::Unknown,
+    }
+}
+
+/// Per-file map from an identifier token's exact byte range to its
+/// facts-arena AST identity, built once per file so a batch of inverse hits
+/// pays one arena pass instead of one per hit.
+///
+/// The lookup is exact, not heuristic: the facts snapshot and the usage hit
+/// address the same analyzed content, so range equality over it is the same
+/// join the forward producer states through `OccurrenceRow::ast_id`.
+struct SiteIdentityIndex {
+    by_range: HashMap<(usize, usize), String>,
+}
+
+impl SiteIdentityIndex {
+    fn build(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Self {
+        let language = crate::analyzer::common::language_for_file(file);
+        let facts = analyzer
+            .structural_search_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == language)
+            .and_then(|provider| provider.structural_facts(file));
+        let mut by_range = HashMap::default();
+        if let Some(facts) = facts {
+            let identity = facts.source_identity();
+            for (node, fact) in facts.nodes().iter().enumerate() {
+                if fact.kind == NormalizedKind::Identifier {
+                    by_range
+                        .entry((fact.range.start_byte, fact.range.end_byte))
+                        .or_insert_with(|| ast_id(identity, node as u32));
+                }
+            }
+        }
+        Self { by_range }
+    }
+
+    fn ast_id(&self, range: &Range) -> Option<String> {
+        self.by_range
+            .get(&(range.start_byte, range.end_byte))
+            .cloned()
+    }
+}
+
 /// Project one usage hit into the canonical row shape.
 ///
 /// A `Vec` and not a set on purpose: two hits that disagree only on proof or
 /// kind are two rows here, where the usage-hit identity would collapse them.
 /// The disagreement is the data.
 fn edge_rows_from_reference_hits(
+    analyzer: &dyn IAnalyzer,
     hits: impl IntoIterator<Item = ReferenceHit>,
     generation: u64,
 ) -> Vec<ReferenceEdgeRow> {
+    let mut site_identities: HashMap<ProjectFile, SiteIdentityIndex> = HashMap::default();
     hits.into_iter()
         .map(|hit| {
             let site_class = match hit.usage_kind {
@@ -220,11 +314,17 @@ fn edge_rows_from_reference_hits(
                 | UsageHitKind::Reexport
                 | UsageHitKind::SelfReceiver => SiteClass::UseSite,
             };
+            let owner_relation =
+                classify_owner_relation(analyzer, Some(&hit.enclosing_unit), &hit.resolved);
+            let ast_id = site_identities
+                .entry(hit.file.clone())
+                .or_insert_with(|| SiteIdentityIndex::build(analyzer, &hit.file))
+                .ast_id(&hit.range);
             ReferenceEdgeRow {
                 site: EdgeSite {
                     file: hit.file,
                     range: hit.range,
-                    ast_id: None,
+                    ast_id,
                     enclosing: Some(hit.enclosing_unit),
                 },
                 target: hit.resolved,
@@ -232,7 +332,7 @@ fn edge_rows_from_reference_hits(
                 proof: hit.proof,
                 usage_kind: hit.usage_kind,
                 site_class,
-                owner_relation: OwnerRelation::Unknown,
+                owner_relation,
                 provenance: EdgeProvenance::Inverse,
                 generation,
             }
@@ -304,9 +404,14 @@ pub fn inverse_edges_for_declaration(
     if truncated {
         reasons.push(EdgeIncompleteReason::UsageListingTruncated);
     }
+    if supports_edge_axis(analyzer, file, EdgeAxis::OwnerClassification) != Some(true) {
+        reasons.push(EdgeIncompleteReason::AxisUnsupported(
+            EdgeAxis::OwnerClassification,
+        ));
+    }
 
     EdgeDerivationResult {
-        edges: edge_rows_from_reference_hits(hits, generation),
+        edges: edge_rows_from_reference_hits(analyzer, hits, generation),
         completeness: if reasons.is_empty() {
             EdgeCompleteness::Complete
         } else {
@@ -384,18 +489,26 @@ pub fn forward_edges_for_file(
                 proof,
                 usage_kind: UsageHitKind::Reference,
                 site_class: SiteClass::UseSite,
-                owner_relation: OwnerRelation::Unknown,
+                owner_relation: classify_owner_relation(analyzer, row.enclosing.as_ref(), unit),
                 provenance: EdgeProvenance::Forward,
                 generation,
             });
         }
     }
 
-    let completeness = match &occurrences.completeness {
-        OccurrenceCompleteness::Complete => EdgeCompleteness::Complete,
-        OccurrenceCompleteness::Incomplete { .. } => EdgeCompleteness::Incomplete {
-            reasons: vec![EdgeIncompleteReason::OccurrenceRowsIncomplete],
-        },
+    let mut reasons = Vec::new();
+    if let OccurrenceCompleteness::Incomplete { .. } = &occurrences.completeness {
+        reasons.push(EdgeIncompleteReason::OccurrenceRowsIncomplete);
+    }
+    if supports_edge_axis(analyzer, file, EdgeAxis::OwnerClassification) != Some(true) {
+        reasons.push(EdgeIncompleteReason::AxisUnsupported(
+            EdgeAxis::OwnerClassification,
+        ));
+    }
+    let completeness = if reasons.is_empty() {
+        EdgeCompleteness::Complete
+    } else {
+        EdgeCompleteness::Incomplete { reasons }
     };
     Ok(EdgeDerivationResult {
         edges,
@@ -516,6 +629,48 @@ mod tests {
         assert_eq!(forward_call.provenance, EdgeProvenance::Forward);
         assert_eq!(inverse_call.provenance, EdgeProvenance::Inverse);
         assert!(forward_call.site.ast_id.is_some());
+        assert_eq!(forward_call.site.ast_id, inverse_call.site.ast_id);
+        assert_eq!(forward_call.owner_relation, inverse_call.owner_relation);
+        assert_ne!(forward_call.owner_relation, OwnerRelation::Unknown);
+    }
+
+    const JAVA_BASE: &str =
+        "package fixture;\n\npublic class Base {\n    public void ping() {\n    }\n}\n";
+    const JAVA_DERIVED: &str = "package fixture;\n\npublic class Derived extends Base {\n    void run() {\n        helper();\n        run();\n    }\n\n    void helper() {\n    }\n}\n";
+
+    /// The one shared classifier answers every relation the issue names, from
+    /// the units alone, so both producers inherit identical classifications by
+    /// construction.
+    #[test]
+    fn the_owner_classifier_states_each_relation() {
+        let fixture = Fixture::new(
+            Language::Java,
+            &[
+                ("src/Base.java", JAVA_BASE),
+                ("src/Derived.java", JAVA_DERIVED),
+            ],
+        );
+        let analyzer = fixture.analyzer();
+        let base_ping = fixture.declaration("Base.ping");
+        let derived_run = fixture.declaration("Derived.run");
+        let derived_helper = fixture.declaration("Derived.helper");
+
+        assert_eq!(
+            classify_owner_relation(analyzer, Some(&derived_run), &derived_helper),
+            OwnerRelation::SameOwner
+        );
+        assert_eq!(
+            classify_owner_relation(analyzer, Some(&derived_run), &derived_run),
+            OwnerRelation::SelfReference
+        );
+        assert_eq!(
+            classify_owner_relation(analyzer, Some(&derived_run), &base_ping),
+            OwnerRelation::InheritedOwner
+        );
+        assert_eq!(
+            classify_owner_relation(analyzer, None, &base_ping),
+            OwnerRelation::Unknown
+        );
     }
 
     /// An adapter without a forward surface answers with a typed abstention,
@@ -578,8 +733,11 @@ mod tests {
             usage_kind: UsageHitKind::Reference,
             proof,
         };
-        let rows =
-            edge_rows_from_reference_hits([hit(UsageProof::Proven), hit(UsageProof::Unproven)], 7);
+        let rows = edge_rows_from_reference_hits(
+            fixture.analyzer(),
+            [hit(UsageProof::Proven), hit(UsageProof::Unproven)],
+            7,
+        );
         assert_eq!(rows.len(), 2);
         assert_ne!(rows[0], rows[1]);
         assert_eq!(rows[0].proof, UsageProof::Proven);
@@ -594,7 +752,6 @@ mod tests {
         for &axis in EDGE_PRODUCER_AXES {
             assert!(complete.covers(axis));
         }
-        assert!(!complete.covers(EdgeAxis::OwnerClassification));
 
         let truncated = EdgeCompleteness::Incomplete {
             reasons: vec![EdgeIncompleteReason::UsageListingTruncated],
