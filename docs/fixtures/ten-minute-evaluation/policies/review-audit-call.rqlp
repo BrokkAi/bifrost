@@ -9,5 +9,5 @@
       :type match
       :selector
         (rql-file
-          :schema-version 2
+          :schema-version 1
           :path "queries/find-audit.rql")))

@@ -3,7 +3,7 @@ title: Python
 description: Query Python calls, decorators, assignments, keyword arguments, and callable containment with query_code.
 ---
 
-> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-14 (`query_code` schema version 1).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
 

@@ -3,7 +3,7 @@ title: Import Traversal
 description: Find declaring files and direct importers across query_code language adapters.
 ---
 
-> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-14 (`query_code` schema version 1).
 
 Import traversal starts with an indexed project declaration, not an import spelling. Convert that declaration to its file with `file-of`, then follow either a forward (`imports-of`) or reverse (`importers-of`) direct project-local edge. This keeps the result honest: Bifrost reports the files connected by a resolved import, not a guess that every importer calls a particular member.
 

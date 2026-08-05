@@ -356,7 +356,7 @@ fn omitted_versions_select_latest_compatible_but_explicit_versions_are_exact() {
         error
             .diagnostic
             .message
-            .contains("supported exact versions: 2, 3, 4, 5")
+            .contains("supported exact versions: 1")
     );
 }
 
@@ -413,7 +413,7 @@ fn file_selector_remains_typed_and_unresolved_until_workspace_loading() {
     assert_eq!(parsed.unresolved_file_selectors().len(), 1);
     let unresolved = &parsed.unresolved_file_selectors()[0];
     assert_eq!(unresolved.path, "/analysis/selector");
-    assert_eq!(unresolved.authored_schema_version, Some(2));
+    assert_eq!(unresolved.authored_schema_version, Some(1));
     assert_eq!(unresolved.workspace_path.as_str(), "queries/eval.rql");
     assert_eq!(
         &source[unresolved.range.clone()],
@@ -426,7 +426,7 @@ fn file_selector_remains_typed_and_unresolved_until_workspace_loading() {
             .pointer("/analysis/selector"),
         Some(&serde_json::json!({
             "type": "file",
-            "authored_schema_version": 2,
+            "authored_schema_version": 1,
             "path": "queries/eval.rql",
         }))
     );

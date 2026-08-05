@@ -682,8 +682,8 @@ fn referenced_rql_retains_both_pin_provenance_and_effective_origin() {
     else {
         panic!("expected referenced selector provenance")
     };
-    assert_eq!(*wrapper_authored_schema_version, Some(2));
-    assert_eq!(*document_authored_schema_version, Some(2));
+    assert_eq!(*wrapper_authored_schema_version, Some(1));
+    assert_eq!(*document_authored_schema_version, Some(1));
 }
 
 #[test]
