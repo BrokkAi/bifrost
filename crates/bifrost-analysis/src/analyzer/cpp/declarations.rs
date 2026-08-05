@@ -2293,22 +2293,22 @@ impl<'a> CppVisitor<'a> {
                         }
                         sibling = candidate.next_named_sibling();
                     }
-                    if let Some(range) = recovered_constructor {
-                        if let (Some(prefix_tree), Some(body)) = (recovered_prefix_tree, body) {
-                            self.visit_recovered_fragment_prefix_members(
-                                prefix_tree.root_node(),
-                                range.start,
-                                &class_unit,
-                                scope,
-                            );
-                            self.visit_recovered_fragment_constructor(
-                                range,
-                                body,
-                                class_node,
-                                &class_unit,
-                                scope,
-                            );
-                        }
+                    if let Some(range) = recovered_constructor
+                        && let (Some(prefix_tree), Some(body)) = (recovered_prefix_tree, body)
+                    {
+                        self.visit_recovered_fragment_prefix_members(
+                            prefix_tree.root_node(),
+                            range.start,
+                            &class_unit,
+                            scope,
+                        );
+                        self.visit_recovered_fragment_constructor(
+                            range,
+                            body,
+                            class_node,
+                            &class_unit,
+                            scope,
+                        );
                     }
                 }
                 stack.extend(class_stack);
@@ -8477,9 +8477,7 @@ fn cpp_reparsed_synthetic_initializer_constructor(
         .named_children(&mut cursor)
         .filter(|child| child.kind() != "comment")
         .collect::<Vec<_>>();
-    let Some(label) = named.first() else {
-        return None;
-    };
+    let label = named.first()?;
     if label.kind() != "statement_identifier"
         || !matches!(
             node_text(*label, source).trim(),
