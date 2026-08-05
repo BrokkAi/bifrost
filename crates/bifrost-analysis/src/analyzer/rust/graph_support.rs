@@ -154,15 +154,11 @@ impl RustPackageFileIndex {
                 .or_default()
                 .push(u32::try_from(index).unwrap_or(u32::MAX));
             if let Some(crate_name) = manifest_crate_name(file) {
-                crate_packages_by_name
-                    .entry(crate_name)
-                    .or_default()
-                    .push(package);
+                let packages = crate_packages_by_name.entry(crate_name).or_default();
+                if !packages.contains(&package) {
+                    packages.push(package);
+                }
             }
-        }
-        for packages in crate_packages_by_name.values_mut() {
-            packages.sort();
-            packages.dedup();
         }
         Self {
             files,
@@ -1158,9 +1154,10 @@ impl RustAnalyzer {
 
     /// Resolve the nearest project module named by one structured import path.
     ///
-    /// This coarse resolver uses Cargo routes and the path-derived package
-    /// index. It does not query declarations or the file system. Start with the
-    /// full path and remove trailing item segments until a module file is found.
+    /// This coarse resolver uses manifest crate names and the path-derived
+    /// package index. It does not query declarations or construct Cargo routes.
+    /// Start with the full path and remove trailing item segments until a module
+    /// file is found.
     pub(super) fn resolve_direct_import_files(
         &self,
         importing_file: &ProjectFile,
@@ -1198,7 +1195,7 @@ impl RustAnalyzer {
                     .into_iter()
                     .collect()
             };
-            let mut files = resolved_modules
+            let files = resolved_modules
                 .into_iter()
                 .flat_map(|module| {
                     analyzed_files
@@ -1207,8 +1204,6 @@ impl RustAnalyzer {
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>();
-            files.sort();
-            files.dedup();
             if !files.is_empty() {
                 return files;
             }

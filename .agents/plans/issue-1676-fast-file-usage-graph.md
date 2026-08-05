@@ -17,7 +17,7 @@ The result is observable with the `most_relevant_files` MCP tool and the `most_r
 - [x] (2026-08-05T20:45:00Z) Added the coarse file graph, dense ranking representation, graph-kind cache identity, and focused Java and Rust tests.
 - [x] (2026-08-05T20:45:00Z) Routed `usage_graph` to the coarse graph and retained the old path as `usage_graph_exact` across Rust, MCP, CLI, and Python surfaces.
 - [x] (2026-08-05T20:45:00Z) Measured and optimized the Bifrost request. The real MCP replay took 406 ms cold and 25 ms warm.
-- [ ] Run focused tests, formatting, Clippy, policy checks, and the applicable featureless test suites.
+- [x] (2026-08-05T21:11:57Z) Ran formatting, focused Rust and Python tests, workspace Clippy, the repository policy pack, and the featureless workspace test gate. Two unrelated tutorial gold tests remain broken on the branch.
 
 ## Surprises & Discoveries
 
@@ -45,6 +45,12 @@ The result is observable with the `most_relevant_files` MCP tool and the `most_r
 - Observation: a manifest-name index gives the cross-crate identity needed by the coarse graph without Cargo route or declaration construction.
   Evidence: the Bifrost graph phase fell to 278 ms. The full MCP request took 406 ms cold and 25 ms warm.
 
+- Observation: the installed Homebrew Clippy driver is not compatible with the active Rustup compiler, even though both report Rust 1.96.0.
+  Evidence: the default command failed with E0514. Putting the Rustup toolchain first in `PATH` made workspace Clippy pass.
+
+- Observation: the full featureless gate has two pre-existing tutorial gold failures on this branch.
+  Evidence: `code_query_tutorials::java_tutorial` and `code_query_tutorials::receiver_traversal_tutorial` expect output without current receiver site identities. This change does not modify tutorial, receiver-query, or documentation files. The other 396 cross-language tests passed.
+
 ## Decision Log
 
 - Decision: keep `usage_graph` as the fast user-facing value and add `usage_graph_exact` for the old behavior.
@@ -69,7 +75,11 @@ The result is observable with the `most_relevant_files` MCP tool and the `most_r
 
 ## Outcomes & Retrospective
 
-The implementation is complete and final validation remains. The real issue #1504 MCP replay now completes in 406 ms on the first graph build and 25 ms on a cache hit. The measured cold graph work is 278 ms, PageRank is 3 ms, and file aggregation is 3 ms. The exact ranking remains available as `usage_graph_exact`, and the public `usage_graph` tool remains unchanged.
+The implementation and validation are complete. The real issue #1504 MCP replay now completes in 406 ms on the first graph build and 25 ms on a cache hit. The measured cold graph work is 278 ms, PageRank is 3 ms, and file aggregation is 3 ms. The exact ranking remains available as `usage_graph_exact`, and the public `usage_graph` tool remains unchanged.
+
+Formatting, focused Rust tests, the Python client test, and workspace Clippy pass. The combined `bifrost.code-smells` policy run completed all 12 policies without an unreliable result. It reports 282 existing repository findings and no findings in the new fast graph code. The policy scan found two unnecessary sorts in the new Rust import resolver. Their removal preserved deterministic order and passed the focused tests and Clippy.
+
+The full featureless workspace test progressed through all changed components. It stopped in the unrelated tutorial gold suite with two failures and 396 passes. A temporary-storage suite first failed because the validation `PATH` omitted `/usr/sbin/lsof`; all 304 active tests passed after the path correction.
 
 ## Context and Orientation
 
@@ -171,3 +181,5 @@ Add an internal file graph under `crates/bifrost-analysis/src/analyzer/usages/fi
 Revision note 2026-08-05T19:53:45Z: Created the implementation plan after issue #1676 approval, code navigation, upstream overlap review, and selection of the existing batched import-analysis seam.
 
 Revision note 2026-08-05T20:45:00Z: Recorded implementation, the persisted-analyzer Rust bottleneck, the manifest-name index decision, and cold and warm MCP evidence.
+
+Revision note 2026-08-05T21:11:57Z: Recorded focused validation, policy cleanup, workspace Clippy, the corrected temporary-storage run, and the unrelated tutorial gold failures.
