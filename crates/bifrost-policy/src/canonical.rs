@@ -153,6 +153,10 @@ fn ensure_inline_local_policy(
             ensure_inline_local_typestate(spec, &local_endpoint_ids)?;
             local_endpoint_ids
         }
+        PolicyAnalysis::Assertion { spec } => {
+            ensure_inline_selector(&spec.subject)?;
+            HashSet::new()
+        }
     };
 
     if let Some(classification) = &definition.classification
@@ -218,6 +222,9 @@ fn policy_selector_paths(definition: &PolicyDefinition) -> HashSet<String> {
                         )
                     }),
             );
+        }
+        PolicyAnalysis::Assertion { .. } => {
+            paths.insert(ASSERTION_SUBJECT_SELECTOR_PATH.to_string());
         }
     }
     paths
@@ -582,6 +589,13 @@ fn endpoint_definition_to_json(definition: &MatchEndpointDefinition) -> Value {
     Value::Object(object)
 }
 
+/// The authored canonical projection of one analysis record, exposed so the
+/// loaded-model projection can overlay resolved selectors on top of it rather
+/// than restating the assertion shape.
+pub(crate) fn policy_analysis_authored_json(analysis: &PolicyAnalysis) -> Value {
+    policy_analysis_to_json(analysis)
+}
+
 fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
     match analysis {
         PolicyAnalysis::Match { spec } => {
@@ -678,7 +692,50 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
             );
             Value::Object(object)
         }
+        PolicyAnalysis::Assertion { spec } => {
+            let mut object = tagged("assertion");
+            insert(&mut object, "subject", selector_to_json(&spec.subject));
+            insert(
+                &mut object,
+                "asserts",
+                // Assert order is authored order, not a set: reordering the
+                // list is a different document even though the invariants are
+                // independent, and the semantic hash must say so.
+                Value::Array(spec.asserts.iter().map(occurrence_assert_to_json).collect()),
+            );
+            Value::Object(object)
+        }
     }
+}
+
+fn occurrence_assert_to_json(assertion: &OccurrenceAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(&mut object, "role", json!(assertion.role.label()));
+    insert(&mut object, "expect", json!(assertion.expect.label()));
+    insert(
+        &mut object,
+        "cardinality",
+        json!({
+            "bound": assertion.cardinality.label(),
+            "count": assertion.cardinality.count(),
+        }),
+    );
+    insert(
+        &mut object,
+        "namespace",
+        match assertion.namespace {
+            Some(namespace) => json!(namespace.label()),
+            None => Value::Null,
+        },
+    );
+    insert(
+        &mut object,
+        "require_target",
+        json!(assertion.require_target),
+    );
+    Value::Object(object)
 }
 
 fn policy_message_to_json(message: &PolicyMessageSpec) -> Value {
@@ -1708,6 +1765,7 @@ const fn policy_analysis_type_label(value: PolicyAnalysisType) -> &'static str {
         PolicyAnalysisType::Match => "match",
         PolicyAnalysisType::Taint => "taint",
         PolicyAnalysisType::Typestate => "typestate",
+        PolicyAnalysisType::Assertion => "assertion",
     }
 }
 

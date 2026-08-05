@@ -685,6 +685,46 @@
           "properties": {
             "kind": {
               "type": "string",
+              "const": "owning_type"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "Direct authored fields that supply generated members. A field-level\nannotation produces that field; a type-level annotation produces its\ndirect fields.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "owned_fields"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "owned_mutable_fields"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
               "const": "resolved_owner"
             }
           },
@@ -885,7 +925,14 @@
               "$ref": "#/$defs/MemberKind"
             },
             "owner": {
-              "$ref": "#/$defs/TemplateExpression"
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TemplateExpression"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "signature": {
               "anyOf": [
@@ -904,7 +951,6 @@
           "additionalProperties": false,
           "required": [
             "kind",
-            "owner",
             "member_kind",
             "visibility"
           ]
@@ -1249,6 +1295,17 @@
         {
           "type": "object",
           "properties": {
+            "anchor": {
+              "description": "A capture-backed authored location for the emitted declaration.\nThe runtime uses a stable model URI when this expression has no\nexact authored anchor.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TemplateExpression"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "declaration": {
               "$ref": "#/$defs/EmittedDeclaration"
             },
@@ -1361,6 +1418,42 @@
           "required": [
             "kind",
             "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "annotation": {
+              "type": "string"
+            },
+            "excluded_annotations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "annotated_field"
+            },
+            "owner_annotation_path": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "value": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "annotation",
+            "owner_annotation_path"
           ]
         },
         {
@@ -1500,6 +1593,52 @@
         "display"
       ]
     },
+    "TemplateCondition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "left": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "op": {
+              "type": "string",
+              "const": "equals"
+            },
+            "right": {
+              "$ref": "#/$defs/TemplateExpression"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "left",
+            "right"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "type": "string",
+              "const": "starts_with"
+            },
+            "prefix": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "value": {
+              "$ref": "#/$defs/TemplateExpression"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "value",
+            "prefix"
+          ]
+        }
+      ]
+    },
     "TemplateExpression": {
       "oneOf": [
         {
@@ -1575,6 +1714,31 @@
             "op",
             "transform",
             "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "condition": {
+              "$ref": "#/$defs/TemplateCondition"
+            },
+            "else": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "op": {
+              "type": "string",
+              "const": "conditional"
+            },
+            "then": {
+              "$ref": "#/$defs/TemplateExpression"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "condition",
+            "then",
+            "else"
           ]
         }
       ]
@@ -1705,6 +1869,23 @@
             "kind": {
               "type": "string",
               "const": "array"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "element"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "element": {
+              "$ref": "#/$defs/TemplateTypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "by_ref"
             }
           },
           "additionalProperties": false,

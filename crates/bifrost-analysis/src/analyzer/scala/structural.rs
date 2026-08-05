@@ -5,6 +5,7 @@ use crate::analyzer::structural::adapter_helpers::{
     attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
     first_named_child,
 };
+use crate::analyzer::structural::{NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport};
 use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, Span, StructuralSpec};
 use tree_sitter::Node;
 
@@ -49,9 +50,9 @@ const SCALA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("throw_expression", NormalizedKind::Throw),
     ("catch_clause", NormalizedKind::Catch),
     ("if_expression", NormalizedKind::If),
-    ("for_expression", NormalizedKind::Loop),
-    ("while_expression", NormalizedKind::Loop),
-    ("do_while_expression", NormalizedKind::Loop),
+    ("for_expression", NormalizedKind::ForLoop),
+    ("while_expression", NormalizedKind::WhileLoop),
+    ("do_while_expression", NormalizedKind::WhileLoop),
 ];
 
 fn last_named_child<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
@@ -219,6 +220,30 @@ fn attach_decorators(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
     }
 }
 
+fn is_case_class(node: Node<'_>) -> bool {
+    node.kind() == "class_definition"
+        && (0..node.child_count())
+            .filter_map(|index| node.child(index))
+            .any(|child| !child.is_named() && child.kind() == "case")
+}
+
+fn attach_class_parameters(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
+    let mut cursor = declaration.walk();
+    for parameters in declaration.children_by_field_name("class_parameters", &mut cursor) {
+        for index in 0..parameters.named_child_count() {
+            let Some(parameter) = parameters.named_child(index) else {
+                continue;
+            };
+            if parameter.kind() != "class_parameter" {
+                continue;
+            }
+            if let Some(name) = parameter.child_by_field_name("name") {
+                sink.role_named(Role::Arg, parameter, name);
+            }
+        }
+    }
+}
+
 fn annotation_name(node: Node<'_>) -> Option<Node<'_>> {
     for index in 0..node.named_child_count() {
         let child = node.named_child(index)?;
@@ -309,6 +334,10 @@ impl StructuralSpec for ScalaStructuralSpec {
         SCALA_KIND_TABLE
     }
 
+    fn generator_construct(&self, node: Node<'_>, _kind: NormalizedKind) -> Option<&'static str> {
+        is_case_class(node).then_some("scala_case_class")
+    }
+
     fn refine_kind(
         &self,
         _node: Node<'_>,
@@ -342,6 +371,13 @@ impl StructuralSpec for ScalaStructuralSpec {
                 .kind_table()
                 .iter()
                 .any(|(_, fact_kind)| fact_kind.satisfies(kind))
+    }
+
+    /// Scala has not learned occurrence-role classification yet (#1473).
+    /// The empty table is the honest answer: queries and assertions that ask
+    /// for an occurrence role here report incomplete rather than clean-empty.
+    fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
+        &NO_OCCURRENCE_ROLE_SUPPORT
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
@@ -408,6 +444,9 @@ impl StructuralSpec for ScalaStructuralSpec {
                     sink.set_name(name);
                 }
                 attach_decorators(sink, node);
+                if is_case_class(node) {
+                    attach_class_parameters(sink, node);
+                }
             }
             NormalizedKind::Assignment => match node.kind() {
                 "val_definition" | "var_definition" => {

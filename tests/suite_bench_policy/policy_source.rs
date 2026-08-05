@@ -15,6 +15,7 @@ const POLICY_FIXTURES: &[&str] = &[
     "attacker-controlled-to-sensitive-sinks.rqlp",
     "resource-lifecycle.rqlp",
     "classification-cvss.rqlp",
+    "role-fidelity.rqlp",
 ];
 
 const ENDPOINT_FIXTURES: &[&str] = &[
@@ -121,6 +122,16 @@ fn shipped_examples_cover_every_document_and_analysis_variant() {
         spec.finding_combinations[0].message,
         "User-controlled I/O can reach sensitive user PII"
     );
+
+    let RqlpDocument::Policy { definition } = parse_fixture("role-fidelity.rqlp").into_document()
+    else {
+        panic!("role-fidelity should be a policy")
+    };
+    let PolicyAnalysis::Assertion { spec } = definition.analysis else {
+        panic!("expected assertion analysis")
+    };
+    assert_eq!(spec.asserts.len(), 1);
+    assert_eq!(spec.asserts[0].at, "token");
 
     let RqlpDocument::Policy { definition } =
         parse_fixture("resource-lifecycle.rqlp").into_document()

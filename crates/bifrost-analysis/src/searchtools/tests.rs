@@ -1146,7 +1146,7 @@ pub fn helper() {}
             "same-file call",
             query_at(main, "src/main.rs", "same_file();", "same_file"),
             "resolved",
-            None,
+            None::<&str>,
         ),
         (
             "aliased import",
@@ -1212,11 +1212,14 @@ pub fn helper() {}
             "resolved",
             None,
         ),
+        // A shadowed read resolves lexically to the `let` binder (#1569), so
+        // it reports a resolved local-variable candidate rather than a
+        // `local_binding` diagnostic.
         (
             "local binding",
             query_at(main, "src/main.rs", "let _ = shadowed;", "shadowed"),
-            "no_definition",
-            Some("local_binding"),
+            "resolved",
+            None,
         ),
         (
             "associated type",

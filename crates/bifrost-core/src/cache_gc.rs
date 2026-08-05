@@ -1,6 +1,7 @@
 //! Shared opportunistic GC driver for the unified bifrost cache DB.
 
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -14,6 +15,16 @@ use crate::{cache_db, gitblob};
 pub const GC_AUTO_BLOB_THRESHOLD: i64 = 5000;
 /// Time-based fallback sweep interval, used only when the registry has grown.
 pub const GC_MIN_INTERVAL_SECS: i64 = 6 * 3600;
+/// How long a store from another schema version must go untouched before
+/// collection removes it.
+///
+/// Disuse is the only criterion. A store file is named for the schema version
+/// that wrote it, so a newer file existing says nothing about whether some
+/// other checkout still opens the older one (issue #1589); only time without
+/// use distinguishes an abandoned version from a live one. Two weeks covers a
+/// branch left alone over a holiday while keeping superseded copies from
+/// accumulating indefinitely.
+pub const VERSION_STORE_GRACE_SECS: i64 = 14 * 24 * 3600;
 
 const GC_CLAIM_TTL_SECS: i64 = 3600;
 
@@ -26,6 +37,7 @@ pub struct GcOutcome {
     pub semantic_dropped: usize,
     pub analyzer_dropped: usize,
     pub total_blobs_after: i64,
+    pub version_stores_removed: usize,
 }
 
 impl GcOutcome {
@@ -35,6 +47,7 @@ impl GcOutcome {
             semantic_dropped: 0,
             analyzer_dropped: 0,
             total_blobs_after,
+            version_stores_removed: 0,
         }
     }
 }
@@ -49,6 +62,13 @@ struct GcClaim {
 /// never through the store handle, which is why neither the semantic store nor
 /// the analyzer store has to be visible from this crate.
 pub fn maybe_gc(db_path: &Path, repo: &Repository) -> Result<GcOutcome, String> {
+    // A deliberately cross-repository cache cannot be collected from the
+    // reachability graph of whichever repository happens to open it first.
+    // Evaluation and fleet operators that provide such a cache can disable
+    // opportunistic collection while retaining the explicit force-GC API.
+    if !automatic_gc_enabled(std::env::var_os("BIFROST_CACHE_GC").as_deref()) {
+        return Ok(GcOutcome::skipped(total_blob_count(db_path)?));
+    }
     run_gc(db_path, repo, false)
 }
 
@@ -69,6 +89,13 @@ fn run_gc(db_path: &Path, repo: &Repository, force: bool) -> Result<GcOutcome, S
     }
 }
 
+fn automatic_gc_enabled(value: Option<&OsStr>) -> bool {
+    !matches!(
+        value.and_then(OsStr::to_str),
+        Some("0" | "off" | "disabled")
+    )
+}
+
 fn sweep_with_claim(claim: &GcClaim, repo: &Repository) -> Result<GcOutcome, String> {
     // Snapshot the rows eligible for this collection before walking Git. A
     // workspace build may persist another blob while the reachability walk is
@@ -82,7 +109,7 @@ fn sweep_with_claim(claim: &GcClaim, repo: &Repository) -> Result<GcOutcome, Str
            blob_oid TEXT PRIMARY KEY
          ) WITHOUT ROWID;
          INSERT INTO gc_semantic_candidates(blob_oid)
-           SELECT blob_oid FROM semantic_blobs;
+           SELECT DISTINCT blob_oid FROM semantic_files;
          CREATE TEMP TABLE gc_analyzer_candidates(
            blob_oid TEXT NOT NULL,
            lang TEXT NOT NULL,
@@ -117,7 +144,7 @@ fn sweep_with_claim(claim: &GcClaim, repo: &Repository) -> Result<GcOutcome, Str
     };
     {
         let mut delete = tx
-            .prepare("DELETE FROM semantic_blobs WHERE blob_oid = ?1")
+            .prepare("DELETE FROM semantic_files WHERE blob_oid = ?1")
             .map_err(|err| format!("cache GC SQLite error: {err}"))?;
         for oid in &dead_semantic {
             delete
@@ -127,25 +154,7 @@ fn sweep_with_claim(claim: &GcClaim, repo: &Repository) -> Result<GcOutcome, Str
     }
     tx.execute(
         "DELETE FROM semantic_vectors
-         WHERE composed_hash NOT IN (SELECT composed_hash FROM semantic_blob_chunks)",
-        [],
-    )
-    .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-    tx.execute(
-        "DELETE FROM semantic_blob_summaries
-         WHERE blob_summary_id NOT IN (
-           SELECT parent_summary_id FROM semantic_blob_chunks
-           WHERE parent_summary_id IS NOT NULL
-         )",
-        [],
-    )
-    .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-    tx.execute(
-        "DELETE FROM semantic_component_vectors
-         WHERE hash NOT IN (
-           SELECT hash FROM semantic_blob_chunks
-           UNION SELECT hash FROM semantic_blob_summaries
-         )",
+         WHERE vector_hash NOT IN (SELECT vector_hash FROM semantic_file_chunks)",
         [],
     )
     .map_err(|err| format!("cache GC SQLite error: {err}"))?;
@@ -177,12 +186,94 @@ fn sweep_with_claim(claim: &GcClaim, repo: &Repository) -> Result<GcOutcome, Str
 
     let semantic_dropped = dead_semantic.len();
     let total_blobs_after = finish_gc(&claim.db_path)?;
+    // Row collection and file collection answer the same question about
+    // different granularities, and both belong under the claim: one sweeper at
+    // a time, at the cadence the claim already paces.
+    let cache_dir = claim
+        .db_path
+        .parent()
+        .expect("a cache DB path has a parent directory");
+    let version_stores_removed = sweep_disused_version_stores(cache_dir)?.len();
     Ok(GcOutcome {
         ran: true,
         semantic_dropped,
         analyzer_dropped,
         total_blobs_after,
+        version_stores_removed,
     })
+}
+
+/// Remove the stores of superseded schema versions that nothing has opened for
+/// [`VERSION_STORE_GRACE_SECS`], returning what was removed.
+///
+/// Only files this scheme names (`bifrost_cache.v{version}.db`) are
+/// candidates, and never this build's own. The pre-versioning
+/// `bifrost_cache.db` is left alone entirely: a build older than version-keyed
+/// naming has no other file to fall back to, and nothing here can tell whether
+/// one is still installed. Anything else in the directory -- a hand-made
+/// `bifrost_cache.db.schema14.bak`, another tool's database -- is not ours to
+/// delete.
+///
+/// Recency is the newest mtime across the store and its sidecars: a WAL-mode
+/// database serves reads and writes for days without the main file's mtime
+/// moving, so the main file alone would call a live store abandoned.
+pub fn sweep_disused_version_stores(cache_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let now = cache_db::now_unix_seconds();
+    let mut removed = Vec::new();
+    for entry in std::fs::read_dir(cache_dir).map_err(|err| format!("cache GC I/O error: {err}"))? {
+        let entry = entry.map_err(|err| format!("cache GC I/O error: {err}"))?;
+        let name = entry.file_name();
+        let Some(version) = name.to_str().and_then(cache_db::store_file_version) else {
+            continue;
+        };
+        if version == cache_db::cache_db_schema_version() {
+            continue;
+        }
+        let store = entry.path();
+        if last_use_unix_seconds(&store)? + VERSION_STORE_GRACE_SECS > now {
+            continue;
+        }
+        for suffix in cache_db::STORE_FILE_SUFFIXES {
+            let path = cache_db::store_file_with_suffix(&store, suffix);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(format!(
+                        "cache GC I/O error removing {}: {err}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        removed.push(store);
+    }
+    Ok(removed)
+}
+
+fn last_use_unix_seconds(store: &Path) -> Result<i64, String> {
+    let mut newest = 0;
+    for suffix in cache_db::STORE_FILE_SUFFIXES {
+        let path = cache_db::store_file_with_suffix(store, suffix);
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(format!(
+                    "cache GC I/O error reading {}: {err}",
+                    path.display()
+                ));
+            }
+        };
+        let modified = metadata
+            .modified()
+            .map_err(|err| format!("cache GC I/O error reading {}: {err}", path.display()))?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|delta| delta.as_secs() as i64)
+            .unwrap_or(0);
+        newest = newest.max(modified);
+    }
+    Ok(newest)
 }
 
 fn delete_analyzer_candidates(
@@ -311,7 +402,7 @@ fn total_blob_count(db_path: &Path) -> Result<i64, String> {
 fn total_blob_count_conn(conn: &Connection) -> Result<i64, String> {
     conn.query_row(
         "SELECT
-           (SELECT COUNT(*) FROM semantic_blobs) +
+           (SELECT COUNT(DISTINCT blob_oid) FROM semantic_files) +
            (SELECT COUNT(*) FROM blobs)",
         [],
         |row| row.get(0),
@@ -384,6 +475,15 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
+
+    #[test]
+    fn automatic_gc_can_be_explicitly_disabled() {
+        assert!(automatic_gc_enabled(None));
+        assert!(automatic_gc_enabled(Some(OsStr::new("on"))));
+        assert!(!automatic_gc_enabled(Some(OsStr::new("0"))));
+        assert!(!automatic_gc_enabled(Some(OsStr::new("off"))));
+        assert!(!automatic_gc_enabled(Some(OsStr::new("disabled"))));
+    }
 
     #[test]
     fn analyzer_gc_candidate_cannot_delete_newer_generation_replacement() {

@@ -1,101 +1,69 @@
-//! Chunk extraction for the semantic index.
+//! Function extraction and canonical embedding-document rendering.
 //!
-//! Per file: one chunk per function/method (source text, parent context =
-//! nearest enclosing class summary, else the file's summary-or-symbols text)
-//! plus one file-summary chunk encoding the summary-or-symbols text alone.
-//! This is the prototype's `nearest-class-else-file-v1` parent policy with
-//! the file-level parent selected by token budget: full summary if it fits
-//! `MAX_SEQ_TOKENS`, else the compact symbols outline, truncated as a last
-//! resort.
-
-use std::collections::{HashMap, HashSet};
+//! Each function is embedded once with a SweRank-shaped path header. Methods
+//! include their nearest structurally enclosing class; free functions do not.
+//! The literal `class` marker is part of the measured document contract even
+//! when the source language calls the enclosing type a struct, trait, or enum.
 
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerStreamingFileScope, CodeUnit, IAnalyzer, ProjectFile,
 };
 use brokk_bifrost_analysis::path_utils::rel_path_string;
-use brokk_bifrost_analysis::searchtools::{
-    SummaryBlock, summary_block_for_code_unit, summary_block_for_file,
-};
 
-use super::keys::{Key, component_key};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChunkKind {
-    FileSummary,
-    Function,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionChunk {
+    pub ord: i64,
+    pub symbol: String,
+    pub function_name: String,
+    pub enclosing_class: Option<String>,
+    pub start_line: Option<i64>,
+    pub end_line: Option<i64>,
+    pub source_text: String,
 }
 
-impl ChunkKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ChunkKind::FileSummary => "file_summary",
-            ChunkKind::Function => "function",
-        }
+impl FunctionChunk {
+    /// Build the exact document sent to the passage embedder. This text is
+    /// deliberately ephemeral: callers hash/embed it but never persist it.
+    pub fn embedding_document(&self, file_path: &str) -> String {
+        embedding_document(
+            file_path,
+            &self.function_name,
+            self.enclosing_class.as_deref(),
+            &self.source_text,
+        )
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ChunkText {
-    /// 0 is reserved for the file-summary chunk; functions follow in source order.
-    pub ord: i64,
-    pub kind: ChunkKind,
-    pub symbol: Option<String>,
-    pub start_line: Option<i64>,
-    pub end_line: Option<i64>,
-    pub text: String,
-    /// Context text averaged into the chunk vector; `None` embeds the chunk alone.
-    pub parent_text: Option<String>,
-}
-
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileChunks {
     pub file_path: String,
-    /// The file's summary-or-symbols text: parent fallback, file-summary chunk
-    /// body, and what `semantic_search` renders for a hit on this file.
-    pub summary_text: Option<String>,
-    pub chunks: Vec<ChunkText>,
+    pub chunks: Vec<FunctionChunk>,
 }
 
-/// Extract all chunks for `file`. `count_tokens` must be the embedding
-/// model's tokenizer so budget decisions match what the model will see.
-pub fn extract_file_chunks(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    count_tokens: &dyn Fn(&str) -> usize,
-    max_seq_tokens: usize,
-) -> FileChunks {
+/// Canonical SweRank document representation used by every embedding profile.
+pub fn embedding_document(
+    file_path: &str,
+    function_name: &str,
+    enclosing_class: Option<&str>,
+    source_text: &str,
+) -> String {
+    match enclosing_class {
+        Some(class_name) => {
+            format!("{file_path}/{class_name}/{function_name}\nclass {class_name}:{source_text}")
+        }
+        None => format!("{file_path}/{function_name}\n{source_text}"),
+    }
+}
+
+/// Extract every named function from `file` in source order.
+pub fn extract_file_chunks(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> FileChunks {
     let _streaming_scope = AnalyzerStreamingFileScope::new(analyzer, file);
     let file_path = rel_path_string(file);
     let _scope =
         brokk_bifrost_analysis::profiling::scope(format!("nlp::extract_file_chunks[{file_path}]"));
-    // Minified/generated bundles (single 100KB+ lines) are rejected upstream at the
-    // tree-sitter parse site (`is_unparseable_source`), so they reach here with no
-    // declarations and naturally produce zero chunks — no special-casing needed.
-    let summary_text = {
-        let _scope = brokk_bifrost_analysis::profiling::scope("nlp::extract_file_chunks::summary");
-        file_summary_or_symbols(analyzer, file, count_tokens, max_seq_tokens)
-    };
 
-    let mut chunks = Vec::new();
-    if let Some(summary) = &summary_text {
-        chunks.push(ChunkText {
-            ord: 0,
-            kind: ChunkKind::FileSummary,
-            symbol: None,
-            start_line: None,
-            end_line: None,
-            text: summary.clone(),
-            parent_text: None,
-        });
-    }
-
-    let mut class_summaries: HashMap<String, Option<String>> = HashMap::new();
-    let mut seen_texts: HashSet<Key> = HashSet::new();
-    let mut next_ord = 1i64;
-    // (unit, nearest enclosing class) work stack; functions do not nest the
-    // traversal further because their source text already contains any
-    // local definitions.
+    // (unit, nearest enclosing class) work stack. Function source already
+    // contains local declarations, so functions do not extend the traversal.
     let mut stack: Vec<(CodeUnit, Option<CodeUnit>)> = {
         let _scope =
             brokk_bifrost_analysis::profiling::scope("nlp::extract_file_chunks::top_level");
@@ -129,121 +97,51 @@ pub fn extract_file_chunks(
             }
         }
     }
-    {
-        let _scope = brokk_bifrost_analysis::profiling::scope("nlp::extract_file_chunks::sort");
-        functions.sort_by_key(|(unit, _)| {
-            analyzer
-                .ranges(unit)
-                .first()
-                .map(|range| range.start_line)
-                .unwrap_or(usize::MAX)
-        });
-    }
+    functions.sort_by_key(|(unit, _)| {
+        analyzer
+            .ranges(unit)
+            .first()
+            .map(|range| range.start_line)
+            .unwrap_or(usize::MAX)
+    });
 
     let _scope = brokk_bifrost_analysis::profiling::scope("nlp::extract_file_chunks::emit");
-    for (unit, enclosing_class) in functions {
-        let Some(text) = analyzer.get_source(&unit, true) else {
-            continue;
-        };
-        if text.trim().is_empty() || !seen_texts.insert(component_key(&text)) {
-            continue;
-        }
-        let parent_text = enclosing_class
-            .as_ref()
-            .and_then(|class| {
-                class_summaries
-                    .entry(class.fq_name())
-                    .or_insert_with(|| class_summary(analyzer, class, count_tokens, max_seq_tokens))
-                    .clone()
-            })
-            .or_else(|| summary_text.clone());
-        let range = analyzer.ranges(&unit).first().cloned();
-        chunks.push(ChunkText {
-            ord: next_ord,
-            kind: ChunkKind::Function,
-            symbol: Some(unit.fq_name()),
-            start_line: range.as_ref().map(|r| r.start_line as i64),
-            end_line: range.as_ref().map(|r| r.end_line as i64),
-            text,
-            parent_text,
-        });
-        next_ord += 1;
-    }
+    let chunks = functions
+        .into_iter()
+        .filter_map(|(unit, enclosing_class)| {
+            let source_text = analyzer.get_source(&unit, true)?;
+            if source_text.trim().is_empty() {
+                return None;
+            }
+            let range = analyzer.ranges(&unit).first().cloned();
+            Some((
+                unit,
+                enclosing_class.map(|class| class.identifier().to_string()),
+                source_text,
+                range,
+            ))
+        })
+        .enumerate()
+        .map(
+            |(ord, (unit, enclosing_class, source_text, range))| FunctionChunk {
+                ord: ord as i64,
+                symbol: unit.fq_name(),
+                function_name: unit.identifier().to_string(),
+                enclosing_class,
+                start_line: range.as_ref().map(|range| range.start_line as i64),
+                end_line: range.as_ref().map(|range| range.end_line as i64),
+                source_text,
+            },
+        )
+        .collect();
 
-    FileChunks {
-        file_path,
-        summary_text,
-        chunks,
-    }
-}
-
-/// The file-level parent text: full summary if it fits the token budget,
-/// else the compact symbols outline (truncated to the budget if needed).
-fn file_summary_or_symbols(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    count_tokens: &dyn Fn(&str) -> usize,
-    max_seq_tokens: usize,
-) -> Option<String> {
-    if let Some(block) = summary_block_for_file(analyzer, file) {
-        let text = flatten_summary_block(&block);
-        if !text.is_empty() && count_tokens(&text) <= max_seq_tokens {
-            return Some(text);
-        }
-    }
-    let symbols = analyzer.list_symbols(file);
-    let symbols = symbols.trim();
-    if symbols.is_empty() {
-        return None;
-    }
-    Some(truncate_to_budget(symbols, count_tokens, max_seq_tokens))
-}
-
-fn class_summary(
-    analyzer: &dyn IAnalyzer,
-    class: &CodeUnit,
-    count_tokens: &dyn Fn(&str) -> usize,
-    max_seq_tokens: usize,
-) -> Option<String> {
-    let block = summary_block_for_code_unit(analyzer, class)?;
-    let text = flatten_summary_block(&block);
-    (!text.is_empty() && count_tokens(&text) <= max_seq_tokens).then_some(text)
-}
-
-fn flatten_summary_block(block: &SummaryBlock) -> String {
-    let mut parts: Vec<&str> = Vec::with_capacity(block.elements.len() + 1);
-    if !block.preamble.is_empty() {
-        parts.push(&block.preamble);
-    }
-    parts.extend(block.elements.iter().map(|element| element.text.as_str()));
-    parts.join("\n").trim().to_string()
-}
-
-/// Halve the line count until the text fits the embedding budget.
-fn truncate_to_budget(
-    text: &str,
-    count_tokens: &dyn Fn(&str) -> usize,
-    max_seq_tokens: usize,
-) -> String {
-    if count_tokens(text) <= max_seq_tokens {
-        return text.to_string();
-    }
-    let lines: Vec<&str> = text.lines().collect();
-    let mut keep = lines.len();
-    while keep > 1 {
-        keep /= 2;
-        let candidate = lines[..keep].join("\n");
-        if count_tokens(&candidate) <= max_seq_tokens {
-            return candidate;
-        }
-    }
-    lines.first().copied().unwrap_or_default().to_string()
+    FileChunks { file_path, chunks }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost_analysis::analyzer::{JavaAnalyzer, Language, TestProject};
+    use brokk_bifrost_analysis::analyzer::{CppAnalyzer, JavaAnalyzer, Language, TestProject};
 
     fn fixture_analyzer() -> (tempfile::TempDir, JavaAnalyzer) {
         let temp = tempfile::tempdir().unwrap();
@@ -268,68 +166,60 @@ mod tests {
         (temp, analyzer)
     }
 
-    fn word_count(text: &str) -> usize {
-        text.split_whitespace().count()
-    }
-
     fn chunks_for(analyzer: &dyn IAnalyzer, name: &str) -> FileChunks {
         let file = analyzer
             .analyzed_files()
             .into_iter()
             .find(|file| rel_path_string(file) == name)
             .unwrap_or_else(|| panic!("fixture file {name} not analyzed"));
-        extract_file_chunks(analyzer, &file, &word_count, 8192)
+        extract_file_chunks(analyzer, &file)
     }
 
     #[test]
-    fn extracts_summary_and_function_chunks() {
+    fn canonical_documents_match_swerank_exactly() {
+        assert_eq!(
+            embedding_document("pkg/mod.py", "do_work", None, "def do_work():\n    pass"),
+            "pkg/mod.py/do_work\ndef do_work():\n    pass"
+        );
+        assert_eq!(
+            embedding_document(
+                "pkg/mod.py",
+                "do_work",
+                Some("Worker"),
+                "    def do_work(self):\n        pass",
+            ),
+            "pkg/mod.py/Worker/do_work\nclass Worker:    def do_work(self):\n        pass"
+        );
+    }
+
+    #[test]
+    fn extracts_only_ordered_functions_with_structured_class_names() {
         let (_temp, analyzer) = fixture_analyzer();
         analyzer.reset_package_declaration_scan_count_for_test();
         let result = chunks_for(&analyzer, "A.java");
         assert_eq!(analyzer.package_declaration_scan_count_for_test(), 0);
+        assert_eq!(result.chunks.len(), 3);
+        assert!(
+            result
+                .chunks
+                .iter()
+                .all(|chunk| chunk.enclosing_class.as_deref() == Some("A"))
+        );
+        assert!(
+            result
+                .chunks
+                .iter()
+                .all(|chunk| chunk.symbol.starts_with("A.method"))
+        );
 
-        let summary = &result.chunks[0];
-        assert_eq!(summary.kind, ChunkKind::FileSummary);
-        assert_eq!(result.summary_text.as_deref(), Some(summary.text.as_str()));
-        assert!(summary.text.contains("class A"));
-
-        let functions: Vec<_> = result
-            .chunks
-            .iter()
-            .filter(|chunk| chunk.kind == ChunkKind::Function)
-            .collect();
-        assert!(!functions.is_empty(), "expected method chunks for A.java");
-        let method = functions
-            .iter()
-            .find(|chunk| chunk.symbol.as_deref() == Some("A.method2"))
-            .expect("A.method2 chunk");
-        assert!(method.text.contains("method2"));
-        assert!(method.start_line.is_some());
-        // Parent context is the enclosing class summary, which contains the
-        // signatures of sibling methods.
-        let parent = method.parent_text.as_deref().expect("parent text");
-        assert!(parent.contains("method1"));
-    }
-
-    #[test]
-    fn function_chunks_are_ordered_and_deduped() {
-        let (_temp, analyzer) = fixture_analyzer();
-        let result = chunks_for(&analyzer, "A.java");
         let lines: Vec<i64> = result
             .chunks
             .iter()
-            .filter(|chunk| chunk.kind == ChunkKind::Function)
             .filter_map(|chunk| chunk.start_line)
             .collect();
         let mut sorted = lines.clone();
         sorted.sort_unstable();
-        assert_eq!(lines, sorted, "function chunks must be in source order");
-
-        let mut texts: Vec<&str> = result.chunks.iter().map(|c| c.text.as_str()).collect();
-        let before = texts.len();
-        texts.sort_unstable();
-        texts.dedup();
-        assert_eq!(before, texts.len(), "chunk texts must be unique");
+        assert_eq!(lines, sorted);
     }
 
     #[test]
@@ -342,30 +232,45 @@ mod tests {
             .expect("A.java analyzed");
         analyzer.reset_candidate_hydration_count_for_test();
 
-        let extracted = extract_file_chunks(&analyzer, &file, &word_count, 8192);
+        let extracted = extract_file_chunks(&analyzer, &file);
         assert!(!extracted.chunks.is_empty());
         assert_eq!(analyzer.candidate_hydration_count_for_test(), 1);
 
         assert!(!analyzer.top_level_declarations(&file).is_empty());
-        assert_eq!(
-            analyzer.candidate_hydration_count_for_test(),
-            2,
-            "the ordinary read must hydrate again after the streaming scope closes"
-        );
+        assert_eq!(analyzer.candidate_hydration_count_for_test(), 2);
+    }
+
+    #[test]
+    fn streaming_cpp_extraction_reuses_file_state_for_definition_ranges() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = ProjectFile::new(root.clone(), "worker.h");
+        file.write(
+            "void run(int value) {\n    value += 1;\n}\n\nvoid run(double value) {\n    value += 2.0;\n}\n",
+        )
+        .unwrap();
+        let analyzer = CppAnalyzer::from_project(TestProject::new(root, Language::Cpp));
+        let top_level = analyzer.top_level_declarations(&file);
+        assert!(!top_level.is_empty());
+        assert!(top_level.iter().any(CodeUnit::is_function));
+        analyzer.reset_enclosing_parent_query_counts_for_test();
+
+        let extracted = extract_file_chunks(&analyzer, &file);
+
+        assert_eq!(extracted.chunks.len(), 2);
+        assert!(extracted.chunks.iter().all(|chunk| {
+            chunk.source_text.contains("value += 1") && chunk.source_text.contains("value += 2.0")
+        }));
+        assert_eq!(analyzer.sql_definitions_query_count_for_test(), 0);
     }
 
     #[test]
     fn function_chunk_excludes_file_license_header() {
         use brokk_bifrost_analysis::analyzer::TypescriptAnalyzer;
 
-        // A function that is the first code in the file, with only a license
-        // header and blank lines above it. The chunk text must be the function
-        // itself, not the license header — and must line up with start_line.
         let source = "\
 /**
  * Copyright (c) 2017-present, Facebook, Inc.
- *
- * This source code is licensed under the MIT license.
  */
 
 export function loadRoutes(routes: number): number {
@@ -379,38 +284,15 @@ export function loadRoutes(routes: number): number {
         let analyzer =
             TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
 
-        let result = extract_file_chunks(&analyzer, &file, &word_count, 8192);
-        let function = result
-            .chunks
-            .iter()
-            .find(|chunk| chunk.kind == ChunkKind::Function)
-            .expect("loadRoutes chunk");
-
-        assert!(
-            !function.text.contains("Copyright"),
-            "child text must not include the file license header: {:?}",
-            function.text
-        );
+        let result = extract_file_chunks(&analyzer, &file);
+        let function = result.chunks.first().expect("loadRoutes chunk");
+        assert!(!function.source_text.contains("Copyright"));
         assert!(
             function
-                .text
+                .source_text
                 .trim_start()
                 .starts_with("export function loadRoutes")
         );
-        // The license header lives in the file summary / parent context, never
-        // the function's own embedded text.
-        assert_eq!(function.start_line, Some(7));
-    }
-
-    #[test]
-    fn truncate_to_budget_halves_until_fit() {
-        let text = (0..64)
-            .map(|i| format!("line {i} with several words here"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let tight = |t: &str| t.split_whitespace().count() * 100;
-        let truncated = truncate_to_budget(&text, &tight, 8);
-        assert!(truncated.starts_with("line 0"));
-        assert!(truncated.lines().count() < 64);
+        assert_eq!(function.start_line, Some(5));
     }
 }

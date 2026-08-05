@@ -320,6 +320,10 @@ pub struct SignatureMetadata {
     extension_receiver_type_identity: Option<StructuredTypeIdentity>,
     #[serde(default)]
     extension_receiver_is_unconstrained_type_parameter: bool,
+    #[serde(default)]
+    field_is_static: bool,
+    #[serde(default)]
+    field_is_final: bool,
     /// Whether this class-like declaration is a Kotlin `companion object`.
     ///
     /// A companion and an ordinary nested `object` are both nested classes, and
@@ -1502,6 +1506,8 @@ impl SignatureMetadata {
             extension_receiver_type: None,
             extension_receiver_type_identity: None,
             extension_receiver_is_unconstrained_type_parameter: false,
+            field_is_static: false,
+            field_is_final: false,
             companion_object: false,
         }
     }
@@ -1548,6 +1554,8 @@ impl SignatureMetadata {
             extension_receiver_type: None,
             extension_receiver_type_identity: None,
             extension_receiver_is_unconstrained_type_parameter: false,
+            field_is_static: false,
+            field_is_final: false,
             companion_object: false,
         }
     }
@@ -1557,6 +1565,12 @@ impl SignatureMetadata {
             .map(Into::into)
             .map(|text| text.trim().to_string())
             .filter(|text| !text.is_empty());
+        self
+    }
+
+    pub fn with_field_modifiers(mut self, is_static: bool, is_final: bool) -> Self {
+        self.field_is_static = is_static;
+        self.field_is_final = is_final;
         self
     }
 
@@ -1651,6 +1665,14 @@ impl SignatureMetadata {
 
     pub fn return_type_text(&self) -> Option<&str> {
         self.return_type_text.as_deref()
+    }
+
+    pub fn field_is_static(&self) -> bool {
+        self.field_is_static
+    }
+
+    pub fn field_is_final(&self) -> bool {
+        self.field_is_final
     }
 
     pub fn return_type_identity(&self) -> Option<&StructuredTypeIdentity> {
@@ -2657,6 +2679,22 @@ pub enum DeclarationKind {
     LambdaParameter,
     PatternVariable,
     ResourceVariable,
+}
+
+impl DeclarationKind {
+    /// Stable snake_case label for wire output and rendering.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Parameter => "parameter",
+            Self::ReceiverParameter => "receiver_parameter",
+            Self::LocalVariable => "local_variable",
+            Self::CatchParameter => "catch_parameter",
+            Self::EnhancedForVariable => "enhanced_for_variable",
+            Self::LambdaParameter => "lambda_parameter",
+            Self::PatternVariable => "pattern_variable",
+            Self::ResourceVariable => "resource_variable",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

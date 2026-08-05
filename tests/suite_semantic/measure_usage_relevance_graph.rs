@@ -152,7 +152,6 @@ fn usage_relevance_memory_and_reads() {
         seed_weights: None,
         recency_half_life: None,
         ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
-        include_tests: true,
         limit: 10,
     };
 
@@ -162,7 +161,7 @@ fn usage_relevance_memory_and_reads() {
     let ranking_first_ms = first_started.elapsed().as_secs_f64() * 1_000.0;
     assert!(first.not_found.is_empty());
     assert!(!first.files.is_empty());
-    assert_eq!(first.files[0], "sub/sub.go");
+    assert_eq!(first.files[0].path, "sub/sub.go");
     let rss_after_first_ranking = peak_rss_bytes();
 
     let mut warm_times = Vec::with_capacity(iterations);
@@ -188,7 +187,7 @@ fn usage_relevance_memory_and_reads() {
         ranking_first_ms,
         ranking_warm_median_ms,
         ranking_results: first.files.len(),
-        first_result: first.files[0].clone(),
+        first_result: first.files[0].path.clone(),
         peak_rss_start_bytes: rss_start,
         peak_rss_after_analyzer_bytes: rss_after_analyzer,
         peak_rss_after_first_ranking_bytes: rss_after_first_ranking,

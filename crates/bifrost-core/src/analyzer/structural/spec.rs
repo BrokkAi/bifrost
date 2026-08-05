@@ -10,6 +10,9 @@
 
 use super::facts::{RoleTarget, Span};
 use super::kinds::{NormalizedKind, Role};
+use super::occurrences::{
+    Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
+};
 use crate::analyzer::Language;
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -43,10 +46,51 @@ pub trait StructuralSpec: Send + Sync + 'static {
         true
     }
 
+    /// A grammar-backed construct label for semantic generator rules.
+    ///
+    /// The label describes source syntax only. It must not describe generated
+    /// behavior. Adapters must derive it from the tree-sitter node and fields.
+    fn generator_construct(&self, _node: Node<'_>, _kind: NormalizedKind) -> Option<&'static str> {
+        None
+    }
+
     /// Whether this adapter can model `role` precisely enough to evaluate a
     /// query that asks for it.
     fn supports_role(&self, _role: Role) -> bool {
         true
+    }
+
+    /// Which occurrence roles this adapter classifies during [`Self::extract`].
+    ///
+    /// Deliberately has no default: the table is total, so a default would let
+    /// a new adapter (or a new role) advertise support nobody implemented.
+    /// Adapters that do not classify occurrences yet return
+    /// [`super::occurrences::NO_OCCURRENCE_ROLE_SUPPORT`].
+    fn occurrence_role_support(&self) -> &OccurrenceRoleSupport;
+
+    /// The namespace an occurrence of `role` resolves in, where `declares` is
+    /// the normalized kind of the fact this token names -- the enclosing fact
+    /// whose own name span is exactly this token, and `None` when the token
+    /// names no fact.
+    ///
+    /// `None` means the adapter cannot say; the occurrence row is dropped and
+    /// the file's occurrence result becomes incomplete for that role, so no
+    /// consumer ever reads a guessed namespace.
+    fn occurrence_namespace(
+        &self,
+        role: OccurrenceRole,
+        declares: Option<NormalizedKind>,
+    ) -> Option<Namespace> {
+        default_occurrence_namespace(role, declares)
+    }
+
+    /// The spelling `raw` denotes once the grammar's identifier escaping is
+    /// removed (Rust's `r#type` is the identifier `type`).
+    ///
+    /// `Some` only when decoding changes the spelling, so a consumer can treat
+    /// the presence of a decoded spelling as "this token was escaped".
+    fn decode_spelling(&self, _raw: &str) -> Option<String> {
+        None
     }
 
     /// Whether this adapter can produce facts satisfying `kind`.
@@ -90,6 +134,10 @@ pub struct RoleSink<'a> {
     fact_by_ts_node: &'a HashMap<usize, u32>,
     name: Option<Span>,
     roles: &'a mut Vec<RoleTarget>,
+    /// Per-node occurrence-role classifications emitted during this walk,
+    /// addressed by fact id rather than by the emitting fact. Extraction
+    /// buckets them into the file's occurrence-role rows once the walk ends.
+    occurrence_roles: &'a mut Vec<(u32, OccurrenceRole)>,
     max_roles: usize,
     cancellation: Option<&'a CancellationToken>,
     stop: Option<RoleSinkStop>,
@@ -112,6 +160,7 @@ impl<'a> RoleSink<'a> {
     pub fn new(
         fact_by_ts_node: &'a HashMap<usize, u32>,
         roles: &'a mut Vec<RoleTarget>,
+        occurrence_roles: &'a mut Vec<(u32, OccurrenceRole)>,
         max_roles: usize,
         cancellation: Option<&'a CancellationToken>,
     ) -> Self {
@@ -119,9 +168,28 @@ impl<'a> RoleSink<'a> {
             fact_by_ts_node,
             name: None,
             roles,
+            occurrence_roles,
             max_roles,
             cancellation,
             stop: None,
+        }
+    }
+
+    /// Classify one identifier-bearing node's occurrence role.
+    ///
+    /// `target` must itself be a fact — an occurrence is addressed by the
+    /// `(content identity, fact id)` pair every later layer joins on, so a
+    /// classification for a node the kind table does not admit has nowhere to
+    /// live. Adapters extend their kind table rather than emitting here.
+    pub fn occurrence_role(&mut self, target: Node<'_>, role: OccurrenceRole) {
+        let node = self.fact_by_ts_node.get(&target.id()).copied();
+        debug_assert!(
+            node.is_some(),
+            "occurrence role {role:?} emitted for non-fact node {:?}; add its kind to the kind table",
+            target.kind()
+        );
+        if let Some(node) = node {
+            self.occurrence_roles.push((node, role));
         }
     }
 

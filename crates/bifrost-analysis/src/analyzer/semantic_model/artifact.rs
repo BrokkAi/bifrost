@@ -939,6 +939,7 @@ pub(crate) fn routing_keys(
             let kind = match rule.trigger {
                 RuleTrigger::LanguageConstruct { .. } => "language_construct",
                 RuleTrigger::Annotation { .. } => "annotation",
+                RuleTrigger::AnnotatedField { .. } => "annotated_field",
                 RuleTrigger::MacroInvocation { .. } => "macro_invocation",
                 RuleTrigger::GeneratorInvocation { .. } => "generator_invocation",
                 RuleTrigger::ResolvedOwner { .. } => "resolved_owner",

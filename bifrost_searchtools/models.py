@@ -8,9 +8,11 @@ from typing import Any, ClassVar, Literal, cast, get_args
 CodeQueryExecutionMode = Literal["results", "explain", "profile"]
 MostRelevantFilesRankingModeValue = Literal["history_imports", "usage_graph"]
 MostRelevantFilesIncompleteReasonValue = Literal["cancelled", "time_budget"]
+TestFileKindValue = Literal["test", "test_support", "production", "ambiguous"]
 _CODE_QUERY_EXECUTION_MODES = get_args(CodeQueryExecutionMode)
 _MOST_RELEVANT_FILES_RANKING_MODES = get_args(MostRelevantFilesRankingModeValue)
 _MOST_RELEVANT_FILES_INCOMPLETE_REASONS = get_args(MostRelevantFilesIncompleteReasonValue)
+_TEST_FILE_KINDS = get_args(TestFileKindValue)
 _MISSING = object()
 
 
@@ -69,6 +71,13 @@ def _most_relevant_files_incomplete_reason(
         )
         raise ValueError(f"incomplete_reason must be one of {expected}, got {value!r}")
     return cast(MostRelevantFilesIncompleteReasonValue, value)
+
+
+def _test_file_kind(value: Any) -> TestFileKindValue:
+    if value not in _TEST_FILE_KINDS:
+        expected = ", ".join(repr(kind) for kind in _TEST_FILE_KINDS)
+        raise ValueError(f"test must be one of {expected}, got {value!r}")
+    return cast(TestFileKindValue, value)
 
 
 def _render_numbered_block(text: str, start_line: int) -> str:
@@ -1715,6 +1724,113 @@ class CodeQueryReceiverAnalysis:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class CodeQueryOccurrenceTarget:
+    """What a reference-class occurrence resolves to.
+
+    ``target_kind`` is always present: a non-reference row is ``none`` and a
+    reference row never is, so an empty target is never ambiguous between
+    "nothing to resolve" and "resolution was skipped".
+    """
+
+    target_kind: str
+    units: list[CodeQueryDeclaration] = field(default_factory=list)
+    name: str | None = None
+    kind: str | None = None
+    range: CodeQueryRange | None = None
+    status: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryOccurrenceTarget:
+        range_data = data.get("range")
+        return cls(
+            target_kind=data["target_kind"],
+            units=[
+                CodeQueryDeclaration.from_dict(item) for item in data.get("units", [])
+            ],
+            name=data.get("name"),
+            kind=data.get("kind"),
+            range=CodeQueryRange.from_dict(range_data) if range_data else None,
+            status=data.get("status"),
+        )
+
+    def render_text(self) -> list[str]:
+        if self.target_kind == "resolved":
+            return [f"-> {unit.fq_name} [{unit.kind}] {unit.path}" for unit in self.units]
+        if self.target_kind == "lexical":
+            line = self.range.start_line if self.range else 0
+            return [f"-> lexical binder `{self.name}` [{self.kind}] at line {line}"]
+        if self.target_kind == "unresolved":
+            return [f"-> unresolved ({self.status})"]
+        return []
+
+
+@dataclass(frozen=True)
+class CodeQueryOccurrence:
+    """One classified identifier position.
+
+    ``ast_id`` is the content-scoped identity of the underlying AST node and is
+    equal to the ``ast_id`` a structural capture over the same node reports.
+    That string equality is the correlation join; do not compare ranges or
+    spellings instead. ``id`` additionally distinguishes the role.
+    """
+
+    id: str
+    ast_id: str
+    path: str
+    language: str
+    occurrence_class: str
+    role: str
+    namespace: str
+    range: CodeQueryRange
+    start_byte: int
+    end_byte: int
+    raw_spelling: str
+    target: CodeQueryOccurrenceTarget
+    enclosing_symbol: str | None = None
+    decoded_spelling: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryOccurrence:
+        return cls(
+            id=data["id"],
+            ast_id=data["ast_id"],
+            path=data["path"],
+            language=data["language"],
+            occurrence_class=data["class"],
+            role=data["role"],
+            namespace=data["namespace"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            start_byte=data["start_byte"],
+            end_byte=data["end_byte"],
+            raw_spelling=data["raw_spelling"],
+            target=CodeQueryOccurrenceTarget.from_dict(data["target"]),
+            enclosing_symbol=data.get("enclosing_symbol"),
+            decoded_spelling=data.get("decoded_spelling"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    @property
+    def effective_spelling(self) -> str:
+        """The spelling to compare against a declared name."""
+        return self.decoded_spelling or self.raw_spelling
+
+    def render_text(self) -> str:
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[occurrence; {self.occurrence_class}; {self.role}; {self.namespace}] "
+            f"`{self.raw_spelling}`"
+        )
+        if self.decoded_spelling is not None:
+            header += f" (decodes to `{self.decoded_spelling}`)"
+        if self.enclosing_symbol is not None:
+            header += f" in {self.enclosing_symbol}"
+        return "\n".join([header, *(f"  {line}" for line in self.target.render_text())])
+
+
 CodeQueryResultItem = (
     CodeQueryMatch
     | CodeQueryDeclaration
@@ -1731,6 +1847,7 @@ CodeQueryResultItem = (
     | CodeQueryCallSite
     | CodeQueryExpressionSite
     | CodeQueryReceiverAnalysis
+    | CodeQueryOccurrence
 )
 
 
@@ -1766,6 +1883,8 @@ def _code_query_result_item(data: dict) -> CodeQueryResultItem:
         return CodeQueryExpressionSite.from_dict(data)
     if result_type == "receiver_analysis":
         return CodeQueryReceiverAnalysis.from_dict(data)
+    if result_type == "occurrence":
+        return CodeQueryOccurrence.from_dict(data)
     raise ValueError(f"unknown code query result_type: {result_type!r}")
 
 
@@ -1822,6 +1941,9 @@ class CodeQueryDiagnosticCode(StrEnum):
     EXECUTION_BUDGET_EXHAUSTED = "execution_budget_exhausted"
     PIPELINE_BUDGET_EXHAUSTED = "pipeline_budget_exhausted"
     IMPORT_GRAPH_BUDGET_EXHAUSTED = "import_graph_budget_exhausted"
+    OCCURRENCE_ROLE_UNSUPPORTED = "occurrence_role_unsupported"
+    OCCURRENCE_RESOLUTION_INCOMPLETE = "occurrence_resolution_incomplete"
+    OCCURRENCE_ROW_BUDGET_EXHAUSTED = "occurrence_row_budget_exhausted"
     RESULT_LIMIT_REACHED = "result_limit_reached"
     BROAD_QUERY = "broad_query"
 
@@ -4025,8 +4147,25 @@ class SkimFilesResult:
 
 
 @dataclass(frozen=True)
+class MostRelevantFile:
+    """A ranked file and the test verdict the caller filters on.
+
+    Ranking applies no test policy of its own (issue #1575): a project without
+    a src/main convention can never report "production", so the caller decides
+    which kinds to keep.
+    """
+
+    path: str
+    test: TestFileKindValue
+
+    @classmethod
+    def from_dict(cls, data: dict) -> MostRelevantFile:
+        return cls(path=data["path"], test=_test_file_kind(data["test"]))
+
+
+@dataclass(frozen=True)
 class MostRelevantFilesResult:
-    files: list[str]
+    files: list[MostRelevantFile]
     not_found: list[str]
     duplicates: list[str]
     complete: bool = True
@@ -4040,7 +4179,7 @@ class MostRelevantFilesResult:
         cls, data: dict, render_line_numbers: bool = True, rendered_text: str | None = None
     ) -> MostRelevantFilesResult:
         return cls(
-            files=list(data["files"]),
+            files=[MostRelevantFile.from_dict(item) for item in data["files"]],
             not_found=list(data["not_found"]),
             duplicates=list(data.get("duplicates", [])),
             complete=_strict_bool(data, "complete", True),
@@ -4064,7 +4203,7 @@ class MostRelevantFilesResult:
         if not self.files and not self.not_found and not self.duplicates:
             return "No related files found."
 
-        lines = list(self.files)
+        lines = [f"{file.path} [{file.test}]" for file in self.files]
         if self.not_found:
             lines.append(f"Not found: {', '.join(self.not_found)}")
         if self.duplicates:

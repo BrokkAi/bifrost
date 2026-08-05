@@ -307,6 +307,85 @@ the focus.
     (1,457 sibling tests passed); that exact C# test passes alone in 0.75
     seconds. Independent oldskool review found no blocker and root review
     removed all temporary diagnosis instrumentation before commit.
+  - [x] (2026-08-03 02:42Z) Completed C++ rank fifteen
+    `BehaviorTree__BehaviorTree.CPP` at pinned head `4630e066`. Its starting
+    envelope audited all 168 eligible files, 85,531 structured candidates,
+    10,000 sites, and 835 inverse targets, exposing 81 missing rows across a
+    related family of C++ declaration ownership, template, macro, and inverse
+    resolution defects. Jonathan-assigned issues #1484 through #1490, #1494
+    through #1497, and #1523 were fixed depth-first in the repository through
+    implementation commit `1c570a35` and pushed merge head `a8957399`. The
+    final clean replay queried all 935 distinct targets with zero missing,
+    skipped, truncated, or error rows. Its JSONL and log SHA-256 values are
+    `9226096a6e139deb4c29c52096b13cf825a55a0249dcca7f891f4bfdf24fbfa7`
+    and
+    `3ca260b1e163edd3916a0f6310ea15ab767ad38cc40445e3acb5a624e2cfeee3`.
+  - [x] (2026-08-03 03:21Z) Completed C++ rank sixteen
+    `GoogleCloudPlatform__esp-v2` at pinned head `1c176f5a`. Its starting
+    81/81-file, 10,000-site envelope queried 535 inverse targets and exposed
+    seven missing rows caused by a macro field absorbing its owning class
+    terminator. Jonathan-assigned issue #1530 was fixed in `ce58a646` and
+    pushed through merge head `6013c8ed`. The clean replay resolved 3,204
+    forward sites and queried all 535 targets with zero missing, skipped,
+    truncated, or error rows in 3.63 seconds.
+  - [x] (2026-08-04 12:02Z) Completed C++ rank seventeen
+    `abseil__abseil-cpp` at pinned head `e65a8cbf`. The accepted pushed-head
+    replay at clean Bifrost `b235b350` audited 614/614 files, 6,233,064 source
+    bytes, 212,425 structured candidates, 10,000 sites, and 1,000 of 1,131
+    distinct targets in 89.7 seconds. It reported 1,340 consistent, 73
+    editor-only, 107 honestly unproven, 8,478 inconclusive, and two
+    configuration-dependent missing rows: a
+    `__cpp_lib_containers_ranges >= 202202L` constructor and the fallback arm
+    of `__cpp_lib_type_identity`. Neither is actionable without one concrete
+    preprocessor configuration. All legitimate rows owned by
+    Jonathan-assigned issues #1536, #1537, and #1560 were fixed and closed on
+    2026-08-04 through the rank's implementation series, upstream merge
+    `8fc8d267`, and final
+    sentinel-ordering fix `b235b350`; the five exact beta/discrete probes all
+    have exact inverse hits. The final JSONL SHA-256 is
+    `c2c7e86251fd2ce16f44c654fc39307c31841c0335f3ce497f7f160c4cae931e`.
+    Formatting, all 105 C++ analyzer tests, focused inverse and epoch tests,
+    and strict all-target/all-feature Clippy pass. The broad featureless
+    workspace run also passed every reached suite except nine MCP CLI tests
+    whose default cache path intentionally collapsed to the primary checkout
+    and found its newer schema; all 33 affected CLI tests pass against an
+    isolated cache, while persistence/default-cache tests pass under their
+    normal environment.
+  - [x] (2026-08-04 12:14Z) Completed C++ rank eighteen
+    `Mbed-TLS__mbedtls` at pinned head `9e9eb069`. The live selector reports
+    16 qualifying tasks, applies `not_overlarge=true`, and excludes the repo
+    from `large-repos.csv`. Its clean C++ header envelope audited 57/57
+    eligible files, 743,297 source bytes, all 6,716 structured candidates, all
+    4,522 sites, and 92/92 inverse targets in 2.5 seconds. It reported 409
+    consistent, 150 honestly unproven, 3,963 inconclusive, and zero
+    editor-only or missing/actionable rows, with no file errors,
+    candidate-limit exclusions, skipped or truncated targets, or configured
+    limit failures. Both Bifrost `642d77da` and the corpus worktree were clean.
+    Existing C rank-eighteen evidence was not reused because it audited `.c`
+    translation units rather than this C++ header corpus. Independent oldskool
+    review and open-issue search found no Mbed-specific owner or symptom, so no
+    issue was warranted. The JSONL and log SHA-256 values are
+    `3a722da19f9bd635444c7db9da1946f2dbf89d1158ec57be6caa8602365aadfe`
+    and
+    `c99f8aedca1a637404d044ce2c8b2f45b78f395aba644c9f0200840a2432a3e6`.
+  - [x] (2026-08-04 12:20Z) Completed C++ rank nineteen
+    `pyro-ppl__pyro` at pinned head `6cc3ecdc`. The live selector reports 13
+    qualifying tasks, applies `not_overlarge=true`, and excludes the repo from
+    `large-repos.csv`. Its entire C++ surface is the one 7,746-byte
+    `pyro/distributions/spanning_tree.cpp` extension. The accepted clean replay
+    audited that file, all 590 structured candidates, all 582 sites, and 4/4
+    inverse targets in 0.63 seconds. It reported six consistent and 576
+    inconclusive rows with zero editor-only, unproven, or missing/actionable
+    rows, and no file errors, candidate-limit exclusions, skipped or truncated
+    targets, or configured limit failures. Generated `.bifrost/` and `.brokk/`
+    databases were retained and ignored through clone-local metadata before
+    the accepted replay; both Bifrost `4446e420` and the corpus worktree report
+    clean. Independent oldskool review and open/closed issue search found no
+    Pyro-specific owner or symptom, so no issue was warranted. The JSONL and
+    log SHA-256 values are
+    `81e80740bdda0b4017d1bde7e84d9f78ad470ff6987e451db8ca5ca7cf16d915`
+    and
+    `2592520007ef93b828ff6a5e10e9c56d0714c55055776ac3fc63bda9397a23b7`.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
@@ -455,6 +534,17 @@ the focus.
   `adb7a530bff52c419ff5edd139e25b33ccca2aaa27a332ce534a096fd2a42a9b`
   and `dc72761ace52a808b19bf0fe2788d932fd1c667dd2b136c5352e94bbbd726d47`.
 
+- Observation: merging upstream after the first Abseil correction introduced
+  a real rank-seventeen regression. Upstream's OpenJDK safety guard rejected
+  every malformed sentinel envelope that retained a callable declarator, but
+  tree-sitter also retains a later Abseil class member as that declarator when
+  `ABSL_NAMESPACE_BEGIN` swallows the class. The structural discriminator is
+  ordering: a displaced class keyword precedes the spurious member callable,
+  while a genuine `struct` parameter is nested inside or follows the real
+  callable. The final predicate and regression fixtures cover both an
+  `operator_name` and a constructor `identifier`, retain the OpenJDK control,
+  and bump the C++ persistence epoch.
+
 ## Decision Log
 
 - Decision: Treat this as a new ranks-eleven-through-twenty expansion rather
@@ -480,6 +570,15 @@ the focus.
   selector dry-runs and the final ten-repository language certification span
   multiple repositories.
   Date/Author: 2026-08-01 / root.
+
+- Decision: Group multiple rows and tickets within one active repository when
+  they share one demonstrated analyzer root cause and one cohesive test/fix,
+  while preserving repository-depth-first sequencing.
+  Rationale: Beta and discrete Abseil aliases were separate symptoms of the
+  same malformed-sentinel predicate. Grouping their investigation and build
+  gates eliminated redundant work without mixing unrelated repositories or
+  deferring ticket closure behind a breadth-first batch.
+  Date/Author: 2026-08-04 / root.
 
 - Decision: Run Cargo and Bifrost outside the restricted sandbox at niceness
   10, using normal repository Cargo caches and targets.

@@ -19,7 +19,7 @@ use crate::cancellation::CancellationToken;
 use crate::gitblob;
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use crate::profiling;
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::text_utils::compute_line_starts;
 use git2::{ObjectType, Oid};
 use rayon::prelude::*;
 use regex::RegexBuilder;
@@ -408,6 +408,18 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     }
     fn hydrate_content_qualifier(&self, content_qualifier: &str, _file: &ProjectFile) -> String {
         content_qualifier.to_string()
+    }
+    /// Whether this unit's structured package prefix must be rebuilt from its
+    /// live path when hydrating a content-addressed blob. This is distinct from
+    /// the persisted qualifier text: an explicitly root-qualified declaration
+    /// may legitimately have an empty package without being path-derived.
+    fn code_unit_package_is_path_derived(
+        &self,
+        code_unit: &CodeUnit,
+        content_qualifier: &str,
+    ) -> bool {
+        self.path_derived_package_fq(content_qualifier, code_unit.source())
+            .is_some()
     }
     /// Return the structured package/module prefix when it depends on the
     /// live path rather than solely on the persisted source blob. `None` means
@@ -857,6 +869,7 @@ struct StreamingFileRead {
     depth: usize,
     file: ProjectFile,
     state: Option<Arc<FileState>>,
+    definition_ranges: Option<HashMap<String, Vec<Range>>>,
 }
 
 thread_local! {
@@ -3501,6 +3514,7 @@ where
                             depth: 1,
                             file: file.clone(),
                             state: None,
+                            definition_ranges: None,
                         },
                     );
                 }
@@ -3581,6 +3595,31 @@ where
             active.state = Some(Arc::clone(&state));
         });
         Some(state)
+    }
+
+    fn streaming_definition_ranges(&self, code_unit: &CodeUnit) -> Option<Vec<Range>> {
+        let state = self.streaming_file_state(code_unit.source())?;
+        let id = self.streaming_file_read_id();
+        let fq_name = code_unit.fq_name();
+        STREAMING_FILE_READS.with(|reads| {
+            let mut reads = reads.borrow_mut();
+            let active = reads
+                .get_mut(&id)
+                .expect("streaming file read must remain active during source extraction");
+            let ranges = active.definition_ranges.get_or_insert_with(|| {
+                let mut by_fq_name: HashMap<String, Vec<Range>> = HashMap::default();
+                for candidate in &state.declarations {
+                    if let Some(candidate_ranges) = state.ranges.get(candidate) {
+                        by_fq_name
+                            .entry(candidate.fq_name())
+                            .or_default()
+                            .extend(candidate_ranges.iter().cloned());
+                    }
+                }
+                by_fq_name
+            });
+            ranges.get(&fq_name).cloned()
+        })
     }
 
     pub(crate) fn fetch_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
@@ -5833,6 +5872,9 @@ where
         } else {
             let mut rows = Vec::new();
             for short_name in candidate_names {
+                let _rows_scope = crate::profiling::scope(format!(
+                    "sql_definition_candidates.rows[{short_name}]"
+                ));
                 let candidates = if include_definition_lookup_units {
                     self.store_context
                         .store
@@ -5856,26 +5898,41 @@ where
             }
             rows
         };
-        let mut candidates = self.resolve_definition_order_candidate_rows(rows);
-        candidates.extend(
-            self.dirty_units_matching(include_definition_lookup_units, |unit| {
-                unit.fq_name() == fq_name
-                    || self.adapter.normalize_full_name(&unit.fq_name()) == normalized
-            })
-            .into_iter()
-            .map(|unit| DefinitionSortCandidate {
-                unit,
-                range_start: DefinitionRangeStart::FileState,
-            }),
-        );
-        candidates.extend(
-            self.sql_path_symbol_units(fq_name, &normalized)?
+        let mut candidates = {
+            let _resolve_scope = crate::profiling::scope(format!(
+                "sql_definition_candidates.resolve_rows[{fq_name}]"
+            ));
+            self.resolve_definition_order_candidate_rows(rows)
+        };
+        {
+            let _dirty_scope = crate::profiling::scope(format!(
+                "sql_definition_candidates.dirty_units[{fq_name}]"
+            ));
+            candidates.extend(
+                self.dirty_units_matching(include_definition_lookup_units, |unit| {
+                    unit.fq_name() == fq_name
+                        || self.adapter.normalize_full_name(&unit.fq_name()) == normalized
+                })
                 .into_iter()
                 .map(|unit| DefinitionSortCandidate {
                     unit,
                     range_start: DefinitionRangeStart::FileState,
                 }),
-        );
+            );
+        }
+        {
+            let _path_scope = crate::profiling::scope(format!(
+                "sql_definition_candidates.path_symbol[{fq_name}]"
+            ));
+            candidates.extend(
+                self.sql_path_symbol_units(fq_name, &normalized)?
+                    .into_iter()
+                    .map(|unit| DefinitionSortCandidate {
+                        unit,
+                        range_start: DefinitionRangeStart::FileState,
+                    }),
+            );
+        }
         let has_exact = candidates
             .iter()
             .any(|candidate| candidate.unit.fq_name() == fq_name);
@@ -8143,14 +8200,23 @@ where
 
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
         let mut ranges = if code_unit.is_function() {
-            let _scope = profiling::scope("TreeSitterAnalyzer::get_sources::definitions");
-            let mut grouped = Vec::new();
-            for candidate in self.definitions(&code_unit.fq_name()) {
-                if candidate.source() == code_unit.source() {
-                    grouped.extend(self.ranges(&candidate));
+            if self.streaming_file_read_active(code_unit.source()) {
+                // Semantic indexing already hydrates the complete file state once per
+                // file. Re-querying the global definition index for every function made
+                // C++ repositories with many declarations spend most extraction time in
+                // redundant SQLite B-tree lookups and reader-pool mutexes.
+                self.streaming_definition_ranges(code_unit)
+                    .unwrap_or_default()
+            } else {
+                let _scope = profiling::scope("TreeSitterAnalyzer::get_sources::definitions");
+                let mut grouped = Vec::new();
+                for candidate in self.definitions(&code_unit.fq_name()) {
+                    if candidate.source() == code_unit.source() {
+                        grouped.extend(self.ranges(&candidate));
+                    }
                 }
+                grouped
             }
-            grouped
         } else {
             self.ranges(code_unit)
         };
@@ -8256,18 +8322,37 @@ fn node_range(node: Node<'_>) -> Range {
 /// `text` start at the file header while `start_line`/`end_line` still pointed
 /// at the declaration body.
 pub(crate) fn expanded_comment_start(source: &str, start_byte: usize) -> usize {
-    let line_starts = compute_line_starts(source);
-    let line_index = find_line_index_for_offset(&line_starts, start_byte);
+    assert!(start_byte <= source.len() && source.is_char_boundary(start_byte));
+
+    // Walk backward from the declaration instead of building a line index for
+    // the whole file. Semantic indexing asks for every function body in a
+    // file; rescanning a multi-megabyte generated file once per function made
+    // that extraction path effectively quadratic.
+    let bytes = source.as_bytes();
+    let mut next_line_start = bytes[..start_byte]
+        .iter()
+        .rposition(|byte| matches!(byte, b'\n' | b'\r'))
+        .map_or(0, |separator| separator + 1);
 
     let mut comment_start = start_byte;
-    for line_idx in (0..line_index).rev() {
-        let line_start = line_starts[line_idx];
-        let line_end = line_starts
-            .get(line_idx + 1)
-            .copied()
-            .unwrap_or(source.len());
+    while next_line_start > 0 {
+        let mut line_end = next_line_start;
+        if bytes[line_end - 1] == b'\n' {
+            line_end -= 1;
+            if line_end > 0 && bytes[line_end - 1] == b'\r' {
+                line_end -= 1;
+            }
+        } else {
+            debug_assert_eq!(bytes[line_end - 1], b'\r');
+            line_end -= 1;
+        }
+        let line_start = bytes[..line_end]
+            .iter()
+            .rposition(|byte| matches!(byte, b'\n' | b'\r'))
+            .map_or(0, |separator| separator + 1);
         let line = &source[line_start..line_end];
         let trimmed = line.trim_start();
+        next_line_start = line_start;
 
         // A blank line separates the declaration (or its attached comment block)
         // from whatever precedes it; stop rather than reaching across the gap.
@@ -8362,6 +8447,28 @@ mod tests {
             oid: Oid::zero(),
             rel_path: PathBuf::from(name),
         }
+    }
+
+    #[test]
+    fn expanded_comment_start_walks_attached_lines_with_mixed_endings() {
+        let source = "// license\r\n\r\n// docs\n#[attr]\rfn work() {}";
+        let declaration = source.find("fn work").unwrap();
+
+        assert_eq!(
+            expanded_comment_start(source, declaration),
+            source.find("// docs").unwrap()
+        );
+    }
+
+    #[test]
+    fn expanded_comment_start_keeps_inline_comment_boundary() {
+        let source = "const pi = \"pi\"; // nearby\nfn work() {}";
+        let declaration = source.find("fn work").unwrap();
+
+        assert_eq!(
+            expanded_comment_start(source, declaration),
+            source.find("// nearby").unwrap()
+        );
     }
 
     #[test]
@@ -9631,6 +9738,23 @@ mod tests {
             rust.storage_content_qualifier(&local_rust_impl_member, "net"),
             ""
         );
+        assert!(rust.code_unit_package_is_path_derived(&local_rust_impl_member, ""));
+        let explicit_root_rust_impl_member = CodeUnit::with_signature(
+            rust_file.clone(),
+            CodeUnitType::Function,
+            "",
+            "ExplicitPaths.into",
+            Some(
+                "impl core::convert::Into<bool> for crate::ExplicitPaths::fn into(self) -> bool { ... }"
+                    .to_string(),
+            ),
+            false,
+        );
+        assert_eq!(
+            rust.storage_content_qualifier(&explicit_root_rust_impl_member, "net"),
+            ""
+        );
+        assert!(!rust.code_unit_package_is_path_derived(&explicit_root_rust_impl_member, ""));
 
         std::fs::write(root.join("go.mod"), "module example.com/demo\n").unwrap();
         let go_file = temp_file(&root, "internal/service/service.go");

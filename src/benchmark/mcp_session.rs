@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use brokk_bifrost_mcp::benchmark_api::{
     BENCHMARK_MCP_REQUEST_BUDGET_SECS, BENCHMARK_PROFILE_BOUNDARY_MARKER,
     BENCHMARK_PROFILE_BOUNDARY_METHOD, MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV, MCP_FILE_WATCHER_ENV,
+    MCP_RMCP_HOST_ENV,
 };
 
 const STDERR_TAIL_CAPACITY_BYTES: usize = 256 * 1024;
@@ -21,6 +22,7 @@ const MCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_BUFFERED_MCP_RESPONSES: usize = 16;
 const BENCHMARK_QUERY_ACCESS_ENV: &str = "BIFROST_BENCHMARK_QUERY_CODE_ACCESS";
 const SERVER_QUERY_ACCESS_ENV: &str = "BIFROST_QUERY_CODE_ACCESS_MODE";
+const BENCHMARK_MCP_RMCP_ENV: &str = "BIFROST_BENCHMARK_MCP_RMCP";
 
 #[derive(Debug, Clone, Copy)]
 pub struct StderrCursor {
@@ -519,6 +521,13 @@ impl McpSession {
             command.env(SERVER_QUERY_ACCESS_ENV, access_mode);
         } else if let Some(access_mode) = std::env::var_os(BENCHMARK_QUERY_ACCESS_ENV) {
             command.env(SERVER_QUERY_ACCESS_ENV, access_mode);
+        }
+        // Which MCP host serves the session changes what a benchmark measures,
+        // so an ambient dogfooding shell must never choose it silently (#1491).
+        // Only the explicit benchmark-facing selector may set it.
+        command.env_remove(MCP_RMCP_HOST_ENV);
+        if let Some(host) = std::env::var_os(BENCHMARK_MCP_RMCP_ENV) {
+            command.env(MCP_RMCP_HOST_ENV, host);
         }
         let mut child = command
             .stdin(Stdio::piped())

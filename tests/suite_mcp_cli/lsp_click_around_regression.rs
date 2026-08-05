@@ -1364,7 +1364,7 @@ void run() {
     Derived made = <make_derived_qualified_call>core::<make_derived_call>makeDerived();
     made.<made_tick_call>tick();
 
-    int id = 0;
+    int <local_id_decl>id = 0;
     <local_id_read>id++;
 }
 "#,
@@ -1465,11 +1465,13 @@ void run() {
                     "base_ptr_tick_call",
                 ]),
             ),
+            // The local shadow resolves to its own binder (#1569), never to
+            // the same-named member field.
             ClickCase::new(
                 "local value shadow does not resolve as member field",
                 "local_id_read",
                 ClickOperation::Definition,
-                ClickExpectation::Empty,
+                ClickExpectation::Locations(&["local_id_decl"]),
             ),
         ],
     );

@@ -2,7 +2,7 @@ mod common;
 
 use brokk_bifrost_analysis::Language;
 use brokk_bifrost_policy::{PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files};
-use common::InlineTestProject;
+use common::{FixtureCorpus, InlineTestProject};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -27,10 +27,18 @@ fn mcp_server_binary() -> &'static str {
         .expect("Cargo did not provide an MCP server binary")
 }
 
-fn repository_fixture_root(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures")
-        .join(name)
+/// A checked-in fixture corpus, copied outside the repository.
+///
+/// A server rooted at `<checkout>/tests/fixtures/<name>` resolves the
+/// developer's real `.bifrost/cache` database, which every other Bifrost build
+/// on the machine also writes (issue #1588). The copy is a workspace root of
+/// its own, so the spawned server's cache lives and dies with the test.
+fn repository_fixture(name: &str) -> FixtureCorpus {
+    FixtureCorpus::copied_from(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(name),
+    )
 }
 
 fn assert_same_canonical_path(actual: &str, expected: &std::path::Path) {
@@ -250,6 +258,9 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     });
     assert_tool_schema_omits_property(tools, "get_definitions_by_location", "include_tests");
     assert_tool_schema_omits_property(tools, "get_declarations_by_location", "include_tests");
+    // #1575: ranking reports a per-file test verdict instead of taking a
+    // boolean it could only honour by guessing.
+    assert_tool_schema_omits_property(tools, "most_relevant_files", "include_tests");
     assert_definition_lookup_schema_limits_and_requires_location(tools);
     assert_declaration_lookup_schema_limits_and_requires_location(tools);
     assert_tool_schema_contains_property(tools, "scan_usages_by_location", "targets");
@@ -867,7 +878,8 @@ fn bifrost_defaults_to_cwd_searchtools_server() {
 
 #[test]
 fn bifrost_mcp_dispatches_distinct_location_navigation_results() {
-    let fixture_root = repository_fixture_root("testcode-java");
+    let fixture = repository_fixture("testcode-java");
+    let fixture_root = fixture.root().to_path_buf();
     let mut child = spawn_server(&fixture_root, "symbol", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
@@ -1456,7 +1468,8 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
 
 #[test]
 fn bifrost_split_servers_publish_expected_tool_sets() {
-    let fixture_root = repository_fixture_root("testcode-java");
+    let fixture = repository_fixture("testcode-java");
+    let fixture_root = fixture.root().to_path_buf();
     let core_expected = [
         "search_symbols",
         "get_symbol_sources",
@@ -1751,7 +1764,8 @@ fn bifrost_semantic_search_fails_cleanly_without_models() {
 
 #[test]
 fn bifrost_split_servers_reject_tools_outside_their_registry() {
-    let fixture_root = repository_fixture_root("testcode-java");
+    let fixture = repository_fixture("testcode-java");
+    let fixture_root = fixture.root().to_path_buf();
 
     assert_unknown_tool(
         &fixture_root,
@@ -1781,7 +1795,8 @@ fn bifrost_split_servers_reject_tools_outside_their_registry() {
 
 #[test]
 fn bifrost_mcp_rename_symbol_returns_structured_edit_set() {
-    let fixture_root = repository_fixture_root("testcode-java");
+    let fixture = repository_fixture("testcode-java");
+    let fixture_root = fixture.root().to_path_buf();
     let before_a = fs::read_to_string(fixture_root.join("A.java")).expect("read A.java");
     let mut child = spawn_server(&fixture_root, "core", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
@@ -1838,7 +1853,8 @@ fn bifrost_mcp_rename_symbol_returns_structured_edit_set() {
 
 #[test]
 fn bifrost_searchtools_server_supports_runtime_workspace_switch() {
-    let initial_root = repository_fixture_root("testcode-java");
+    let fixture = repository_fixture("testcode-java");
+    let initial_root = fixture.root().to_path_buf();
 
     let switched = TempDir::new().expect("temp dir");
     fs::write(
@@ -1980,7 +1996,8 @@ fn bifrost_searchtools_server_supports_runtime_workspace_switch() {
 
 #[test]
 fn bifrost_searchtools_server_can_hide_line_numbers_in_text_preview() {
-    let fixture_root = repository_fixture_root("testcode-java");
+    let fixture = repository_fixture("testcode-java");
+    let fixture_root = fixture.root().to_path_buf();
 
     let mut child = spawn_server(&fixture_root, "searchtools", &["--no-line-numbers"]);
     let mut stdin = child.stdin.take().expect("stdin");
@@ -2291,7 +2308,8 @@ fn bifrost_mcp_absolute_paths_follow_activated_workspace() {
 
 #[test]
 fn bifrost_mcp_get_summaries_remains_directory_aware() {
-    let fixture_root = repository_fixture_root("testcode-java");
+    let fixture = repository_fixture("testcode-java");
+    let fixture_root = fixture.root().to_path_buf();
 
     let mut child = spawn_server(&fixture_root, "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
@@ -2858,7 +2876,8 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "a withdrawn root must never become analyzer storage"
     );
@@ -3029,7 +3048,8 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "plugin cwd must not become analyzer storage"
     );
@@ -3271,7 +3291,8 @@ fn rootless_mcp_binds_from_codex_sandbox_state_and_revokes_per_call_scope() {
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "plugin cwd must not become analyzer storage"
     );
@@ -3367,7 +3388,8 @@ fn rootless_mcp_rejects_first_codex_workspace_activation_outside_sandbox_on(host
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "rejected activation must not create analyzer state in the escaped root"
     );
@@ -3490,7 +3512,8 @@ fn rootless_mcp_accepts_codex_sandbox_metadata_from_a_compatible_client_on(host:
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "plugin cwd must not become analyzer storage"
     );
@@ -3907,7 +3930,8 @@ fn rootless_mcp_binds_through_mrtr_roots_on_2026_07_28() {
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "MRTR activation must not analyze the process working directory"
     );
@@ -3983,7 +4007,8 @@ fn assert_codex_metadata_cannot_bind_before_initialize(
     );
     assert!(
         !sandbox_root
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "Codex metadata must not grant workspace authority before capability negotiation"
     );
@@ -4058,10 +4083,93 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
         .expect("spawn bifrost")
 }
 
+/// Issue #1491: the benchmark's transport-phase profile contract in
+/// `src/benchmark/mcp_iteration.rs` requires all four `mcp_request.*` phases
+/// (`queue_wait`, `execution`, `response_queue_wait`, `writer_delivery`) in
+/// the stderr trace of a profiled session. The hand-written host emits them
+/// from its writer thread; the rmcp host emits the delivery phases from its
+/// transport wrapper. Asserted over the wire on both hosts so a divergence
+/// fails here rather than in a dogfooded benchmark run.
+#[test]
+fn profiled_tool_calls_emit_all_transport_phases() {
+    for host in McpHost::ALL {
+        profiled_tool_calls_emit_all_transport_phases_on(host);
+    }
+}
+
+fn profiled_tool_calls_emit_all_transport_phases_on(host: McpHost) {
+    let workspace = InlineTestProject::new()
+        .file(
+            "Example.java",
+            "public class Example { public void execute() {} }\n",
+        )
+        .build();
+    let mut child = Command::new(mcp_server_binary())
+        .env("BIFROST_MCP_RMCP", host.switch())
+        .env("BIFROST_SEMANTIC_INDEX", "off")
+        .env("BIFROST_TIMING", "1")
+        .arg("--force-semantic-cpu")
+        .arg("--root")
+        .arg(workspace.root())
+        .arg("--mcp")
+        .arg("searchtools")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn profiled bifrost");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["Example"] }
+            }
+        }),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    // The delivery phases reach stderr only after the response is on stdout.
+    // A second round trip serializes behind that delivery, and waiting for
+    // process exit below guarantees stderr is complete before it is read.
+    let list = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({ "jsonrpc": "2.0", "id": 42, "method": "tools/list" }),
+    );
+    assert!(list["result"]["tools"].is_array(), "{list}");
+
+    drop(stdin);
+    child.wait().expect("bifrost exits after stdin closes");
+    let mut trace = String::new();
+    stderr.read_to_string(&mut trace).expect("read stderr");
+    for phase in [
+        "queue_wait",
+        "execution",
+        "response_queue_wait",
+        "writer_delivery",
+    ] {
+        assert!(
+            trace.contains(&format!("mcp_request.{phase}[search_symbols]")),
+            "host={host:?} stderr trace omitted transport phase `{phase}`:\n{trace}"
+        );
+    }
+}
+
 /// Which MCP host serves a session.
 ///
-/// `rmcp` is the default; the hand-written stack remains reachable with
-/// `BIFROST_MCP_RMCP=off` as a rollback lever. Rootless behaviour -- where all
+/// The hand-written stack is the default. The rmcp stack is selected with
+/// `BIFROST_MCP_RMCP=on`. Rootless behaviour -- where all
 /// client-supplied workspace authorization lives -- is asserted against both,
 /// because whichever one an operator falls back to has to be correct, and
 /// because testing only one host is what let a pre-handshake bypass reach a
@@ -4128,7 +4236,7 @@ fn spawn_rootless_server_on(
 
 /// Spawn a rootless server on the rmcp host specifically.
 ///
-/// For assertions that only hold on the default host: it refuses any
+/// For assertions that only hold on the rmcp host: it refuses any
 /// pre-`initialize` request outright, and it asks a Roots-capable client for
 /// its workspace from the tool call that needs one rather than from a
 /// lifecycle notification. Contracts both hosts must honour should use

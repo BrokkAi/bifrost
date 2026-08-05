@@ -19,6 +19,10 @@ pub(crate) struct CaptureBinding {
     pub name: String,
     pub span: Span,
     pub kind: Option<NormalizedKind>,
+    /// Facts-arena id of the captured node, when the capture bound a fact
+    /// rather than a role target's raw span. Together with the file's
+    /// `ContentIdentity` this is the AST identity occurrence rows join on.
+    pub node: Option<u32>,
 }
 
 /// One match of the query's root pattern: the matched fact plus every capture
@@ -274,7 +278,14 @@ fn eval_pattern_inner_with_name(
     }
 
     if let Some(label) = &pattern.capture
-        && !add_capture(label, fact.span(), Some(fact.kind), facts, captures)
+        && !add_capture(
+            label,
+            fact.span(),
+            Some(fact.kind),
+            Some(node),
+            facts,
+            captures,
+        )
     {
         return false;
     }
@@ -362,7 +373,7 @@ fn eval_span_only(
         return false;
     }
     if let Some(label) = &pattern.capture
-        && !add_capture(label, target.span, None, facts, captures)
+        && !add_capture(label, target.span, None, None, facts, captures)
     {
         return false;
     }
@@ -373,6 +384,7 @@ fn add_capture(
     label: &str,
     span: Span,
     kind: Option<NormalizedKind>,
+    node: Option<u32>,
     facts: &FileFacts,
     captures: &mut Vec<CaptureBinding>,
 ) -> bool {
@@ -387,6 +399,7 @@ fn add_capture(
         name: label.to_string(),
         span,
         kind,
+        node,
     });
     true
 }

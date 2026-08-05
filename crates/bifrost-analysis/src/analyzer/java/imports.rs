@@ -1,7 +1,10 @@
 use super::*;
 use crate::analyzer::jvm::external::JvmExternalType;
-use crate::analyzer::{ImportInfo, build_reverse_file_index};
+use crate::analyzer::{
+    ImportInfo, StructuredImportPath, StructuredImportPathKind, build_reverse_file_index,
+};
 use std::sync::Arc;
+use tree_sitter::Node;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JavaTypeResolution {
@@ -696,26 +699,37 @@ impl JavaAnalyzer {
     }
 }
 
-pub(super) fn parse_import_info(raw: String) -> ImportInfo {
-    let trimmed = raw
-        .trim()
-        .strip_prefix("import ")
-        .unwrap_or(raw.trim())
-        .strip_suffix(';')
-        .unwrap_or(raw.trim())
-        .trim();
-    let trimmed = trimmed.strip_prefix("static ").unwrap_or(trimmed).trim();
-    let is_wildcard = trimmed.ends_with(".*");
-    let identifier = (!is_wildcard)
-        .then(|| trimmed.rsplit('.').next().map(str::to_string))
-        .flatten();
+pub(super) fn parse_import_info(node: Node<'_>, source: &str, raw: String) -> ImportInfo {
+    let mut segments = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if matches!(current.kind(), "identifier" | "type_identifier") {
+            segments.push(node_text(current, source).to_owned());
+            continue;
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    let is_wildcard = node
+        .children(&mut node.walk())
+        .any(|child| child.kind() == "asterisk");
+    let identifier = (!is_wildcard).then(|| segments.last().cloned()).flatten();
 
     ImportInfo {
         raw_snippet: raw,
         is_wildcard,
         identifier,
         alias: None,
-        path: None,
+        path: (!segments.is_empty()).then_some(StructuredImportPath {
+            segments,
+            kind: Some(StructuredImportPathKind::Namespace),
+            lexical_prefixes: Vec::new(),
+            lexical_scopes: Vec::new(),
+            declaration_start_byte: node.start_byte(),
+        }),
     }
 }
 

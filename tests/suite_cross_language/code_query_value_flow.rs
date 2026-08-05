@@ -28,19 +28,17 @@ use crate::value_flow_conformance::{
     direct_witness_symbol_sequences, resolve_value_flow_conformance_case,
 };
 use crate::value_flow_scenarios::{
-    with_c_exact_helper, with_cpp_exact_helper, with_csharp_exact_helper, with_go_exact_helper,
-    with_java_ambiguous_call_negative, with_java_branch_merge, with_java_capture_flow,
-    with_java_cleanup_flow, with_java_early_return, with_java_exact_helper,
-    with_java_exceptional_flow, with_java_field_access_flow, with_java_field_alias_flow,
-    with_java_index_access_flow, with_java_loop_exit, with_java_over_bound_field_flow,
-    with_java_receiver_flow, with_java_split_exact_helper, with_java_two_matched_calls,
-    with_java_unresolved_call_negative, with_javascript_exact_helper, with_kotlin_exact_helper,
-    with_php_exact_helper, with_python_exact_helper, with_ruby_exact_helper,
-    with_rust_exact_helper, with_scala_exact_helper, with_typescript_ambiguous_call_negative,
-    with_typescript_branch_merge, with_typescript_capture_flow, with_typescript_cleanup_flow,
-    with_typescript_early_return, with_typescript_exact_helper, with_typescript_exceptional_flow,
-    with_typescript_field_access_flow, with_typescript_field_alias_flow,
-    with_typescript_index_access_flow, with_typescript_loop_exit,
+    DirectReadyValueFlowScenario, assert_direct_ready_value_flow_scenario_inventory,
+    direct_ready_value_flow_scenario_entries, with_java_ambiguous_call_negative,
+    with_java_branch_merge, with_java_capture_flow, with_java_cleanup_flow, with_java_early_return,
+    with_java_exact_helper, with_java_exceptional_flow, with_java_field_access_flow,
+    with_java_field_alias_flow, with_java_index_access_flow, with_java_loop_exit,
+    with_java_over_bound_field_flow, with_java_receiver_flow, with_java_split_exact_helper,
+    with_java_two_matched_calls, with_java_unresolved_call_negative,
+    with_typescript_ambiguous_call_negative, with_typescript_branch_merge,
+    with_typescript_capture_flow, with_typescript_cleanup_flow, with_typescript_early_return,
+    with_typescript_exceptional_flow, with_typescript_field_access_flow,
+    with_typescript_field_alias_flow, with_typescript_index_access_flow, with_typescript_loop_exit,
     with_typescript_over_bound_field_flow, with_typescript_receiver_flow,
     with_typescript_two_matched_calls, with_typescript_unresolved_call_negative,
 };
@@ -1645,69 +1643,28 @@ fn independently_allocated_equal_plans_share_registration_identity() {
     assert_eq!(registrations.registration_count(), 1);
 }
 
-#[test]
-fn java_helper_scenario_runs_through_direct_and_public_queries() {
-    with_java_exact_helper(assert_shared_helper_scenario);
+macro_rules! define_public_direct_ready_value_flow_tests {
+    ($(($scenario:ident, $direct_test:ident, $public_test:ident),)*) => {
+        $(
+            #[test]
+            fn $public_test() {
+                let scenario = DirectReadyValueFlowScenario::$scenario;
+                scenario.with_case(|case| {
+                    let seed_kind = match scenario {
+                        DirectReadyValueFlowScenario::Ruby => "function",
+                        _ => shared_scenario_seed_kind(case),
+                    };
+                    assert_shared_helper_scenario_with_seed_kind(case, seed_kind);
+                });
+            }
+        )*
+    };
 }
+direct_ready_value_flow_scenario_entries!(define_public_direct_ready_value_flow_tests);
 
 #[test]
-fn typescript_helper_scenario_runs_through_direct_and_public_queries() {
-    with_typescript_exact_helper(assert_shared_helper_scenario);
-}
-
-#[test]
-fn javascript_helper_scenario_runs_through_direct_and_public_queries() {
-    with_javascript_exact_helper(assert_shared_helper_scenario);
-}
-
-#[test]
-fn go_helper_scenario_runs_through_direct_and_public_queries() {
-    with_go_exact_helper(assert_shared_helper_scenario);
-}
-
-#[test]
-fn php_helper_scenario_runs_through_direct_and_public_queries() {
-    with_php_exact_helper(assert_shared_helper_scenario);
-}
-
-#[test]
-fn ruby_helper_scenario_runs_through_direct_and_public_queries() {
-    with_ruby_exact_helper(|case| assert_shared_helper_scenario_with_seed_kind(case, "function"));
-}
-
-#[test]
-fn csharp_helper_scenario_runs_through_direct_and_public_queries() {
-    with_csharp_exact_helper(assert_shared_helper_scenario);
-}
-
-#[test]
-fn rust_helper_scenario_runs_through_direct_and_public_queries() {
-    with_rust_exact_helper(assert_shared_helper_scenario);
-}
-
-#[test]
-fn python_helper_scenario_runs_through_direct_and_public_queries() {
-    with_python_exact_helper(assert_shared_helper_scenario);
-}
-
-#[test]
-fn scala_helper_scenario_runs_through_direct_and_public_queries() {
-    with_scala_exact_helper(assert_shared_helper_scenario);
-}
-
-#[test]
-fn kotlin_helper_scenario_runs_through_direct_and_public_queries() {
-    with_kotlin_exact_helper(assert_shared_helper_scenario);
-}
-
-#[test]
-fn c_helper_scenario_runs_through_direct_and_public_queries() {
-    with_c_exact_helper(assert_shared_helper_scenario);
-}
-
-#[test]
-fn cpp_helper_scenario_runs_through_direct_and_public_queries() {
-    with_cpp_exact_helper(assert_shared_helper_scenario);
+fn direct_ready_value_flow_scenario_inventory_is_complete() {
+    assert_direct_ready_value_flow_scenario_inventory();
 }
 
 #[test]

@@ -24,7 +24,7 @@ For a result that another person can compare, publish all of the following:
 1. Bifrost version and full commit, build profile, feature set, operating system, CPU, memory, and accelerator.
 2. Corpus repository URL, exact commit, included roots, generated/vendor exclusions, language/file counts, and total indexed bytes.
 3. The exact command, MCP composition, environment variables, query files, and execution limits.
-4. A cold-start definition that removes or relocates both the repository `.bifrost/cache/bifrost_cache.db` and any deliberately tested process state. Do not call a new process “cold” while reusing a warm persistent cache.
+4. A cold-start definition that removes or relocates both the repository `.bifrost/cache/bifrost_cache.v<N>.db` stores and any deliberately tested process state. Do not call a new process “cold” while reusing a warm persistent cache.
 5. A warm-run definition: how many warmups ran, whether the same process remained alive, and whether the workspace changed.
 6. Wall time, CPU time, and peak resident memory for each phase you report: startup/index-ready, first query, and repeated query. Publish individual samples plus the aggregation method, not only the best run.
 

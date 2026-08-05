@@ -6,6 +6,7 @@ mod inline_project;
 pub mod lsp_click;
 #[path = "../../crates/bifrost-lsp/tests/common/lsp_client.rs"]
 pub mod lsp_client;
+pub mod scratch_cache;
 pub mod search_tools;
 pub mod semantic_graph;
 pub mod usage_graph;
@@ -16,7 +17,6 @@ use brokk_bifrost::{
 };
 use pretty_assertions::assert_eq;
 use serde_json::Value;
-use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -24,8 +24,18 @@ use tempfile::TempDir;
 #[allow(dead_code)]
 pub fn copy_fixture_to_temp(name: &str) -> TempDir {
     let temp = TempDir::new().unwrap();
-    copy_dir_recursively(&fixture_root(name), temp.path()).unwrap();
+    scratch_cache::copy_dir_recursively(&fixture_root(name), temp.path()).unwrap();
     temp
+}
+
+/// A checked-in fixture corpus, materialized outside the repository.
+///
+/// Prefer this over a workspace root under `tests/fixtures`: a persisted
+/// workspace rooted inside the checkout opens the developer's real
+/// `.bifrost/cache` database (issue #1588). See [`scratch_cache`].
+#[allow(dead_code)]
+pub fn fixture_corpus(name: &str) -> FixtureCorpus {
+    FixtureCorpus::copied_from(&fixture_root(name))
 }
 
 #[allow(dead_code)]
@@ -36,22 +46,11 @@ fn fixture_root(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn copy_dir_recursively(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let target = destination.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_recursively(&entry.path(), &target)?;
-        } else {
-            fs::copy(entry.path(), target)?;
-        }
-    }
-    Ok(())
-}
-
 #[allow(unused_imports)]
 pub use inline_project::{BuiltInlineTestProject, InlineTestProject};
+
+#[allow(unused_imports)]
+pub use scratch_cache::{FixtureCorpus, ScratchCacheDir};
 
 #[allow(unused_imports)]
 pub use search_tools::{

@@ -3,9 +3,11 @@
 use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    first_named_child,
+    field_name_in_parent, first_named_child, is_field_of,
 };
-use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, StructuralSpec};
+use crate::analyzer::structural::{
+    NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
+};
 use tree_sitter::Node;
 
 #[derive(Debug, Default)]
@@ -13,8 +15,19 @@ pub(crate) struct RustStructuralSpec;
 
 pub(crate) static RUST_STRUCTURAL_SPEC: RustStructuralSpec = RustStructuralSpec;
 
+fn macro_arguments(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("arguments").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "token_tree")
+    })
+}
+
 const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("call_expression", NormalizedKind::Call),
+    ("macro_invocation", NormalizedKind::Call),
+    ("attribute", NormalizedKind::Decorator),
+    ("field_declaration", NormalizedKind::Declaration),
     ("field_expression", NormalizedKind::FieldAccess),
     ("function_item", NormalizedKind::Function),
     ("function_signature_item", NormalizedKind::Function),
@@ -43,8 +56,8 @@ const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("boolean_literal", NormalizedKind::BooleanLiteral),
     ("return_expression", NormalizedKind::Return),
     ("if_expression", NormalizedKind::If),
-    ("for_expression", NormalizedKind::Loop),
-    ("while_expression", NormalizedKind::Loop),
+    ("for_expression", NormalizedKind::ForLoop),
+    ("while_expression", NormalizedKind::WhileLoop),
     ("loop_expression", NormalizedKind::Loop),
 ];
 
@@ -142,6 +155,139 @@ fn function_item_is_method(node: Node<'_>) -> bool {
     false
 }
 
+fn is_inside_derive_attribute(node: Node<'_>, source: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "token_tree" => current = parent.parent(),
+            "attribute" => {
+                return first_named_child(parent).is_some_and(|name| {
+                    name.kind() == "identifier" && name.utf8_text(source.as_bytes()) == Ok("derive")
+                });
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn derive_path_module(node: Node<'_>) -> Option<Node<'_>> {
+    let separator = node.prev_sibling()?;
+    (separator.kind() == "::")
+        .then(|| separator.prev_named_sibling())
+        .flatten()
+        .filter(|module| module.kind() == "identifier")
+}
+
+static RUST_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE
+    .supported(OccurrenceRole::DeclarationName)
+    .supported(OccurrenceRole::Binder)
+    .supported(OccurrenceRole::LabelOrKey)
+    .supported(OccurrenceRole::TypeOperand)
+    .supported(OccurrenceRole::PathSegment)
+    .supported(OccurrenceRole::ImportAlias)
+    .supported(OccurrenceRole::ImportTarget)
+    .supported(OccurrenceRole::ReceiverPosition)
+    .supported(OccurrenceRole::MemberPosition)
+    .supported(OccurrenceRole::PatternPosition)
+    .supported(OccurrenceRole::ValueReference);
+
+const RUST_DECLARATION_HEADS: &[&str] = &[
+    "function_item",
+    "function_signature_item",
+    "struct_item",
+    "enum_item",
+    "union_item",
+    "trait_item",
+    "type_item",
+    "const_item",
+    "static_item",
+    "mod_item",
+    "macro_definition",
+    "field_declaration",
+    "enum_variant",
+    "associated_type",
+    "extern_crate_declaration",
+    "type_parameter",
+    "const_parameter",
+];
+
+/// Whether this node sits inside a `use` tree, which is what separates an
+/// import target from an ordinary path reference spelled the same way.
+fn rust_is_in_use_tree(node: Node<'_>) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "use_declaration" => return true,
+            "scoped_identifier" | "scoped_use_list" | "use_list" | "use_as_clause"
+            | "use_wildcard" => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Classify one Rust identifier token by its AST position.
+///
+/// Raw identifiers need no special handling here: `r#type` lexes as a single
+/// `identifier` token, so `let r#type = ...` reaches the same binder arm as any
+/// other let pattern. Stripping the `r#` prefix is a spelling concern, not a
+/// role concern.
+fn rust_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
+    if !matches!(
+        node.kind(),
+        "identifier" | "field_identifier" | "type_identifier"
+    ) {
+        return None;
+    }
+
+    let mut anchor = node;
+    let mut parent = anchor.parent()?;
+    while matches!(
+        parent.kind(),
+        "scoped_identifier" | "scoped_type_identifier"
+    ) {
+        if !is_field_of(parent, anchor, "name") {
+            return Some(OccurrenceRole::PathSegment);
+        }
+        anchor = parent;
+        parent = anchor.parent()?;
+    }
+
+    let field = field_name_in_parent(parent, anchor);
+    let parent_kind = parent.kind();
+    let role = match parent_kind {
+        "use_as_clause" if field == Some("alias") => OccurrenceRole::ImportAlias,
+        "scoped_use_list" if field == Some("path") => OccurrenceRole::PathSegment,
+        _ if rust_is_in_use_tree(anchor) => OccurrenceRole::ImportTarget,
+        _ if field == Some("name") && RUST_DECLARATION_HEADS.contains(&parent_kind) => {
+            OccurrenceRole::DeclarationName
+        }
+        "parameter" | "let_declaration" | "for_expression" if field == Some("pattern") => {
+            OccurrenceRole::Binder
+        }
+        "closure_parameters" | "ref_pattern" | "mut_pattern" | "tuple_pattern"
+        | "slice_pattern" | "captured_pattern" => OccurrenceRole::Binder,
+        "field_pattern" if field == Some("pattern") => OccurrenceRole::Binder,
+        "field_pattern" if field == Some("name") => OccurrenceRole::LabelOrKey,
+        "tuple_struct_pattern" => match field {
+            Some("type") => OccurrenceRole::PatternPosition,
+            _ => OccurrenceRole::Binder,
+        },
+        "struct_pattern" if field == Some("type") => OccurrenceRole::PatternPosition,
+        "field_expression" => match field {
+            Some("field") => OccurrenceRole::MemberPosition,
+            Some("value") => OccurrenceRole::ReceiverPosition,
+            _ => OccurrenceRole::ValueReference,
+        },
+        "field_initializer" if field == Some("field") => OccurrenceRole::LabelOrKey,
+        _ if node.kind() == "type_identifier" => OccurrenceRole::TypeOperand,
+        _ if node.kind() == "field_identifier" => OccurrenceRole::MemberPosition,
+        _ => OccurrenceRole::ValueReference,
+    };
+    Some(role)
+}
+
 impl StructuralSpec for RustStructuralSpec {
     fn language(&self) -> Language {
         Language::Rust
@@ -156,9 +302,14 @@ impl StructuralSpec for RustStructuralSpec {
         node: Node<'_>,
         kind: NormalizedKind,
         _enclosing: Option<NormalizedKind>,
-        _source: &str,
+        source: &str,
     ) -> NormalizedKind {
-        if kind == NormalizedKind::Function && function_item_is_method(node) {
+        if kind == NormalizedKind::Identifier
+            && node.kind() == "identifier"
+            && is_inside_derive_attribute(node, source)
+        {
+            NormalizedKind::Decorator
+        } else if kind == NormalizedKind::Function && function_item_is_method(node) {
             NormalizedKind::Method
         } else {
             kind
@@ -195,10 +346,55 @@ impl StructuralSpec for RustStructuralSpec {
         !matches!(role, Role::Kwarg | Role::Decorator)
     }
 
+    fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
+        &RUST_OCCURRENCE_ROLE_SUPPORT
+    }
+
+    /// `r#type` is the identifier `type` wearing the raw-identifier escape the
+    /// lexer already accepted as one token.
+    fn decode_spelling(&self, raw: &str) -> Option<String> {
+        raw.strip_prefix("r#").map(str::to_owned)
+    }
+
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
+        if let Some(role) = rust_occurrence_role(node) {
+            sink.occurrence_role(node, role);
+        }
         match kind {
+            NormalizedKind::Decorator => {
+                let name = if node.kind() == "attribute" {
+                    first_named_child(node)
+                } else {
+                    expression_name_node(node)
+                };
+                if let Some(name) = name {
+                    sink.set_name(name);
+                }
+                if node.kind() == "attribute"
+                    && let Some(value) = node.child_by_field_name("value")
+                {
+                    sink.role(Role::Arg, value);
+                }
+                if node.kind() == "identifier"
+                    && let Some(module) = derive_path_module(node)
+                {
+                    sink.role_named(Role::Module, module, module);
+                }
+            }
+            NormalizedKind::Declaration if node.kind() == "field_declaration" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    sink.set_name(name);
+                }
+            }
             NormalizedKind::Call => {
-                if let Some(function) = node.child_by_field_name("function") {
+                if node.kind() == "macro_invocation" {
+                    if let Some(macro_name) = node.child_by_field_name("macro") {
+                        attach_terminal_callee(sink, macro_name, expression_name_node(macro_name));
+                    }
+                    if let Some(arguments) = macro_arguments(node) {
+                        attach_positional_argument_roles(sink, arguments, expression_name_node);
+                    }
+                } else if let Some(function) = node.child_by_field_name("function") {
                     attach_terminal_callee(sink, function, expression_name_node(function));
                     let target = call_function_target(function);
                     if target.kind() == "field_expression"
@@ -213,7 +409,9 @@ impl StructuralSpec for RustStructuralSpec {
                     }
                     attach_scoped_receiver(sink, target);
                 }
-                if let Some(arguments) = node.child_by_field_name("arguments") {
+                if node.kind() != "macro_invocation"
+                    && let Some(arguments) = node.child_by_field_name("arguments")
+                {
                     attach_positional_argument_roles(sink, arguments, expression_name_node);
                 }
             }
@@ -302,6 +500,137 @@ impl StructuralSpec for RustStructuralSpec {
 #[cfg(test)]
 mod structural_spec_tests {
     use super::*;
+
+    use crate::analyzer::structural::adapter_helpers::{
+        assert_occurrence_role, occurrence_roles_of,
+    };
+
+    /// Raw identifiers are the Rust-specific trap #1473 names: `r#type` is one
+    /// `identifier` token in a pattern position, so it must classify as a
+    /// binder exactly like any other local, without any prefix stripping.
+    #[test]
+    fn rust_classifies_raw_identifier_binders_declarations_and_use_trees() {
+        let source = concat!(
+            "use std::collections::HashMap as Map;\n",
+            "\n",
+            "struct Widget {\n",
+            "    label: String,\n",
+            "}\n",
+            "\n",
+            "impl Widget {\n",
+            "    fn render(&self, r#type: Map) -> String {\n",
+            "        self.label.clone()\n",
+            "    }\n",
+            "}\n",
+        );
+        let found = occurrence_roles_of(
+            &RUST_STRUCTURAL_SPEC,
+            &tree_sitter_rust::LANGUAGE.into(),
+            source,
+        );
+
+        let at = |needle: &str| source.find(needle).expect("fixture token");
+        assert_occurrence_role(&found, at("std"), OccurrenceRole::PathSegment);
+        assert_occurrence_role(&found, at("collections"), OccurrenceRole::PathSegment);
+        assert_occurrence_role(&found, at("HashMap"), OccurrenceRole::ImportTarget);
+        assert_occurrence_role(&found, at("Map;"), OccurrenceRole::ImportAlias);
+        assert_occurrence_role(&found, at("Widget {"), OccurrenceRole::DeclarationName);
+        assert_occurrence_role(&found, at("label: String"), OccurrenceRole::DeclarationName);
+        assert_occurrence_role(&found, at("String,"), OccurrenceRole::TypeOperand);
+        assert_occurrence_role(&found, at("render"), OccurrenceRole::DeclarationName);
+        assert_occurrence_role(&found, at("r#type"), OccurrenceRole::Binder);
+        assert_occurrence_role(&found, at("Map)"), OccurrenceRole::TypeOperand);
+        assert_occurrence_role(&found, at("label.clone"), OccurrenceRole::MemberPosition);
+        assert_occurrence_role(&found, at("clone()"), OccurrenceRole::MemberPosition);
+    }
+
+    #[test]
+    fn rust_emits_only_roles_it_declares_as_supported() {
+        let source = "fn f(a: u32) -> u32 { let b = a; b }\n";
+        let found = occurrence_roles_of(
+            &RUST_STRUCTURAL_SPEC,
+            &tree_sitter_rust::LANGUAGE.into(),
+            source,
+        );
+        assert!(!found.is_empty());
+        for (_, text, role) in &found {
+            assert!(
+                RUST_STRUCTURAL_SPEC
+                    .occurrence_role_support()
+                    .is_supported(*role),
+                "rust emitted undeclared role {role:?} for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_retains_structured_derive_and_field_attribute_facts() {
+        let source = concat!(
+            "use getset::Getters;\n",
+            "#[derive(Getters)]\n",
+            "struct Record {\n",
+            "    #[get = \"pub\"]\n",
+            "    value: String,\n",
+            "}\n",
+        );
+        let facts = crate::analyzer::structural::extract::extract_file_facts(
+            &RUST_STRUCTURAL_SPEC,
+            &tree_sitter_rust::LANGUAGE.into(),
+            source,
+        )
+        .unwrap();
+        let derive = facts
+            .nodes()
+            .iter()
+            .enumerate()
+            .find(|(_, node)| {
+                node.kind == NormalizedKind::Decorator
+                    && node
+                        .name
+                        .is_some_and(|name| name.text(facts.source()) == "Getters")
+            })
+            .map(|(index, _)| u32::try_from(index).unwrap())
+            .expect("derive path decorator");
+        assert_eq!(
+            facts
+                .role_targets(derive, Role::Module)
+                .filter_map(|target| target.name)
+                .map(|name| name.text(facts.source()))
+                .collect::<Vec<_>>(),
+            Vec::<&str>::new()
+        );
+        assert!(facts.nodes().iter().any(|node| {
+            node.kind == NormalizedKind::Decorator
+                && node
+                    .name
+                    .is_some_and(|name| name.text(facts.source()) == "get")
+        }));
+        let getter = facts
+            .nodes()
+            .iter()
+            .enumerate()
+            .find(|(_, node)| {
+                node.kind == NormalizedKind::Decorator
+                    && node
+                        .name
+                        .is_some_and(|name| name.text(facts.source()) == "get")
+            })
+            .map(|(index, _)| u32::try_from(index).unwrap())
+            .expect("get attribute");
+        assert_eq!(
+            facts
+                .role_targets(getter, Role::Arg)
+                .map(|target| target.span.text(facts.source()))
+                .collect::<Vec<_>>(),
+            vec!["\"pub\""]
+        );
+        assert!(facts.nodes().iter().any(|node| {
+            node.kind == NormalizedKind::Declaration
+                && node
+                    .name
+                    .is_some_and(|name| name.text(facts.source()) == "value")
+        }));
+    }
 
     #[test]
     fn rust_kind_table_matches_grammar() {

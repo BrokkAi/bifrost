@@ -1,35 +1,40 @@
 use crate::value_flow_conformance::assert_value_flow_conformance;
 use crate::value_flow_scenarios::{
-    with_c_exact_helper, with_cpp_exact_helper, with_csharp_exact_helper, with_go_exact_helper,
-    with_java_ambiguous_call_negative, with_java_branch_merge, with_java_capture_flow,
-    with_java_cleanup_flow, with_java_early_return, with_java_exact_helper,
+    DirectReadyValueFlowScenario, assert_direct_ready_value_flow_scenario_inventory,
+    direct_ready_value_flow_scenario_entries, with_java_ambiguous_call_negative,
+    with_java_branch_merge, with_java_capture_flow, with_java_cleanup_flow, with_java_early_return,
     with_java_exceptional_flow, with_java_field_access_flow, with_java_field_alias_flow,
     with_java_index_access_flow, with_java_loop_exit, with_java_over_bound_field_flow,
     with_java_receiver_flow, with_java_split_exact_helper, with_java_two_matched_calls,
-    with_java_unresolved_call_negative, with_javascript_exact_helper, with_kotlin_exact_helper,
-    with_php_exact_helper, with_python_exact_helper, with_ruby_exact_helper,
-    with_rust_exact_helper, with_scala_exact_helper, with_typescript_ambiguous_call_negative,
+    with_java_unresolved_call_negative, with_typescript_ambiguous_call_negative,
     with_typescript_branch_merge, with_typescript_capture_flow, with_typescript_cleanup_flow,
-    with_typescript_early_return, with_typescript_exact_helper, with_typescript_exceptional_flow,
+    with_typescript_early_return, with_typescript_exceptional_flow,
     with_typescript_field_access_flow, with_typescript_field_alias_flow,
     with_typescript_index_access_flow, with_typescript_loop_exit,
     with_typescript_over_bound_field_flow, with_typescript_receiver_flow,
     with_typescript_two_matched_calls, with_typescript_unresolved_call_negative,
 };
 
+macro_rules! define_direct_ready_value_flow_tests {
+    ($(($scenario:ident, $direct_test:ident, $public_test:ident),)*) => {
+        $(
+            #[test]
+            fn $direct_test() {
+                DirectReadyValueFlowScenario::$scenario.with_case(assert_value_flow_conformance);
+            }
+        )*
+    };
+}
+direct_ready_value_flow_scenario_entries!(define_direct_ready_value_flow_tests);
+
 #[test]
-fn java_exact_helper_flow() {
-    with_java_exact_helper(assert_value_flow_conformance);
+fn direct_ready_value_flow_scenario_inventory_is_complete() {
+    assert_direct_ready_value_flow_scenario_inventory();
 }
 
 #[test]
 fn java_split_file_exact_helper_flow() {
     with_java_split_exact_helper(assert_value_flow_conformance);
-}
-
-#[test]
-fn typescript_exact_helper_flow() {
-    with_typescript_exact_helper(assert_value_flow_conformance);
 }
 
 #[test]
@@ -170,59 +175,4 @@ fn java_ambiguous_call_does_not_invent_a_meeting() {
 #[test]
 fn typescript_ambiguous_call_does_not_invent_a_meeting() {
     with_typescript_ambiguous_call_negative(assert_value_flow_conformance);
-}
-
-#[test]
-fn csharp_exact_helper_flow() {
-    with_csharp_exact_helper(assert_value_flow_conformance);
-}
-
-#[test]
-fn javascript_exact_helper_flow() {
-    with_javascript_exact_helper(assert_value_flow_conformance);
-}
-
-#[test]
-fn rust_exact_helper_flow() {
-    with_rust_exact_helper(assert_value_flow_conformance);
-}
-
-#[test]
-fn python_exact_helper_flow() {
-    with_python_exact_helper(assert_value_flow_conformance);
-}
-
-#[test]
-fn php_exact_helper_flow() {
-    with_php_exact_helper(assert_value_flow_conformance);
-}
-
-#[test]
-fn ruby_exact_helper_flow() {
-    with_ruby_exact_helper(assert_value_flow_conformance);
-}
-
-#[test]
-fn scala_exact_helper_flow() {
-    with_scala_exact_helper(assert_value_flow_conformance);
-}
-
-#[test]
-fn kotlin_exact_helper_flow() {
-    with_kotlin_exact_helper(assert_value_flow_conformance);
-}
-
-#[test]
-fn c_exact_helper_flow_through_header_declaration() {
-    with_c_exact_helper(assert_value_flow_conformance);
-}
-
-#[test]
-fn cpp_exact_helper_flow_through_header_declaration() {
-    with_cpp_exact_helper(assert_value_flow_conformance);
-}
-
-#[test]
-fn go_exact_helper_flow() {
-    with_go_exact_helper(assert_value_flow_conformance);
 }
