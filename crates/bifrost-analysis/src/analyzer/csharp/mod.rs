@@ -1597,7 +1597,7 @@ impl IAnalyzer for CSharpAnalyzer {
         if !code_unit.is_class() {
             return None;
         }
-        Some(self.partial_type_parts(code_unit))
+        Some(graph_support::partial_type_parts(self, code_unit))
     }
 
     fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
