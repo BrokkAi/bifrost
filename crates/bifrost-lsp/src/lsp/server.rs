@@ -1350,6 +1350,8 @@ fn run_rql_query_result(
                     CodeQueryResultValue::CallSite { value } => &value.path,
                     CodeQueryResultValue::ExpressionSite { value } => &value.path,
                     CodeQueryResultValue::ReceiverAnalysis { value } => &value.path,
+                    CodeQueryResultValue::ReceiverOutcome { value } => &value.path,
+                    CodeQueryResultValue::ReceiverEvidence { value } => &value.path,
                     CodeQueryResultValue::Occurrence { value } => &value.path,
                     CodeQueryResultValue::LexicalScope { value } => &value.path,
                     CodeQueryResultValue::Binding { value } => &value.path,
@@ -1938,6 +1940,12 @@ fn handle_notification(
             }
             if !changed.is_empty() {
                 state.workspace = state.workspace.update(&changed);
+                // The new analyzer generation has no retained dependency proof
+                // until the host activation lifecycle publishes it. Refresh all
+                // prior diagnostic documents now, so stale errors cannot remain.
+                for uri in state.published_diagnostic_uris.clone() {
+                    publish_diagnostics_for_state(connection, state, &uri)?;
+                }
             }
             Ok(())
         }

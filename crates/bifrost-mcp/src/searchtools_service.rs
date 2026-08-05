@@ -2700,6 +2700,10 @@ impl SearchToolsService {
             .analyzer()
             .project()
             .invalidate_cached_file_listing();
+        session
+            .snapshot
+            .analyzer()
+            .invalidate_cached_file_identities();
         let next = session.snapshot.update_all();
         session.snapshot = Arc::new(next);
         #[cfg(feature = "nlp")]

@@ -331,6 +331,20 @@ impl DependencyDiscoveryOutcome {
             cancelled: false,
         }
     }
+
+    /// Convert discovery completeness into the shared diagnostic suppression
+    /// vocabulary. This does not start discovery or read the filesystem.
+    pub fn semantic_diagnostic_incomplete_reasons(
+        &self,
+    ) -> Vec<crate::analyzer::SemanticDiagnosticIncompleteReason> {
+        if self.cancelled {
+            vec![crate::analyzer::SemanticDiagnosticIncompleteReason::Cancelled]
+        } else if !self.complete {
+            vec![crate::analyzer::SemanticDiagnosticIncompleteReason::Truncated]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 impl std::ops::Deref for DependencyDiscoveryOutcome {
@@ -405,6 +419,24 @@ impl DependencyDiscoveryEvidence {
             prefix = head;
         }
         false
+    }
+}
+
+/// Read retained discovery evidence for a diagnostic request. A missing value
+/// is incomplete external evidence. This function never starts discovery.
+pub fn dependency_discovery_incomplete_reasons(
+    evidence: Option<&DependencyDiscoveryEvidence>,
+) -> Vec<crate::analyzer::SemanticDiagnosticIncompleteReason> {
+    match evidence {
+        None => vec![
+            crate::analyzer::SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                boundary: crate::analyzer::structural::BoundaryStatus::ExternalUnknown,
+            },
+        ],
+        Some(evidence) if evidence.truncated() => {
+            vec![crate::analyzer::SemanticDiagnosticIncompleteReason::Truncated]
+        }
+        Some(_) => Vec::new(),
     }
 }
 
@@ -1139,4 +1171,56 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     value[..end].to_owned()
+}
+
+#[cfg(test)]
+mod semantic_diagnostic_evidence_tests {
+    use super::*;
+    use crate::analyzer::{SemanticDiagnosticIncompleteReason, structural::BoundaryStatus};
+
+    #[test]
+    fn discovery_outcome_maps_cancelled_and_truncated_states() {
+        let mut outcome = DependencyDiscoveryOutcome::complete(Vec::new());
+        assert!(outcome.semantic_diagnostic_incomplete_reasons().is_empty());
+
+        outcome.complete = false;
+        assert_eq!(
+            outcome.semantic_diagnostic_incomplete_reasons(),
+            vec![SemanticDiagnosticIncompleteReason::Truncated]
+        );
+
+        outcome.cancelled = true;
+        assert_eq!(
+            outcome.semantic_diagnostic_incomplete_reasons(),
+            vec![SemanticDiagnosticIncompleteReason::Cancelled]
+        );
+    }
+
+    #[test]
+    fn retained_discovery_evidence_distinguishes_missing_and_truncated() {
+        assert_eq!(
+            dependency_discovery_incomplete_reasons(None),
+            vec![
+                SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                    boundary: BoundaryStatus::ExternalUnknown,
+                }
+            ]
+        );
+
+        let mut outcome = DependencyDiscoveryOutcome::complete(Vec::new());
+        assert!(
+            dependency_discovery_incomplete_reasons(Some(
+                &DependencyDiscoveryEvidence::from_outcome(&outcome)
+            ))
+            .is_empty()
+        );
+
+        outcome.complete = false;
+        assert_eq!(
+            dependency_discovery_incomplete_reasons(Some(
+                &DependencyDiscoveryEvidence::from_outcome(&outcome)
+            )),
+            vec![SemanticDiagnosticIncompleteReason::Truncated]
+        );
+    }
 }

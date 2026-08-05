@@ -272,7 +272,7 @@ impl JavaAnalyzer {
     /// so the caller can report the ambiguity, mirroring what
     /// `resolve_external_imports` already expresses for external targets by
     /// refusing to pick one (issue #1602).
-    fn resolve_type_name_with(
+    pub(crate) fn resolve_type_name_with(
         &self,
         file: &ProjectFile,
         raw_name: &str,

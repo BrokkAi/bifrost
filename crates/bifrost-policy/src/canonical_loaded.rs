@@ -102,13 +102,32 @@ pub(crate) fn resolved_policy_to_json(
         (PolicyAnalysis::Taint { .. }, ResolvedPolicyAnalysisRef::Taint { spec }) => {
             resolved_taint_to_json(spec, selectors)?
         }
-        (PolicyAnalysis::Assertion { .. }, ResolvedPolicyAnalysisRef::Assertion) => {
-            let selector = selector_at(selectors, ASSERTION_SUBJECT_SELECTOR_PATH)?;
+        (PolicyAnalysis::Assertion { spec }, ResolvedPolicyAnalysisRef::Assertion) => {
             let mut value = super::canonical::policy_analysis_authored_json(&definition.analysis);
-            value
-                .as_object_mut()
-                .expect("the assertion analysis projection is an object")
-                .insert("subject".to_string(), resolved_selector_to_json(selector));
+            if let Some(plan) = &spec.relational {
+                let bindings = value
+                    .get_mut("plan")
+                    .and_then(|value| value.get_mut("bindings"))
+                    .and_then(Value::as_array_mut)
+                    .expect("the relational assertion projection has bindings");
+                for (binding, projected) in plan.bindings.iter().zip(bindings) {
+                    if !matches!(binding.source, RowBindingSource::Query(_)) {
+                        continue;
+                    }
+                    let selector =
+                        selector_at(selectors, &relational_binding_selector_path(&binding.name))?;
+                    projected
+                        .as_object_mut()
+                        .expect("a relational binding projection is an object")
+                        .insert("query".to_string(), resolved_selector_to_json(selector));
+                }
+            } else {
+                let selector = selector_at(selectors, ASSERTION_SUBJECT_SELECTOR_PATH)?;
+                value
+                    .as_object_mut()
+                    .expect("the assertion analysis projection is an object")
+                    .insert("subject".to_string(), resolved_selector_to_json(selector));
+            }
             value
         }
         (PolicyAnalysis::Typestate { .. }, ResolvedPolicyAnalysisRef::Typestate { spec }) => {

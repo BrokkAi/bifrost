@@ -1,3 +1,4 @@
+use super::results::{ALL_DETAILED_CODE_QUERY_DOMAINS, CodeQueryRowScalarRef};
 use super::*;
 use crate::analyzer::structural::CodeQuery;
 use crate::analyzer::usages::get_definition::ResolvedReferenceSite;
@@ -4633,6 +4634,194 @@ service.run();
         file_result.results[0].value,
         CodeQueryResultValue::File { ref value } if value.path == "app.ts"
     ));
+
+    let outcome_query = CodeQuery::from_json(&json!({
+        "match": { "kind": "call", "callee": { "name": "run" } },
+        "steps": [
+            { "op": "receiver_targets" },
+            { "op": "receiver_outcome" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("outcome query");
+    let outcome = execute_with_receiver_budget_for_test(
+        &analyzer,
+        &outcome_query,
+        ReceiverAnalysisBudget::tiny(),
+    );
+    assert!(matches!(
+        outcome.results.as_slice(),
+        [CodeQueryResultItem {
+            value: CodeQueryResultValue::ReceiverOutcome { value },
+            ..
+        }] if value.outcome == "exceeded_budget"
+            && value.coverage == "truncated"
+            && value.candidate_count == 0
+            && value.site_id == value.id
+    ));
+
+    let evidence_query = CodeQuery::from_json(&json!({
+        "match": { "kind": "call", "callee": { "name": "run" } },
+        "steps": [
+            { "op": "receiver_targets" },
+            { "op": "receiver_evidence" }
+        ]
+    }))
+    .expect("evidence query");
+    let evidence = execute_with_receiver_budget_for_test(
+        &analyzer,
+        &evidence_query,
+        ReceiverAnalysisBudget::tiny(),
+    );
+    assert!(evidence.results.is_empty());
+}
+
+#[test]
+fn receiver_evidence_rows_join_to_their_mandatory_outcome() {
+    let source = r#"class Service { run() {} }
+export function caller(service: Service) { service.run(); }
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
+    file.write(source).expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let query = |terminal| {
+        CodeQuery::from_json(&json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [
+                { "op": "receiver_targets" },
+                { "op": terminal }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("receiver row query")
+    };
+
+    let outcome = execute(&analyzer, &query("receiver_outcome"));
+    let evidence = execute(&analyzer, &query("receiver_evidence"));
+    let CodeQueryResultValue::ReceiverOutcome { value: outcome } = &outcome.results[0].value else {
+        panic!("expected receiver outcome")
+    };
+    assert_eq!(outcome.outcome, "precise");
+    assert_eq!(outcome.coverage, "exhaustive");
+    assert_eq!(outcome.candidate_count, 1);
+    assert!(outcome.site_ast_id.is_some());
+    assert_eq!(evidence.results.len(), 1, "{}", evidence.render_text());
+    let CodeQueryResultValue::ReceiverEvidence { value: evidence } = &evidence.results[0].value
+    else {
+        panic!("expected receiver evidence")
+    };
+    assert_eq!(evidence.site_id, outcome.site_id);
+    assert_eq!(evidence.ordinal, 0);
+    assert_eq!(evidence.chain_hop, 0);
+    assert_eq!(evidence.proof, "precise");
+    assert_eq!(evidence.completeness, "exhaustive");
+    assert!(evidence.declaration_id.is_some());
+}
+
+#[test]
+fn member_occurrence_ast_id_correlates_receiver_and_resolution_rows() {
+    let source = r#"class Service { run() {} }
+export function caller(service: Service) { service.run(); }
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+        .write(source)
+        .expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let query = |terminal: &str| {
+        let mut steps = vec![json!({ "op": terminal })];
+        if terminal == "member_targets" {
+            steps.push(json!({ "op": "receiver_outcome" }));
+        }
+        CodeQuery::from_json(&json!({
+            "where": ["app.ts"],
+            "occurrences": {
+                "role": ["member_position"]
+            },
+            "steps": steps,
+            "result_detail": "full"
+        }))
+        .expect("occurrence relation query")
+    };
+
+    let candidates = execute(&analyzer, &query("candidates_of"));
+    let outcomes = execute(&analyzer, &query("member_targets"));
+    let CodeQueryResultValue::ResolutionCandidate { value: candidate } =
+        &candidates.results[0].value
+    else {
+        panic!("expected resolution candidate")
+    };
+    let CodeQueryResultValue::ReceiverOutcome { value: outcome } = &outcomes.results[0].value
+    else {
+        panic!("expected receiver outcome")
+    };
+    assert_eq!(
+        outcome.site_ast_id.as_deref(),
+        Some(candidate.ast_id.as_str())
+    );
+    assert_eq!(outcome.outcome, "precise");
+}
+
+#[test]
+fn receiver_factory_evidence_is_a_stable_parent_linked_chain() {
+    let source = r#"class Service { run() {} }
+function makeService() { return new Service(); }
+export function caller() { const service = makeService(); service.run(); }
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+        .write(source)
+        .expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let query = CodeQuery::from_json(&json!({
+        "match": {
+            "kind": "call",
+            "callee": { "name": "run" },
+            "receiver": { "capture": "receiver" }
+        },
+        "steps": [
+            { "op": "points_to", "capture": "receiver" },
+            { "op": "receiver_evidence" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("factory evidence query");
+
+    let first = execute(&analyzer, &query);
+    let second = execute(&analyzer, &query);
+    assert_eq!(first.results.len(), 2, "{}", first.render_text());
+    let rows = first
+        .results
+        .iter()
+        .map(|item| match &item.value {
+            CodeQueryResultValue::ReceiverEvidence { value } => value,
+            _ => panic!("expected receiver evidence"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows[0].evidence_kind, "factory_return");
+    assert!(rows[0].factory_id.is_some());
+    assert_eq!(rows[0].parent_evidence_id, None);
+    assert_eq!(
+        rows[1].parent_evidence_id.as_deref(),
+        Some(rows[0].id.as_str())
+    );
+    assert_eq!(rows[1].chain_hop, 1);
+    let second_ids = second
+        .results
+        .iter()
+        .map(|item| match &item.value {
+            CodeQueryResultValue::ReceiverEvidence { value } => value.id.as_str(),
+            _ => panic!("expected receiver evidence"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        second_ids,
+        rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -4834,4 +5023,134 @@ fn canonical_ast_keys_stay_within_the_stable_identity_limit() {
     let mut other = deep.clone();
     other[20] = ("call", Some("a_different_middle_segment"));
     assert_ne!(bounded_canonical_ast_key(&other).expect("other key"), key);
+}
+
+#[test]
+fn detailed_row_field_registry_covers_every_domain_without_duplicate_fields() {
+    let mut labels = std::collections::HashSet::new();
+    for domain in ALL_DETAILED_CODE_QUERY_DOMAINS {
+        assert!(labels.insert(domain.label()), "duplicate domain label");
+        assert!(
+            !domain.row_fields().is_empty(),
+            "{} must declare an addressable scalar surface",
+            domain.label()
+        );
+        let mut field_names = std::collections::HashSet::new();
+        for field in domain.row_fields() {
+            assert!(
+                field_names.insert(field.name),
+                "duplicate field {}.{}",
+                domain.label(),
+                field.name
+            );
+        }
+    }
+}
+
+#[test]
+fn occurrence_row_projection_exposes_typed_identity_and_rejects_unknown_fields() {
+    let target = CodeQueryDeclaration {
+        path: "src/lib.rs".to_string(),
+        language: "rust",
+        kind: "function",
+        fq_name: "crate::target".to_string(),
+        start_line: 1,
+        end_line: 1,
+        signature: None,
+        id: Some("decl-1".to_string()),
+        node_range: None,
+        semantic_model: None,
+    };
+    let result = CodeQueryResultValue::Occurrence {
+        value: Box::new(CodeQueryOccurrence {
+            id: "occurrence-1".to_string(),
+            ast_id: "ast-1".to_string(),
+            path: "src/lib.rs".to_string(),
+            language: "rust",
+            class: "reference",
+            role: "call_callee",
+            namespace: "value",
+            range: CodeQueryRange {
+                start_line: 2,
+                start_column: 5,
+                end_line: 2,
+                end_column: 11,
+            },
+            start_byte: 20,
+            end_byte: 26,
+            enclosing_symbol: Some("crate::caller".to_string()),
+            raw_spelling: "target".to_string(),
+            decoded_spelling: None,
+            target: CodeQueryOccurrenceTarget::Resolved {
+                units: vec![target],
+            },
+        }),
+    };
+    let row = result.row();
+
+    assert_eq!(row.domain(), DetailedCodeQueryDomain::Occurrence);
+    assert_eq!(
+        row.field("ast_id").expect("registered field"),
+        Some(CodeQueryRowScalarRef::StableId("ast-1"))
+    );
+    assert_eq!(
+        row.field("target_id").expect("registered field"),
+        Some(CodeQueryRowScalarRef::DeclarationIdentity("decl-1"))
+    );
+    assert_eq!(
+        row.field("target_count").expect("registered field"),
+        Some(CodeQueryRowScalarRef::Integer(1))
+    );
+
+    let error = row.field("range").expect_err("ranges are not join keys");
+    assert_eq!(error.domain(), DetailedCodeQueryDomain::Occurrence);
+    assert_eq!(error.field(), "range");
+}
+
+#[test]
+fn occurrence_row_projection_does_not_invent_one_identity_for_ambiguous_targets() {
+    let declaration = |id: &str| CodeQueryDeclaration {
+        path: "src/lib.rs".to_string(),
+        language: "rust",
+        kind: "function",
+        fq_name: format!("crate::{id}"),
+        start_line: 1,
+        end_line: 1,
+        signature: None,
+        id: Some(id.to_string()),
+        node_range: None,
+        semantic_model: None,
+    };
+    let result = CodeQueryResultValue::Occurrence {
+        value: Box::new(CodeQueryOccurrence {
+            id: "occurrence-ambiguous".to_string(),
+            ast_id: "ast-ambiguous".to_string(),
+            path: "src/lib.rs".to_string(),
+            language: "rust",
+            class: "reference",
+            role: "call_callee",
+            namespace: "value",
+            range: CodeQueryRange {
+                start_line: 2,
+                start_column: 5,
+                end_line: 2,
+                end_column: 11,
+            },
+            start_byte: 20,
+            end_byte: 26,
+            enclosing_symbol: None,
+            raw_spelling: "target".to_string(),
+            decoded_spelling: None,
+            target: CodeQueryOccurrenceTarget::Resolved {
+                units: vec![declaration("decl-1"), declaration("decl-2")],
+            },
+        }),
+    };
+    let row = result.row();
+
+    assert_eq!(row.field("target_id").expect("registered field"), None);
+    assert_eq!(
+        row.field("target_count").expect("registered field"),
+        Some(CodeQueryRowScalarRef::Integer(2))
+    );
 }

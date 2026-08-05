@@ -104,6 +104,13 @@ impl Liveness {
         Ok(resolved)
     }
 
+    pub fn invalidate_startup_oids(&self) {
+        *self
+            .startup_identity
+            .lock()
+            .expect("liveness startup identity mutex poisoned") = None;
+    }
+
     /// Full live view; rebuilt when the Git index bytes or overlay generation change.
     pub fn snapshot(&self) -> Result<Arc<LiveSnapshot>> {
         let repo = self.repo.lock().expect("liveness repo mutex poisoned");
@@ -1096,6 +1103,34 @@ mod tests {
         assert_eq!(
             snapshot.oid_for_path(&file),
             Some(Oid::hash_object(ObjectType::Blob, b"fn dirty() {}\n").unwrap())
+        );
+    }
+
+    #[test]
+    fn invalidating_startup_oids_refreshes_bulk_working_tree_identities() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("a.rs"), "fn old() {}\n").unwrap();
+        commit_all(&repo, "init");
+
+        let file = project_file(temp.path(), "a.rs");
+        let liveness = Liveness::new(repo).unwrap();
+        let initial = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            initial.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn old() {}\n").unwrap())
+        );
+
+        std::fs::write(temp.path().join("a.rs"), "fn refreshed() {}\n").unwrap();
+        liveness.invalidate_startup_oids();
+        let refreshed = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            refreshed.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn refreshed() {}\n").unwrap())
         );
     }
 }

@@ -731,6 +731,22 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::ReceiverOutcome | RqlForm::ReceiverEvidence => {
+            expect_len(expr, items, 2, head)?;
+            let mut query = query_object(&items[1])?;
+            let op = match form {
+                RqlForm::ReceiverOutcome => "receiver_outcome",
+                RqlForm::ReceiverEvidence => "receiver_evidence",
+                _ => unreachable!("receiver row wrapper filtered above"),
+            };
+            query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
+                .push(json!({ "op": op }));
+            Ok(Some(Value::Object(query)))
+        }
         RqlForm::Supertypes | RqlForm::Subtypes => {
             let (query_expr, option) = match items.len() {
                 2 => (&items[1], None),
@@ -1472,6 +1488,8 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::ReceiverTargets
         | RqlForm::PointsTo
         | RqlForm::MemberTargets
+        | RqlForm::ReceiverOutcome
+        | RqlForm::ReceiverEvidence
         | RqlForm::Occurrences
         | RqlForm::OccurrencesOf
         | RqlForm::OccurrencesIn

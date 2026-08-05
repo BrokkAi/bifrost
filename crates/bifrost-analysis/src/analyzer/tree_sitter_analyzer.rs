@@ -7718,6 +7718,12 @@ impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
+    fn invalidate_cached_file_identities(&self) {
+        if let Some(liveness) = self.store_context.liveness.as_ref() {
+            liveness.invalidate_startup_oids();
+        }
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         let mut cache = self.query_read_cache_write();
         let was_active = cache.is_active();
