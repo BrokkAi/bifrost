@@ -115,7 +115,7 @@ With `--fail-on never`, the complete human report is:
 
 <!-- policy-doc-test:human:dynamic-eval -->
 ```text
-note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 9
+note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 10
 [warning]  app.py:2:12
     Dynamic evaluation is forbidden
 
@@ -239,7 +239,7 @@ source/sink leaves should normally use endpoint documents.
 | `match` | One inline or file-backed RQL selector returning supported, location-bearing terminal results. | Executable. |
 | `taint` | Set-oriented sources, sinks, sanitizers, transforms, external models, and optional finding combinations. | Parses, validates, and composes; evaluation reports `unsupported` until [#824](https://github.com/BrokkAi/bifrost/issues/824). |
 | `typestate` | Tracked subjects, typed events, deterministic transitions, uncertainty rules, and terminal expectations. | Executes query-local semantic bindings and emits production findings with stable identity, primary/related locations, bounded witnesses, and completeness metadata. |
-| `assertion` | A subject selector that captures identifier tokens, plus one or more `assert`, `assert-resolution`, `assert-reaching`, or `assert-boundary` invariants about the [occurrence](/rune-query-language/) each captured token carries and about how it resolved. | Executes. Correlates captures to occurrence, candidate, and binding rows by AST identity and emits one multi-location finding per violated invariant. |
+| `assertion` | A subject selector that captures identifier tokens, plus one or more `assert`, `assert-resolution`, `assert-reaching`, `assert-boundary`, `assert-canonical`, `assert-route`, or `assert-round-trip` invariants about the [occurrence](/rune-query-language/) each captured token carries and about how it resolved. | Executes. Correlates captures to occurrence, candidate, and binding rows by AST identity and emits one multi-location finding per violated invariant. |
 
 ### Taint: broad libraries, specific findings
 
@@ -385,6 +385,30 @@ containment is fixed.
 external_declared_unindexed|external_unknown)` forbids a `name_only_fallback`
 selection once resolution reached or passed one authoritative boundary. It is a
 prohibition, so a reference where nothing was selected satisfies it.
+
+`(assert-canonical :id ID :at CAPTURE :role ROLE :equals CAPTURE :equals-role
+ROLE [:distinct true])` requires the two captured tokens' resolved declarations
+to share one canonical identity -- language, namespace, ordered kind-tagged
+name segments, and generic arity, compared structurally and never by rendered
+text. `:distinct true` inverts it: the selections must share none, which is how
+a same-terminal decoy (two `Map`s under different owners) is separated from the
+true target. `:equals` may not name the same capture as `:at`, whose comparison
+is fixed.
+
+`(assert-route :id ID :at CAPTURE :role ROLE :to CAPTURE :to-role ROLE [:via
+HOP] [:forbid HOP])` requires an identity route from the captured site to what
+the `:to` capture resolves to. The traversal follows the identity-preserving
+hop kinds (alias, import, export, re_export) plus whatever `:via` names, and
+`:via` additionally requires at least one hop of that kind on the matching
+route -- `(assert-route ... :via re_export)` is how "this facade genuinely
+forwards the origin" is spelled. A traversal that ends in a cycle or a
+truncation is inconclusive, never evidence of absence.
+
+`(assert-round-trip :id ID :at CAPTURE :role ROLE)` requires forward
+resolution and inverse enumeration to close: every declaration the site's
+route reaches must reach the site back through inverse edges over the involved
+files. The mined regressions this family answers are the ones where the
+forward and inverse sides of one indirection quietly disagreed.
 
 Three absences make these asserts inconclusive rather than passing or failing:
 a selected candidate whose recording seam could not name a tier (an absent tier

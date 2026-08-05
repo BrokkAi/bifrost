@@ -576,6 +576,10 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.signature_metadata(code_unit)
     }
 
+    fn abstract_member_implementations(&self, code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
+        self.rust_trait_member_implementations(code_unit)
+    }
+
     fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
         self.inner.get_analyzed_files()
     }

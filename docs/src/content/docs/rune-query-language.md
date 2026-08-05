@@ -258,6 +258,25 @@ The reaching binding of an occurrence is the binding of that name in effect at i
 
 `:include-shadowed true` additionally returns the bindings the winner shadows, so "more than one binding of this name is in effect here" becomes a visible multi-row answer instead of a collapsed one.
 
+## Qualified Paths and Their Segments
+
+Schema v10 adds the rows that keep a qualified path's identity visible segment by segment. `(paths ...)` is a source: one row per linear chain (`java.util.Map`, `crate::util::Widget`), anchored at its terminal segment's AST identity. `(segments-of ...)` returns each path's ordered segments with decoded identifier text (a quoted or raw identifier stays one segment) and the generic argument count the source spells; with `:resolved true`, every segment also carries its own prefix resolution, so "what is `util` in `crate::util::Widget`" is answerable at the segment. `(segment-target ...)` projects those per-segment resolutions onto workspace declarations.
+
+<!-- code-query-test:rql:path-seed -->
+```lisp
+(language "rust"
+  (paths :min-segments 3))
+```
+
+<!-- code-query-test:rql:segments-of -->
+```lisp
+(segments-of :resolved true
+  (language "rust"
+    (paths)))
+```
+
+A segment row states its namespace only when the adapter's classification or the segment's own resolution decides it; a Java or Rust scope segment without resolution has none, which is "not stated", never a guess. A language whose adapter does not answer the path axes makes the run incomplete rather than returning an empty complete answer.
+
 <!-- code-query-test:rql:reaching-binding-shadowed -->
 ```lisp
 (reaching-binding :include-shadowed true
