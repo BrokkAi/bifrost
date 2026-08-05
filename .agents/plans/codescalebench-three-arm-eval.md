@@ -22,8 +22,8 @@ The campaign must also find Bifrost performance failures. A Bifrost startup or q
 - [x] (2026-08-05 19:14Z) Ran the symbol arm at concurrency 10.
 - [x] (2026-08-05 19:20Z) Stopped the first NLP arm after Camel preflight exceeded 120 seconds.
 - [x] (2026-08-05 19:33Z) Profiled the exact path and added host analysis mounts with trusted-prewarm selection.
-- [ ] Restart the symbol and NLP arm at concurrency 10.
-- [ ] Compare the paired results and complete this plan.
+- [x] (2026-08-05 19:55Z) Restarted and completed the symbol and NLP arm at concurrency 10.
+- [x] (2026-08-05 19:58Z) Generated the paired JSON and Markdown reports.
 
 ## Surprises & Discoveries
 
@@ -76,7 +76,11 @@ The bare arm had 15 successful completions, four test failures, and one agent fa
 
 The symbol arm had 14 successful completions, four test failures, and two agent failures. Its mean score was 0.150645. Luna made no Bifrost calls, so this arm measured tool availability without tool use.
 
-The NLP arm still requires a clean restart after the setup-path correction.
+The NLP arm had 16 successful completions, three test failures, and one agent failure. Its mean score was 0.158905.
+
+The paired mean changes were -0.0176 for symbols against bare, -0.0093 for NLP against bare, and +0.0083 for NLP against symbols. No Bifrost arm called a Bifrost tool. The score changes therefore measure run variance and tool availability. They do not measure Bifrost localization value.
+
+The final reports are `/mnt/containers/code_isnt_memory/codescale-three-arm-luna-max-20-20260805/report.json` and `report.md`.
 
 ## Context and Orientation
 
@@ -129,4 +133,4 @@ Store large campaign artifacts under `/mnt/containers/code_isnt_memory/`. Store 
 
 `bpr_agent.py` must accept the three new mode names. `codescalebench_agent_engine.py` must map each mode to its required cache and embedding resources. Its result JSON must add stable `toolCalls`, `llmRequests`, and combined token fields. `cimeval/remote/run_task.sh` must accept the new remote arm names without changing existing names.
 
-Revision note: Updated after the NLP preflight stop. It records completed arms, profile evidence, and host-mounted analysis recovery.
+Revision note: Completed after all three arms and the paired report.
