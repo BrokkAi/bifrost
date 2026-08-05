@@ -1,6 +1,7 @@
 mod adapter;
 mod cache;
 mod clones;
+#[cfg(test)]
 mod diagnostics;
 mod hierarchy;
 mod identity;
@@ -521,6 +522,10 @@ impl CppAnalysisSource for CppAnalyzer {
         CppAnalyzer::template_metadata(self, code_unit)
     }
 
+    fn compile_context_for(&self, file: &ProjectFile) -> Option<&CppCompileContext> {
+        CppAnalyzer::compile_context_for(self, file)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn record_cpp_parent_resolution_for_test(&self) {
         CppAnalyzer::record_cpp_parent_resolution_for_test(self);
@@ -836,7 +841,7 @@ impl IAnalyzer for CppAnalyzer {
     ) -> crate::analyzer::SemanticDiagnosticReport {
         crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(
             file,
-            diagnostics::collect_cpp_semantic_diagnostics(self, file, source),
+            brokk_bifrost_cpp::diagnostics::collect_cpp_semantic_diagnostics(self, file, source),
         )
     }
 

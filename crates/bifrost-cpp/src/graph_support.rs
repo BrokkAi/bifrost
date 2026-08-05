@@ -27,6 +27,7 @@
 //!   `TreeSitterAnalyzer::raw_supertypes_of`, whose rows are crate-private to
 //!   analysis; the analyzer hands the decoded base-specifier strings across.
 
+use crate::compile_context::CppCompileContext;
 use crate::graph::CppWorkspaceSource;
 use crate::imports::IncludeTargetIndex;
 use brokk_bifrost_core::analyzer::capabilities::{TypeAliasProvider, TypeHierarchyProvider};
@@ -72,6 +73,11 @@ pub trait CppAnalysisSource:
 
     /// The persisted C++ template metadata side table's row for `code_unit`.
     fn template_metadata(&self, code_unit: &CodeUnit) -> Option<CppTemplateMetadata>;
+
+    /// The `compile_commands.json` entry governing `file`, if the workspace has
+    /// a compile database that names it. The only analyzer-resident product
+    /// [`crate::diagnostics`] needs.
+    fn compile_context_for(&self, file: &ProjectFile) -> Option<&CppCompileContext>;
 
     /// Count a precise-parent resolution against the analyzer's counter.
     ///
