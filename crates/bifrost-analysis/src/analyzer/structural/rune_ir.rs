@@ -146,7 +146,7 @@ pub fn render_source_rune_ir(
     let spec = crate::analyzer::structural_spec_for(analyzer_language).ok_or_else(|| {
         RuneIrError::UnsupportedLanguage(analyzer_language.config_label().to_string())
     })?;
-    let grammar = language.parser_language().ok_or_else(|| {
+    let grammar = crate::analyzer::parser_language_for_dialect(language).ok_or_else(|| {
         RuneIrError::UnsupportedLanguage(analyzer_language.config_label().to_string())
     })?;
     let facts = extract_file_facts(spec, &grammar, source).ok_or(RuneIrError::NoStructuralFacts)?;

@@ -9,6 +9,17 @@ pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{
     walk_tree_preorder,
 };
 
+// `PreparedSyntaxTree` and its source backing hold model data plus a live
+// `tree_sitter::Tree`, so they live in `brokk-bifrost-core` where a language
+// crate can consume them, and are re-exported here at the paths their callers
+// already use. What stays is the preparation pipeline below: the parse, the
+// per-request single-flight cell, the byte-bounded cross-request store, and
+// `FileState`'s implementation of the core index contract.
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSourceIndex;
+pub(crate) use brokk_bifrost_core::analyzer::prepared_syntax::{
+    PreparedSourceOrigin, PreparedSyntaxSource, PreparedSyntaxTree,
+};
+
 use crate::analyzer::CodeUnitIndex;
 use arc_swap::ArcSwapOption;
 
@@ -494,95 +505,21 @@ pub struct FileState {
     pub(crate) parse_errors: Option<Vec<crate::analyzer::ParseError>>,
 }
 
-/// Source backing for an immutable prepared syntax tree.
-///
-/// Ordinary unbounded queries retain the indexed [`FileState`] needed by
-/// declaration-oriented helpers. Bounded syntax-only queries retain just the
-/// exact admitted source snapshot, avoiding analyzer hydration and store
-/// writes before their cancellable parse.
-#[derive(Debug)]
-enum PreparedSyntaxSource {
-    Indexed(Arc<FileState>),
-    Exact(Arc<str>),
-}
-
-impl PreparedSyntaxSource {
+/// The indexed backing a prepared tree consults for declaration facts. The
+/// contract itself is core-owned so a language crate can consume prepared
+/// syntax; `FileState` is the analysis-side storage record that satisfies it.
+impl PreparedSourceIndex for FileState {
     fn source(&self) -> &str {
-        match self {
-            Self::Indexed(file_state) => &file_state.source,
-            Self::Exact(source) => source,
-        }
+        &self.source
     }
 
-    fn file_state(&self) -> Option<&FileState> {
-        match self {
-            Self::Indexed(file_state) => Some(file_state),
-            Self::Exact(_) => None,
-        }
-    }
-}
-
-/// Immutable syntax prepared from one exact source snapshot. Keeping the
-/// backing alive prevents the source bytes and tree from drifting apart while
-/// concurrent queries reuse it.
-#[derive(Debug)]
-pub(crate) struct PreparedSyntaxTree {
-    source: PreparedSyntaxSource,
-    tree: Tree,
-    line_starts: Vec<usize>,
-    dialect: LanguageDialect,
-    origin: PreparedSourceOrigin,
-    overlay_revision: Option<OverlayRevision>,
-}
-
-impl PreparedSyntaxTree {
-    pub(crate) fn source(&self) -> &str {
-        self.source.source()
+    fn declaration_ranges(&self, code_unit: &CodeUnit) -> Option<&[Range]> {
+        self.ranges.get(code_unit).map(Vec::as_slice)
     }
 
-    pub(crate) fn tree(&self) -> &Tree {
-        &self.tree
+    fn direct_children(&self, owner: &CodeUnit) -> Option<&[CodeUnit]> {
+        self.children.get(owner).map(Vec::as_slice)
     }
-
-    pub(crate) fn declaration_node(&self, code_unit: &CodeUnit) -> Option<Node<'_>> {
-        let range = self.source.file_state()?.ranges.get(code_unit)?.first()?;
-        self.tree
-            .root_node()
-            .descendant_for_byte_range(range.start_byte, range.end_byte)
-    }
-
-    pub(crate) fn direct_children(&self, owner: &CodeUnit) -> &[CodeUnit] {
-        self.source
-            .file_state()
-            .and_then(|file_state| file_state.children.get(owner))
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn line_starts(&self) -> &[usize] {
-        &self.line_starts
-    }
-
-    pub(crate) const fn dialect(&self) -> LanguageDialect {
-        self.dialect
-    }
-
-    pub(crate) const fn origin(&self) -> PreparedSourceOrigin {
-        self.origin
-    }
-
-    pub(crate) const fn overlay_revision(&self) -> Option<OverlayRevision> {
-        self.overlay_revision
-    }
-}
-
-/// How the exact source snapshot selected for a prepared syntax tree entered
-/// the analyzer. The content digest remains authoritative; this marker keeps
-/// disk and unsaved-overlay revisions distinct even when their bytes match.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum PreparedSourceOrigin {
-    Disk,
-    Overlay,
 }
 
 /// The requested source snapshot exceeded a caller-supplied preparation cap.
@@ -3541,14 +3478,14 @@ where
             return PreparedSyntaxPreparation::Cancelled;
         }
         let line_starts = compute_line_starts(exact_source);
-        PreparedSyntaxPreparation::Complete(Some(Arc::new(PreparedSyntaxTree {
+        PreparedSyntaxPreparation::Complete(Some(Arc::new(PreparedSyntaxTree::new(
             source,
             tree,
             line_starts,
-            dialect: LanguageDialect::for_path(self.adapter.language(), file.rel_path()),
+            LanguageDialect::for_path(self.adapter.language(), file.rel_path()),
             origin,
             overlay_revision,
-        })))
+        ))))
     }
 
     /// How many times `file` has been parsed since the last reset. Pins the
@@ -10150,7 +10087,7 @@ mod tests {
         assert_eq!(prepared.source(), source);
         assert_eq!(prepared.origin(), PreparedSourceOrigin::Overlay);
         assert!(prepared.overlay_revision().is_some());
-        assert!(matches!(&prepared.source, PreparedSyntaxSource::Exact(_)));
+        assert!(matches!(prepared.backing(), PreparedSyntaxSource::Exact(_)));
         assert_eq!(
             analyzer.prepared_syntax_parse_count_for_test(&file),
             2,
@@ -10168,7 +10105,10 @@ mod tests {
         assert_eq!(indexed.source(), source);
         assert_eq!(indexed.origin(), prepared.origin());
         assert_eq!(indexed.overlay_revision(), prepared.overlay_revision());
-        assert!(matches!(&indexed.source, PreparedSyntaxSource::Indexed(_)));
+        assert!(matches!(
+            indexed.backing(),
+            PreparedSyntaxSource::Indexed(_)
+        ));
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
             1,
