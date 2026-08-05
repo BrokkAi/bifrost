@@ -1,5 +1,5 @@
 use super::{CppAnalyzer, include_paths, resolve_include_targets_with_index};
-use crate::analyzer::declaration_range::node_for_exact_range;
+use crate::analyzer::tree_walk::node_for_exact_range;
 use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::{CallableLinkage, CodeUnit, IAnalyzer, ProjectFile, Range, resolve_analyzer};
 use crate::path_utils::rel_path_string;

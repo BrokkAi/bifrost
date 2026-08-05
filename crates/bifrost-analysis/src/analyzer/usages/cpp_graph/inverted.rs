@@ -42,7 +42,6 @@ use super::resolver::{
     recovered_macro_decorated_type_node, resolve_declaring_member_owner, same_visible_symbol,
     type_reference_hit_node,
 };
-use super::syntax::explicit_qualified_callable_value;
 use crate::analyzer::cpp::{
     CppSentinelRecoveredClass, cpp_sentinel_recovered_classes,
     cpp_sentinel_recovered_scope_for_node, recovered_macro_return_type_node,
@@ -56,6 +55,7 @@ use crate::analyzer::usages::inverted_edges::{
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, cpp_node_text as node_text};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_cpp::graph::syntax::explicit_qualified_callable_value;
 use tree_sitter::Node;
 
 /// Build the whole C++ `caller -> callee` edge set in a single inverted pass over

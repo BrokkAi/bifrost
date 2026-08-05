@@ -6,6 +6,7 @@ use crate::analyzer::common::{
     language_for_file, language_for_target, source_identifier_for_target,
 };
 use crate::analyzer::languages::LanguageSupport;
+use crate::analyzer::tree_walk::node_for_exact_range;
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::text_utils::compute_line_starts;
@@ -137,32 +138,6 @@ pub(crate) fn code_unit_declaration_name_range_for_range(
 /// declaration token in source, which is what this module selects.
 fn declaration_source_identifier(code_unit: &CodeUnit) -> &str {
     source_identifier_for_target(code_unit)
-}
-
-/// Find the node whose byte span exactly equals `range`. When several nested
-/// nodes share that exact span, return the deepest one. The shallow wrapper
-/// often carries no `name` field, so returning it would defeat declaration-name
-/// resolution.
-pub(crate) fn node_for_exact_range<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
-    let mut best: Option<Node<'tree>> = None;
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
-            continue;
-        }
-        if node.start_byte() == range.start_byte && node.end_byte() == range.end_byte {
-            // Exact-span nodes form a nested chain; overwriting keeps the
-            // deepest node encountered so far.
-            best = Some(node);
-        }
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if child.start_byte() <= range.start_byte && child.end_byte() >= range.end_byte {
-                stack.push(child);
-            }
-        }
-    }
-    best
 }
 
 fn node_for_smallest_containing_range<'tree>(

@@ -69,6 +69,10 @@ pub use code_unit_index::CodeUnitIndex;
 pub(crate) use code_unit_index::default_parent_fq_name;
 pub(crate) use definition_lookup::{BoundedDefinitionLookup, sort_units};
 
+pub(crate) use brokk_bifrost_cpp::imports::{
+    IncludeTargetIndex, include_paths as cpp_include_paths, resolve_include_targets,
+    resolve_include_targets_with_index,
+};
 pub use capabilities::{
     CapabilityProvider, ImportAnalysisProvider, TestDetectionProvider, TypeAliasProvider,
     TypeHierarchyProvider,
@@ -89,11 +93,10 @@ pub use config::{
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
-    CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole, IncludeTargetIndex,
+    CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole,
     cpp_callable_definitions_share_identity_evidence, cpp_callable_unit_role,
-    cpp_indexed_callable_linkage, cpp_template_term, include_paths as cpp_include_paths,
-    node_text as cpp_node_text, normalize_cpp_whitespace, recovered_exported_class_has_body,
-    resolve_include_targets, resolve_include_targets_with_index,
+    cpp_indexed_callable_linkage, cpp_template_term, node_text as cpp_node_text,
+    normalize_cpp_whitespace, recovered_exported_class_has_body,
 };
 pub use csharp::CSharpAnalyzer;
 pub use csharp::external::{

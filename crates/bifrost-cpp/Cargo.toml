@@ -1,0 +1,40 @@
+[package]
+name = "brokk-bifrost-cpp"
+version.workspace = true
+edition.workspace = true
+description = "C++ language knowledge for brokk-bifrost: declarations and macro-sentinel recovery, include-graph visibility, out-of-line member identity reconciliation, and usage-graph resolution"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[lib]
+name = "brokk_bifrost_cpp"
+
+[dependencies]
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22" }
+regex = "1.12.2"
+serde = { version = "1.0.228", features = ["derive"] }
+# `compile_commands.json` is a JSON array of entries whose `command` field is a
+# shell-quoted argv; `compile_context` deserializes the former and tokenizes the
+# latter without ever executing it.
+serde_json = "1.0.145"
+shlex = "2.0.1"
+tree-sitter = "0.25.10"
+# tree-sitter-cpp is a grammar generation behind the fleet's 0.25 line, in the
+# same class as tree-sitter-c-sharp 0.23.1, tree-sitter-php 0.23.11 and
+# tree-sitter-ruby 0.23.1. It is also the parser for plain C: `Language::Cpp`
+# covers `.c`, which is why the receiver route has a file-extension gate.
+tree-sitter-cpp = "0.23.4"
+
+[features]
+default = []
+# Mirrors `brokk-bifrost-analysis`'s feature of the same name, chained exactly
+# like `brokk-bifrost-core`'s. C++ is the first fleet language to need it: the
+# `CppAnalysisSource` implementors on the analysis side record build counters
+# from production paths that moved here, so the counter hooks on the source
+# trait must be reachable across the crate boundary under the same gate.
+test-support = ["brokk-bifrost-core/test-support"]
+
+[dev-dependencies]
+tempfile = "3.23.0"

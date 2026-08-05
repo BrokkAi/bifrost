@@ -507,10 +507,10 @@ fn account_test_module(file: &Path, walked: &mut BTreeSet<PathBuf>) {
                 .into_owned()
         });
     for item in &parsed.items {
-        if let syn::Item::Mod(module) = item {
-            if module.content.is_none() {
-                account_test_module(&module_file(&dir.join(module.ident.to_string())), walked);
-            }
+        if let syn::Item::Mod(module) = item
+            && module.content.is_none()
+        {
+            account_test_module(&module_file(&dir.join(module.ident.to_string())), walked);
         }
     }
 }

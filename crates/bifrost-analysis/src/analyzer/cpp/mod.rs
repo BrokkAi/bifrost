@@ -1,15 +1,14 @@
 mod adapter;
 mod cache;
 mod clones;
-mod compile_context;
 mod declarations;
 mod diagnostics;
 mod hierarchy;
 mod identity;
 mod imports;
-mod reconcile;
 mod semantic;
-pub(crate) mod structural;
+mod structural;
+#[cfg(test)]
 mod tests;
 
 use crate::analyzer::clone_detection::{
@@ -50,10 +49,14 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::CppAdapter;
+use brokk_bifrost_cpp::clones::cpp_clone_parser;
+use brokk_bifrost_cpp::compile_context::{CppCompileContext, CppCompileContexts};
+use brokk_bifrost_cpp::imports::{
+    IncludeTargetIndex, include_paths, resolve_include_targets_with_index,
+};
+use brokk_bifrost_cpp::test_detection::detect_cpp_test_assertion_smells;
 use cache::{weight_code_unit_set_by_file, weight_code_unit_vec_by_file, weight_project_file_set};
-use clones::{build_clone_candidate_data, cpp_clone_parser};
-use compile_context::{CppCompileContext, CppCompileContexts};
-use tests::detect_cpp_test_assertion_smells;
+use clones::build_clone_candidate_data;
 
 pub(crate) use declarations::{
     CppSentinelRecoveredClass, cpp_export_macro_token, cpp_sentinel_recovered_classes,
@@ -67,9 +70,6 @@ pub(crate) use identity::{
     cpp_callable_definitions_share_identity_evidence, cpp_callable_unit_role,
     cpp_header_body_files_are_related, cpp_indexed_callable_linkage, cpp_is_range_for_binding_name,
     cpp_occurrence_role_for_range,
-};
-pub(crate) use imports::{
-    IncludeTargetIndex, include_paths, resolve_include_targets, resolve_include_targets_with_index,
 };
 #[derive(Clone)]
 pub struct CppAnalyzer {
@@ -346,7 +346,7 @@ impl CppAnalyzer {
         &self,
         unit: &CodeUnit,
         using_by_file: &mut HashMap<ProjectFile, Arc<Vec<String>>>,
-    ) -> Option<reconcile::ReconciledIdentity> {
+    ) -> Option<brokk_bifrost_cpp::reconcile::ReconciledIdentity> {
         // Read the full source-order qualifier off the definition's *structured*
         // `FqName` -- the namespace (`Package`) segments followed by the
         // class-nesting (`Type`/`Nested`) ones, with the terminal `Member` as the
@@ -403,16 +403,16 @@ impl CppAnalyzer {
             ));
             self.visible_type_units(unit.source())
         };
-        let class_table: Vec<reconcile::VisibleClass> = visible
+        let class_table: Vec<brokk_bifrost_cpp::reconcile::VisibleClass> = visible
             .iter()
             .filter(|candidate| candidate.is_class())
-            .map(|candidate| reconcile::VisibleClass {
+            .map(|candidate| brokk_bifrost_cpp::reconcile::VisibleClass {
                 package: candidate.package_name(),
                 nested_short_name: candidate.short_name(),
             })
             .collect();
 
-        reconcile::reconcile_out_of_line_member_identity(
+        brokk_bifrost_cpp::reconcile::reconcile_out_of_line_member_identity(
             &owner_segments,
             member,
             &namespace_candidates,
@@ -1244,7 +1244,7 @@ impl LanguageSupport for CppSupport {
     }
 
     fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
-        &structural::CPP_STRUCTURAL_SPEC
+        &brokk_bifrost_cpp::structural::CPP_STRUCTURAL_SPEC
     }
 
     fn highlight_query(&self) -> Option<&'static str> {

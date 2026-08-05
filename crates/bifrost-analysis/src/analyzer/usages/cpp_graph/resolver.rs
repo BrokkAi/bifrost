@@ -1,6 +1,6 @@
 use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::declaration_range::node_for_exact_range;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
+use crate::analyzer::tree_walk::node_for_exact_range;
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::cpp_call_match::{
     CppArgType, cpp_signature_param_types, cpp_split_top_level_commas, normalize_cpp_type_name,
@@ -7016,9 +7016,7 @@ pub(in crate::analyzer::usages) fn designated_initializer_owner(
 
     let init_declarator = node.parent()?;
     if init_declarator.child_by_field_name("declarator") != Some(node)
-        || !crate::analyzer::cpp::structural::is_recovered_designator_init_declarator(
-            init_declarator,
-        )
+        || !brokk_bifrost_cpp::structural::is_recovered_designator_init_declarator(init_declarator)
     {
         return None;
     }

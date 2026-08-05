@@ -14,7 +14,6 @@ use crate::analyzer::usages::cpp_graph::hits::{
     push_unproven_definition_hit, push_unproven_hit,
 };
 use crate::analyzer::usages::cpp_graph::resolver::*;
-use crate::analyzer::usages::cpp_graph::syntax::explicit_qualified_callable_value;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{
@@ -22,6 +21,7 @@ use crate::analyzer::{
     cpp_callable_definitions_share_identity_evidence, cpp_node_text as node_text,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_cpp::graph::syntax::explicit_qualified_callable_value;
 #[cfg(test)]
 use std::cell::Cell;
 use std::cell::RefCell;

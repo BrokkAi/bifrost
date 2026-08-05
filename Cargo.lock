@@ -263,6 +263,7 @@ dependencies = [
  "arc-swap",
  "bincode",
  "brokk-bifrost-core",
+ "brokk-bifrost-cpp",
  "brokk-bifrost-csharp",
  "brokk-bifrost-go",
  "brokk-bifrost-php",
@@ -350,6 +351,20 @@ dependencies = [
  "tempfile",
  "tree-sitter",
  "walkdir",
+]
+
+[[package]]
+name = "brokk-bifrost-cpp"
+version = "0.8.22"
+dependencies = [
+ "brokk-bifrost-core",
+ "regex",
+ "serde",
+ "serde_json",
+ "shlex",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-cpp",
 ]
 
 [[package]]

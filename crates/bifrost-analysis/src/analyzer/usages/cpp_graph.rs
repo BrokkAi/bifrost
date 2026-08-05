@@ -3,7 +3,6 @@ mod hits;
 mod inverted;
 mod resolver;
 mod shared;
-mod syntax;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::language_for_target;

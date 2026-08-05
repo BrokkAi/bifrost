@@ -19,7 +19,7 @@
 use tree_sitter::Node;
 
 pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{
-    TreeWalkAction, subtree_contains, walk_tree_iterative,
+    TreeWalkAction, node_for_exact_range, subtree_contains, walk_tree_iterative,
 };
 
 /// All descendants of `node` (not including `node` itself) whose `kind()` equals

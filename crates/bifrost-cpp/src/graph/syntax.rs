@@ -1,11 +1,11 @@
 use tree_sitter::Node;
 
 #[derive(Clone)]
-pub(super) struct ExplicitQualifiedCallableValue<'tree> {
-    pub(super) qualified: Node<'tree>,
-    pub(super) global: bool,
-    pub(super) owner_components: Vec<Node<'tree>>,
-    pub(super) member: Node<'tree>,
+pub struct ExplicitQualifiedCallableValue<'tree> {
+    pub qualified: Node<'tree>,
+    pub global: bool,
+    pub owner_components: Vec<Node<'tree>>,
+    pub member: Node<'tree>,
 }
 
 /// Recognize an explicit address-of qualified callable value such as
@@ -14,7 +14,7 @@ pub(super) struct ExplicitQualifiedCallableValue<'tree> {
 /// The returned nodes come exclusively from the C++ grammar's named fields. In
 /// particular, a nested namespace/type owner remains a structured subtree rather
 /// than being reconstructed from source text.
-pub(super) fn explicit_qualified_callable_value(
+pub fn explicit_qualified_callable_value(
     node: Node<'_>,
 ) -> Option<ExplicitQualifiedCallableValue<'_>> {
     if node.kind() != "pointer_expression" || node.child_by_field_name("operator")?.kind() != "&" {

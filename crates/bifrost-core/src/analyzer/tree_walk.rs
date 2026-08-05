@@ -216,6 +216,32 @@ pub fn subtree_contains(node: Node<'_>, predicate: impl Fn(Node<'_>) -> bool) ->
     false
 }
 
+/// Find the node whose byte span exactly equals `range`. When several nested
+/// nodes share that exact span, return the deepest one. The shallow wrapper
+/// often carries no `name` field, so returning it would defeat declaration-name
+/// resolution.
+pub fn node_for_exact_range<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
+    let mut best: Option<Node<'tree>> = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
+            continue;
+        }
+        if node.start_byte() == range.start_byte && node.end_byte() == range.end_byte {
+            // Exact-span nodes form a nested chain; overwriting keeps the
+            // deepest node encountered so far.
+            best = Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.start_byte() <= range.start_byte && child.end_byte() >= range.end_byte {
+                stack.push(child);
+            }
+        }
+    }
+    best
+}
+
 /// Walk `node` and append every `ERROR` / `MISSING` span into `out`. Does NOT
 /// recurse into `ERROR` nodes: every descendant would also report as errored
 /// and the diagnostic list would explode. Used both by `analyze_file` (to

@@ -1,6 +1,13 @@
-use crate::analyzer::{Project, ProjectFile};
-use crate::hash::{HashMap, HashSet};
-use crate::path_normalization::NormalizePath;
+//! `compile_commands.json` ingestion.
+//!
+//! `analyzer/cpp/mod.rs` keeps the `OnceLock<CppCompileContexts>` that memoizes
+//! [`CppCompileContexts::load`] per analyzer generation; the database format and
+//! the argument grammar are here.
+
+use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::project::Project;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
+use brokk_bifrost_core::path_normalization::NormalizePath;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -9,20 +16,20 @@ use std::path::{Path, PathBuf};
 /// This is deliberately narrower than a compiler invocation. It records only
 /// context that later semantic diagnostics need and never executes `command`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CppCompileContext {
-    pub(crate) project_include_roots: Vec<PathBuf>,
-    pub(crate) system_include_roots: Vec<PathBuf>,
-    pub(crate) forced_includes: Vec<PathBuf>,
-    pub(crate) defined_macros: HashSet<String>,
+pub struct CppCompileContext {
+    pub project_include_roots: Vec<PathBuf>,
+    pub system_include_roots: Vec<PathBuf>,
+    pub forced_includes: Vec<PathBuf>,
+    pub defined_macros: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct CppCompileContexts {
+pub struct CppCompileContexts {
     by_source: HashMap<PathBuf, CppCompileContext>,
 }
 
 impl CppCompileContexts {
-    pub(crate) fn load(project: &dyn Project) -> Self {
+    pub fn load(project: &dyn Project) -> Self {
         let database_path = project.root().join("compile_commands.json");
         let Ok(database) = std::fs::read_to_string(database_path) else {
             return Self::default();
@@ -51,7 +58,7 @@ impl CppCompileContexts {
         Self { by_source }
     }
 
-    pub(crate) fn for_file(&self, file: &ProjectFile) -> Option<&CppCompileContext> {
+    pub fn for_file(&self, file: &ProjectFile) -> Option<&CppCompileContext> {
         self.by_source.get(&file.abs_path().normalize())
     }
 }
@@ -171,7 +178,8 @@ fn macro_name(definition: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::CppCompileContexts;
-    use crate::analyzer::{Language, ProjectFile, TestProject};
+    use brokk_bifrost_core::analyzer::project::TestProject;
+    use brokk_bifrost_core::analyzer::{Language, ProjectFile};
 
     fn project_with_database(database: Option<&str>) -> (tempfile::TempDir, TestProject) {
         let temp = tempfile::tempdir().expect("temp dir");

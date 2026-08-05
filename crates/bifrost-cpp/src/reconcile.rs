@@ -28,7 +28,7 @@
 /// scope) and its class-nesting chain as Bifrost's `$`-joined short name
 /// (`Outer$Inner` for `Outer::Inner`, `Klass` for a non-nested class).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VisibleClass<'a> {
+pub struct VisibleClass<'a> {
     pub package: &'a str,
     pub nested_short_name: &'a str,
 }
@@ -37,7 +37,7 @@ pub(crate) struct VisibleClass<'a> {
 /// namespace (`::`-joined), the class-nesting chain (`$`-joined short name), and
 /// the member name.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReconciledIdentity {
+pub struct ReconciledIdentity {
     pub package: String,
     pub owner_chain: String,
     pub member: String,
@@ -47,7 +47,7 @@ impl ReconciledIdentity {
     /// Render this identity as a `CodeUnit`-style `fq_name`
     /// (`package.owner_chain.member`, package omitted at global scope), so it can
     /// be compared against and keyed alongside stored identities.
-    pub(crate) fn fq_name(&self) -> String {
+    pub fn fq_name(&self) -> String {
         let short = format!("{}.{}", self.owner_chain, self.member);
         if self.package.is_empty() {
             short
@@ -76,7 +76,7 @@ impl ReconciledIdentity {
 /// in the table confirms any reading (caller leaves the provisional identity
 /// untouched) and when two distinct identities tie at the deepest confirmed
 /// nesting (genuinely ambiguous -- never guess).
-pub(crate) fn reconcile_out_of_line_member_identity(
+pub fn reconcile_out_of_line_member_identity(
     owner_segments: &[&str],
     member: &str,
     namespace_candidates: &[&str],

@@ -83,6 +83,7 @@ fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str
     hasher.update(b"\n");
     for (path, contents) in EMBEDDED_QUERIES
         .iter()
+        .chain(brokk_bifrost_cpp::queries::CPP_QUERY_ASSETS)
         .chain(brokk_bifrost_csharp::queries::CSHARP_QUERY_ASSETS)
         .chain(brokk_bifrost_go::queries::GO_QUERY_ASSETS)
         .chain(brokk_bifrost_php::queries::PHP_QUERY_ASSETS)
@@ -158,10 +159,11 @@ fn hash_grammar(hasher: &mut Sha256, lang: &TsLanguage) {
 /// contents)`. Adding/removing or editing a query file rebuilds the crate and
 /// changes the per-language epoch.
 ///
-/// C#'s, Go's, PHP's, Python's and Rust's assets live in `brokk-bifrost-csharp`,
-/// `brokk-bifrost-go`, `brokk-bifrost-php`, `brokk-bifrost-python` and
-/// `brokk-bifrost-rust` (they moved with their language knowledge) and are
-/// chained in above under the same `treesitter/c_sharp/`, `treesitter/go/`,
+/// C++'s, C#'s, Go's, PHP's, Python's and Rust's assets live in
+/// `brokk-bifrost-cpp`, `brokk-bifrost-csharp`, `brokk-bifrost-go`,
+/// `brokk-bifrost-php`, `brokk-bifrost-python` and `brokk-bifrost-rust` (they
+/// moved with their language knowledge) and are chained in above under the same
+/// `treesitter/cpp/`, `treesitter/c_sharp/`, `treesitter/go/`,
 /// `treesitter/php/`, `treesitter/python/` and `treesitter/rust/` prefixes, so
 /// the per-language filter stays one rule.
 const EMBEDDED_QUERIES: &[(&str, &str)] = &[
@@ -205,18 +207,6 @@ const EMBEDDED_QUERIES: &[(&str, &str)] = &[
         include_str!("../../../resources/treesitter/typescript/identifiers.scm"),
     ),
     // C++
-    (
-        "treesitter/cpp/definitions.scm",
-        include_str!("../../../resources/treesitter/cpp/definitions.scm"),
-    ),
-    (
-        "treesitter/cpp/imports.scm",
-        include_str!("../../../resources/treesitter/cpp/imports.scm"),
-    ),
-    (
-        "treesitter/cpp/identifiers.scm",
-        include_str!("../../../resources/treesitter/cpp/identifiers.scm"),
-    ),
     // C#
     // PHP
     // Scala
@@ -315,11 +305,14 @@ lang_epoch!(
 // preprocessor container keeps the namespace scope of its preceding sibling.
 // Salt bumped again (#1670): macro-decorated template classes recovered from
 // sentinel envelopes now retain their real class identity and member scope.
+// Salt bumped again (#1548 stage 3 fleet): the C++ `.scm` query assets moved
+// from this crate's `resources/treesitter/cpp/` into `brokk-bifrost-cpp`, so
+// the salted content now comes from that crate's `resources/`.
 lang_epoch!(
     Cpp,
     "cpp",
     "treesitter/cpp/",
-    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-ownership-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08"
+    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-ownership-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;cpp-query-assets-in-brokk-bifrost-cpp-2026-08"
 );
 
 #[cfg(test)]

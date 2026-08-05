@@ -2996,7 +2996,7 @@ impl<'a> CppVisitor<'a> {
 
         let mut cursor = node.walk();
         for child in node.children_by_field_name("declarator", &mut cursor) {
-            if super::structural::is_recovered_designator_init_declarator(child) {
+            if brokk_bifrost_cpp::structural::is_recovered_designator_init_declarator(child) {
                 handled_declarator = true;
                 continue;
             }
@@ -3022,7 +3022,7 @@ impl<'a> CppVisitor<'a> {
         if !handled_declarator {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                if super::structural::is_recovered_designator_init_declarator(child) {
+                if brokk_bifrost_cpp::structural::is_recovered_designator_init_declarator(child) {
                     handled_declarator = true;
                     continue;
                 }
