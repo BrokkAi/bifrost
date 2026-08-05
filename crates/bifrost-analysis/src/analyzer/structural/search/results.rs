@@ -1081,6 +1081,11 @@ pub enum CodeQueryCandidateRef {
         path: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         ast_id: Option<String>,
+        /// The parser-derived path the route pointed at. Empty when the
+        /// adapter or seam recorded no structured target. That is a stated
+        /// gap, not a claim that the import has no target.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        target_segments: Vec<String>,
     },
     ExternalRoute {
         name: String,
