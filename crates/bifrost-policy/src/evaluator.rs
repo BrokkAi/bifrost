@@ -4695,7 +4695,11 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, form.as_bytes());
             update_hash(&mut hasher, exported_name.as_bytes());
         }
-        DetailedCodeQueryKey::DeclarationState { id, fq_name, origin } => {
+        DetailedCodeQueryKey::DeclarationState {
+            id,
+            fq_name,
+            origin,
+        } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, fq_name.as_bytes());
             update_hash(&mut hasher, origin.as_bytes());

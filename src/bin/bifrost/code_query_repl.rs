@@ -1357,7 +1357,11 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                     out.push_str(&format!(
                         "{}\n  {} {} ({}; {})\n",
                         paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
-                        paint(Style::new().fg(Color::Blue), "declaration state:", use_color),
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "declaration state:",
+                            use_color
+                        ),
                         paint(Style::new().bold(), &name, use_color),
                         value.unit_kind,
                         value.origin,

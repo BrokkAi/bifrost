@@ -1619,6 +1619,61 @@ mod tests {
         resolve_rql_schema_version(None).unwrap()
     }
 
+    /// The seven materialization forms lower to their canonical JSON (#1476):
+    /// seed filters keep their registry field spellings, the filtered step
+    /// carries its options, and the filterless steps are bare ops.
+    #[test]
+    fn materialization_forms_lower_to_canonical_json() {
+        let version = rql_schema_resolution().version;
+        assert_eq!(
+            canonical(
+                "(generated-by (generates (generation-sites :kind accessor_macro :input literal)))"
+            ),
+            json!({
+                "generation_sites": { "kind": ["accessor_macro"], "input": ["literal"] },
+                "steps": [ { "op": "generates" }, { "op": "generated_by" } ],
+                "limit": 100,
+                "result_detail": "compact",
+                "execution_mode": "results",
+                "schema_version": version,
+            })
+        );
+        assert_eq!(
+            canonical("(export-target (exports :form default_anonymous :name \"default\"))"),
+            json!({
+                "exports": { "form": ["default_anonymous"], "name": ["default"] },
+                "steps": [ { "op": "export_target" } ],
+                "limit": 100,
+                "result_detail": "compact",
+                "execution_mode": "results",
+                "schema_version": version,
+            })
+        );
+        assert_eq!(
+            canonical(
+                "(implementation-of (declaration-state-of :origin parsed :declaration-only true \
+                 :config-gated false (enclosing-decl (function))))"
+            ),
+            json!({
+                "match": { "kind": "function" },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    {
+                        "op": "declaration_state_of",
+                        "origin": ["parsed"],
+                        "declaration_only": true,
+                        "config_gated": false,
+                    },
+                    { "op": "implementation_of" },
+                ],
+                "limit": 100,
+                "result_detail": "compact",
+                "execution_mode": "results",
+                "schema_version": version,
+            })
+        );
+    }
+
     #[test]
     fn policy_selector_validation_rejects_output_controls_at_their_head() {
         for (source, expected) in [

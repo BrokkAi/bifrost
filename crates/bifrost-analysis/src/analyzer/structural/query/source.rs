@@ -5046,6 +5046,98 @@ mod tests {
         }
     }
 
+    /// Materialization filters are validated against the registries in both
+    /// frontends, and hover reaches every option keyword (#1476).
+    #[test]
+    fn materialization_filter_help_and_value_diagnostics_are_range_precise() {
+        let rql = "(declaration-state-of :origin generated :declaration-only true \
+                   :config-gated false (enclosing-decl (function)))";
+        for token in [
+            "declaration-state-of",
+            ":origin",
+            ":declaration-only",
+            ":config-gated",
+        ] {
+            let offset = rql.find(token).unwrap();
+            let help = query_source_help_at(rql, offset)
+                .unwrap_or_else(|| panic!("no materialization help for {token}"));
+            assert_eq!(&rql[help.range], token);
+            assert!(!help.description.is_empty());
+        }
+        assert!(
+            validate_query_source(rql).is_empty(),
+            "{rql}: {:#?}",
+            validate_query_source(rql)
+        );
+
+        let sites = "(generated-by (generates (generation-sites :kind accessor_macro \
+                     :input literal)))";
+        for token in [
+            "generation-sites",
+            ":kind",
+            ":input",
+            "generates",
+            "generated-by",
+        ] {
+            let offset = sites.find(token).unwrap();
+            let help = query_source_help_at(sites, offset)
+                .unwrap_or_else(|| panic!("no materialization help for {token}"));
+            assert_eq!(&sites[help.range], token);
+            assert!(!help.description.is_empty());
+        }
+        assert!(
+            validate_query_source(sites).is_empty(),
+            "{sites}: {:#?}",
+            validate_query_source(sites)
+        );
+
+        let exports = "(export-target (exports :form default_anonymous :name \"default\"))";
+        assert!(
+            validate_query_source(exports).is_empty(),
+            "{exports}: {:#?}",
+            validate_query_source(exports)
+        );
+
+        for (source, token, code) in [
+            (
+                "(generation-sites :kind accessor_macroo)",
+                "accessor_macroo",
+                "unknown-value",
+            ),
+            (
+                "(generation-sites :form named)",
+                ":form",
+                "unknown-property",
+            ),
+            (
+                "(exports :form default_anonymous :form named)",
+                ":form",
+                "duplicate-property",
+            ),
+            (
+                "(declaration-state-of :declaration-only maybe (class))",
+                "maybe",
+                "unknown-value",
+            ),
+            (
+                r#"{"generation_sites":{"kind":["accessor_macroo"]}}"#,
+                "\"accessor_macroo\"",
+                "unknown-value",
+            ),
+            (
+                r#"{"exports":{"input":["literal"]}}"#,
+                "\"input\"",
+                "unknown-property",
+            ),
+        ] {
+            let diagnostic = validate_query_source(source)
+                .into_iter()
+                .find(|diagnostic| diagnostic.code == code)
+                .unwrap_or_else(|| panic!("no {code} diagnostic for {source}"));
+            assert_eq!(&source[diagnostic.range.clone()], token, "{source}");
+        }
+    }
+
     #[test]
     fn accepted_language_aliases_do_not_produce_diagnostics() {
         for source in [
