@@ -5,7 +5,7 @@ use crate::analyzer::semantic_diagnostics::{
 use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
 use crate::analyzer::usages::go_graph::{go_graph_source, resolve_go_import_namespaces};
 use crate::analyzer::{
-    DefinitionIndexHandle, GoAnalyzer, IAnalyzer, ProjectFile, Range, SemanticDiagnostic,
+    BoundedDefinitionLookup, GoAnalyzer, IAnalyzer, ProjectFile, Range, SemanticDiagnostic,
     resolve_analyzer,
 };
 use crate::hash::HashMap;
@@ -81,7 +81,7 @@ fn parse_go_tree(source: &str) -> Option<Tree> {
 }
 
 struct GoDiagnosticCollector<'a> {
-    support: &'a DefinitionIndexHandle<'a>,
+    support: &'a dyn BoundedDefinitionLookup,
     source: &'a str,
     line_starts: &'a [usize],
     package_name: String,
@@ -391,7 +391,7 @@ impl GoImportNamespaces {
         }
     }
 
-    fn has_dot_member(&self, name: &str, support: &DefinitionIndexHandle<'_>) -> bool {
+    fn has_dot_member(&self, name: &str, support: &dyn BoundedDefinitionLookup) -> bool {
         self.dot_packages.iter().any(|package| {
             !support.fqn(&format!("{package}.{name}")).is_empty()
                 || !support

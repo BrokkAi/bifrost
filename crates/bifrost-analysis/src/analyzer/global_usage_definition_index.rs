@@ -1,6 +1,8 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::languages::{LanguageSupport, language_support};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{
+    BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile, sort_units,
+};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use std::borrow::Borrow;
@@ -19,64 +21,6 @@ pub struct GlobalUsageDefinitionIndex {
     child_packages_by_parent: HashMap<String, HashSet<String>>,
     by_normalized_fqn: HashMap<String, Vec<CodeUnit>>,
     types_by_package_simple: HashMap<(String, String), Vec<CodeUnit>>,
-}
-
-/// Candidate-shaped declaration operations used by forward symbols queries.
-///
-/// Unlike [`GlobalUsageDefinitionIndex`], implementations backed by a persisted
-/// analyzer must not materialize every workspace declaration.  The legacy
-/// index implements this trait only for explicit whole-workspace graph paths;
-/// forward `get_definition` and `get_type_by_location` dispatches use the
-/// `dyn IAnalyzer` implementation, which delegates to bounded store queries.
-pub(crate) trait BoundedDefinitionLookup {
-    fn fqn(&self, fqn: &str) -> Vec<CodeUnit>;
-    fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit>;
-
-    /// Exact-fq lookup across *every* language the workspace indexes.
-    ///
-    /// A language-scoped resolver cannot tell "this fq is not in the workspace"
-    /// apart from "this fq belongs to another language's declarations", so a
-    /// confident cross-workspace boundary claim must consult this before it
-    /// fires (#1174).  The default is the implementation's own scope: bounded
-    /// single-language providers genuinely have no view of other languages, and
-    /// answering same-language keeps them conservative (they can only *fail* to
-    /// suppress a boundary claim, never invent a cross-language hit).
-    fn fqn_in_any_language(&self, fqn: &str) -> Vec<CodeUnit> {
-        self.fqn(fqn)
-    }
-
-    /// Language-blind counterpart of [`Self::package_exists`]; see
-    /// [`Self::fqn_in_any_language`] for why the default is same-language.
-    fn package_exists_in_any_language(&self, package: &str) -> bool {
-        self.package_exists(package)
-    }
-
-    fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit>;
-    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit>;
-    fn fqn_exists(&self, fqn: &str) -> bool;
-    fn package_exists(&self, package: &str) -> bool;
-    fn package_exists_in_language(&self, package: &str, language: Language) -> bool;
-    fn fqn_prefix_exists(&self, prefix: &str) -> bool;
-
-    fn fqn_candidates(&self, fqns: Vec<String>) -> Vec<CodeUnit> {
-        let mut candidates = fqns
-            .into_iter()
-            .flat_map(|fqn| self.fqn(&fqn))
-            .collect::<Vec<_>>();
-        sort_units(&mut candidates);
-        candidates.dedup();
-        candidates
-    }
-
-    fn file_identifier_in_files(&self, files: &[ProjectFile], ident: &str) -> Vec<CodeUnit> {
-        let mut out = Vec::new();
-        for file in files {
-            out.extend(self.file_identifier(file, ident));
-        }
-        sort_units(&mut out);
-        out.dedup();
-        out
-    }
 }
 
 pub(crate) trait ForwardQueryProvider {
@@ -802,15 +746,6 @@ fn package_parent_name(language: Language, package: &str) -> Option<&str> {
         .rsplit_once(separator)
         .map(|(parent, _)| parent)
         .or(Some(""))
-}
-
-fn sort_units(units: &mut [CodeUnit]) {
-    units.sort_by(|left, right| {
-        rel_path_string(left.source())
-            .cmp(&rel_path_string(right.source()))
-            .then_with(|| left.fq_name().cmp(&right.fq_name()))
-            .then_with(|| left.signature().cmp(&right.signature()))
-    });
 }
 
 #[cfg(test)]

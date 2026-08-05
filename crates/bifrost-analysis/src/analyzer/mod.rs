@@ -59,13 +59,15 @@ mod workspace;
 // quietly widen this crate's public surface.
 pub use brokk_bifrost_core::analyzer::{canonical_hash, identifier, test_paths};
 use brokk_bifrost_core::analyzer::{
-    capabilities, code_unit_index, config, model, pool_memo, project, source_content,
+    capabilities, code_unit_index, config, definition_lookup, model, pool_memo, project,
+    source_content,
 };
 pub(crate) use brokk_bifrost_core::analyzer::{
     dense_id, fq_name, semantic_diagnostics, type_relations,
 };
 pub use code_unit_index::CodeUnitIndex;
 pub(crate) use code_unit_index::default_parent_fq_name;
+pub(crate) use definition_lookup::{BoundedDefinitionLookup, sort_units};
 
 pub use capabilities::{
     CapabilityProvider, ImportAnalysisProvider, TestDetectionProvider, TypeAliasProvider,
@@ -114,8 +116,7 @@ pub(crate) use csharp::{
 pub use csharp::{csharp_source_name_segment, strip_csharp_generic_arity};
 pub use fq_name::FqName;
 pub(crate) use global_usage_definition_index::{
-    AnalyzerDefinitionLookup, BoundedDefinitionLookup, ForwardQueryProvider,
-    impl_forward_query_provider,
+    AnalyzerDefinitionLookup, ForwardQueryProvider, impl_forward_query_provider,
 };
 pub use global_usage_definition_index::{DefinitionIndexHandle, GlobalUsageDefinitionIndex};
 // Go language knowledge lives in `brokk-bifrost-go`; these keep their

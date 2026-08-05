@@ -11,6 +11,7 @@ pub mod code_unit_index;
 pub mod cognitive_complexity;
 pub mod common;
 pub mod config;
+pub mod definition_lookup;
 pub mod dense_id;
 pub mod fq_name;
 pub mod identifier;
@@ -26,4 +27,5 @@ pub mod type_relations;
 pub mod usages;
 
 pub use code_unit_index::{CodeUnitIndex, default_parent_fq_name};
+pub use definition_lookup::BoundedDefinitionLookup;
 pub use model::{CodeUnit, Language, ProjectFile, Range};

@@ -356,12 +356,27 @@ CompactRowsBuilder}`, `hash::{HashMap, HashSet}`.
   would be speculative. Both moved methods stay required (no default), as they were on
   `IAnalyzer`; all 17 implementors relocate their existing body from the `IAnalyzer` impl
   block to the `CodeUnitIndex` one with no change to the body.
-* 2026-08-05: `DefinitionNameLookup` added to core beside `CodeUnitIndex`
-  (`analyzer/definition_lookup.rs`), implemented for `DefinitionIndexHandle` in analysis.
-  It is not an inventory method -- `global_usage_definition_index` stays on `IAnalyzer`
-  per section 3.1, and the handle stays in analysis -- but it is the same adjudication
-  applied to a return type: a language scan that only needs "does the workspace define
-  this fully-qualified name" should not have to name the usages resolution model to ask.
-  The trait is shaped from `go/diagnostics.rs`'s call sites, which are all
-  `!handle.fqn(name).is_empty()`, so the method is a `bool` existence query rather than a
-  `Vec<CodeUnit>` the caller discards.
+* 2026-08-05: `BoundedDefinitionLookup` lowered to core beside `CodeUnitIndex`
+  (`analyzer/definition_lookup.rs`), with `sort_units` (its default bodies' canonical
+  ordering). The W3 brief asked for a *new* core-owned bounded-definition-lookup trait
+  shaped from `go/diagnostics.rs`'s call sites, which are all
+  `!handle.fqn(name).is_empty()`. That trait already existed: `BoundedDefinitionLookup`
+  in `global_usage_definition_index.rs`, object-safe, already `&dyn`-consumed by five
+  language definition providers, and already implemented for `DefinitionIndexHandle`.
+  Defining a second single-method trait next to it would have given
+  `DefinitionIndexHandle` two overlapping name-lookup contracts, so the resolution is to
+  lower the existing one rather than add a rival. It passes the mechanical check
+  unchanged -- every signature is `CodeUnit`/`Language`/`ProjectFile`/`&str`/`bool`, and
+  the one helper its defaults need (`rel_path_string`) was already in core. It is not an
+  inventory method and does not change section 3.1: `global_usage_definition_index` stays
+  on `IAnalyzer` and `DefinitionIndexHandle` stays in analysis, because the *handle* is
+  the usages resolution model. What moves is the question, not the index: a language scan
+  asking "does the workspace define this fq name" now names a core trait.
+* 2026-08-05: `go/diagnostics.rs`'s `GoDiagnosticCollector` holds
+  `&dyn BoundedDefinitionLookup` instead of `&'a DefinitionIndexHandle<'a>`. The handle's
+  lifetime structure supported this without redesign: the borrow is a plain shared
+  reference and the trait has no lifetime-bearing method, so `&DefinitionIndexHandle<'_>`
+  unsizes at the call site with no signature change. The collector no longer names an
+  analysis type; the file's remaining analysis dependencies are `IAnalyzer` /
+  `resolve_analyzer::<GoAnalyzer>`, `tree_sitter_analyzer::collect_parse_errors`, and
+  `usages::go_graph`, which are W1/W4's to move.
