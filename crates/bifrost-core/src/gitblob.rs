@@ -115,26 +115,91 @@ pub fn working_tree_oid_values(
     resolve_working_tree_oid_values(workdir, rel_paths, &dirty, &index_oids, started)
 }
 
-/// Resolve every tracked and untracked path in one repository snapshot.
-/// Language analyzers share this result instead of repeating Git work.
-pub fn all_working_tree_oid_values(repo: &Repository) -> Result<HashMap<String, Oid>> {
+/// One-scan working-tree identity snapshot: index OIDs with their cached
+/// stat data for tracked paths, and the set of dirty (modified, staged, or
+/// untracked) paths.
+///
+/// Callers resolve individual paths against it and hash only the files whose
+/// working bytes Git did not record. Building the snapshot reads no file
+/// contents, so an unreadable file outside the caller's file set (for example
+/// another process's live database under `.bifrost/cache`) cannot fail the
+/// scan. Serving an index OID re-checks the file's current stat against the
+/// index entry, the same way Git detects worktree edits, so a snapshot taken
+/// at startup stays valid for later full-refresh sweeps.
+pub struct WorkingTreeIdentity {
+    tracked: HashMap<String, TrackedIdentity>,
+    dirty: HashSet<String>,
+}
+
+struct TrackedIdentity {
+    oid: Oid,
+    file_size: u32,
+    mtime_seconds: i32,
+    mtime_nanoseconds: u32,
+}
+
+impl WorkingTreeIdentity {
+    /// Index OID for `rel` when the file at `abs_path` still carries the
+    /// bytes Git recorded: the path was clean at scan time and its current
+    /// size and mtime match the index entry's cached stat. Dirty, untracked,
+    /// ignored, and since-edited paths return `None`; their identity is the
+    /// hash of the visible working bytes.
+    pub fn clean_index_oid(&self, rel: &str, abs_path: &Path) -> Option<Oid> {
+        if self.dirty.contains(rel) {
+            return None;
+        }
+        let tracked = self.tracked.get(rel)?;
+        let metadata = std::fs::metadata(abs_path).ok()?;
+        if !metadata.is_file() || metadata.len() != u64::from(tracked.file_size) {
+            return None;
+        }
+        let modified = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        if modified.as_secs() != u64::try_from(tracked.mtime_seconds).ok()? {
+            return None;
+        }
+        // Index entries on some filesystems and Git versions truncate the
+        // nanosecond field to zero; only a recorded value can disagree.
+        if tracked.mtime_nanoseconds != 0 && modified.subsec_nanos() != tracked.mtime_nanoseconds {
+            return None;
+        }
+        Some(tracked.oid)
+    }
+}
+
+/// Take one repository-wide identity scan. Language analyzers share this
+/// result instead of repeating Git index and dirty-tree work at startup.
+pub fn working_tree_identity(repo: &Repository) -> Result<WorkingTreeIdentity> {
     let started = std::time::Instant::now();
-    let workdir = workdir(repo)?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
     index.read(true).map_err(|e| e.to_string())?;
     let dirty = dirty_worktree_paths(repo)?;
-    let index_oids: HashMap<String, Oid> = index
+    let tracked: HashMap<String, TrackedIdentity> = index
         .iter()
-        .map(|entry| Ok((index_path_to_string(&entry)?, entry.id)))
+        .map(|entry| {
+            Ok((
+                index_path_to_string(&entry)?,
+                TrackedIdentity {
+                    oid: entry.id,
+                    file_size: entry.file_size,
+                    mtime_seconds: entry.mtime.seconds(),
+                    mtime_nanoseconds: entry.mtime.nanoseconds(),
+                },
+            ))
+        })
         .collect::<Result<_>>()?;
-    let mut rel_paths = index_oids.keys().cloned().collect::<Vec<_>>();
-    rel_paths.extend(
-        dirty
-            .iter()
-            .filter(|path| !index_oids.contains_key(*path))
-            .cloned(),
-    );
-    resolve_working_tree_oid_values(workdir, &rel_paths, &dirty, &index_oids, started)
+    if crate::profiling::enabled() {
+        crate::profiling::note(format!(
+            "git_identity_scan index={} dirty={} elapsed_ms={:.1}",
+            tracked.len(),
+            dirty.len(),
+            started.elapsed().as_secs_f64() * 1000.0,
+        ));
+    }
+    Ok(WorkingTreeIdentity { tracked, dirty })
 }
 
 fn resolve_working_tree_oid_values(
