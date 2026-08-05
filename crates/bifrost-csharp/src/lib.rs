@@ -29,6 +29,7 @@ pub mod declarations;
 pub mod graph_support;
 pub mod hierarchy;
 pub mod imports;
+pub mod queries;
 pub mod structural;
 pub mod syntax;
 pub mod test_detection;

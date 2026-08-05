@@ -13,6 +13,7 @@ use brokk_bifrost_csharp::adapter::{
     csharp_extract_call_receiver, csharp_nested_owner_short_name_candidates,
 };
 use brokk_bifrost_csharp::declarations::parse_csharp_file;
+use brokk_bifrost_csharp::queries::CSHARP_QUERY_DIRECTORY;
 use brokk_bifrost_csharp::test_detection::csharp_contains_tests;
 use tree_sitter::Tree;
 
@@ -29,8 +30,10 @@ impl LanguageAdapter for CSharpAdapter {
         Language::CSharp
     }
 
+    /// Relative to `brokk-bifrost-csharp`'s crate root: the `.scm` assets moved
+    /// with the language knowledge and are embedded there.
     fn query_directory(&self) -> &'static str {
-        "resources/treesitter/c_sharp"
+        CSHARP_QUERY_DIRECTORY
     }
 
     fn file_extension(&self) -> &'static str {
