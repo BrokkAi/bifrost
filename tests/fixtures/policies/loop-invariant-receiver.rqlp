@@ -39,7 +39,7 @@
       :type assertion
       :subject
         (rql
-          :schema-version 9
+          :schema-version 1
           (union
             (language rust
               (inside (loop :capture "region")

@@ -24,9 +24,9 @@
             "regex": "^logger$"
           }
         },
-        "schema_version": 13
+        "schema_version": 1
       },
-      "schema_version": 13,
+      "schema_version": 1,
       "type": "inline"
     },
     "type": "assertion"

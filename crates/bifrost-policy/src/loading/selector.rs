@@ -508,25 +508,25 @@ mod tests {
             resolve_rql_schema_version(None).unwrap()
         );
 
-        let wrapper = resolve("(name \"A\")", Some(2)).unwrap();
-        assert_eq!(wrapper.wrapper_authored_schema_version(), Some(2));
+        let wrapper = resolve("(name \"A\")", Some(1)).unwrap();
+        assert_eq!(wrapper.wrapper_authored_schema_version(), Some(1));
         assert_eq!(wrapper.document_authored_schema_version(), None);
         assert_eq!(
             wrapper.schema_resolution().origin,
             SchemaVersionOrigin::Explicit
         );
 
-        let document = resolve("(rql :schema-version 2 (name \"A\"))", None).unwrap();
+        let document = resolve("(rql :schema-version 1 (name \"A\"))", None).unwrap();
         assert_eq!(document.wrapper_authored_schema_version(), None);
-        assert_eq!(document.document_authored_schema_version(), Some(2));
+        assert_eq!(document.document_authored_schema_version(), Some(1));
         assert_eq!(
             document.schema_resolution().origin,
             SchemaVersionOrigin::ReferencedDocumentExplicit
         );
 
-        let agreeing = resolve("(rql :schema-version 2 (name \"A\"))", Some(2)).unwrap();
-        assert_eq!(agreeing.wrapper_authored_schema_version(), Some(2));
-        assert_eq!(agreeing.document_authored_schema_version(), Some(2));
+        let agreeing = resolve("(rql :schema-version 1 (name \"A\"))", Some(1)).unwrap();
+        assert_eq!(agreeing.wrapper_authored_schema_version(), Some(1));
+        assert_eq!(agreeing.document_authored_schema_version(), Some(1));
         assert_eq!(
             agreeing.schema_resolution().origin,
             SchemaVersionOrigin::ReferencedDocumentExplicit
@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn conflict_precedes_unsupported_document_version() {
-        let error = resolve("(rql :schema-version 3 (name \"A\"))", Some(2)).unwrap_err();
+        let error = resolve("(rql :schema-version 3 (name \"A\"))", Some(1)).unwrap_err();
         let ReferencedRqlError::Source { diagnostic, .. } = error else {
             panic!("expected source diagnostic");
         };

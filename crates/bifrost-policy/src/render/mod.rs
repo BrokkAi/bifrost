@@ -364,7 +364,7 @@ mod tests {
       :message "Avoid target"
       :severity warning
       :analysis (analysis :type match :selector
-        (rql :schema-version 2 (language typescript (function :name "target")))))"#;
+        (rql :schema-version 1 (language typescript (function :name "target")))))"#;
 
     fn evaluated_report(
         policy_source: &str,
@@ -638,7 +638,7 @@ mod tests {
     fn human_report_emits_one_concise_note_for_inferred_policy_and_rql_schemas() {
         let inferred = MATCHING_POLICY
             .replacen("\n      :schema-version 1", "", 1)
-            .replacen("rql :schema-version 2", "rql", 1);
+            .replacen("rql :schema-version 1", "rql", 1);
         let report = evaluated_report(&inferred, "export function other() { return 1; }\n", None);
         let mut output = Vec::new();
         write_policy_human(
