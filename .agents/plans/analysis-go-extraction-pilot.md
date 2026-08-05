@@ -112,7 +112,29 @@ P2 — measurement and verdict (the "works as expected" test):
    under ~1.3k LOC. On PASS, the fleet proceeds under this plan's sequencing section.
    On FAIL, stop and report to Jonathan with the numbers.
 
-## Fleet sequencing (on pilot PASS)
+## Fleet sequencing (amended 2026-08-05 after the Rust census)
+
+The Rust census (.agents/docs/rust-extraction-census-2026-08.md) added two
+prerequisites and one deviation before Rust can ship near the shim bar:
+
+- W5 (shared): lower a PreparedSyntaxTree contract to core. Five non-semantic
+  Rust files sit on the crate-private analysis struct; Go never did.
+- R1 (Rust-only): rewrite the 2,896 LOC of impl-RustAnalyzer inherent language
+  logic (73 methods, 303 call sites) as free functions before the crate move.
+  The self-recursive memo accessors (usage_index -> declarations ->
+  cargo_routes) stay shim-side with the PoolSafeMemo/parallel-flag contract of
+  #1416 preserved byte-for-byte in behavior.
+- Deviation: moka enters the rust crate with lexical_scope.rs's RUST_TREES
+  parse memo. A global parse cache is language-crate state; the pilot's
+  moka-stays-in-analysis rule was about GoMemoCaches shim state, not this.
+
+With those, the census projects a ~21.4k move (54%), a ~2.8k shim, and about
+-10s of analysis frontend -- the largest single opportunity in the fleet.
+Expect the same census-first discipline per language: each fleet language gets
+its seam census before its extraction, and new couplings become named
+workstreams rather than improvisations.
+
+## Fleet sequencing (original, on pilot PASS)
 
 Per the seam matrix order, each language repeating the P1 pattern (P0's lowerings are
 already fleet-shared): Rust, then the remaining MODERATE languages (Python, C#, PHP,
