@@ -26,7 +26,7 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 - [x] (2026-08-05) Committed the completed change to the current branch. A push still requires a user request.
 - [x] (2026-08-05) Released the startup OID lock before language projection and parallelized the pure path-to-OID work.
 - [x] (2026-08-05) Reprofiled Apache Camel and ran the focused, workspace, and all-feature lint gates.
-- [ ] Commit the parallelization and push to `origin/master`.
+- [x] (2026-08-05) Committed the parallelization and pushed the merged work to `origin/master`.
 
 ## Surprises & Discoveries
 
