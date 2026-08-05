@@ -478,13 +478,15 @@ impl StructuralSpec for JsTsStructuralSpec {
     }
 
     fn identity_route_support(&self) -> &IdentityRouteSupport {
-        // `import {x as y}` is an alias, `export` makes a local reachable,
-        // and `export ... from` forwards identity onward.
+        // `export { x }` resolves through the local binding (including an
+        // imported one) to the origin declaration, so the export relation has
+        // a producer. Import specifiers and `export ... from` specifiers
+        // resolve to NoDefinition today -- a resolver gap, not a modeling
+        // choice -- so the import, alias and re-export relations stay
+        // unclaimed until the resolver answers them (see the #1475 ExecPlan
+        // Decision Log, M3, and its follow-up issue).
         static SUPPORT: IdentityRouteSupport = DEEP_IDENTITY_AXES
-            .supported_relation(RouteHopKind::Alias)
-            .supported_relation(RouteHopKind::Import)
             .supported_relation(RouteHopKind::Export)
-            .supported_relation(RouteHopKind::ReExport)
             .supported_relation(RouteHopKind::NestedOwner);
         &SUPPORT
     }
@@ -509,6 +511,17 @@ impl StructuralSpec for JsTsStructuralSpec {
 
     fn segment_generic_arity(&self, token: Node<'_>) -> Option<u32> {
         spelled_generic_arity(token, JS_TS_PATH_CHAIN, &["generic_type"])
+    }
+
+    fn indirection_relation(&self, token: Node<'_>) -> Option<RouteHopKind> {
+        if let Some(export) = nearest_ancestor(token, |kind| kind == "export_statement") {
+            return Some(if export.child_by_field_name("source").is_some() {
+                RouteHopKind::ReExport
+            } else {
+                RouteHopKind::Export
+            });
+        }
+        nearest_ancestor(token, |kind| kind == "import_statement").map(|_| RouteHopKind::Import)
     }
 
     /// The only scope segments this adapter classifies come from

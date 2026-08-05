@@ -473,6 +473,19 @@ impl StructuralSpec for RustStructuralSpec {
         )
     }
 
+    fn indirection_relation(&self, token: Node<'_>) -> Option<RouteHopKind> {
+        let declaration = nearest_ancestor(token, |kind| kind == "use_declaration")?;
+        let mut cursor = declaration.walk();
+        let reexports = declaration
+            .children(&mut cursor)
+            .any(|child| child.kind() == "visibility_modifier");
+        Some(if reexports {
+            RouteHopKind::ReExport
+        } else {
+            RouteHopKind::Import
+        })
+    }
+
     /// `r#type` is the identifier `type` wearing the raw-identifier escape the
     /// lexer already accepted as one token.
     fn decode_spelling(&self, raw: &str) -> Option<String> {

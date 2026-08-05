@@ -18,6 +18,8 @@
 //!   package rows, plus the reaching-binding algorithm over them (issue #1474).
 //! - [`qualified_paths`]: per-file qualified-path and path-segment rows with
 //!   opt-in per-segment prefix resolution (issue #1475).
+//! - [`identity_routes`]: canonical identity projection, physical grouping,
+//!   per-file route relation rows and the bounded route traversal (#1475).
 //! - [`planner`]: positive-anchor candidate pruning (negation never prunes).
 //! - [`provider`]: the capability trait analyzers expose, plus the
 //!   source-hash-validated facts cache behind it.
@@ -32,6 +34,7 @@ pub(crate) mod capabilities;
 pub(crate) mod execution;
 pub mod extract;
 pub mod facts;
+pub mod identity_routes;
 pub(crate) mod index;
 pub mod lexical_environment;
 pub mod matcher;
@@ -82,6 +85,13 @@ pub use execution::{
     CodeQueryStructuralFactsCacheCounters,
 };
 pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
+pub use identity_routes::{
+    IDENTITY_ROUTE_PRODUCER_AXES, IdentityRoute, MAX_ROUTE_DEPTH, MAX_ROUTE_FAN_OUT,
+    PhysicalOccurrence, RoundTripOutcome, RouteEndpoint, RouteProvenance,
+    RouteRelationCompleteness, RouteRelationIncompleteReason, RouteRelationRow,
+    RouteRelationsFileResult, RoutesCancelled, canonical_identity_of, identity_routes_from,
+    physical_occurrences, round_trip_from_site, route_relations_for_file,
+};
 pub use kinds::{ALL_KINDS, NormalizedKind, Role};
 pub use lexical_environment::{
     BindingRow, ENVIRONMENT_PRODUCER_AXES, EnvironmentCompleteness, EnvironmentFileResult,

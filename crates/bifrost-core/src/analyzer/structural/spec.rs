@@ -14,7 +14,7 @@ use super::occurrences::{
     Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
 };
 use super::resolution::{BindingActivation, LexicalEnvironmentSupport};
-use super::routes::IdentityRouteSupport;
+use super::routes::{IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::{Language, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -126,6 +126,19 @@ pub trait StructuralSpec: Send + Sync + 'static {
         declares: Option<NormalizedKind>,
     ) -> Option<Namespace> {
         default_occurrence_namespace(role, declares)
+    }
+
+    /// The indirection relation an import/export token participates in:
+    /// `Import` for a plain import, `Export` for an export of a local
+    /// declaration, `ReExport` for an export whose subject comes from
+    /// elsewhere (`pub use`, `export ... from`). Read from the token's
+    /// enclosing statement through AST fields.
+    ///
+    /// `None` means the adapter cannot classify the statement; the derivation
+    /// layer then treats an import-target token as a plain `Import`, which is
+    /// what the occurrence role already states.
+    fn indirection_relation(&self, _token: Node<'_>) -> Option<RouteHopKind> {
+        None
     }
 
     /// The root node of the qualified-path chain `token` participates in: the

@@ -295,12 +295,14 @@ impl StructuralSpec for PythonStructuralSpec {
     }
 
     fn identity_route_support(&self) -> &IdentityRouteSupport {
-        // `import x as y` is an alias and a module re-exporting an imported
-        // name (an `__init__` facade) is a re-export.
+        // `import x as y` is an alias. Python's re-export shapes (an
+        // `__init__` facade, `__all__`) are conventions over files rather
+        // than statements a parse tree names, so the relation stays
+        // unclaimed until a producer models them (see the #1475 ExecPlan
+        // Decision Log, M3).
         static SUPPORT: IdentityRouteSupport = DEEP_IDENTITY_AXES
             .supported_relation(RouteHopKind::Alias)
             .supported_relation(RouteHopKind::Import)
-            .supported_relation(RouteHopKind::ReExport)
             .supported_relation(RouteHopKind::NestedOwner);
         &SUPPORT
     }
@@ -328,6 +330,13 @@ impl StructuralSpec for PythonStructuralSpec {
         root.named_children(&mut cursor)
             .filter(|child| child.kind() == "identifier")
             .collect()
+    }
+
+    fn indirection_relation(&self, token: Node<'_>) -> Option<RouteHopKind> {
+        nearest_ancestor(token, |kind| {
+            matches!(kind, "import_statement" | "import_from_statement")
+        })
+        .map(|_| RouteHopKind::Import)
     }
 
     /// Python only classifies a scope segment inside a `dotted_name`, and every

@@ -395,6 +395,10 @@ impl StructuralSpec for JavaStructuralSpec {
         spelled_generic_arity(token, JAVA_PATH_CHAIN, &["generic_type"])
     }
 
+    fn indirection_relation(&self, token: Node<'_>) -> Option<RouteHopKind> {
+        nearest_ancestor(token, |kind| kind == "import_declaration").map(|_| RouteHopKind::Import)
+    }
+
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
         if let Some(role) = java_occurrence_role(node) {
             sink.occurrence_role(node, role);
