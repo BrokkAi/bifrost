@@ -1,12 +1,13 @@
-use crate::analyzer::Range;
-use crate::analyzer::usages::common::{
+use brokk_bifrost_core::analyzer::Range;
+use brokk_bifrost_core::analyzer::usages::common::{
     SNIPPET_CONTEXT_LINES, reclassify_self_receiver_hit_at, usage_hit,
 };
-use crate::analyzer::usages::go_graph::extractor::ScanCtx;
-use crate::text_utils::{find_line_index_for_offset, trimmed_snippet_around_range};
+use brokk_bifrost_core::text_utils::{find_line_index_for_offset, trimmed_snippet_around_range};
 use tree_sitter::Node;
 
-pub(super) fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+use crate::graph::extractor::ScanCtx;
+
+pub(crate) fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let start = node.start_byte();
     let end = node.end_byte();
     let range = Range {
@@ -15,7 +16,7 @@ pub(super) fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         start_line: find_line_index_for_offset(ctx.line_starts, start),
         end_line: find_line_index_for_offset(ctx.line_starts, end),
     };
-    let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
+    let Some(enclosing) = ctx.code_units.enclosing_code_unit(ctx.file, &range) else {
         return;
     };
     if enclosing == ctx.spec.target {
@@ -43,12 +44,12 @@ pub(super) fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// same-owner site. Records the ordinary hit, then reclassifies it — the shared
 /// scan consumer, so the record ceremony (span, enclosing, self-definition
 /// guard) lives in exactly one place.
-pub(super) fn record_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub(crate) fn record_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     record_hit(node, ctx);
     reclassify_self_receiver_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
 }
 
-pub(super) fn record_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub(crate) fn record_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let start = node.start_byte();
     let end = node.end_byte();
     let range = Range {
@@ -57,7 +58,7 @@ pub(super) fn record_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         start_line: find_line_index_for_offset(ctx.line_starts, start),
         end_line: find_line_index_for_offset(ctx.line_starts, end),
     };
-    let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
+    let Some(enclosing) = ctx.code_units.enclosing_code_unit(ctx.file, &range) else {
         return;
     };
     if enclosing == ctx.spec.target {

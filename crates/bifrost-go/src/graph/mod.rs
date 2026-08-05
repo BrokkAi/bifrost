@@ -1,17 +1,21 @@
-//! Go's usage-graph knowledge: the AST vocabulary, the reference resolver, and
-//! the tree-free project/edge indexes both the per-symbol scan and the
-//! whole-workspace inverted pass are built on.
+//! Go's usage-graph knowledge: the AST vocabulary, the reference resolver, the
+//! tree-free project/edge indexes, and both scan bodies built on them.
 //!
-//! What is *not* here yet: the two scan bodies, held in
-//! `brokk-bifrost-analysis` until workstream W4 moves them. The inverted
-//! pass's per-file walk is already core-expressible (`scan_go_file` reads a
-//! `FileEdgeScanInput` and returns `PerFileEdges`, both core types); only the
-//! workspace fan-out needs an analyzer handle for each file's declaration
-//! index. The forward scan attributes each hit through
-//! `enclosing_code_unit`, which now lives on `CodeUnitIndex`, so its move is
-//! unblocked too.
+//! [`extractor`] is the per-symbol forward scan (one target, every candidate
+//! file); it attributes each hit through
+//! [`CodeUnitIndex::enclosing_code_unit`], so it needs no analyzer handle.
+//! [`inverted`] is the per-file half of the whole-workspace pass, reading a core
+//! `FileEdgeScanInput` and returning core `PerFileEdges`. Only that pass's
+//! workspace fan-out stays in `brokk-bifrost-analysis`, because it needs an
+//! analyzer handle for each file's declaration index.
+//!
+//! [`CodeUnitIndex::enclosing_code_unit`]:
+//! brokk_bifrost_core::analyzer::CodeUnitIndex::enclosing_code_unit
 
 pub mod ast;
+pub mod extractor;
+mod hits;
+pub mod inverted;
 pub mod reference;
 pub mod resolver;
 

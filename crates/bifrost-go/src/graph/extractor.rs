@@ -1,29 +1,29 @@
 //! The per-symbol forward scan: walk each candidate file once looking for one
 //! target's call sites.
 //!
-//! Stays in this crate rather than moving to [`brokk_bifrost_go`] with the rest
-//! of the Go graph: [`ScanCtx`] carries an `&dyn IAnalyzer` because
-//! [`super::hits`] attributes every hit through `enclosing_code_unit`, which is
-//! an analyzer method with no `CodeUnitIndex` equivalent. The Go AST vocabulary
-//! the walk is written in lives in [`brokk_bifrost_go::graph::ast`].
+//! [`ScanCtx`] carries a [`CodeUnitIndex`] because [`super::hits`] attributes
+//! every hit to its enclosing declaration; that query lives on the core
+//! capability trait, so the whole scan is expressible over core types plus the
+//! Go AST vocabulary in [`super::ast`].
 
-use crate::analyzer::usages::go_graph::hits::{
-    record_hit, record_self_receiver_hit, record_unproven_hit,
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
 };
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::{IAnalyzer, ProjectFile};
-use crate::cancellation::CancellationToken;
-use crate::hash::{HashMap, HashSet};
-use brokk_bifrost_go::graph::ast::{
+use brokk_bifrost_core::analyzer::usages::model::UsageHit;
+use brokk_bifrost_core::analyzer::{CodeUnitIndex, ProjectFile};
+use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
+
+use crate::graph::ast::{
     NON_OWNER_TOKEN, OWNER_TOKEN, SELF_RECEIVER_TOKEN, composite_literal_owner_type_for_key,
     field_owner_token, for_each_var_spec, is_definition_identifier, is_identifier_node,
     is_method_receiver_parameter, lhs_identifier_slots, parameter_names,
     receiver_symbol_from_qualifier, rhs_expressions, selector_parts, type_ref_from_node,
     var_spec_name_slots, var_spec_names,
 };
-use brokk_bifrost_go::graph::reference::go_is_top_level_decl;
-use brokk_bifrost_go::graph::resolver::{
+use crate::graph::hits::{record_hit, record_self_receiver_hit, record_unproven_hit};
+use crate::graph::reference::go_is_top_level_decl;
+use crate::graph::resolver::{
     GoProjectGraph, ScanBindings, TargetSpec, TypeRef, constructor_call_type_fqns, node_text,
 };
 use rayon::prelude::*;
@@ -31,8 +31,8 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 use tree_sitter::Node;
 
-pub(super) fn scan_files_for_target(
-    analyzer: &dyn IAnalyzer,
+pub fn scan_files_for_target(
+    code_units: &dyn CodeUnitIndex,
     graph: &GoProjectGraph,
     files: HashSet<ProjectFile>,
     spec: &TargetSpec,
@@ -73,7 +73,7 @@ pub(super) fn scan_files_for_target(
             file,
             source,
             line_starts: &parsed.line_starts,
-            analyzer,
+            code_units,
             spec,
             bindings: scan_bindings,
             file_package,
@@ -105,24 +105,24 @@ pub(super) fn scan_files_for_target(
     }
 }
 
-pub(super) struct GoScanResult {
-    pub(super) hits: BTreeSet<UsageHit>,
-    pub(super) unproven_hits: BTreeSet<UsageHit>,
+pub struct GoScanResult {
+    pub hits: BTreeSet<UsageHit>,
+    pub unproven_hits: BTreeSet<UsageHit>,
 }
 
-pub(super) struct ScanCtx<'a> {
-    pub(super) graph: &'a GoProjectGraph,
-    pub(super) file: &'a ProjectFile,
-    pub(super) source: &'a str,
-    pub(super) line_starts: &'a [usize],
-    pub(super) analyzer: &'a dyn IAnalyzer,
-    pub(super) spec: &'a TargetSpec,
+pub struct ScanCtx<'a> {
+    pub(crate) graph: &'a GoProjectGraph,
+    pub(crate) file: &'a ProjectFile,
+    pub(crate) source: &'a str,
+    pub(crate) line_starts: &'a [usize],
+    pub(crate) code_units: &'a dyn CodeUnitIndex,
+    pub(crate) spec: &'a TargetSpec,
     bindings: ScanBindings,
     file_package: String,
     alias_packages: HashMap<String, Vec<String>>,
     dot_packages: Vec<String>,
-    pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
+    pub(crate) hits: &'a mut BTreeSet<UsageHit>,
+    pub(crate) unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
 
 impl ScanCtx<'_> {

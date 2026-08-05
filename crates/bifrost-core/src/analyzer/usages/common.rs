@@ -1,13 +1,90 @@
 //! The language-blind half of the usage resolvers' shared helpers.
 //!
-//! Node identity, node text, and fqn prefix walking: each is decided by a
-//! tree-sitter node or a string, so none of it needs an analyzer handle. The
-//! rest of `usages::common` -- hit reclassification, the enclosing-owner chain,
-//! `analyzed_files_for_language` -- names `IAnalyzer` or the hit set and stays
-//! in `brokk-bifrost-analysis`, which re-exports these at their original paths.
+//! Node identity, node text, fqn prefix walking, and hit recording and
+//! reclassification: each is decided by a tree-sitter node, a string, or the hit
+//! set, so none of it needs an analyzer handle. What is left of `usages::common`
+//! -- the enclosing-owner chain, `analyzed_files_for_language`,
+//! `language_for_target` -- names `IAnalyzer` or `Language` and stays in
+//! `brokk-bifrost-analysis`, which re-exports these at their original paths.
 
 use crate::analyzer::common::node_source_text_trimmed;
+use crate::analyzer::usages::model::UsageHit;
+use crate::analyzer::{CodeUnit, ProjectFile};
+use std::collections::BTreeSet;
 use tree_sitter::Node;
+
+/// Graph-strategy hits land at maximum confidence.
+pub const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
+/// Lines of context to include before/after a match in [`UsageHit::snippet`].
+pub const SNIPPET_CONTEXT_LINES: usize = 1;
+
+pub fn reclassify_import_hit_at(
+    hits: &mut BTreeSet<UsageHit>,
+    file: &ProjectFile,
+    start: usize,
+    end: usize,
+) {
+    reclassify_hit_at(hits, file, start, end, UsageHit::into_import);
+}
+
+pub fn reclassify_override_declaration_hit_at(
+    hits: &mut BTreeSet<UsageHit>,
+    file: &ProjectFile,
+    start: usize,
+    end: usize,
+) {
+    reclassify_hit_at(hits, file, start, end, UsageHit::into_override_declaration);
+}
+
+/// Reclassify an already-recorded proven hit at `[start, end)` as a same-owner
+/// self/this receiver hit. Used by the per-language extractors (#1014 facet B)
+/// so a call whose receiver is the current instance / own type is counted as a
+/// same-owner site and excluded from the external usage surface, uniformly with
+/// Rust/C++/JS-TS.
+pub fn reclassify_self_receiver_hit_at(
+    hits: &mut BTreeSet<UsageHit>,
+    file: &ProjectFile,
+    start: usize,
+    end: usize,
+) {
+    reclassify_hit_at(hits, file, start, end, UsageHit::into_self_receiver);
+}
+
+fn reclassify_hit_at(
+    hits: &mut BTreeSet<UsageHit>,
+    file: &ProjectFile,
+    start: usize,
+    end: usize,
+    reclassify: impl FnOnce(UsageHit) -> UsageHit,
+) {
+    if let Some(hit) = hits
+        .iter()
+        .find(|hit| hit.file == *file && hit.start_offset == start && hit.end_offset == end)
+        .cloned()
+    {
+        hits.remove(&hit);
+        hits.insert(reclassify(hit));
+    }
+}
+
+pub fn usage_hit(
+    file: &ProjectFile,
+    line_idx: usize,
+    start_offset: usize,
+    end_offset: usize,
+    enclosing: CodeUnit,
+    snippet: impl Into<String>,
+) -> UsageHit {
+    UsageHit::new(
+        file.clone(),
+        line_idx + 1,
+        start_offset,
+        end_offset,
+        enclosing,
+        GRAPH_HIT_CONFIDENCE,
+        snippet,
+    )
+}
 
 /// Yields `fqn`, then each progressively shorter dot-truncated prefix down to
 /// (and including) the last single segment -- `"a.b.c"` -> `"a.b.c"`, `"a.b"`,

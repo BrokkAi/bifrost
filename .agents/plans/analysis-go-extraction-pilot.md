@@ -168,6 +168,16 @@ else the language's unit pins are the evidence (Ruby/Kotlin precedent).
       shared workstreams (W1 ParsedFile/ScalaExportInfo lowering, W2 inverted-edge
       scan contract, W3 CodeUnitIndex enclosing query + bounded-lookup trait), then
       move Go's residual files (W4), then fleet
+- [x] W4: Go's four residual blocks moved (declaration walk, diagnostics, forward
+      scan, inverted per-file walk) -- 2,445 LOC out of analysis, all four
+      couplings cleared by W1/W2/W3 with no new abstractions needed. Analysis Go
+      residue 4,529 -> 2,084 (1,598 production shim + 486 retained tests); the
+      parked 11,098 (semantic/artifact/dependency-discovery/definition routes)
+      untouched, its workstream is semantic_model lowering. Go crate 6,090 ->
+      8,544. Fleet note: the pilot tip already carried 1,570 of pure forwarding
+      shim, so the plan's ~1.05k per-language shim estimate is low by ~500 LOC
+      independently of the blocks -- the floor is the SPI block plus the memo
+      shell.
 
 ## Decision log
 

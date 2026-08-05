@@ -1,18 +1,17 @@
-// Node identity, node text, and fqn prefix walking need nothing but a node or a
-// string, so they moved to `brokk-bifrost-core` and are re-exported here at the
-// paths their callers already use. What stays needs a hit set or an `IAnalyzer`.
+// Node identity, node text, fqn prefix walking, and hit recording and
+// reclassification need nothing but a node, a string, or the hit set, so they
+// moved to `brokk-bifrost-core` and are re-exported here at the paths their
+// callers already use. What stays needs an `IAnalyzer` or a `Language`.
 pub(crate) use brokk_bifrost_core::analyzer::usages::common::namespace_prefixes;
-pub(super) use brokk_bifrost_core::analyzer::usages::common::{node_text, same_node};
+pub(super) use brokk_bifrost_core::analyzer::usages::common::{
+    SNIPPET_CONTEXT_LINES, node_text, reclassify_import_hit_at,
+    reclassify_override_declaration_hit_at, reclassify_self_receiver_hit_at, same_node, usage_hit,
+};
 
 use crate::analyzer::common as analyzer_common;
 use crate::analyzer::usages::model::{UsageHit, UsageHitSurface};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use std::collections::BTreeSet;
-
-/// Graph-strategy hits land at maximum confidence.
-pub(super) const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
-/// Lines of context to include before/after a match in [`UsageHit::snippet`].
-pub(super) const SNIPPET_CONTEXT_LINES: usize = 1;
 
 /// Count the proven hits that are visible to agent/search consumers. Binding,
 /// definition, and same-owner sites remain available to editor consumers but
@@ -113,72 +112,4 @@ where
         }
         self.last.clone()
     }
-}
-
-pub(super) fn reclassify_import_hit_at(
-    hits: &mut BTreeSet<UsageHit>,
-    file: &ProjectFile,
-    start: usize,
-    end: usize,
-) {
-    reclassify_hit_at(hits, file, start, end, UsageHit::into_import);
-}
-
-pub(super) fn reclassify_override_declaration_hit_at(
-    hits: &mut BTreeSet<UsageHit>,
-    file: &ProjectFile,
-    start: usize,
-    end: usize,
-) {
-    reclassify_hit_at(hits, file, start, end, UsageHit::into_override_declaration);
-}
-
-/// Reclassify an already-recorded proven hit at `[start, end)` as a same-owner
-/// self/this receiver hit. Used by the per-language extractors (#1014 facet B)
-/// so a call whose receiver is the current instance / own type is counted as a
-/// same-owner site and excluded from the external usage surface, uniformly with
-/// Rust/C++/JS-TS.
-pub(super) fn reclassify_self_receiver_hit_at(
-    hits: &mut BTreeSet<UsageHit>,
-    file: &ProjectFile,
-    start: usize,
-    end: usize,
-) {
-    reclassify_hit_at(hits, file, start, end, UsageHit::into_self_receiver);
-}
-
-fn reclassify_hit_at(
-    hits: &mut BTreeSet<UsageHit>,
-    file: &ProjectFile,
-    start: usize,
-    end: usize,
-    reclassify: impl FnOnce(UsageHit) -> UsageHit,
-) {
-    if let Some(hit) = hits
-        .iter()
-        .find(|hit| hit.file == *file && hit.start_offset == start && hit.end_offset == end)
-        .cloned()
-    {
-        hits.remove(&hit);
-        hits.insert(reclassify(hit));
-    }
-}
-
-pub(super) fn usage_hit(
-    file: &ProjectFile,
-    line_idx: usize,
-    start_offset: usize,
-    end_offset: usize,
-    enclosing: CodeUnit,
-    snippet: impl Into<String>,
-) -> UsageHit {
-    UsageHit::new(
-        file.clone(),
-        line_idx + 1,
-        start_offset,
-        end_offset,
-        enclosing,
-        GRAPH_HIT_CONFIDENCE,
-        snippet,
-    )
 }

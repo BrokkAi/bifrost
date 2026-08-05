@@ -2,7 +2,6 @@ mod adapter;
 mod artifact;
 mod cache;
 mod clones;
-mod declarations;
 mod dependency_discovery;
 pub(crate) mod diagnostics;
 mod imports;
@@ -45,6 +44,9 @@ use std::sync::atomic::Ordering;
 
 pub(crate) use adapter::GoAdapter;
 pub use artifact::GoDependencyPackAdapter;
+// The Go declaration walk lives in the go crate; the rest of analysis (artifact,
+// semantic) still reaches its helpers through `super::declarations::`.
+pub(crate) use brokk_bifrost_go::declarations;
 pub(crate) use brokk_bifrost_go::declarations::{
     determine_go_package_name, go_structured_type_identity_bounded,
 };

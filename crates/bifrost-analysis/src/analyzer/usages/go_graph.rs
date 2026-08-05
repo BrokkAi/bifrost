@@ -1,26 +1,25 @@
 //! Go's usage-graph strategy: the analysis-side half.
 //!
 //! The language knowledge -- the AST vocabulary, the reference resolver, the
-//! project and edge indexes -- lives in [`brokk_bifrost_go::graph`]. What stays
-//! here are the scan drivers that need an analyzer handle (`extractor`/`hits`
-//! for `enclosing_code_unit`, `inverted`'s `build_go_edges` for the workspace
-//! fan-out and per-file declaration index) and the trait impls that plug them
-//! into the SPI. `inverted`'s per-file walk itself is pure logic over core
-//! types and the tree-free edge index.
+//! project and edge indexes, and both scan bodies -- lives in
+//! [`brokk_bifrost_go::graph`]. What stays here is the SPI: the trait impls, the
+//! downcasts that unpack a `GoAnalyzer` into the core capability traits and Go
+//! side data the go crate takes, and [`build_go_edges`], whose workspace fan-out
+//! needs an analyzer handle for each file's declaration index.
 
-mod extractor;
-mod hits;
-mod inverted;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_target};
-use crate::analyzer::usages::go_graph::extractor::scan_files_for_target;
-use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
+use crate::analyzer::usages::inverted_edges::{
+    UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output, parse_and_collect,
+};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
+use brokk_bifrost_go::graph::extractor::scan_files_for_target;
+use brokk_bifrost_go::graph::inverted::scan_go_file;
 pub(in crate::analyzer::usages) use brokk_bifrost_go::graph::reference::{
     GoReferenceResolution, GoSelectorDescriptor, go_selector_descriptor,
     go_selector_descriptor_with_scope, resolve_go_reference_with_namespaces,
@@ -31,15 +30,54 @@ use brokk_bifrost_go::graph::resolver::{
 use std::collections::BTreeSet;
 
 pub(crate) use brokk_bifrost_go::graph::go_implicit_entry_point;
-pub(crate) use brokk_bifrost_go::graph::resolver::{
-    go_simple_type_name, go_type_name_parts, resolve_go_import_namespaces,
-};
+pub(crate) use brokk_bifrost_go::graph::resolver::{go_simple_type_name, go_type_name_parts};
+
+/// Build every Go `caller -> callee` edge in one pass over the workspace.
+///
+/// The per-symbol path ([`resolve_with_graph`]) answers "who calls X" by
+/// scanning every candidate file for X. Building the *whole* graph that way
+/// walks each file once per symbol whose name it contains -- quadratic on real
+/// repos. This inverts it: walk each file's tree once, resolve every reference
+/// to the fully qualified callee it names, and emit a `caller -> callee` edge
+/// when both endpoints are nodes. Cost is linear in total source size,
+/// independent of the symbol count.
+///
+/// All the language-agnostic accounting (parallel fan-out, enclosing
+/// attribution, per-callee cap, dedup, merge) lives in [`build_edge_output`];
+/// this function supplies only the two Go-specific pieces: the per-file package
+/// facts and [`scan_go_file`], the AST walk that resolves each reference.
+///
+/// Trees are parsed on demand inside the per-file walk and dropped when the
+/// closure returns, so live trees are bounded by the worker count rather than
+/// the workspace size (#200). Cross-file resolution comes from the tree-free
+/// [`GoEdgeIndex`] and the index's per-file import facts -- no other file's tree
+/// is read during a scan.
+fn build_go_edges<Output, F>(
+    analyzer: &dyn IAnalyzer,
+    index: &GoEdgeIndex,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Output
+where
+    Output: UsageEdgeBuildOutput<String>,
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let files: Vec<ProjectFile> = index.files().cloned().collect();
+    let language = tree_sitter_go::LANGUAGE.into();
+    build_edge_output(&files, keep_file, |file| {
+        let file_pkg = index.package_name_of(file)?;
+        parse_and_collect(analyzer, file, nodes, &language, |input| {
+            let (alias_packages, dot_packages) = index.namespace_packages(file);
+            scan_go_file(index, file_pkg, alias_packages, dot_packages, input)
+        })
+    })
+}
 
 /// Build the whole Go `caller -> callee` edge set in a single inverted pass over
-/// the workspace (see [`inverted`]). Returns `None` when the analyzer exposes no
-/// Go files. `nodes` is the set of node fqns and `keep_file` drops out-of-scope
-/// caller files; the per-file definition ranges used to exclude self-declarations
-/// are derived inside the shared driver.
+/// the workspace (see [`build_go_edges`]). Returns `None` when the analyzer
+/// exposes no Go files. `nodes` is the set of node fqns and `keep_file` drops
+/// out-of-scope caller files; the per-file definition ranges used to exclude
+/// self-declarations are derived inside the shared driver.
 pub(crate) fn build_go_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
     nodes: &HashSet<String>,
@@ -149,7 +187,7 @@ impl GoEdgeResolver {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_go_edges(analyzer, &self.index, nodes, keep_file)
+        build_go_edges(analyzer, &self.index, nodes, keep_file)
     }
 
     pub(crate) fn build_edge_weights<F>(
@@ -161,7 +199,7 @@ impl GoEdgeResolver {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_go_edges(analyzer, &self.index, nodes, keep_file)
+        build_go_edges(analyzer, &self.index, nodes, keep_file)
     }
 }
 

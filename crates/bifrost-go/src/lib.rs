@@ -20,6 +20,7 @@
 
 pub mod adapter;
 pub mod declarations;
+pub mod diagnostics;
 pub mod graph;
 pub mod hierarchy;
 pub mod imports;
