@@ -1,13 +1,13 @@
 use crate::analyzer::structural::query::schema::{
-    ALL_CODE_QUERY_EXECUTION_MODES, ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, QueryField,
-    QueryStepField, environment_filter_labels, occurrence_filter_labels, reference_kind_label,
-    supported_query_schema_versions,
+    ALL_CODE_QUERY_EXECUTION_MODES, ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, ALL_USAGE_KINDS,
+    QueryField, QueryStepField, environment_filter_labels, occurrence_filter_labels,
+    reference_kind_label, supported_query_schema_versions,
 };
 use crate::analyzer::structural::{
-    ALL_KINDS, DEFAULT_LIMIT, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,
-    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH,
-    MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
-    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, SCHEMA_VERSION,
+    ALL_KINDS, ALL_OWNER_RELATIONS, ALL_SITE_CLASSES, DEFAULT_LIMIT, MAX_BINDING_NAME_LENGTH,
+    MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS,
+    MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_STEPS,
+    MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, SCHEMA_VERSION,
 };
 use crate::mcp_common::{McpRenderOptions, run_stdio_server, tool_descriptor};
 use serde_json::{Value, json};
@@ -71,6 +71,7 @@ fn query_step_input_variants() -> Vec<Value> {
                 && !op.allows_binding_options()
                 && !op.allows_candidate_options()
                 && !op.allows_reaching_binding_options()
+                && !op.allows_edge_options()
                 && op.label() != "call_input"
         })
         .map(|op| op.label())
@@ -153,6 +154,12 @@ fn query_step_input_variants() -> Vec<Value> {
         .filter(|op| op.allows_reaching_binding_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
+    let edge_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_edge_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
     let occurrence_classes = occurrence_filter_labels(QueryStepField::OccurrenceClasses);
     let occurrence_roles = occurrence_filter_labels(QueryStepField::OccurrenceRoles);
     let occurrence_namespaces = occurrence_filter_labels(QueryStepField::OccurrenceNamespaces);
@@ -200,7 +207,7 @@ fn query_step_input_variants() -> Vec<Value> {
                     "type": "array",
                     "minItems": 1,
                     "uniqueItems": true,
-                    "items": { "type": "string", "enum": reference_kinds }
+                    "items": { "type": "string", "enum": reference_kinds.clone() }
                 },
                 "proof": { "type": "string", "enum": ["proven", "unproven"] },
                 "surface": { "type": "string", "enum": ["external_usages", "lsp_references"] }
@@ -392,6 +399,37 @@ fn query_step_input_variants() -> Vec<Value> {
             "required": ["op"],
             "additionalProperties": false
         }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": edge_steps },
+                "reference_kinds": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": { "type": "string", "enum": reference_kinds },
+                    "description": QueryStepField::ReferenceKinds.description()
+                },
+                "proof": {
+                    "type": "string",
+                    "enum": ["proven", "unproven"],
+                    "description": QueryStepField::Proof.description()
+                },
+                "surface": {
+                    "type": "string",
+                    "enum": ["external_usages", "lsp_references"],
+                    // Unlike references_of, the edge surface has no default:
+                    // the canonical edge answer includes editor-only rows, so
+                    // omitting the field must not silently narrow the set.
+                    "description": QueryStepField::Surface.description()
+                },
+                "usage": edge_usage_kind_array(),
+                "relation": edge_relation_array(),
+                "site_class": edge_site_class_array()
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
     ]
 }
 
@@ -447,6 +485,33 @@ fn candidate_boundary_array() -> Value {
     constrained_label_array(
         environment_filter_labels(QueryStepField::CandidateBoundaries),
         QueryStepField::CandidateBoundaries.description(),
+    )
+}
+
+fn edge_usage_kind_array() -> Value {
+    constrained_label_array(
+        ALL_USAGE_KINDS
+            .iter()
+            .map(|kind| kind.wire_label())
+            .collect(),
+        QueryStepField::EdgeUsageKinds.description(),
+    )
+}
+
+fn edge_relation_array() -> Value {
+    constrained_label_array(
+        ALL_OWNER_RELATIONS
+            .iter()
+            .map(|relation| relation.label())
+            .collect(),
+        QueryStepField::EdgeRelations.description(),
+    )
+}
+
+fn edge_site_class_array() -> Value {
+    constrained_label_array(
+        ALL_SITE_CLASSES.iter().map(|class| class.label()).collect(),
+        QueryStepField::EdgeSiteClasses.description(),
     )
 }
 
@@ -917,7 +982,8 @@ mod tests {
                 "scope_of",
                 "scope_ancestors",
                 "binding_occurrence",
-                "candidate_target"
+                "candidate_target",
+                "edge_target"
             ])
         );
         assert_eq!(
@@ -1021,9 +1087,36 @@ mod tests {
                 .is_some_and(|roles| roles.iter().any(|role| role == "binder")),
             "occurrence steps advertise the role vocabulary"
         );
+        let edge_variant = steps["items"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| {
+                variant["properties"]["op"]["enum"]
+                    .as_array()
+                    .is_some_and(|ops| ops.iter().any(|op| op == "edges_of"))
+            })
+            .expect("reference-edge traversal schema");
+        assert_eq!(
+            edge_variant["properties"]["op"]["enum"],
+            json!(["edges_of", "edges_from"])
+        );
+        // The edge filter's `surface` is optional with no default, because the
+        // canonical edge answer includes editor-only rows.
+        assert_eq!(edge_variant["required"], json!(["op"]));
+        assert!(
+            edge_variant["properties"]["surface"]
+                .get("default")
+                .is_none(),
+            "the edge surface axis must not advertise a default"
+        );
+        assert_eq!(
+            edge_variant["properties"]["site_class"]["items"]["enum"],
+            json!(["use_site", "declaration_site"])
+        );
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
-            json!([2, 3, 4, 5, 6, 7, 8, 9])
+            json!([2, 3, 4, 5, 6, 7, 8, 9, 10])
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["execution_mode"]["enum"],

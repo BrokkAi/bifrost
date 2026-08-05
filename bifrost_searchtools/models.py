@@ -2107,6 +2107,90 @@ class CodeQueryResolutionCandidate:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class CodeQueryReferenceEdge:
+    """One canonical reference edge from a use site to a target declaration.
+
+    The row shape is the same whichever producer derived it, and
+    ``provenance`` says which one did: ``forward`` for the resolver's own
+    resolved targets of one token, ``inverse`` for the sites the usage index
+    enumerates for one declaration. Every classification a parity comparison
+    depends on is an explicit field, never inferred from counts.
+
+    ``ast_id`` is absent when the producer cannot address the site token as a
+    facts-arena node; where it is present, string equality with a capture's or
+    an occurrence's ``ast_id`` is the correlation join.
+    ``enclosing_declaration`` is absent when no indexed declaration encloses
+    the site, and ``reference_kind`` is absent when the producer classified no
+    structured kind -- neither absence means the edge is weaker.
+    ``generation`` is the workspace generation the edge was derived in; a
+    comparison must refuse to relate rows from two generations.
+
+    ``provenance_direction`` is the wire's ``edge_provenance`` key: the
+    producer that derived the row, renamed on the wire so the result item's
+    branch-trace ``provenance`` list cannot shadow it under full detail.
+    """
+
+    id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    start_byte: int
+    end_byte: int
+    target: CodeQueryDeclaration
+    proof: str
+    usage_kind: str
+    site_class: str
+    owner_relation: str
+    provenance_direction: str
+    generation: int
+    ast_id: str | None = None
+    enclosing_declaration: CodeQueryDeclaration | None = None
+    reference_kind: str | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryReferenceEdge:
+        return cls(
+            id=data["id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            start_byte=data["start_byte"],
+            end_byte=data["end_byte"],
+            target=CodeQueryDeclaration.from_dict(data["target"]),
+            proof=data["proof"],
+            usage_kind=data["usage_kind"],
+            site_class=data["site_class"],
+            owner_relation=data["owner_relation"],
+            provenance_direction=data["edge_provenance"],
+            generation=int(data["generation"]),
+            ast_id=data.get("ast_id"),
+            enclosing_declaration=CodeQueryDeclaration.from_dict(
+                data["enclosing_declaration"]
+            )
+            if "enclosing_declaration" in data
+            else None,
+            reference_kind=data.get("reference_kind"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[reference_edge; {self.provenance_direction or 'unstated'}; {self.proof}; "
+            f"{self.usage_kind}] -> {self.target.fq_name} [{self.target.kind}]"
+        )
+        detail = (
+            f"  kind {self.reference_kind or 'unclassified'}, "
+            f"site {self.site_class}, relation {self.owner_relation}, "
+            f"generation {self.generation}"
+        )
+        return f"{header}\n{detail}"
+
+
 CodeQueryResultItem = (
     CodeQueryMatch
     | CodeQueryDeclaration
@@ -2127,6 +2211,7 @@ CodeQueryResultItem = (
     | CodeQueryLexicalScope
     | CodeQueryBinding
     | CodeQueryResolutionCandidate
+    | CodeQueryReferenceEdge
 )
 
 
@@ -2170,6 +2255,8 @@ def _code_query_result_item(data: dict) -> CodeQueryResultItem:
         return CodeQueryBinding.from_dict(data)
     if result_type == "resolution_candidate":
         return CodeQueryResolutionCandidate.from_dict(data)
+    if result_type == "reference_edge":
+        return CodeQueryReferenceEdge.from_dict(data)
     raise ValueError(f"unknown code query result_type: {result_type!r}")
 
 
@@ -2233,6 +2320,8 @@ class CodeQueryDiagnosticCode(StrEnum):
     ENVIRONMENT_DERIVATION_INCOMPLETE = "environment_derivation_incomplete"
     ENVIRONMENT_ROW_BUDGET_EXHAUSTED = "environment_row_budget_exhausted"
     RESOLUTION_TRACE_INCOMPLETE = "resolution_trace_incomplete"
+    EDGE_AXIS_UNSUPPORTED = "edge_axis_unsupported"
+    EDGE_DERIVATION_INCOMPLETE = "edge_derivation_incomplete"
     RESULT_LIMIT_REACHED = "result_limit_reached"
     BROAD_QUERY = "broad_query"
 

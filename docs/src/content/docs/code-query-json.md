@@ -140,7 +140,7 @@ Each `args` pattern must match a distinct positional argument in source order, b
 
 The same capture label may appear more than once in a query. Every occurrence must bind exactly the same source text, allowing equality constraints such as “both arguments use the same expression.”
 
-The response contains a `results` array. Every item has a `result_type`: `structural_match`, `declaration`, `procedure`, `program_point`, `control_edge`, `reference_site`, `call_site`, `expression_site`, `receiver_analysis`, `occurrence`, `lexical_scope`, `binding`, `resolution_candidate`, or `file`. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`.
+The response contains a `results` array. Every item has a `result_type`: `structural_match`, `declaration`, `procedure`, `program_point`, `control_edge`, `reference_site`, `call_site`, `expression_site`, `receiver_analysis`, `occurrence`, `lexical_scope`, `binding`, `resolution_candidate`, `reference_edge`, or `file`. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`.
 
 With `result_detail: "full"`, results additionally include:
 
@@ -220,6 +220,9 @@ Steps execute in array order and are validated before the workspace is searched:
 | `binding_occurrence` (v9) | binding | occurrence | The binder-class occurrence row of the binding's declaring token. |
 | `candidates_of` (v9) | occurrence | resolution candidate | Candidates the resolver considered; accepts `tier`, `outcome`, and `boundary`. |
 | `candidate_target` (v9) | resolution candidate | declaration | Workspace declarations of unit-backed candidates; partial by construction. |
+| `edges_of` (v10) | declaration | reference edge | The inverse projection: every usage site the usage index enumerates for the declaration; accepts `reference_kinds`, `proof`, `surface`, `usage`, `relation`, and `site_class`. |
+| `edges_from` (v10) | occurrence | reference edge | The forward projection: the resolver's own resolved targets for that exact token; accepts the same six filters. |
+| `edge_target` (v10) | reference edge | declaration | Exact indexed target declaration of each edge. |
 
 Repeat an import step for multiple hops. Traversal is cycle-safe and deterministic; it does not silently compute a transitive closure.
 
@@ -423,6 +426,51 @@ Where an adapter declares a lexical-environment axis unsupported, the run report
 Seed with the roles you need rather than with a class. `{"class": ["reference"]}` requires *every* reference role, so an adapter gap in an unrelated part of a file -- a pattern position it does not classify, a path segment whose namespace it cannot name -- makes the whole run incomplete and the answer unreadable. `{"role": ["receiver_position"]}` asks only for what the question is about, and reports incompleteness only when that role is genuinely unavailable.
 
 The **package clause** is fields on the file row rather than a fourth row kind, because it is exactly one row per file. `package_fq` and `package_syntactic` appear together; `package_syntactic` is `true` when the language spells the package in the source (Java's `package a.b;`) and `false` when it is derived from the file's path (Python, Rust, JavaScript). Both being absent means no package could be named at all, which is not the same as "the file is in the root package".
+
+### Canonical reference edges (schema v10)
+
+Bifrost derives "X uses Y" twice: the resolver derives it forward, from one classified token to the declaration it resolved to, and the usage index derives it backward, from one declaration to the sites that point at it. Schema v10 states both in one row shape so the two answers can be compared instead of merely coexisting.
+
+`edges_of` is the inverse projection and `edges_from` the forward one:
+
+<!-- code-query-test:json:edges-of -->
+```json
+{
+  "languages": ["java"],
+  "match": {"kind": "callable", "name": "register"},
+  "steps": [
+    {"op": "enclosing_decl"},
+    {"op": "edges_of", "usage": ["reference"], "site_class": ["use_site"]}
+  ]
+}
+```
+
+<!-- code-query-test:json:edges-from -->
+```json
+{
+  "languages": ["java"],
+  "occurrences": {"class": ["reference"]},
+  "steps": [
+    {"op": "edges_from", "reference_kinds": ["method_call"]},
+    {"op": "edge_target"}
+  ]
+}
+```
+
+Each edge row carries `id`, an optional `ast_id`, `path`, `language`, `range`, `start_byte`, `end_byte`, a `target` declaration, an optional `enclosing_declaration`, an optional `reference_kind`, a `proof`, a `usage_kind`, a `site_class`, an `owner_relation`, an `edge_provenance`, and a `generation`. Both steps accept `reference_kinds`, `proof`, `surface`, `usage`, `relation`, and `site_class`.
+
+`edge_provenance` is the field the whole domain exists for: `forward` for a resolver-derived row and `inverse` for a usage-index-derived one. It is spelled `edge_provenance` on the wire because every result item already owns `provenance` for its branch trace. It is data on every row rather than something read off which step produced the set, so a parity comparison is a comparison across a field. `generation` is the workspace generation the derivation ran in; two rows from two generations describe two workspaces and must not be related.
+
+Four absences here are answers rather than gaps:
+
+- An **absent `ast_id`** means the producer could not address the site token as a facts-arena node, not that the edge is weaker. Where it is present, string equality with a capture's or an occurrence's `ast_id` is the correlation join.
+- An **absent `reference_kind`** means the producer classified no structured kind. It is not a kind of its own and must not be compared against one.
+- An `owner_relation` of `unknown` means the classifier could not relate the site's owner to the target's. It is never silently equal to `external`: an assertion over unknown relations is inconclusive, not clean.
+- A `site_class` of `declaration_site` is editor-visible navigation, not a runtime usage. The whole-workspace edge build drops such sites by design, so the classification is a field rather than a missing edge.
+
+`surface` is optional and has **no default**, unlike `references_of`. The canonical edge answer includes editor-only rows, and silently defaulting to `external_usages` would narrow the compared ground set without the author saying so.
+
+Only Java, Rust, Python, JavaScript and TypeScript answer the forward projection today. `edges_from` in any other language reports `edge_axis_unsupported` with `incomplete` impact rather than a clean empty answer, and a derivation that was truncated, cancelled or failed reports `edge_derivation_incomplete`.
 
 ```json
 {

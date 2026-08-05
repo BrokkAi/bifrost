@@ -42,6 +42,7 @@ from bifrost_searchtools import (
     CodeQueryProgramPointBoundary,
     CodeQueryProfile,
     CodeQueryProfileCacheCounters,
+    CodeQueryReferenceEdge,
     CodeQueryReferenceSite,
     CodeQueryBinding,
     CodeQueryLexicalScope,
@@ -1869,6 +1870,104 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIn("api/Widget.java [file; java] in api (syntactic)", text)
         self.assertIn("script.js [file; javascript]", text)
 
+    def test_query_code_parses_the_canonical_reference_edge_rows(self) -> None:
+        """Both producers give one row shape, and the direction is a field.
+
+        The forward row comes from the resolver and the inverse row from the
+        usage index. Nothing about a row may be read off which step produced
+        it, so ``provenance_direction``, ``site_class`` and ``owner_relation``
+        are all explicit here.
+        """
+        target = {
+            "fq_name": "fixture.Registry.register",
+            "kind": "function",
+            "path": "src/Registry.java",
+            "language": "java",
+            "start_line": 4,
+            "end_line": 5,
+        }
+        source_range = {
+            "start_line": 5,
+            "start_column": 18,
+            "end_line": 5,
+            "end_column": 26,
+        }
+        result = CodeQueryResult.from_dict(
+            {
+                "results": [
+                    {
+                        "result_type": "reference_edge",
+                        "id": "forward-digest",
+                        "ast_id": "call-node",
+                        "path": "src/Startup.java",
+                        "language": "java",
+                        "range": source_range,
+                        "start_byte": 120,
+                        "end_byte": 128,
+                        "target": target,
+                        "reference_kind": "method_call",
+                        "proof": "proven",
+                        "usage_kind": "reference",
+                        "site_class": "use_site",
+                        "owner_relation": "external",
+                        "edge_provenance": "forward",
+                        "generation": 7,
+                    },
+                    {
+                        "result_type": "reference_edge",
+                        "id": "inverse-digest",
+                        "path": "src/Startup.java",
+                        "language": "java",
+                        "range": source_range,
+                        "start_byte": 120,
+                        "end_byte": 128,
+                        "target": target,
+                        "proof": "unproven",
+                        "usage_kind": "reference",
+                        "site_class": "declaration_site",
+                        "owner_relation": "unknown",
+                        "edge_provenance": "inverse",
+                        "generation": 7,
+                    },
+                ],
+                "truncated": False,
+            }
+        )
+
+        forward, inverse = result.results
+        self.assertIsInstance(forward, CodeQueryReferenceEdge)
+        self.assertEqual(forward.provenance_direction, "forward")
+        self.assertEqual(inverse.provenance_direction, "inverse")
+        # The two producers state the same site, which is what makes a parity
+        # comparison possible at all.
+        self.assertEqual(forward.start_byte, inverse.start_byte)
+        self.assertEqual(forward.target.fq_name, inverse.target.fq_name)
+        self.assertEqual(forward.generation, inverse.generation)
+        # An absent ast_id means the producer could not address the site as an
+        # AST node, not that the edge is weaker.
+        self.assertEqual(forward.ast_id, "call-node")
+        self.assertIsNone(inverse.ast_id)
+        # An unclassified reference kind is likewise an absence, never a kind.
+        self.assertEqual(forward.reference_kind, "method_call")
+        self.assertIsNone(inverse.reference_kind)
+        # A declaration site is editor-visible navigation, not a runtime usage,
+        # so it is classified rather than dropped.
+        self.assertEqual(inverse.site_class, "declaration_site")
+        self.assertEqual(inverse.owner_relation, "unknown")
+        self.assertIsNone(forward.enclosing_declaration)
+
+        text = result.render_text()
+        self.assertIn(
+            "[reference_edge; forward; proven; reference] -> "
+            "fixture.Registry.register [function]",
+            text,
+        )
+        self.assertIn(
+            "kind method_call, site use_site, relation external, generation 7",
+            text,
+        )
+        self.assertIn("kind unclassified, site declaration_site", text)
+
     def test_occurrence_diagnostic_codes_are_recognized(self) -> None:
         self.assertEqual(
             CodeQueryDiagnosticCode("occurrence_role_unsupported"),
@@ -1896,6 +1995,20 @@ class SearchToolsClientTest(unittest.TestCase):
             (
                 "resolution_trace_incomplete",
                 CodeQueryDiagnosticCode.RESOLUTION_TRACE_INCOMPLETE,
+            ),
+        ]:
+            self.assertEqual(CodeQueryDiagnosticCode(label), expected)
+
+    def test_reference_edge_diagnostic_codes_are_recognized(self) -> None:
+        """An unanswerable edge axis is a diagnostic, never a clean empty set."""
+        for label, expected in [
+            (
+                "edge_axis_unsupported",
+                CodeQueryDiagnosticCode.EDGE_AXIS_UNSUPPORTED,
+            ),
+            (
+                "edge_derivation_incomplete",
+                CodeQueryDiagnosticCode.EDGE_DERIVATION_INCOMPLETE,
             ),
         ]:
             self.assertEqual(CodeQueryDiagnosticCode(label), expected)
