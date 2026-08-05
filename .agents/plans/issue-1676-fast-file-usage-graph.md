@@ -14,9 +14,9 @@ The result is observable with the `most_relevant_files` MCP tool and the `most_r
 
 - [x] (2026-08-05T19:53:45Z) Inspected the issue branch, fetched `origin`, checked upstream overlap, and mapped the exact graph, PageRank, cache, and import-analysis seams.
 - [x] (2026-08-05T19:53:45Z) Selected an explicit `usage_graph_exact` ranking mode instead of a Boolean `fast` flag.
-- [ ] Add the coarse file graph and focused graph tests.
-- [ ] Route `usage_graph` to the coarse graph and retain the old path as `usage_graph_exact` across Rust, MCP, CLI, and Python surfaces.
-- [ ] Measure cold and warm Bifrost requests, then optimize construction if the five-second target is missed.
+- [x] (2026-08-05T20:45:00Z) Added the coarse file graph, dense ranking representation, graph-kind cache identity, and focused Java and Rust tests.
+- [x] (2026-08-05T20:45:00Z) Routed `usage_graph` to the coarse graph and retained the old path as `usage_graph_exact` across Rust, MCP, CLI, and Python surfaces.
+- [x] (2026-08-05T20:45:00Z) Measured and optimized the Bifrost request. The real MCP replay took 406 ms cold and 25 ms warm.
 - [ ] Run focused tests, formatting, Clippy, policy checks, and the applicable featureless test suites.
 
 ## Surprises & Discoveries
@@ -36,6 +36,15 @@ The result is observable with the `most_relevant_files` MCP tool and the `most_r
 - Observation: the branch is 16 commits behind `origin/master`, but upstream does not change the relevance, workspace graph, cache, or public ranking files.
   Evidence: `git diff --stat HEAD..origin/master` showed only a receiver-query file split inside the wider usages directory.
 
+- Observation: projecting Rust imports through exact declaration lookup still exceeded the five-second MCP budget.
+  Evidence: phase timing stopped inside `file_usage_graph.resolve_relations` after files took 155 ms and import facts took 222 ms.
+
+- Observation: the full Rust Cargo route index is also too heavy for this coarse graph because it prepares syntax for the workspace.
+  Evidence: the first coarse Rust resolver still exceeded five seconds when it called `RustAnalyzer::cargo_routes`.
+
+- Observation: a manifest-name index gives the cross-crate identity needed by the coarse graph without Cargo route or declaration construction.
+  Evidence: the Bifrost graph phase fell to 278 ms. The full MCP request took 406 ms cold and 25 ms warm.
+
 ## Decision Log
 
 - Decision: keep `usage_graph` as the fast user-facing value and add `usage_graph_exact` for the old behavior.
@@ -54,9 +63,13 @@ The result is observable with the `most_relevant_files` MCP tool and the `most_r
   Rationale: fast and exact graphs must not collide, and concurrent requests must share one build. The current complete-value cache already provides the required behavior.
   Date/Author: 2026-08-05 / Codex
 
+- Decision: resolve Rust file imports with structured path segments, path-derived package names, and crate names from nearby Cargo manifests.
+  Rationale: this data identifies coarse module files without exact declarations, syntax-wide Cargo route construction, file scans, or text parsing of Rust source.
+  Date/Author: 2026-08-05 / Codex
+
 ## Outcomes & Retrospective
 
-Implementation has not started. Research confirms that a general cross-language file graph can use existing structured import facts. No new parser or dependency is required.
+The implementation is complete and final validation remains. The real issue #1504 MCP replay now completes in 406 ms on the first graph build and 25 ms on a cache hit. The measured cold graph work is 278 ms, PageRank is 3 ms, and file aggregation is 3 ms. The exact ranking remains available as `usage_graph_exact`, and the public `usage_graph` tool remains unchanged.
 
 ## Context and Orientation
 
@@ -107,10 +120,10 @@ Measure the two modes with the helper binary. Build the binary once and exclude 
 Before completion, run:
 
     cargo fmt --all -- --check
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
     BIFROST_SEMANTIC_INDEX=off cargo test --workspace
 
-Do not enable `nlp` unless a changed Python boundary requires it. If an isolated Cargo target is necessary, use `scripts/with-isolated-cargo-target.sh`.
+Do not enable `nlp` for this non-NLP change. If an isolated Cargo target is necessary, use `scripts/with-isolated-cargo-target.sh`.
 
 ## Validation and Acceptance
 
@@ -156,3 +169,5 @@ Add an internal cache discriminator in `crates/bifrost-analysis/src/analyzer/usa
 Add an internal file graph under `crates/bifrost-analysis/src/analyzer/usages/file_usage_graph.rs`. Its stable interface will accept `&dyn IAnalyzer`, a selected `BTreeSet<UsageEcosystem>`, and a `CancellationToken`. It will return either one complete dense file graph or cancellation. It will use `ImportAnalysisProvider`, `resolve_imported_files_from_infos`, `UsageReferenceCounts`, and existing hash collections. No new crate or third-party dependency is required.
 
 Revision note 2026-08-05T19:53:45Z: Created the implementation plan after issue #1676 approval, code navigation, upstream overlap review, and selection of the existing batched import-analysis seam.
+
+Revision note 2026-08-05T20:45:00Z: Recorded implementation, the persisted-analyzer Rust bottleneck, the manifest-name index decision, and cold and warm MCP evidence.

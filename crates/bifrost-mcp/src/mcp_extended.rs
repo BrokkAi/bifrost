@@ -971,9 +971,9 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     },
                     "ranking_mode": {
                         "type": "string",
-                        "enum": ["history_imports", "usage_graph"],
+                        "enum": ["history_imports", "usage_graph", "usage_graph_exact"],
                         "default": "history_imports",
-                        "description": "Ranking source. history_imports preserves git-first/import-fill behavior; usage_graph ranks resolved caller-to-callee relationships first and uses the legacy ranking to fill remaining slots. If usage-graph construction is cancelled or exceeds the interactive budget, the response is marked incomplete and returns deterministic history/import ranking instead."
+                        "description": "Ranking source. history_imports preserves git-first/import-fill behavior; usage_graph runs PageRank on the fast structured file graph; usage_graph_exact ranks the exact symbol-level caller-to-callee graph. Both usage modes use the legacy ranking to fill remaining slots. If graph construction is cancelled or exceeds the interactive budget, the response is marked incomplete and returns deterministic history/import ranking instead."
                     },
                     "limit": {
                         "type": "integer",
@@ -1264,7 +1264,10 @@ mod tests {
             .find(|descriptor| descriptor["name"] == "most_relevant_files")
             .expect("most_relevant_files descriptor");
         let mode = &descriptor["inputSchema"]["properties"]["ranking_mode"];
-        assert_eq!(mode["enum"], json!(["history_imports", "usage_graph"]));
+        assert_eq!(
+            mode["enum"],
+            json!(["history_imports", "usage_graph", "usage_graph_exact"])
+        );
         assert_eq!(mode["default"], "history_imports");
         // #1575: the boolean test filter is gone; each result carries its own
         // classification and the caller applies the policy.

@@ -18,6 +18,7 @@ mod common;
 mod cpp_call_match;
 pub mod cpp_graph;
 pub(crate) mod csharp_graph;
+pub(crate) mod file_usage_graph;
 mod finder;
 pub mod get_definition;
 pub mod get_type;

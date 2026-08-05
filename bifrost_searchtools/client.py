@@ -64,6 +64,7 @@ class SymbolKindFilter(StrEnum):
 class MostRelevantFilesRankingMode(StrEnum):
     HISTORY_IMPORTS = "history_imports"
     USAGE_GRAPH = "usage_graph"
+    USAGE_GRAPH_EXACT = "usage_graph_exact"
 
 
 _CODE_QUERY_EXECUTION_MODES = frozenset(get_args(CodeQueryExecutionMode))

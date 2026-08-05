@@ -299,6 +299,20 @@ impl ImportAnalysisProvider for RustAnalyzer {
         self.inner.import_info_of(file)
     }
 
+    fn imported_files_from_infos(
+        &self,
+        file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashSet<ProjectFile>> {
+        Some(
+            imports
+                .iter()
+                .filter_map(|import| import.path.as_ref())
+                .flat_map(|path| self.resolve_direct_import_files(file, &path.segments))
+                .collect(),
+        )
+    }
+
     fn could_import_file(
         &self,
         source_file: &ProjectFile,
