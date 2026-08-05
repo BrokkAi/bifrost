@@ -8,6 +8,7 @@ members = [
     "crates/bifrost-nlp",
     "crates/bifrost-policy",
     "crates/bifrost-runtime",
+    "crates/bifrost-rust",
     "crates/bifrost-semantic-packs",
 ]
 default-members = ["."]

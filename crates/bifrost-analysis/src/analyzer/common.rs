@@ -1,9 +1,16 @@
+pub(crate) use brokk_bifrost_core::analyzer::common::{
+    IdentifierSigil, node_ident_text, node_source_text, node_source_text_trimmed,
+    parse_source_region,
+};
 pub use brokk_bifrost_core::analyzer::common::{language_for_file, language_for_target};
-pub(crate) use brokk_bifrost_core::analyzer::common::{node_source_text, node_source_text_trimmed};
+// Rust's identifier sigil and `r#` strip moved with the language: the sigil to
+// `brokk-bifrost-rust`, the segment-level strip to core's `symbol_path` (where
+// the client-selector normalizer that needs it lives). C#'s sigil stays below
+// until C# is extracted.
+pub(crate) use brokk_bifrost_rust::declarations::RUST_IDENTIFIER_SIGIL;
 
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use std::path::Path;
-use tree_sitter::Node;
 
 /// Default longest single line a source file may contain before tree-sitter parsing is
 /// skipped. Minified/generated single-line bundles (committed webpack output, mermaid.min.js,
@@ -39,66 +46,6 @@ pub fn is_unparseable_source(source: &str) -> bool {
     match max_line_length_limit() {
         Some(limit) => source.lines().any(|line| line.len() > limit),
         None => false,
-    }
-}
-
-/// Parse only `[start, end)` of `source` as `language`, confining the parser to
-/// that region via tree-sitter included ranges. Every node keeps its original
-/// byte offset and line/column position, exactly like the historical
-/// "padded copy" technique (issues #941/#1015), but without materializing an
-/// O(file) whitespace prefix or making the lexer walk it -- on a large file with
-/// a region near the end that padding turned each recovery reparse into seconds
-/// of whitespace lexing (issue #1309's cold-start profile).
-///
-/// Returns `None` for an empty or invalid region (out of bounds, or not on
-/// char boundaries), mirroring the padded implementations' refusal to build a
-/// reparse for nothing.
-pub(crate) fn parse_source_region(
-    language: &tree_sitter::Language,
-    source: &str,
-    start: usize,
-    end: usize,
-) -> Option<tree_sitter::Tree> {
-    if start >= end
-        || end > source.len()
-        || !source.is_char_boundary(start)
-        || !source.is_char_boundary(end)
-    {
-        return None;
-    }
-    let bytes = source.as_bytes();
-    let start_point = advance_ts_point(bytes, tree_sitter::Point { row: 0, column: 0 }, 0, start);
-    let end_point = advance_ts_point(bytes, start_point, start, end);
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(language).ok()?;
-    parser
-        .set_included_ranges(&[tree_sitter::Range {
-            start_byte: start,
-            end_byte: end,
-            start_point,
-            end_point,
-        }])
-        .ok()?;
-    parser.parse(source, None)
-}
-
-/// Advance `point` across `bytes[from..to]`. Tree-sitter columns count bytes.
-fn advance_ts_point(
-    bytes: &[u8],
-    point: tree_sitter::Point,
-    from: usize,
-    to: usize,
-) -> tree_sitter::Point {
-    let slice = &bytes[from..to];
-    match slice.iter().rposition(|&b| b == b'\n') {
-        None => tree_sitter::Point {
-            row: point.row,
-            column: point.column + slice.len(),
-        },
-        Some(last_newline) => tree_sitter::Point {
-            row: point.row + slice.iter().filter(|&&b| b == b'\n').count(),
-            column: slice.len() - last_newline - 1,
-        },
     }
 }
 
@@ -202,39 +149,6 @@ fn is_reserved_identifier(language: Language, name: &str) -> bool {
         !parser_language.node_kind_is_named(id)
             && parser_language.node_kind_for_id(id) == Some(name)
     })
-}
-
-/// Whether `kind` is one of tree-sitter-rust's identifier leaf node kinds.
-/// `identifier`, `field_identifier`, `type_identifier`, and
-/// `shorthand_field_identifier` are all grammar aliases of the exact same
-/// lexical rule (`/(r#)?[_\p{XID_Start}][_\p{XID_Continue}]*/`), so any of
-/// them can carry the `r#` raw-identifier escape prefix verbatim in their
-/// token text. Compound path nodes (`scoped_identifier`,
-/// `scoped_type_identifier`) are deliberately excluded: callers read those by
-/// walking to their constituent identifier-kind children (the `path`/`name`
-/// fields), never by string-splitting the whole node text, so each segment's
-/// text is normalized individually when it is itself read as one of the leaf
-/// kinds above.
-pub(crate) fn rust_identifier_like_node_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "identifier" | "field_identifier" | "type_identifier" | "shorthand_field_identifier"
-    )
-}
-
-/// Strip the `r#` raw-identifier escape prefix, if present.
-///
-/// `r#` is escape syntax, not part of the identifier's canonical name — this
-/// is how rustc/rust-analyzer treat raw identifiers, and it is the single
-/// normalization rule declaration short_names/fq_names and reference/member
-/// text must agree on for a raw-identifier declaration (`r#type`) and its
-/// plain spelling (`type`) to resolve to the same symbol. Apply this only to
-/// text already known to be a single identifier token (e.g. gated by
-/// [`rust_identifier_like_node_kind`]) — never as a blanket string replace
-/// over a larger span, where the two characters `r#` could legitimately
-/// appear inside a string literal or doc comment that must not change.
-pub(crate) fn strip_raw_identifier_prefix(text: &str) -> &str {
-    text.strip_prefix("r#").unwrap_or(text)
 }
 
 /// One unit of pending skeleton-rendering work.
@@ -359,27 +273,6 @@ pub(crate) fn collapse_whitespace(text: &str) -> String {
     out
 }
 
-/// Per-language identifier sigil: which tree-sitter node kinds are single
-/// identifier tokens, and the escape/sigil `prefix` (`r#` in Rust, `@` in C#)
-/// to strip from those tokens so identity text (short/fq names) and
-/// reference/member text agree on the canonical spelling.
-///
-/// Stripping is gated on `is_identifier_kind`: the sigil is only removed from
-/// genuine identifier leaf nodes, never from spans where the same character is
-/// meaningful (C# `@"..."` verbatim strings, attribute markers, larger token
-/// runs). See [`node_ident_text`].
-pub(crate) struct IdentifierSigil {
-    pub(crate) is_identifier_kind: fn(&str) -> bool,
-    pub(crate) prefix: &'static str,
-}
-
-/// tree-sitter-rust raw-identifier normalization (`r#type` -> `type`), gated to
-/// the identifier leaf kinds (see [`rust_identifier_like_node_kind`]).
-pub(crate) const RUST_IDENTIFIER_SIGIL: IdentifierSigil = IdentifierSigil {
-    is_identifier_kind: rust_identifier_like_node_kind,
-    prefix: "r#",
-};
-
 /// Whether `kind` is tree-sitter-c-sharp's identifier leaf kind. C# spells its
 /// verbatim-identifier escape as a leading `@` (`@class`), carried verbatim in
 /// the `identifier` token text; no other node kind carries an `@` that denotes
@@ -399,28 +292,6 @@ pub(crate) const CSHARP_IDENTIFIER_SIGIL: IdentifierSigil = IdentifierSigil {
     is_identifier_kind: csharp_identifier_like_node_kind,
     prefix: "@",
 };
-
-/// Node text with a language identifier sigil normalized off.
-///
-/// Slices `node`'s source (empty on a bad range), optionally trims, then strips
-/// `sigil.prefix` iff `node`'s kind satisfies `sigil.is_identifier_kind`. This
-/// is the one place the sigil-normalization invariant lives; the per-surface
-/// (declaration / graph / get-definition) copies delegate here so they cannot
-/// drift out of agreement.
-pub(crate) fn node_ident_text<'a>(
-    node: Node<'_>,
-    source: &'a str,
-    trim: bool,
-    sigil: &IdentifierSigil,
-) -> &'a str {
-    let raw = source.get(node.byte_range()).unwrap_or("");
-    let text = if trim { raw.trim() } else { raw };
-    if (sigil.is_identifier_kind)(node.kind()) {
-        text.strip_prefix(sigil.prefix).unwrap_or(text)
-    } else {
-        text
-    }
-}
 
 pub(crate) fn is_scala_object_like(target: &CodeUnit) -> bool {
     language_for_target(target) == Language::Scala && (target.is_class() || target.is_module()) && {

@@ -481,7 +481,7 @@ fn has_ancestor_kind(mut node: Node<'_>, kind: &str) -> bool {
 /// `node` is one of tree-sitter-rust's identifier leaf kinds, so a usage site
 /// like `self.r#type` compares equal to the (also-normalized) declaration
 /// name `type` (#1128). See
-/// `crate::analyzer::rust::declarations::rust_node_text` for the extraction
+/// `brokk_bifrost_rust::declarations::rust_node_text` for the extraction
 /// side of the same normalization.
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     crate::analyzer::common::node_ident_text(

@@ -1,7 +1,7 @@
-use super::graph_support::RustReferenceContext;
 use crate::analyzer::ProjectFile;
 use crate::analyzer::usages::{ExportEntry, ExportIndex};
 use crate::hash::HashMap;
+use brokk_bifrost_rust::graph_support::RustReferenceContext;
 use std::mem::size_of;
 use std::sync::Arc;
 

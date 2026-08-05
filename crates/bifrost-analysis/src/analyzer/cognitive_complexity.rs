@@ -15,7 +15,7 @@
 use brokk_bifrost_core::analyzer::cognitive_complexity::slice_contains;
 pub use brokk_bifrost_core::analyzer::cognitive_complexity::{
     CaseIncrementPredicate, Config, DefaultCasePredicate, JumpPredicate,
-    NamedFunctionBoundaryPredicate,
+    NamedFunctionBoundaryPredicate, is_wildcard_case,
 };
 
 use crate::analyzer::tree_walk::named_children;
@@ -281,17 +281,6 @@ fn is_logical_operator_token(node: Node<'_>, source: &str, operators: &[&str]) -
         return false;
     };
     slice_contains(operators, text)
-}
-
-/// Helper exposed for language configs (Rust, Scala) whose default-case
-/// node is a wildcard pattern. Matches a leading `_` (Rust `_ =>`) or
-/// `case _ =>` (Scala).
-pub fn is_wildcard_case(node: Node<'_>, source: &str) -> bool {
-    let Some(text) = source.get(node.start_byte()..node.end_byte()) else {
-        return false;
-    };
-    let stripped = text.trim_start();
-    stripped.starts_with('_') || stripped.starts_with("case _ =>")
 }
 
 fn direct_named_child_matching<'tree, F>(node: Node<'tree>, pred: F) -> Option<Node<'tree>>

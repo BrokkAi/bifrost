@@ -1,12 +1,14 @@
-use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
-use crate::analyzer::model::StructuredTypeIdentityBuilder;
-use crate::analyzer::tree_sitter_analyzer::ParsedFile;
-use crate::analyzer::usages::{ImportBinder, ImportKind};
-use crate::analyzer::{
-    CodeUnit, DispatchExtensibility, ParameterMetadata, ProjectFile, Range, SignatureMetadata,
+use brokk_bifrost_core::analyzer::common::{IdentifierSigil, node_ident_text};
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
+use brokk_bifrost_core::analyzer::model::{
+    CodeUnitType, DispatchExtensibility, ParameterMetadata, SignatureMetadata,
     StructuredTypeIdentity, StructuredTypeName,
 };
-use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportKind};
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use std::path::Path;
 use tree_sitter::{Node, Parser, Tree};
@@ -22,7 +24,7 @@ fn rust_segment(text: &str, kind: SegmentKind) -> SegmentId {
     segment_interner().intern(text, kind)
 }
 
-pub(crate) fn rust_file_package_fq(file: &ProjectFile) -> FqName {
+pub fn rust_file_package_fq(file: &ProjectFile) -> FqName {
     let mut fq = FqName::new();
     for component in rust_package_components(file) {
         fq.push(rust_segment(&component, SegmentKind::Package));
@@ -50,23 +52,43 @@ fn rust_child_fq_base(parent: Option<&CodeUnit>, file: &ProjectFile) -> FqName {
     }
 }
 
-use super::imports::rust_imports_from_use_declaration;
+use crate::imports::rust_imports_from_use_declaration;
+
+/// Whether `kind` is one of tree-sitter-rust's identifier leaf node kinds.
+/// `identifier`, `field_identifier`, `type_identifier`, and
+/// `shorthand_field_identifier` are all grammar aliases of the exact same
+/// lexical rule (`/(r#)?[_\p{XID_Start}][_\p{XID_Continue}]*/`), so any of
+/// them can carry the `r#` raw-identifier escape prefix verbatim in their
+/// token text. Compound path nodes (`scoped_identifier`,
+/// `scoped_type_identifier`) are deliberately excluded: callers read those by
+/// walking to their constituent identifier-kind children (the `path`/`name`
+/// fields), never by string-splitting the whole node text, so each segment's
+/// text is normalized individually when it is itself read as one of the leaf
+/// kinds above.
+pub fn rust_identifier_like_node_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier" | "field_identifier" | "type_identifier" | "shorthand_field_identifier"
+    )
+}
+
+/// tree-sitter-rust raw-identifier normalization (`r#type` -> `type`), gated to
+/// the identifier leaf kinds (see [`rust_identifier_like_node_kind`]).
+pub const RUST_IDENTIFIER_SIGIL: IdentifierSigil = IdentifierSigil {
+    is_identifier_kind: rust_identifier_like_node_kind,
+    prefix: "r#",
+};
 
 /// Text of `node` verbatim from source, EXCEPT that when `node` is one of
 /// tree-sitter-rust's identifier leaf kinds (see
-/// [`crate::analyzer::common::rust_identifier_like_node_kind`]) a leading
+/// [`rust_identifier_like_node_kind`]) a leading
 /// `r#` raw-identifier escape is stripped so identity text (short_name,
 /// fq_name) and reference/member-name text agree on the canonical spelling
 /// (issue #1128). Compound nodes (whole signatures, headers, macro token
 /// spans, scoped paths) are returned unmodified — those are only ever
 /// normalized by first walking down to their own identifier-kind children.
-pub(super) fn rust_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_ident_text(
-        node,
-        source,
-        false,
-        &crate::analyzer::common::RUST_IDENTIFIER_SIGIL,
-    )
+pub fn rust_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    node_ident_text(node, source, false, &RUST_IDENTIFIER_SIGIL)
 }
 
 /// Whether `item` is directly preceded by a test-evidence attribute
@@ -84,7 +106,7 @@ fn rust_item_carries_test_attribute(item: Node<'_>, source: &str) -> bool {
     while let Some(node) = prev {
         match node.kind() {
             "attribute_item" => {
-                if super::tests::rust_attribute_is_test_evidence(node, source) {
+                if crate::test_detection::rust_attribute_is_test_evidence(node, source) {
                     return true;
                 }
             }
@@ -96,7 +118,7 @@ fn rust_item_carries_test_attribute(item: Node<'_>, source: &str) -> bool {
     false
 }
 
-pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
+pub fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
     let mut parsed = ParsedFile::new(rust_package_name(file));
     let root = tree.root_node();
     collect_rust_type_identifiers(root, source, &mut parsed.type_identifiers);
@@ -110,7 +132,7 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
         if child.kind() == "use_declaration" {
             let imports = rust_imports_from_use_declaration(child, source);
             for import in &imports {
-                super::lexical_scope::insert_rust_import_binding(&mut impl_import_binder, import);
+                crate::lexical_scope::insert_rust_import_binding(&mut impl_import_binder, import);
             }
             parsed
                 .import_statements
@@ -222,7 +244,7 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
     parsed
 }
 
-pub(crate) fn rust_package_name(file: &ProjectFile) -> String {
+pub fn rust_package_name(file: &ProjectFile) -> String {
     rust_package_components(file).join(".")
 }
 
@@ -267,7 +289,7 @@ fn visit_rust_class_like(
     parent: Option<&CodeUnit>,
     package_name: &str,
     parent_in_test_region: bool,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut ParsedFile,
 ) -> Option<CodeUnit> {
     let name_node = node.child_by_field_name("name")?;
     let name = rust_node_text(name_node, source).trim();
@@ -282,7 +304,7 @@ fn visit_rust_class_like(
     let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Type));
     let code_unit = CodeUnit::new_fq(
         file.clone(),
-        crate::analyzer::CodeUnitType::Class,
+        CodeUnitType::Class,
         package_name.to_string(),
         short_name,
         fq,
@@ -359,7 +381,7 @@ fn visit_rust_module(
     package_name: &str,
     item_macro_definitions: &[RustRulesItemMacroDefinition],
     parent_in_test_region: bool,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut ParsedFile,
 ) -> Option<CodeUnit> {
     let name_node = node.child_by_field_name("name")?;
     let name = rust_node_text(name_node, source).trim();
@@ -374,7 +396,7 @@ fn visit_rust_module(
     let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Package));
     let code_unit = CodeUnit::new_fq(
         file.clone(),
-        crate::analyzer::CodeUnitType::Module,
+        CodeUnitType::Module,
         package_name.to_string(),
         short_name,
         fq,
@@ -400,7 +422,7 @@ fn visit_rust_module(
             };
             if child.kind() == "use_declaration" {
                 for import in rust_imports_from_use_declaration(child, source) {
-                    super::lexical_scope::insert_rust_import_binding(
+                    crate::lexical_scope::insert_rust_import_binding(
                         &mut impl_import_binder,
                         &import,
                     );
@@ -519,7 +541,7 @@ fn visit_rust_function(
     parent: Option<&CodeUnit>,
     package_name: &str,
     parent_in_test_region: bool,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut ParsedFile,
 ) -> Option<CodeUnit> {
     let name_node = node.child_by_field_name("name")?;
     let name = rust_node_text(name_node, source).trim();
@@ -538,7 +560,7 @@ fn visit_rust_function(
     let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Member));
     let code_unit = CodeUnit::with_signature_and_fq(
         file.clone(),
-        crate::analyzer::CodeUnitType::Function,
+        CodeUnitType::Function,
         package_name.to_string(),
         short_name,
         signature,
@@ -571,7 +593,7 @@ fn visit_rust_macro(
     parent: Option<&CodeUnit>,
     package_name: &str,
     parent_in_test_region: bool,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut ParsedFile,
 ) -> Option<CodeUnit> {
     let name_node = node.child_by_field_name("name")?;
     let name = rust_node_text(name_node, source).trim();
@@ -601,7 +623,7 @@ fn register_rust_macro(
     range: Range,
     signature: String,
     in_test_region: bool,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut ParsedFile,
 ) -> Option<CodeUnit> {
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
@@ -609,7 +631,7 @@ fn register_rust_macro(
     let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Member));
     let code_unit = CodeUnit::new_fq(
         file.clone(),
-        crate::analyzer::CodeUnitType::Macro,
+        CodeUnitType::Macro,
         package_name.to_string(),
         short_name,
         fq,
@@ -651,7 +673,7 @@ fn visit_rust_macro_invocation_definitions(
     package_name: &str,
     item_macro_definitions: &[RustRulesItemMacroDefinition],
     parent_in_test_region: bool,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut ParsedFile,
 ) {
     let Some(invoked_macro) = rust_unqualified_macro_invocation_name(node, source) else {
         return;
@@ -712,7 +734,7 @@ fn visit_rust_macro_invocation_definitions(
         if child.kind() == "use_declaration" {
             let imports = rust_imports_from_use_declaration(child, source);
             for import in &imports {
-                super::lexical_scope::insert_rust_import_binding(&mut interior_binder, import);
+                crate::lexical_scope::insert_rust_import_binding(&mut interior_binder, import);
             }
             parsed
                 .import_statements
@@ -764,7 +786,7 @@ fn rust_reparse_macro_items(
     interior_start: usize,
     interior_end: usize,
 ) -> Option<Tree> {
-    super::lexical_scope::parse_rust_region_tree(source, interior_start, interior_end)
+    crate::lexical_scope::parse_rust_region_tree(source, interior_start, interior_end)
 }
 
 /// Robustness gate: the reparsed interior is only indexed when it consists
@@ -823,7 +845,7 @@ fn visit_rust_macro_item(
     impl_binder: &ImportBinder,
     replay_macro_definitions: bool,
     in_test_region: bool,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut ParsedFile,
 ) {
     match child.kind() {
         "use_declaration" => {}
@@ -922,7 +944,7 @@ fn visit_rust_macro_item(
     }
 }
 
-pub(super) fn rust_unqualified_macro_invocation_name<'a>(
+pub fn rust_unqualified_macro_invocation_name<'a>(
     node: Node<'_>,
     source: &'a str,
 ) -> Option<&'a str> {
@@ -934,7 +956,7 @@ pub(super) fn rust_unqualified_macro_invocation_name<'a>(
     (!name.is_empty()).then_some(name)
 }
 
-pub(super) fn rust_macro_invocation_arguments(node: Node<'_>) -> Option<Node<'_>> {
+pub fn rust_macro_invocation_arguments(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("arguments").or_else(|| {
         let mut cursor = node.walk();
         node.named_children(&mut cursor)
@@ -950,15 +972,15 @@ fn rust_is_identifier_like(node: Node<'_>) -> bool {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct RustRulesItemMacroDefinition {
-    pub(super) name: String,
-    pub(super) visible_after: usize,
-    pub(super) scope_start: usize,
-    pub(super) scope_end: usize,
-    pub(super) passthrough: bool,
+pub struct RustRulesItemMacroDefinition {
+    pub name: String,
+    pub visible_after: usize,
+    pub scope_start: usize,
+    pub scope_end: usize,
+    pub passthrough: bool,
 }
 
-pub(super) fn rust_rules_item_macro_definitions(
+pub fn rust_rules_item_macro_definitions(
     root: Node<'_>,
     source: &str,
 ) -> Vec<RustRulesItemMacroDefinition> {
@@ -1390,7 +1412,7 @@ fn visit_rust_field(
     parent: Option<&CodeUnit>,
     package_name: &str,
     parent_in_test_region: bool,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut ParsedFile,
 ) -> Option<CodeUnit> {
     let name_node = node.child_by_field_name("name").unwrap_or(node);
     let name = rust_node_text(name_node, source)
@@ -1417,7 +1439,7 @@ fn visit_rust_field(
     .with_pushed(rust_segment(&name, SegmentKind::Member));
     let code_unit = CodeUnit::with_signature_and_fq(
         file.clone(),
-        crate::analyzer::CodeUnitType::Field,
+        CodeUnitType::Field,
         package_name.to_string(),
         short_name,
         rust_impl_member_identity_signature(node, source),
@@ -1498,7 +1520,7 @@ fn visit_rust_alias(
     parent: Option<&CodeUnit>,
     package_name: &str,
     parent_in_test_region: bool,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut ParsedFile,
 ) -> Option<CodeUnit> {
     let name_node = node.child_by_field_name("name")?;
     let name = rust_node_text(name_node, source).trim();
@@ -1512,7 +1534,7 @@ fn visit_rust_alias(
     let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Member));
     let code_unit = CodeUnit::with_signature_and_fq(
         file.clone(),
-        crate::analyzer::CodeUnitType::Field,
+        CodeUnitType::Field,
         package_name.to_string(),
         short_name,
         rust_impl_member_identity_signature(node, source),
@@ -1547,7 +1569,7 @@ fn visit_rust_impl(
     package_name: &str,
     import_binder: &ImportBinder,
     parent_in_test_region: bool,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut ParsedFile,
 ) {
     let Some(type_node) = node.child_by_field_name("type") else {
         return;
@@ -1628,7 +1650,7 @@ fn rust_impl_owner(
     lexical_parent: Option<&CodeUnit>,
     package_name: &str,
     import_binder: &ImportBinder,
-    parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &ParsedFile,
 ) -> Option<CodeUnit> {
     let target_path = rust_nominal_type_path(type_node, source)?;
     let lexical_package = match lexical_parent {
@@ -1650,9 +1672,9 @@ fn rust_impl_owner(
             && binding.kind == ImportKind::Named
         {
             let imported_name = binding.imported_name.as_ref()?;
-            let resolved_package = super::imports::resolve_rust_module_path_with_crate(
+            let resolved_package = crate::imports::resolve_rust_module_path_with_crate(
                 &lexical_package,
-                &super::imports::rust_crate_root_package(file),
+                &crate::imports::rust_crate_root_package(file),
                 &binding.module_specifier,
             )?;
             RustImplOwnerIdentity {
@@ -1713,7 +1735,7 @@ fn rust_impl_owner(
         }
         Some(CodeUnit::new_fq(
             file.clone(),
-            crate::analyzer::CodeUnitType::Class,
+            CodeUnitType::Class,
             owner_package,
             owner_short_name,
             fq,
@@ -1722,7 +1744,7 @@ fn rust_impl_owner(
 }
 
 fn rust_declared_impl_owner(
-    parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &ParsedFile,
     identity: &RustImplOwnerIdentity,
 ) -> Option<CodeUnit> {
     let expected_fqn = if identity.package_name.is_empty() {
@@ -1734,8 +1756,7 @@ fn rust_declared_impl_owner(
         .declarations()
         .iter()
         .find(|unit| {
-            (unit.kind() == crate::analyzer::CodeUnitType::Class
-                || parsed.type_aliases.contains(*unit))
+            (unit.kind() == CodeUnitType::Class || parsed.type_aliases.contains(*unit))
                 && ((unit.package_name() == identity.package_name
                     && unit.short_name() == identity.short_name)
                     || unit.fq_name() == expected_fqn)
@@ -1750,12 +1771,12 @@ fn rust_impl_owner_identity_from_path(
     import_binder: &ImportBinder,
 ) -> Option<RustImplOwnerIdentity> {
     let (name, module_path) = path.split_last()?;
-    let crate_package = super::imports::rust_crate_root_package(file);
+    let crate_package = crate::imports::rust_crate_root_package(file);
     let package_name = if let Some((root, remainder)) = module_path.split_first()
         && let Some(binding) = import_binder.bindings.get(root)
         && binding.kind == ImportKind::Namespace
     {
-        let mut resolved = super::imports::resolve_rust_module_path_with_crate(
+        let mut resolved = crate::imports::resolve_rust_module_path_with_crate(
             package_name,
             &crate_package,
             &binding.module_specifier,
@@ -1769,7 +1790,7 @@ fn rust_impl_owner_identity_from_path(
         resolved
     } else {
         let module_specifier = module_path.join("::");
-        super::imports::resolve_rust_module_path_with_crate(
+        crate::imports::resolve_rust_module_path_with_crate(
             package_name,
             &crate_package,
             &module_specifier,
@@ -2031,7 +2052,7 @@ fn rust_macro_signature(node: Node<'_>, source: &str) -> String {
 /// Every type identifier named anywhere in `source`, parsed standalone rather
 /// than read off an indexed file: callers pass ad hoc snippets that the
 /// analyzer has never seen.
-pub(super) fn rust_type_identifiers(source: &str) -> BTreeSet<String> {
+pub fn rust_type_identifiers(source: &str) -> BTreeSet<String> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -2044,7 +2065,7 @@ pub(super) fn rust_type_identifiers(source: &str) -> BTreeSet<String> {
     identifiers.into_iter().collect()
 }
 
-pub(super) fn collect_rust_type_identifiers(
+pub fn collect_rust_type_identifiers(
     node: Node<'_>,
     source: &str,
     identifiers: &mut HashSet<String>,

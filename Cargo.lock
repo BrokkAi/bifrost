@@ -264,6 +264,7 @@ dependencies = [
  "bincode",
  "brokk-bifrost-core",
  "brokk-bifrost-go",
+ "brokk-bifrost-rust",
  "cap-fs-ext",
  "cap-std",
  "cc",
@@ -450,6 +451,22 @@ dependencies = [
  "brokk-bifrost-policy",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "brokk-bifrost-rust"
+version = "0.8.21"
+dependencies = [
+ "brokk-bifrost-core",
+ "glob",
+ "moka",
+ "rayon",
+ "regex",
+ "semver",
+ "tempfile",
+ "toml",
+ "tree-sitter",
+ "tree-sitter-rust",
 ]
 
 [[package]]

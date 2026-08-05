@@ -1,7 +1,5 @@
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::rust::canonical_rust_hierarchy_type;
-use crate::analyzer::rust::field_roles::rust_struct_field_references;
-use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
 use crate::analyzer::rust::{RustBindingSeeds, RustReferenceNamespace};
 use crate::analyzer::rust::{
     has_rust_value_constructor, is_rust_const_or_static_declaration, is_rust_enum_declaration,
@@ -40,6 +38,8 @@ use crate::analyzer::{
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_rust::field_roles::rust_struct_field_references;
+use brokk_bifrost_rust::lexical_scope::{self, RustLexicalScopeIndex};
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Mutex;

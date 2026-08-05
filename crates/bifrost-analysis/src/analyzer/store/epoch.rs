@@ -81,6 +81,7 @@ fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str
     for (path, contents) in EMBEDDED_QUERIES
         .iter()
         .chain(brokk_bifrost_go::queries::GO_QUERY_ASSETS)
+        .chain(brokk_bifrost_rust::queries::RUST_QUERY_ASSETS)
     {
         if path.starts_with(L::QUERY_DIR) {
             hasher.update(path.as_bytes());
@@ -150,9 +151,10 @@ fn hash_grammar(hasher: &mut Sha256, lang: &TsLanguage) {
 /// contents)`. Adding/removing or editing a query file rebuilds the crate and
 /// changes the per-language epoch.
 ///
-/// Go's assets live in `brokk-bifrost-go` (they moved with its language
-/// knowledge) and are chained in above under the same `treesitter/go/` prefix,
-/// so the per-language filter stays one rule.
+/// Go's and Rust's assets live in `brokk-bifrost-go` and `brokk-bifrost-rust`
+/// (they moved with their language knowledge) and are chained in above under
+/// the same `treesitter/go/` and `treesitter/rust/` prefixes, so the
+/// per-language filter stays one rule.
 const EMBEDDED_QUERIES: &[(&str, &str)] = &[
     // Java
     (
@@ -179,15 +181,6 @@ const EMBEDDED_QUERIES: &[(&str, &str)] = &[
     (
         "treesitter/python/identifiers.scm",
         include_str!("../../../resources/treesitter/python/identifiers.scm"),
-    ),
-    // Rust
-    (
-        "treesitter/rust/definitions.scm",
-        include_str!("../../../resources/treesitter/rust/definitions.scm"),
-    ),
-    (
-        "treesitter/rust/imports.scm",
-        include_str!("../../../resources/treesitter/rust/imports.scm"),
     ),
     // JavaScript
     (
@@ -432,11 +425,15 @@ lang_epoch!(
     "treesitter/python/",
     "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07"
 );
+// Salt bumped (#1548 stage 3 fleet): the Rust `.scm` query assets moved from
+// this crate's `resources/treesitter/rust/` into `brokk-bifrost-rust`, so the
+// salted content now comes from a different crate's `include_str!`. The bytes
+// are unchanged, which is exactly why the salt has to carry the relocation.
 lang_epoch!(
     Rust,
     "rust",
     "treesitter/rust/",
-    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07"
+    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;rust-query-assets-in-brokk-bifrost-rust-2026-08"
 );
 // Salt bumped after #1420: namespace-level structural traversal now emits
 // conditionally declared free functions that older PHP blobs omitted.

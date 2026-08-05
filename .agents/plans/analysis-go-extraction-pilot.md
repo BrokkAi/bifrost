@@ -178,6 +178,19 @@ else the language's unit pins are the evidence (Ruby/Kotlin precedent).
       shim, so the plan's ~1.05k per-language shim estimate is low by ~500 LOC
       independently of the blocks -- the floor is the SPI block plus the memo
       shell.
+- [x] R2 (Rust extraction, 27153340 5039cfa7 b3feef88 c28e56ff 508912cb):
+      `brokk-bifrost-rust` created and wired. 16,375 LOC in the crate -- the
+      `analyzer/rust/` band (declarations, imports, structural, test detection,
+      field roles, adapter bodies, cargo routes, graph support, usage index,
+      hierarchy, lexical scope, diagnostics) plus the usage-graph resolver -- and
+      the `.scm` assets ship from the crate with the Rust epoch salt bumped.
+      Analysis Rust residue 23,582, of which 17,494 is parked by design
+      (semantic 3,235; semantic_model adapters 4,233; definition/type routes
+      7,619; and the two scan bodies plus their hit recorder, 5,642 -- newly
+      found to route receiver types through `get_definition/rust.rs`, so they
+      follow it) and ~2,540 is production shim plus retained analyzer-bound
+      tests. Move rate 41% of the 39.9k seam, 68% of the seam outside the parks.
+      Three census-missed lowerings were needed; see the decision log.
 
 ## Decision log
 
@@ -204,3 +217,30 @@ else the language's unit pins are the evidence (Ruby/Kotlin precedent).
 - 2026-08-04: Epoch-salt rule honored: moving the .scm query files changes the salted
   path, so the Go lang_epoch! salt bumps in P1 (worktree-agent-pitfalls memory:
   epoch-salt requirement).
+- 2026-08-05 (R2): three census-missed couplings resolved by lowering pure code to
+  core rather than by leaving Rust logic behind. (1) `parse_symbol_path` and its
+  private helper chain moved to `core::analyzer::symbol_path`: the Rust crate
+  splits `self::`/`super::` use-paths through it at three sites, cannot depend on
+  analysis, and re-deriving the split in the language crate would be the
+  source-text mini-parser the design rules forbid. It carries the Go and Rust
+  per-segment normalizers with it, which is language knowledge in core and the
+  one thing about this move to revisit if the fleet finds a better seam. (2)
+  `IdentifierSigil`/`node_ident_text`/`parse_source_region` to `core::analyzer::
+  common` -- language-blind mechanism; Rust's sigil constant went to the language
+  crate, C#'s stayed in analysis. (3) `cognitive_complexity::is_wildcard_case` to
+  core beside the `Config` that stores it. All three are verbatim moves with
+  analysis re-exporting the old paths, so no caller changed.
+- 2026-08-05 (R2): moka enters `brokk-bifrost-rust` with `lexical_scope`'s
+  `RUST_TREES` parse memo, as the amended fleet section anticipated. The pilot's
+  moka-stays-in-analysis rule was about `GoMemoCaches` shim state; a global
+  source-keyed parse cache is language-crate state. The three facade parse
+  counters survive as re-exports through `analyzer/rust/mod.rs`, so `src/lib.rs`
+  is unchanged.
+- 2026-08-05 (R2): `rust_graph/{extractor,inverted,hits}.rs` (5,642 LOC) do NOT
+  move, against the census's "movable-with-reshaping" classification. Both scan
+  bodies route Rust receiver types through six items of `get_definition/rust.rs`
+  (`RustTypeLookupCache` and the cached type-definition helpers around it), and
+  `hits.rs` is written against `extractor::ScanCtx`. They follow the definition
+  route's park on `ResolutionSession`/`LimitedQueryRows`/`DefinitionBatchContext`
+  and need nothing new of their own once that park lifts. Recorded rather than
+  improvised around, per the pilot's own handling of census-missed couplings.

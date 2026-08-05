@@ -2,19 +2,15 @@ mod adapter;
 mod cache;
 mod cargo_routes;
 mod clones;
-mod declarations;
 mod dependency_discovery;
 mod diagnostics;
 mod external;
-pub(crate) mod field_roles;
 mod graph_support;
 mod hierarchy;
 mod imports;
-pub(crate) mod lexical_scope;
 mod rustdoc_artifact;
 mod semantic;
-pub(crate) mod structural;
-mod tests;
+mod structural;
 mod usage_index;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
@@ -55,40 +51,38 @@ use std::sync::{Arc, OnceLock};
 
 use super::weighted_cache::{build_weighted_cache, weight_code_unit_set, weight_project_file_set};
 pub(crate) use adapter::RustAdapter;
-use cache::{weight_export_index, weight_reference_context};
-use cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
-use clones::build_rust_clone_candidate_data;
-pub(crate) use declarations::rust_package_name;
-use declarations::rust_type_identifiers;
-pub use dependency_discovery::resolve_rust_semantic_pack_dependencies;
-pub use external::RustDependencyPackAdapter;
-pub use field_roles::rust_is_field_declaration_name;
-pub(crate) use imports::{
+use brokk_bifrost_rust::cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
+pub(crate) use brokk_bifrost_rust::declarations::{rust_package_name, rust_type_identifiers};
+pub use brokk_bifrost_rust::field_roles::rust_is_field_declaration_name;
+pub(crate) use brokk_bifrost_rust::imports::{
     resolve_rust_import_package_scoped, resolve_rust_module_segments_with_crate,
     rust_crate_root_package, rust_focused_use_path,
 };
+use brokk_bifrost_rust::test_detection::detect_rust_test_assertion_smells;
+use cache::{weight_export_index, weight_reference_context};
+use clones::build_rust_clone_candidate_data;
+pub use dependency_discovery::resolve_rust_semantic_pack_dependencies;
+pub use external::RustDependencyPackAdapter;
 pub use rustdoc_artifact::RustdocJsonPackProducer;
-use tests::detect_rust_test_assertion_smells;
 
-use graph_support::RustPackageFileIndex;
-pub use graph_support::RustReferenceContext;
-pub(crate) use graph_support::{
-    exact_member, forward_export_fqn_from_files, has_rust_value_constructor,
-    is_rust_const_or_static_declaration, is_rust_enum_declaration,
-    is_rust_export_visible_declaration, is_rust_public_like_declaration, is_rust_trait_declaration,
+use brokk_bifrost_rust::graph_support::RustPackageFileIndex;
+pub use brokk_bifrost_rust::graph_support::RustReferenceContext;
+pub(crate) use brokk_bifrost_rust::graph_support::{
+    forward_export_fqn_from_files, has_rust_value_constructor, is_rust_const_or_static_declaration,
+    is_rust_enum_declaration, is_rust_public_like_declaration, is_rust_trait_declaration,
     is_rust_trait_impl_member_declaration, resolve_imported_export_from_binder_forward,
     resolve_module_files, resolve_module_package, resolve_visible_import_targets_forward,
     rust_associated_type_declaration_for_exact_node, trait_implementer_names,
 };
 
-use hierarchy::RustHierarchyIndex;
-pub(crate) use hierarchy::{canonical_rust_hierarchy_type, rust_trait_for_impl_member};
-pub use lexical_scope::{
+use brokk_bifrost_rust::hierarchy::RustHierarchyIndex;
+pub(crate) use brokk_bifrost_rust::hierarchy::canonical_rust_hierarchy_type;
+pub use brokk_bifrost_rust::lexical_scope::{
     reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
     rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
-use usage_index::RustUsageIndex;
-pub(crate) use usage_index::{
+use brokk_bifrost_rust::usage_index::RustUsageIndex;
+pub(crate) use brokk_bifrost_rust::usage_index::{
     RustBindingSeeds, RustReferenceNamespace, usage_binding_local_names, usage_binding_names,
     usage_binding_seeds, usage_crate_export_targets, usage_declaration_visible_at,
     usage_exact_root_for_resolution, usage_has_exact_scoped_binding, usage_importers,
@@ -411,7 +405,7 @@ impl TypeAliasProvider for RustAnalyzer {
 /// implementor of the source traits the Rust language logic is written against.
 /// Every method here forwards to an inherent accessor; inherent methods win
 /// name resolution, so these bodies do not recurse.
-impl graph_support::RustAnalysisSource for RustAnalyzer {
+impl brokk_bifrost_rust::graph_support::RustAnalysisSource for RustAnalyzer {
     fn code_units(&self) -> &dyn CodeUnitIndex {
         self
     }
@@ -448,13 +442,33 @@ impl graph_support::RustAnalysisSource for RustAnalyzer {
     }
 }
 
-impl graph_support::RustUsageSource for RustAnalyzer {
+impl brokk_bifrost_rust::graph_support::RustUsageSource for RustAnalyzer {
     fn usage_index(&self) -> Arc<RustUsageIndex> {
         self.usage_index()
     }
 
     fn reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext> {
         self.reference_context_of(file)
+    }
+
+    fn reference_context_of_with_progress(
+        &self,
+        file: &ProjectFile,
+        progress: &dyn Fn() -> bool,
+    ) -> Option<Arc<RustReferenceContext>> {
+        self.reference_context_of_with_progress(file, progress)
+    }
+
+    fn forward_reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext> {
+        self.forward_reference_context_of(file)
+    }
+
+    fn forward_reference_context_of_with_progress(
+        &self,
+        file: &ProjectFile,
+        progress: &dyn Fn() -> bool,
+    ) -> Option<Arc<RustReferenceContext>> {
+        self.forward_reference_context_of_with_progress(file, progress)
     }
 }
 
@@ -905,8 +919,8 @@ impl LanguageSupport for RustSupport {
 
     fn focus_resolves_lexically(&self, focus: tree_sitter::Node<'_>) -> bool {
         matches!(
-            field_roles::classify_rust_field_name(focus),
-            field_roles::RustFieldNameRole::Other
+            brokk_bifrost_rust::field_roles::classify_rust_field_name(focus),
+            brokk_bifrost_rust::field_roles::RustFieldNameRole::Other
         )
     }
 
@@ -994,7 +1008,7 @@ impl LanguageSupport for RustSupport {
     }
 
     fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
-        &structural::RUST_STRUCTURAL_SPEC
+        &brokk_bifrost_rust::structural::RUST_STRUCTURAL_SPEC
     }
 
     fn highlight_query(&self) -> Option<&'static str> {

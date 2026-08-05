@@ -26,7 +26,6 @@ use super::extractor::{
 };
 use super::hits::{rust_path_is_leading_absolute, rust_path_segments};
 use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::rust::lexical_scope::RustLexicalScopeIndex;
 use crate::analyzer::rust::rust_focused_use_path;
 use crate::analyzer::rust::{
     RustBindingSeeds, RustReferenceNamespace, resolve_rust_import_package_scoped,
@@ -53,6 +52,7 @@ use crate::analyzer::{
     TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_rust::lexical_scope::RustLexicalScopeIndex;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use tree_sitter::Node;

@@ -1,25 +1,19 @@
+//! The `LanguageAdapter` forwarding shell for Rust.
+//!
+//! Every answer below comes from [`brokk_bifrost_rust`]; this file exists only
+//! because `LanguageAdapter` and `ParsedFile` are analysis-owned types the Rust
+//! crate cannot name.
+
 use crate::analyzer::cognitive_complexity;
-use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile};
-use std::sync::LazyLock;
+use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
+use brokk_bifrost_rust::adapter::{
+    RUST_COGNITIVE_CONFIG, RUST_FILE_EXTENSION, rust_extract_call_receiver,
+    rust_unit_has_explicit_qualifier,
+};
+use brokk_bifrost_rust::declarations::{parse_rust_file, rust_file_package_fq, rust_package_name};
+use brokk_bifrost_rust::queries::RUST_QUERY_DIRECTORY;
+use brokk_bifrost_rust::test_detection::rust_source_contains_tests;
 use tree_sitter::Tree;
-
-use super::declarations::{parse_rust_file, rust_file_package_fq, rust_package_name};
-use super::tests::rust_source_contains_tests;
-
-static RUST_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
-    LazyLock::new(|| cognitive_complexity::Config {
-        if_types: &["if_expression"],
-        loop_types: &["for_expression", "while_expression", "loop_expression"],
-        case_types: &["match_arm"],
-        binary_types: &["binary_expression"],
-        logical_operators: &["&&", "||"],
-        jump_types: &["break_expression", "continue_expression"],
-        named_function_boundary_types: &["function_item"],
-        anonymous_function_types: &["closure_expression"],
-        else_clause_types: &["else_clause"],
-        default_case_predicate: Some(cognitive_complexity::is_wildcard_case),
-        ..cognitive_complexity::Config::empty()
-    });
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RustAdapter;
@@ -29,12 +23,14 @@ impl LanguageAdapter for RustAdapter {
         Language::Rust
     }
 
+    /// Relative to `brokk-bifrost-rust`'s crate root: the `.scm` assets moved
+    /// with the language knowledge and are embedded there.
     fn query_directory(&self) -> &'static str {
-        "resources/treesitter/rust"
+        RUST_QUERY_DIRECTORY
     }
 
     fn file_extension(&self) -> &'static str {
-        "rs"
+        RUST_FILE_EXTENSION
     }
 
     fn storage_content_qualifier(
@@ -76,14 +72,7 @@ impl LanguageAdapter for RustAdapter {
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        let trimmed = reference.trim();
-        let before_args = trimmed
-            .split_once('(')
-            .map(|(head, _)| head)
-            .unwrap_or(trimmed);
-        before_args
-            .rsplit_once("::")
-            .map(|(receiver, _)| receiver.to_string())
+        rust_extract_call_receiver(reference)
     }
 
     fn contains_tests(
@@ -108,8 +97,4 @@ impl LanguageAdapter for RustAdapter {
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&RUST_COGNITIVE_CONFIG)
     }
-}
-
-fn rust_unit_has_explicit_qualifier(code_unit: &CodeUnit) -> bool {
-    code_unit.package_name() != rust_package_name(code_unit.source())
 }
