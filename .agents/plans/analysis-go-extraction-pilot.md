@@ -142,8 +142,10 @@ else the language's unit pins are the evidence (Ruby/Kotlin precedent).
 - [x] P2: measurements + differential (evidence docs committed). Frontend -2.8s
       (~0.47s/kLOC), go test loop 0.44s steady, wall neutral; behavior byte-identical
       4/4. Shim ~4.5k vs the ~1.3k bar.
-- [ ] Verdict: CONDITIONAL -- fleet on hold pending Jonathan's call on the three
-      shared workstreams (see the evaluation doc's pilot section)
+- [x] Verdict: CONDITIONAL; Jonathan chose option 1 (2026-08-05): fund the three
+      shared workstreams (W1 ParsedFile/ScalaExportInfo lowering, W2 inverted-edge
+      scan contract, W3 CodeUnitIndex enclosing query + bounded-lookup trait), then
+      move Go's residual files (W4), then fleet
 
 ## Decision log
 
