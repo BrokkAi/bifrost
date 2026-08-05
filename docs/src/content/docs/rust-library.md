@@ -61,7 +61,8 @@ during initialization. Reserve the process's standard input and output for LSP
 messages, and follow the [LSP server guide](/lsp/) for protocol configuration.
 
 `brokk-bifrost-core`, `brokk-bifrost-csharp`, `brokk-bifrost-go`,
-`brokk-bifrost-python`, `brokk-bifrost-rust`, `brokk-bifrost-analysis`,
+`brokk-bifrost-php`, `brokk-bifrost-python`, `brokk-bifrost-rust`,
+`brokk-bifrost-analysis`,
 `brokk-bifrost-policy`, `brokk-bifrost-nlp`, `brokk-bifrost-runtime`, and
 `brokk-bifrost-mcp` are lower-level workspace components. They are published
 so focused hosts can compose them, but they are not necessary for ordinary

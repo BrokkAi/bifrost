@@ -8,6 +8,7 @@ const names = [
   "brokk-bifrost-core",
   "brokk-bifrost-csharp",
   "brokk-bifrost-go",
+  "brokk-bifrost-php",
   "brokk-bifrost-python",
   "brokk-bifrost-rust",
   "brokk-bifrost-analysis",
@@ -29,12 +30,14 @@ function metadata(overrides = {}) {
     "brokk-bifrost-core": [],
     "brokk-bifrost-csharp": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-go": [dependency("brokk-bifrost-core")],
+    "brokk-bifrost-php": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-python": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-rust": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-analysis": [
       dependency("brokk-bifrost-core"),
       dependency("brokk-bifrost-csharp"),
       dependency("brokk-bifrost-go"),
+      dependency("brokk-bifrost-php"),
       dependency("brokk-bifrost-python"),
       dependency("brokk-bifrost-rust"),
     ],
@@ -101,6 +104,7 @@ test("rejects an analysis dependency on prebuilt semantic packs", () => {
             dependency("brokk-bifrost-core"),
             dependency("brokk-bifrost-csharp"),
             dependency("brokk-bifrost-go"),
+            dependency("brokk-bifrost-php"),
             dependency("brokk-bifrost-python"),
             dependency("brokk-bifrost-rust"),
             dependency("brokk-bifrost-semantic-packs"),
@@ -220,5 +224,21 @@ test("rejects one language crate depending on another", () => {
       }),
     ),
     ["brokk-bifrost-rust must not depend on workspace package brokk-bifrost-go"],
+  );
+});
+
+test("rejects a php crate reaching back up to analysis", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({
+        dependencies: {
+          "brokk-bifrost-php": [
+            dependency("brokk-bifrost-core"),
+            dependency("brokk-bifrost-analysis"),
+          ],
+        },
+      }),
+    ),
+    ["brokk-bifrost-php must not depend on workspace package brokk-bifrost-analysis"],
   );
 });

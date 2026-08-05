@@ -10,6 +10,7 @@ use brokk_bifrost_php::adapter::{
     php_signature_return_type_text,
 };
 use brokk_bifrost_php::declarations::parse_php_file;
+use brokk_bifrost_php::queries::PHP_QUERY_DIRECTORY;
 use brokk_bifrost_php::test_detection::php_contains_tests;
 use tree_sitter::Tree;
 
@@ -21,8 +22,10 @@ impl LanguageAdapter for PhpAdapter {
         Language::Php
     }
 
+    /// Relative to `brokk-bifrost-php`'s crate root: the `.scm` assets moved with
+    /// the language knowledge and are embedded there.
     fn query_directory(&self) -> &'static str {
-        "resources/treesitter/php"
+        PHP_QUERY_DIRECTORY
     }
 
     fn file_extension(&self) -> &'static str {
