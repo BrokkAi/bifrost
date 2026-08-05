@@ -1,19 +1,7 @@
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
 import test from "node:test";
 
-import { packageExists, publishTarball } from "../scripts/publish-release.mjs";
-
-function publishProcess(stderr, status = 1) {
-  const child = new EventEmitter();
-  child.stdout = new EventEmitter();
-  child.stderr = new EventEmitter();
-  queueMicrotask(() => {
-    child.stderr.emit("data", stderr);
-    child.emit("close", status);
-  });
-  return child;
-}
+import { packageExists, publishOrRecover, publishTarball } from "../scripts/publish-release.mjs";
 
 test("treats a registry 404 as a version that is not visible", () => {
   const exists = packageExists("@brokkai/bifrost-linux-arm64-gnu", "0.8.22", () => ({
@@ -36,30 +24,29 @@ test("does not treat other npm view errors as a missing version", () => {
   );
 });
 
-test("continues waiting when npm already accepted a version", async () => {
-  let message;
-  await publishTarball(
-    "/tmp/brokkai-bifrost-linux-arm64-gnu-0.8.22.tgz",
-    () =>
-      publishProcess(
-        "npm error code E403\nnpm error You cannot publish over the previously published versions: 0.8.22.\n",
-      ),
-    () => {},
-    (value) => {
-      message = `${message ?? ""}${value}`;
-    },
-  );
-  assert.match(message, /already accepted.*waiting for registry visibility/);
+test("keeps npm publish attached to the terminal for browser authentication", () => {
+  let invocation;
+  const published = publishTarball("/tmp/package.tgz", (command, args, options) => {
+    invocation = { command, args, options };
+    return { status: 0 };
+  });
+  assert.equal(published, true);
+  assert.equal(invocation.command, "npm");
+  assert.deepEqual(invocation.args, ["publish", "/tmp/package.tgz", "--access", "public"]);
+  assert.equal(invocation.options.stdio, "inherit");
 });
 
-test("rejects a publish permission error", async () => {
-  await assert.rejects(
-    publishTarball(
-      "/tmp/brokkai-bifrost-linux-arm64-gnu-0.8.22.tgz",
-      () => publishProcess("npm error code E403\nnpm error permission denied\n"),
-      () => {},
-      () => {},
-    ),
-    /npm publish failed/,
+test("checks registry visibility after a failed publish", async () => {
+  let waitedFor;
+  await publishOrRecover(
+    { packageName: "@brokkai/bifrost-linux-arm64-gnu", tarball: "/tmp/package.tgz" },
+    "0.8.22",
+    () => false,
+    () => false,
+    async (packageName, version) => {
+      waitedFor = `${packageName}@${version}`;
+    },
+    () => {},
   );
+  assert.equal(waitedFor, "@brokkai/bifrost-linux-arm64-gnu@0.8.22");
 });
