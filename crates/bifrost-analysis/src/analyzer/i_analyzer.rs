@@ -454,6 +454,9 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn query_indexes_warm(&self) -> bool {
         true
     }
+    /// Drop any cached bulk working-tree identities before an explicit
+    /// from-disk rebuild. Implementations without such a cache do nothing.
+    fn invalidate_cached_file_identities(&self) {}
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self
     where
         Self: Sized;

@@ -265,6 +265,10 @@ impl TypeAliasProvider for KotlinAnalyzer {
 }
 
 impl IAnalyzer for KotlinAnalyzer {
+    fn invalidate_cached_file_identities(&self) {
+        self.inner.invalidate_cached_file_identities();
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.begin_query(context);
     }

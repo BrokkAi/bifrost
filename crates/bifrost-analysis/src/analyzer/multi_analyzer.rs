@@ -530,6 +530,12 @@ impl TypeAliasProvider for MultiAnalyzer {
 impl TestDetectionProvider for MultiAnalyzer {}
 
 impl IAnalyzer for MultiAnalyzer {
+    fn invalidate_cached_file_identities(&self) {
+        self.delegates
+            .values()
+            .for_each(|delegate| delegate.analyzer().invalidate_cached_file_identities());
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         let mut contexts = self
             .query_contexts
