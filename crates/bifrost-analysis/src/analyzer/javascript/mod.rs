@@ -19,8 +19,9 @@ use crate::analyzer::js_ts::model::{
     add_default_export_unit, add_destructured_binder_units, call_has_likely_surface_factory_name,
     call_identifier_name, call_is_schema_object_builder, collect_function_nodes,
     file_scoped_field_fq, file_scoped_field_name, js_ts_segment, module_code_unit,
-    module_scoped_field_uses_file_name, node_text, property_name_text, root_node,
-    this_member_property, trim_statement, variable_header,
+    module_scoped_field_uses_file_name, node_text, property_name_text, record_default_reexport,
+    record_named_declarator_exports, record_named_export, root_node, this_member_property,
+    trim_statement, variable_header,
 };
 use crate::analyzer::js_ts::providers::{self, JsTsAnalyzerHost};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
@@ -29,6 +30,7 @@ use crate::analyzer::js_ts::{
     source_contains_tests as js_ts_source_contains_tests,
     synthesize_hydrated_module as synthesize_js_ts_hydrated_module_unit,
 };
+use crate::analyzer::structural::materialization::{ExportForm, MaterializationRecord};
 use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::usages::js_ts_graph::JsTsUsageIndex;
@@ -806,6 +808,13 @@ fn visit_js_export(
                 {
                     visit_js_default_export_class(file, source, node, declaration, parsed);
                 } else {
+                    record_named_export(
+                        source,
+                        node,
+                        declaration,
+                        js_export_is_default(node, source),
+                        parsed,
+                    );
                     visit_js_class(file, source, node, None, parsed, true);
                 }
             }
@@ -815,10 +824,18 @@ fn visit_js_export(
                 {
                     visit_js_default_export_function(file, source, node, declaration, parsed);
                 } else {
+                    record_named_export(
+                        source,
+                        node,
+                        declaration,
+                        js_export_is_default(node, source),
+                        parsed,
+                    );
                     visit_js_function(file, source, node, None, parsed, true);
                 }
             }
             "lexical_declaration" | "variable_declaration" => {
+                record_named_declarator_exports(source, node, declaration, parsed);
                 visit_js_variable_statement(
                     file,
                     source,
@@ -870,7 +887,8 @@ fn visit_js_default_export_value(
         }
         // `export default name` points at an existing binding; indexing `default`
         // here would duplicate that declaration instead of describing new code.
-        _ => {}
+        // The export declaration itself is still recorded.
+        _ => record_default_reexport(export, parsed),
     }
 }
 
@@ -1434,15 +1452,23 @@ fn visit_js_module_exports_object_literal_properties(
         let Some(child) = object.named_child(index) else {
             continue;
         };
-        if js_module_exports_property_is_reference(child) {
-            continue;
-        }
         let Some(name) = js_object_literal_property_name(child, source) else {
             continue;
         };
+        if js_module_exports_property_is_reference(child) {
+            // A reference property re-exports an existing local declaration;
+            // it is an export row but materializes no declaration of its own.
+            parsed.record_materialization(MaterializationRecord::Export {
+                range: crate::analyzer::tree_sitter_analyzer::node_range(child),
+                form: ExportForm::CommonJsMember,
+                exported_name: name,
+                target: None,
+            });
+            continue;
+        }
         let kind = js_object_literal_property_kind(child);
         let fq = FqName::new().with_pushed(js_ts_segment(&name, SegmentKind::Member));
-        let code_unit = CodeUnit::new_fq(file.clone(), kind, "", name, fq);
+        let code_unit = CodeUnit::new_fq(file.clone(), kind, "", name.clone(), fq);
         parsed.add_code_unit(
             code_unit.clone(),
             child,
@@ -1450,6 +1476,12 @@ fn visit_js_module_exports_object_literal_properties(
             None,
             Some(code_unit.clone()),
         );
+        parsed.record_materialization(MaterializationRecord::Export {
+            range: crate::analyzer::tree_sitter_analyzer::node_range(child),
+            form: ExportForm::CommonJsMember,
+            exported_name: name,
+            target: Some(code_unit.clone()),
+        });
         parsed.add_signature(code_unit, trim_statement(node_text(child, source)));
     }
 }
@@ -2192,6 +2224,12 @@ fn visit_js_assignment_expression(
         && let Some(value) = value
         && let Some(object) = js_object_literal_value(value)
     {
+        parsed.record_materialization(MaterializationRecord::Export {
+            range: crate::analyzer::tree_sitter_analyzer::node_range(node),
+            form: ExportForm::CommonJsRoot,
+            exported_name: "module.exports".to_string(),
+            target: None,
+        });
         visit_js_module_exports_object_literal_properties(file, source, object, parsed);
         return;
     }

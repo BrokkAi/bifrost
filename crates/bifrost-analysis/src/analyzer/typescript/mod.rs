@@ -31,8 +31,9 @@ use crate::analyzer::js_ts::model::{
     add_default_export_unit, add_destructured_binder_units, call_has_likely_surface_factory_name,
     call_identifier_name, call_is_schema_object_builder, collect_function_nodes,
     file_scoped_field_fq, file_scoped_field_name, js_ts_segment, module_code_unit,
-    module_scoped_field_uses_file_name, node_text, property_name_text, root_node,
-    this_member_property, trim_statement, variable_header,
+    module_scoped_field_uses_file_name, node_text, property_name_text, record_default_reexport,
+    record_named_declarator_exports, record_named_export, root_node, this_member_property,
+    trim_statement, variable_header,
 };
 use crate::analyzer::js_ts::providers::{self, JsTsAnalyzerHost};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
@@ -940,6 +941,15 @@ fn visit_ts_export(
                 {
                     visit_ts_default_export_class(file, source, node, declaration, parsed);
                 } else {
+                    if parent.is_none() {
+                        record_named_export(
+                            source,
+                            node,
+                            declaration,
+                            ts_export_is_default(node, source),
+                            parsed,
+                        );
+                    }
                     visit_ts_class_like(file, source, node, parent, parsed, true);
                 }
             }
@@ -951,10 +961,26 @@ fn visit_ts_export(
                 {
                     visit_ts_default_export_function(file, source, node, declaration, parsed);
                 } else {
+                    if parent.is_none() {
+                        record_named_export(
+                            source,
+                            node,
+                            declaration,
+                            ts_export_is_default(node, source),
+                            parsed,
+                        );
+                    }
                     visit_ts_function(file, source, node, parent, parsed, true);
                 }
             }
             "lexical_declaration" | "variable_declaration" | "type_alias_declaration" => {
+                if parent.is_none() {
+                    if declaration.kind() == "type_alias_declaration" {
+                        record_named_export(source, node, declaration, false, parsed);
+                    } else {
+                        record_named_declarator_exports(source, node, declaration, parsed);
+                    }
+                }
                 visit_ts_value(file, source, node, parent, parsed, true, exported_roots);
             }
             _ => {}
@@ -1000,7 +1026,8 @@ fn visit_ts_default_export_value(
         }
         // `export default name` points at an existing binding; indexing `default`
         // here would duplicate that declaration instead of describing new code.
-        _ => {}
+        // The export declaration itself is still recorded.
+        _ => record_default_reexport(export, parsed),
     }
 }
 

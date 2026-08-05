@@ -11757,6 +11757,166 @@ mod tests {
         );
     }
 
+    /// TS export provenance (issue #1476): the TypeScript dialect's own
+    /// visitor records the same export-row vocabulary, including type-space
+    /// exports (interfaces, type aliases) and the default re-export.
+    #[test]
+    fn typescript_export_records_state_their_forms() {
+        use crate::analyzer::structural::materialization::{ExportForm, MaterializationRecord};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "exports.ts",
+            concat!(
+                "export interface Shape { area(): number }\n",
+                "export type Alias = Shape;\n",
+                "export const answer = 42;\n",
+                "export class Widget {}\n",
+                "const table = { greet: 'hi' };\n",
+                "export default table;\n",
+            ),
+        );
+        let state = parse_state(&TypescriptAdapter, &file);
+        let exports: Vec<_> = state
+            .materialization_records
+            .iter()
+            .filter_map(|record| match record {
+                MaterializationRecord::Export {
+                    form,
+                    exported_name,
+                    ..
+                } => Some((*form, exported_name.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            exports,
+            vec![
+                (ExportForm::Named, "Shape".to_string()),
+                (ExportForm::Named, "Alias".to_string()),
+                (ExportForm::Named, "answer".to_string()),
+                (ExportForm::Named, "Widget".to_string()),
+                (ExportForm::DefaultNamed, "default".to_string()),
+            ],
+            "records: {:?}",
+            state.materialization_records
+        );
+    }
+
+    /// JS export provenance (issue #1476): the producer records default,
+    /// named, and CommonJS export rows with their forms, and the anonymous
+    /// default's synthetic `default` unit is the row's target.
+    #[test]
+    fn javascript_export_records_state_their_forms() {
+        use crate::analyzer::structural::materialization::{ExportForm, MaterializationRecord};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "exports.js",
+            concat!(
+                "export const answer = 42;\n",
+                "export function makeWidget() {}\n",
+                "const messages = { greet: 'hi' };\n",
+                "export default messages;\n",
+            ),
+        );
+        let state = parse_state(&crate::analyzer::javascript::JavascriptAdapter, &file);
+        let exports: Vec<_> = state
+            .materialization_records
+            .iter()
+            .filter_map(|record| match record {
+                MaterializationRecord::Export {
+                    form,
+                    exported_name,
+                    target,
+                    ..
+                } => Some((*form, exported_name.clone(), target.is_some())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            exports,
+            vec![
+                (ExportForm::Named, "answer".to_string(), false),
+                (ExportForm::Named, "makeWidget".to_string(), false),
+                (ExportForm::DefaultNamed, "default".to_string(), false),
+            ],
+            "records: {:?}",
+            state.materialization_records
+        );
+
+        let commonjs = write_file(
+            temp.path(),
+            "commonjs.js",
+            concat!(
+                "const local = () => 1;\n",
+                "module.exports = {\n",
+                "  inline() { return 2; },\n",
+                "  local,\n",
+                "};\n",
+            ),
+        );
+        let state = parse_state(&crate::analyzer::javascript::JavascriptAdapter, &commonjs);
+        let exports: Vec<_> = state
+            .materialization_records
+            .iter()
+            .filter_map(|record| match record {
+                MaterializationRecord::Export {
+                    form,
+                    exported_name,
+                    target,
+                    ..
+                } => Some((
+                    *form,
+                    exported_name.clone(),
+                    target.as_ref().map(|unit| unit.fq_name().to_string()),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            exports,
+            vec![
+                (ExportForm::CommonJsRoot, "module.exports".to_string(), None),
+                (
+                    ExportForm::CommonJsMember,
+                    "inline".to_string(),
+                    Some("inline".to_string())
+                ),
+                (ExportForm::CommonJsMember, "local".to_string(), None),
+            ],
+            "records: {:?}",
+            state.materialization_records
+        );
+
+        let anonymous = write_file(
+            temp.path(),
+            "anonymous.js",
+            "export default { greet: 'hi' };\n",
+        );
+        let state = parse_state(&crate::analyzer::javascript::JavascriptAdapter, &anonymous);
+        let default_export = state
+            .materialization_records
+            .iter()
+            .find_map(|record| match record {
+                MaterializationRecord::Export {
+                    form: ExportForm::DefaultAnonymous,
+                    exported_name,
+                    target,
+                    ..
+                } => Some((exported_name.clone(), target.clone())),
+                _ => None,
+            })
+            .expect("anonymous default export row");
+        assert_eq!(default_export.0, "default");
+        assert_eq!(
+            default_export.1.expect("synthetic default unit").fq_name(),
+            "default"
+        );
+    }
+
     fn write_file(root: &Path, rel_path: &str, contents: &str) -> ProjectFile {
         let file = ProjectFile::new(root.to_path_buf(), rel_path);
         file.write(contents).unwrap();
