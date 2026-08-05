@@ -410,6 +410,51 @@ fn grouped_var_shadowed_constructor_does_not_resolve_to_package_constructor() {
     );
 }
 
+/// A local copied from a typed struct field (`h := pi.handler`) resolves member
+/// calls to the field type's method, matching the forward per-symbol scan's
+/// field-derived local receiver proof (#1611).
+#[test]
+fn field_derived_local_receiver_call_resolves_to_an_edge() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "parse.go",
+            r#"package app
+
+type Handler struct{}
+
+func (h *Handler) addName(name string) {}
+
+type ParseInfo struct {
+    handler *Handler
+}
+
+func (pi *ParseInfo) parse() {
+    h := pi.handler
+    h.addName("x")
+}
+"#,
+        )
+        .build();
+
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("persisted service");
+    let payload = service
+        .call_tool_json("usage_graph", "{}")
+        .expect("usage_graph call failed");
+    let graph: Value = serde_json::from_str(&payload).expect("usage_graph JSON");
+
+    assert!(
+        has_edge(
+            &graph,
+            "example.com/app.ParseInfo.parse",
+            "example.com/app.Handler.addName"
+        ),
+        "field-derived local receiver call should resolve to Handler.addName: {}",
+        graph["edges"]
+    );
+}
+
 #[test]
 fn same_named_methods_are_not_cross_linked() {
     let graph = go_usage_graph();

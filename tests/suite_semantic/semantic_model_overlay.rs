@@ -945,17 +945,34 @@ fn conflicting_model_relations_make_usage_ambiguous() {
 }
 
 #[test]
-fn modeled_usage_relations_fit_the_public_response_budget() {
+fn modeled_usage_relations_fit_the_public_response_budget_across_entries() {
     let (_project, analyzer) = inline_analyzer();
     let mut source: Value = serde_json::from_slice(DECLARATIONS_JSON).unwrap();
+    for (id, name, path) in [
+        ("type.gadget", "com.acme.Gadget", "com/acme/Gadget.class"),
+        ("type.device", "com.acme.Device", "com/acme/Device.class"),
+    ] {
+        let mut modeled_type = source["shards"][0]["payload"]["types"][0].clone();
+        modeled_type["id"] = Value::String(id.to_string());
+        modeled_type["name"] = Value::String(name.to_string());
+        modeled_type["aliases"] = json!([]);
+        modeled_type["extension_surfaces"] = json!([]);
+        modeled_type["locator"]["path"] = Value::String(path.to_string());
+        modeled_type["locator"]["symbol"] = Value::String(name.to_string());
+        source["shards"][0]["payload"]["types"]
+            .as_array_mut()
+            .unwrap()
+            .push(modeled_type);
+    }
+    let targets = ["type.widget", "type.gadget", "type.device"];
     source["shards"][0]["payload"]["relations"] = Value::Array(
-        (0..200)
+        (0..600)
             .map(|index| {
                 json!({
                     "id": format!("relation.widget.reference.{index:03}"),
                     "relation_kind": "references",
                     "from": "member.widget.create",
-                    "to": "type.widget"
+                    "to": targets[index % targets.len()]
                 })
             })
             .collect(),
@@ -984,20 +1001,38 @@ fn modeled_usage_relations_fit_the_public_response_budget() {
     let usages = scan_usages_by_reference(
         analyzer.analyzer(),
         ScanUsagesByReferenceParams {
-            symbols: vec!["com.acme.Widget".to_string()],
+            symbols: vec![
+                "com.acme.Widget".to_string(),
+                "com.acme.Gadget".to_string(),
+                "com.acme.Device".to_string(),
+            ],
             include_tests: false,
             paths: None,
             include_same_owner: false,
             max_duration_secs: None,
         },
     );
-    let entry = &usages.results[0];
-    assert!(entry.model_relations_omitted > 0);
-    assert!(!entry.complete);
-    assert_eq!(
-        entry.incomplete_reason,
-        Some(ScanUsagesIncompleteReason::ResponseBudget)
-    );
+    let incomplete = usages
+        .results
+        .iter()
+        .filter(|entry| entry.model_relations_omitted > 0)
+        .collect::<Vec<_>>();
+    assert!(incomplete.len() > 1);
+    for entry in incomplete {
+        assert!(!entry.complete);
+        assert_eq!(
+            entry.incomplete_reason,
+            Some(ScanUsagesIncompleteReason::ResponseBudget)
+        );
+        assert!(
+            entry
+                .message
+                .iter()
+                .chain(&entry.notes)
+                .any(|guidance| guidance.contains("scan_usages_by_reference")),
+            "each response-budget result must give structured recovery guidance"
+        );
+    }
     assert!(serde_json::to_vec(&usages).unwrap().len() <= 8 * 1024);
 }
 

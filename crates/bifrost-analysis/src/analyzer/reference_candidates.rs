@@ -1,3 +1,4 @@
+use crate::analyzer::cpp::cpp_is_range_for_binding_name;
 use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
 
@@ -125,6 +126,7 @@ fn is_excluded_reference_candidate(
     }
 
     match language {
+        Language::Cpp => cpp_is_range_for_binding_name(node),
         Language::Go => is_go_declaration_name(node),
         Language::CSharp => is_csharp_tuple_element_name(node),
         Language::Rust => is_rust_associated_type_declaration_name(node),
@@ -352,6 +354,129 @@ func use(repository Repository) Alias {
             assert!(
                 offsets.contains(&reference),
                 "neighboring Go type/reference at byte {reference} must remain in the frontier: {offsets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_reference_frontier_excludes_range_for_binders_but_keeps_range_and_body_uses() {
+        let source = r#"void consume(int);
+
+void check() {
+    for (auto value : values) {
+        consume(value);
+    }
+    for (auto* pointer : pointers) {
+        consume(pointer);
+    }
+    for (auto& reference : references) {
+        consume(reference);
+    }
+    for (const auto& const_reference : const_references) {
+        consume(const_reference);
+    }
+    for (auto [key, mapped] : entries) {
+        consume(key);
+        consume(mapped);
+    }
+    for (auto array_value[bound] : array_values) {
+        consume(array_value);
+    }
+    for (auto attributed [[gnu::annotate(attr)]] : attributed_values) {
+        consume(attributed);
+    }
+    for (auto (__cdecl *callback)() : callbacks) {
+        consume(callback);
+    }
+}
+"#;
+        let offsets = reference_candidate_offsets(Language::Cpp, "sample.cpp", source);
+        let cases = [
+            ("value", "values"),
+            ("pointer", "pointers"),
+            ("reference", "references"),
+            ("const_reference", "const_references"),
+        ];
+
+        for (binding, range) in cases {
+            let binding_start = source
+                .find(&format!("{binding} :"))
+                .expect("range-for binding");
+            let range_start = source.find(range).expect("range-for range expression");
+            let body_start = source
+                .rfind(&format!("consume({binding});"))
+                .expect("range-for body use")
+                + "consume(".len();
+            assert!(
+                !offsets.contains(&binding_start),
+                "C++ range-for binding at byte {binding_start} must not enter the reference frontier: {offsets:?}"
+            );
+            for reference in [range_start, body_start] {
+                assert!(
+                    offsets.contains(&reference),
+                    "C++ range-for use at byte {reference} must remain in the reference frontier: {offsets:?}"
+                );
+            }
+        }
+
+        let key_binding = source.find("[key").expect("structured binding key") + 1;
+        let mapped_binding = source.find(", mapped").expect("structured binding mapped") + 2;
+        let key_body = source.rfind("key").expect("structured binding key use");
+        let mapped_body = source
+            .rfind("mapped")
+            .expect("structured binding mapped use");
+        let entries = source
+            .find("entries")
+            .expect("structured binding range expression");
+        for binding in [key_binding, mapped_binding] {
+            assert!(
+                !offsets.contains(&binding),
+                "C++ structured binding at byte {binding} must not enter the reference frontier: {offsets:?}"
+            );
+        }
+        for reference in [entries, key_body, mapped_body] {
+            assert!(
+                offsets.contains(&reference),
+                "C++ structured binding use at byte {reference} must remain in the reference frontier: {offsets:?}"
+            );
+        }
+
+        for (binding, range) in [
+            (
+                source.find("array_value[").expect("array binding"),
+                source.find("array_values").expect("array range"),
+            ),
+            (
+                source.find("attributed [[").expect("attributed binding"),
+                source.find("attributed_values").expect("attributed range"),
+            ),
+            (
+                source
+                    .find("callback)()")
+                    .expect("function-pointer binding"),
+                source.find("callbacks").expect("function-pointer range"),
+            ),
+        ] {
+            assert!(
+                !offsets.contains(&binding),
+                "C++ wrapped range-for binding at byte {binding} must not enter the reference frontier: {offsets:?}"
+            );
+            assert!(
+                offsets.contains(&range),
+                "C++ wrapped range expression at byte {range} must remain in the reference frontier: {offsets:?}"
+            );
+        }
+
+        for (reference, description) in [
+            (source.find("bound").expect("array bound"), "array bound"),
+            (
+                source.find("annotate(attr)").expect("attribute argument") + "annotate(".len(),
+                "attribute argument",
+            ),
+        ] {
+            assert!(
+                offsets.contains(&reference),
+                "C++ {description} at byte {reference} must remain in the reference frontier: {offsets:?}"
             );
         }
     }

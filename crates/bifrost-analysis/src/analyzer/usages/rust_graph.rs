@@ -11,14 +11,15 @@ use crate::analyzer::usages::rust_graph::extractor::{
     effective_scan_files, scan_files_for_member_target, scan_files_for_target,
 };
 use crate::analyzer::usages::rust_graph::resolver::{
-    RustGraphSeedKind, canonical_usage_target, infer_graph_seeds, is_graph_visible_member_target,
-    is_member_target, local_impl_target_importer_files, trait_member_for_impl_member,
-    unresolved_external_frontier_specifiers,
+    RustGraphSeedKind, canonical_usage_target, infer_graph_seeds, infer_graph_seeds_while,
+    is_graph_visible_member_target, is_member_target, local_impl_target_importer_files,
+    trait_member_for_impl_member, unresolved_external_frontier_specifiers,
 };
 use crate::analyzer::usages::traits::{
     UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver, UsageScanScope,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, RustAnalyzer, resolve_analyzer};
+use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
@@ -66,6 +67,7 @@ where
 pub(in crate::analyzer::usages) fn rust_usage_candidate_files(
     analyzer: &dyn IAnalyzer,
     target: &CodeUnit,
+    cancellation: &CancellationToken,
 ) -> HashSet<ProjectFile> {
     let _scope = crate::profiling::scope("RustQueryResolver::candidate_files");
     let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
@@ -73,14 +75,15 @@ pub(in crate::analyzer::usages) fn rust_usage_candidate_files(
     };
     let roots = {
         let _scope = crate::profiling::scope("RustQueryResolver::candidate_seeds");
-        infer_graph_seeds(rust, target).roots
+        let Some(seeds) = infer_graph_seeds_while(rust, target, &|| !cancellation.is_cancelled())
+        else {
+            return HashSet::default();
+        };
+        seeds.roots
     };
-    let seeds = {
-        let _scope = crate::profiling::scope("RustQueryResolver::binding_seeds");
-        rust.usage_binding_seeds(&roots)
-    };
-    let _scope = crate::profiling::scope("RustQueryResolver::usage_importers");
-    rust.usage_importers(&seeds)
+    let _scope = crate::profiling::scope("RustQueryResolver::usage_candidates");
+    rust.usage_candidate_files_while(&roots, &|| !cancellation.is_cancelled())
+        .unwrap_or_default()
 }
 
 pub(crate) struct RustQueryResolver<'a> {
@@ -323,5 +326,47 @@ impl UsageAnalyzer for RustExportUsageGraphStrategy {
         let scan_scope = UsageScanScope::new(candidate_files, false);
         self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
             .into_fuzzy_result()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{Language, TestProject};
+
+    #[test]
+    fn cancelled_cold_candidate_discovery_does_not_publish_partial_index() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "Cargo.toml")
+            .write("[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+            .expect("write Cargo.toml");
+        let source = ProjectFile::new(root.clone(), "src/lib.rs");
+        source
+            .write("pub mod worker;\npub fn root() {}\n")
+            .expect("write lib.rs");
+        ProjectFile::new(root.clone(), "src/worker.rs")
+            .write("use crate::root;\npub fn run() { root(); }\n")
+            .expect("write worker.rs");
+        let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+        let target = analyzer
+            .declarations(&source)
+            .into_iter()
+            .find(|unit| unit.identifier() == "root")
+            .expect("root declaration");
+
+        let cancellation = CancellationToken::cancel_after_checks_for_test(12);
+        assert!(
+            rust_usage_candidate_files(&analyzer, &target, &cancellation).is_empty(),
+            "cancelled cold discovery must not return partial candidates"
+        );
+        assert!(cancellation.is_cancelled());
+        assert!(!analyzer.cargo_routes_ready_for_test());
+        assert!(!analyzer.usage_index_ready_for_test());
+
+        let candidates = rust_usage_candidate_files(&analyzer, &target, &CancellationToken::new());
+        assert!(candidates.contains(&source));
+        assert!(analyzer.cargo_routes_ready_for_test());
+        assert!(analyzer.usage_index_ready_for_test());
     }
 }

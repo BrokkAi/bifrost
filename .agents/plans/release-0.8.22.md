@@ -17,10 +17,10 @@ This work publishes Bifrost 0.8.22 from a fixed release-candidate branch. The re
 - [x] (2026-08-05 08:44Z) Passed the full pre-push gate: 8,422 featureless tests, doctests, and all-feature workspace clippy.
 - [x] (2026-08-05 09:17Z) Passed all comprehensive `nlp,python` executable tests and matching-toolchain doctests.
 - [x] (2026-08-05 09:18Z) Ran the final code-smell pack. It completed reliably with the unchanged 295 baseline findings and no findings in changed files.
-- [ ] Commit and push the validated release candidate.
-- [ ] Synchronize the version change to `master` as required by the release process.
-- [ ] Tag the validated RC commit as `v0.8.22` and push the tag.
-- [ ] Observe the Release workflow and report publication status.
+- [x] (2026-08-05 08:37Z) Committed and pushed validated RC commit `ea361cfb2a08781d5163a16fe798d754b008e9da`.
+- [x] (2026-08-05 08:38Z) Applied the release patch to current `master` as `0d08a7262d5b65f2f120ca551a68532069bb9a71` and pushed it.
+- [x] (2026-08-05 08:38Z) Tagged the validated RC commit as `v0.8.22` and pushed the tag.
+- [x] (2026-08-05 09:27Z) Observed Release run `30989872467`. Builds and most publication targets passed. Two crates.io targets failed due missing trusted-publisher access.
 
 ## Surprises & Discoveries
 
@@ -50,6 +50,9 @@ This work publishes Bifrost 0.8.22 from a fixed release-candidate branch. The re
 
 - Observation: The documented comprehensive command also selected Homebrew `rustdoc` after all executable suites passed.
   Evidence: Its final doctest phase reported E0514 for rustup-built dependencies. The doctest passed when `RUSTDOC` named the active rustup sysroot tool.
+
+- Observation: crates.io rejected trusted-publishing tokens for `brokk-bifrost-nlp` and `brokk-bifrost-policy`.
+  Evidence: Both publish jobs returned HTTP 403: `The provided access token is not valid for crate`.
 
 ## Decision Log
 
@@ -87,7 +90,7 @@ This work publishes Bifrost 0.8.22 from a fixed release-candidate branch. The re
 
 ## Outcomes & Retrospective
 
-The release is in progress. This section will record the final tag, workflow run, publication results, and any recovery work.
+The immutable `v0.8.22` tag and GitHub Release exist at RC commit `ea361cfb2`. The workflow published PyPI artifacts, editor targets, agent assets, and some crates. It published `brokk-bifrost-core`, `brokk-bifrost-analysis`, and `brokk-bifrost-semantic-packs`. It could not publish `brokk-bifrost-nlp` or `brokk-bifrost-policy` because those crates do not authorize this repository's trusted publisher. Dependent Rust crates did not run. Add trusted publishers for both crates with repository `BrokkAi/bifrost`, workflow `release.yml`, and environment `release`. Then use Re-run failed jobs on run `30989872467`.
 
 ## Context and Orientation
 

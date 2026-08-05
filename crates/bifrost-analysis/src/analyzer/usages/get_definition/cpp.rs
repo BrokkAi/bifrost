@@ -3,7 +3,8 @@ use crate::analyzer::LanguageAdapter;
 use crate::analyzer::cpp::CppAdapter;
 use crate::analyzer::cpp::{
     CppOccurrenceRole, cpp_callable_definitions_share_identity_evidence,
-    cpp_header_body_files_are_related, cpp_indexed_callable_linkage, cpp_occurrence_role_for_range,
+    cpp_header_body_files_are_related, cpp_indexed_callable_linkage, cpp_is_range_for_binding_name,
+    cpp_occurrence_role_for_range,
 };
 use crate::analyzer::declaration_range::code_unit_declaration_name_range_for_range;
 use crate::analyzer::resolve_include_targets_with_index;
@@ -3662,6 +3663,9 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 cpp_callable_name_node(function).is_none_or(|name| {
                     let trailing = cpp_node_text(name, ctx.source);
                     !construction.definitions.is_empty()
+                        && construction.definitions.iter().all(|unit| {
+                            unit.is_class() || cpp_unit_is_type_alias(ctx.analyzer, unit)
+                        })
                         && construction
                             .definitions
                             .iter()
@@ -4353,7 +4357,9 @@ fn cpp_is_non_reference_declaration_name(node: Node<'_>) -> bool {
     if cpp_is_out_of_line_destructor_type_name(node) {
         return false;
     }
-    cpp_is_declaration_name(node) || cpp_is_terminal_declarator_name(node)
+    cpp_is_declaration_name(node)
+        || cpp_is_terminal_declarator_name(node)
+        || cpp_is_range_for_binding_name(node)
 }
 
 fn cpp_is_out_of_line_destructor_type_name(node: Node<'_>) -> bool {

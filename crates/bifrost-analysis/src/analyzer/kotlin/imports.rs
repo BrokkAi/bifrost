@@ -68,21 +68,37 @@ pub(crate) fn kotlin_import_info_from_node(node: Node<'_>, source: &str) -> Opti
         return None;
     }
     let identifier = first_named_child(node, "identifier")?;
-    let segments: Vec<String> = named_children(identifier)
+    let segment_nodes: Vec<Node<'_>> = named_children(identifier)
         .into_iter()
         .filter(|child| child.kind() == "simple_identifier")
-        .map(|segment| super::declarations::kotlin_identifier_text(segment, source).to_string())
-        .filter(|segment| !segment.is_empty())
+        .filter(|segment| !super::declarations::kotlin_identifier_text(*segment, source).is_empty())
+        .collect();
+    let segments: Vec<String> = segment_nodes
+        .iter()
+        .map(|segment| super::declarations::kotlin_identifier_text(*segment, source).to_string())
         .collect();
     if segments.is_empty() {
         return None;
     }
 
     let is_wildcard = first_named_child(node, "wildcard_import").is_some();
-    let alias = first_named_child(node, "import_alias")
-        .and_then(|alias| first_named_child(alias, "type_identifier"))
+    let alias_node = first_named_child(node, "import_alias")
+        .and_then(|alias| first_named_child(alias, "type_identifier"));
+    let alias = alias_node
         .map(|name| super::declarations::kotlin_identifier_text(name, source).to_string())
         .filter(|name| !name.is_empty());
+    // The bound name is spelled by the alias token when renamed, and by the
+    // path's last segment token otherwise; a star import binds no single name.
+    let binder_span = (!is_wildcard)
+        .then(|| {
+            alias
+                .is_some()
+                .then_some(alias_node)
+                .flatten()
+                .or_else(|| segment_nodes.last().copied())
+        })
+        .flatten()
+        .map(crate::analyzer::common::node_span);
     // A star import binds no single name, so it has no bound identifier; every
     // other form binds its alias when renamed and its last segment otherwise.
     let identifier = (!is_wildcard)
@@ -109,6 +125,7 @@ pub(crate) fn kotlin_import_info_from_node(node: Node<'_>, source: &str) -> Opti
             lexical_scopes: Vec::new(),
             declaration_start_byte: node.start_byte(),
         }),
+        binder_span,
     })
 }
 
