@@ -13,6 +13,7 @@ use crate::analyzer::usages::cpp_call_match::{
     CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_parameter_type_text,
     cpp_signature_param_types, cpp_type_text_pointer_depth, normalize_cpp_type_name,
 };
+use crate::analyzer::usages::cpp_graph::canonical_cpp_scope_components;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{SignatureMetadata, StructuredTypeName};
 
@@ -5689,6 +5690,41 @@ fn cpp_resolve_owner_type_in_lexical_namespace(
                 })
                 .cloned()
         })
+    })
+    .or_else(|| {
+        // A macro namespace wrapper can hide the namespace that contains an
+        // out-of-line member from the parser-derived lexical scope. Recover
+        // the owner from the indexed callable's direct parent. Match the full
+        // owner path, not only its terminal name, so an unrelated nested type
+        // cannot win (for example `Cord::CharIterator` for `btree<P>::iterator`).
+        let declarator = node.child_by_field_name("declarator")?;
+        let qualified = cpp_declarator_qualified_name_node(declarator)?;
+        let mut function_components = cpp_type_name_components(qualified, source)?;
+        let function_name = function_components.pop()?;
+        let lexical_scope = crate::analyzer::symbol_lookup::parse_symbol_path(
+            Language::Cpp,
+            &cpp_lexical_namespace(node, source).unwrap_or_default(),
+        );
+        let mut owners = support
+            .file_identifier(file, &function_name)
+            .into_iter()
+            .filter(|candidate| candidate.is_function())
+            .filter_map(|candidate| analyzer.parent_of(&candidate))
+            .filter(|candidate| {
+                if !candidate.is_class()
+                    || !visibility.external_type_declaration_visible_at(file, candidate, byte)
+                {
+                    return false;
+                }
+                let candidate_components = canonical_cpp_scope_components(candidate);
+                candidate_components.ends_with(&owner_components)
+                    && (lexical_scope.is_empty()
+                        || candidate_components.starts_with(&lexical_scope))
+            })
+            .collect::<Vec<_>>();
+        sort_units(&mut owners);
+        owners.dedup();
+        cpp_choose_canonical_type(analyzer, owners)
     })?;
     let candidates = support
         .fqn(&resolved.fq_name())

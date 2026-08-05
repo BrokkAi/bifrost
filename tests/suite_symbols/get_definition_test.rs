@@ -20693,6 +20693,85 @@ void Scoped<P>::g() {
 }
 
 #[test]
+fn cpp_macro_namespace_out_of_line_alias_uses_callable_parent_owner() {
+    let source = r#"
+namespace unrelated {
+struct iterator {};
+}
+using namespace unrelated;
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace container_internal {
+template <typename P>
+struct btree {
+    using iterator = int;
+    void take(iterator* value);
+};
+
+template <typename P>
+void btree<P>::take(iterator* value) {
+    (void)value;
+}
+}
+ABSL_NAMESPACE_END
+}
+
+namespace other {
+ABSL_NAMESPACE_BEGIN
+namespace container_internal {
+template <typename P>
+struct btree {
+    using iterator = long;
+    void take(iterator* value);
+};
+
+template <typename P>
+void btree<P>::take(iterator* value) {
+    (void)value;
+}
+}
+ABSL_NAMESPACE_END
+}
+
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+    let reference = source
+        .find("void btree<P>::take(iterator* value)")
+        .expect("out-of-line iterator alias reference")
+        + "void btree<P>::take(".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app.cpp", source, reference),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "absl::container_internal.btree$iterator",
+        "the nested alias must win over an unrelated visible iterator type: {value}"
+    );
+
+    let other_start = source.find("namespace other {").expect("other namespace");
+    let other_reference = other_start
+        + source[other_start..]
+            .find("void btree<P>::take(iterator* value)")
+            .expect("second out-of-line iterator alias reference")
+        + "void btree<P>::take(".len();
+    let other_value = lookup(
+        project.root(),
+        &location_reference("app.cpp", source, other_reference),
+    );
+    let other_result = &other_value["results"][0];
+    assert_eq!(other_result["status"], "resolved", "{other_value}");
+    assert_eq!(
+        other_result["definitions"][0]["fqn"], "other::container_internal.btree$iterator",
+        "owner recovery must not cross to the same-named btree in another namespace: {other_value}"
+    );
+}
+
+#[test]
 fn cpp_recovered_class_alias_scope_does_not_leak_or_shadow_later_types() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

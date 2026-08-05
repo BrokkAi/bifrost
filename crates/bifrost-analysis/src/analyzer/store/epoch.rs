@@ -4,13 +4,17 @@
 //! invalidate previously-persisted analyzer payloads. It folds in:
 //!
 //! - the analyzer store epoch salt
-//! - the analyzer crate version (`CARGO_PKG_VERSION`)
 //! - the language adapter's actual `tree_sitter::Language` fingerprint
 //!   (ABI version + every node kind name + every field name)
 //! - the contents of the language's bundled `.scm` query files
 //!
 //! When any of these change, every row written under the previous epoch is
 //! treated as logically dirty regardless of mtime/size.
+//!
+//! The crate version is deliberately not an input. Analyzer behavior changes
+//! are tracked by the store salt, the per-language salts, the grammar
+//! fingerprint, and the query files. A release that changes none of these
+//! keeps the warm cache valid.
 //!
 //! The grammar fingerprint is taken from the live `Language` rather than a
 //! hard-coded crate version literal: Cargo.toml uses semver ranges, so a
@@ -24,7 +28,6 @@ use std::borrow::Cow;
 use std::sync::OnceLock;
 use tree_sitter::Language as TsLanguage;
 
-const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 // v7: `ImportInfo` gained `binder_span` (#1600), which changes the bincode
 // layout of every persisted import row.
 const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v7-import-binder-span";
@@ -70,8 +73,6 @@ fn epoch_cell<L: LanguageEpoch>(ts_language: &TsLanguage) -> &'static str {
 fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"bifrost-analyzer-epoch-v2\n");
-    hasher.update(ANALYZER_VERSION.as_bytes());
-    hasher.update(b"\n");
     hasher.update(STORE_EPOCH_SALT.as_bytes());
     hasher.update(b"\n");
     hasher.update(L::NAME.as_bytes());
@@ -312,11 +313,13 @@ lang_epoch!(
 // invalidating blobs written before the final recovery boundary.
 // Salt bumped again (#1665): a later macro-export class lifted through a
 // preprocessor container keeps the namespace scope of its preceding sibling.
+// Salt bumped again (#1670): macro-decorated template classes recovered from
+// sentinel envelopes now retain their real class identity and member scope.
 lang_epoch!(
     Cpp,
     "cpp",
     "treesitter/cpp/",
-    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-ownership-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08"
+    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-ownership-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08"
 );
 
 #[cfg(test)]
@@ -340,6 +343,14 @@ pub(super) fn cpp_epoch_before_fragmented_export_sibling_class_parent_scope() ->
     compute_epoch::<Cpp>(
         &tree_sitter_cpp::LANGUAGE.into(),
         "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-ownership-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08",
+    )
+}
+
+#[cfg(test)]
+pub(super) fn cpp_epoch_before_macro_decorated_template_class_scope() -> String {
+    compute_epoch::<Cpp>(
+        &tree_sitter_cpp::LANGUAGE.into(),
+        "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-ownership-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08",
     )
 }
 

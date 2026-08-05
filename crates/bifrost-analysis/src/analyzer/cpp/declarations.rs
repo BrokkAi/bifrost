@@ -1009,6 +1009,72 @@ fn recover_exported_class_function_definition<'tree>(
     class_identifier_before_body(node, source).map(|name| (node, name, None))
 }
 
+/// Recover the class item from a region reparse that still carries the
+/// sentinel's synthetic function envelope.  An unknown class attribute can
+/// make tree-sitter parse `class ATTR Span { ... }` as a function whose type
+/// is `class ATTR` and whose declarator is `Span`.  The parser's class node is
+/// then nested below that function, so direct class-child lookup is not enough.
+struct CppSentinelReparsedClass<'tree> {
+    declaration_node: Node<'tree>,
+    name: String,
+    body: Node<'tree>,
+    raw_supertypes: Option<Vec<String>>,
+}
+
+fn cpp_sentinel_reparsed_class<'tree>(
+    root: Node<'tree>,
+    template_node: Option<Node<'tree>>,
+    source: &str,
+) -> Option<CppSentinelReparsedClass<'tree>> {
+    let container = template_node.unwrap_or(root);
+    let mut cursor = container.walk();
+    for child in container.named_children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) {
+            let name = class_like_name(child, source)?;
+            let body = cpp_body_node(child)?;
+            let raw_supertypes = matches!(child.kind(), "class_specifier" | "struct_specifier")
+                .then(|| extract_cpp_supertypes(child, source));
+            return Some(CppSentinelReparsedClass {
+                declaration_node: child,
+                name,
+                body,
+                raw_supertypes,
+            });
+        }
+        if child.kind() == "declaration"
+            && let Some(class_node) = first_class_like_child(child)
+        {
+            let name = class_like_name(class_node, source)?;
+            let body = cpp_body_node(class_node)?;
+            let raw_supertypes =
+                matches!(class_node.kind(), "class_specifier" | "struct_specifier")
+                    .then(|| extract_cpp_supertypes(class_node, source));
+            return Some(CppSentinelReparsedClass {
+                declaration_node: class_node,
+                name,
+                body,
+                raw_supertypes,
+            });
+        }
+        if child.kind() == "function_definition"
+            && let Some((_, name, raw_supertypes)) =
+                recover_exported_class_function_definition(child, source)
+        {
+            let body = cpp_body_node(child)?;
+            return Some(CppSentinelReparsedClass {
+                declaration_node: child,
+                name,
+                body,
+                raw_supertypes,
+            });
+        }
+    }
+    None
+}
+
 fn recovered_postfix_export_macro_base(
     node: Node<'_>,
     type_node: Node<'_>,
@@ -1260,27 +1326,6 @@ fn first_class_like_child(node: Node<'_>) -> Option<Node<'_>> {
             "class_specifier" | "struct_specifier" | "union_specifier"
         )
     })
-}
-
-/// Find the first body-bearing class-like node anywhere below a malformed
-/// wrapper. The normal visitor only needs direct children, but sentinel ERROR
-/// recovery may wrap the class in dependent/qualified identifiers. An explicit
-/// stack keeps this bounded by the tree size and avoids recursive parser walks.
-fn first_body_bearing_class_like_descendant(node: Node<'_>) -> Option<Node<'_>> {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if matches!(
-            current.kind(),
-            "class_specifier" | "struct_specifier" | "union_specifier"
-        ) && cpp_body_node(current).is_some()
-        {
-            return Some(current);
-        }
-        let mut cursor = current.walk();
-        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
-        stack.extend(children.into_iter().rev());
-    }
-    None
 }
 
 /// Push a container's children as a `Siblings` cursor rather than snapshotting
@@ -2661,15 +2706,13 @@ impl<'a> CppVisitor<'a> {
                     .named_children(&mut cursor)
                     .find(|child| child.kind() == "template_declaration")
             };
-            let Some(class_node) = template_node
-                .and_then(first_class_like_child)
-                .or_else(|| first_class_like_child(class_root))
+            let Some(reparsed_class) =
+                cpp_sentinel_reparsed_class(class_root, template_node, self.source)
             else {
                 return false;
             };
-            let Some(name) = class_like_name(class_node, self.source) else {
-                return false;
-            };
+            let class_node = reparsed_class.declaration_node;
+            let name = reparsed_class.name;
             let mut class_scope = scope.clone();
             if let Some(template_node) = template_node {
                 class_scope.template_signature =
@@ -2682,9 +2725,7 @@ impl<'a> CppVisitor<'a> {
             else {
                 return false;
             };
-            let raw_supertypes =
-                matches!(class_node.kind(), "class_specifier" | "struct_specifier")
-                    .then(|| extract_cpp_supertypes(class_node, self.source));
+            let raw_supertypes = reparsed_class.raw_supertypes;
             let class_range = Range {
                 start_byte: class_start,
                 end_byte: class_close_end,
@@ -6650,15 +6691,12 @@ pub(crate) fn cpp_sentinel_recovered_classes(
                 root.named_children(&mut cursor)
                     .find(|child| child.kind() == "template_declaration")
             };
-            let Some(class_node) = template_node
-                .and_then(first_class_like_child)
-                .or_else(|| first_class_like_child(root))
+            let Some(reparsed_class) = cpp_sentinel_reparsed_class(root, template_node, source)
             else {
                 continue;
             };
-            let Some(name) = class_like_name(class_node, source) else {
-                continue;
-            };
+            let class_node = reparsed_class.declaration_node;
+            let name = reparsed_class.name;
             let namespace_components =
                 cpp_sentinel_recovered_namespace_components(current, &[], source);
             let owner_container = current
@@ -7284,8 +7322,15 @@ fn cpp_sentinel_macro_class_region(
             // the partition boundary. This keeps balancing in tree-sitter and
             // preserves the source's original byte offsets.
             let tree = cpp_reparse_region_items(source, reparse_start, source.len())?;
-            let class_node = first_body_bearing_class_like_descendant(tree.root_node())?;
-            let body = cpp_body_node(class_node)?;
+            let template_node = {
+                let mut cursor = tree.root_node().walk();
+                tree.root_node()
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "template_declaration")
+            };
+            let reparsed_class =
+                cpp_sentinel_reparsed_class(tree.root_node(), template_node, source)?;
+            let body = reparsed_class.body;
             let body_open_start = body.start_byte();
             let class_close_end = body.end_byte();
             let class_close_start = class_close_end.checked_sub(1)?;
@@ -7312,10 +7357,8 @@ fn cpp_sentinel_macro_class_region(
             .named_children(&mut cursor)
             .find(|child| child.kind() == "template_declaration")
     };
-    let class_node = template_node
-        .and_then(first_class_like_child)
-        .or_else(|| first_class_like_child(class_root))?;
-    let body = cpp_body_node(class_node)?;
+    let reparsed_class = cpp_sentinel_reparsed_class(class_root, template_node, source)?;
+    let body = reparsed_class.body;
     let body_start = body.start_byte().checked_add(1)?;
     // The class body opening must agree with the original malformed tree's
     // structured token. This avoids accidentally recovering an inner nested
@@ -8749,6 +8792,65 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
         let file = ProjectFile::new(std::env::temp_dir(), name);
         CppAdapter.parse_file(&file, source, &tree)
+    }
+
+    #[test]
+    fn macro_decorated_template_class_keeps_member_scope_without_forward_declaration() {
+        let source = r#"namespace control {
+template <typename T>
+class AnySpan;
+template <typename T>
+class ABSL_ATTRIBUTE_VIEW AnySpan {
+ public:
+  int begin() const;
+};
+}
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+template <typename T>
+class ABSL_ATTRIBUTE_VIEW Span {
+ public:
+  int begin() const;
+  int back() const;
+};
+
+int begin();
+int back();
+}
+"#;
+        let parsed = parse_cpp_declarations(source, "cpp-sentinel-span.cpp");
+        let declarations = parsed.declarations();
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| unit.is_class() && unit.fq_name() == "absl.Span")
+        );
+        for method in ["begin", "back"] {
+            assert!(declarations.iter().any(|unit| {
+                unit.is_function() && unit.fq_name() == format!("absl.Span.{method}")
+            }));
+            assert!(
+                declarations.iter().any(|unit| {
+                    unit.is_function() && unit.fq_name() == format!("absl.{method}")
+                })
+            );
+        }
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| unit.is_class() && unit.fq_name() == "control.AnySpan")
+        );
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| { unit.is_function() && unit.fq_name() == "control.AnySpan.begin" })
+        );
+        assert!(
+            declarations
+                .iter()
+                .all(|unit| unit.fq_name() != "absl.ABSL_ATTRIBUTE_VIEW")
+        );
     }
 
     #[test]

@@ -2474,14 +2474,19 @@ impl<'a> VisibilityIndex<'a> {
         else {
             return false;
         };
+        // An external header selects its declaration branch before the
+        // reference file is parsed. Require compatible reference guards, but
+        // do not test the header's guard expression for stability in the
+        // reference file. Same-file aliases still require that stability.
         if !candidate_guards.iter().any(|(_, target_guards)| {
             merge_preprocessor_guards(target_guards, &reference_guards).is_some()
-                && self.preprocessor_guards_stable_between(
-                    file,
-                    0,
-                    reference.start_byte(),
-                    target_guards,
-                )
+                && (candidate.source() != file
+                    || self.preprocessor_guards_stable_between(
+                        file,
+                        0,
+                        reference.start_byte(),
+                        target_guards,
+                    ))
         }) {
             return false;
         }
@@ -4021,29 +4026,57 @@ impl<'a> VisibilityIndex<'a> {
         raw_name: &str,
         arity: usize,
         lexical_namespace: Option<&str>,
+        direct_type: Option<&CodeUnit>,
     ) -> Option<CppScanBinding> {
         let normalized = normalize_reference_name(raw_name)?;
         let mut candidates = Vec::new();
         for function in
             self.named_candidates_for_normalized(file, &normalized, TargetKind::FreeFunction)
         {
-            if cpp_callable_arity(analyzer, function).accepts(arity) {
+            if cpp_callable_arity(analyzer, function).accepts(arity)
+                && !direct_type.is_some_and(|direct_type| {
+                    self.callable_is_constructor_declaration(analyzer, function)
+                        && type_owner_of(analyzer, function)
+                            .is_some_and(|owner| same_visible_symbol(&owner, direct_type))
+                })
+            {
                 candidates.push(function.clone());
             }
         }
-        if !normalized.contains("::")
-            && let Some(namespace) = lexical_namespace
-        {
-            let scoped: Vec<_> = candidates
-                .iter()
-                .filter(|function| cpp_namespace_for(function).as_deref() == Some(namespace))
-                .cloned()
-                .collect();
-            if !scoped.is_empty() {
-                candidates = scoped;
-            }
-        }
+        candidates = nearest_namespace_candidates(candidates, &normalized, lexical_namespace);
         unanimous_return_binding(analyzer, self, file, &candidates)
+    }
+
+    pub(super) fn resolve_call_return_binding_without_arity(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        raw_name: &str,
+        lexical_namespace: Option<&str>,
+        direct_type: Option<&CodeUnit>,
+    ) -> (bool, Option<CppScanBinding>) {
+        let Some(normalized) = normalize_reference_name(raw_name) else {
+            return (false, None);
+        };
+        let mut candidates = self
+            .named_candidates_for_normalized(file, &normalized, TargetKind::FreeFunction)
+            .into_iter()
+            .filter(|function| {
+                function.is_function()
+                    && !direct_type.is_some_and(|direct_type| {
+                        self.callable_is_constructor_declaration(analyzer, function)
+                            && type_owner_of(analyzer, function)
+                                .is_some_and(|owner| same_visible_symbol(&owner, direct_type))
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates = nearest_namespace_candidates(candidates, &normalized, lexical_namespace);
+        let has_candidates = !candidates.is_empty();
+        (
+            has_candidates,
+            unanimous_return_binding(analyzer, self, file, &candidates),
+        )
     }
 
     pub(in crate::analyzer::usages) fn visible_identifier_candidates<'b>(
@@ -4867,15 +4900,50 @@ pub(super) fn infer_cpp_initializer_binding(
         }
         "call_expression" => node.child_by_field_name("function").and_then(|function| {
             let function_text = node_text(function, source);
+            let direct_type_binding = visibility
+                .resolve_type(file, function_text)
+                .map(|unit| CppScanBinding::from_unit(unit, 0));
+            if function.kind() == "template_function" && direct_type_binding.is_some() {
+                let lexical_namespace = enclosing_namespace_context(node, source);
+                let arity = visibility.call_arity_evidence(file, node, source).exact();
+                if let Some(arity) = arity
+                    && let Some(binding) = visibility.resolve_call_return_binding(
+                        analyzer,
+                        file,
+                        function_text,
+                        arity,
+                        lexical_namespace.as_deref(),
+                        direct_type_binding
+                            .as_ref()
+                            .and_then(|binding| binding.unit.as_ref()),
+                    )
+                {
+                    return Some(binding);
+                }
+                let (has_callable, callable_binding) = visibility
+                    .resolve_call_return_binding_without_arity(
+                        analyzer,
+                        file,
+                        function_text,
+                        lexical_namespace.as_deref(),
+                        direct_type_binding
+                            .as_ref()
+                            .and_then(|binding| binding.unit.as_ref()),
+                    );
+                if let Some(binding) = callable_binding {
+                    return Some(binding);
+                }
+                if has_callable {
+                    return None;
+                }
+                return direct_type_binding;
+            }
             let arity = visibility.call_arity_evidence(file, node, source).exact()?;
+            let direct_type_binding_for_call = direct_type_binding.clone();
             resolve_static_method_call_return_binding(
                 analyzer, visibility, file, source, function, arity,
             )
-            .or_else(|| {
-                visibility
-                    .resolve_type(file, function_text)
-                    .map(|unit| CppScanBinding::from_unit(unit, 0))
-            })
+            .or(direct_type_binding)
             .or_else(|| {
                 visibility.resolve_call_return_binding(
                     analyzer,
@@ -4883,6 +4951,9 @@ pub(super) fn infer_cpp_initializer_binding(
                     function_text,
                     arity,
                     enclosing_namespace_context(node, source).as_deref(),
+                    direct_type_binding_for_call
+                        .as_ref()
+                        .and_then(|binding| binding.unit.as_ref()),
                 )
             })
             .or_else(|| {
@@ -8263,7 +8334,7 @@ fn canonical_cpp_name_matches(unit: &CodeUnit, expected: &str) -> bool {
 /// through `parse_symbol_path` would mistake those dots for component
 /// separators.  Cache-loaded/legacy units may still have an empty structured
 /// name, so retain the parser only as that explicit fallback.
-pub(super) fn canonical_cpp_scope_components(unit: &CodeUnit) -> Vec<String> {
+pub(in crate::analyzer::usages) fn canonical_cpp_scope_components(unit: &CodeUnit) -> Vec<String> {
     let fq = unit.fq();
     if !fq.is_empty() {
         let interner = crate::analyzer::fq_name::segment_interner();
@@ -8537,6 +8608,32 @@ fn namespace_prefixes(namespace: &str) -> Vec<String> {
         parts.pop();
     }
     prefixes
+}
+
+fn nearest_namespace_candidates(
+    candidates: Vec<CodeUnit>,
+    normalized: &str,
+    lexical_namespace: Option<&str>,
+) -> Vec<CodeUnit> {
+    if normalized.contains("::") {
+        return candidates;
+    }
+    if let Some(namespace) = lexical_namespace {
+        for prefix in namespace_prefixes(namespace) {
+            let scoped = candidates
+                .iter()
+                .filter(|function| cpp_namespace_for(function).as_deref() == Some(prefix.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !scoped.is_empty() {
+                return scoped;
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter(|function| cpp_namespace_for(function).is_none_or(|namespace| namespace.is_empty()))
+        .collect()
 }
 
 pub(in crate::analyzer::usages) fn enclosing_namespace_context(

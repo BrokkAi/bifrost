@@ -10093,6 +10093,56 @@ mod tests {
     }
 
     #[test]
+    fn cpp_macro_decorated_template_class_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "span.h",
+            "namespace absl {\n\
+             ABSL_NAMESPACE_BEGIN\n\
+             template <typename T>\n\
+             class ABSL_ATTRIBUTE_VIEW Span {\n\
+             public:\n\
+               int begin() const;\n\
+               int back() const;\n\
+             };\n\
+             int begin();\n\
+             int back();\n\
+             }\n",
+        );
+        let state = Arc::new(parse_state(&CppAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_epoch = epoch::cpp_epoch_before_macro_decorated_template_class_scope();
+        let prior_generation = store
+            .ensure_language_epoch_value("cpp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .unwrap(),
+            vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    #[test]
     fn php_conditional_free_function_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
@@ -10148,8 +10198,9 @@ mod tests {
         // malformed significant-indentation template bodies. That changed
         // Scala FQNs without changing the grammar vocabulary covered by the
         // automatic epoch fingerprint. Do not pin the helper's literal hash:
-        // the fingerprint includes CARGO_PKG_VERSION, so a literal breaks at
-        // every release. The generation inequality below proves the cutover.
+        // the fingerprint includes the live grammar fingerprint and query
+        // contents, so a literal breaks whenever either shifts. The generation
+        // inequality below proves the cutover.
         let prior_epoch = epoch::scala_epoch_before_scalachess_fqn_recovery();
         let prior_generation = store
             .ensure_language_epoch_value("scala", &prior_epoch)
