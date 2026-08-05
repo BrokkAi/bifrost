@@ -260,13 +260,15 @@ impl StructuralSpec for CppStructuralSpec {
     }
 
     fn identity_route_support(&self) -> &IdentityRouteSupport {
-        // C++'s occurrence adapter is shallow, so it claims no path axes; its
-        // declaration layer does keep prototype/body occurrences distinct,
-        // which is exactly the declaration-definition peer relation.
+        // C++'s occurrence adapter is shallow, so it claims no path axes. Its
+        // declaration layer keeps prototype/body occurrences distinct, which
+        // the physical-grouping axis carries; the declaration-definition peer
+        // *relation* stays unclaimed until a producer emits typed peer rows
+        // rather than merged ranges (see the #1475 ExecPlan Decision Log, M6,
+        // and its follow-up issue).
         static SUPPORT: IdentityRouteSupport = IdentityRouteSupport::NONE
             .supported_axis(IdentityAxis::CanonicalIdentity)
             .supported_axis(IdentityAxis::PhysicalGrouping)
-            .supported_relation(RouteHopKind::DeclarationDefinitionPeer)
             .supported_relation(RouteHopKind::NestedOwner);
         &SUPPORT
     }

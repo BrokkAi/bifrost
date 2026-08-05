@@ -231,3 +231,51 @@ fn min_segments_filters_short_chains() {
         "two-segment paths must not pass a min_segments of 3"
     );
 }
+
+/// The same-terminal different-owner decoy family, on the query surface: two
+/// `Map` structs under different modules produce segment rows whose owner
+/// segments resolve to different modules and whose terminals project onto
+/// two distinct declarations — the separation the display string could
+/// never state.
+#[test]
+fn same_terminal_decoys_separate_through_their_segments() {
+    let result = run(
+        &[(
+            "src/lib.rs",
+            concat!(
+                "pub mod a {\n    pub struct Map;\n}\n",
+                "pub mod b {\n    pub struct Map;\n}\n",
+                "pub fn cross(x: a::Map) -> b::Map {\n",
+                "    b::Map\n",
+                "}\n",
+            ),
+        )],
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "paths": {},
+            "steps": [
+                { "op": "segments_of" },
+                { "op": "segment_target" }
+            ],
+            "limit": 50
+        }),
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "diagnostics: {:?}",
+        result.diagnostics
+    );
+    let value = serialized(&result);
+    let map_targets: std::collections::BTreeSet<String> = rows(&value)
+        .iter()
+        .filter_map(|row| row["fq_name"].as_str())
+        .filter(|name| name.ends_with("Map"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        map_targets.len(),
+        2,
+        "the two same-spelled terminals must project onto two declarations: {map_targets:?}"
+    );
+}

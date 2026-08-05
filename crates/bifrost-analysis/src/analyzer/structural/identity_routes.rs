@@ -885,7 +885,32 @@ mod tests {
         result.rows.iter().filter(|row| row.kind == kind).collect()
     }
 
-    /// Two declarations whose terminal spelling coincides but whose owner
+    /// Declaration-side generic arity has no producer for Rust type
+    /// declarations today: `signature_metadata` records type parameters for
+    /// no struct, so a generic and a nongeneric type both project `None` and
+    /// the field never separates them. This pin fails the day a producer
+    /// arrives, which is when the generic/nongeneric decoy family can move
+    /// from the use-site surface (segment rows carry spelled arity, #1475
+    /// M2) to the declaration surface. Tracked in the #1475 follow-ups.
+    #[test]
+    fn declaration_generic_arity_has_no_rust_producer_yet() {
+        let fixture = Fixture::new(
+            Language::Rust,
+            &[(
+                "src/lib.rs",
+                "pub struct Plain;\npub struct Generic<T> {\n    pub value: T,\n}\n",
+            )],
+        );
+        let plain = canonical_identity_of(fixture.analyzer(), &fixture.declaration("Plain"));
+        let generic = canonical_identity_of(fixture.analyzer(), &fixture.declaration("Generic"));
+        assert_eq!(plain.generic_arity, None);
+        assert_eq!(generic.generic_arity, None);
+        // The identities still separate, by name segments; arity is the
+        // field that would separate same-named siblings.
+        assert_ne!(plain, generic);
+    }
+
+    /// Two declarations whose terminal spelling coincides    /// Two declarations whose terminal spelling coincides but whose owner
     /// segments differ are different canonical identities; equality reads the
     /// structure, never the rendering.
     #[test]

@@ -2266,17 +2266,31 @@ fn evaluate_route_assert<'rows>(
         allowed.retain(|kind| *kind != forbidden);
     }
     let allowed = Some(allowed);
-    let start = RouteEndpoint::Site {
+    // Relation rows anchor at import/export sites; every other token's route
+    // starts at what it resolves to. A site with no outgoing rows is not
+    // evidence of no route, so both starts are walked: the site's own rows
+    // where they exist, and the resolved declarations' otherwise.
+    let mut starts = vec![RouteEndpoint::Site {
         file,
         range: subject_row.range,
         name: subject_row.effective_spelling().to_owned(),
-    };
+    }];
+    if let Some(subject_units) = row_declarations(subject_row) {
+        for unit in subject_units {
+            starts.push(RouteEndpoint::Declaration(unit));
+        }
+    }
     let token = context.cancellation.cloned().unwrap_or_default();
-    let Ok(routes) = identity_routes_from(context.analyzer, &start, allowed.as_deref(), &token)
-    else {
-        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
-        return None;
-    };
+    let mut routes = Vec::new();
+    for start in &starts {
+        let Ok(mut from_start) =
+            identity_routes_from(context.analyzer, start, allowed.as_deref(), &token)
+        else {
+            late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+            return None;
+        };
+        routes.append(&mut from_start);
+    }
 
     let matched = routes.iter().any(|route| {
         route
