@@ -1,6 +1,4 @@
-use super::extractor::{ScanState, prepare_file, scan_prepared_file};
-use super::inverted;
-use super::resolver::TargetSpec;
+use super::{build_csharp_edges, csharp_graph_source};
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
@@ -10,6 +8,8 @@ use crate::analyzer::{
     CSharpAnalyzer, CodeUnit, IAnalyzer, Language, ProjectFile, resolve_analyzer,
 };
 use crate::hash::HashSet;
+use brokk_bifrost_csharp::graph::extractor::{ScanState, prepare_file, scan_prepared_file};
+use brokk_bifrost_csharp::graph::resolver::TargetSpec;
 use std::collections::BTreeSet;
 
 pub(crate) struct CSharpQueryResolver<'a> {
@@ -33,9 +33,10 @@ impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
+        let graph = csharp_graph_source(analyzer);
         let mut specs = Vec::with_capacity(overloads.len());
         for overload in overloads {
-            let Some(spec) = TargetSpec::from_target(analyzer, overload) else {
+            let Some(spec) = TargetSpec::from_target(&graph, overload) else {
                 return GraphUsageOutcome::fallback_safe(
                     overload.fq_name(),
                     GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
@@ -74,7 +75,7 @@ impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
                 continue;
             };
             for spec in &specs {
-                scan_prepared_file(self.csharp, analyzer, &file, &prepared, spec, &mut state);
+                scan_prepared_file(self.csharp, &graph, &file, &prepared, spec, &mut state);
                 if *state.limit_exceeded {
                     break;
                 }
@@ -124,7 +125,7 @@ impl<'a> CSharpEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_csharp_edges(analyzer, self.csharp, &self.files, nodes, keep_file)
+        build_csharp_edges(analyzer, self.csharp, &self.files, nodes, keep_file)
     }
 
     pub(crate) fn build_edge_weights<F>(
@@ -136,6 +137,6 @@ impl<'a> CSharpEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_csharp_edges(analyzer, self.csharp, &self.files, nodes, keep_file)
+        build_csharp_edges(analyzer, self.csharp, &self.files, nodes, keep_file)
     }
 }

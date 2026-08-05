@@ -1,8 +1,6 @@
-use crate::analyzer::csharp::{graph_support, hierarchy};
-use crate::analyzer::usages::csharp_graph::hits::{
-    push_hit, push_self_receiver_hit, push_unproven_hit,
-};
-use crate::analyzer::usages::csharp_graph::resolver::{
+use crate::graph::CSharpGraphSource;
+use crate::graph::hits::{push_hit, push_self_receiver_hit, push_unproven_hit};
+use crate::graph::resolver::{
     TargetKind, TargetSpec, UnqualifiedMethodGroupResolution,
     applicable_member_candidates_for_owner, argument_count, binding_scope_node,
     class_unit_for_fq_name, enclosing_declared_type, extension_visibility_site_key,
@@ -15,30 +13,35 @@ use crate::analyzer::usages::csharp_graph::resolver::{
     unqualified_member_has_structured_shadow, unqualified_member_resolves_to_owner,
     usage_unqualified_value_member_shadows_type, usage_visible_extension_method_candidates,
 };
-use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
-use crate::analyzer::usages::local_inference::SymbolResolution;
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::{
-    CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_attribute_terminal_name,
-    csharp_attribute_type_names, csharp_conditional_member_access,
+use crate::graph_support::{self, CSharpAnalysisSource};
+use crate::hierarchy;
+use crate::syntax::{
+    csharp_attribute_terminal_name, csharp_attribute_type_names, csharp_conditional_member_access,
     csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver, csharp_member_name,
     csharp_nameof_type_candidates, csharp_type_leftmost_identifier, csharp_type_reference_root,
     csharp_type_terminal_identifier, csharp_unqualified_invocation_for_name,
 };
-use crate::hash::HashMap;
-use crate::text_utils::compute_line_starts;
+use brokk_bifrost_core::analyzer::common::is_unparseable_source;
+use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
+use brokk_bifrost_core::analyzer::usages::local_inference::SymbolResolution;
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
+};
+use brokk_bifrost_core::analyzer::usages::model::UsageHit;
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::HashMap;
+use brokk_bifrost_core::text_utils::compute_line_starts;
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser, Tree};
 
-pub(super) struct ScanState<'a> {
-    pub(super) max_usages: usize,
-    pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) limit_exceeded: &'a mut bool,
+pub struct ScanState<'a> {
+    pub max_usages: usize,
+    pub hits: &'a mut BTreeSet<UsageHit>,
+    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
+    pub limit_exceeded: &'a mut bool,
 }
 
-pub(super) struct PreparedCSharpFile {
+pub struct PreparedCSharpFile {
     source: String,
     tree: Tree,
     line_starts: Vec<usize>,
@@ -46,8 +49,8 @@ pub(super) struct PreparedCSharpFile {
     using_aliases: HashMap<String, String>,
 }
 
-pub(super) fn prepare_file(
-    csharp: &CSharpAnalyzer,
+pub fn prepare_file(
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
 ) -> Option<PreparedCSharpFile> {
     let Ok(source) = file.read_to_string() else {
@@ -56,7 +59,7 @@ pub(super) fn prepare_file(
     if source.is_empty() {
         return None;
     }
-    if crate::analyzer::common::is_unparseable_source(&source) {
+    if is_unparseable_source(&source) {
         return None;
     }
 
@@ -80,9 +83,9 @@ pub(super) fn prepare_file(
     })
 }
 
-pub(super) fn scan_prepared_file(
-    csharp: &CSharpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn scan_prepared_file(
+    csharp: &dyn CSharpAnalysisSource,
+    graph: &CSharpGraphSource<'_>,
     file: &ProjectFile,
     prepared: &PreparedCSharpFile,
     spec: &TargetSpec,
@@ -94,7 +97,7 @@ pub(super) fn scan_prepared_file(
 
     let mut ctx = ScanCtx {
         csharp,
-        analyzer,
+        graph,
         file,
         source: &prepared.source,
         line_starts: &prepared.line_starts,
@@ -113,8 +116,8 @@ pub(super) fn scan_prepared_file(
 }
 
 pub(super) struct ScanCtx<'a> {
-    pub(super) csharp: &'a CSharpAnalyzer,
-    pub(super) analyzer: &'a dyn IAnalyzer,
+    pub(super) csharp: &'a dyn CSharpAnalysisSource,
+    pub(super) graph: &'a CSharpGraphSource<'a>,
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
@@ -231,12 +234,7 @@ fn scan_structured_type_candidate(
         if member_name_is_locally_bound(&left_name, &bindings)
             || unqualified_member_has_structured_shadow(leftmost, ctx.source)
             || usage_unqualified_value_member_shadows_type(
-                leftmost,
-                &left_name,
-                ctx.analyzer,
-                ctx.csharp,
-                ctx.file,
-                ctx.source,
+                leftmost, &left_name, ctx.graph, ctx.csharp, ctx.file, ctx.source,
             )
         {
             return false;
@@ -300,9 +298,9 @@ fn csharp_receiver_member_selects_visible_target(
     let Some(resolved_owner) = class_unit_for_fq_name(ctx.csharp, resolved_fqn) else {
         return false;
     };
-    nearest_member_candidates_for_owner(ctx.analyzer, ctx.csharp, &resolved_owner, member, None)
+    nearest_member_candidates_for_owner(ctx.graph, ctx.csharp, &resolved_owner, member, None)
         .is_empty()
-        && !nearest_member_candidates_for_owner(ctx.analyzer, ctx.csharp, &visible, member, None)
+        && !nearest_member_candidates_for_owner(ctx.graph, ctx.csharp, &visible, member, None)
             .is_empty()
 }
 
@@ -444,7 +442,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if ctx.spec.kind == TargetKind::Method && ctx.spec.is_extension_method() {
         match receiver_targets_owner(
             receiver_node,
-            ctx.analyzer,
+            ctx.graph,
             ctx.csharp,
             ctx.file,
             ctx.source,
@@ -480,7 +478,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     match receiver_targets_owner(
         receiver_node,
-        ctx.analyzer,
+        ctx.graph,
         ctx.csharp,
         ctx.file,
         ctx.source,
@@ -558,7 +556,7 @@ fn extension_call_resolution(
     let ordinary_member_is_applicable = receiver_type_names.iter().any(|receiver_fqn| {
         class_unit_for_fq_name(ctx.csharp, receiver_fqn).is_some_and(|owner| {
             applicable_member_candidates_for_owner(
-                ctx.analyzer,
+                ctx.graph,
                 ctx.csharp,
                 &owner,
                 &ctx.spec.member_name,
@@ -576,7 +574,7 @@ fn extension_call_resolution(
     }
     let candidates = usage_visible_extension_method_candidates(
         ctx.csharp,
-        ctx.analyzer,
+        ctx.graph,
         ctx.source,
         name,
         receiver_type_names,
@@ -647,7 +645,7 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 return;
             };
             match resolve_unqualified_method_group_for_owner(
-                ctx.analyzer,
+                ctx.graph,
                 ctx.csharp,
                 &owner,
                 node_text(node, ctx.source),
@@ -707,7 +705,7 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 node,
                 &ctx.spec.member_name,
                 &ctx.spec.owner,
-                ctx.analyzer,
+                ctx.graph,
                 ctx.csharp,
                 ctx.file,
                 ctx.source,
@@ -843,7 +841,7 @@ fn receiver_fqn_target_member_resolution(
             call_arity.map_or_else(
                 || {
                     nearest_member_candidates_for_owner(
-                        ctx.analyzer,
+                        ctx.graph,
                         ctx.csharp,
                         &receiver_owner,
                         &ctx.spec.member_name,
@@ -852,7 +850,7 @@ fn receiver_fqn_target_member_resolution(
                 },
                 |arity| {
                     applicable_member_candidates_for_owner(
-                        ctx.analyzer,
+                        ctx.graph,
                         ctx.csharp,
                         &receiver_owner,
                         &ctx.spec.member_name,
@@ -946,7 +944,7 @@ fn is_nameof_argument(node: Node<'_>, source: &str) -> bool {
     false
 }
 
-pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
+pub fn is_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -973,12 +971,12 @@ pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
     false
 }
 
-pub(in crate::analyzer::usages) fn member_access_receiver(node: Node<'_>) -> Option<Node<'_>> {
+pub fn member_access_receiver(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("expression")
         .or_else(|| node.named_child(0))
 }
 
-pub(in crate::analyzer::usages) fn member_access_name(node: Node<'_>) -> Option<Node<'_>> {
+pub fn member_access_name(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("name").or_else(|| {
         let mut cursor = node.walk();
         let mut last = None;

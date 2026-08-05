@@ -30,15 +30,10 @@ pub(crate) use brokk_bifrost_csharp::{graph_support, hierarchy};
 // (the re-export hub in `analyzer/mod.rs`, the definition and type routes, the
 // usage graph, and this crate's own C# modules).
 pub(crate) use brokk_bifrost_csharp::syntax::{
-    CSharpMemberName, csharp_attribute_name_node, csharp_attribute_terminal_name,
-    csharp_attribute_type_names, csharp_callable_arity, csharp_conditional_member_access,
-    csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver, csharp_member_name,
-    csharp_method_generic_arity, csharp_nameof_type_candidates, csharp_normalize_full_name,
-    csharp_signature_arity, csharp_signature_return_type, csharp_source_identifier,
-    csharp_type_leftmost_identifier, csharp_type_node_identity, csharp_type_reference_root,
-    csharp_type_terminal_identifier, csharp_unqualified_invocation_for_name,
-    csharp_using_directive_is_global, csharp_using_directive_is_static,
-    csharp_using_directive_namespace, csharp_using_directive_target,
+    csharp_attribute_name_node, csharp_attribute_type_names, csharp_callable_arity,
+    csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
+    csharp_normalize_full_name, csharp_signature_arity, csharp_source_identifier,
+    csharp_type_node_identity,
 };
 pub use brokk_bifrost_csharp::syntax::{csharp_source_name_segment, strip_csharp_generic_arity};
 
@@ -468,6 +463,48 @@ impl CSharpAnalysisSource for CSharpAnalyzer {
         )
     }
 
+    fn declaration_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
+        CSharpAnalyzer::declaration_candidates_by_identifier(self, identifier)
+    }
+
+    fn declaration_candidates_by_identifier_limited(
+        &self,
+        identifier: &str,
+        limit: usize,
+        continue_query: &mut dyn FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        CSharpAnalyzer::declaration_candidates_by_identifier_limited(
+            self,
+            identifier,
+            limit,
+            continue_query,
+        )
+    }
+
+    fn member_candidates_for_owner(&self, owner_fqn: &str, name: &str) -> BTreeSet<CodeUnit> {
+        CSharpAnalyzer::member_candidates_for_owner(self, owner_fqn, name)
+    }
+
+    fn member_candidates_for_owner_limited(
+        &self,
+        owner_fqn: &str,
+        name: &str,
+        limit: usize,
+        continue_query: &mut dyn FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        CSharpAnalyzer::member_candidates_for_owner_limited(
+            self,
+            owner_fqn,
+            name,
+            limit,
+            continue_query,
+        )
+    }
+
+    fn workspace_namespace_exists(&self, namespace: &str) -> bool {
+        CSharpAnalyzer::workspace_namespace_exists(self, namespace)
+    }
+
     fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
         self.inner.forward_definition_fqn(fqn)
     }
@@ -513,6 +550,22 @@ impl CSharpAnalysisSource for CSharpAnalyzer {
         self.inner.raw_supertypes_of(code_unit)
     }
 
+    fn raw_supertypes_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<String> {
+        CSharpAnalyzer::raw_supertypes_limited(self, code_unit, limit)
+    }
+
+    fn signature_metadata_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<SignatureMetadata> {
+        CSharpAnalyzer::signature_metadata_limited(self, code_unit, limit)
+    }
+
     fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>> {
         self.inner.type_identifiers_of(file)
     }
@@ -521,12 +574,54 @@ impl CSharpAnalysisSource for CSharpAnalyzer {
         CSharpAnalyzer::namespace_of_file(self, file)
     }
 
+    fn namespace_of_file_limited(
+        &self,
+        file: &ProjectFile,
+        limit: usize,
+    ) -> LimitedQueryRows<String> {
+        CSharpAnalyzer::namespace_of_file_limited(self, file, limit)
+    }
+
     fn using_namespaces_of(&self, file: &ProjectFile) -> Vec<String> {
         CSharpAnalyzer::using_namespaces_of(self, file)
     }
 
+    fn using_namespaces_of_limited(
+        &self,
+        file: &ProjectFile,
+        limit: usize,
+        continue_query: &mut dyn FnMut() -> bool,
+    ) -> LimitedQueryRows<String> {
+        CSharpAnalyzer::using_namespaces_of_limited(self, file, limit, continue_query)
+    }
+
     fn using_aliases_of(&self, file: &ProjectFile) -> HashMap<String, String> {
         CSharpAnalyzer::using_aliases_of(self, file)
+    }
+
+    fn using_aliases_of_limited(
+        &self,
+        file: &ProjectFile,
+        limit: usize,
+        continue_query: &mut dyn FnMut() -> bool,
+    ) -> LimitedQueryRows<(String, String)> {
+        CSharpAnalyzer::using_aliases_of_limited(self, file, limit, continue_query)
+    }
+
+    fn global_static_using_type_names_limited(
+        &self,
+        limit: usize,
+        continue_query: &mut dyn FnMut() -> bool,
+    ) -> LimitedQueryRows<String> {
+        CSharpAnalyzer::global_static_using_type_names_limited(self, limit, continue_query)
+    }
+
+    fn global_static_using_types(&self) -> &[CodeUnit] {
+        CSharpAnalyzer::global_static_using_types(self)
+    }
+
+    fn usage_global_static_using_types(&self) -> &[CodeUnit] {
+        CSharpAnalyzer::usage_global_static_using_types(self)
     }
 
     fn global_using_namespaces(&self) -> &HashSet<String> {

@@ -1,9 +1,10 @@
-use crate::analyzer::usages::common::{
+use crate::graph::extractor::ScanCtx;
+use brokk_bifrost_core::analyzer::CodeUnit;
+use brokk_bifrost_core::analyzer::model::Range;
+use brokk_bifrost_core::analyzer::usages::common::{
     SNIPPET_CONTEXT_LINES, external_usage_hit_count, reclassify_self_receiver_hit_at, usage_hit,
 };
-use crate::analyzer::usages::csharp_graph::extractor::ScanCtx;
-use crate::analyzer::{CodeUnit, Range};
-use crate::text_utils::{find_line_index_for_offset, snippet_around_line};
+use brokk_bifrost_core::text_utils::{find_line_index_for_offset, snippet_around_line};
 use tree_sitter::Node;
 
 pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -79,7 +80,7 @@ fn enclosing_code_unit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Option<CodeUnit
         start_line: find_line_index_for_offset(ctx.line_starts, node.start_byte()),
         end_line: find_line_index_for_offset(ctx.line_starts, node.end_byte()),
     };
-    let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
+    let enclosing = ctx.graph.index.enclosing_code_unit(ctx.file, &range);
     ctx.enclosing_cache.insert(key, enclosing.clone());
     enclosing
 }

@@ -1,3 +1,4 @@
+use brokk_bifrost_core::analyzer::common::IdentifierSigil;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
 use brokk_bifrost_core::analyzer::model::{
@@ -14,6 +15,26 @@ use crate::imports::csharp_import_info_from_using_directive;
 use crate::syntax::{
     csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver,
     csharp_type_node_identity, csharp_type_reference_root,
+};
+
+/// Whether `kind` is tree-sitter-c-sharp's identifier leaf kind. C# spells its
+/// verbatim-identifier escape as a leading `@` (`@class`), carried verbatim in
+/// the `identifier` token text; no other node kind carries an `@` that denotes
+/// an identifier (verbatim strings are `verbatim_string_literal`, interpolated
+/// strings and attributes are their own kinds), so gating here keeps the sigil
+/// strip off those spans.
+fn csharp_identifier_like_node_kind(kind: &str) -> bool {
+    kind == "identifier"
+}
+
+/// tree-sitter-c-sharp verbatim-identifier normalization (`@class` -> `class`),
+/// gated to the identifier leaf kind. This is the same normalization the
+/// declaration side already applies when building short/fq names, shared here so
+/// the reference/get-definition side agrees (previously it did not — issue-1128
+/// class inconsistency).
+pub const CSHARP_IDENTIFIER_SIGIL: IdentifierSigil = IdentifierSigil {
+    is_identifier_kind: csharp_identifier_like_node_kind,
+    prefix: "@",
 };
 
 /// Intern one qualified-name segment in the process-global interner.

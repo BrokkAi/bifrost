@@ -17,11 +17,12 @@
 //! re-deriving the namespace. Receivers needing return-type inference (method
 //! chains) are an unhandled recall gap, not a wrong edge.
 
-use super::extractor::{
+use crate::graph::CSharpGraphSource;
+use crate::graph::extractor::{
     is_declaration_name, is_unqualified_method_group_value, member_access_name,
     member_access_receiver,
 };
-use super::resolver::{
+use crate::graph::resolver::{
     UnqualifiedMethodGroupResolution, argument_count, class_unit_for_fq_name,
     extension_visibility_site_key, first_type_child, invocation_member_candidates_for_owner,
     is_member_variable_declaration, is_type_reference_node, nearest_member_candidates_for_owner,
@@ -32,58 +33,56 @@ use super::resolver::{
     usage_method_return_type_fq_name_for_arity, usage_unqualified_value_member_shadows_type,
     usage_visible_extension_method_candidates,
 };
-use crate::analyzer::csharp::hierarchy;
-use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
-    classify_reference_node, first_precise, parse_and_collect,
-};
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::{
-    CSharpAnalyzer, CSharpMemberName, CodeUnit, IAnalyzer, ProjectFile,
-    csharp_attribute_type_names, csharp_conditional_member_access,
+use crate::graph_support::CSharpAnalysisSource;
+use crate::hierarchy;
+use crate::syntax::{
+    CSharpMemberName, csharp_attribute_type_names, csharp_conditional_member_access,
     csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver, csharp_member_name,
     csharp_nameof_type_candidates, csharp_type_leftmost_identifier, csharp_type_reference_root,
     csharp_unqualified_invocation_for_name,
 };
-use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node, first_precise,
+};
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
+};
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::HashMap;
 use tree_sitter::Node;
 
-pub(super) fn build_csharp_edges<Output, F>(
-    analyzer: &dyn IAnalyzer,
-    csharp: &CSharpAnalyzer,
-    files: &[ProjectFile],
-    nodes: &HashSet<String>,
-    keep_file: F,
-) -> Output
-where
-    Output: UsageEdgeBuildOutput<String>,
-    F: Fn(&ProjectFile) -> bool + Sync,
-{
-    let language = tree_sitter_c_sharp::LANGUAGE.into();
-    build_edge_output(files, keep_file, |file| {
-        parse_and_collect(analyzer, file, nodes, &language, |input| {
-            let mut ctx = CsScan {
-                analyzer,
-                csharp,
-                file,
-                source: input.source,
-                class_ranges: ClassRangeIndex::build(analyzer, file),
-                method_group_cache: HashMap::default(),
-                member_cache: HashMap::default(),
-                extension_cache: HashMap::default(),
-                input,
-                edges: PerFileEdges::default(),
-            };
-            let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            walk(input.root(), &mut ctx, &mut bindings);
-            ctx.edges
-        })
-    })
+/// One file's `caller -> callee` edges, for the whole-workspace inverted pass.
+///
+/// The pass's fan-out -- `build_edge_output` plus `parse_and_collect`, the
+/// shared cross-language driver -- stays in `brokk-bifrost-analysis` and calls
+/// this per file, so the C# half is a pure function of a parsed file and the
+/// two sources.
+pub fn scan_file(
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpAnalysisSource,
+    file: &ProjectFile,
+    input: &FileEdgeScanInput<'_>,
+) -> PerFileEdges {
+    let mut ctx = CsScan {
+        graph,
+        csharp,
+        file,
+        source: input.source,
+        class_ranges: ClassRangeIndex::build(graph.index, file),
+        method_group_cache: HashMap::default(),
+        member_cache: HashMap::default(),
+        extension_cache: HashMap::default(),
+        input,
+        edges: PerFileEdges::default(),
+    };
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    walk(input.root(), &mut ctx, &mut bindings);
+    ctx.edges
 }
 
 struct CsScan<'a> {
-    analyzer: &'a dyn IAnalyzer,
-    csharp: &'a CSharpAnalyzer,
+    graph: &'a CSharpGraphSource<'a>,
+    csharp: &'a dyn CSharpAnalysisSource,
     file: &'a ProjectFile,
     source: &'a str,
     class_ranges: ClassRangeIndex,
@@ -156,7 +155,7 @@ impl CsScan<'_> {
                     call_arity.map_or_else(
                         || {
                             nearest_member_candidates_for_owner(
-                                self.analyzer,
+                                self.graph,
                                 self.csharp,
                                 &owner,
                                 name,
@@ -165,7 +164,7 @@ impl CsScan<'_> {
                         },
                         |arity| {
                             invocation_member_candidates_for_owner(
-                                self.analyzer,
+                                self.graph,
                                 self.csharp,
                                 &owner,
                                 name,
@@ -216,7 +215,7 @@ impl CsScan<'_> {
                     let receiver_types = [owner_fqn.to_string()];
                     let mut extensions = usage_visible_extension_method_candidates(
                         self.csharp,
-                        self.analyzer,
+                        self.graph,
                         self.source,
                         node,
                         &receiver_types,
@@ -391,10 +390,7 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
                             return;
                         };
                         let resolution = resolve_unqualified_method_group_for_owner(
-                            ctx.analyzer,
-                            ctx.csharp,
-                            &owner,
-                            &name,
+                            ctx.graph, ctx.csharp, &owner, &name,
                         );
                         ctx.method_group_cache.insert(key, resolution.clone());
                         resolution
@@ -506,12 +502,7 @@ fn unqualified_value_shadows_type(
     !bindings.resolve_symbol(name).is_unknown()
         || unqualified_member_has_structured_shadow(node, ctx.source)
         || usage_unqualified_value_member_shadows_type(
-            node,
-            name,
-            ctx.analyzer,
-            ctx.csharp,
-            ctx.file,
-            ctx.source,
+            node, name, ctx.graph, ctx.csharp, ctx.file, ctx.source,
         )
 }
 
@@ -574,7 +565,7 @@ fn receiver_type_fqn(
         "base" => ctx
             .enclosing_class(receiver.start_byte())
             .and_then(|owner| class_unit_for_fq_name(ctx.csharp, owner))
-            .and_then(|owner| usage_direct_base(ctx.analyzer, ctx.csharp, &owner))
+            .and_then(|owner| usage_direct_base(ctx.graph, ctx.csharp, &owner))
             .map(|owner| owner.fq_name()),
         "invocation_expression" => invocation_return_type_fqn(receiver, ctx, bindings),
         "parenthesized_expression" | "checked_expression" => receiver

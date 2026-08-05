@@ -1,53 +1,24 @@
 pub(crate) use brokk_bifrost_core::analyzer::common::{
-    IdentifierSigil, node_ident_text, node_source_text, node_source_text_trimmed, node_span,
+    max_line_length_limit, node_ident_text, node_source_text, node_source_text_trimmed, node_span,
     parse_source_region,
 };
-pub use brokk_bifrost_core::analyzer::common::{language_for_file, language_for_target};
-// Rust's identifier sigil and `r#` strip moved with the language: the sigil to
-// `brokk-bifrost-rust`, the segment-level strip to core's `symbol_path` (where
-// the client-selector normalizer that needs it lives). C#'s sigil stays below
-// until C# is extracted.
+// The line cap's only remaining in-crate readers are the three suites that
+// build an over-long line to prove the parse guard fires; production reads it
+// through `is_unparseable_source`.
+#[cfg(test)]
+pub(crate) use brokk_bifrost_core::analyzer::common::DEFAULT_MAX_LINE_LENGTH;
+pub use brokk_bifrost_core::analyzer::common::{
+    is_unparseable_source, language_for_file, language_for_target,
+};
+// Each language's identifier sigil moved with the language: Rust's to
+// `brokk-bifrost-rust`, C#'s to `brokk-bifrost-csharp` (its one consumer,
+// `graph::resolver::node_text`, moved with it). The segment-level `r#` strip
+// went to core's `symbol_path`, where the client-selector normalizer that needs
+// it lives.
 pub(crate) use brokk_bifrost_rust::declarations::RUST_IDENTIFIER_SIGIL;
 
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 use std::path::Path;
-
-/// Default longest single line a source file may contain before tree-sitter parsing is
-/// skipped. Minified/generated single-line bundles (committed webpack output, mermaid.min.js,
-/// etc.) have 16KB+ lines and otherwise both livelock the parser and explode downstream
-/// consumers (e.g. the semantic indexer extracting thousands of bogus chunks). Hand-written
-/// and normally-formatted generated source stays far below this, so the cap is effectively
-/// invisible to real code. 16000 is comfortably above any human-authored line while still
-/// catching moderately-sized minified bundles that a higher cap would let through.
-pub(crate) const DEFAULT_MAX_LINE_LENGTH: usize = 16_000;
-
-/// Longest single line a source file may contain before tree-sitter parsing is skipped.
-/// Defaults to [`DEFAULT_MAX_LINE_LENGTH`]; `BIFROST_MAX_LINE_LENGTH` overrides it, and an
-/// explicit `0` disables the limit entirely (parse everything, at your own risk).
-pub(crate) fn max_line_length_limit() -> Option<usize> {
-    match std::env::var("BIFROST_MAX_LINE_LENGTH") {
-        Ok(v) => match v.trim().parse::<usize>() {
-            Ok(0) => None,
-            Ok(n) => Some(n),
-            Err(_) => Some(DEFAULT_MAX_LINE_LENGTH),
-        },
-        Err(_) => Some(DEFAULT_MAX_LINE_LENGTH),
-    }
-}
-
-/// Whether `source` must NOT be handed to tree-sitter: it is binary (contains NUL
-/// bytes) or pathological for the parser (a line longer than the configured cap).
-/// Centralizes the "is this safe to parse?" decision for every parse site so no
-/// consumer livelocks on adversarial input.
-pub fn is_unparseable_source(source: &str) -> bool {
-    if source.as_bytes().contains(&0) {
-        return true;
-    }
-    match max_line_length_limit() {
-        Some(limit) => source.lines().any(|line| line.len() > limit),
-        None => false,
-    }
-}
 
 pub(crate) fn rebase_project_file_to_root(file: &ProjectFile, root: &Path) -> Option<ProjectFile> {
     if file.root() == root {
@@ -272,26 +243,6 @@ pub(crate) fn collapse_whitespace(text: &str) -> String {
     }
     out
 }
-
-/// Whether `kind` is tree-sitter-c-sharp's identifier leaf kind. C# spells its
-/// verbatim-identifier escape as a leading `@` (`@class`), carried verbatim in
-/// the `identifier` token text; no other node kind carries an `@` that denotes
-/// an identifier (verbatim strings are `verbatim_string_literal`, interpolated
-/// strings and attributes are their own kinds), so gating here keeps the sigil
-/// strip off those spans.
-fn csharp_identifier_like_node_kind(kind: &str) -> bool {
-    kind == "identifier"
-}
-
-/// tree-sitter-c-sharp verbatim-identifier normalization (`@class` -> `class`),
-/// gated to the identifier leaf kind. This is the same normalization the
-/// declaration side already applies when building short/fq names, shared here so
-/// the reference/get-definition side agrees (previously it did not — issue-1128
-/// class inconsistency).
-pub(crate) const CSHARP_IDENTIFIER_SIGIL: IdentifierSigil = IdentifierSigil {
-    is_identifier_kind: csharp_identifier_like_node_kind,
-    prefix: "@",
-};
 
 pub(crate) fn is_scala_object_like(target: &CodeUnit) -> bool {
     language_for_target(target) == Language::Scala && (target.is_class() || target.is_module()) && {

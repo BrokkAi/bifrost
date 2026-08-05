@@ -17,6 +17,7 @@ pub mod inverted_edges;
 pub mod local_inference;
 pub mod model;
 pub mod outcome;
+pub mod parsed_tree;
 pub mod receiver_analysis;
 pub mod reexport_seeds;
 pub mod reference_site;

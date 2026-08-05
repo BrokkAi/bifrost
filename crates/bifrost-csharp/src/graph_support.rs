@@ -17,9 +17,9 @@
 //! `CSharpAnalyzer` lives in `brokk-bifrost-analysis`; this crate never names it.
 
 use brokk_bifrost_core::analyzer::capabilities::{
-    ImportAnalysisProvider, build_reverse_file_index,
+    ImportAnalysisProvider, TypeHierarchyProvider, build_reverse_file_index,
 };
-use brokk_bifrost_core::analyzer::model::{CodeUnitType, ImportInfo};
+use brokk_bifrost_core::analyzer::model::{CodeUnitType, ImportInfo, SignatureMetadata};
 use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
 use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -38,7 +38,13 @@ use crate::syntax::{
 /// The analyzer is the only implementor and every method forwards to one of its
 /// own accessors or memo cells, so the cells stay where they are and no free
 /// function below can reach past this surface.
-pub trait CSharpAnalysisSource: CodeUnitIndex + ImportAnalysisProvider {
+///
+/// `TypeHierarchyProvider` is a supertrait because the analyzer answers
+/// `Some(self)` to `IAnalyzer::type_hierarchy_provider`, and the resolution
+/// paths that hold only the concrete C# analyzer used it in both roles.
+pub trait CSharpAnalysisSource:
+    CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider
+{
     // --- bounded declaration lookups ---
 
     fn persisted_declaration_candidates_by_fqn(
@@ -54,6 +60,27 @@ pub trait CSharpAnalysisSource: CodeUnitIndex + ImportAnalysisProvider {
         limit: usize,
         continue_query: &mut dyn FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit>;
+
+    fn declaration_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit>;
+
+    fn declaration_candidates_by_identifier_limited(
+        &self,
+        identifier: &str,
+        limit: usize,
+        continue_query: &mut dyn FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit>;
+
+    fn member_candidates_for_owner(&self, owner_fqn: &str, name: &str) -> BTreeSet<CodeUnit>;
+
+    fn member_candidates_for_owner_limited(
+        &self,
+        owner_fqn: &str,
+        name: &str,
+        limit: usize,
+        continue_query: &mut dyn FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit>;
+
+    fn workspace_namespace_exists(&self, namespace: &str) -> bool;
 
     fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit>;
 
@@ -88,15 +115,57 @@ pub trait CSharpAnalysisSource: CodeUnitIndex + ImportAnalysisProvider {
 
     fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String>;
 
+    fn raw_supertypes_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<String>;
+
+    fn signature_metadata_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<SignatureMetadata>;
+
     fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>>;
 
     // --- memoized products the analyzer owns ---
 
     fn namespace_of_file(&self, file: &ProjectFile) -> String;
 
+    fn namespace_of_file_limited(
+        &self,
+        file: &ProjectFile,
+        limit: usize,
+    ) -> LimitedQueryRows<String>;
+
     fn using_namespaces_of(&self, file: &ProjectFile) -> Vec<String>;
 
+    fn using_namespaces_of_limited(
+        &self,
+        file: &ProjectFile,
+        limit: usize,
+        continue_query: &mut dyn FnMut() -> bool,
+    ) -> LimitedQueryRows<String>;
+
     fn using_aliases_of(&self, file: &ProjectFile) -> HashMap<String, String>;
+
+    fn using_aliases_of_limited(
+        &self,
+        file: &ProjectFile,
+        limit: usize,
+        continue_query: &mut dyn FnMut() -> bool,
+    ) -> LimitedQueryRows<(String, String)>;
+
+    fn global_static_using_type_names_limited(
+        &self,
+        limit: usize,
+        continue_query: &mut dyn FnMut() -> bool,
+    ) -> LimitedQueryRows<String>;
+
+    fn global_static_using_types(&self) -> &[CodeUnit];
+
+    fn usage_global_static_using_types(&self) -> &[CodeUnit];
 
     fn global_using_namespaces(&self) -> &HashSet<String>;
 

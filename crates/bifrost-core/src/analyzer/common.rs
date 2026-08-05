@@ -33,6 +33,43 @@ pub fn language_for_file(file: &ProjectFile) -> Language {
         .unwrap_or(Language::None)
 }
 
+/// Default longest single line a source file may contain before tree-sitter parsing is
+/// skipped. Minified/generated single-line bundles (committed webpack output, mermaid.min.js,
+/// etc.) have 16KB+ lines and otherwise both livelock the parser and explode downstream
+/// consumers (e.g. the semantic indexer extracting thousands of bogus chunks). Hand-written
+/// and normally-formatted generated source stays far below this, so the cap is effectively
+/// invisible to real code. 16000 is comfortably above any human-authored line while still
+/// catching moderately-sized minified bundles that a higher cap would let through.
+pub const DEFAULT_MAX_LINE_LENGTH: usize = 16_000;
+
+/// Longest single line a source file may contain before tree-sitter parsing is skipped.
+/// Defaults to [`DEFAULT_MAX_LINE_LENGTH`]; `BIFROST_MAX_LINE_LENGTH` overrides it, and an
+/// explicit `0` disables the limit entirely (parse everything, at your own risk).
+pub fn max_line_length_limit() -> Option<usize> {
+    match std::env::var("BIFROST_MAX_LINE_LENGTH") {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(DEFAULT_MAX_LINE_LENGTH),
+        },
+        Err(_) => Some(DEFAULT_MAX_LINE_LENGTH),
+    }
+}
+
+/// Whether `source` must NOT be handed to tree-sitter: it is binary (contains NUL
+/// bytes) or pathological for the parser (a line longer than the configured cap).
+/// Centralizes the "is this safe to parse?" decision for every parse site so no
+/// consumer livelocks on adversarial input.
+pub fn is_unparseable_source(source: &str) -> bool {
+    if source.as_bytes().contains(&0) {
+        return true;
+    }
+    match max_line_length_limit() {
+        Some(limit) => source.lines().any(|line| line.len() > limit),
+        None => false,
+    }
+}
+
 /// Verbatim source text spanned by `node`, or `""` when the byte range is not a
 /// valid `str` boundary (adversarial or partially-parsed input).
 ///

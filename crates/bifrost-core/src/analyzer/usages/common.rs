@@ -8,7 +8,7 @@
 //! `brokk-bifrost-analysis`, which re-exports these at their original paths.
 
 use crate::analyzer::common::node_source_text_trimmed;
-use crate::analyzer::usages::model::UsageHit;
+use crate::analyzer::usages::model::{UsageHit, UsageHitSurface};
 use crate::analyzer::{CodeUnit, ProjectFile};
 use std::collections::BTreeSet;
 use tree_sitter::Node;
@@ -17,6 +17,15 @@ use tree_sitter::Node;
 pub const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
 /// Lines of context to include before/after a match in [`UsageHit::snippet`].
 pub const SNIPPET_CONTEXT_LINES: usize = 1;
+
+/// Count the proven hits that are visible to agent/search consumers. Binding,
+/// definition, and same-owner sites remain available to editor consumers but
+/// must not consume the external-usage budget.
+pub fn external_usage_hit_count(hits: &BTreeSet<UsageHit>) -> usize {
+    hits.iter()
+        .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
+        .count()
+}
 
 pub fn reclassify_import_hit_at(
     hits: &mut BTreeSet<UsageHit>,

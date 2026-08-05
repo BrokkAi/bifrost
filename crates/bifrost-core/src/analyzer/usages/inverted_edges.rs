@@ -19,12 +19,25 @@
 
 use crate::analyzer::code_unit_index::CodeUnitIndex;
 use crate::analyzer::model::Range;
+use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::{CodeUnit, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::find_line_index_for_offset;
 use std::collections::BTreeMap;
 use std::hash::Hash;
 use tree_sitter::{Node, Tree};
+
+/// The single precise binding for `name`, if the engine resolved it to exactly
+/// one (or a first-of) target. Shared by the per-language receiver typing.
+pub fn first_precise<T: Clone + Eq + Hash>(
+    bindings: &LocalInferenceEngine<T>,
+    name: &str,
+) -> Option<T> {
+    bindings
+        .resolve_symbol_ref(name)
+        .and_then(SymbolResolution::as_precise)
+        .and_then(|targets| targets.iter().next().cloned())
+}
 
 /// Per-file index of class-like declaration spans, for attributing an
 /// unqualified / `this` / `self` reference to its enclosing class. Sources the

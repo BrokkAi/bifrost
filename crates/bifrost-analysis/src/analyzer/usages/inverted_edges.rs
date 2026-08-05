@@ -30,11 +30,10 @@
 pub(crate) use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     CallSite, ClassRangeIndex, FileDeclarations, FileEdgeScanInput, NodeKey, PerFileEdges,
     UsageEdgeWeights, UsageEdges, UsageNodeKey, UsageReferenceCounts, UsageReferenceKind,
-    classify_reference_node,
+    classify_reference_node, first_precise,
 };
 
 use crate::analyzer::tree_sitter_analyzer::FileState;
-use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::usages::parsed_tree::{
     ParsedTreeFile, parse_tree_sitter_file, parse_tree_sitter_source,
 };
@@ -42,7 +41,6 @@ use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
-use std::hash::Hash;
 use tree_sitter::Language as TreeSitterLanguage;
 
 /// [`ClassRangeIndex`] over a persisted file state, for scans that already
@@ -62,18 +60,6 @@ pub(crate) fn class_range_index_from_state(state: &FileState) -> ClassRangeIndex
                     .map(move |range| (unit.clone(), *range))
             }),
     )
-}
-
-/// The single precise binding for `name`, if the engine resolved it to exactly
-/// one (or a first-of) target. Shared by the per-language receiver typing.
-pub(crate) fn first_precise<T: Clone + Eq + Hash>(
-    bindings: &LocalInferenceEngine<T>,
-    name: &str,
-) -> Option<T> {
-    bindings
-        .resolve_symbol_ref(name)
-        .and_then(SymbolResolution::as_precise)
-        .and_then(|targets| targets.iter().next().cloned())
 }
 
 /// A callee with more distinct call sites than this is reported as truncated and

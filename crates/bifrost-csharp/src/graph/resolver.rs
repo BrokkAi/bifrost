@@ -1,7 +1,19 @@
-use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::csharp::{graph_support, hierarchy};
-use crate::analyzer::store::LimitedQueryRows;
-pub(super) use crate::analyzer::usages::common::same_node;
+use crate::declarations::CSHARP_IDENTIFIER_SIGIL;
+use crate::graph::CSharpGraphSource;
+use crate::graph_support::{self, CSharpAnalysisSource};
+use crate::hierarchy;
+use crate::syntax::{
+    CSharpMemberName, csharp_callable_arity, csharp_conditional_member_access, csharp_member_name,
+    csharp_method_generic_arity, csharp_normalize_full_name, csharp_signature_return_type,
+    csharp_source_identifier, csharp_type_node_identity, csharp_type_reference_root,
+    csharp_using_directive_is_global, csharp_using_directive_is_static,
+    csharp_using_directive_namespace, csharp_using_directive_target,
+};
+use brokk_bifrost_core::analyzer::model::{
+    CallableArity, SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
+};
+use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
+pub(super) use brokk_bifrost_core::analyzer::usages::common::same_node;
 
 /// Trimmed C# node text with the verbatim-identifier `@` sigil normalized off
 /// identifier tokens (`@class` -> `class`). Declaration short/fq names already
@@ -10,31 +22,22 @@ pub(super) use crate::analyzer::usages::common::same_node;
 /// did not — the same normalization-agreement class as Rust's `r#`). Gated to
 /// the `identifier` kind so `@"..."` verbatim strings and attribute markers are
 /// untouched.
-pub(in crate::analyzer::usages) fn node_text<'a>(
-    node: tree_sitter::Node<'_>,
-    source: &'a str,
-) -> &'a str {
-    crate::analyzer::common::node_ident_text(
+pub fn node_text<'a>(node: tree_sitter::Node<'_>, source: &'a str) -> &'a str {
+    brokk_bifrost_core::analyzer::common::node_ident_text(
         node,
         source,
         true,
-        &crate::analyzer::common::CSHARP_IDENTIFIER_SIGIL,
+        &CSHARP_IDENTIFIER_SIGIL,
     )
 }
-use crate::analyzer::usages::get_definition::ResolutionSession;
-use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
-use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
-use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
-use crate::analyzer::{
-    CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, Language, ProjectFile,
-    StructuredTypeIdentity, StructuredTypeName, csharp_callable_arity,
-    csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
-    csharp_normalize_full_name, csharp_signature_return_type, csharp_source_identifier,
-    csharp_type_node_identity, csharp_type_reference_root, csharp_using_directive_is_global,
-    csharp_using_directive_is_static, csharp_using_directive_namespace,
-    csharp_using_directive_target, resolve_analyzer,
+use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceEngine, SymbolResolution,
 };
-use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::usages::parsed_tree::parse_tree_sitter_file;
+use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
 fn resolution_scope_step(session: Option<&ResolutionSession>) -> bool {
@@ -83,15 +86,15 @@ fn resolution_summary_rows<T>(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum TargetKind {
+pub enum TargetKind {
     Type,
     Constructor,
     Method,
     Field,
 }
 
-pub(super) struct TargetSpec {
-    pub(super) target: CodeUnit,
+pub struct TargetSpec {
+    pub target: CodeUnit,
     pub(super) kind: TargetKind,
     pub(super) owner: CodeUnit,
     pub(super) member_name: String,
@@ -101,7 +104,7 @@ pub(super) struct TargetSpec {
 }
 
 impl TargetSpec {
-    pub(super) fn from_target(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> Option<Self> {
+    pub fn from_target(graph: &CSharpGraphSource<'_>, target: &CodeUnit) -> Option<Self> {
         if target.is_class() {
             return Some(Self {
                 target: target.clone(),
@@ -114,7 +117,7 @@ impl TargetSpec {
             });
         }
 
-        let owner = analyzer.parent_of(target)?;
+        let owner = graph.index.parent_of(target)?;
         let kind = if target.is_field() {
             TargetKind::Field
         } else if target.identifier() == csharp_source_identifier(&owner) {
@@ -129,11 +132,10 @@ impl TargetSpec {
             owner,
             member_name: target.identifier().to_string(),
             callable_arity: (kind == TargetKind::Method || kind == TargetKind::Constructor)
-                .then(|| csharp_callable_arity(analyzer, target)),
+                .then(|| csharp_callable_arity(graph.index, target)),
             generic_arity: (kind == TargetKind::Method)
                 .then(|| csharp_method_generic_arity(target.signature())),
-            is_extension_method: kind == TargetKind::Method
-                && is_extension_method(analyzer, target),
+            is_extension_method: kind == TargetKind::Method && is_extension_method(graph, target),
         })
     }
 
@@ -146,10 +148,10 @@ impl TargetSpec {
     }
 }
 
-pub(in crate::analyzer::usages) fn seed_visible_bindings_at(
+pub fn seed_visible_bindings_at(
     scope: Node<'_>,
     target: Node<'_>,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -157,10 +159,10 @@ pub(in crate::analyzer::usages) fn seed_visible_bindings_at(
     seed_visible_bindings_inner(scope, target, csharp, file, source, bindings, true);
 }
 
-pub(in crate::analyzer::usages) fn seed_bindings_before(
+pub fn seed_bindings_before(
     node: Node<'_>,
     cutoff_start: usize,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -168,10 +170,10 @@ pub(in crate::analyzer::usages) fn seed_bindings_before(
     seed_bindings_before_inner(node, cutoff_start, csharp, file, source, bindings, false);
 }
 
-pub(in crate::analyzer::usages) fn seed_bindings_before_in_session(
+pub fn seed_bindings_before_in_session(
     node: Node<'_>,
     cutoff_start: usize,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -217,7 +219,7 @@ pub(in crate::analyzer::usages) fn seed_bindings_before_in_session(
 fn seed_bindings_before_inner(
     node: Node<'_>,
     cutoff_start: usize,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -263,7 +265,7 @@ const SCOPE_NODES: &[&str] = &[
 fn seed_visible_bindings_inner(
     node: Node<'_>,
     target: Node<'_>,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -307,7 +309,7 @@ fn node_covers(container: Node<'_>, target: Node<'_>) -> bool {
 
 fn seed_parameter(
     node: Node<'_>,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -324,7 +326,7 @@ fn seed_parameter(
 
 fn seed_parameter_in_session(
     node: Node<'_>,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -343,7 +345,7 @@ fn seed_parameter_in_session(
 
 fn seed_variable_declaration(
     node: Node<'_>,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -390,7 +392,7 @@ fn seed_variable_declaration(
 
 fn seed_variable_declaration_in_session(
     node: Node<'_>,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -449,7 +451,7 @@ pub(super) fn is_member_variable_declaration(node: Node<'_>) -> bool {
 
 fn var_initializer_member_type(
     declarator: Node<'_>,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
@@ -485,7 +487,7 @@ fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
 
 fn expression_type_fq_name(
     expression: Node<'_>,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
@@ -495,7 +497,7 @@ fn expression_type_fq_name(
 
 fn expression_type_fq_name_inner(
     expression: Node<'_>,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
@@ -559,7 +561,7 @@ fn expression_type_fq_name_inner(
 
 fn invocation_expression_return_type_fq_name(
     invocation: Node<'_>,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
@@ -629,7 +631,7 @@ fn invocation_expression_return_type_fq_name(
 
 fn receiver_type_units(
     receiver: Node<'_>,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
@@ -659,9 +661,7 @@ fn receiver_type_units(
 }
 
 fn first_precise_binding(bindings: &LocalInferenceEngine<String>, name: &str) -> Option<String> {
-    let crate::analyzer::usages::local_inference::SymbolResolution::Precise(targets) =
-        bindings.resolve_symbol(name)
-    else {
+    let SymbolResolution::Precise(targets) = bindings.resolve_symbol(name) else {
         return None;
     };
     (targets.len() == 1)
@@ -691,7 +691,7 @@ fn member_access_name(node: Node<'_>) -> Option<Node<'_>> {
 
 pub(super) fn enclosing_declared_type(
     node: Node<'_>,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     _source: &str,
 ) -> Option<CodeUnit> {
@@ -701,20 +701,23 @@ pub(super) fn enclosing_declared_type(
     class_unit_for_fq_name(csharp, fqn)
 }
 
-pub(super) fn class_unit_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Option<CodeUnit> {
+pub(super) fn class_unit_for_fq_name(
+    csharp: &dyn CSharpAnalysisSource,
+    fqn: &str,
+) -> Option<CodeUnit> {
     let mut candidates = usage_type_declarations_for_fq_name(csharp, fqn);
     graph_support::sort_dedup_type_candidates(&mut candidates);
     (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
-pub(in crate::analyzer::usages) fn usage_direct_base(
-    analyzer: &dyn IAnalyzer,
-    csharp: &CSharpAnalyzer,
+pub fn usage_direct_base(
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpAnalysisSource,
     owner: &CodeUnit,
 ) -> Option<CodeUnit> {
     let mut candidates = hierarchy::usage_direct_ancestors(csharp, owner)
         .into_iter()
-        .filter(|candidate| csharp_is_class_base_declaration(analyzer, candidate))
+        .filter(|candidate| csharp_is_class_base_declaration(graph, candidate))
         .collect::<Vec<_>>();
     graph_support::sort_dedup_type_candidates(&mut candidates);
     (graph_support::logical_type_count(&candidates) == 1)
@@ -722,12 +725,12 @@ pub(in crate::analyzer::usages) fn usage_direct_base(
         .flatten()
 }
 
-fn csharp_is_class_base_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+fn csharp_is_class_base_declaration(graph: &CSharpGraphSource<'_>, candidate: &CodeUnit) -> bool {
     let language = tree_sitter_c_sharp::LANGUAGE.into();
     let Some(parsed) = parse_tree_sitter_file(candidate.source(), &language) else {
         return false;
     };
-    analyzer.ranges(candidate).into_iter().any(|range| {
+    graph.index.ranges(candidate).into_iter().any(|range| {
         parsed
             .tree
             .root_node()
@@ -736,19 +739,28 @@ fn csharp_is_class_base_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUn
     })
 }
 
-fn forward_class_unit_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Option<CodeUnit> {
+fn forward_class_unit_for_fq_name(
+    csharp: &dyn CSharpAnalysisSource,
+    fqn: &str,
+) -> Option<CodeUnit> {
     let mut candidates = forward_type_declarations_for_fq_name(csharp, fqn);
     graph_support::sort_dedup_type_candidates(&mut candidates);
     (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
-fn usage_type_declarations_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Vec<CodeUnit> {
+fn usage_type_declarations_for_fq_name(
+    csharp: &dyn CSharpAnalysisSource,
+    fqn: &str,
+) -> Vec<CodeUnit> {
     let mut candidates = graph_support::usage_type_candidates_by_fqn(csharp, fqn);
     graph_support::sort_dedup_type_candidates(&mut candidates);
     candidates
 }
 
-fn forward_type_declarations_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Vec<CodeUnit> {
+fn forward_type_declarations_for_fq_name(
+    csharp: &dyn CSharpAnalysisSource,
+    fqn: &str,
+) -> Vec<CodeUnit> {
     let mut candidates = graph_support::declaration_candidates_by_fqn(csharp, fqn, false)
         .into_iter()
         .filter(|unit| unit.is_class())
@@ -764,7 +776,7 @@ fn forward_type_declarations_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> 
 }
 
 fn forward_type_declarations_for_fq_name_in_session(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     fqn: &str,
     session: &ResolutionSession,
 ) -> Vec<CodeUnit> {
@@ -797,7 +809,7 @@ fn forward_type_declarations_for_fq_name_in_session(
 }
 
 fn forward_class_unit_for_fq_name_in_session(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     fqn: &str,
     session: &ResolutionSession,
 ) -> Option<CodeUnit> {
@@ -806,30 +818,30 @@ fn forward_class_unit_for_fq_name_in_session(
 }
 
 fn using_aliases_for_file_in_session(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     session: &ResolutionSession,
 ) -> HashMap<String, String> {
     session
         .query_limited_rows(|limit| {
-            csharp.using_aliases_of_limited(file, limit, || session.observe_cancellation())
+            csharp.using_aliases_of_limited(file, limit, &mut || session.observe_cancellation())
         })
         .into_iter()
         .collect()
 }
 
 fn using_namespaces_for_file_in_session(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     session: &ResolutionSession,
 ) -> Vec<String> {
     session.query_limited_rows(|limit| {
-        csharp.using_namespaces_of_limited(file, limit, || session.observe_cancellation())
+        csharp.using_namespaces_of_limited(file, limit, &mut || session.observe_cancellation())
     })
 }
 
 fn visible_type_candidates_in_session(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     name: &str,
     resolve_aliases: bool,
@@ -864,7 +876,7 @@ fn visible_type_candidates_in_session(
 }
 
 fn forward_direct_ancestors_in_session(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     owner: &CodeUnit,
     session: &ResolutionSession,
 ) -> Vec<CodeUnit> {
@@ -922,8 +934,8 @@ fn forward_direct_ancestors_in_session(
     ancestors
 }
 
-pub(in crate::analyzer::usages) fn member_declared_type_fq_name(
-    csharp: &CSharpAnalyzer,
+pub fn member_declared_type_fq_name(
+    csharp: &dyn CSharpAnalysisSource,
     _file: &ProjectFile,
     owner: &CodeUnit,
     member_name: &str,
@@ -931,8 +943,8 @@ pub(in crate::analyzer::usages) fn member_declared_type_fq_name(
     member_declared_type_fq_name_inner(csharp, owner, member_name, false, None)
 }
 
-pub(in crate::analyzer::usages) fn member_declared_type_fq_name_in_session(
-    csharp: &CSharpAnalyzer,
+pub fn member_declared_type_fq_name_in_session(
+    csharp: &dyn CSharpAnalysisSource,
     _file: &ProjectFile,
     owner: &CodeUnit,
     member_name: &str,
@@ -942,7 +954,7 @@ pub(in crate::analyzer::usages) fn member_declared_type_fq_name_in_session(
 }
 
 pub(super) fn usage_member_declared_type_fq_name(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     owner: &CodeUnit,
     member_name: &str,
 ) -> Option<String> {
@@ -950,7 +962,7 @@ pub(super) fn usage_member_declared_type_fq_name(
 }
 
 fn member_declared_type_fq_name_for_scope(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     owner: &CodeUnit,
     member_name: &str,
     usage: bool,
@@ -959,7 +971,7 @@ fn member_declared_type_fq_name_for_scope(
 }
 
 fn member_declared_type_fq_name_inner(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     owner: &CodeUnit,
     member_name: &str,
     usage: bool,
@@ -982,7 +994,7 @@ fn member_declared_type_fq_name_inner(
                     owner.fq_name().as_str(),
                     member_name,
                     limit,
-                    || session.is_none_or(ResolutionSession::observe_cancellation),
+                    &mut || session.is_none_or(ResolutionSession::observe_cancellation),
                 )
             },
             || {
@@ -1040,8 +1052,8 @@ fn member_declared_type_fq_name_inner(
 /// receiver (`GetFoo().Member`) can be typed by the callee. The stored member
 /// `signature()` keeps only the parameter list, so read the return type from the
 /// full signature text (`signatures`), which is `Return Name(params) { … }`.
-pub(in crate::analyzer::usages) fn method_return_type_fq_name_for_arity(
-    csharp: &CSharpAnalyzer,
+pub fn method_return_type_fq_name_for_arity(
+    csharp: &dyn CSharpAnalysisSource,
     _file: &ProjectFile,
     owner: &CodeUnit,
     method_name: &str,
@@ -1062,8 +1074,8 @@ pub(in crate::analyzer::usages) fn method_return_type_fq_name_for_arity(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::analyzer::usages) fn method_return_type_fq_name_for_arity_in_session(
-    csharp: &CSharpAnalyzer,
+pub fn method_return_type_fq_name_for_arity_in_session(
+    csharp: &dyn CSharpAnalysisSource,
     _file: &ProjectFile,
     owner: &CodeUnit,
     method_name: &str,
@@ -1085,7 +1097,7 @@ pub(in crate::analyzer::usages) fn method_return_type_fq_name_for_arity_in_sessi
 }
 
 pub(super) fn usage_method_return_type_fq_name_for_arity(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     owner: &CodeUnit,
     method_name: &str,
     arity: Option<usize>,
@@ -1106,7 +1118,7 @@ pub(super) fn usage_method_return_type_fq_name_for_arity(
 
 #[allow(clippy::too_many_arguments)]
 fn method_return_type_fq_name_for_arity_inner(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     owner: &CodeUnit,
     method_name: &str,
     arity: Option<usize>,
@@ -1116,7 +1128,7 @@ fn method_return_type_fq_name_for_arity_inner(
     session: Option<&ResolutionSession>,
 ) -> Option<String> {
     let candidates = nearest_member_candidates_for_owner_inner(
-        csharp,
+        &CSharpGraphSource::from_source(csharp),
         csharp,
         owner,
         method_name,
@@ -1161,7 +1173,7 @@ fn method_return_type_fq_name_for_arity_inner(
 /// unit's own parent is unavailable. Shared between ordinary member return typing
 /// and extension-method return typing so both derive the return FQN identically.
 fn callable_return_type_fq_name(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     unit: &CodeUnit,
     owner_fallback: &CodeUnit,
     explicit_type_arguments: Option<&[String]>,
@@ -1217,9 +1229,9 @@ fn callable_return_type_fq_name(
 /// and `this`-parameter compatibility gate apply) and the shared return-type
 /// derivation. Returns a type FQN only when the matching extensions agree on one.
 #[allow(clippy::too_many_arguments)]
-pub(in crate::analyzer::usages) fn extension_invocation_return_type_fq_name(
-    csharp: &CSharpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn extension_invocation_return_type_fq_name(
+    csharp: &dyn CSharpAnalysisSource,
+    graph: &CSharpGraphSource<'_>,
     source: &str,
     site: Node<'_>,
     receiver_type_names: &[String],
@@ -1231,7 +1243,7 @@ pub(in crate::analyzer::usages) fn extension_invocation_return_type_fq_name(
 ) -> Option<String> {
     extension_invocation_return_type_fq_name_inner(
         csharp,
-        analyzer,
+        graph,
         source,
         site,
         receiver_type_names,
@@ -1245,9 +1257,9 @@ pub(in crate::analyzer::usages) fn extension_invocation_return_type_fq_name(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::analyzer::usages) fn extension_invocation_return_type_fq_name_in_session(
-    csharp: &CSharpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn extension_invocation_return_type_fq_name_in_session(
+    csharp: &dyn CSharpAnalysisSource,
+    graph: &CSharpGraphSource<'_>,
     source: &str,
     site: Node<'_>,
     receiver_type_names: &[String],
@@ -1260,7 +1272,7 @@ pub(in crate::analyzer::usages) fn extension_invocation_return_type_fq_name_in_s
 ) -> Option<String> {
     extension_invocation_return_type_fq_name_inner(
         csharp,
-        analyzer,
+        graph,
         source,
         site,
         receiver_type_names,
@@ -1275,8 +1287,8 @@ pub(in crate::analyzer::usages) fn extension_invocation_return_type_fq_name_in_s
 
 #[allow(clippy::too_many_arguments)]
 fn extension_invocation_return_type_fq_name_inner(
-    csharp: &CSharpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
+    graph: &CSharpGraphSource<'_>,
     source: &str,
     site: Node<'_>,
     receiver_type_names: &[String],
@@ -1292,7 +1304,7 @@ fn extension_invocation_return_type_fq_name_inner(
     }
     let candidates = visible_extension_method_candidates_inner(
         csharp,
-        analyzer,
+        graph,
         source,
         site,
         receiver_type_names,
@@ -1328,7 +1340,7 @@ fn extension_invocation_return_type_fq_name_inner(
 
 fn resolved_type_arguments(
     name: CSharpMemberName<'_>,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     usage: bool,
@@ -1349,7 +1361,7 @@ fn resolved_type_arguments(
 }
 
 fn substituted_method_type_parameter(
-    metadata: &[crate::analyzer::SignatureMetadata],
+    metadata: &[SignatureMetadata],
     explicit_type_arguments: Option<&[String]>,
 ) -> Option<String> {
     let arguments = explicit_type_arguments?;
@@ -1364,7 +1376,7 @@ fn substituted_method_type_parameter(
 }
 
 fn resolve_member_type_fq_name(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     owner: &CodeUnit,
     type_text: &str,
@@ -1394,10 +1406,10 @@ fn resolve_member_type_fq_name(
 }
 
 fn resolve_structured_method_return_type_fq_name_in_session(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     owner: &CodeUnit,
-    metadata: &crate::analyzer::SignatureMetadata,
+    metadata: &SignatureMetadata,
     explicit_type_arguments: Option<&[String]>,
     session: &ResolutionSession,
 ) -> Option<String> {
@@ -1422,7 +1434,7 @@ fn resolve_structured_method_return_type_fq_name_in_session(
 }
 
 fn resolve_structured_member_type_fq_name_in_session(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     owner: &CodeUnit,
     identity: &StructuredTypeIdentity,
@@ -1437,14 +1449,14 @@ fn resolve_structured_member_type_fq_name_in_session(
 
 fn csharp_structured_name_is_method_type_parameter(
     name: &StructuredTypeName,
-    metadata: &crate::analyzer::SignatureMetadata,
+    metadata: &SignatureMetadata,
 ) -> bool {
     !name.is_absolute()
         && matches!(name.path(), [parameter] if metadata.type_parameters().contains(parameter))
 }
 
 fn csharp_owner_chain_declares_type_parameter_in_session(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     owner: &CodeUnit,
     name: &StructuredTypeName,
     session: &ResolutionSession,
@@ -1480,7 +1492,7 @@ fn csharp_owner_chain_declares_type_parameter_in_session(
 }
 
 fn resolve_structured_type_fq_name_in_session(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     name: &StructuredTypeName,
     session: &ResolutionSession,
@@ -1496,7 +1508,7 @@ fn resolve_structured_type_fq_name_in_session(
 }
 
 fn resolve_non_builtin_structured_type_fq_name_in_session(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     name: &StructuredTypeName,
     session: &ResolutionSession,
@@ -1572,7 +1584,7 @@ fn unique_logical_type_fq_name(
     graph_support::first_logical_type_fqn(candidates)
 }
 
-fn member_declared_type(csharp: &CSharpAnalyzer, member: &CodeUnit) -> Option<String> {
+fn member_declared_type(csharp: &dyn CSharpAnalysisSource, member: &CodeUnit) -> Option<String> {
     let signatures = csharp.signatures(member);
     let signature = member
         .signature()
@@ -1583,7 +1595,7 @@ fn member_declared_type(csharp: &CSharpAnalyzer, member: &CodeUnit) -> Option<St
 /// A method's declared return type, read from the full signature
 /// (`Return Name(params) { … }`); constructors, whose signature starts at the
 /// name, yield `None`.
-fn method_return_type(csharp: &CSharpAnalyzer, method: &CodeUnit) -> Option<String> {
+fn method_return_type(csharp: &dyn CSharpAnalysisSource, method: &CodeUnit) -> Option<String> {
     let signatures = csharp.signatures(method);
     let signature = signatures.first().map(String::as_str)?;
     type_text_before_name(signature, method.identifier())
@@ -1598,7 +1610,7 @@ fn type_text_before_name(signature: &str, name: &str) -> Option<String> {
 fn seed_symbol_for_type(
     name_node: Node<'_>,
     type_node: Node<'_>,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -1627,7 +1639,7 @@ fn seed_symbol_for_type(
 fn seed_symbol_for_type_in_session(
     name_node: Node<'_>,
     type_node: Node<'_>,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -1653,7 +1665,7 @@ fn seed_symbol_for_type_in_session(
     }
 }
 
-pub(in crate::analyzer::usages) fn object_created_type(node: Node<'_>) -> Option<Node<'_>> {
+pub fn object_created_type(node: Node<'_>) -> Option<Node<'_>> {
     if node.kind() == "object_creation_expression" {
         return node
             .child_by_field_name("type")
@@ -1669,7 +1681,7 @@ pub(in crate::analyzer::usages) fn object_created_type(node: Node<'_>) -> Option
 }
 
 pub(super) fn resolves_to_target(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     reference: &str,
     target: &CodeUnit,
@@ -1687,14 +1699,14 @@ pub(super) fn resolves_to_target_at(
     node: Node<'_>,
     source: &str,
     target: &CodeUnit,
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
 ) -> bool {
     resolve_type_fq_name_at(csharp, file, class_ranges, reference, node, source)
         .is_some_and(|resolved| type_identity_matches(&resolved, &target.fq_name()))
 }
 
 pub(super) fn resolve_type_fq_name_at(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     class_ranges: &ClassRangeIndex,
     reference: &str,
@@ -1714,8 +1726,8 @@ pub(super) fn resolve_type_fq_name_at(
         .or_else(|| class_unit_for_fq_name(csharp, &normalized).map(|unit| unit.fq_name()))
 }
 
-pub(in crate::analyzer::usages) fn resolve_type_fq_name(
-    csharp: &CSharpAnalyzer,
+pub fn resolve_type_fq_name(
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     reference: &str,
 ) -> Option<String> {
@@ -1730,7 +1742,7 @@ pub(in crate::analyzer::usages) fn resolve_type_fq_name(
 }
 
 fn resolve_type_fq_name_in_session(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     reference: &str,
     session: &ResolutionSession,
@@ -1748,7 +1760,7 @@ fn resolve_type_fq_name_in_session(
 }
 
 fn resolve_usage_type_fq_name(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     reference: &str,
 ) -> Option<String> {
@@ -1763,7 +1775,7 @@ fn resolve_usage_type_fq_name(
 }
 
 fn resolve_type_fq_name_for_scope(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     reference: &str,
     usage: bool,
@@ -1776,7 +1788,7 @@ fn resolve_type_fq_name_for_scope(
 }
 
 fn expand_alias_qualified_type(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     reference: &str,
 ) -> String {
@@ -1800,7 +1812,7 @@ fn expand_alias_qualified_type(
 }
 
 fn resolve_visible_type_fq_name(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     reference: &str,
 ) -> Option<String> {
@@ -1811,7 +1823,7 @@ fn resolve_visible_type_fq_name(
 }
 
 fn resolve_usage_visible_type_fq_name(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     reference: &str,
 ) -> Option<String> {
@@ -1822,7 +1834,7 @@ fn resolve_usage_visible_type_fq_name(
 }
 
 fn resolve_in_enclosing_type_scopes(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     class_ranges: &ClassRangeIndex,
     name: &str,
     byte: usize,
@@ -1857,11 +1869,11 @@ fn resolve_in_enclosing_type_scopes(
 }
 
 fn resolve_in_enclosing_namespace(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     namespace: &str,
     name: &str,
 ) -> Option<CodeUnit> {
-    crate::analyzer::usages::common::namespace_prefixes(namespace).find_map(|scope| {
+    brokk_bifrost_core::analyzer::usages::common::namespace_prefixes(namespace).find_map(|scope| {
         let candidate_fqn = if scope.is_empty() {
             name.to_string()
         } else {
@@ -1933,9 +1945,7 @@ pub(super) fn type_identity_matches(left: &str, right: &str) -> bool {
         })
 }
 
-pub(in crate::analyzer::usages) fn canonical_builtin_type_identity(
-    reference: &str,
-) -> Option<&'static str> {
+pub fn canonical_builtin_type_identity(reference: &str) -> Option<&'static str> {
     match reference.strip_prefix("global::").unwrap_or(reference) {
         "bool" | "System.Boolean" => Some("System.Boolean"),
         "byte" | "System.Byte" => Some("System.Byte"),
@@ -1958,46 +1968,53 @@ pub(in crate::analyzer::usages) fn canonical_builtin_type_identity(
     }
 }
 
-pub(in crate::analyzer::usages) fn is_extension_method(
-    analyzer: &dyn IAnalyzer,
-    unit: &CodeUnit,
-) -> bool {
+pub fn is_extension_method(graph: &CSharpGraphSource<'_>, unit: &CodeUnit) -> bool {
     unit.is_function()
-        && analyzer.signature_metadata(unit).iter().any(|metadata| {
+        && graph.index.signature_metadata(unit).iter().any(|metadata| {
             metadata.extension_receiver_type_identity().is_some()
                 || metadata.extension_receiver_type().is_some()
         })
 }
 
-pub(in crate::analyzer::usages) fn extension_method_receiver_type(
-    analyzer: &dyn IAnalyzer,
+pub fn extension_method_receiver_type(
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpAnalysisSource,
     unit: &CodeUnit,
 ) -> Option<CSharpExtensionReceiver> {
-    extension_method_receiver_type_inner(analyzer, unit, false, None)
+    extension_method_receiver_type_inner(graph, csharp, unit, false, None)
 }
 
 fn usage_extension_method_receiver_type(
-    analyzer: &dyn IAnalyzer,
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpAnalysisSource,
     unit: &CodeUnit,
 ) -> Option<CSharpExtensionReceiver> {
-    extension_method_receiver_type_inner(analyzer, unit, true, None)
+    extension_method_receiver_type_inner(graph, csharp, unit, true, None)
 }
 
 fn extension_method_receiver_type_in_session(
-    analyzer: &dyn IAnalyzer,
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpAnalysisSource,
     unit: &CodeUnit,
     session: &ResolutionSession,
 ) -> Option<CSharpExtensionReceiver> {
-    extension_method_receiver_type_inner(analyzer, unit, false, Some(session))
+    extension_method_receiver_type_inner(graph, csharp, unit, false, Some(session))
 }
 
-pub(in crate::analyzer::usages) enum CSharpExtensionReceiver {
+pub enum CSharpExtensionReceiver {
     Any,
     Exact(String),
 }
 
+/// The C# source arrives as a parameter rather than from a downcast of the
+/// dispatching analyzer, which is what this body did before the move. Every
+/// caller already holds the same source -- the graph entry points are reached
+/// only after `resolve_analyzer::<CSharpAnalyzer>` succeeded in the shim -- so
+/// the resolved value is identical and the `?` this replaces could not fail on
+/// any of them.
 fn extension_method_receiver_type_inner(
-    analyzer: &dyn IAnalyzer,
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpAnalysisSource,
     unit: &CodeUnit,
     usage: bool,
     session: Option<&ResolutionSession>,
@@ -2005,8 +2022,7 @@ fn extension_method_receiver_type_inner(
     if !unit.is_function() {
         return None;
     }
-    let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
-    let owner = resolution_query(session, || analyzer.parent_of(unit)).flatten()?;
+    let owner = resolution_query(session, || graph.index.parent_of(unit)).flatten()?;
     let metadata = resolution_query_limited_rows(
         session,
         |limit| csharp.signature_metadata_limited(unit, limit),
@@ -2034,7 +2050,7 @@ fn extension_method_receiver_type_inner(
         None => {
             if metadata
                 .iter()
-                .any(crate::analyzer::SignatureMetadata::extension_receiver_is_unconstrained_type_parameter)
+                .any(SignatureMetadata::extension_receiver_is_unconstrained_type_parameter)
             {
                 return Some(CSharpExtensionReceiver::Any);
             }
@@ -2073,9 +2089,9 @@ pub(super) fn extension_visibility_site_key(site: Node<'_>) -> (usize, usize) {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::analyzer::usages) fn visible_extension_method_candidates(
-    csharp: &CSharpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn visible_extension_method_candidates(
+    csharp: &dyn CSharpAnalysisSource,
+    graph: &CSharpGraphSource<'_>,
     _file: &ProjectFile,
     source: &str,
     site: Node<'_>,
@@ -2087,7 +2103,7 @@ pub(in crate::analyzer::usages) fn visible_extension_method_candidates(
 ) -> Vec<CodeUnit> {
     visible_extension_method_candidates_inner(
         csharp,
-        analyzer,
+        graph,
         source,
         site,
         receiver_type_names,
@@ -2101,9 +2117,9 @@ pub(in crate::analyzer::usages) fn visible_extension_method_candidates(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::analyzer::usages) fn visible_extension_method_candidates_in_session(
-    csharp: &CSharpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn visible_extension_method_candidates_in_session(
+    csharp: &dyn CSharpAnalysisSource,
+    graph: &CSharpGraphSource<'_>,
     _file: &ProjectFile,
     source: &str,
     site: Node<'_>,
@@ -2116,7 +2132,7 @@ pub(in crate::analyzer::usages) fn visible_extension_method_candidates_in_sessio
 ) -> Vec<CodeUnit> {
     visible_extension_method_candidates_inner(
         csharp,
-        analyzer,
+        graph,
         source,
         site,
         receiver_type_names,
@@ -2131,8 +2147,8 @@ pub(in crate::analyzer::usages) fn visible_extension_method_candidates_in_sessio
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn usage_visible_extension_method_candidates(
-    csharp: &CSharpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
+    graph: &CSharpGraphSource<'_>,
     source: &str,
     site: Node<'_>,
     receiver_type_names: &[String],
@@ -2143,7 +2159,7 @@ pub(super) fn usage_visible_extension_method_candidates(
 ) -> Vec<CodeUnit> {
     visible_extension_method_candidates_inner(
         csharp,
-        analyzer,
+        graph,
         source,
         site,
         receiver_type_names,
@@ -2158,8 +2174,8 @@ pub(super) fn usage_visible_extension_method_candidates(
 
 #[allow(clippy::too_many_arguments)]
 fn visible_extension_method_candidates_inner(
-    csharp: &CSharpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
+    graph: &CSharpGraphSource<'_>,
     source: &str,
     site: Node<'_>,
     receiver_type_names: &[String],
@@ -2171,7 +2187,7 @@ fn visible_extension_method_candidates_inner(
     session: Option<&ResolutionSession>,
 ) -> Vec<CodeUnit> {
     let compatible_receiver_types =
-        compatible_receiver_type_names(csharp, analyzer, receiver_type_names, usage, session);
+        compatible_receiver_type_names(csharp, graph, receiver_type_names, usage, session);
     if !usage && compatible_receiver_types.is_empty() {
         return Vec::new();
     }
@@ -2185,7 +2201,7 @@ fn visible_extension_method_candidates_inner(
         resolution_query_limited_rows(
             session,
             |limit| {
-                csharp.declaration_candidates_by_identifier_limited(member, limit, || {
+                csharp.declaration_candidates_by_identifier_limited(member, limit, &mut || {
                     session.is_none_or(ResolutionSession::observe_cancellation)
                 })
             },
@@ -2230,9 +2246,12 @@ fn visible_extension_method_candidates_inner(
                 resolution_query_limited_rows(
                     session,
                     |limit| {
-                        csharp.member_candidates_for_owner_limited(owner_fqn, member, limit, || {
-                            session.is_none_or(ResolutionSession::observe_cancellation)
-                        })
+                        csharp.member_candidates_for_owner_limited(
+                            owner_fqn,
+                            member,
+                            limit,
+                            &mut || session.is_none_or(ResolutionSession::observe_cancellation),
+                        )
                     },
                     || {
                         csharp
@@ -2264,11 +2283,11 @@ fn visible_extension_method_candidates_inner(
                 continue;
             }
             let receiver = if usage {
-                usage_extension_method_receiver_type(analyzer, &unit)
+                usage_extension_method_receiver_type(graph, csharp, &unit)
             } else if let Some(session) = session {
-                extension_method_receiver_type_in_session(analyzer, &unit, session)
+                extension_method_receiver_type_in_session(graph, csharp, &unit, session)
             } else {
-                extension_method_receiver_type(analyzer, &unit)
+                extension_method_receiver_type(graph, csharp, &unit)
             };
             if session.is_some_and(|session| !session.observe_cancellation()) {
                 return Vec::new();
@@ -2307,7 +2326,7 @@ fn visible_extension_method_candidates_inner(
             .filter(|candidate| {
                 resolution_scope_step(session)
                     && resolution_query(session, || {
-                        csharp_callable_arity(analyzer, candidate).accepts(declared_arity)
+                        csharp_callable_arity(graph.index, candidate).accepts(declared_arity)
                     })
                     .unwrap_or(false)
             })
@@ -2324,7 +2343,7 @@ fn visible_extension_method_candidates_inner(
 }
 
 fn extension_visibility_scopes(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     source: &str,
     site: Node<'_>,
     usage: bool,
@@ -2428,7 +2447,7 @@ fn extension_visibility_scopes(
         .extend(resolution_query_limited_rows(
             session,
             |limit| {
-                csharp.global_using_namespaces_limited(limit, || {
+                csharp.global_using_namespaces_limited(limit, &mut || {
                     session.is_none_or(ResolutionSession::observe_cancellation)
                 })
             },
@@ -2437,7 +2456,7 @@ fn extension_visibility_scopes(
     let global_static_owner_fqns = resolution_query_limited_rows(
         session,
         |limit| {
-            csharp.global_static_using_type_names_limited(limit, || {
+            csharp.global_static_using_type_names_limited(limit, &mut || {
                 session.is_none_or(ResolutionSession::observe_cancellation)
             })
         },
@@ -2466,7 +2485,7 @@ fn extension_visibility_scopes(
 
 #[allow(clippy::too_many_arguments)]
 fn push_namespace_scopes(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     source: &str,
     scopes: &mut Vec<CSharpExtensionScope>,
     namespace: &str,
@@ -2515,7 +2534,8 @@ fn push_namespace_scopes(
 /// `rsplit_once('.')`'s outward walk exactly (mirrors the cpp namespace-chain
 /// walk in `cpp_qualifier_lookup_tiers`).
 fn csharp_namespace_parent(current: &str) -> Option<String> {
-    let mut parts = crate::analyzer::symbol_lookup::parse_symbol_path(Language::CSharp, current);
+    let mut parts =
+        brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(Language::CSharp, current);
     if parts.len() <= 1 {
         return None;
     }
@@ -2525,7 +2545,7 @@ fn csharp_namespace_parent(current: &str) -> Option<String> {
 
 #[allow(clippy::too_many_arguments)]
 fn collect_scope_using_directives(
-    csharp: &CSharpAnalyzer,
+    csharp: &dyn CSharpAnalysisSource,
     source: &str,
     scope_node: Node<'_>,
     resolution_namespace: &str,
@@ -2609,9 +2629,9 @@ fn namespace_relative_names(namespace: &str, target: &str) -> Vec<String> {
     names
 }
 
-fn compatible_receiver_type_names(
-    csharp: &CSharpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn compatible_receiver_type_names(
+    csharp: &dyn CSharpAnalysisSource,
+    graph: &CSharpGraphSource<'_>,
     receiver_type_names: &[String],
     usage: bool,
     session: Option<&ResolutionSession>,
@@ -2672,7 +2692,7 @@ fn compatible_receiver_type_names(
                     }
                     stack.extend(direct);
                 }
-            } else if let Some(provider) = analyzer.type_hierarchy_provider() {
+            } else if let Some(provider) = graph.hierarchy {
                 let mut stack = provider.get_direct_ancestors(&owner);
                 let mut seen = HashSet::default();
                 while let Some(ancestor) = stack.pop() {
@@ -2710,7 +2730,7 @@ pub(super) fn normalize_type_text(reference: &str) -> String {
         .to_string()
 }
 
-pub(in crate::analyzer::usages) fn reference_type_node(mut node: Node<'_>) -> Node<'_> {
+pub fn reference_type_node(mut node: Node<'_>) -> Node<'_> {
     while let Some(parent) = node.parent() {
         if matches!(
             parent.kind(),
@@ -2724,11 +2744,11 @@ pub(in crate::analyzer::usages) fn reference_type_node(mut node: Node<'_>) -> No
     node
 }
 
-pub(in crate::analyzer::usages) fn reference_type_text(node: Node<'_>, source: &str) -> String {
+pub fn reference_type_text(node: Node<'_>, source: &str) -> String {
     csharp_type_node_identity(reference_type_node(node), source)
 }
 
-pub(in crate::analyzer::usages) fn binding_scope_node(mut node: Node<'_>) -> Node<'_> {
+pub fn binding_scope_node(mut node: Node<'_>) -> Node<'_> {
     while let Some(parent) = node.parent() {
         if matches!(
             parent.kind(),
@@ -2747,19 +2767,19 @@ pub(in crate::analyzer::usages) fn binding_scope_node(mut node: Node<'_>) -> Nod
 
 pub(super) fn receiver_targets_owner(
     receiver_node: Node<'_>,
-    analyzer: &dyn IAnalyzer,
-    csharp: &CSharpAnalyzer,
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
 ) -> SymbolResolution<String> {
-    receiver_type_fq_names(receiver_node, analyzer, csharp, file, source, bindings)
+    receiver_type_fq_names(receiver_node, graph, csharp, file, source, bindings)
 }
 
 fn receiver_type_fq_names(
     receiver_node: Node<'_>,
-    analyzer: &dyn IAnalyzer,
-    csharp: &CSharpAnalyzer,
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
@@ -2773,7 +2793,7 @@ fn receiver_type_fq_names(
                     usage_class_field_receiver_type(
                         receiver_node,
                         receiver,
-                        analyzer,
+                        graph,
                         csharp,
                         file,
                         source,
@@ -2800,7 +2820,7 @@ fn receiver_type_fq_names(
             .unwrap_or(SymbolResolution::Unknown),
         "parenthesized_expression" | "checked_expression" => receiver_node
             .named_child(0)
-            .map(|inner| receiver_type_fq_names(inner, analyzer, csharp, file, source, bindings))
+            .map(|inner| receiver_type_fq_names(inner, graph, csharp, file, source, bindings))
             .unwrap_or(SymbolResolution::Unknown),
         "cast_expression" | "as_expression" => receiver_node
             .child_by_field_name(if receiver_node.kind() == "cast_expression" {
@@ -2817,7 +2837,7 @@ fn receiver_type_fq_names(
             .map(|owner| SymbolResolution::Precise(std::iter::once(owner.fq_name()).collect()))
             .unwrap_or(SymbolResolution::Unknown),
         "base" => enclosing_declared_type(receiver_node, csharp, file, source)
-            .and_then(|owner| usage_direct_base(analyzer, csharp, &owner))
+            .and_then(|owner| usage_direct_base(graph, csharp, &owner))
             .map(|owner| SymbolResolution::Precise(std::iter::once(owner.fq_name()).collect()))
             .unwrap_or(SymbolResolution::Unknown),
         _ => SymbolResolution::Unknown,
@@ -2827,31 +2847,30 @@ fn receiver_type_fq_names(
 pub(super) fn usage_class_field_receiver_type(
     receiver_node: Node<'_>,
     receiver: &str,
-    analyzer: &dyn IAnalyzer,
-    csharp: &CSharpAnalyzer,
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
 ) -> SymbolResolution<String> {
     let Some(enclosing) = enclosing_declared_type(receiver_node, csharp, file, source) else {
         return SymbolResolution::Unknown;
     };
-    let candidates =
-        nearest_member_candidates_for_owner(analyzer, csharp, &enclosing, receiver, None)
-            .into_iter()
-            .filter(|candidate| {
-                !(candidate.is_function()
-                    && analyzer.parent_of(candidate).is_some_and(|owner| {
-                        candidate.identifier() == csharp_source_identifier(&owner)
-                    }))
-            })
-            .collect::<Vec<_>>();
+    let candidates = nearest_member_candidates_for_owner(graph, csharp, &enclosing, receiver, None)
+        .into_iter()
+        .filter(|candidate| {
+            !(candidate.is_function()
+                && graph.index.parent_of(candidate).is_some_and(|owner| {
+                    candidate.identifier() == csharp_source_identifier(&owner)
+                }))
+        })
+        .collect::<Vec<_>>();
     if candidates.is_empty() {
         return SymbolResolution::Unknown;
     }
     let mut resolved_types = candidates
         .iter()
         .filter(|candidate| candidate.is_field())
-        .filter_map(|candidate| analyzer.parent_of(candidate))
+        .filter_map(|candidate| graph.index.parent_of(candidate))
         .filter_map(|owner| usage_member_declared_type_fq_name(csharp, &owner, receiver))
         .collect::<Vec<_>>();
     resolved_types.sort();
@@ -2870,15 +2889,15 @@ pub(super) fn usage_class_field_receiver_type(
 pub(super) fn usage_unqualified_value_member_shadows_type(
     node: Node<'_>,
     name: &str,
-    analyzer: &dyn IAnalyzer,
-    csharp: &CSharpAnalyzer,
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
 ) -> bool {
     let Some(enclosing) = enclosing_declared_type(node, csharp, file, source) else {
         return false;
     };
-    nearest_member_candidates_for_owner(analyzer, csharp, &enclosing, name, None)
+    nearest_member_candidates_for_owner(graph, csharp, &enclosing, name, None)
         .iter()
         .any(CodeUnit::is_field)
 }
@@ -2905,14 +2924,14 @@ pub(super) enum UnqualifiedMethodGroupResolution {
 }
 
 pub(super) fn nearest_member_candidates_for_owner(
-    analyzer: &dyn IAnalyzer,
-    csharp: &CSharpAnalyzer,
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpAnalysisSource,
     owner: &CodeUnit,
     name: &str,
     explicit_generic_arity: Option<usize>,
 ) -> Vec<CodeUnit> {
     nearest_member_candidates_for_owner_inner(
-        analyzer,
+        graph,
         csharp,
         owner,
         name,
@@ -2924,15 +2943,15 @@ pub(super) fn nearest_member_candidates_for_owner(
 }
 
 pub(super) fn applicable_member_candidates_for_owner(
-    analyzer: &dyn IAnalyzer,
-    csharp: &CSharpAnalyzer,
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpAnalysisSource,
     owner: &CodeUnit,
     name: &str,
     explicit_generic_arity: Option<usize>,
     call_arity: usize,
 ) -> Vec<CodeUnit> {
     nearest_member_candidates_for_owner_inner(
-        analyzer,
+        graph,
         csharp,
         owner,
         name,
@@ -2947,15 +2966,15 @@ pub(super) fn applicable_member_candidates_for_owner(
 /// either a method or the delegate value read from a field/property, so only
 /// method candidates are constrained by the outer argument list.
 pub(super) fn invocation_member_candidates_for_owner(
-    analyzer: &dyn IAnalyzer,
-    csharp: &CSharpAnalyzer,
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpAnalysisSource,
     owner: &CodeUnit,
     name: &str,
     explicit_generic_arity: Option<usize>,
     call_arity: usize,
 ) -> Vec<CodeUnit> {
     let mut candidates = applicable_member_candidates_for_owner(
-        analyzer,
+        graph,
         csharp,
         owner,
         name,
@@ -2964,7 +2983,7 @@ pub(super) fn invocation_member_candidates_for_owner(
     );
     if explicit_generic_arity.is_none() {
         candidates.extend(
-            nearest_member_candidates_for_owner(analyzer, csharp, owner, name, None)
+            nearest_member_candidates_for_owner(graph, csharp, owner, name, None)
                 .into_iter()
                 .filter(|candidate| !candidate.is_function()),
         );
@@ -2975,9 +2994,9 @@ pub(super) fn invocation_member_candidates_for_owner(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn nearest_member_candidates_for_owner_inner(
-    analyzer: &dyn IAnalyzer,
-    csharp: &CSharpAnalyzer,
+pub fn nearest_member_candidates_for_owner_inner(
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpAnalysisSource,
     owner: &CodeUnit,
     name: &str,
     explicit_generic_arity: Option<usize>,
@@ -3037,7 +3056,7 @@ fn nearest_member_candidates_for_owner_inner(
                             &current.fq_name(),
                             name,
                             limit,
-                            || session.is_none_or(ResolutionSession::observe_cancellation),
+                            &mut || session.is_none_or(ResolutionSession::observe_cancellation),
                         )
                     },
                     || {
@@ -3055,9 +3074,10 @@ fn nearest_member_candidates_for_owner_inner(
                 if candidate.identifier() != name {
                     continue;
                 }
-                let parent_matches = resolution_query(session, || analyzer.parent_of(&candidate))
-                    .flatten()
-                    .is_some_and(|parent| parent.fq_name() == current.fq_name());
+                let parent_matches =
+                    resolution_query(session, || graph.index.parent_of(&candidate))
+                        .flatten()
+                        .is_some_and(|parent| parent.fq_name() == current.fq_name());
                 if !parent_matches {
                     continue;
                 }
@@ -3070,7 +3090,7 @@ fn nearest_member_candidates_for_owner_inner(
                 let accepts_arity = call_arity.is_none_or(|arity| {
                     candidate.is_function()
                         && resolution_query(session, || {
-                            csharp_callable_arity(analyzer, &candidate).accepts(arity)
+                            csharp_callable_arity(graph.index, &candidate).accepts(arity)
                         })
                         .unwrap_or(false)
                 });
@@ -3086,7 +3106,7 @@ fn nearest_member_candidates_for_owner_inner(
             return members;
         }
         if !usage && session.is_none() && hierarchy.is_none() {
-            hierarchy = analyzer.type_hierarchy_provider();
+            hierarchy = graph.hierarchy;
         }
         let mut next_level = Vec::new();
         if usage {
@@ -3169,12 +3189,12 @@ pub(super) fn unqualified_member_has_structured_shadow(node: Node<'_>, source: &
 }
 
 pub(super) fn resolve_unqualified_method_group_for_owner(
-    analyzer: &dyn IAnalyzer,
-    csharp: &CSharpAnalyzer,
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpAnalysisSource,
     owner: &CodeUnit,
     name: &str,
 ) -> UnqualifiedMethodGroupResolution {
-    let members = nearest_member_candidates_for_owner(analyzer, csharp, owner, name, None);
+    let members = nearest_member_candidates_for_owner(graph, csharp, owner, name, None);
     if members.is_empty() {
         return UnqualifiedMethodGroupResolution::NoMember;
     }
@@ -3182,7 +3202,8 @@ pub(super) fn resolve_unqualified_method_group_for_owner(
         .iter()
         .filter(|candidate| {
             candidate.is_function()
-                && analyzer
+                && graph
+                    .index
                     .parent_of(candidate)
                     .is_some_and(|declaring_owner| {
                         candidate.identifier() != csharp_source_identifier(&declaring_owner)
@@ -3340,8 +3361,8 @@ pub(super) fn unqualified_member_resolves_to_owner(
     node: Node<'_>,
     member_name: &str,
     owner: &CodeUnit,
-    analyzer: &dyn IAnalyzer,
-    csharp: &CSharpAnalyzer,
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpAnalysisSource,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
@@ -3351,20 +3372,21 @@ pub(super) fn unqualified_member_resolves_to_owner(
     }
     enclosing_declared_type(node, csharp, file, source).is_some_and(|enclosing| {
         let candidates =
-            nearest_member_candidates_for_owner(analyzer, csharp, &enclosing, member_name, None);
+            nearest_member_candidates_for_owner(graph, csharp, &enclosing, member_name, None);
         candidates.iter().any(|candidate| {
-            analyzer
+            graph
+                .index
                 .parent_of(candidate)
                 .is_some_and(|declaring_owner| declaring_owner.fq_name() == owner.fq_name())
         })
     })
 }
 
-pub(in crate::analyzer::usages) fn is_type_reference_node(node: Node<'_>) -> bool {
+pub fn is_type_reference_node(node: Node<'_>) -> bool {
     csharp_type_reference_root(node).is_some()
 }
 
-pub(in crate::analyzer::usages) fn argument_count(node: Node<'_>, _source: &str) -> usize {
+pub fn argument_count(node: Node<'_>, _source: &str) -> usize {
     let Some(arguments) = node
         .child_by_field_name("arguments")
         .or_else(|| first_named_child_of_kind(node, "argument_list"))
@@ -3374,9 +3396,7 @@ pub(in crate::analyzer::usages) fn argument_count(node: Node<'_>, _source: &str)
     count_named_children_of_kind(arguments, "argument")
 }
 
-pub(in crate::analyzer::usages) fn object_initializer_for_label(
-    node: Node<'_>,
-) -> Option<Node<'_>> {
+pub fn object_initializer_for_label(node: Node<'_>) -> Option<Node<'_>> {
     let parent = node.parent()?;
     if parent.kind() != "assignment_expression" {
         return None;
@@ -3392,9 +3412,7 @@ pub(in crate::analyzer::usages) fn object_initializer_for_label(
     .then_some(initializer)
 }
 
-pub(in crate::analyzer::usages) fn object_initializer_owner_type_node(
-    initializer: Node<'_>,
-) -> Option<Node<'_>> {
+pub fn object_initializer_owner_type_node(initializer: Node<'_>) -> Option<Node<'_>> {
     let object_creation = initializer.parent()?;
     match object_creation.kind() {
         "object_creation_expression" => object_creation
@@ -3465,7 +3483,7 @@ fn count_named_children_of_kind(node: Node<'_>, kind: &str) -> usize {
         .count()
 }
 
-pub(in crate::analyzer::usages) fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {
+pub fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| is_type_syntax_kind(child.kind()))
@@ -3482,153 +3500,4 @@ fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>>
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| child.kind() == kind)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::analyzer::Language;
-    use crate::analyzer::usages::get_definition::BoundedResolution;
-    use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverBudgetLimit};
-    use crate::cancellation::CancellationToken;
-    use crate::test_support::AnalyzerFixture;
-    use std::fmt::Write;
-
-    fn deep_wide_hierarchy_source(depth: usize, width: usize) -> String {
-        let mut source = String::from("namespace Demo;\n");
-        for index in 0..width {
-            writeln!(source, "public interface IWide{index} {{}}").expect("write interface");
-        }
-        source.push_str("public class Root { public void RootMethod() {} }\n");
-        write!(source, "public class Level0 : Root").expect("write level zero");
-        for index in 0..width {
-            write!(source, ", IWide{index}").expect("write interface base");
-        }
-        source.push_str(" {}\n");
-        for index in 1..=depth {
-            writeln!(
-                source,
-                "public class Level{index} : Level{} {{}}",
-                index - 1
-            )
-            .expect("write hierarchy level");
-        }
-        source
-    }
-
-    fn hierarchy_fixture() -> AnalyzerFixture {
-        let source = deep_wide_hierarchy_source(12, 16);
-        AnalyzerFixture::new_for_language(Language::CSharp, &[("Hierarchy.cs", &source)])
-    }
-
-    fn type_definition(analyzer: &dyn IAnalyzer, fqn: &str) -> CodeUnit {
-        analyzer
-            .get_definitions(fqn)
-            .into_iter()
-            .find(CodeUnit::is_class)
-            .unwrap_or_else(|| panic!("missing type {fqn}"))
-    }
-
-    #[test]
-    fn bounded_receiver_hierarchy_stops_before_materializing_a_wide_walk() {
-        let fixture = hierarchy_fixture();
-        let analyzer = fixture.analyzer.analyzer();
-        let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C# analyzer");
-        let leaf_fqn = "Demo.Level12".to_string();
-
-        let complete_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
-        let compatible = compatible_receiver_type_names(
-            csharp,
-            analyzer,
-            std::slice::from_ref(&leaf_fqn),
-            false,
-            Some(&complete_session),
-        );
-        assert!(compatible.contains("Demo.Root"), "{compatible:#?}");
-        assert!(compatible.contains("Demo.IWide15"), "{compatible:#?}");
-        assert!(matches!(
-            complete_session.finish(()),
-            BoundedResolution::Complete { .. }
-        ));
-
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 48,
-            ..ReceiverAnalysisBudget::default()
-        };
-        let bounded_session = ResolutionSession::bounded(budget, None);
-        let compatible = compatible_receiver_type_names(
-            csharp,
-            analyzer,
-            std::slice::from_ref(&leaf_fqn),
-            false,
-            Some(&bounded_session),
-        );
-        assert!(
-            compatible.is_empty(),
-            "terminal budget exhaustion must discard partial hierarchy evidence"
-        );
-        assert!(matches!(
-            bounded_session.finish(()),
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                work,
-            } if work.scope_nodes == budget.max_scope_nodes
-        ));
-    }
-
-    #[test]
-    fn bounded_member_hierarchy_observes_mid_walk_cancellation() {
-        let fixture = hierarchy_fixture();
-        let analyzer = fixture.analyzer.analyzer();
-        let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer).expect("C# analyzer");
-        let leaf = type_definition(analyzer, "Demo.Level12");
-
-        let exact_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
-        let members = nearest_member_candidates_for_owner_inner(
-            analyzer,
-            csharp,
-            &leaf,
-            "RootMethod",
-            None,
-            Some(0),
-            false,
-            Some(&exact_session),
-        );
-        assert!(
-            matches!(members.as_slice(), [member] if member.fq_name() == "Demo.Root.RootMethod"),
-            "{members:#?}"
-        );
-        assert!(matches!(
-            exact_session.finish(()),
-            BoundedResolution::Complete { .. }
-        ));
-
-        let cancelled_work = (16..512).step_by(8).find_map(|checks| {
-            let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
-            let session =
-                ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&cancellation));
-            let members = nearest_member_candidates_for_owner_inner(
-                analyzer,
-                csharp,
-                &leaf,
-                "RootMethod",
-                None,
-                Some(0),
-                false,
-                Some(&session),
-            );
-            match session.finish(members) {
-                BoundedResolution::Cancelled { work }
-                    if work.scope_nodes > 0 && work.summary_expansions >= 2 =>
-                {
-                    Some(work)
-                }
-                _ => None,
-            }
-        });
-        assert!(
-            cancelled_work.is_some(),
-            "expected deterministic cancellation after at least two hierarchy expansions"
-        );
-    }
 }
