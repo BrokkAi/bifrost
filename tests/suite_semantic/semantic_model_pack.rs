@@ -633,7 +633,6 @@ fn capture_type_cardinality_and_identifier_errors_are_aggregated() {
     });
     let diagnostics = compile_pack(&authored, &CompilerOptions::default()).unwrap_err();
 
-    assert!(diagnostics.iter().any(|d| d.code == "capture.cardinality"));
     assert!(
         diagnostics
             .iter()

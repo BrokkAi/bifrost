@@ -136,10 +136,7 @@ pub(crate) use go::{
     AnalyzerGoDefinitionProvider, GoDefinitionProvider, GoTypeLookupResolutionKind,
     go_type_lookup_resolution, resolve_go_bounded,
 };
-pub(crate) use java::{
-    JavaTypeLookupResolution, java_lombok_accessor_field_candidates,
-    java_lombok_generated_accessor_field_candidates, java_type_lookup_resolution,
-};
+pub(crate) use java::{JavaTypeLookupResolution, java_type_lookup_resolution};
 pub(crate) use kotlin::{
     KotlinDefinitionProvider, KotlinTypeLookupResolution, kotlin_type_lookup_resolution,
     kotlin_type_lookup_resolution_in_session, resolve_kotlin_bounded,

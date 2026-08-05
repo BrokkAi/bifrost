@@ -56,6 +56,10 @@ enum PolicyColorMode {
 }
 
 fn main() -> ExitCode {
+    if let Err(error) = brokk_bifrost::install_bifrost_semantic_model_packs() {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
     match run(env::args().skip(1)) {
         Ok(CliRunResult::Complete) => ExitCode::SUCCESS,
         Ok(CliRunResult::PolicyStatus(status)) => ExitCode::from(status),

@@ -26,10 +26,10 @@ use std::fmt;
 /// SQLite row key so incompatible facts are treated as ordinary cache misses.
 /// Version 2 was claimed twice on divergent branches (loop-kind refinement and
 /// the #1473 per-node occurrence-role rows), so their merge is version 3.
-/// Version 4 adds the #1474 `Block` kind: scope-forming statement lists become
-/// facts, so a version-3 arena is missing nodes rather than merely encoded
-/// differently.
-pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 4;
+/// Version 4 was also claimed twice (the #1474 `Block` kind, which makes
+/// scope-forming statement lists facts, and the #1603 generated behavior
+/// models), so their merge is version 5.
+pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralSnapshotError(String);
@@ -57,6 +57,7 @@ struct SnapshotSpan {
 #[derive(Debug, Serialize, Deserialize)]
 struct SnapshotNode {
     kind: u8,
+    construct: Option<String>,
     span: SnapshotSpan,
     parent: Option<u32>,
     name: Option<SnapshotSpan>,
@@ -258,6 +259,8 @@ fn line_of_byte(line_starts: &[usize], byte: usize) -> usize {
 #[derive(Debug, Clone)]
 pub struct NormalizedNode {
     pub kind: NormalizedKind,
+    /// Grammar-backed source construct used by semantic generator rules.
+    pub construct: Option<String>,
     pub range: Range,
     /// Nearest enclosing normalized node, forming the containment chain used
     /// by `inside` / `not_inside` / `has`.
@@ -336,6 +339,7 @@ impl FileFacts {
             .map(|node| {
                 Ok(SnapshotNode {
                     kind: kind_code(node.kind),
+                    construct: node.construct.clone(),
                     span: encode_span(node.span())?,
                     parent: node.parent,
                     name: node.name.map(encode_span).transpose()?,
@@ -446,6 +450,7 @@ impl FileFacts {
             }
             nodes.push(NormalizedNode {
                 kind: decode_kind(node.kind)?,
+                construct: node.construct,
                 range: Range {
                     start_byte: span.start_byte,
                     end_byte: span.end_byte,
@@ -584,6 +589,12 @@ impl FileFacts {
                 (self.nodes.capacity() as u64)
                     .saturating_mul(std::mem::size_of::<NormalizedNode>() as u64),
             )
+            .saturating_add(
+                self.nodes
+                    .iter()
+                    .map(|node| node.construct.as_ref().map_or(0, String::capacity) as u64)
+                    .sum::<u64>(),
+            )
             .saturating_add(self.roles.estimated_bytes())
             .saturating_add(self.occurrence_roles.estimated_bytes())
     }
@@ -602,7 +613,6 @@ mod tests {
         occurrence_role_code, role_code,
     };
     use crate::analyzer::Range;
-    use crate::analyzer::structural::facts::STRUCTURAL_FACTS_SNAPSHOT_VERSION;
     use crate::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, NormalizedKind, Role};
     use crate::analyzer::structural::occurrences::{ALL_OCCURRENCE_ROLES, OccurrenceRole};
     use crate::compact_graph::{CompactRows, CompactRowsBuilder};
@@ -630,6 +640,7 @@ mod tests {
     fn node() -> NormalizedNode {
         NormalizedNode {
             kind: NormalizedKind::Call,
+            construct: None,
             range: Range {
                 start_byte: 0,
                 end_byte: 1,
@@ -647,6 +658,7 @@ mod tests {
         let nodes = vec![
             NormalizedNode {
                 kind: NormalizedKind::Call,
+                construct: Some("fixture_call".to_owned()),
                 range: Range {
                     start_byte: 0,
                     end_byte: 5,
@@ -662,6 +674,7 @@ mod tests {
             },
             NormalizedNode {
                 kind: NormalizedKind::Identifier,
+                construct: None,
                 range: Range {
                     start_byte: 2,
                     end_byte: 4,
@@ -860,6 +873,7 @@ mod tests {
         let unknown_kind = StructuralFactsSnapshot {
             nodes: vec![SnapshotNode {
                 kind: u8::MAX,
+                construct: None,
                 span: SnapshotSpan { start: 0, end: 1 },
                 parent: None,
                 name: None,
@@ -877,6 +891,7 @@ mod tests {
         let corrupt_rows = StructuralFactsSnapshot {
             nodes: vec![SnapshotNode {
                 kind: kind_code(NormalizedKind::Call),
+                construct: None,
                 span: SnapshotSpan { start: 0, end: 1 },
                 parent: None,
                 name: None,
@@ -917,6 +932,7 @@ mod tests {
         let legacy = VersionOneSnapshot {
             nodes: vec![SnapshotNode {
                 kind: kind_code(NormalizedKind::Identifier),
+                construct: None,
                 span: SnapshotSpan { start: 0, end: 1 },
                 parent: None,
                 name: None,
@@ -955,6 +971,7 @@ mod tests {
         let pre_block = StructuralFactsSnapshot {
             nodes: vec![SnapshotNode {
                 kind: kind_code(NormalizedKind::Function),
+                construct: None,
                 span: SnapshotSpan { start: 0, end: 13 },
                 parent: None,
                 name: Some(SnapshotSpan { start: 3, end: 7 }),
@@ -975,10 +992,6 @@ mod tests {
                 .all(|node| node.kind != NormalizedKind::Block),
             "a pre-block arena cannot answer scope queries: {:?}",
             decoded.nodes()
-        );
-        assert_eq!(
-            STRUCTURAL_FACTS_SNAPSHOT_VERSION, 4,
-            "the Block kind must be gated by its own snapshot version"
         );
     }
 

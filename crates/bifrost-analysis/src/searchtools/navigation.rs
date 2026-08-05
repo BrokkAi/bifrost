@@ -3,6 +3,7 @@ use super::selectors::*;
 use super::sources::*;
 use super::summaries::*;
 use super::*;
+use crate::analyzer::structural::{NormalizedKind, Role};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchSymbolsParams {
@@ -809,7 +810,10 @@ fn get_navigation_by_location_with_cancellation(
                 let (mut definitions, navigation_diagnostic) = match navigation {
                     Ok(Some(definitions)) => (definitions, None),
                     Ok(None) => (
-                        vec![semantic_model_definition_candidate(matched.records[0])],
+                        vec![semantic_model_definition_candidate(
+                            analyzer,
+                            matched.records[0],
+                        )],
                         None,
                     ),
                     Err(diagnostic) => (Vec::new(), Some(diagnostic)),
@@ -953,6 +957,7 @@ fn semantic_model_navigation_candidates(
     match modeled_target.disposition {
         crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
             return Ok(Some(vec![semantic_model_definition_candidate(
+                analyzer,
                 modeled_target.records[0],
             )]));
         }
@@ -1301,9 +1306,23 @@ pub(super) fn render_definition_lookup(
     if let Some(overlay) = analyzer.semantic_model_overlay() {
         if definitions.is_empty() {
             if let Some(target) = reference_target.as_deref() {
-                let mut matched = imported_model_target
+                let receiver_owner = outcome
+                    .reference
+                    .as_ref()
+                    .and_then(|reference| structured_receiver_owner(analyzer, file, reference));
+                let member_name = target
+                    .rsplit(['.', '#', ':'])
+                    .find(|part| !part.is_empty())
+                    .unwrap_or(target);
+                let mut matched = receiver_owner
                     .as_deref()
-                    .map(|target| overlay.symbols_named(target))
+                    .map(|owner| modeled_member_named(&overlay, owner, member_name))
+                    .filter(|matched| !matched.records.is_empty())
+                    .or_else(|| {
+                        imported_model_target
+                            .as_deref()
+                            .map(|target| overlay.symbols_named(target))
+                    })
                     .unwrap_or_else(|| overlay.symbols_with_id(target));
                 if matched.records.is_empty() {
                     matched = overlay.symbols_named(target);
@@ -1313,6 +1332,64 @@ pub(super) fn render_definition_lookup(
                 }
                 if matched.records.is_empty() && target.contains('#') {
                     matched = overlay.symbols_named(&target.replace('#', "."));
+                }
+                if structured_reference_kind(analyzer, file, outcome.reference.as_ref())
+                    == Some(NormalizedKind::FieldAccess)
+                    && matched
+                        .records
+                        .iter()
+                        .all(|record| record.language == "java")
+                {
+                    matched.records.retain(|record| {
+                        record.provenance.rule_id.is_none()
+                            || !matches!(
+                                record.kind,
+                                crate::analyzer::semantic_model::SemanticModelSymbolKind::Method
+                                    | crate::analyzer::semantic_model::SemanticModelSymbolKind::Function
+                                    | crate::analyzer::semantic_model::SemanticModelSymbolKind::Constructor
+                            )
+                    });
+                    matched.disposition = if matched.records.is_empty() {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
+                    } else if matched.records.len() == 1 && !matched.records[0].provenance.ambiguous
+                    {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                    } else {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict
+                    };
+                }
+                if let Some(arity) = outcome.reference.as_ref().and_then(|reference| {
+                    structured_reference_call_arity(analyzer, file, reference)
+                }) {
+                    matched.records.retain(|record| {
+                        record.provenance.rule_id.is_none()
+                            || record
+                                .structured_signature
+                                .as_ref()
+                                .is_none_or(|signature| {
+                                    let required = signature
+                                        .parameters
+                                        .iter()
+                                        .filter(|parameter| {
+                                            !parameter.optional && !parameter.variadic
+                                        })
+                                        .count();
+                                    let has_variadic = signature
+                                        .parameters
+                                        .iter()
+                                        .any(|parameter| parameter.variadic);
+                                    required <= arity
+                                        && (has_variadic || arity <= signature.parameters.len())
+                                })
+                    });
+                    matched.disposition = if matched.records.is_empty() {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
+                    } else if matched.records.len() == 1 && !matched.records[0].provenance.ambiguous
+                    {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                    } else {
+                        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict
+                    };
                 }
                 if matched
                     .records
@@ -1334,7 +1411,10 @@ pub(super) fn render_definition_lookup(
                 }
                 match matched.disposition {
                     crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
-                        definitions.push(semantic_model_definition_candidate(matched.records[0]));
+                        definitions.push(semantic_model_definition_candidate(
+                            analyzer,
+                            matched.records[0],
+                        ));
                         status = "resolved".to_string();
                     }
                     crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict => {
@@ -1353,12 +1433,9 @@ pub(super) fn render_definition_lookup(
                                 })
                         });
                         if overload_set {
-                            definitions.extend(
-                                matched
-                                    .records
-                                    .iter()
-                                    .map(|record| semantic_model_definition_candidate(record)),
-                            );
+                            definitions.extend(matched.records.iter().map(|record| {
+                                semantic_model_definition_candidate(analyzer, record)
+                            }));
                             status = "resolved".to_string();
                         } else {
                             status = "ambiguous".to_string();
@@ -1379,6 +1456,13 @@ pub(super) fn render_definition_lookup(
                 let matched = overlay.symbols_named(target);
                 if matched.disposition
                     == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                    && matches!(
+                        &matched.records[0].location,
+                        crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor)
+                            if candidate.fqn.as_deref() == Some(anchor.symbol.as_str())
+                                && candidate.path == anchor.path
+                                && candidate.start_line == anchor.range.start_line
+                    )
                 {
                     candidate.semantic_model = Some(matched.records[0].provenance.clone());
                 }
@@ -1425,6 +1509,188 @@ pub(super) fn render_definition_lookup(
         definitions,
         diagnostics,
     }
+}
+
+fn modeled_member_named<'a>(
+    overlay: &'a crate::analyzer::semantic_model::SemanticModelOverlay,
+    owner: &str,
+    name: &str,
+) -> crate::analyzer::semantic_model::SemanticModelOverlayMatch<
+    'a,
+    crate::analyzer::semantic_model::SemanticModelSymbol,
+> {
+    let records = overlay
+        .members_of(owner)
+        .records
+        .into_iter()
+        .filter(|symbol| symbol.name == name)
+        .collect::<Vec<_>>();
+    let disposition = if records.is_empty() {
+        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
+    } else if records.len() == 1 && !records[0].provenance.ambiguous {
+        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+    } else {
+        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict
+    };
+    crate::analyzer::semantic_model::SemanticModelOverlayMatch {
+        records,
+        disposition,
+    }
+}
+
+fn structured_receiver_owner(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    reference: &crate::analyzer::usages::reference_site::ResolvedReferenceSite,
+) -> Option<String> {
+    let focus = reference.focus_start_byte;
+    let receiver = analyzer
+        .structural_search_providers()
+        .into_iter()
+        .find_map(|provider| {
+            let facts = provider.structural_facts(file)?;
+            facts
+                .nodes()
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| {
+                    matches!(
+                        node.kind,
+                        NormalizedKind::Call | NormalizedKind::FieldAccess
+                    ) && node.range.start_byte <= focus
+                        && focus < node.range.end_byte
+                })
+                .min_by_key(|(_, node)| node.range.end_byte - node.range.start_byte)
+                .and_then(|(index, node)| {
+                    let node_id = u32::try_from(index).ok()?;
+                    let names_reference = node
+                        .name
+                        .is_some_and(|span| span.start_byte <= focus && focus < span.end_byte)
+                        || facts.roles(node_id).iter().any(|target| {
+                            target.role == Role::Kwarg
+                                && target.keyword.is_some_and(|span| {
+                                    span.start_byte <= focus && focus < span.end_byte
+                                })
+                        });
+                    if !names_reference {
+                        return None;
+                    }
+                    let role = if node.kind == NormalizedKind::Call {
+                        Role::Receiver
+                    } else {
+                        Role::Object
+                    };
+                    let receiver_byte = facts.role_targets(node_id, role).next()?.span.start_byte;
+                    Some(facts.line_column_of_byte(receiver_byte))
+                })
+        })?;
+    let (line, column) = receiver;
+    let result = get_type_by_location(
+        analyzer,
+        GetTypeParams {
+            references: vec![TypeReferenceQuery {
+                path: file.rel_path().to_string_lossy().replace('\\', "/"),
+                line: Some(line),
+                column: Some(column),
+            }],
+        },
+    );
+    if let [result] = result.results.as_slice()
+        && let [candidate] = result.types.as_slice()
+    {
+        return Some(candidate.fqn.clone());
+    }
+    let definition = get_definitions_by_location(
+        analyzer,
+        GetDefinitionParams {
+            references: vec![DefinitionReferenceQuery {
+                path: file.rel_path().to_string_lossy().replace('\\', "/"),
+                line: Some(line),
+                column: Some(column),
+            }],
+        },
+    );
+    let [result] = definition.results.as_slice() else {
+        return None;
+    };
+    let [candidate] = result.definitions.as_slice() else {
+        return None;
+    };
+    candidate.fqn.clone()
+}
+
+fn structured_reference_call_arity(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    reference: &crate::analyzer::usages::reference_site::ResolvedReferenceSite,
+) -> Option<usize> {
+    let reference_range = &reference.range;
+    analyzer
+        .structural_search_providers()
+        .into_iter()
+        .find_map(|provider| {
+            let facts = provider.structural_facts(file)?;
+            facts
+                .nodes()
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| {
+                    node.kind == NormalizedKind::Call
+                        && node.name.is_some_and(|name| {
+                            name.start_byte < reference_range.end_byte
+                                && reference_range.start_byte < name.end_byte
+                        })
+                        && node.range.start_byte < reference_range.end_byte
+                        && reference_range.start_byte < node.range.end_byte
+                })
+                .min_by_key(|(_, node)| node.range.end_byte - node.range.start_byte)
+                .and_then(|(index, node)| {
+                    if node.construct.as_deref() == Some("java_method_reference") {
+                        return None;
+                    }
+                    let node_id = u32::try_from(index).ok()?;
+                    node.name.is_some().then(|| {
+                        facts
+                            .roles(node_id)
+                            .iter()
+                            .filter(|target| matches!(target.role, Role::Arg | Role::Kwarg))
+                            .count()
+                    })
+                })
+        })
+}
+
+fn structured_reference_kind(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    reference: Option<&crate::analyzer::usages::reference_site::ResolvedReferenceSite>,
+) -> Option<NormalizedKind> {
+    let reference = reference?;
+    let reference_range = &reference.range;
+    analyzer
+        .structural_search_providers()
+        .into_iter()
+        .find_map(|provider| {
+            let facts = provider.structural_facts(file)?;
+            facts
+                .nodes()
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node.kind,
+                        NormalizedKind::Call | NormalizedKind::FieldAccess
+                    ) && node.name.is_some_and(|name| {
+                        name.start_byte < reference_range.end_byte
+                            && reference_range.start_byte < name.end_byte
+                    }) && node.range.start_byte < reference_range.end_byte
+                        && reference_range.start_byte < node.range.end_byte
+                })
+                .min_by_key(|node| {
+                    let named_call = node.kind == NormalizedKind::Call && node.name.is_some();
+                    (!named_call, node.range.end_byte - node.range.start_byte)
+                })
+                .map(|node| node.kind)
+        })
 }
 
 fn explicit_import_model_target(

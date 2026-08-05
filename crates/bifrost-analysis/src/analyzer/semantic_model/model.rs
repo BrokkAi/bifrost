@@ -527,12 +527,33 @@ pub struct GeneratorRule {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RuleTrigger {
-    LanguageConstruct { construct: String },
-    Annotation { name: String },
-    MacroInvocation { name: String },
-    GeneratorInvocation { name: String },
-    ResolvedOwner { owner: String },
-    ResolvedCall { owner: String, name: String },
+    LanguageConstruct {
+        construct: String,
+    },
+    Annotation {
+        name: String,
+    },
+    AnnotatedField {
+        annotation: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        excluded_annotations: Vec<String>,
+        owner_annotation_path: Vec<String>,
+    },
+    MacroInvocation {
+        name: String,
+    },
+    GeneratorInvocation {
+        name: String,
+    },
+    ResolvedOwner {
+        owner: String,
+    },
+    ResolvedCall {
+        owner: String,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -556,10 +577,22 @@ pub struct CaptureBinding {
 pub enum CaptureSource {
     MatchedNode,
     EnclosingDeclaration,
+    OwningType,
+    /// Direct authored fields that supply generated members. A field-level
+    /// annotation produces that field; a type-level annotation produces its
+    /// direct fields.
+    OwnedFields,
+    OwnedMutableFields,
     ResolvedOwner,
-    Argument { index: u32 },
-    Arguments { from: u32 },
-    AnnotationArgument { name: String },
+    Argument {
+        index: u32,
+    },
+    Arguments {
+        from: u32,
+    },
+    AnnotationArgument {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -596,6 +629,11 @@ pub enum RuleEmission {
     Declaration {
         id: TemplateExpression,
         name: TemplateExpression,
+        /// A capture-backed authored location for the emitted declaration.
+        /// The runtime uses a stable model URI when this expression has no
+        /// exact authored anchor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor: Option<TemplateExpression>,
         declaration: EmittedDeclaration,
     },
     Alias {
@@ -629,7 +667,8 @@ pub enum EmittedDeclaration {
         extension_surfaces: Vec<TemplateExpression>,
     },
     Member {
-        owner: TemplateExpression,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<TemplateExpression>,
         member_kind: MemberKind,
         visibility: Visibility,
         #[serde(default)]
@@ -688,6 +727,9 @@ pub enum TemplateTypeRef {
     Array {
         element: Box<TemplateTypeRef>,
     },
+    ByRef {
+        element: Box<TemplateTypeRef>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -705,6 +747,26 @@ pub enum TemplateExpression {
     Transform {
         transform: AsciiTransform,
         value: Box<TemplateExpression>,
+    },
+    Conditional {
+        condition: TemplateCondition,
+        #[serde(rename = "then")]
+        then_value: Box<TemplateExpression>,
+        #[serde(rename = "else")]
+        else_value: Box<TemplateExpression>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TemplateCondition {
+    Equals {
+        left: Box<TemplateExpression>,
+        right: Box<TemplateExpression>,
+    },
+    StartsWith {
+        value: Box<TemplateExpression>,
+        prefix: Box<TemplateExpression>,
     },
 }
 

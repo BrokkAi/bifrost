@@ -134,6 +134,7 @@ pub(crate) fn extract_file_facts_limited(
                     let fact_id = nodes.len() as u32;
                     nodes.push(NormalizedNode {
                         kind,
+                        construct: spec.generator_construct(node, kind).map(str::to_owned),
                         range: node_range(node),
                         parent: enclosing,
                         name: None,

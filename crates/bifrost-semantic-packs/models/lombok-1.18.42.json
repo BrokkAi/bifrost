@@ -1,0 +1,771 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.java.lombok",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.8.21"
+  },
+  "language": "java",
+  "ecosystem": "maven",
+  "compatibility": {
+    "bifrost": ">=0.8.21, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://projectlombok.org/features/GetterSetter",
+    "revision": "1.18.42"
+  },
+  "license": "Apache-2.0",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": true,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "java.lombok.generated-accessors",
+      "activation": [
+        {
+          "package": {
+            "name": "org.projectlombok:lombok",
+            "version": "=1.18.42"
+          }
+        }
+      ],
+      "payload": {
+        "kind": "generator_rules",
+        "rules": [
+          {
+            "id": "java.lombok.getter",
+            "trigger": {
+              "kind": "annotation",
+              "name": "lombok.Getter"
+            },
+            "captures": [
+              {
+                "name": "owner_id",
+                "binding": {
+                  "source": {
+                    "kind": "owning_type"
+                  },
+                  "projection": "stable_id"
+                },
+                "value_kind": "stable_id",
+                "cardinality": "one"
+              },
+              {
+                "name": "field_name",
+                "binding": {
+                  "source": {
+                    "kind": "owned_fields"
+                  },
+                  "projection": "name"
+                },
+                "value_kind": "identifier",
+                "cardinality": "many"
+              },
+              {
+                "name": "field_id",
+                "binding": {
+                  "source": {
+                    "kind": "owned_fields"
+                  },
+                  "projection": "stable_id"
+                },
+                "value_kind": "stable_id",
+                "cardinality": "many"
+              },
+              {
+                "name": "field_type",
+                "binding": {
+                  "source": {
+                    "kind": "owned_fields"
+                  },
+                  "projection": "type"
+                },
+                "value_kind": "type",
+                "cardinality": "many"
+              }
+            ],
+            "emissions": [
+              {
+                "kind": "declaration",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    {
+                      "op": "capture",
+                      "name": "field_id"
+                    },
+                    {
+                      "op": "literal",
+                      "value": ".lombok-getter"
+                    }
+                  ]
+                },
+                "name": {
+                  "op": "conditional",
+                  "condition": {
+                    "op": "equals",
+                    "left": {
+                      "op": "capture",
+                      "name": "field_type"
+                    },
+                    "right": {
+                      "op": "literal",
+                      "value": "boolean"
+                    }
+                  },
+                  "then": {
+                    "op": "conditional",
+                    "condition": {
+                      "op": "starts_with",
+                      "value": {
+                        "op": "capture",
+                        "name": "field_name"
+                      },
+                      "prefix": {
+                        "op": "literal",
+                        "value": "is"
+                      }
+                    },
+                    "then": {
+                      "op": "capture",
+                      "name": "field_name"
+                    },
+                    "else": {
+                      "op": "concat",
+                      "values": [
+                        {
+                          "op": "literal",
+                          "value": "is"
+                        },
+                        {
+                          "op": "transform",
+                          "transform": "pascal_case",
+                          "value": {
+                            "op": "capture",
+                            "name": "field_name"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "else": {
+                    "op": "concat",
+                    "values": [
+                      {
+                        "op": "literal",
+                        "value": "get"
+                      },
+                      {
+                        "op": "transform",
+                        "transform": "pascal_case",
+                        "value": {
+                          "op": "capture",
+                          "name": "field_name"
+                        }
+                      }
+                    ]
+                  }
+                },
+                "anchor": {
+                  "op": "capture",
+                  "name": "field_name"
+                },
+                "declaration": {
+                  "kind": "member",
+                  "owner": {
+                    "op": "capture",
+                    "name": "owner_id"
+                  },
+                  "member_kind": "method",
+                  "visibility": "public",
+                  "signature": {
+                    "type_parameters": [],
+                    "parameters": [],
+                    "returns": {
+                      "kind": "capture",
+                      "name": "field_type"
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "relation",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    {
+                      "op": "capture",
+                      "name": "field_id"
+                    },
+                    {
+                      "op": "literal",
+                      "value": ".lombok-getter-navigation"
+                    }
+                  ]
+                },
+                "relation_kind": "navigates_to",
+                "from": {
+                  "op": "concat",
+                  "values": [
+                    {
+                      "op": "capture",
+                      "name": "field_id"
+                    },
+                    {
+                      "op": "literal",
+                      "value": ".lombok-getter"
+                    }
+                  ]
+                },
+                "to": {
+                  "op": "capture",
+                  "name": "field_id"
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.lombok.setter",
+            "trigger": {
+              "kind": "annotation",
+              "name": "lombok.Setter"
+            },
+            "captures": [
+              {
+                "name": "owner_id",
+                "binding": {
+                  "source": {
+                    "kind": "owning_type"
+                  },
+                  "projection": "stable_id"
+                },
+                "value_kind": "stable_id",
+                "cardinality": "one"
+              },
+              {
+                "name": "field_name",
+                "binding": {
+                  "source": {
+                    "kind": "owned_mutable_fields"
+                  },
+                  "projection": "name"
+                },
+                "value_kind": "identifier",
+                "cardinality": "many"
+              },
+              {
+                "name": "field_id",
+                "binding": {
+                  "source": {
+                    "kind": "owned_mutable_fields"
+                  },
+                  "projection": "stable_id"
+                },
+                "value_kind": "stable_id",
+                "cardinality": "many"
+              },
+              {
+                "name": "field_type",
+                "binding": {
+                  "source": {
+                    "kind": "owned_mutable_fields"
+                  },
+                  "projection": "type"
+                },
+                "value_kind": "type",
+                "cardinality": "many"
+              }
+            ],
+            "emissions": [
+              {
+                "kind": "declaration",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    {
+                      "op": "capture",
+                      "name": "field_id"
+                    },
+                    {
+                      "op": "literal",
+                      "value": ".lombok-setter"
+                    }
+                  ]
+                },
+                "name": {
+                  "op": "concat",
+                  "values": [
+                    {
+                      "op": "literal",
+                      "value": "set"
+                    },
+                    {
+                      "op": "transform",
+                      "transform": "pascal_case",
+                      "value": {
+                        "op": "capture",
+                        "name": "field_name"
+                      }
+                    }
+                  ]
+                },
+                "anchor": {
+                  "op": "capture",
+                  "name": "field_name"
+                },
+                "declaration": {
+                  "kind": "member",
+                  "owner": {
+                    "op": "capture",
+                    "name": "owner_id"
+                  },
+                  "member_kind": "method",
+                  "visibility": "public",
+                  "signature": {
+                    "type_parameters": [],
+                    "parameters": [
+                      {
+                        "name": {
+                          "op": "literal",
+                          "value": "value"
+                        },
+                        "type": {
+                          "kind": "capture",
+                          "name": "field_type"
+                        },
+                        "optional": false,
+                        "variadic": false
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "kind": "relation",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    {
+                      "op": "capture",
+                      "name": "field_id"
+                    },
+                    {
+                      "op": "literal",
+                      "value": ".lombok-setter-navigation"
+                    }
+                  ]
+                },
+                "relation_kind": "navigates_to",
+                "from": {
+                  "op": "concat",
+                  "values": [
+                    {
+                      "op": "capture",
+                      "name": "field_id"
+                    },
+                    {
+                      "op": "literal",
+                      "value": ".lombok-setter"
+                    }
+                  ]
+                },
+                "to": {
+                  "op": "capture",
+                  "name": "field_id"
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.lombok.data-getter",
+            "trigger": {
+              "kind": "annotation",
+              "name": "lombok.Data"
+            },
+            "captures": [
+              {
+                "name": "owner_id",
+                "binding": {
+                  "source": {
+                    "kind": "owning_type"
+                  },
+                  "projection": "stable_id"
+                },
+                "value_kind": "stable_id",
+                "cardinality": "one"
+              },
+              {
+                "name": "field_name",
+                "binding": {
+                  "source": {
+                    "kind": "owned_fields"
+                  },
+                  "projection": "name"
+                },
+                "value_kind": "identifier",
+                "cardinality": "many"
+              },
+              {
+                "name": "field_id",
+                "binding": {
+                  "source": {
+                    "kind": "owned_fields"
+                  },
+                  "projection": "stable_id"
+                },
+                "value_kind": "stable_id",
+                "cardinality": "many"
+              },
+              {
+                "name": "field_type",
+                "binding": {
+                  "source": {
+                    "kind": "owned_fields"
+                  },
+                  "projection": "type"
+                },
+                "value_kind": "type",
+                "cardinality": "many"
+              }
+            ],
+            "emissions": [
+              {
+                "kind": "declaration",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    {
+                      "op": "capture",
+                      "name": "field_id"
+                    },
+                    {
+                      "op": "literal",
+                      "value": ".lombok-getter"
+                    }
+                  ]
+                },
+                "name": {
+                  "op": "conditional",
+                  "condition": {
+                    "op": "equals",
+                    "left": {
+                      "op": "capture",
+                      "name": "field_type"
+                    },
+                    "right": {
+                      "op": "literal",
+                      "value": "boolean"
+                    }
+                  },
+                  "then": {
+                    "op": "conditional",
+                    "condition": {
+                      "op": "starts_with",
+                      "value": {
+                        "op": "capture",
+                        "name": "field_name"
+                      },
+                      "prefix": {
+                        "op": "literal",
+                        "value": "is"
+                      }
+                    },
+                    "then": {
+                      "op": "capture",
+                      "name": "field_name"
+                    },
+                    "else": {
+                      "op": "concat",
+                      "values": [
+                        {
+                          "op": "literal",
+                          "value": "is"
+                        },
+                        {
+                          "op": "transform",
+                          "transform": "pascal_case",
+                          "value": {
+                            "op": "capture",
+                            "name": "field_name"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "else": {
+                    "op": "concat",
+                    "values": [
+                      {
+                        "op": "literal",
+                        "value": "get"
+                      },
+                      {
+                        "op": "transform",
+                        "transform": "pascal_case",
+                        "value": {
+                          "op": "capture",
+                          "name": "field_name"
+                        }
+                      }
+                    ]
+                  }
+                },
+                "anchor": {
+                  "op": "capture",
+                  "name": "field_name"
+                },
+                "declaration": {
+                  "kind": "member",
+                  "owner": {
+                    "op": "capture",
+                    "name": "owner_id"
+                  },
+                  "member_kind": "method",
+                  "visibility": "public",
+                  "signature": {
+                    "type_parameters": [],
+                    "parameters": [],
+                    "returns": {
+                      "kind": "capture",
+                      "name": "field_type"
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "relation",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    {
+                      "op": "capture",
+                      "name": "field_id"
+                    },
+                    {
+                      "op": "literal",
+                      "value": ".lombok-getter-navigation"
+                    }
+                  ]
+                },
+                "relation_kind": "navigates_to",
+                "from": {
+                  "op": "concat",
+                  "values": [
+                    {
+                      "op": "capture",
+                      "name": "field_id"
+                    },
+                    {
+                      "op": "literal",
+                      "value": ".lombok-getter"
+                    }
+                  ]
+                },
+                "to": {
+                  "op": "capture",
+                  "name": "field_id"
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.lombok.value-getter",
+            "trigger": {
+              "kind": "annotation",
+              "name": "lombok.Value"
+            },
+            "captures": [
+              {
+                "name": "owner_id",
+                "binding": {
+                  "source": {
+                    "kind": "owning_type"
+                  },
+                  "projection": "stable_id"
+                },
+                "value_kind": "stable_id",
+                "cardinality": "one"
+              },
+              {
+                "name": "field_name",
+                "binding": {
+                  "source": {
+                    "kind": "owned_fields"
+                  },
+                  "projection": "name"
+                },
+                "value_kind": "identifier",
+                "cardinality": "many"
+              },
+              {
+                "name": "field_id",
+                "binding": {
+                  "source": {
+                    "kind": "owned_fields"
+                  },
+                  "projection": "stable_id"
+                },
+                "value_kind": "stable_id",
+                "cardinality": "many"
+              },
+              {
+                "name": "field_type",
+                "binding": {
+                  "source": {
+                    "kind": "owned_fields"
+                  },
+                  "projection": "type"
+                },
+                "value_kind": "type",
+                "cardinality": "many"
+              }
+            ],
+            "emissions": [
+              {
+                "kind": "declaration",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    {
+                      "op": "capture",
+                      "name": "field_id"
+                    },
+                    {
+                      "op": "literal",
+                      "value": ".lombok-getter"
+                    }
+                  ]
+                },
+                "name": {
+                  "op": "conditional",
+                  "condition": {
+                    "op": "equals",
+                    "left": {
+                      "op": "capture",
+                      "name": "field_type"
+                    },
+                    "right": {
+                      "op": "literal",
+                      "value": "boolean"
+                    }
+                  },
+                  "then": {
+                    "op": "conditional",
+                    "condition": {
+                      "op": "starts_with",
+                      "value": {
+                        "op": "capture",
+                        "name": "field_name"
+                      },
+                      "prefix": {
+                        "op": "literal",
+                        "value": "is"
+                      }
+                    },
+                    "then": {
+                      "op": "capture",
+                      "name": "field_name"
+                    },
+                    "else": {
+                      "op": "concat",
+                      "values": [
+                        {
+                          "op": "literal",
+                          "value": "is"
+                        },
+                        {
+                          "op": "transform",
+                          "transform": "pascal_case",
+                          "value": {
+                            "op": "capture",
+                            "name": "field_name"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "else": {
+                    "op": "concat",
+                    "values": [
+                      {
+                        "op": "literal",
+                        "value": "get"
+                      },
+                      {
+                        "op": "transform",
+                        "transform": "pascal_case",
+                        "value": {
+                          "op": "capture",
+                          "name": "field_name"
+                        }
+                      }
+                    ]
+                  }
+                },
+                "anchor": {
+                  "op": "capture",
+                  "name": "field_name"
+                },
+                "declaration": {
+                  "kind": "member",
+                  "owner": {
+                    "op": "capture",
+                    "name": "owner_id"
+                  },
+                  "member_kind": "method",
+                  "visibility": "public",
+                  "signature": {
+                    "type_parameters": [],
+                    "parameters": [],
+                    "returns": {
+                      "kind": "capture",
+                      "name": "field_type"
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "relation",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    {
+                      "op": "capture",
+                      "name": "field_id"
+                    },
+                    {
+                      "op": "literal",
+                      "value": ".lombok-getter-navigation"
+                    }
+                  ]
+                },
+                "relation_kind": "navigates_to",
+                "from": {
+                  "op": "concat",
+                  "values": [
+                    {
+                      "op": "capture",
+                      "name": "field_id"
+                    },
+                    {
+                      "op": "literal",
+                      "value": ".lombok-getter"
+                    }
+                  ]
+                },
+                "to": {
+                  "op": "capture",
+                  "name": "field_id"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -536,7 +536,17 @@ fn visit_field_declaration(
             Some(parent.clone()),
             Some(top_level.clone()),
         );
-        parsed.add_signature(code_unit, field_signature(node, child, source));
+        let signature = field_signature(node, child, source);
+        let field_type = node
+            .child_by_field_name("type")
+            .map(|type_node| normalize_whitespace(node_text(type_node, source)));
+        let (is_static, is_final) = java_field_modifiers(node);
+        parsed.add_signature_with_metadata(
+            code_unit,
+            SignatureMetadata::new(signature, Vec::new())
+                .with_return_type_text(field_type)
+                .with_field_modifiers(is_static, is_final),
+        );
 
         if let Some(value) = child.child_by_field_name("value") {
             collect_lambda_expressions(
@@ -550,6 +560,28 @@ fn visit_field_declaration(
             );
         }
     }
+}
+
+fn java_field_modifiers(field: Node<'_>) -> (bool, bool) {
+    let Some(modifiers) = (0..field.named_child_count())
+        .filter_map(|index| field.named_child(index))
+        .find(|child| child.kind() == "modifiers")
+    else {
+        return (false, false);
+    };
+    let mut is_static = false;
+    let mut is_final = false;
+    for index in 0..modifiers.child_count() {
+        let Some(modifier) = modifiers.child(index) else {
+            continue;
+        };
+        match modifier.kind() {
+            "static" => is_static = true,
+            "final" => is_final = true,
+            _ => {}
+        }
+    }
+    (is_static, is_final)
 }
 
 fn visit_record_components(

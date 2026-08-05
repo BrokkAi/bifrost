@@ -1,5 +1,6 @@
 //! Shared opportunistic GC driver for the unified bifrost cache DB.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -61,6 +62,13 @@ struct GcClaim {
 /// never through the store handle, which is why neither the semantic store nor
 /// the analyzer store has to be visible from this crate.
 pub fn maybe_gc(db_path: &Path, repo: &Repository) -> Result<GcOutcome, String> {
+    // A deliberately cross-repository cache cannot be collected from the
+    // reachability graph of whichever repository happens to open it first.
+    // Evaluation and fleet operators that provide such a cache can disable
+    // opportunistic collection while retaining the explicit force-GC API.
+    if !automatic_gc_enabled(std::env::var_os("BIFROST_CACHE_GC").as_deref()) {
+        return Ok(GcOutcome::skipped(total_blob_count(db_path)?));
+    }
     run_gc(db_path, repo, false)
 }
 
@@ -79,6 +87,13 @@ fn run_gc(db_path: &Path, repo: &Repository, force: bool) -> Result<GcOutcome, S
             Err(err)
         }
     }
+}
+
+fn automatic_gc_enabled(value: Option<&OsStr>) -> bool {
+    !matches!(
+        value.and_then(OsStr::to_str),
+        Some("0" | "off" | "disabled")
+    )
 }
 
 fn sweep_with_claim(claim: &GcClaim, repo: &Repository) -> Result<GcOutcome, String> {
@@ -460,6 +475,15 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
+
+    #[test]
+    fn automatic_gc_can_be_explicitly_disabled() {
+        assert!(automatic_gc_enabled(None));
+        assert!(automatic_gc_enabled(Some(OsStr::new("on"))));
+        assert!(!automatic_gc_enabled(Some(OsStr::new("0"))));
+        assert!(!automatic_gc_enabled(Some(OsStr::new("off"))));
+        assert!(!automatic_gc_enabled(Some(OsStr::new("disabled"))));
+    }
 
     #[test]
     fn analyzer_gc_candidate_cannot_delete_newer_generation_replacement() {

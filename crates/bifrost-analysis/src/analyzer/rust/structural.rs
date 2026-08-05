@@ -17,8 +17,19 @@ pub(crate) struct RustStructuralSpec;
 
 pub(crate) static RUST_STRUCTURAL_SPEC: RustStructuralSpec = RustStructuralSpec;
 
+fn macro_arguments(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("arguments").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "token_tree")
+    })
+}
+
 const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("call_expression", NormalizedKind::Call),
+    ("macro_invocation", NormalizedKind::Call),
+    ("attribute", NormalizedKind::Decorator),
+    ("field_declaration", NormalizedKind::Declaration),
     ("field_expression", NormalizedKind::FieldAccess),
     ("function_item", NormalizedKind::Function),
     ("function_signature_item", NormalizedKind::Function),
@@ -147,6 +158,30 @@ fn function_item_is_method(node: Node<'_>) -> bool {
         }
     }
     false
+}
+
+fn is_inside_derive_attribute(node: Node<'_>, source: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "token_tree" => current = parent.parent(),
+            "attribute" => {
+                return first_named_child(parent).is_some_and(|name| {
+                    name.kind() == "identifier" && name.utf8_text(source.as_bytes()) == Ok("derive")
+                });
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn derive_path_module(node: Node<'_>) -> Option<Node<'_>> {
+    let separator = node.prev_sibling()?;
+    (separator.kind() == "::")
+        .then(|| separator.prev_named_sibling())
+        .flatten()
+        .filter(|module| module.kind() == "identifier")
 }
 
 static RUST_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE
@@ -338,9 +373,14 @@ impl StructuralSpec for RustStructuralSpec {
         node: Node<'_>,
         kind: NormalizedKind,
         _enclosing: Option<NormalizedKind>,
-        _source: &str,
+        source: &str,
     ) -> NormalizedKind {
-        if kind == NormalizedKind::Function && function_item_is_method(node) {
+        if kind == NormalizedKind::Identifier
+            && node.kind() == "identifier"
+            && is_inside_derive_attribute(node, source)
+        {
+            NormalizedKind::Decorator
+        } else if kind == NormalizedKind::Function && function_item_is_method(node) {
             NormalizedKind::Method
         } else {
             kind
@@ -400,8 +440,40 @@ impl StructuralSpec for RustStructuralSpec {
             sink.occurrence_role(node, role);
         }
         match kind {
+            NormalizedKind::Decorator => {
+                let name = if node.kind() == "attribute" {
+                    first_named_child(node)
+                } else {
+                    expression_name_node(node)
+                };
+                if let Some(name) = name {
+                    sink.set_name(name);
+                }
+                if node.kind() == "attribute"
+                    && let Some(value) = node.child_by_field_name("value")
+                {
+                    sink.role(Role::Arg, value);
+                }
+                if node.kind() == "identifier"
+                    && let Some(module) = derive_path_module(node)
+                {
+                    sink.role_named(Role::Module, module, module);
+                }
+            }
+            NormalizedKind::Declaration if node.kind() == "field_declaration" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    sink.set_name(name);
+                }
+            }
             NormalizedKind::Call => {
-                if let Some(function) = node.child_by_field_name("function") {
+                if node.kind() == "macro_invocation" {
+                    if let Some(macro_name) = node.child_by_field_name("macro") {
+                        attach_terminal_callee(sink, macro_name, expression_name_node(macro_name));
+                    }
+                    if let Some(arguments) = macro_arguments(node) {
+                        attach_positional_argument_roles(sink, arguments, expression_name_node);
+                    }
+                } else if let Some(function) = node.child_by_field_name("function") {
                     attach_terminal_callee(sink, function, expression_name_node(function));
                     let target = call_function_target(function);
                     if target.kind() == "field_expression"
@@ -416,7 +488,9 @@ impl StructuralSpec for RustStructuralSpec {
                     }
                     attach_scoped_receiver(sink, target);
                 }
-                if let Some(arguments) = node.child_by_field_name("arguments") {
+                if node.kind() != "macro_invocation"
+                    && let Some(arguments) = node.child_by_field_name("arguments")
+                {
                     attach_positional_argument_roles(sink, arguments, expression_name_node);
                 }
             }
@@ -601,6 +675,75 @@ mod structural_spec_tests {
                 "rust emitted undeclared role {role:?} for {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn rust_retains_structured_derive_and_field_attribute_facts() {
+        let source = concat!(
+            "use getset::Getters;\n",
+            "#[derive(Getters)]\n",
+            "struct Record {\n",
+            "    #[get = \"pub\"]\n",
+            "    value: String,\n",
+            "}\n",
+        );
+        let facts = crate::analyzer::structural::extract::extract_file_facts(
+            &RUST_STRUCTURAL_SPEC,
+            &tree_sitter_rust::LANGUAGE.into(),
+            source,
+        )
+        .unwrap();
+        let derive = facts
+            .nodes()
+            .iter()
+            .enumerate()
+            .find(|(_, node)| {
+                node.kind == NormalizedKind::Decorator
+                    && node
+                        .name
+                        .is_some_and(|name| name.text(facts.source()) == "Getters")
+            })
+            .map(|(index, _)| u32::try_from(index).unwrap())
+            .expect("derive path decorator");
+        assert_eq!(
+            facts
+                .role_targets(derive, Role::Module)
+                .filter_map(|target| target.name)
+                .map(|name| name.text(facts.source()))
+                .collect::<Vec<_>>(),
+            Vec::<&str>::new()
+        );
+        assert!(facts.nodes().iter().any(|node| {
+            node.kind == NormalizedKind::Decorator
+                && node
+                    .name
+                    .is_some_and(|name| name.text(facts.source()) == "get")
+        }));
+        let getter = facts
+            .nodes()
+            .iter()
+            .enumerate()
+            .find(|(_, node)| {
+                node.kind == NormalizedKind::Decorator
+                    && node
+                        .name
+                        .is_some_and(|name| name.text(facts.source()) == "get")
+            })
+            .map(|(index, _)| u32::try_from(index).unwrap())
+            .expect("get attribute");
+        assert_eq!(
+            facts
+                .role_targets(getter, Role::Arg)
+                .map(|target| target.span.text(facts.source()))
+                .collect::<Vec<_>>(),
+            vec!["\"pub\""]
+        );
+        assert!(facts.nodes().iter().any(|node| {
+            node.kind == NormalizedKind::Declaration
+                && node
+                    .name
+                    .is_some_and(|name| name.text(facts.source()) == "value")
+        }));
     }
 
     #[test]

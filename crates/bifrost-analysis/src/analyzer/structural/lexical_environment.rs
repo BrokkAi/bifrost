@@ -1260,23 +1260,17 @@ mod tests {
         assert_eq!(detail.local_name, "List");
         assert!(!detail.wildcard);
         assert_eq!(detail.wildcard_ambiguous, None);
-        // The Java adapter records no parser-derived import path, so the row
-        // can name the local name but not its target. That is reported, not
-        // papered over: the import axis is incomplete while the binding axis
-        // stays trustworthy.
-        assert!(detail.target_segments.is_empty());
-        assert!(!env.completeness.covers(EnvironmentAxis::ImportBinders));
+        // Java imports gained a parser-derived structured path in #1603, so
+        // the row names both the local name and its target segments, and the
+        // import axis is covered. (Before #1603 this test pinned the gap that
+        // follow-up #1600 tracked.)
+        assert_eq!(
+            detail.target_segments,
+            vec!["java".to_owned(), "util".to_owned(), "List".to_owned()]
+        );
+        assert!(env.completeness.covers(EnvironmentAxis::ImportBinders));
         assert!(env.completeness.covers(EnvironmentAxis::BindingIntervals));
         assert!(env.completeness.covers(EnvironmentAxis::Scopes));
-        match &env.completeness {
-            EnvironmentCompleteness::Incomplete { reasons, .. } => assert_eq!(
-                reasons.as_slice(),
-                [EnvironmentIncompleteReason::ImportTargetUnstructured]
-            ),
-            EnvironmentCompleteness::Complete => {
-                panic!("an import with no structured path cannot be complete")
-            }
-        }
 
         let items = binding(&env, "items");
         assert_eq!(items.kind, BindingKind::Local);
