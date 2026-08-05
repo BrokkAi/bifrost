@@ -2804,82 +2804,75 @@ where
         replace_live_paths: bool,
     ) -> Result<HashMap<ProjectFile, Oid>, String> {
         let _scope = profiling::scope("TreeSitterAnalyzer::resolve_live_oids");
-        let mut planned = Vec::with_capacity(files.len());
-        let mut overlay_files = Vec::new();
-        let mut disk_files = Vec::with_capacity(files.len());
-        for file in files {
-            if project.has_overlay(file) {
-                overlay_files.push(file);
-            } else {
-                disk_files.push(file.clone());
-            }
-        }
+        type PlannedLiveOid = Option<(ProjectFile, Oid, LivePathEntry)>;
 
-        let plan_overlay = |file: &&ProjectFile| -> Result<_, String> {
-            let source = project.read_source(file).map_err(|err| err.to_string())?;
-            let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
-                .map_err(|err| err.to_string())?;
-            Ok((
-                (*file).clone(),
-                oid,
-                LivePathEntry::overlay((*file).clone(), oid),
-            ))
-        };
-        let resolved_overlays = if overlay_files.len() <= 1 {
-            overlay_files.iter().map(&plan_overlay).collect::<Vec<_>>()
-        } else {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(config.parallelism().clamp(1, overlay_files.len()))
-                .build()
-                .map_err(|err| format!("failed to build live OID thread pool: {err}"))?;
-            pool.install(|| {
-                overlay_files
-                    .par_iter()
-                    .map(&plan_overlay)
-                    .collect::<Vec<_>>()
-            })
-        };
-        for result in resolved_overlays {
-            planned.push(result?);
-        }
-
-        if let Some(liveness) = store_context.liveness.as_ref() {
-            for (file, oid) in liveness.oids_for_files(&disk_files)? {
-                planned.push((file.clone(), oid, LivePathEntry::filesystem(file, oid)));
+        let liveness = store_context.liveness.as_ref();
+        let plan_one = |file: &ProjectFile| -> Result<PlannedLiveOid, String> {
+            let has_overlay = project.has_overlay(file);
+            if !file.exists() && !has_overlay {
+                return Ok(None);
             }
-        } else {
-            let plan_one = |file: &ProjectFile| -> Result<Option<_>, String> {
-                if !file.exists() {
+            let (oid, entry) = if has_overlay {
+                let source = project.read_source(file).map_err(|err| err.to_string())?;
+                let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
+                    .map_err(|err| err.to_string())?;
+                (oid, LivePathEntry::overlay(file.clone(), oid))
+            } else if let Some(liveness) = liveness {
+                // Point resolution hashes the bytes currently on disk, so an
+                // incremental update observes the edit that triggered it.
+                let Some(oid) = liveness.oid_for_path(file)? else {
                     return Ok(None);
-                }
+                };
+                (oid, LivePathEntry::filesystem(file.clone(), oid))
+            } else {
                 let bytes = std::fs::read(file.abs_path()).map_err(|err| err.to_string())?;
                 let oid =
                     Oid::hash_object(ObjectType::Blob, &bytes).map_err(|err| err.to_string())?;
-                Ok(Some((
-                    file.clone(),
-                    oid,
-                    LivePathEntry::overlay(file.clone(), oid),
-                )))
+                (oid, LivePathEntry::overlay(file.clone(), oid))
             };
-            let resolved = if disk_files.len() <= 1 {
-                disk_files.iter().map(&plan_one).collect::<Vec<_>>()
-            } else {
+            Ok(Some((file.clone(), oid, entry)))
+        };
+        let plan_parallel =
+            |subset: &[ProjectFile]| -> Result<Vec<Result<PlannedLiveOid, String>>, String> {
+                if subset.len() <= 1 {
+                    return Ok(subset.iter().map(&plan_one).collect());
+                }
                 let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(config.parallelism().clamp(1, disk_files.len()))
+                    .num_threads(config.parallelism().clamp(1, subset.len()))
                     .build()
                     .map_err(|err| format!("failed to build live OID thread pool: {err}"))?;
-                pool.install(|| disk_files.par_iter().map(&plan_one).collect::<Vec<_>>())
+                Ok(pool.install(|| subset.par_iter().map(&plan_one).collect()))
             };
-            for result in resolved {
-                if let Some(entry) = result? {
-                    planned.push(entry);
-                }
-            }
-        }
+
+        let planned =
+            if replace_live_paths && let Some(liveness) = liveness {
+                // Startup and full-sweep reconciles project every disk file with
+                // one shared Git identity scan instead of hashing each clean file.
+                // Incremental updates stay on point resolution above: they carry
+                // few files and must observe the edit that triggered them without
+                // depending on the startup scan.
+                let (overlay_files, disk_files): (Vec<ProjectFile>, Vec<ProjectFile>) = files
+                    .iter()
+                    .cloned()
+                    .partition(|file| project.has_overlay(file));
+                let mut planned = plan_parallel(&overlay_files)?;
+                planned.extend(liveness.oids_for_files(&disk_files)?.into_iter().map(
+                    |(file, oid)| {
+                        let entry = LivePathEntry::filesystem(file.clone(), oid);
+                        Ok(Some((file, oid, entry)))
+                    },
+                ));
+                planned
+            } else {
+                plan_parallel(files)?
+            };
 
         let mut out = map_with_capacity(files.len());
         let mut live_entries = Vec::with_capacity(files.len());
-        for (file, oid, entry) in planned {
+        for result in planned {
+            let Some((file, oid, entry)) = result? else {
+                continue;
+            };
             live_entries.push(entry);
             out.insert(file, oid);
         }
@@ -3325,7 +3318,11 @@ where
                     }
                 }
             }
-            Err(_) => {
+            Err(error) => {
+                profiling::note(format!(
+                    "resolve_live_oids failed; reconciling {:?} without live identities: {error}",
+                    adapter.language()
+                ));
                 for (file, state) in Self::analyze_files(adapter, project, config, files, progress)
                 {
                     let Some(state) = state else {
