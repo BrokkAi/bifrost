@@ -75,6 +75,14 @@ impl LanguageAdapter for RustAdapter {
             .then(|| rust_file_package_fq(file))
     }
 
+    fn code_unit_package_is_path_derived(
+        &self,
+        code_unit: &CodeUnit,
+        _content_qualifier: &str,
+    ) -> bool {
+        !rust_unit_has_explicit_qualifier(code_unit)
+    }
+
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
         let trimmed = reference.trim();
         let before_args = trimmed

@@ -604,6 +604,10 @@ pub(super) enum ScanUsageTargetResolution {
         symbol: String,
         overloads: Vec<CodeUnit>,
     },
+    Modeled {
+        symbol: String,
+        definition: ResolvedUsageDefinition,
+    },
     NotFound(NotFoundInput),
     Ambiguous(AmbiguousUsageSymbol),
     Failure(UsageFailureInfo),
@@ -913,31 +917,71 @@ fn query_incomplete_reason(
     }
 }
 
+fn incomplete_recovery_message(
+    reason: ScanUsagesIncompleteReason,
+    surface: ScanUsagesSurface,
+) -> String {
+    match reason {
+        ScanUsagesIncompleteReason::Cancelled => format!(
+            "usage analysis was cancelled; after cancellation clears, re-call {}",
+            surface.tool_name()
+        ),
+        ScanUsagesIncompleteReason::TimeBudget => {
+            format!(
+                "usage analysis exhausted its wall-clock time budget; narrow `paths` or use a more specific selector, then re-call {}",
+                surface.tool_name()
+            )
+        }
+        ScanUsagesIncompleteReason::CandidateFiles => {
+            format!(
+                "usage analysis exhausted its candidate-file budget; narrow `paths`, then re-call {}",
+                surface.tool_name()
+            )
+        }
+        ScanUsagesIncompleteReason::SourceBytes => {
+            format!(
+                "usage analysis exhausted its source-byte budget; narrow `paths`, then re-call {}",
+                surface.tool_name()
+            )
+        }
+        ScanUsagesIncompleteReason::Callsites => format!(
+            "usage analysis exhausted its callsite budget; narrow `paths` or use a more specific selector, then re-call {}",
+            surface.tool_name()
+        ),
+        ScanUsagesIncompleteReason::ResponseBudget => format!(
+            "usage results were summarized to fit the response budget; re-call {} with one target to maximize retained detail, but exhaustive modeled relation retrieval is unavailable",
+            surface.tool_name()
+        ),
+    }
+}
+
+fn mark_incomplete(
+    entry: &mut ScanUsagesEntry,
+    reason: ScanUsagesIncompleteReason,
+    surface: ScanUsagesSurface,
+) -> bool {
+    let mut changed = entry.complete || entry.incomplete_reason != Some(reason);
+    entry.complete = false;
+    entry.incomplete_reason = Some(reason);
+    let recovery = incomplete_recovery_message(reason, surface);
+    if entry.message.is_none() {
+        entry.message = Some(recovery);
+        changed = true;
+    } else if entry.message.as_deref() != Some(recovery.as_str())
+        && !entry.notes.contains(&recovery)
+    {
+        entry.notes.push(recovery);
+        changed = true;
+    }
+    changed
+}
+
 fn incomplete_work_entry(
     request: ScanUsageRequest,
     symbol: Option<String>,
     reason: ScanUsagesIncompleteReason,
 ) -> ScanUsagesWorkEntry {
-    let message = match reason {
-        ScanUsagesIncompleteReason::Cancelled => {
-            "usage analysis was cancelled before it could produce a complete answer".to_string()
-        }
-        ScanUsagesIncompleteReason::TimeBudget => {
-            "usage analysis exhausted its wall-clock time budget".to_string()
-        }
-        ScanUsagesIncompleteReason::CandidateFiles => {
-            "usage analysis exhausted its candidate-file budget".to_string()
-        }
-        ScanUsagesIncompleteReason::SourceBytes => {
-            "usage analysis exhausted its source-byte budget".to_string()
-        }
-        ScanUsagesIncompleteReason::Callsites => {
-            "usage analysis exhausted its callsite budget".to_string()
-        }
-        ScanUsagesIncompleteReason::ResponseBudget => {
-            "usage results were summarized to fit the response budget".to_string()
-        }
-    };
+    let message = incomplete_recovery_message(reason, request.surface);
     ScanUsagesWorkEntry::Incomplete {
         request,
         symbol,
@@ -1246,6 +1290,68 @@ pub(super) fn resolve_scan_usages_target(
     };
 
     let range_context = DeclarationNameRangeContext::new(&file, source);
+
+    if let Some(overlay) = analyzer.semantic_model_overlay() {
+        let path = rel_path_string(&file);
+        let mut modeled = overlay
+            .symbols_at_authored_path(&path)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                let crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor) =
+                    &symbol.location
+                else {
+                    return false;
+                };
+                let range = crate::analyzer::Range {
+                    start_byte: anchor.range.start_byte,
+                    end_byte: anchor.range.end_byte,
+                    start_line: anchor.range.start_line,
+                    end_line: anchor.range.end_line,
+                };
+                scan_usages_target_matches_range(selection, range)
+                    && selector.is_none_or(|requested| {
+                        symbol.id == requested
+                            || symbol.name == requested
+                            || symbol.qualified_name == requested
+                    })
+            })
+            .collect::<Vec<_>>();
+        modeled.sort_by(|left, right| left.id.cmp(&right.id));
+        modeled.dedup_by(|left, right| left.id == right.id);
+        if modeled.len() == 1 && !modeled[0].provenance.ambiguous {
+            let symbol = modeled[0];
+            return ScanUsageTargetResolution::Modeled {
+                symbol: symbol.qualified_name.clone(),
+                definition: ResolvedUsageDefinition {
+                    fq_name: symbol.qualified_name.clone(),
+                    path,
+                    line: symbol.location.range().start_line,
+                },
+            };
+        }
+        if !modeled.is_empty() {
+            let candidate_targets = modeled
+                .iter()
+                .map(|symbol| symbol.qualified_name.clone())
+                .collect::<Vec<_>>();
+            return ScanUsageTargetResolution::Ambiguous(AmbiguousUsageSymbol {
+                symbol: scan_usages_target_label(&target),
+                short_name: target.symbol.clone().unwrap_or_default(),
+                candidate_targets,
+                candidate_details: Vec::new(),
+                candidate_details_total: None,
+                candidate_details_truncated: false,
+                candidates: Vec::new(),
+                candidate_files_truncated: false,
+                definition_sites_excluded: None,
+                note: Some(
+                    "Ambiguous modeled location; provide an exact model declaration selector."
+                        .to_owned(),
+                ),
+            });
+        }
+    }
 
     // The selector to match is an explicit parameter (not closed over) so the
     // same pool computation can be re-run with `selector_arg: None` below for
@@ -1743,7 +1849,7 @@ pub(crate) fn scan_usages_by_location_with_context(
         .enumerate()
         .map(|(index, target)| ScanUsageRequest::target(index, target))
         .collect();
-    scan_usages_backend(
+    let mut result = scan_usages_backend(
         analyzer,
         ScanUsagesSurface::Location,
         params.include_tests,
@@ -1752,7 +1858,9 @@ pub(crate) fn scan_usages_by_location_with_context(
         targets,
         params.include_same_owner,
         context,
-    )
+    );
+    attach_model_relations(analyzer, &mut result);
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1857,6 +1965,27 @@ pub(super) fn scan_usages_backend(
                     symbol,
                     overloads,
                     location_selected: true,
+                });
+            }
+            ScanUsageTargetResolution::Modeled { symbol, definition } => {
+                work_entries.push(ScanUsagesWorkEntry::Usage {
+                    request,
+                    state: SymbolUsageRenderState::new(
+                        symbol,
+                        Some(definition),
+                        false,
+                        0,
+                        Vec::new(),
+                        0,
+                        Vec::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                        include_same_owner,
+                    ),
+                    candidate_files_sample: None,
+                    target_is_method: false,
+                    incomplete_reason: None,
                 });
             }
             ScanUsageTargetResolution::NotFound(item) => {
@@ -3251,12 +3380,16 @@ pub(super) fn classify_usage_entry(
         let (short_name, total_callsites, limit) =
             callsite_cap.expect("too_many_callsites entry includes cap details");
         let mut result = scan_usages_entry_base(request, ScanUsagesStatus::TooManyCallsites, false);
-        result.incomplete_reason = Some(ScanUsagesIncompleteReason::Callsites);
         populate_usage_payload(&mut result, usage, target_is_method, &[], request.surface);
         result.short_name = Some(short_name);
         result.total_callsites = Some(total_callsites);
         result.limit = Some(limit);
         result.message = Some(too_many_callsites_note(limit));
+        mark_incomplete(
+            &mut result,
+            ScanUsagesIncompleteReason::Callsites,
+            request.surface,
+        );
         return result;
     }
 
@@ -3291,7 +3424,6 @@ pub(super) fn classify_usage_entry(
     };
 
     let mut result = scan_usages_entry_base(request, status, complete);
-    result.incomplete_reason = incomplete_reason;
     if usage.candidate_files_truncated {
         result.candidate_files_sample = candidate_files_sample;
     }
@@ -3304,6 +3436,9 @@ pub(super) fn classify_usage_entry(
     );
     if status == ScanUsagesStatus::UnverifiedAbsent {
         result.absence_caveats = caveats;
+    }
+    if let Some(reason) = incomplete_reason {
+        mark_incomplete(&mut result, reason, request.surface);
     }
     result
 }
@@ -3714,6 +3849,99 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
             != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
         {
             if symbol.disposition
+                == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
+                && authored_target
+                && whole_workspace
+            {
+                let authored_name = entry.fq_name.as_deref().unwrap_or_default();
+                let mut reverse_relations = overlay
+                    .relations()
+                    .iter()
+                    .filter(|relation| {
+                        relation.kind == "navigates_to" && relation.to == authored_name
+                    })
+                    .collect::<Vec<_>>();
+                reverse_relations.sort_by(|left, right| left.id.cmp(&right.id));
+                if reverse_relations
+                    .iter()
+                    .any(|relation| relation.provenance.ambiguous)
+                {
+                    entry.notes.push(
+                        "Conflicting modeled relations were omitted; authored usage resolution retained precedence."
+                            .to_string(),
+                    );
+                    continue;
+                }
+                let mut modeled_references = BTreeMap::<String, Vec<UsageLocation>>::new();
+                for relation in &reverse_relations {
+                    let source = overlay.symbols_with_id(&relation.from);
+                    if source.disposition
+                        != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                    {
+                        continue;
+                    }
+                    for file in authored_model_references(analyzer, &overlay, source.records[0]) {
+                        modeled_references
+                            .entry(file.path)
+                            .or_default()
+                            .extend(file.hits);
+                    }
+                }
+                let mut modeled_references = modeled_references
+                    .into_iter()
+                    .map(|(path, mut hits)| {
+                        hits.sort_by_key(|hit| (hit.line, hit.column));
+                        hits.dedup_by(|left, right| {
+                            left.line == right.line && left.column == right.column
+                        });
+                        UsageFileGroup {
+                            path,
+                            hits,
+                            hit_count: None,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let authored_hits = modeled_references
+                    .iter()
+                    .map(|file| file.hits.len())
+                    .sum::<usize>();
+                if authored_hits != 0 {
+                    entry.files.append(&mut modeled_references);
+                    entry
+                        .files
+                        .sort_by(|left, right| left.path.cmp(&right.path));
+                    entry.total_hits = Some(
+                        entry
+                            .total_hits
+                            .unwrap_or_default()
+                            .saturating_add(authored_hits),
+                    );
+                    entry.status = ScanUsagesStatus::Found;
+                    entry.notes.push(
+                        "Generated accessors were matched through modeled navigation relations."
+                            .to_owned(),
+                    );
+                }
+                let total_model_relations = reverse_relations.len();
+                entry.model_relations = reverse_relations
+                    .into_iter()
+                    .take(MAX_MODEL_RELATIONS_PER_SYMBOL)
+                    .cloned()
+                    .collect();
+                entry.model_relations_omitted =
+                    total_model_relations.saturating_sub(entry.model_relations.len());
+                if !entry.model_relations.is_empty() {
+                    entry.total_hits = Some(
+                        entry
+                            .total_hits
+                            .unwrap_or_default()
+                            .saturating_add(entry.model_relations.len()),
+                    );
+                    entry.status = ScanUsagesStatus::Found;
+                }
+                continue;
+            }
+            if symbol.disposition
                 == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict
             {
                 if authored_target {
@@ -3733,8 +3961,7 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
         }
         let model_symbol = symbol.records[0];
         if whole_workspace {
-            let authored_references =
-                go_authored_model_references(analyzer, &overlay, model_symbol);
+            let authored_references = authored_model_references(analyzer, &overlay, model_symbol);
             let authored_hits = authored_references
                 .iter()
                 .map(|file| file.hits.len())
@@ -3754,7 +3981,7 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
                 );
                 entry.status = ScanUsagesStatus::Found;
                 entry.notes.push(
-                    "Workspace Go references were matched from structured import selectors."
+                    "Workspace references were matched through structured definition resolution."
                         .to_owned(),
                 );
             }
@@ -3814,6 +4041,126 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
     }
     fit_model_relations_to_response_budget(result);
     result.summary = build_scan_usages_summary(&result.results);
+}
+
+fn authored_model_references(
+    analyzer: &dyn IAnalyzer,
+    overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+) -> Vec<UsageFileGroup> {
+    use crate::analyzer::structural::{NormalizedKind, Role};
+    use crate::searchtools::navigation::{
+        DefinitionReferenceQuery, GetDefinitionParams, get_definitions_by_location,
+    };
+
+    if symbol.language == "go" {
+        return go_authored_model_references(analyzer, overlay, symbol);
+    }
+    if !symbol.externally_visible() {
+        return Vec::new();
+    }
+
+    let mut grouped = BTreeMap::<String, Vec<UsageLocation>>::new();
+    for provider in analyzer
+        .structural_search_providers()
+        .into_iter()
+        .filter(|provider| provider.structural_language().config_label() == symbol.language)
+    {
+        let mut files = provider.structural_files();
+        files.sort();
+        files.dedup();
+        for file in files {
+            let Some(facts) = provider.structural_facts(&file) else {
+                continue;
+            };
+            let mut spans = Vec::new();
+            for (index, node) in facts.nodes().iter().enumerate() {
+                if !matches!(
+                    node.kind,
+                    NormalizedKind::Call | NormalizedKind::FieldAccess
+                ) {
+                    continue;
+                }
+                if let Some(name) = node.name
+                    && name.text(facts.source()) == symbol.name
+                {
+                    spans.push(name);
+                }
+                let node_id = u32::try_from(index).expect("structural fact IDs fit u32");
+                spans.extend(
+                    facts
+                        .roles(node_id)
+                        .iter()
+                        .filter(|target| target.role == Role::Kwarg)
+                        .filter_map(|target| target.keyword)
+                        .filter(|keyword| keyword.text(facts.source()) == symbol.name),
+                );
+            }
+            spans.sort_by_key(|span| (span.start_byte, span.end_byte));
+            spans.dedup();
+            let lines = facts.source().lines().collect::<Vec<_>>();
+            for span in spans {
+                let (line, column) = facts.line_column_of_byte(span.start_byte);
+                let result = get_definitions_by_location(
+                    analyzer,
+                    GetDefinitionParams {
+                        references: vec![DefinitionReferenceQuery {
+                            path: file.rel_path().to_string_lossy().replace('\\', "/"),
+                            line: Some(line),
+                            column: Some(column),
+                        }],
+                    },
+                );
+                let resolves_to_symbol = result.results.first().is_some_and(|result| {
+                    result.definitions.iter().any(|candidate| {
+                        candidate
+                            .semantic_model
+                            .as_ref()
+                            .is_some_and(|provenance| provenance.record_id == symbol.id)
+                    })
+                });
+                if !resolves_to_symbol {
+                    continue;
+                }
+                let range = crate::analyzer::Range {
+                    start_byte: span.start_byte,
+                    end_byte: span.end_byte,
+                    start_line: line,
+                    end_line: facts.line_of_byte(span.end_byte),
+                };
+                let enclosing = analyzer
+                    .enclosing_code_unit(&file, &range)
+                    .map(|unit| unit.fq_name())
+                    .unwrap_or_default();
+                grouped
+                    .entry(crate::path_utils::rel_path_string(&file))
+                    .or_default()
+                    .push(UsageLocation {
+                        line,
+                        column: Some(column),
+                        end_line: Some(range.end_line),
+                        end_column: Some(column.saturating_add(span.end_byte - span.start_byte)),
+                        enclosing,
+                        kind: None,
+                        snippet: lines
+                            .get(line.saturating_sub(1))
+                            .map(|line| (*line).to_owned()),
+                        confidence: 1.0,
+                    });
+            }
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(path, mut hits)| {
+            hits.sort_by_key(|hit| (hit.line, hit.column));
+            UsageFileGroup {
+                path,
+                hits,
+                hit_count: None,
+            }
+        })
+        .collect()
 }
 
 fn go_authored_model_references(
@@ -3927,7 +4274,6 @@ fn go_authored_model_references(
 }
 
 fn fit_model_relations_to_response_budget(result: &mut ScanUsagesResult) {
-    const MODEL_RELATION_METADATA_MARGIN_BYTES: usize = 256;
     let mut relation_sizes = result
         .results
         .iter()
@@ -3943,24 +4289,26 @@ fn fit_model_relations_to_response_budget(result: &mut ScanUsagesResult) {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    trim_model_relations_to_serialized_budget(
-        result,
-        &mut relation_sizes,
-        SCAN_USAGES_RESPONSE_BUDGET_BYTES.saturating_sub(MODEL_RELATION_METADATA_MARGIN_BYTES),
-    );
-    for entry in result
-        .results
-        .iter_mut()
-        .filter(|entry| entry.model_relations_omitted != 0)
-    {
-        entry.complete = false;
-        entry.incomplete_reason = Some(ScanUsagesIncompleteReason::ResponseBudget);
+    let surface = result.surface;
+    loop {
+        trim_model_relations_to_serialized_budget(
+            result,
+            &mut relation_sizes,
+            SCAN_USAGES_RESPONSE_BUDGET_BYTES,
+        );
+        let mut guidance_changed = false;
+        for entry in result
+            .results
+            .iter_mut()
+            .filter(|entry| entry.model_relations_omitted != 0)
+        {
+            guidance_changed |=
+                mark_incomplete(entry, ScanUsagesIncompleteReason::ResponseBudget, surface);
+        }
+        if !guidance_changed {
+            break;
+        }
     }
-    trim_model_relations_to_serialized_budget(
-        result,
-        &mut relation_sizes,
-        SCAN_USAGES_RESPONSE_BUDGET_BYTES,
-    );
 }
 
 fn trim_model_relations_to_serialized_budget(
@@ -4378,6 +4726,28 @@ mod tests {
         )
     }
 
+    fn scan_location_with(
+        analyzer: &RustAnalyzer,
+        cancellation: CancellationToken,
+    ) -> ScanUsagesResult {
+        scan_usages_by_location_with_cancellation(
+            analyzer,
+            ScanUsagesByLocationParams {
+                targets: vec![ScanUsagesTarget {
+                    path: "src/target.rs".to_string(),
+                    line: 1,
+                    column: None,
+                    symbol: None,
+                }],
+                include_tests: true,
+                paths: None,
+                include_same_owner: false,
+                max_duration_secs: None,
+            },
+            cancellation,
+        )
+    }
+
     #[test]
     fn issue_1416_interrupted_scan_reports_the_sites_it_proved() {
         let (_temp, analyzer) = partial_scan_fixture();
@@ -4419,12 +4789,53 @@ mod tests {
             entry.incomplete_reason
         );
         assert!(
+            entry
+                .message
+                .iter()
+                .chain(&entry.notes)
+                .any(|guidance| guidance.contains("scan_usages_by_reference")),
+            "a partial result must give structured recovery guidance"
+        );
+        assert!(
             partial.summary.partial,
             "summary must mark the batch partial"
         );
         assert!(
             entry.total_hits.is_some_and(|hits| hits <= complete_hits),
             "a partial hit list cannot exceed the complete one"
+        );
+    }
+
+    #[test]
+    fn issue_1630_location_partial_scan_gives_structured_recovery_guidance() {
+        let (_temp, analyzer) = partial_scan_fixture();
+
+        let partial = (1..=600)
+            .map(|checks| {
+                scan_location_with(
+                    &analyzer,
+                    CancellationToken::cancel_after_checks_for_test(checks),
+                )
+            })
+            .find(|result| {
+                let entry = &result.results[0];
+                !entry.complete && entry.total_hits.is_some_and(|hits| hits > 0)
+            })
+            .expect("an interrupted location scan must report the sites it proved");
+
+        let entry = &partial.results[0];
+        assert_eq!(ScanUsagesStatus::Found, entry.status);
+        assert_eq!(
+            Some(ScanUsagesIncompleteReason::Cancelled),
+            entry.incomplete_reason
+        );
+        assert!(
+            entry
+                .message
+                .iter()
+                .chain(&entry.notes)
+                .any(|guidance| guidance.contains("scan_usages_by_location")),
+            "a partial location result must give structured recovery guidance"
         );
     }
 

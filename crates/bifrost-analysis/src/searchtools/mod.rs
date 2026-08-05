@@ -14,7 +14,6 @@ use crate::analyzer::symbol_lookup::{
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::get_definition::{
     SCALA_UNSUPPORTED_CALL_TARGET_SHAPE, SCALA_UNSUPPORTED_RECEIVER,
-    java_lombok_accessor_field_candidates,
 };
 use crate::analyzer::usages::reference_site::reference_target_match_offsets;
 use crate::analyzer::usages::workspace_graph::{UsageEcosystem, WorkspaceUsageCatalog};

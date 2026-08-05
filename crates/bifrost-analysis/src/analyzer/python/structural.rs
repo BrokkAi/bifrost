@@ -3,18 +3,24 @@
 //! See `src/analyzer/structural/spec.rs` for the contract and
 //! `.agent/ISSUE_328_SEARCH_AST_EXECPLAN.md` for the design.
 
-use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{
     attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, first_named_child,
+    field_name_in_parent, first_named_child, nearest_ancestor, node_range,
 };
 use crate::analyzer::structural::{
-    Namespace, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink,
-    StructuralSpec, default_occurrence_namespace,
+    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, HoistingClass,
+    LexicalEnvironmentSupport, Namespace, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport,
+    Role, RoleSink, StructuralSpec, default_occurrence_namespace,
 };
+use crate::analyzer::{Language, Range};
+use crate::cancellation::CancellationToken;
+use brokk_bifrost_core::analyzer::structural::spec::EmbeddedLeafFact;
 use tree_sitter::Node;
 
-use super::syntax::expression_name_node;
+use super::syntax::{
+    expression_name_node, python_deferred_annotation_identifier_ranges,
+    python_node_is_in_annotation,
+};
 
 #[derive(Debug, Default)]
 pub(crate) struct PythonStructuralSpec;
@@ -47,6 +53,11 @@ const PYTHON_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("if_statement", NormalizedKind::If),
     ("for_statement", NormalizedKind::ForLoop),
     ("while_statement", NormalizedKind::WhileLoop),
+    // Python's indented suite. The module node is deliberately absent: a file
+    // scope is not a statement list nested inside another one, and making the
+    // root a fact in one language only would give Python a scope shape no
+    // other adapter has.
+    ("block", NormalizedKind::Block),
     ("decorator", NormalizedKind::Decorator),
 ];
 
@@ -154,6 +165,96 @@ fn python_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
     Some(role)
 }
 
+/// Whether a `def` declares a method, that is, whether the suite it sits in
+/// belongs to a `class_definition`.
+///
+/// This reads the parse tree rather than the nearest enclosing normalized kind
+/// because the suite between a class and its methods is itself a normalized
+/// node now (`NormalizedKind::Block`, issue #1474). Walking the concrete
+/// ancestors is also the more direct statement of the rule: a nested `def`
+/// inside a method reaches its enclosing `function_definition` first and stays
+/// a function.
+fn python_definition_is_method(definition: Node<'_>) -> bool {
+    let mut current = definition;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "class_definition" => return true,
+            // The suite that holds the members, and the wrapper a decorated
+            // definition sits in, are pass-through on the way to the owner.
+            "block" | "decorated_definition" => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The binding one Python binder token introduces, and the interval it is in
+/// effect over.
+///
+/// Python's function locals are scope-categorical rather than positional: a
+/// name assigned anywhere in a function body is a local of that function for
+/// the whole body, which is why a read above the assignment is an
+/// `UnboundLocalError` rather than a read of an outer name. That is exactly
+/// `ScopeWide`. The one positional exception is a comprehension target, which
+/// lives in the comprehension's own implicit scope; the same exception
+/// `analyzer::python::bindings` records as `PythonComprehensionBinding`.
+fn python_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+    let form = nearest_ancestor(binder, |kind| {
+        matches!(
+            kind,
+            "parameters"
+                | "lambda_parameters"
+                | "for_statement"
+                | "for_in_clause"
+                | "as_pattern"
+                | "list_comprehension"
+                | "set_comprehension"
+                | "dictionary_comprehension"
+                | "generator_expression"
+                | "function_definition"
+        )
+    })?;
+    match form.kind() {
+        "parameters" | "lambda_parameters" | "function_definition" => Some(BindingActivation {
+            kind: BindingKind::Parameter,
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
+        }),
+        "for_in_clause" => {
+            // A comprehension clause binds only inside the comprehension.
+            let comprehension = nearest_ancestor(form, |kind| {
+                matches!(
+                    kind,
+                    "list_comprehension"
+                        | "set_comprehension"
+                        | "dictionary_comprehension"
+                        | "generator_expression"
+                )
+            })?;
+            Some(BindingActivation {
+                kind: BindingKind::LoopVariable,
+                hoisting: HoistingClass::DeclaredHead,
+                activation: node_range(comprehension),
+            })
+        }
+        "for_statement" => Some(BindingActivation {
+            kind: BindingKind::LoopVariable,
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
+        }),
+        "as_pattern" => Some(BindingActivation {
+            kind: BindingKind::PatternBinder,
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
+        }),
+        _ => Some(BindingActivation {
+            kind: BindingKind::Local,
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
+        }),
+    }
+}
+
 impl StructuralSpec for PythonStructuralSpec {
     fn language(&self) -> Language {
         Language::Python
@@ -165,14 +266,12 @@ impl StructuralSpec for PythonStructuralSpec {
 
     fn refine_kind(
         &self,
-        _node: Node<'_>,
+        node: Node<'_>,
         kind: NormalizedKind,
-        enclosing: Option<NormalizedKind>,
+        _enclosing: Option<NormalizedKind>,
         _source: &str,
     ) -> NormalizedKind {
-        // A def whose nearest normalized ancestor is a class body is a
-        // method; nested defs inside methods stay functions.
-        if kind == NormalizedKind::Function && enclosing == Some(NormalizedKind::Class) {
+        if kind == NormalizedKind::Function && python_definition_is_method(node) {
             NormalizedKind::Method
         } else {
             kind
@@ -195,6 +294,14 @@ impl StructuralSpec for PythonStructuralSpec {
         &PYTHON_OCCURRENCE_ROLE_SUPPORT
     }
 
+    fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
+        &DEEP_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+        python_binding_activation(binder, scope)
+    }
+
     /// Python only classifies a scope segment inside a `dotted_name`, and every
     /// non-tail segment of a dotted name is a module.
     fn occurrence_namespace(
@@ -206,6 +313,31 @@ impl StructuralSpec for PythonStructuralSpec {
             OccurrenceRole::PathSegment => Some(Namespace::Module),
             _ => default_occurrence_namespace(role, declares),
         }
+    }
+
+    fn embedded_leaf_facts(
+        &self,
+        node: Node<'_>,
+        kind: NormalizedKind,
+        source: &str,
+        cancellation: Option<&CancellationToken>,
+    ) -> Vec<EmbeddedLeafFact> {
+        if kind != NormalizedKind::StringLiteral
+            || node.kind() != "string"
+            || !python_node_is_in_annotation(node)
+        {
+            return Vec::new();
+        }
+
+        python_deferred_annotation_identifier_ranges(node, source, cancellation)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|range| EmbeddedLeafFact {
+                kind: NormalizedKind::Identifier,
+                range,
+                occurrence_role: OccurrenceRole::TypeOperand,
+            })
+            .collect()
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
@@ -320,9 +452,138 @@ impl StructuralSpec for PythonStructuralSpec {
 mod structural_spec_tests {
     use super::*;
 
+    use crate::analyzer::common::parse_source_region;
     use crate::analyzer::structural::adapter_helpers::{
-        assert_occurrence_role, occurrence_roles_of,
+        assert_occurrence_role, block_facts_of, occurrence_roles_of,
     };
+
+    #[test]
+    fn deferred_annotation_region_parse_preserves_source_positions() {
+        let source = "def render(widget: \"Widget | list[Gadget]\") -> None:\n    pass\n";
+        let language = tree_sitter_python::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).expect("Python grammar");
+        let tree = parser.parse(source, None).expect("Python source parses");
+
+        let mut content = None;
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "string_content" {
+                content = Some(node);
+                break;
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+        let content = content.expect("deferred annotation content");
+        let string = content.parent().expect("annotation string");
+        assert!(python_node_is_in_annotation(string));
+        let inner =
+            parse_source_region(&language, source, content.start_byte(), content.end_byte())
+                .expect("annotation region parses");
+        assert!(!inner.root_node().has_error());
+
+        let mut identifiers = Vec::new();
+        let mut stack = vec![inner.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier" {
+                identifiers.push((
+                    &source[node.start_byte()..node.end_byte()],
+                    node.start_byte(),
+                    node.end_byte(),
+                ));
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+
+        assert_eq!(
+            identifiers,
+            vec![
+                (
+                    "Widget",
+                    source.find("Widget").expect("Widget offset"),
+                    source.find("Widget").expect("Widget offset") + "Widget".len(),
+                ),
+                (
+                    "list",
+                    source.find("list").expect("list offset"),
+                    source.find("list").expect("list offset") + "list".len(),
+                ),
+                (
+                    "Gadget",
+                    source.find("Gadget").expect("Gadget offset"),
+                    source.find("Gadget").expect("Gadget offset") + "Gadget".len(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn deferred_annotations_emit_type_operands_but_ordinary_strings_do_not() {
+        let source = concat!(
+            "class Widget:\n",
+            "    pass\n",
+            "class Gadget:\n",
+            "    pass\n",
+            "def render(widget: \"Widget | list[Gadget]\") -> None:\n",
+            "    return \"Widget\"\n",
+            "def malformed(widget: \"Widget[\") -> None:\n",
+            "    pass\n",
+            "def escaped(widget: \"Wid\\x67et\") -> None:\n",
+            "    pass\n",
+            "def concatenated(widget: \"Wid\" \"get\") -> None:\n",
+            "    pass\n",
+        );
+        let found = occurrence_roles_of(
+            &PYTHON_STRUCTURAL_SPEC,
+            &tree_sitter_python::LANGUAGE.into(),
+            source,
+        );
+
+        let at = |needle: &str| source.find(needle).expect("fixture token");
+        assert_occurrence_role(&found, at("Widget |"), OccurrenceRole::TypeOperand);
+        assert_occurrence_role(&found, at("list["), OccurrenceRole::TypeOperand);
+        assert_occurrence_role(&found, at("Gadget]"), OccurrenceRole::TypeOperand);
+
+        for absent in [
+            source.rfind("Widget\"").expect("ordinary string content"),
+            at("Widget["),
+            at("Wid\\x67et"),
+            source.rfind("Wid\"").expect("concatenated first content"),
+            source.rfind("get\"").expect("concatenated second content"),
+        ] {
+            assert!(
+                found.iter().all(|(start, _, _)| *start != absent),
+                "unstructured or non-annotation string content must stay absent: {found:?}"
+            );
+        }
+    }
+
+    /// Python scopes with the indented suite its grammar calls `block`. The
+    /// module node is deliberately not a block: a file scope is not a
+    /// statement list nested inside another one.
+    #[test]
+    fn python_indented_suites_become_scope_facts_but_the_module_does_not() {
+        let source = concat!("def demo(flag):\n", "    if flag:\n", "        work()\n",);
+
+        assert_eq!(
+            block_facts_of(
+                &PYTHON_STRUCTURAL_SPEC,
+                &tree_sitter_python::LANGUAGE.into(),
+                source,
+            ),
+            // A suite spans its statements only: neither the indentation that
+            // opens it nor the newline that closes it belongs to the scope.
+            vec![concat!("if flag:\n", "        work()"), "work()"]
+        );
+    }
 
     /// Python's role trap is the annotation: `label: str` puts a binder and a
     /// type operand one token apart, distinguished only by the `type` node the

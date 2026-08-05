@@ -14,6 +14,7 @@ use brokk_bifrost_analysis::analyzer::structural::CodeQuery;
 use brokk_bifrost_analysis::analyzer::structural::occurrences::{
     Namespace, OccurrenceClass, OccurrenceRole,
 };
+use brokk_bifrost_analysis::analyzer::structural::{BoundaryStatus, PrecedenceTier};
 use brokk_bifrost_analysis::schema_version::SchemaVersionResolution;
 
 pub const POLICY_DOCUMENT_SCHEMA_VERSION: u32 = 1;
@@ -103,7 +104,63 @@ impl PolicyAnalysisType {
 #[derive(Debug, Clone)]
 pub struct AssertionPolicySpec {
     pub subject: PolicySelector,
-    pub asserts: Vec<OccurrenceAssert>,
+    pub asserts: Vec<PolicyAssert>,
+}
+
+/// One authored invariant evaluated at every subject node.
+///
+/// The four families share the subject selector, the `ast_id` join, the
+/// soundness accounting and the finding anchor; they differ only in which row
+/// family they read and what they compare. Keeping them one sequence is what
+/// keeps the evaluator's completeness accounting single.
+#[derive(Debug, Clone)]
+pub enum PolicyAssert {
+    Occurrence(OccurrenceAssert),
+    Resolution(ResolutionAssert),
+    Reaching(ReachingAssert),
+    Boundary(BoundaryAssert),
+}
+
+impl PolicyAssert {
+    pub const fn id(&self) -> &PolicyAssertId {
+        match self {
+            Self::Occurrence(assertion) => &assertion.id,
+            Self::Resolution(assertion) => &assertion.id,
+            Self::Reaching(assertion) => &assertion.id,
+            Self::Boundary(assertion) => &assertion.id,
+        }
+    }
+
+    /// The subject capture whose AST node the rows are joined to.
+    pub fn at(&self) -> &str {
+        match self {
+            Self::Occurrence(assertion) => &assertion.at,
+            Self::Resolution(assertion) => &assertion.at,
+            Self::Reaching(assertion) => &assertion.at,
+            Self::Boundary(assertion) => &assertion.at,
+        }
+    }
+
+    /// The occurrence role the joined rows must carry. Capability reporting is
+    /// narrowed to exactly this role, so an adapter gap in an unrelated role
+    /// does not make the run unreliable.
+    pub const fn role(&self) -> OccurrenceRole {
+        match self {
+            Self::Occurrence(assertion) => assertion.role,
+            Self::Resolution(assertion) => assertion.role,
+            Self::Reaching(assertion) => assertion.role,
+            Self::Boundary(assertion) => assertion.role,
+        }
+    }
+
+    pub const fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Occurrence(_) => "occurrence",
+            Self::Resolution(_) => "resolution",
+            Self::Reaching(_) => "reaching",
+            Self::Boundary(_) => "boundary",
+        }
+    }
 }
 
 /// A single correlated existence/absence/cardinality invariant.
@@ -121,6 +178,187 @@ pub struct OccurrenceAssert {
     pub cardinality: AssertCardinality,
     pub namespace: Option<Namespace>,
     pub require_target: bool,
+}
+
+/// Require the resolver's selected candidate to sit at (or above) one
+/// precedence tier, optionally forbidding a named tier and ambiguity.
+///
+/// Every field is a claim about the *selected* candidate rows joined to the
+/// subject occurrence. A row whose tier the recording seam could not name
+/// (`unattributed`) makes the verdict inconclusive rather than a pass or a
+/// violation, because an absent tier is not a weak tier.
+#[derive(Debug, Clone)]
+pub struct ResolutionAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub role: OccurrenceRole,
+    pub expect_tier: PrecedenceTier,
+    /// `false` requires the exact tier; `true` accepts any tier at least as
+    /// strong as it.
+    pub at_least: bool,
+    pub forbid_tier: Option<PrecedenceTier>,
+    /// Require exactly one selected candidate. Ambiguity is a violation rather
+    /// than a silent pick.
+    pub require_unique: bool,
+}
+
+impl ResolutionAssert {
+    /// Whether a selected candidate at `tier` satisfies the expectation.
+    ///
+    /// `PrecedenceTier` is ordered strongest first, so "at least as strong as
+    /// `expect_tier`" is `tier <= expect_tier`.
+    pub fn accepts(&self, tier: PrecedenceTier) -> bool {
+        if self.forbid_tier == Some(tier) {
+            return false;
+        }
+        if self.at_least {
+            tier <= self.expect_tier
+        } else {
+            tier == self.expect_tier
+        }
+    }
+
+    /// Whether any tier at all can satisfy this assert. A decoder rejects an
+    /// assert for which no tier can, so the evaluator never runs a comparison
+    /// whose verdict was fixed before it saw a row.
+    pub fn is_satisfiable(&self) -> bool {
+        brokk_bifrost_analysis::analyzer::structural::ALL_PRECEDENCE_TIERS
+            .iter()
+            .any(|tier| self.accepts(*tier))
+    }
+
+    /// A human-readable statement of the expectation, for finding evidence.
+    pub fn expectation(&self) -> String {
+        let mut text = if self.at_least {
+            format!("selected tier at least {}", self.expect_tier.label())
+        } else {
+            format!("selected tier exactly {}", self.expect_tier.label())
+        };
+        if let Some(tier) = self.forbid_tier {
+            text.push_str(&format!(", never {}", tier.label()));
+        }
+        if self.require_unique {
+            text.push_str(", uniquely selected");
+        }
+        text
+    }
+}
+
+/// Require the reaching binding of the subject occurrence to be declared inside
+/// or outside a second captured node.
+///
+/// This is the loop-invariance predicate: capture the receiver and the loop,
+/// then ask whether the binding actually in effect at the receiver is declared
+/// within the loop body.
+#[derive(Debug, Clone)]
+pub struct ReachingAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub role: OccurrenceRole,
+    pub containment: DeclaredContainment,
+    /// The capture whose node interval the declaring scope is compared against.
+    pub relative_to: String,
+}
+
+impl ReachingAssert {
+    pub fn expectation(&self) -> String {
+        format!(
+            "reaching binding declared {} capture `{}`",
+            self.containment.label(),
+            self.relative_to
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeclaredContainment {
+    Inside,
+    Outside,
+}
+
+impl DeclaredContainment {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Inside => "inside",
+            Self::Outside => "outside",
+        }
+    }
+
+    /// Whether an observed containment satisfies the requirement.
+    pub const fn satisfied_by(self, contained: bool) -> bool {
+        match self {
+            Self::Inside => contained,
+            Self::Outside => !contained,
+        }
+    }
+}
+
+/// Forbid a name-only fallback selection once resolution has reached or passed
+/// one authoritative boundary strength.
+///
+/// The contract this expresses is "do not guess by bare name after the lookup
+/// left ground it can vouch for".
+#[derive(Debug, Clone)]
+pub struct BoundaryAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub role: OccurrenceRole,
+    pub forbid_fallback_past: BoundaryStrength,
+}
+
+impl BoundaryAssert {
+    pub fn expectation(&self) -> String {
+        format!(
+            "no name_only_fallback selection at or past {}",
+            self.forbid_fallback_past.label()
+        )
+    }
+}
+
+/// The two boundary statuses strong enough to be an authoritative boundary.
+///
+/// `workspace_local` and `external_indexed` are deliberately not authorable:
+/// resolution that stayed inside indexed ground has not left anything, so
+/// forbidding a fallback "past" them would name a boundary that was not
+/// crossed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BoundaryStrength {
+    ExternalDeclaredUnindexed,
+    ExternalUnknown,
+}
+
+impl BoundaryStrength {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ExternalDeclaredUnindexed => "external_declared_unindexed",
+            Self::ExternalUnknown => "external_unknown",
+        }
+    }
+
+    pub const fn status(self) -> BoundaryStatus {
+        match self {
+            Self::ExternalDeclaredUnindexed => BoundaryStatus::ExternalDeclaredUnindexed,
+            Self::ExternalUnknown => BoundaryStatus::ExternalUnknown,
+        }
+    }
+
+    /// Whether an observed boundary status is at or past this strength.
+    ///
+    /// `BoundaryStatus` is declared weakest first, so "at or past" is `>=`.
+    pub fn reached_by(self, observed: BoundaryStatus) -> bool {
+        boundary_rank(observed) >= boundary_rank(self.status())
+    }
+}
+
+/// Ordinal strength of a boundary status, stated once so the two comparisons
+/// that need it cannot disagree.
+const fn boundary_rank(status: BoundaryStatus) -> u8 {
+    match status {
+        BoundaryStatus::WorkspaceLocal => 0,
+        BoundaryStatus::ExternalIndexed => 1,
+        BoundaryStatus::ExternalDeclaredUnindexed => 2,
+        BoundaryStatus::ExternalUnknown => 3,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

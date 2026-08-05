@@ -945,17 +945,34 @@ fn conflicting_model_relations_make_usage_ambiguous() {
 }
 
 #[test]
-fn modeled_usage_relations_fit_the_public_response_budget() {
+fn modeled_usage_relations_fit_the_public_response_budget_across_entries() {
     let (_project, analyzer) = inline_analyzer();
     let mut source: Value = serde_json::from_slice(DECLARATIONS_JSON).unwrap();
+    for (id, name, path) in [
+        ("type.gadget", "com.acme.Gadget", "com/acme/Gadget.class"),
+        ("type.device", "com.acme.Device", "com/acme/Device.class"),
+    ] {
+        let mut modeled_type = source["shards"][0]["payload"]["types"][0].clone();
+        modeled_type["id"] = Value::String(id.to_string());
+        modeled_type["name"] = Value::String(name.to_string());
+        modeled_type["aliases"] = json!([]);
+        modeled_type["extension_surfaces"] = json!([]);
+        modeled_type["locator"]["path"] = Value::String(path.to_string());
+        modeled_type["locator"]["symbol"] = Value::String(name.to_string());
+        source["shards"][0]["payload"]["types"]
+            .as_array_mut()
+            .unwrap()
+            .push(modeled_type);
+    }
+    let targets = ["type.widget", "type.gadget", "type.device"];
     source["shards"][0]["payload"]["relations"] = Value::Array(
-        (0..200)
+        (0..600)
             .map(|index| {
                 json!({
                     "id": format!("relation.widget.reference.{index:03}"),
                     "relation_kind": "references",
                     "from": "member.widget.create",
-                    "to": "type.widget"
+                    "to": targets[index % targets.len()]
                 })
             })
             .collect(),
@@ -984,20 +1001,38 @@ fn modeled_usage_relations_fit_the_public_response_budget() {
     let usages = scan_usages_by_reference(
         analyzer.analyzer(),
         ScanUsagesByReferenceParams {
-            symbols: vec!["com.acme.Widget".to_string()],
+            symbols: vec![
+                "com.acme.Widget".to_string(),
+                "com.acme.Gadget".to_string(),
+                "com.acme.Device".to_string(),
+            ],
             include_tests: false,
             paths: None,
             include_same_owner: false,
             max_duration_secs: None,
         },
     );
-    let entry = &usages.results[0];
-    assert!(entry.model_relations_omitted > 0);
-    assert!(!entry.complete);
-    assert_eq!(
-        entry.incomplete_reason,
-        Some(ScanUsagesIncompleteReason::ResponseBudget)
-    );
+    let incomplete = usages
+        .results
+        .iter()
+        .filter(|entry| entry.model_relations_omitted > 0)
+        .collect::<Vec<_>>();
+    assert!(incomplete.len() > 1);
+    for entry in incomplete {
+        assert!(!entry.complete);
+        assert_eq!(
+            entry.incomplete_reason,
+            Some(ScanUsagesIncompleteReason::ResponseBudget)
+        );
+        assert!(
+            entry
+                .message
+                .iter()
+                .chain(&entry.notes)
+                .any(|guidance| guidance.contains("scan_usages_by_reference")),
+            "each response-budget result must give structured recovery guidance"
+        );
+    }
     assert!(serde_json::to_vec(&usages).unwrap().len() <= 8 * 1024);
 }
 
@@ -1242,6 +1277,96 @@ fn active_generator_rule_emits_a_typed_model_declaration_with_rule_provenance() 
             .semantic_model
             .as_ref()
             .and_then(|provenance| provenance.rule_id.as_deref()),
+        Some("rule.builder")
+    );
+}
+
+#[test]
+fn repeated_argument_captures_emit_ordered_declarations_with_authored_anchors() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/app/Order.java",
+            "package app; class Order { void make() { build(first, second); } }",
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut source: Value = serde_json::from_slice(GENERATOR_RULES_JSON).unwrap();
+    let rule = &mut source["shards"][0]["payload"]["rules"][0];
+    rule["trigger"] = json!({ "kind": "language_construct", "construct": "call" });
+    rule["captures"] = json!([
+      {
+        "name": "owner_id",
+        "binding": {
+          "source": { "kind": "enclosing_declaration" },
+          "projection": "stable_id"
+        },
+        "value_kind": "stable_id",
+        "cardinality": "one"
+      },
+      {
+        "name": "argument",
+        "binding": {
+          "source": { "kind": "arguments", "from": 0 },
+          "projection": "stable_id"
+        },
+        "value_kind": "stable_id",
+        "cardinality": "many"
+      }
+    ]);
+    rule["emissions"] = json!([{
+      "kind": "declaration",
+      "id": { "op": "capture", "name": "argument" },
+      "name": { "op": "literal", "value": "generated" },
+      "anchor": { "op": "capture", "name": "argument" },
+      "declaration": {
+        "kind": "member",
+        "owner": { "op": "capture", "name": "owner_id" },
+        "member_kind": "method",
+        "visibility": "public"
+      }
+    }]);
+
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    catalog
+        .register_session_pack(
+            &compiled_from_value(&source),
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "repeated-generator-fixture".to_owned(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        acquire_active_semantic_models(
+            analyzer.analyzer(),
+            &catalog,
+            None,
+            &generator_activation_request(),
+            &CancellationToken::default(),
+        ),
+        SemanticModelRuntimeOutcome::Ready { .. }
+    ));
+
+    let overlay = analyzer.analyzer().semantic_model_overlay().unwrap();
+    let first = overlay.symbols_with_id("app.Order.make.first");
+    let second = overlay.symbols_with_id("app.Order.make.second");
+    assert_eq!(first.disposition, SemanticModelOverlayDisposition::Unique);
+    assert_eq!(second.disposition, SemanticModelOverlayDisposition::Unique);
+    let SemanticModelLocation::Authored(first_anchor) = &first.records[0].location else {
+        panic!("the first repeated declaration needs an authored anchor");
+    };
+    let SemanticModelLocation::Authored(second_anchor) = &second.records[0].location else {
+        panic!("the second repeated declaration needs an authored anchor");
+    };
+    assert_eq!(first_anchor.path, "src/app/Order.java");
+    assert_eq!(first_anchor.symbol, "app.Order.make.first");
+    assert!(first_anchor.range.start_byte < second_anchor.range.start_byte);
+    assert_eq!(
+        first.records[0].provenance.rule_id.as_deref(),
+        Some("rule.builder")
+    );
+    assert_eq!(
+        second.records[0].provenance.rule_id.as_deref(),
         Some("rule.builder")
     );
 }

@@ -1419,14 +1419,18 @@ fn write_evidence_summary<W: Write>(
             .map_err(map_io_error)?;
         }
         PolicyFindingEvidence::Assertion { evidence } => {
+            let observed = evidence
+                .observed()
+                .map_or_else(|| evidence.actual_count().to_string(), str::to_string);
             writeln!(
                 output,
-                "  evidence: assertion {} at role {}; expected {} {}, found {}",
+                "  evidence: {} assertion {} at role {}; expected {} {}, found {}",
+                escape_terminal_text(evidence.assert_kind()),
                 escape_terminal_text(evidence.anchor().assert_id()),
                 escape_terminal_text(evidence.asserted_role()),
                 escape_terminal_text(evidence.expected_class()),
-                escape_terminal_text(evidence.expected_cardinality()),
-                evidence.actual_count(),
+                escape_terminal_text(evidence.expectation()),
+                escape_terminal_text(&observed),
             )
             .map_err(map_io_error)?;
         }
@@ -2699,6 +2703,9 @@ const fn match_result_domain(value: MatchResultDomain) -> &'static str {
         MatchResultDomain::CallSite => "call_site",
         MatchResultDomain::ExpressionSite => "expression_site",
         MatchResultDomain::Occurrence => "occurrence",
+        MatchResultDomain::LexicalScope => "lexical_scope",
+        MatchResultDomain::Binding => "binding",
+        MatchResultDomain::ResolutionCandidate => "resolution_candidate",
     }
 }
 
@@ -2713,6 +2720,10 @@ const fn location_relationship(value: PolicyLocationRelationship) -> &'static st
         PolicyLocationRelationship::CallTarget => "call_target",
         PolicyLocationRelationship::Subject => "subject",
         PolicyLocationRelationship::ExpectedOccurrence => "expected_occurrence",
+        PolicyLocationRelationship::SelectedCandidate => "selected_candidate",
+        PolicyLocationRelationship::ConsideredCandidate => "considered_candidate",
+        PolicyLocationRelationship::ReachingBinding => "reaching_binding",
+        PolicyLocationRelationship::DeclaringScope => "declaring_scope",
         PolicyLocationRelationship::ActualOccurrence => "actual_occurrence",
     }
 }

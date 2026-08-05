@@ -409,6 +409,18 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn hydrate_content_qualifier(&self, content_qualifier: &str, _file: &ProjectFile) -> String {
         content_qualifier.to_string()
     }
+    /// Whether this unit's structured package prefix must be rebuilt from its
+    /// live path when hydrating a content-addressed blob. This is distinct from
+    /// the persisted qualifier text: an explicitly root-qualified declaration
+    /// may legitimately have an empty package without being path-derived.
+    fn code_unit_package_is_path_derived(
+        &self,
+        code_unit: &CodeUnit,
+        content_qualifier: &str,
+    ) -> bool {
+        self.path_derived_package_fq(content_qualifier, code_unit.source())
+            .is_some()
+    }
     /// Return the structured package/module prefix when it depends on the
     /// live path rather than solely on the persisted source blob. `None` means
     /// the complete structured name can be persisted with the blob.
@@ -9726,6 +9738,23 @@ mod tests {
             rust.storage_content_qualifier(&local_rust_impl_member, "net"),
             ""
         );
+        assert!(rust.code_unit_package_is_path_derived(&local_rust_impl_member, ""));
+        let explicit_root_rust_impl_member = CodeUnit::with_signature(
+            rust_file.clone(),
+            CodeUnitType::Function,
+            "",
+            "ExplicitPaths.into",
+            Some(
+                "impl core::convert::Into<bool> for crate::ExplicitPaths::fn into(self) -> bool { ... }"
+                    .to_string(),
+            ),
+            false,
+        );
+        assert_eq!(
+            rust.storage_content_qualifier(&explicit_root_rust_impl_member, "net"),
+            ""
+        );
+        assert!(!rust.code_unit_package_is_path_derived(&explicit_root_rust_impl_member, ""));
 
         std::fs::write(root.join("go.mod"), "module example.com/demo\n").unwrap();
         let go_file = temp_file(&root, "internal/service/service.go");
@@ -9774,6 +9803,7 @@ mod tests {
             identifier: Some("value".to_string()),
             alias: None,
             path: None,
+            binder_span: None,
         });
         assert!(adapter.storage_contains_tests(&state));
         assert!(adapter.hydrate_contains_tests(false, &tsx_file, ""));
@@ -10561,6 +10591,7 @@ mod tests {
                 identifier: None,
                 alias: None,
                 path: None,
+                binder_span: None,
             })
             .collect()
     }

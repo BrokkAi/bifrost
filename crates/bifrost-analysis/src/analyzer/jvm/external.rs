@@ -1025,6 +1025,21 @@ impl JvmExternalDeclarationIndex {
         &self.production_diagnostics
     }
 
+    /// How many diagnostics the artifact producers raised while this index was
+    /// built.
+    ///
+    /// A non-zero count means the build declared JVM artifacts that the index
+    /// could not read to the end -- an archive past `MAX_ARCHIVE_ENTRIES`, a
+    /// class past `MAX_CLASS_ENTRY_BYTES`, an artifact set past
+    /// `MAX_INDEX_ARTIFACTS`. It is the difference between "this name is not
+    /// declared anywhere" and "this name may well be declared in a dependency
+    /// nothing finished indexing", which is exactly the boundary distinction a
+    /// resolution trace must report. The full diagnostics stay test-only; a
+    /// count is all a boundary classification needs.
+    pub(crate) fn production_diagnostic_count(&self) -> usize {
+        self.production_diagnostics.len()
+    }
+
     pub(crate) fn get(&self, fqn: &str) -> Option<&JvmExternalType> {
         self.types_by_fqn.get(fqn)
     }

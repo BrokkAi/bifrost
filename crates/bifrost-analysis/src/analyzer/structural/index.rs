@@ -1489,6 +1489,13 @@ mod tests {
         fn structural_supports_occurrence_role(&self, _role: OccurrenceRole) -> bool {
             true
         }
+
+        fn structural_supports_environment_axis(
+            &self,
+            _axis: crate::analyzer::structural::resolution::EnvironmentAxis,
+        ) -> bool {
+            true
+        }
     }
 
     fn provider() -> FakeProvider {
@@ -1501,6 +1508,7 @@ mod tests {
             vec![0, 11],
             vec![NormalizedNode {
                 kind: NormalizedKind::Class,
+                construct: None,
                 range: Range {
                     start_byte: 0,
                     end_byte: 19,
@@ -1537,6 +1545,7 @@ mod tests {
                     } else {
                         NormalizedKind::Function
                     },
+                    construct: None,
                     range: Range {
                         start_byte,
                         end_byte: start_byte + "Shared".len(),
@@ -1779,6 +1788,7 @@ mod tests {
             vec![0],
             vec![NormalizedNode {
                 kind: NormalizedKind::Class,
+                construct: None,
                 range: Range {
                     start_byte: 0,
                     end_byte: identifier.len(),

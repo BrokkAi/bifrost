@@ -83,8 +83,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+mod environment;
 mod expansions;
 mod occurrences;
+use environment::{
+    BindingKey, BindingValue, CandidateKey, CandidateValue, EnvironmentTraversalCache, ScopeKey,
+    ScopeValue,
+};
 use occurrences::{OccurrenceKey, OccurrenceTraversalCache, OccurrenceValue};
 mod results;
 mod semantic;
@@ -123,12 +128,16 @@ use expansions::{
 // Re-export the exact previous public/pub(crate) surface of `search.rs` so
 // that `crate::analyzer::structural::search::X` keeps resolving for every
 // existing consumer path unchanged.
+use super::lexical_environment::ReachingBindingOutcome;
 use super::occurrence_rows::{OccurrenceRow, OccurrenceTarget};
 use super::occurrences::OccurrenceClass;
-use super::query::{OccurrenceFilter, OccurrenceSeed};
+use super::query::{BindingFilter, CandidateFilter, OccurrenceFilter, OccurrenceSeed, ScopeFilter};
 use crate::analyzer::semantic::ContentIdentity;
+use crate::analyzer::usages::get_definition::TraceCandidateRef;
+pub use results::CodeQueryBinding;
 pub use results::CodeQueryCallArgument;
 pub use results::CodeQueryCallSite;
+pub use results::CodeQueryCandidateRef;
 pub use results::CodeQueryCapture;
 pub use results::CodeQueryCompletion;
 pub use results::CodeQueryControlEdge;
@@ -156,6 +165,8 @@ pub use results::CodeQueryFlowSymbolSite;
 pub use results::CodeQueryFlowWitness;
 pub use results::CodeQueryFlowWitnessStep;
 pub use results::CodeQueryFlowWitnessStepKind;
+pub use results::CodeQueryImportBinder;
+pub use results::CodeQueryLexicalScope;
 pub use results::CodeQueryMatch;
 pub use results::CodeQueryOccurrence;
 pub use results::CodeQueryOccurrenceTarget;
@@ -169,6 +180,7 @@ pub use results::CodeQueryRange;
 pub use results::CodeQueryReceiverAnalysis;
 pub use results::CodeQueryReceiverValue;
 pub use results::CodeQueryReferenceSite;
+pub use results::CodeQueryResolutionCandidate;
 pub use results::CodeQueryResponse;
 pub use results::CodeQueryResult;
 pub use results::CodeQueryResultItem;
@@ -450,6 +462,9 @@ enum PipelineValue {
     ExpressionSite(ExpressionSiteValue),
     ReceiverAnalysis(ReceiverAnalysisValue),
     Occurrence(OccurrenceValue),
+    LexicalScope(ScopeValue),
+    Binding(BindingValue),
+    ResolutionCandidate(Box<CandidateValue>),
 }
 
 #[derive(Debug, Clone)]
@@ -485,6 +500,9 @@ enum PipelineKey {
     ExpressionSite(ExpressionSiteValue),
     ReceiverAnalysis(ReceiverQueryOperation, ProjectFile, Range),
     Occurrence(OccurrenceKey),
+    LexicalScope(ScopeKey),
+    Binding(BindingKey),
+    ResolutionCandidate(CandidateKey),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -517,6 +535,9 @@ impl PipelineValue {
                 value.report.site.range,
             ),
             Self::Occurrence(value) => PipelineKey::Occurrence(value.key()),
+            Self::LexicalScope(value) => PipelineKey::LexicalScope(value.key()),
+            Self::Binding(value) => PipelineKey::Binding(value.key()),
+            Self::ResolutionCandidate(value) => PipelineKey::ResolutionCandidate(value.key()),
         }
     }
 }
@@ -731,6 +752,9 @@ enum PipelineTraceValue {
     ExpressionSite(ExpressionSiteValue),
     ReceiverAnalysis(ReceiverAnalysisValue),
     Occurrence(OccurrenceValue),
+    LexicalScope(ScopeValue),
+    Binding(BindingValue),
+    ResolutionCandidate(Box<CandidateValue>),
 }
 
 #[derive(Debug, Clone)]
@@ -1424,6 +1448,7 @@ struct QueryExecutionState<'a> {
     reference_cache: ReferenceTraversalCache,
     call_cache: CallTraversalCache,
     occurrence_cache: OccurrenceTraversalCache,
+    environment_cache: EnvironmentTraversalCache,
     receiver_facts: HashMap<ProjectFile, Arc<FileFacts>>,
     semantic: Option<SemanticQueryContext<'a>>,
     import_graph: Option<RequestLocalDirectImportGraph>,
@@ -2137,6 +2162,7 @@ fn execute_internal_with_analysis_strategy(
         indexed_declarations: IndexedDeclarations::default(),
         reference_cache: ReferenceTraversalCache::default(),
         occurrence_cache: OccurrenceTraversalCache::default(),
+        environment_cache: EnvironmentTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
         receiver_facts: HashMap::default(),
         semantic: workspace.filter(|_| requires_semantic).map(|workspace| {
@@ -2638,6 +2664,69 @@ fn detailed_evidence_for_pipeline_value(
                 provenance: Vec::new(),
             }
         }
+        PipelineValue::LexicalScope(value) => {
+            let row = value.row();
+            let byte_span = row.range.start_byte..row.range.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::LexicalScope,
+                key: DetailedCodeQueryKey::LexicalScope {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                    index: row.index,
+                },
+                file: row.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::Binding(value) => {
+            let row = value.row();
+            let byte_span = row.range.start_byte..row.range.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::Binding,
+                key: DetailedCodeQueryKey::Binding {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                    name: row.name.clone(),
+                },
+                file: row.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::ResolutionCandidate(value) => {
+            let row = &value.occurrence;
+            let byte_span = row.range.start_byte..row.range.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::ResolutionCandidate,
+                key: DetailedCodeQueryKey::ResolutionCandidate {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                    ordinal: value.ordinal,
+                },
+                file: row.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: row
+                    .enclosing
+                    .as_ref()
+                    .and_then(|unit| stable_owner_candidate_for_unit(&row.file, unit)),
+                provenance: Vec::new(),
+            }
+        }
     }
 }
 
@@ -2696,6 +2785,9 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::CallSite(site) => Some(&site.0.file),
         PipelineValue::ExpressionSite(site) => Some(&site.call_site.0.file),
         PipelineValue::Occurrence(value) => Some(value.file()),
+        PipelineValue::LexicalScope(value) => Some(value.file()),
+        PipelineValue::Binding(value) => Some(value.file()),
+        PipelineValue::ResolutionCandidate(value) => Some(value.file()),
         PipelineValue::File(_) | PipelineValue::ReceiverAnalysis(_) => None,
     }
 }
@@ -2793,6 +2885,15 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::Occurrence(value) => {
             files.insert(value.file().clone());
         }
+        PipelineValue::LexicalScope(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::Binding(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::ResolutionCandidate(value) => {
+            files.insert(value.file().clone());
+        }
     }
 }
 
@@ -2812,6 +2913,15 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
         }
         PipelineTraceValue::ReceiverAnalysis(value) => collect_receiver_source_files(value, files),
         PipelineTraceValue::Occurrence(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::LexicalScope(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::Binding(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::ResolutionCandidate(value) => {
             files.insert(value.file().clone());
         }
     }
@@ -2997,6 +3107,48 @@ fn detailed_trace_provenance_ref(
             detailed_receiver_provenance_ref(value, cache)
         }
         PipelineTraceValue::Occurrence(value) => detailed_occurrence_provenance_ref(value, cache),
+        PipelineTraceValue::LexicalScope(value) => {
+            let row = value.row();
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::LexicalScope,
+                DetailedCodeQueryKey::LexicalScope {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                    index: row.index,
+                },
+                &row.file,
+                row.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::Binding(value) => {
+            let row = value.row();
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::Binding,
+                DetailedCodeQueryKey::Binding {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                    name: row.name.clone(),
+                },
+                &row.file,
+                row.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::ResolutionCandidate(value) => {
+            let row = &value.occurrence;
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::ResolutionCandidate,
+                DetailedCodeQueryKey::ResolutionCandidate {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                    ordinal: value.ordinal,
+                },
+                &row.file,
+                row.range,
+                cache,
+            )
+        }
     }
 }
 
@@ -3185,6 +3337,27 @@ fn detailed_occurrence_provenance_ref(
     }
 }
 
+/// The provenance-ref evidence shape shared by the three lexical-environment
+/// row families, whose identity is a digest plus a byte span and nothing else.
+fn detailed_environment_provenance_ref(
+    domain: DetailedCodeQueryDomain,
+    key: DetailedCodeQueryKey,
+    file: &ProjectFile,
+    range: Range,
+    cache: &PipelineRenderCache,
+) -> DetailedCodeQueryProvenanceRefEvidence {
+    let byte_span = range_byte_span(range);
+    DetailedCodeQueryProvenanceRefEvidence {
+        domain,
+        key,
+        file: file.clone(),
+        source_slice_sha256: cached_source_slice_sha256(cache, file, &byte_span),
+        byte_span: Some(byte_span),
+        display_range: cached_display_range(cache, file, range),
+        identities: DetailedCodeQueryProvenanceIdentities::None,
+    }
+}
+
 fn cached_source_slice_sha256(
     cache: &PipelineRenderCache,
     file: &ProjectFile,
@@ -3351,6 +3524,74 @@ fn execute_plan(
             } else {
                 let execution =
                     execute_occurrence_seed(seed, terminal_cap, state, limits, diagnostics);
+                if terminal_cap.is_some_and(|cap| execution.rows.len() >= cap) {
+                    push_operator_termination(
+                        &mut terminations,
+                        QueryOperatorTermination::TerminalCap,
+                    );
+                }
+                self_truncated = execution.truncated;
+                if execution.cancelled {
+                    disposition = QueryOperatorDisposition::Cancelled;
+                }
+                execution
+            }
+        }
+        (PhysicalQueryOperator::ScopeScan, LogicalQueryOperator::ScopeSeed(seed)) => {
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::CancellationBeforeWork,
+                );
+                cancelled_plan_execution()
+            } else {
+                let execution = execute_environment_seed(
+                    EnvironmentSeedKind::Scopes(&seed.filter),
+                    &seed.where_globs,
+                    &seed.languages,
+                    terminal_cap,
+                    state,
+                    limits,
+                    diagnostics,
+                );
+                if terminal_cap.is_some_and(|cap| execution.rows.len() >= cap) {
+                    push_operator_termination(
+                        &mut terminations,
+                        QueryOperatorTermination::TerminalCap,
+                    );
+                }
+                self_truncated = execution.truncated;
+                if execution.cancelled {
+                    disposition = QueryOperatorDisposition::Cancelled;
+                }
+                execution
+            }
+        }
+        (PhysicalQueryOperator::BindingScan, LogicalQueryOperator::BindingSeed(seed)) => {
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::CancellationBeforeWork,
+                );
+                cancelled_plan_execution()
+            } else {
+                let execution = execute_environment_seed(
+                    EnvironmentSeedKind::Bindings(&seed.filter),
+                    &seed.where_globs,
+                    &seed.languages,
+                    terminal_cap,
+                    state,
+                    limits,
+                    diagnostics,
+                );
                 if terminal_cap.is_some_and(|cap| execution.rows.len() >= cap) {
                     push_operator_termination(
                         &mut terminations,
@@ -3799,6 +4040,7 @@ fn execute_parallel_seed_union(
                     indexed_declarations: IndexedDeclarations::default(),
                     reference_cache: ReferenceTraversalCache::default(),
                     occurrence_cache: OccurrenceTraversalCache::default(),
+                    environment_cache: EnvironmentTraversalCache::default(),
                     call_cache: CallTraversalCache::default(),
                     receiver_facts: HashMap::default(),
                     semantic: None,
@@ -4038,10 +4280,12 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::SemanticCapabilityUnsupported
             | CodeQueryDiagnosticCode::TypestateCapabilityUnsupported
             | CodeQueryDiagnosticCode::ValueFlowCapabilityUnsupported
-            | CodeQueryDiagnosticCode::OccurrenceRoleUnsupported => {
+            | CodeQueryDiagnosticCode::OccurrenceRoleUnsupported
+            | CodeQueryDiagnosticCode::EnvironmentAxisUnsupported => {
                 Some(QueryOperatorTermination::UnsupportedAnalysis)
             }
-            CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted => {
+            CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted
+            | CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted => {
                 Some(QueryOperatorTermination::AnalysisLimit)
             }
             CodeQueryDiagnosticCode::SemanticResultsOmitted
@@ -4071,7 +4315,9 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::CallRelationCandidatesOmitted
             | CodeQueryDiagnosticCode::CallRelationAnalysisFailed
             | CodeQueryDiagnosticCode::ReferenceAnalysisFailed
-            | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete => {
+            | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
+            | CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
+            | CodeQueryDiagnosticCode::ResolutionTraceIncomplete => {
                 Some(QueryOperatorTermination::AnalysisIncomplete)
             }
             CodeQueryDiagnosticCode::InvalidPlan
@@ -4574,6 +4820,137 @@ fn execute_occurrence_seed(
                 Vec::new(),
                 false,
             );
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    PlanExecution {
+        rows,
+        truncated,
+        cancelled: false,
+        pipeline_halted: false,
+    }
+}
+
+/// Which lexical-environment row family a seed scan produces.
+enum EnvironmentSeedKind<'a> {
+    Scopes(&'a ScopeFilter),
+    Bindings(&'a BindingFilter),
+}
+
+/// Scan the workspace for lexical scope or binding rows (#1474).
+///
+/// Structurally identical to the occurrence seed scan: file selection, the
+/// per-file scanned-file charge, the row cap, and per-file capability
+/// diagnostics. The two families share it because they share one producer, one
+/// budget and one honesty rule; only which rows are selected differs.
+fn execute_environment_seed(
+    kind: EnvironmentSeedKind<'_>,
+    where_globs: &[glob::Pattern],
+    languages: &[Language],
+    terminal_cap: Option<usize>,
+    state: &mut QueryExecutionState<'_>,
+    limits: CodeQueryExecutionLimits,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> PlanExecution {
+    let budget_cap = limits
+        .max_pipeline_rows
+        .saturating_sub(state.budget.pipeline_rows);
+    let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
+    if desired_rows == 0 {
+        push_pipeline_budget_diagnostic(diagnostics, &state.budget);
+        return PlanExecution {
+            rows: Vec::new(),
+            truncated: true,
+            cancelled: false,
+            pipeline_halted: false,
+        };
+    }
+
+    let mut files: Vec<ProjectFile> = state
+        .analyzer
+        .analyzed_files()
+        .into_iter()
+        .filter(|file| {
+            let language = crate::analyzer::common::language_for_file(file);
+            (languages.is_empty() || languages.contains(&language))
+                && (where_globs.is_empty() || {
+                    let path = rel_path_string(file);
+                    where_globs.iter().any(|glob| glob.matches(&path))
+                })
+        })
+        .collect();
+    files.sort();
+
+    let required_axes = match kind {
+        EnvironmentSeedKind::Scopes(_) => environment::SCOPE_QUERY_AXES,
+        EnvironmentSeedKind::Bindings(_) => environment::BINDING_QUERY_AXES,
+    };
+    let mut rows: Vec<PipelineRow> = Vec::new();
+    let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
+    let mut truncated = false;
+    for file in files {
+        if state
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return cancelled_plan_execution();
+        }
+        let mut projected = state.budget;
+        projected.scanned_files = projected.scanned_files.saturating_add(1);
+        if projected.scanned_files > limits.max_scanned_files {
+            push_budget_diagnostic(diagnostics, &projected);
+            truncated = true;
+            break;
+        }
+        state.budget.scanned_files = projected.scanned_files;
+
+        let result = state
+            .environment_cache
+            .environment_for(state.analyzer, &file);
+        state
+            .environment_cache
+            .report_completeness(&file, &result, required_axes, diagnostics);
+        let values: Vec<PipelineValue> = match kind {
+            EnvironmentSeedKind::Scopes(filter) => environment::select_scopes(&result, filter)
+                .map(|index| {
+                    PipelineValue::LexicalScope(ScopeValue {
+                        file: file.clone(),
+                        result: Arc::clone(&result),
+                        index,
+                    })
+                })
+                .collect(),
+            EnvironmentSeedKind::Bindings(filter) => environment::select_bindings(&result, filter)
+                .map(|index| {
+                    PipelineValue::Binding(BindingValue {
+                        file: file.clone(),
+                        result: Arc::clone(&result),
+                        index,
+                        shadowed: false,
+                        reached_from: None,
+                    })
+                })
+                .collect(),
+        };
+        for value in values {
+            if rows.len() >= desired_rows {
+                truncated = true;
+                diagnostics.push(CodeQueryDiagnostic {
+                    code: CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: "workspace",
+                    message: format!(
+                        "lexical environment seed reached its {desired_rows}-row cap; narrow the filter, languages, or where globs"
+                    ),
+                });
+                break;
+            }
+            state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(1);
+            insert_pipeline_row(&mut rows, &mut indexes, value, Vec::new(), false);
         }
         if truncated {
             break;
@@ -5583,7 +5960,10 @@ fn apply_plan_step(
                     | PipelineValue::CallSite(_)
                     | PipelineValue::ExpressionSite(_)
                     | PipelineValue::ReceiverAnalysis(_)
-                    | PipelineValue::Occurrence(_) => None,
+                    | PipelineValue::Occurrence(_)
+                    | PipelineValue::LexicalScope(_)
+                    | PipelineValue::Binding(_)
+                    | PipelineValue::ResolutionCandidate(_) => None,
                 })
                 .sum();
             if let Some(profile) = &mut state.cache_profile {
@@ -5628,7 +6008,10 @@ fn apply_plan_step(
                                 | PipelineValue::CallSite(_)
                                 | PipelineValue::ExpressionSite(_)
                                 | PipelineValue::ReceiverAnalysis(_)
-                                | PipelineValue::Occurrence(_) => None,
+                                | PipelineValue::Occurrence(_)
+                                | PipelineValue::LexicalScope(_)
+                                | PipelineValue::Binding(_)
+                                | PipelineValue::ResolutionCandidate(_) => None,
                             })
                             .sum();
                         profile
@@ -5680,7 +6063,10 @@ fn apply_plan_step(
                         | PipelineValue::CallSite(_)
                         | PipelineValue::ExpressionSite(_)
                         | PipelineValue::ReceiverAnalysis(_)
-                        | PipelineValue::Occurrence(_) => None,
+                        | PipelineValue::Occurrence(_)
+                        | PipelineValue::LexicalScope(_)
+                        | PipelineValue::Binding(_)
+                        | PipelineValue::ResolutionCandidate(_) => None,
                     })
                     .collect::<Vec<_>>();
                 frontier.sort_by_key(rel_path_string);
@@ -5785,6 +6171,7 @@ fn apply_plan_step(
         &mut state.reference_cache,
         &mut state.call_cache,
         &mut state.occurrence_cache,
+        &mut state.environment_cache,
         &mut state.receiver_facts,
         &mut state.semantic,
         &mut state.budget,
@@ -6274,6 +6661,7 @@ fn apply_pipeline_step(
     reference_cache: &mut ReferenceTraversalCache,
     call_cache: &mut CallTraversalCache,
     occurrence_cache: &mut OccurrenceTraversalCache,
+    environment_cache: &mut EnvironmentTraversalCache,
     receiver_facts: &mut HashMap<ProjectFile, Arc<FileFacts>>,
     semantic: &mut Option<SemanticQueryContext<'_>>,
     budget: &mut CodeQueryExecutionBudget,
@@ -7059,6 +7447,146 @@ fn apply_pipeline_step(
                 vec![pipeline_expansion(PipelineValue::File(
                     value.file().clone(),
                 ))]
+            }
+            (PipelineValue::LexicalScope(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
+            (PipelineValue::Binding(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
+            (PipelineValue::Binding(value), QueryStep::ScopeOf) => {
+                vec![pipeline_expansion(PipelineValue::LexicalScope(
+                    ScopeValue {
+                        file: value.file.clone(),
+                        result: Arc::clone(&value.result),
+                        index: value.row().declaring_scope,
+                    },
+                ))]
+            }
+            (PipelineValue::Occurrence(value), QueryStep::ScopeOf) => scope_of_position(
+                analyzer,
+                environment_cache,
+                &value.row.file,
+                value.row.range.start_byte,
+                diagnostics,
+            ),
+            (PipelineValue::StructuralMatch(seed), QueryStep::ScopeOf) => scope_of_position(
+                analyzer,
+                environment_cache,
+                &seed.file,
+                seed.facts.node(seed.fact_match.node).range.start_byte,
+                diagnostics,
+            ),
+            (PipelineValue::LexicalScope(value), QueryStep::ScopeAncestors) => {
+                // `scope_ancestry` returns the scope itself first; the step is
+                // documented as excluding it, so the chain is skipped by one.
+                value
+                    .result
+                    .scope_ancestry(value.index)
+                    .into_iter()
+                    .skip(1)
+                    .map(|index| {
+                        pipeline_expansion(PipelineValue::LexicalScope(ScopeValue {
+                            file: value.file.clone(),
+                            result: Arc::clone(&value.result),
+                            index,
+                        }))
+                    })
+                    .collect()
+            }
+            (PipelineValue::LexicalScope(value), QueryStep::BindingsIn(filter)) => {
+                environment_cache.report_completeness(
+                    &value.file,
+                    &value.result,
+                    environment::BINDING_QUERY_AXES,
+                    diagnostics,
+                );
+                environment::select_bindings(&value.result, filter)
+                    .filter(|index| value.result.bindings[*index].declaring_scope == value.index)
+                    .map(|index| {
+                        pipeline_expansion(PipelineValue::Binding(BindingValue {
+                            file: value.file.clone(),
+                            result: Arc::clone(&value.result),
+                            index,
+                            shadowed: false,
+                            reached_from: None,
+                        }))
+                    })
+                    .collect()
+            }
+            (PipelineValue::StructuralMatch(seed), QueryStep::BindingsIn(filter)) => {
+                // Containment over a structural match is the arena's own
+                // pre-order subtree interval on the *binder token*, so a
+                // binding is inside a match exactly when its declaring token is.
+                let node = seed.facts.node(seed.fact_match.node);
+                let (start, end) = (node.range.start_byte, node.range.end_byte);
+                let result = environment_cache.environment_for(analyzer, &seed.file);
+                environment_cache.report_completeness(
+                    &seed.file,
+                    &result,
+                    environment::BINDING_QUERY_AXES,
+                    diagnostics,
+                );
+                environment::select_bindings(&result, filter)
+                    .filter(|index| {
+                        let row = &result.bindings[*index];
+                        row.range.start_byte >= start && row.range.end_byte <= end
+                    })
+                    .map(|index| {
+                        pipeline_expansion(PipelineValue::Binding(BindingValue {
+                            file: seed.file.clone(),
+                            result: Arc::clone(&result),
+                            index,
+                            shadowed: false,
+                            reached_from: None,
+                        }))
+                    })
+                    .collect()
+            }
+            (PipelineValue::Occurrence(value), QueryStep::ReachingBinding(options)) => {
+                reaching_binding_expansions(
+                    analyzer,
+                    environment_cache,
+                    &value.row,
+                    options.include_shadowed,
+                    diagnostics,
+                )
+            }
+            (PipelineValue::Binding(value), QueryStep::BindingOccurrence) => {
+                binding_occurrence_expansions(
+                    analyzer,
+                    occurrence_cache,
+                    value,
+                    cancellation,
+                    diagnostics,
+                    &mut row_exhausted,
+                )
+            }
+            (PipelineValue::Occurrence(value), QueryStep::CandidatesOf(filter)) => {
+                candidate_expansions(
+                    analyzer,
+                    environment_cache,
+                    &value.row,
+                    filter,
+                    cancellation,
+                    diagnostics,
+                    &mut row_exhausted,
+                )
+            }
+            (PipelineValue::ResolutionCandidate(value), QueryStep::CandidateTarget) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                environment::candidate_unit(&value.candidate.candidate)
+                    .and_then(|unit| indexed.get(analyzer, unit))
+                    .map(|declaration| {
+                        vec![pipeline_expansion(PipelineValue::Declaration(declaration))]
+                    })
+                    .unwrap_or_default()
             }
             _ => unreachable!("query step domains are validated before execution"),
         };
@@ -8591,6 +9119,11 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
             Some(PipelineTraceValue::ReceiverAnalysis(value.clone()))
         }
         PipelineValue::Occurrence(value) => Some(PipelineTraceValue::Occurrence(value.clone())),
+        PipelineValue::LexicalScope(value) => Some(PipelineTraceValue::LexicalScope(value.clone())),
+        PipelineValue::Binding(value) => Some(PipelineTraceValue::Binding(value.clone())),
+        PipelineValue::ResolutionCandidate(value) => {
+            Some(PipelineTraceValue::ResolutionCandidate(value.clone()))
+        }
     }
 }
 
@@ -8651,7 +9184,7 @@ fn render_pipeline_item(
         },
         PipelineValue::Semantic(value) => value.public_result(),
         PipelineValue::File(file) => CodeQueryResultValue::File {
-            value: render_file(&file),
+            value: render_file(analyzer, &file),
         },
         PipelineValue::ReferenceSite(site) => CodeQueryResultValue::ReferenceSite {
             value: Box::new(render_reference_site(analyzer, &site, detail, cache)),
@@ -8667,6 +9200,15 @@ fn render_pipeline_item(
         },
         PipelineValue::Occurrence(value) => CodeQueryResultValue::Occurrence {
             value: Box::new(render_occurrence(analyzer, &value, detail, cache)),
+        },
+        PipelineValue::LexicalScope(value) => CodeQueryResultValue::LexicalScope {
+            value: Box::new(render_scope(analyzer, &value, cache)),
+        },
+        PipelineValue::Binding(value) => CodeQueryResultValue::Binding {
+            value: Box::new(render_binding(analyzer, &value, cache)),
+        },
+        PipelineValue::ResolutionCandidate(value) => CodeQueryResultValue::ResolutionCandidate {
+            value: Box::new(render_resolution_candidate(analyzer, &value, detail, cache)),
         },
     };
     CodeQueryResultItem {
@@ -8710,6 +9252,15 @@ fn render_provenance(
                     }
                     PipelineTraceValue::Occurrence(value) => {
                         render_occurrence_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::LexicalScope(value) => {
+                        render_scope_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::Binding(value) => {
+                        render_binding_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::ResolutionCandidate(value) => {
+                        render_candidate_ref(analyzer, value, cache)
                     }
                 },
                 via: step.via.as_ref().map(|via| match via {
@@ -8971,6 +9522,178 @@ fn occurrences_of_declaration(
     (expansions, exhausted || cancelled)
 }
 
+/// The innermost lexical scope containing one byte position (#1474).
+///
+/// A position with no containing scope yields no row rather than a synthesized
+/// one: every file has a file scope, so an empty answer means the file has no
+/// derivable environment at all, which the completeness report already states.
+fn scope_of_position(
+    analyzer: &dyn IAnalyzer,
+    environment_cache: &mut EnvironmentTraversalCache,
+    file: &ProjectFile,
+    position_byte: usize,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Vec<PipelineExpansion> {
+    let result = environment_cache.environment_for(analyzer, file);
+    environment_cache.report_completeness(
+        file,
+        &result,
+        environment::SCOPE_QUERY_AXES,
+        diagnostics,
+    );
+    result
+        .innermost_scope(position_byte)
+        .map(|index| {
+            vec![pipeline_expansion(PipelineValue::LexicalScope(
+                ScopeValue {
+                    file: file.clone(),
+                    result: Arc::clone(&result),
+                    index,
+                },
+            ))]
+        })
+        .unwrap_or_default()
+}
+
+/// The binding of an occurrence's name in effect at its exact position.
+///
+/// `Incomplete` and `NoBinding` both yield zero rows, but only `Incomplete`
+/// reports a diagnostic: "no binding of this name is in effect here" is a
+/// complete answer (the name resolves to something other than a lexical
+/// binding), while "this file's intervals are not stateable" is not.
+fn reaching_binding_expansions(
+    analyzer: &dyn IAnalyzer,
+    environment_cache: &mut EnvironmentTraversalCache,
+    row: &OccurrenceRow,
+    include_shadowed: bool,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Vec<PipelineExpansion> {
+    let result = environment_cache.environment_for(analyzer, &row.file);
+    environment_cache.report_completeness(
+        &row.file,
+        &result,
+        environment::BINDING_QUERY_AXES,
+        diagnostics,
+    );
+    let outcome = super::lexical_environment::reaching_binding(
+        &result,
+        row.effective_spelling(),
+        row.range.start_byte,
+        Some(row.namespace),
+    );
+    // The occurrence's identity travels with the answer: a reaching binding is
+    // an answer *about one occurrence*, and a consumer that captured that token
+    // joins on this rather than guessing which returned binding is theirs.
+    let reached_from = row.ast_id();
+    let binding = |index: usize, shadowed: bool| {
+        pipeline_expansion(PipelineValue::Binding(BindingValue {
+            file: row.file.clone(),
+            result: Arc::clone(&result),
+            index,
+            shadowed,
+            reached_from: Some(reached_from.clone()),
+        }))
+    };
+    match outcome {
+        ReachingBindingOutcome::Reached(index) => vec![binding(index, false)],
+        ReachingBindingOutcome::Shadowed { winner, shadowed } => {
+            let mut expansions = vec![binding(winner, false)];
+            if include_shadowed {
+                expansions.extend(shadowed.into_iter().map(|index| binding(index, true)));
+            }
+            expansions
+        }
+        ReachingBindingOutcome::NoBinding => Vec::new(),
+        ReachingBindingOutcome::Incomplete(_) => Vec::new(),
+    }
+}
+
+/// The binder-class occurrence row of one binding's declaring token.
+///
+/// A binding whose local name is not spelled by a classified token has no
+/// occurrence to return; that is the honest answer, and the binding row's
+/// absent `ast_id` already says so.
+fn binding_occurrence_expansions(
+    analyzer: &dyn IAnalyzer,
+    occurrence_cache: &mut OccurrenceTraversalCache,
+    value: &BindingValue,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    row_exhausted: &mut bool,
+) -> Vec<PipelineExpansion> {
+    let Some(node) = value.row().node else {
+        return Vec::new();
+    };
+    let filter = OccurrenceFilter::default();
+    let Some(result) = occurrence_cache.rows_for_file(analyzer, value.file(), cancellation) else {
+        *row_exhausted = true;
+        return Vec::new();
+    };
+    occurrence_cache.report_completeness(value.file(), &result, &filter, diagnostics);
+    result
+        .rows
+        .iter()
+        .filter(|row| row.node == node && row.class == OccurrenceClass::Binding)
+        .map(|row| {
+            pipeline_expansion(PipelineValue::Occurrence(OccurrenceValue {
+                row: Arc::new(row.clone()),
+            }))
+        })
+        .collect()
+}
+
+/// The candidates the resolver considered for one reference occurrence.
+///
+/// The trace is a second, opt-in derivation of the occurrence's file, so this
+/// re-locates the reference row inside the traced result by AST identity --
+/// node plus role -- rather than by position.
+#[allow(clippy::too_many_arguments)]
+fn candidate_expansions(
+    analyzer: &dyn IAnalyzer,
+    environment_cache: &mut EnvironmentTraversalCache,
+    row: &OccurrenceRow,
+    filter: &CandidateFilter,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    row_exhausted: &mut bool,
+) -> Vec<PipelineExpansion> {
+    let Some(traced) = environment_cache.traced_occurrences_for(analyzer, &row.file, cancellation)
+    else {
+        *row_exhausted = true;
+        return Vec::new();
+    };
+    let Some(traced_row) = traced
+        .rows
+        .iter()
+        .find(|other| other.node == row.node && other.role == row.role)
+    else {
+        return Vec::new();
+    };
+    let Some(trace) = &traced_row.candidates else {
+        return Vec::new();
+    };
+    environment_cache.report_trace_completeness(&row.file, trace, filter, diagnostics);
+    let occurrence = Arc::new(traced_row.clone());
+    trace
+        .candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            filter.matches(candidate.tier, candidate.outcome, candidate.boundary)
+        })
+        .map(|(ordinal, candidate)| {
+            pipeline_expansion(PipelineValue::ResolutionCandidate(Box::new(
+                CandidateValue {
+                    occurrence: Arc::clone(&occurrence),
+                    candidate: Arc::new(candidate.clone()),
+                    ordinal,
+                    completeness: trace.completeness,
+                },
+            )))
+        })
+        .collect()
+}
+
 fn render_occurrence(
     analyzer: &dyn IAnalyzer,
     value: &OccurrenceValue,
@@ -9007,6 +9730,134 @@ fn render_occurrence(
         },
     };
     occurrences::public_occurrence(row, range, target)
+}
+
+fn render_scope(
+    analyzer: &dyn IAnalyzer,
+    value: &ScopeValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryLexicalScope {
+    let row = value.row();
+    let range = render_source_range(analyzer, &row.file, &row.range, cache);
+    environment::public_scope(value, range)
+}
+
+fn render_binding(
+    analyzer: &dyn IAnalyzer,
+    value: &BindingValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryBinding {
+    let row = value.row();
+    let range = render_source_range(analyzer, &row.file, &row.range, cache);
+    environment::public_binding(value, range)
+}
+
+fn render_resolution_candidate(
+    analyzer: &dyn IAnalyzer,
+    value: &CandidateValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResolutionCandidate {
+    let occurrence = &value.occurrence;
+    let range = render_source_range(analyzer, &occurrence.file, &occurrence.range, cache);
+    let candidate = match &value.candidate.candidate {
+        TraceCandidateRef::Unit(unit) => {
+            let declaration = analyzer
+                .ranges_of(unit)
+                .into_iter()
+                .min_by_key(primary_range_key)
+                .map(|range| DeclarationValue {
+                    unit: unit.clone(),
+                    range,
+                });
+            match declaration {
+                Some(declaration) => CodeQueryCandidateRef::Unit {
+                    unit: Box::new(render_declaration(analyzer, &declaration, detail, cache)),
+                },
+                // A candidate whose unit the workspace can no longer locate is
+                // reported as an external route rather than dropped: the
+                // resolver did consider something, and saying nothing would be
+                // the silent gap this domain exists to remove.
+                None => CodeQueryCandidateRef::ExternalRoute {
+                    name: unit.fq_name(),
+                },
+            }
+        }
+        TraceCandidateRef::Lexical(lexical) => CodeQueryCandidateRef::Lexical {
+            name: lexical.identifier.clone(),
+            kind: lexical.kind.label(),
+            range: render_source_range(analyzer, &occurrence.file, &lexical.name_range, cache),
+        },
+        TraceCandidateRef::Binding { file, node, name } => CodeQueryCandidateRef::Binding {
+            name: name.clone(),
+            path: rel_path_string(file),
+            ast_id: node
+                .map(|node| super::occurrence_rows::ast_id(occurrence.content_identity, node)),
+        },
+        TraceCandidateRef::ImportBinder {
+            file,
+            node,
+            name,
+            target_segments,
+        } => CodeQueryCandidateRef::ImportBinder {
+            name: name.clone(),
+            path: rel_path_string(file),
+            ast_id: node
+                .map(|node| super::occurrence_rows::ast_id(occurrence.content_identity, node)),
+            target_segments: target_segments.clone(),
+        },
+        TraceCandidateRef::ExternalRoute { name } => {
+            CodeQueryCandidateRef::ExternalRoute { name: name.clone() }
+        }
+    };
+    environment::public_candidate(value, range, candidate)
+}
+
+fn render_scope_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &ScopeValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let row = value.row();
+    CodeQueryResultRef::LexicalScope {
+        id: value.id(),
+        ast_id: row.ast_id(),
+        path: rel_path_string(&row.file),
+        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        index: row.index,
+    }
+}
+
+fn render_binding_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &BindingValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let row = value.row();
+    CodeQueryResultRef::Binding {
+        id: value.id(),
+        ast_id: row.ast_id(),
+        path: rel_path_string(&row.file),
+        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        name: row.name.clone(),
+        kind: row.kind.label(),
+    }
+}
+
+fn render_candidate_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &CandidateValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let occurrence = &value.occurrence;
+    CodeQueryResultRef::ResolutionCandidate {
+        id: value.id(),
+        ast_id: occurrence.ast_id(),
+        path: rel_path_string(&occurrence.file),
+        range: render_source_range(analyzer, &occurrence.file, &occurrence.range, cache),
+        tier: value.candidate.tier.map(|tier| tier.label()),
+        outcome: value.candidate.outcome.label(),
+    }
 }
 
 fn render_occurrence_ref(
@@ -9367,10 +10218,18 @@ fn model_language_label(language: &str) -> Option<&'static str> {
     Language::from_config_label(language).map(Language::config_label)
 }
 
-fn render_file(file: &ProjectFile) -> CodeQueryFile {
+fn render_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> CodeQueryFile {
+    let package = super::lexical_environment::package_clause_for_file(analyzer, file);
     CodeQueryFile {
         path: rel_path_string(file),
         language: crate::analyzer::common::language_for_file(file).config_label(),
+        // `syntactic` only means something once a package was named, so the two
+        // fields appear and disappear together rather than leaving a stray
+        // "derived from the path" claim about a file with no package at all.
+        package_syntactic: package.package_fq.is_some().then_some(package.syntactic),
+        package_fq: package
+            .package_fq
+            .map(|fq| fq.display(crate::analyzer::fq_name::segment_interner())),
     }
 }
 
@@ -9676,6 +10535,7 @@ fn provider_supports_feature(
         QueryFeature::Kind(kind) => provider.structural_supports_kind(kind),
         QueryFeature::Role(role) => provider.structural_supports_role(role),
         QueryFeature::OccurrenceRole(role) => provider.structural_supports_occurrence_role(role),
+        QueryFeature::EnvironmentAxis(axis) => provider.structural_supports_environment_axis(axis),
     }
 }
 

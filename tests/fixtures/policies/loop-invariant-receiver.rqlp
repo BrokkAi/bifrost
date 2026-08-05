@@ -1,0 +1,35 @@
+; Prototype rule for issue #1474, Milestone 6. DELIBERATELY NOT SHIPPED in the
+; built-in pack: it claims one language, and the pack bar requires proven
+; near-misses per claimed language plus re-verification on every adapter
+; graduation. `tests/suite_bench_policy/policy_loop_invariance_prototype.rs` is
+; its test suite.
+;
+; What it means. The built-in in-loop performance rules ask "is this call
+; written inside a loop?", which produced 284 findings against this repository
+; with a 100% false-positive rate: in almost every case the value being sorted
+; was itself created inside the loop, so the work is inherent to the iteration.
+; The condition those rules actually want is loop *invariance* of the operand:
+; the same value, created once, re-sorted on every pass. That is a
+; reaching-binding question, and this rule asks it -- the requirement is that
+; the sorted receiver be declared inside the loop, so the violation is the half
+; declared outside it.
+;
+; Boundary, stated because containment cannot decide it: a call written inside a
+; closure or other deferred body inside the loop is reported, because it is
+; lexically inside the loop. Containment can say where the call is written; it
+; cannot say how many times the body runs. The message says so rather than
+; claiming per-iteration cost.
+(policy
+  :id "prototype.performance.loop-invariant-receiver"
+  :name "Loop-invariant receiver sorted on every iteration"
+  :message "this receiver's binding is declared outside the enclosing loop, so every iteration re-sorts the same value; if the call sits in a closure or other deferred body, it is reported because it is written inside the loop, not because it is proven to run once per iteration"
+  :severity warning
+  :analysis (analysis
+    :type assertion
+    :subject (rql (inside (loop :capture "region")
+                          (call :callee (name/regex "^(sort|sort_by|sort_unstable|sort_unstable_by)$")
+                                :receiver (capture "target"))))
+    :asserts [
+      (assert-reaching :id declared-inside :at "target" :role receiver_position
+                       :declared inside :relative-to "region")
+    ]))

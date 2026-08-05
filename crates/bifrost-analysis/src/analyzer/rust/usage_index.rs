@@ -302,6 +302,8 @@ struct RustMacroScopeEdge {
     imports_macros: bool,
 }
 
+type RustMacroVisibleRanges = HashMap<CodeUnit, HashMap<RustMacroScopeKey, Vec<(usize, usize)>>>;
+
 #[derive(Debug, Default)]
 struct RustPhysicalOwnerIndex {
     roots_by_file: HashMap<ProjectFile, HashSet<ProjectFile>>,
@@ -315,12 +317,14 @@ impl RustPhysicalOwnerIndex {
         physical_roots: &HashMap<ProjectFile, ModuleKey>,
         declarations: &HashMap<CodeUnit, RustSymbolIdentity>,
         roots: &HashSet<ProjectFile>,
-    ) -> Self {
+        keep_going: &impl Fn() -> bool,
+    ) -> Option<Self> {
         let mut edges: HashMap<ProjectFile, Vec<ProjectFile>> = HashMap::default();
         for (_declaration, identity) in declarations.iter().filter(|(declaration, identity)| {
             identity.namespace == RustSymbolNamespace::Module
                 && analyzer.is_external_module_declaration(declaration)
         }) {
+            keep_going().then_some(())?;
             let declared = identity
                 .module
                 .with_suffix(std::slice::from_ref(&identity.name));
@@ -353,9 +357,11 @@ impl RustPhysicalOwnerIndex {
         let mut index = Self::default();
         let mut pending = VecDeque::new();
         for root in roots {
+            keep_going().then_some(())?;
             pending.push_back((root.clone(), root.clone()));
         }
         while let Some((file, owner)) = pending.pop_front() {
+            keep_going().then_some(())?;
             if !index
                 .roots_by_file
                 .entry(file.clone())
@@ -373,18 +379,22 @@ impl RustPhysicalOwnerIndex {
                     .map(|child| (child, owner.clone())),
             );
         }
-        let rooted_crates: HashSet<_> = roots
-            .iter()
-            .filter_map(|root| physical_roots.get(root))
-            .map(|module| module.crate_root.clone())
-            .collect();
-        index.inferred_crates_by_file.extend(
-            physical_roots
-                .iter()
-                .filter(|(_, module)| !rooted_crates.contains(&module.crate_root))
-                .map(|(file, module)| (file.clone(), module.crate_root.clone())),
-        );
-        index
+        let mut rooted_crates = HashSet::default();
+        for root in roots {
+            keep_going().then_some(())?;
+            if let Some(module) = physical_roots.get(root) {
+                rooted_crates.insert(module.crate_root.clone());
+            }
+        }
+        for (file, module) in physical_roots {
+            keep_going().then_some(())?;
+            if !rooted_crates.contains(&module.crate_root) {
+                index
+                    .inferred_crates_by_file
+                    .insert(file.clone(), module.crate_root.clone());
+            }
+        }
+        Some(index)
     }
 
     fn intersects(&self, left: &ProjectFile, right: &ProjectFile) -> bool {
@@ -478,7 +488,7 @@ pub(super) struct RustUsageIndex {
     actual_crate_roots: HashSet<ProjectFile>,
     physical_owners: RustPhysicalOwnerIndex,
     origin_routes_by_file: HashMap<ProjectFile, HashMap<String, Vec<RustOriginRoute>>>,
-    macro_visible_ranges: HashMap<CodeUnit, HashMap<RustMacroScopeKey, Vec<(usize, usize)>>>,
+    macro_visible_ranges: RustMacroVisibleRanges,
     module_aliases: RustModuleAliasRoutes,
     module_files: RustModuleFiles,
 }
@@ -714,21 +724,25 @@ fn build_macro_scope_edges(
     module_files: &RustModuleFiles,
     physical_owners: &RustPhysicalOwnerIndex,
     parallel: bool,
-) -> Vec<RustMacroScopeEdge> {
+    keep_going: &(impl Fn() -> bool + Sync),
+) -> Option<Vec<RustMacroScopeEdge>> {
     // Per-file scope walks are independent; collect in file order so edge
     // order matches a serial walk.
     let per_file_edges = |file: &ProjectFile| {
+        keep_going().then_some(())?;
         let mut edges = Vec::new();
         let Some(prepared) = analyzer.prepared_syntax(file) else {
-            return edges;
+            return Some(edges);
         };
         let source = prepared.source();
         let root_module = ModuleKey::new(file, &rust_package_name(file));
         let mut pending = vec![(prepared.tree().root_node(), root_module)];
         while let Some((node, owner)) = pending.pop() {
+            keep_going().then_some(())?;
             let mut cursor = node.walk();
             let children = node.named_children(&mut cursor).collect::<Vec<_>>();
             for child in children.into_iter().rev() {
+                keep_going().then_some(())?;
                 if child.kind() != "mod_item" {
                     pending.push((child, owner.clone()));
                     continue;
@@ -770,6 +784,7 @@ fn build_macro_scope_edges(
                         child_file != file && physical_owners.intersects(file, child_file)
                     })
                 {
+                    keep_going().then_some(())?;
                     edges.push(RustMacroScopeEdge {
                         parent: parent.clone(),
                         child: RustMacroScopeKey {
@@ -783,14 +798,17 @@ fn build_macro_scope_edges(
                 }
             }
         }
-        edges
+        Some(edges)
     };
     let per_file_edges: Vec<Vec<RustMacroScopeEdge>> = if parallel {
-        files.par_iter().map(per_file_edges).collect()
+        files
+            .par_iter()
+            .map(per_file_edges)
+            .collect::<Option<Vec<_>>>()
     } else {
-        files.iter().map(per_file_edges).collect()
-    };
-    per_file_edges.into_iter().flatten().collect()
+        files.iter().map(per_file_edges).collect::<Option<Vec<_>>>()
+    }?;
+    keep_going().then_some(per_file_edges.into_iter().flatten().collect())
 }
 
 fn rust_mod_item_has_macro_use(module: Node<'_>, source: &str) -> bool {
@@ -817,10 +835,12 @@ fn build_macro_visible_ranges(
     analyzer: &RustAnalyzer,
     declarations: &HashMap<CodeUnit, RustSymbolIdentity>,
     edges: Vec<RustMacroScopeEdge>,
-) -> HashMap<CodeUnit, HashMap<RustMacroScopeKey, Vec<(usize, usize)>>> {
+    keep_going: &impl Fn() -> bool,
+) -> Option<RustMacroVisibleRanges> {
     let mut incoming: HashMap<RustMacroScopeKey, Vec<RustMacroScopeEdge>> = HashMap::default();
     let mut outgoing: HashMap<RustMacroScopeKey, Vec<RustMacroScopeEdge>> = HashMap::default();
     for edge in edges {
+        keep_going().then_some(())?;
         outgoing
             .entry(edge.parent.clone())
             .or_default()
@@ -836,6 +856,7 @@ fn build_macro_visible_ranges(
         .iter()
         .filter(|(_, identity)| identity.namespace == RustSymbolNamespace::Macro)
     {
+        keep_going().then_some(())?;
         if let Some(definition_start) = analyzer
             .ranges(declaration)
             .into_iter()
@@ -860,6 +881,7 @@ fn build_macro_visible_ranges(
         .iter()
         .filter(|(_, identity)| identity.namespace == RustSymbolNamespace::Macro)
     {
+        keep_going().then_some(())?;
         let Some(definition_end) = analyzer
             .ranges(declaration)
             .into_iter()
@@ -876,6 +898,7 @@ fn build_macro_visible_ranges(
         let mut visited = HashSet::default();
         let mut pending = vec![(initial, definition_end)];
         while let Some((scope, visible_after)) = pending.pop() {
+            keep_going().then_some(())?;
             if !visited.insert((scope.clone(), visible_after)) {
                 continue;
             }
@@ -913,7 +936,7 @@ fn build_macro_visible_ranges(
         }
         visible_by_macro.insert(declaration.clone(), visible);
     }
-    visible_by_macro
+    Some(visible_by_macro)
 }
 
 impl From<RustCargoRouteKind> for RustRouteProvenance {
@@ -1151,6 +1174,15 @@ impl RustUsageIndex {
     }
 
     pub(super) fn build(analyzer: &RustAnalyzer, parallel: bool) -> Self {
+        Self::build_while(analyzer, parallel, &|| true)
+            .expect("uninterrupted Rust usage-index construction")
+    }
+
+    fn build_while(
+        analyzer: &RustAnalyzer,
+        parallel: bool,
+        keep_going: &(impl Fn() -> bool + Sync),
+    ) -> Option<Self> {
         /// One file's contribution to the index, collected off-thread and merged
         /// in `files` order so accumulator ordering matches a serial walk.
         #[derive(Default)]
@@ -1166,6 +1198,7 @@ impl RustUsageIndex {
         }
 
         let _build_scope = crate::profiling::scope("RustUsageIndex::build");
+        keep_going().then_some(())?;
         let files: Vec<ProjectFile> = analyzer.get_analyzed_files().into_iter().collect();
         let physical_roots: HashMap<ProjectFile, ModuleKey> = files
             .iter()
@@ -1183,8 +1216,9 @@ impl RustUsageIndex {
             HashMap::default();
         let cargo_routes = {
             let _scope = crate::profiling::scope("RustUsageIndex::build::cargo_routes");
-            analyzer.cargo_routes()
+            analyzer.cargo_routes_while(keep_going)?
         };
+        keep_going().then_some(())?;
         let mut module_files = RustModuleFiles::new(&files, cargo_routes);
         let actual_crate_roots = {
             let _scope = crate::profiling::scope("RustUsageIndex::build::crate_roots");
@@ -1207,6 +1241,7 @@ impl RustUsageIndex {
         // building from inside a rayon worker (see `usage_index()`): running
         // par_iter there lets the join steal a job that re-enters the memo.
         let per_file_facts = |file: &ProjectFile| {
+            keep_going().then_some(())?;
             let mut facts = RustFileFacts::default();
             let declarations = analyzer.declarations(file);
             let prepared = analyzer.prepared_syntax(file);
@@ -1229,6 +1264,7 @@ impl RustUsageIndex {
                 })
                 .unwrap_or_default();
             for declaration in &declarations {
+                keep_going().then_some(())?;
                 let (owner, declared_module) = if declaration.is_module() {
                     let declared = ModuleKey::new(file, &declaration.fq_name());
                     let owner = declared
@@ -1309,16 +1345,20 @@ impl RustUsageIndex {
             facts.exports = analyzer.export_index_of_declarations(file, &declarations);
             facts.imports = imports;
             facts.declarations = declarations;
-            facts
+            Some(facts)
         };
         let per_file_scope = crate::profiling::scope("RustUsageIndex::build::per_file");
         let file_facts: Vec<RustFileFacts> = if parallel {
-            files.par_iter().map(per_file_facts).collect()
+            files
+                .par_iter()
+                .map(per_file_facts)
+                .collect::<Option<Vec<_>>>()
         } else {
-            files.iter().map(per_file_facts).collect()
-        };
+            files.iter().map(per_file_facts).collect::<Option<Vec<_>>>()
+        }?;
 
         for (file_id, (file, facts)) in files.iter().zip(file_facts).enumerate() {
+            keep_going().then_some(())?;
             if !facts.module_extents.is_empty() {
                 module_extents.insert(file.clone(), facts.module_extents);
             }
@@ -1343,6 +1383,7 @@ impl RustUsageIndex {
         drop(per_file_scope);
 
         for declaration in module_files.cargo_routes.external_module_declarations() {
+            keep_going().then_some(())?;
             if !physical_roots.contains_key(&declaration.target_file) {
                 continue;
             }
@@ -1371,12 +1412,15 @@ impl RustUsageIndex {
                 &physical_roots,
                 &declaration_identities,
                 &actual_crate_roots,
-            )
+                keep_going,
+            )?
         };
+        keep_going().then_some(())?;
         let module_aliases = {
             let _scope = crate::profiling::scope("RustUsageIndex::build::module_aliases");
-            build_module_alias_routes(&module_files, &files, &imports_by_file)
+            build_module_alias_routes(&module_files, &files, &imports_by_file, keep_going)?
         };
+        keep_going().then_some(())?;
         let importer_reverse = {
             let _scope = crate::profiling::scope("RustUsageIndex::build::importer_reverse");
             build_importer_reverse(
@@ -1386,12 +1430,20 @@ impl RustUsageIndex {
                 &files,
                 &imports_by_file,
                 parallel,
-            )
+                keep_going,
+            )?
         };
+        keep_going().then_some(())?;
         let origin_routes_by_file = {
             let _scope = crate::profiling::scope("RustUsageIndex::build::origin_routes");
-            build_origin_routes(&importer_reverse, &declaration_domains, &module_domains)
+            build_origin_routes(
+                &importer_reverse,
+                &declaration_domains,
+                &module_domains,
+                keep_going,
+            )?
         };
+        keep_going().then_some(())?;
         let macro_visible_ranges = {
             let _scope = crate::profiling::scope("RustUsageIndex::build::macro_visible_ranges");
             build_macro_visible_ranges(
@@ -1403,12 +1455,16 @@ impl RustUsageIndex {
                     &module_files,
                     &physical_owners,
                     parallel,
-                ),
-            )
+                    keep_going,
+                )?,
+                keep_going,
+            )?
         };
+        keep_going().then_some(())?;
 
         let mut identities_by_name: HashMap<String, Vec<RustSymbolIdentity>> = HashMap::default();
         for identity in declaration_domains.keys() {
+            keep_going().then_some(())?;
             identities_by_name
                 .entry(identity.name.clone())
                 .or_default()
@@ -1416,13 +1472,14 @@ impl RustUsageIndex {
         }
         let mut module_importers: HashMap<ModuleKey, HashSet<ProjectFile>> = HashMap::default();
         for edge in importer_reverse.values().flatten() {
+            keep_going().then_some(())?;
             module_importers
                 .entry(edge.target_module.clone())
                 .or_default()
                 .insert(edge.importer.clone());
         }
 
-        Self {
+        Some(Self {
             exports_by_file,
             importer_reverse,
             declaration_domains,
@@ -1439,7 +1496,7 @@ impl RustUsageIndex {
             macro_visible_ranges,
             module_aliases,
             module_files,
-        }
+        })
     }
 
     /// Files that import one of the `seeds` (plus the seed files themselves) —
@@ -1447,50 +1504,70 @@ impl RustUsageIndex {
     /// transitively because a private parent-module import can itself be imported
     /// by a child module without becoming a public re-export.
     pub(super) fn importers_of_seeds(&self, seeds: &RustBindingSeeds) -> HashSet<ProjectFile> {
-        let mut out: HashSet<ProjectFile> = seeds.edges_by_importer.keys().cloned().collect();
+        self.importers_of_seeds_while(seeds, &|| true)
+            .expect("uninterrupted Rust importer selection")
+    }
+
+    fn importers_of_seeds_while(
+        &self,
+        seeds: &RustBindingSeeds,
+        keep_going: &impl Fn() -> bool,
+    ) -> Option<HashSet<ProjectFile>> {
+        keep_going().then_some(())?;
+        let mut out = HashSet::default();
+        for importer in seeds.edges_by_importer.keys() {
+            keep_going().then_some(())?;
+            out.insert(importer.clone());
+        }
         // Module-prefix importers are computed here, not in `binding_seeds`:
         // only this forward-scan candidate-set path consumes them, and the
         // whole-workspace inverted build calls `binding_seeds` per candidate
         // symbol, where paying a workspace-wide file union per call is the
         // dominant cost (#1504).
-        let target_modules: HashSet<ModuleKey> = seeds
-            .roots
-            .iter()
-            .filter_map(|root| self.declaration_identities.get(root))
-            .filter(|identity| identity.namespace == RustSymbolNamespace::Module)
-            .map(|identity| {
-                identity
-                    .module
-                    .with_suffix(std::slice::from_ref(&identity.name))
-            })
-            .collect();
-        out.extend(
-            target_modules
-                .iter()
-                .filter_map(|module| self.module_importers.get(module))
-                .flatten()
-                .cloned(),
-        );
-        out.extend(seeds.roots.iter().flat_map(|root| {
-            self.module_files
+        let mut target_modules = HashSet::default();
+        for root in &seeds.roots {
+            keep_going().then_some(())?;
+            if let Some(identity) = self
+                .declaration_identities
+                .get(root)
+                .filter(|identity| identity.namespace == RustSymbolNamespace::Module)
+            {
+                target_modules.insert(
+                    identity
+                        .module
+                        .with_suffix(std::slice::from_ref(&identity.name)),
+                );
+            }
+        }
+        for module in target_modules {
+            for importer in self.module_importers.get(&module).into_iter().flatten() {
+                keep_going().then_some(())?;
+                out.insert(importer.clone());
+            }
+        }
+        for root in &seeds.roots {
+            for file in self
+                .module_files
                 .cargo_routes
                 .files_that_can_reference_target_of(root.source())
-        }));
-        out.extend(
-            seeds
-                .identities
-                .iter()
-                .map(|identity| identity.file.clone()),
-        );
-        out.extend(seeds.roots.iter().map(|root| root.source().clone()));
-        out.extend(seeds.roots.iter().flat_map(|root| {
-            self.macro_visible_ranges
-                .get(root)
-                .into_iter()
-                .flatten()
-                .map(|scope| scope.0.file.clone())
-        }));
-        out
+            {
+                keep_going().then_some(())?;
+                out.insert(file);
+            }
+        }
+        for identity in &seeds.identities {
+            keep_going().then_some(())?;
+            out.insert(identity.file.clone());
+        }
+        for root in &seeds.roots {
+            keep_going().then_some(())?;
+            out.insert(root.source().clone());
+            for scope in self.macro_visible_ranges.get(root).into_iter().flatten() {
+                keep_going().then_some(())?;
+                out.insert(scope.0.file.clone());
+            }
+        }
+        Some(out)
     }
 
     fn matching_edges_for_importer<'a>(
@@ -1506,6 +1583,16 @@ impl RustUsageIndex {
         analyzer: &RustAnalyzer,
         roots: &BTreeSet<CodeUnit>,
     ) -> RustBindingSeeds {
+        self.binding_seeds_while(analyzer, roots, &|| true)
+            .expect("uninterrupted Rust binding-seed construction")
+    }
+
+    fn binding_seeds_while(
+        &self,
+        analyzer: &RustAnalyzer,
+        roots: &BTreeSet<CodeUnit>,
+        keep_going: &impl Fn() -> bool,
+    ) -> Option<RustBindingSeeds> {
         let mut identities = HashSet::default();
         let mut identity_domains: HashMap<RustSymbolIdentity, Vec<Domain>> = HashMap::default();
         let mut root_identities: HashMap<CodeUnit, Vec<RustSymbolIdentity>> = HashMap::default();
@@ -1513,6 +1600,7 @@ impl RustUsageIndex {
             HashMap::default();
         let mut pending = VecDeque::new();
         for root in roots {
+            keep_going().then_some(())?;
             let mut candidate_identities = self
                 .declaration_identities
                 .get(root)
@@ -1530,6 +1618,7 @@ impl RustUsageIndex {
                 });
             }
             for identity in candidate_identities {
+                keep_going().then_some(())?;
                 root_identities
                     .entry(root.clone())
                     .or_default()
@@ -1556,6 +1645,7 @@ impl RustUsageIndex {
         let mut edges_by_importer: HashMap<ProjectFile, Vec<RustImportEdge>> = HashMap::default();
         let mut visited = HashSet::default();
         while let Some((target, domain, canonical_origin)) = pending.pop_front() {
+            keep_going().then_some(())?;
             if !visited.insert((target.clone(), domain.clone(), canonical_origin.clone())) {
                 continue;
             }
@@ -1563,6 +1653,7 @@ impl RustUsageIndex {
                 continue;
             };
             for edge in edges {
+                keep_going().then_some(())?;
                 if !edge_matches_single_seed(edge, &target) {
                     continue;
                 }
@@ -1632,7 +1723,7 @@ impl RustUsageIndex {
                 }
             }
         }
-        RustBindingSeeds {
+        Some(RustBindingSeeds {
             roots: roots.clone(),
             root_origins: root_identities.values().flatten().cloned().collect(),
             root_identities,
@@ -1640,7 +1731,7 @@ impl RustUsageIndex {
             identities,
             identity_domains,
             edges_by_importer,
-        }
+        })
     }
 
     pub(super) fn export_targets_from_files(
@@ -1821,6 +1912,22 @@ impl RustAnalyzer {
         )
     }
 
+    fn usage_index_while(
+        &self,
+        keep_going: &(impl Fn() -> bool + Sync),
+    ) -> Option<Arc<RustUsageIndex>> {
+        self.usage_index.get_or_build_while(
+            keep_going,
+            || RustUsageIndex::build_while(self, true, keep_going),
+            || RustUsageIndex::build_while(self, false, keep_going),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn usage_index_ready_for_test(&self) -> bool {
+        self.usage_index.is_ready()
+    }
+
     /// Force the lazy usage index and the per-file reference contexts to exist
     /// now, so a background warmer can pay their build cost instead of the
     /// first interactive usage query (which otherwise spends most of a warm
@@ -1837,6 +1944,28 @@ impl RustAnalyzer {
     /// Candidate files: those importing a seed, plus the seed files themselves.
     pub(crate) fn usage_importers(&self, seeds: &RustBindingSeeds) -> HashSet<ProjectFile> {
         self.usage_index().importers_of_seeds(seeds)
+    }
+
+    pub(crate) fn usage_candidate_files_while(
+        &self,
+        roots: &BTreeSet<CodeUnit>,
+        keep_going: &(impl Fn() -> bool + Sync),
+    ) -> Option<HashSet<ProjectFile>> {
+        let index = self.usage_index_while(keep_going)?;
+        keep_going().then_some(())?;
+        let seeds = index.binding_seeds_while(self, roots, keep_going)?;
+        keep_going().then_some(())?;
+        index.importers_of_seeds_while(&seeds, keep_going)
+    }
+
+    pub(crate) fn usage_binding_seeds_while(
+        &self,
+        roots: &BTreeSet<CodeUnit>,
+        keep_going: &(impl Fn() -> bool + Sync),
+    ) -> Option<RustBindingSeeds> {
+        let index = self.usage_index_while(keep_going)?;
+        keep_going().then_some(())?;
+        index.binding_seeds_while(self, roots, keep_going)
     }
 
     /// Canonical local binding identities for a target, including named private
@@ -2704,13 +2833,16 @@ fn build_origin_routes(
     importer_reverse: &HashMap<ProjectFile, Vec<RustImportEdge>>,
     declaration_domains: &HashMap<RustSymbolIdentity, Vec<Domain>>,
     module_domains: &HashMap<ModuleKey, Vec<Domain>>,
-) -> HashMap<ProjectFile, HashMap<String, Vec<RustOriginRoute>>> {
+    keep_going: &impl Fn() -> bool,
+) -> Option<HashMap<ProjectFile, HashMap<String, Vec<RustOriginRoute>>>> {
     type ExactKey = (ProjectFile, ModuleKey, String);
     type ModuleEdgeKey = (ProjectFile, ModuleKey);
     let mut exact_edges: HashMap<ExactKey, Vec<&RustImportEdge>> = HashMap::default();
     let mut module_edges: HashMap<ModuleEdgeKey, Vec<&RustImportEdge>> = HashMap::default();
     for edges in importer_reverse.values() {
+        keep_going().then_some(())?;
         for edge in edges {
+            keep_going().then_some(())?;
             match &edge.kind {
                 RustImportEdgeKind::Named(name) => exact_edges
                     .entry((
@@ -2731,6 +2863,7 @@ fn build_origin_routes(
 
     let mut pending = VecDeque::new();
     for (identity, domains) in declaration_domains {
+        keep_going().then_some(())?;
         pending.extend(
             domains
                 .iter()
@@ -2742,6 +2875,7 @@ fn build_origin_routes(
     let mut routes: HashMap<ProjectFile, HashMap<String, Vec<RustOriginRoute>>> =
         HashMap::default();
     while let Some((target, origin, domain)) = pending.pop_front() {
+        keep_going().then_some(())?;
         if !visited.insert((target.clone(), origin.clone(), domain.clone())) {
             continue;
         }
@@ -2757,6 +2891,7 @@ fn build_origin_routes(
             .flatten()
             .chain(module_edges.get(&module_key).into_iter().flatten())
         {
+            keep_going().then_some(())?;
             if matches!(&domain, Domain::Module(module)
                 if *module == target.module
                     && *module == edge.importer_module
@@ -2828,23 +2963,27 @@ fn build_origin_routes(
             }
         }
     }
-    routes
+    Some(routes)
 }
 
 fn build_module_alias_routes(
     module_files: &RustModuleFiles,
     files: &[ProjectFile],
     imports_by_file: &HashMap<ProjectFile, Vec<RustProjectedImport>>,
-) -> RustModuleAliasRoutes {
+    keep_going: &impl Fn() -> bool,
+) -> Option<RustModuleAliasRoutes> {
     let mut routes = RustModuleAliasRoutes::default();
     let import_count = imports_by_file.values().map(Vec::len).sum::<usize>();
     for _ in 0..=import_count {
+        keep_going().then_some(())?;
         let mut changed = false;
         for file in files {
+            keep_going().then_some(())?;
             let Some(imports) = imports_by_file.get(file) else {
                 continue;
             };
             for projected in imports {
+                keep_going().then_some(())?;
                 let RustImportOwner::Module { module: owner, .. } = &projected.owner else {
                     continue;
                 };
@@ -2859,7 +2998,9 @@ fn build_module_alias_routes(
                         routes.resolve_segments(module_files, file, owner, &import.path);
                     let mut inherited = Vec::new();
                     for imported in &imported_modules {
+                        keep_going().then_some(())?;
                         for (alias, aliases) in &routes.by_alias {
+                            keep_going().then_some(())?;
                             if alias.parent().as_ref() != Some(&imported.target_module) {
                                 continue;
                             }
@@ -2869,6 +3010,7 @@ fn build_module_alias_routes(
                             for route in aliases.iter().filter(|route| {
                                 route.domain.contains_module(&imported.target_module)
                             }) {
+                                keep_going().then_some(())?;
                                 let Some(effective_domain) = route.domain.intersect(&domain) else {
                                     continue;
                                 };
@@ -2886,6 +3028,7 @@ fn build_module_alias_routes(
                     }
                     let owner = ModuleKey::new(file, owner);
                     for (local_name, route) in inherited {
+                        keep_going().then_some(())?;
                         let alias = owner.with_suffix(&[local_name]);
                         let entries = routes.by_alias.entry(alias).or_default();
                         if !entries.contains(&route) {
@@ -2905,6 +3048,7 @@ fn build_module_alias_routes(
                 };
                 let alias = ModuleKey::new(file, &alias_package);
                 for resolved in routes.resolve_segments(module_files, file, owner, &import.path) {
+                    keep_going().then_some(())?;
                     let route = RustModuleAliasRoute {
                         target_file: resolved.target_file,
                         target_module: resolved.target_module,
@@ -2923,7 +3067,7 @@ fn build_module_alias_routes(
             break;
         }
     }
-    routes
+    Some(routes)
 }
 
 fn build_importer_reverse(
@@ -2933,16 +3077,19 @@ fn build_importer_reverse(
     files: &[ProjectFile],
     imports_by_file: &HashMap<ProjectFile, Vec<RustProjectedImport>>,
     parallel: bool,
-) -> HashMap<ProjectFile, Vec<RustImportEdge>> {
+    keep_going: &(impl Fn() -> bool + Sync),
+) -> Option<HashMap<ProjectFile, Vec<RustImportEdge>>> {
     // Per-file edge production only reads the shared route indices; collect in
     // file order so the merged reverse map matches a serial walk. `parallel`
     // is false when building from inside a rayon worker (see `usage_index()`).
     let per_file_edges = |file: &ProjectFile| {
+        keep_going().then_some(())?;
         let mut edges: Vec<RustImportEdge> = Vec::new();
         let Some(imports) = imports_by_file.get(file) else {
-            return edges;
+            return Some(edges);
         };
         for projected in imports {
+            keep_going().then_some(())?;
             let import = &projected.import;
             let (owner, extent) = match &projected.owner {
                 RustImportOwner::Module { module, start, end } => (
@@ -2980,6 +3127,7 @@ fn build_importer_reverse(
                 for resolved in
                     module_aliases.resolve_segments(module_files, file, &owner, &import.path)
                 {
+                    keep_going().then_some(())?;
                     add_import_edge(
                         &mut edges,
                         module_files,
@@ -3010,6 +3158,7 @@ fn build_importer_reverse(
                 &owner,
                 &import.path[..import.path.len() - 1],
             ) {
+                keep_going().then_some(())?;
                 add_import_edge(
                     &mut edges,
                     module_files,
@@ -3032,6 +3181,7 @@ fn build_importer_reverse(
             for resolved in
                 module_aliases.resolve_segments(module_files, file, &owner, &import.path)
             {
+                keep_going().then_some(())?;
                 add_import_edge(
                     &mut edges,
                     module_files,
@@ -3052,21 +3202,25 @@ fn build_importer_reverse(
                 );
             }
         }
-        edges
+        Some(edges)
     };
     let per_file_edges: Vec<Vec<RustImportEdge>> = if parallel {
-        files.par_iter().map(per_file_edges).collect()
+        files
+            .par_iter()
+            .map(per_file_edges)
+            .collect::<Option<Vec<_>>>()
     } else {
-        files.iter().map(per_file_edges).collect()
-    };
+        files.iter().map(per_file_edges).collect::<Option<Vec<_>>>()
+    }?;
     let mut reverse: HashMap<ProjectFile, Vec<RustImportEdge>> = HashMap::default();
     for edge in per_file_edges.into_iter().flatten() {
+        keep_going().then_some(())?;
         reverse
             .entry(edge.target_file.clone())
             .or_default()
             .push(edge);
     }
-    reverse
+    Some(reverse)
 }
 
 fn add_import_edge(
@@ -3106,7 +3260,8 @@ fn edge_target_matches_exact_module(edge: &RustImportEdge) -> bool {
 mod tests {
     use super::*;
     use crate::analyzer::usages::ExportEntry;
-    use crate::analyzer::{CodeUnitType, Language, TestProject};
+    use crate::analyzer::{CodeUnitType, Language, ProjectFile, TestProject};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn rust_domains_intersect_without_cross_crate_or_sibling_widening() {
@@ -3172,6 +3327,31 @@ mod tests {
 
     fn analyzer_for(root: &std::path::Path) -> RustAnalyzer {
         RustAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Rust))
+    }
+
+    #[test]
+    fn cancelled_usage_index_build_is_not_published() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/lib.rs")
+            .write("pub mod worker;\npub fn root() {}\n")
+            .expect("write lib.rs");
+        ProjectFile::new(root.clone(), "src/worker.rs")
+            .write("use crate::root;\npub fn run() { root(); }\n")
+            .expect("write worker.rs");
+        let analyzer = analyzer_for(&root);
+
+        let checks = AtomicUsize::new(0);
+        assert!(
+            analyzer
+                .usage_index_while(&|| checks.fetch_add(1, Ordering::AcqRel) < 3)
+                .is_none()
+        );
+        assert!(checks.load(Ordering::Acquire) >= 4);
+        assert!(analyzer.usage_index.get().is_none());
+
+        assert!(analyzer.usage_index_while(&|| true).is_some());
+        assert!(analyzer.usage_index.get().is_some());
     }
 
     fn reexport_chain(

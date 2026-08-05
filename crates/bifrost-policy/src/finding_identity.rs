@@ -34,6 +34,9 @@ pub enum MatchResultDomain {
     CallSite,
     ExpressionSite,
     Occurrence,
+    LexicalScope,
+    Binding,
+    ResolutionCandidate,
     File,
 }
 
@@ -46,6 +49,9 @@ impl MatchResultDomain {
             Self::CallSite => "call_site",
             Self::ExpressionSite => "expression_site",
             Self::Occurrence => "occurrence",
+            Self::LexicalScope => "lexical_scope",
+            Self::Binding => "binding",
+            Self::ResolutionCandidate => "resolution_candidate",
             Self::File => "file",
         }
     }

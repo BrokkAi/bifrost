@@ -9,6 +9,10 @@
 use crate::analyzer::structural::occurrences::{
     ALL_NAMESPACES, ALL_OCCURRENCE_CLASSES, ALL_OCCURRENCE_ROLES,
 };
+use crate::analyzer::structural::resolution::{
+    ALL_BINDING_KINDS, ALL_BOUNDARY_STATUSES, ALL_HOISTING_CLASSES, ALL_PRECEDENCE_TIERS,
+    ALL_REJECTION_REASONS,
+};
 use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
 use crate::schema_version::{
     SchemaVersionDescriptor, SchemaVersionRegistry, SchemaVersionResolution,
@@ -16,7 +20,10 @@ use crate::schema_version::{
 };
 use std::sync::OnceLock;
 
-use super::ir::{MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH, SCHEMA_VERSION};
+use super::ir::{
+    CandidateOutcomeLabel, MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH, SCHEMA_VERSION,
+    UNATTRIBUTED_TIER_LABEL,
+};
 
 const RQL_INITIAL_SCHEMA_VERSION: u32 = 2;
 const RQL_CFG_SCHEMA_VERSION: u32 = 3;
@@ -26,6 +33,9 @@ const RQL_VALUE_FLOW_SCHEMA_VERSION: u32 = 6;
 const RQL_TAINT_SCHEMA_VERSION: u32 = 7;
 /// Occurrence rows, the three occurrence steps, and capture AST ids (#1473).
 const RQL_OCCURRENCE_SCHEMA_VERSION: u32 = 8;
+/// Lexical scope, binding and resolution-candidate rows, their two seeds and
+/// seven steps, and the package clause on the file row (#1474).
+const RQL_RESOLUTION_SCHEMA_VERSION: u32 = 9;
 const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
     SchemaVersionDescriptor::new(RQL_INITIAL_SCHEMA_VERSION, None, true),
     SchemaVersionDescriptor::new(
@@ -58,9 +68,14 @@ const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
         Some(RQL_TAINT_SCHEMA_VERSION),
         true,
     ),
+    SchemaVersionDescriptor::new(
+        RQL_RESOLUTION_SCHEMA_VERSION,
+        Some(RQL_OCCURRENCE_SCHEMA_VERSION),
+        true,
+    ),
 ];
 
-const _: () = assert!(RQL_OCCURRENCE_SCHEMA_VERSION as u64 == SCHEMA_VERSION);
+const _: () = assert!(RQL_RESOLUTION_SCHEMA_VERSION as u64 == SCHEMA_VERSION);
 
 static RQL_SCHEMA_VERSION_REGISTRY: OnceLock<SchemaVersionRegistry> = OnceLock::new();
 
@@ -122,6 +137,14 @@ pub enum ValueShape {
     OccurrenceClassList,
     OccurrenceRoleList,
     NamespaceList,
+    ScopeFilter,
+    BindingFilter,
+    BindingKindList,
+    BindingNameList,
+    HoistingClassList,
+    PrecedenceTierList,
+    CandidateOutcomeList,
+    BoundaryStatusList,
 }
 
 impl ValueShape {
@@ -161,6 +184,16 @@ impl ValueShape {
             Self::OccurrenceClassList => "one or more occurrence classes",
             Self::OccurrenceRoleList => "one or more occurrence roles",
             Self::NamespaceList => "one or more naming namespaces",
+            Self::ScopeFilter => "a lexical scope kind filter object",
+            Self::BindingFilter => "a binding kind/name/hoisting filter object",
+            Self::BindingKindList => "one or more binding kinds",
+            Self::BindingNameList => "one or more exact binding names",
+            Self::HoistingClassList => "one or more hoisting classes",
+            Self::PrecedenceTierList => "one or more precedence tiers, or unattributed",
+            Self::CandidateOutcomeList => {
+                "one or more candidate outcomes or typed rejection reasons"
+            }
+            Self::BoundaryStatusList => "one or more resolution boundary statuses",
         }
     }
 
@@ -363,6 +396,18 @@ macro_rules! query_step_ops {
             pub fn allows_occurrence_options(self) -> bool {
                 matches!(self, Self::OccurrencesOf | Self::OccurrencesIn)
             }
+
+            pub fn allows_binding_options(self) -> bool {
+                matches!(self, Self::BindingsIn)
+            }
+
+            pub fn allows_candidate_options(self) -> bool {
+                matches!(self, Self::CandidatesOf)
+            }
+
+            pub fn allows_reaching_binding_options(self) -> bool {
+                matches!(self, Self::ReachingBinding)
+            }
         }
     };
 }
@@ -411,6 +456,13 @@ query_step_ops! {
     OccurrencesOf { label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it.", since: 8, }
     OccurrencesIn { label: "occurrences_in", signature: "structural_match|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or file.", since: 8, }
     OccurrenceTarget { label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences.", since: 8, }
+    ScopeOf { label: "scope_of", signature: "binding|occurrence|structural_match -> lexical_scope", description: "Return the innermost lexical scope that owns each binding, occurrence, or structural match.", since: 9, }
+    ScopeAncestors { label: "scope_ancestors", signature: "lexical_scope -> lexical_scope", description: "Return the enclosing lexical scopes of each scope, innermost first, excluding the scope itself.", since: 9, }
+    BindingsIn { label: "bindings_in", signature: "lexical_scope|structural_match -> binding", description: "Return the bindings declared in each lexical scope, or in the scopes inside each structural match.", since: 9, }
+    ReachingBinding { label: "reaching_binding", signature: "occurrence -> binding", description: "Return the binding of the occurrence's name that is in effect at its exact position.", since: 9, }
+    BindingOccurrence { label: "binding_occurrence", signature: "binding -> occurrence", description: "Return the binder-class occurrence row of each binding's declaring token.", since: 9, }
+    CandidatesOf { label: "candidates_of", signature: "occurrence -> resolution_candidate", description: "Return the candidates the resolver considered for each reference-class occurrence, with tier, outcome, and boundary.", since: 9, }
+    CandidateTarget { label: "candidate_target", signature: "resolution_candidate -> declaration", description: "Project the workspace declarations of unit-backed resolution candidates.", since: 9, }
 }
 
 macro_rules! rql_form_description {
@@ -568,7 +620,16 @@ macro_rules! rql_forms {
                     | Self::Occurrences
                     | Self::OccurrencesOf
                     | Self::OccurrencesIn
-                    | Self::OccurrenceTarget => None,
+                    | Self::OccurrenceTarget
+                    | Self::Scopes
+                    | Self::Bindings
+                    | Self::ScopeOf
+                    | Self::ScopeAncestors
+                    | Self::BindingsIn
+                    | Self::ReachingBinding
+                    | Self::BindingOccurrence
+                    | Self::CandidatesOf
+                    | Self::CandidateTarget => None,
                     Self::Name => Some(RqlProperty::Name),
                     Self::NameRegex => Some(RqlProperty::NameRegex),
                     Self::TextRegex => Some(RqlProperty::TextRegex),
@@ -940,6 +1001,78 @@ rql_forms! {
         description: (QueryStepOp::OccurrenceTarget),
         step: OccurrenceTarget,
     }
+    Scopes {
+        labels: ["scopes", "scope"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(scopes [:kind ...])",
+        description: "Seed lexical scope rows directly from workspace facts.",
+        since: 9,
+    }
+    Bindings {
+        labels: ["bindings", "binding"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(bindings [:kind ...] [:name ...] [:hoisting ...])",
+        description: "Seed lexical binding rows directly from workspace facts.",
+        since: 9,
+    }
+    ScopeOf {
+        labels: ["scope-of", "scope_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(scope-of query)",
+        description: (QueryStepOp::ScopeOf),
+        step: ScopeOf,
+    }
+    ScopeAncestors {
+        labels: ["scope-ancestors", "scope_ancestors"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(scope-ancestors query)",
+        description: (QueryStepOp::ScopeAncestors),
+        step: ScopeAncestors,
+    }
+    BindingsIn {
+        labels: ["bindings-in", "bindings_in"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(bindings-in [:kind ...] [:name ...] [:hoisting ...] query)",
+        description: (QueryStepOp::BindingsIn),
+        step: BindingsIn,
+    }
+    ReachingBinding {
+        labels: ["reaching-binding", "reaching_binding"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(reaching-binding [:include-shadowed true] query)",
+        description: (QueryStepOp::ReachingBinding),
+        step: ReachingBinding,
+    }
+    BindingOccurrence {
+        labels: ["binding-occurrence", "binding_occurrence"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(binding-occurrence query)",
+        description: (QueryStepOp::BindingOccurrence),
+        step: BindingOccurrence,
+    }
+    CandidatesOf {
+        labels: ["candidates-of", "candidates_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(candidates-of [:tier ...] [:outcome ...] [:boundary ...] query)",
+        description: (QueryStepOp::CandidatesOf),
+        step: CandidatesOf,
+    }
+    CandidateTarget {
+        labels: ["candidate-target", "candidate_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(candidate-target query)",
+        description: (QueryStepOp::CandidateTarget),
+        step: CandidateTarget,
+    }
     Name {
         labels: ["name"],
         class: Predicate,
@@ -1162,6 +1295,8 @@ json_fields! {
     ExecutionMode { label: "execution_mode", shape: ExecutionMode, signature: "\"execution_mode\": \"results\" | \"explain\" | \"profile\"", description: "Return ordinary results, explain the selected plan without execution, or execute with an operator profile." }
     SchemaVersion { label: "schema_version", shape: SchemaVersion, signature: "\"schema_version\": supported positive integer", description: "Pin one exact CodeQuery schema version; omission selects the compatible lineage head." }
     Occurrences { label: "occurrences", shape: OccurrenceFilter, signature: "\"occurrences\": { \"class\": [...], \"role\": [...], \"namespace\": [...] }", description: "Seed classified identifier occurrences directly from workspace facts." }
+    Scopes { label: "scopes", shape: ScopeFilter, signature: "\"scopes\": { \"kind\": [...] }", description: "Seed lexical scope rows directly from workspace facts." }
+    Bindings { label: "bindings", shape: BindingFilter, signature: "\"bindings\": { \"kind\": [...], \"name\": [...], \"hoisting\": [...] }", description: "Seed lexical binding rows directly from workspace facts." }
 }
 
 json_fields! {
@@ -1186,6 +1321,23 @@ json_fields! {
     OccurrenceClasses { label: "class", shape: OccurrenceClassList, signature: "\"class\": [\"declaration\", ...]", description: "Restrict occurrence rows to one or more occurrence classes." }
     OccurrenceRoles { label: "role", shape: OccurrenceRoleList, signature: "\"role\": [\"binder\", ...]", description: "Restrict occurrence rows to one or more syntactic occurrence roles." }
     OccurrenceNamespaces { label: "namespace", shape: NamespaceList, signature: "\"namespace\": [\"type\", ...]", description: "Restrict occurrence rows to one or more naming namespaces." }
+    BindingKinds { label: "kind", shape: BindingKindList, signature: "\"kind\": [\"local\", ...]", description: "Restrict binding rows to one or more binder kinds." }
+    BindingNames { label: "name", shape: BindingNameList, signature: "\"name\": [\"rows\", ...]", description: "Restrict binding rows to one or more exact bound names." }
+    BindingHoisting { label: "hoisting", shape: HoistingClassList, signature: "\"hoisting\": [\"scope_wide\", ...]", description: "Restrict binding rows to one or more hoisting classes." }
+    IncludeShadowed { label: "include_shadowed", shape: TrueBoolean, signature: "\"include_shadowed\": true", description: "Also return the bindings the reaching binding shadows, instead of the winner alone." }
+    CandidateTiers { label: "tier", shape: PrecedenceTierList, signature: "\"tier\": [\"lexical_binding\", \"unattributed\", ...]", description: "Restrict candidate rows to one or more precedence tiers, or to rows whose seam named none." }
+    CandidateOutcomes { label: "outcome", shape: CandidateOutcomeList, signature: "\"outcome\": [\"selected\", \"shadowed_by_nearer\", ...]", description: "Restrict candidate rows to one or more coarse outcomes or typed rejection reasons." }
+    CandidateBoundaries { label: "boundary", shape: BoundaryStatusList, signature: "\"boundary\": [\"workspace_local\", ...]", description: "Restrict candidate rows to one or more resolution boundary statuses." }
+}
+
+// The scope filter has exactly one axis, and its JSON key is `kind` -- the same
+// spelling the binding filter uses for a different vocabulary. They therefore
+// cannot share one label registry, and the scope axis gets its own rather than
+// being renamed to something no author would guess.
+json_fields! {
+    ScopeFilterField,
+    ALL_SCOPE_FILTER_FIELDS,
+    ScopeKinds { label: "kind", shape: KindList, signature: "\"kind\": [\"block\", ...]", description: "Restrict lexical scope rows to one or more normalized anchor kinds." }
 }
 
 /// One RQL option owned by a typed query-step descriptor.
@@ -1267,6 +1419,49 @@ pub fn occurrence_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
         .find(|option| option.accepts_rql_label(label))
 }
 
+/// Shared by the `bindings` seed and the `bindings-in` step (#1474).
+pub const BINDING_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::BindingKinds, &[":kind", ":kinds"]),
+    QueryStepOption::optional(QueryStepField::BindingNames, &[":name", ":names"]),
+    QueryStepOption::optional(QueryStepField::BindingHoisting, &[":hoisting"]),
+];
+
+/// Options of the `candidates-of` step (#1474).
+pub const CANDIDATE_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::CandidateTiers, &[":tier", ":tiers"]),
+    QueryStepOption::optional(
+        QueryStepField::CandidateOutcomes,
+        &[":outcome", ":outcomes"],
+    ),
+    QueryStepOption::optional(
+        QueryStepField::CandidateBoundaries,
+        &[":boundary", ":boundaries"],
+    ),
+];
+
+/// Options of the `reaching-binding` step (#1474).
+pub const REACHING_BINDING_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::optional(
+    QueryStepField::IncludeShadowed,
+    &[":include-shadowed", ":include_shadowed"],
+)];
+
+/// The single option of the `scopes` seed (#1474).
+pub const SCOPE_SEED_RQL_LABELS: &[&str] = &[":kind", ":kinds"];
+
+pub fn binding_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
+    BINDING_STEP_OPTIONS
+        .iter()
+        .copied()
+        .find(|option| option.accepts_rql_label(label))
+}
+
+pub fn candidate_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
+    CANDIDATE_STEP_OPTIONS
+        .iter()
+        .copied()
+        .find(|option| option.accepts_rql_label(label))
+}
+
 impl QueryStepOp {
     pub const fn options(self) -> &'static [QueryStepOption] {
         match self {
@@ -1275,6 +1470,9 @@ impl QueryStepOp {
             Self::Taint => TAINT_STEP_OPTIONS,
             Self::Witness => WITNESS_STEP_OPTIONS,
             Self::OccurrencesOf | Self::OccurrencesIn => OCCURRENCE_STEP_OPTIONS,
+            Self::BindingsIn => BINDING_STEP_OPTIONS,
+            Self::CandidatesOf => CANDIDATE_STEP_OPTIONS,
+            Self::ReachingBinding => REACHING_BINDING_STEP_OPTIONS,
             _ => &[],
         }
     }
@@ -1334,6 +1532,39 @@ pub fn occurrence_filter_labels(field: QueryStepField) -> Vec<&'static str> {
         QueryStepField::OccurrenceNamespaces => ALL_NAMESPACES
             .iter()
             .map(|namespace| namespace.label())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The constrained-value vocabulary each lexical-environment filter axis
+/// accepts, in canonical registry order, so parser, validator, hover and
+/// completion all read one table (#1474).
+///
+/// The `:tier` axis additionally accepts [`UNATTRIBUTED_TIER_LABEL`], and the
+/// `:outcome` axis accepts the two coarse outcomes plus every typed rejection
+/// reason, because "rejected" and "rejected because shadowed" are both things an
+/// author legitimately asks for.
+pub fn environment_filter_labels(field: QueryStepField) -> Vec<&'static str> {
+    match field {
+        QueryStepField::BindingKinds => ALL_BINDING_KINDS.iter().map(|kind| kind.label()).collect(),
+        QueryStepField::BindingHoisting => ALL_HOISTING_CLASSES
+            .iter()
+            .map(|class| class.label())
+            .collect(),
+        QueryStepField::CandidateTiers => std::iter::once(UNATTRIBUTED_TIER_LABEL)
+            .chain(ALL_PRECEDENCE_TIERS.iter().map(|tier| tier.label()))
+            .collect(),
+        QueryStepField::CandidateOutcomes => [
+            CandidateOutcomeLabel::Selected.label(),
+            CandidateOutcomeLabel::Rejected.label(),
+        ]
+        .into_iter()
+        .chain(ALL_REJECTION_REASONS.iter().map(|reason| reason.label()))
+        .collect(),
+        QueryStepField::CandidateBoundaries => ALL_BOUNDARY_STATUSES
+            .iter()
+            .map(|status| status.label())
             .collect(),
         _ => Vec::new(),
     }
@@ -1406,7 +1637,7 @@ mod tests {
         assert_eq!(
             resolve_rql_schema_version(None).unwrap(),
             SchemaVersionResolution {
-                version: 8,
+                version: 9,
                 origin: SchemaVersionOrigin::ImplicitCompatible,
             }
         );
@@ -1454,9 +1685,17 @@ mod tests {
             }
         );
 
+        assert_eq!(
+            resolve_rql_schema_version(Some(8)).unwrap(),
+            SchemaVersionResolution {
+                version: 8,
+                origin: SchemaVersionOrigin::Explicit,
+            }
+        );
+
         let error = resolve_rql_schema_version(Some(1)).unwrap_err();
         assert_eq!(error.requested, 1);
-        assert_eq!(error.supported, vec![2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(error.supported, vec![2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
     #[test]

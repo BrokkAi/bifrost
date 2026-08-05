@@ -35,18 +35,7 @@ export function readCargoVersion(contents) {
 }
 
 export function validateWorkspaceVersionInheritance(repoRoot) {
-  const manifests = [
-    "Cargo.toml",
-    "crates/bifrost-core/Cargo.toml",
-    "crates/bifrost-analysis/Cargo.toml",
-    "crates/bifrost-nlp/Cargo.toml",
-    "crates/bifrost-policy/Cargo.toml",
-    "crates/bifrost-runtime/Cargo.toml",
-    "crates/bifrost-mcp/Cargo.toml",
-    "crates/bifrost-lsp/Cargo.toml",
-    "crates/bifrost-semantic-packs/Cargo.toml",
-  ];
-  for (const relativePath of manifests) {
+  for (const relativePath of RELEASED_CARGO_MANIFESTS) {
     const packageSection = readTomlSection(readFile(repoRoot, relativePath), "package", relativePath);
     if (!/^\s*version\.workspace\s*=\s*true\s*(?:#.*)?$/mu.test(packageSection)) {
       throw new Error(`${relativePath} must inherit version.workspace = true.`);
@@ -55,6 +44,25 @@ export function validateWorkspaceVersionInheritance(repoRoot) {
       throw new Error(`${relativePath} must not declare an independent package version.`);
     }
   }
+}
+
+const RELEASED_CARGO_MANIFESTS = [
+  "Cargo.toml",
+  "crates/bifrost-core/Cargo.toml",
+  "crates/bifrost-analysis/Cargo.toml",
+  "crates/bifrost-nlp/Cargo.toml",
+  "crates/bifrost-policy/Cargo.toml",
+  "crates/bifrost-runtime/Cargo.toml",
+  "crates/bifrost-mcp/Cargo.toml",
+  "crates/bifrost-lsp/Cargo.toml",
+  "crates/bifrost-semantic-packs/Cargo.toml",
+];
+
+export function syncBifrostDependencyVersions(contents, version) {
+  return contents.replace(
+    /^(\s*brokk-bifrost-[a-z-]+\s*=\s*\{[^\n]*\bversion\s*=\s*")=[^"]+("[^\n]*\}\s*(?:#.*)?)$/gmu,
+    `$1=${version}$2`,
+  );
 }
 
 export function validatePyprojectVersionInheritance(contents) {
@@ -152,6 +160,11 @@ function collectProjectionUpdates(repoRoot, version) {
   const canCopyReleaseChecksums = existingReleaseMetadata.binaryVersion === version;
 
   const updates = [
+    ...RELEASED_CARGO_MANIFESTS.map((relativePath) =>
+      updateText(repoRoot, relativePath, (contents) =>
+        syncBifrostDependencyVersions(contents, version),
+      ),
+    ),
     updateJson(repoRoot, "plugins/bifrost-agent/.codex-plugin/plugin.json", (json) => {
       json.version = version;
     }),

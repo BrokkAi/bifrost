@@ -78,11 +78,14 @@ fn scala_location_definition_returns_parameters_without_guessing_other_namespace
         assert_eq!(result["definitions"][0]["kind"], "parameter", "{value}");
         assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
     }
-    assert_eq!(results[2]["status"], "no_definition", "{value}");
+    // The `result` read resolves lexically to its `val` binder (#1569).
+    assert_eq!(results[2]["status"], "resolved", "{value}");
+    assert_eq!(results[2]["definitions"][0]["name"], "result", "{value}");
     assert_eq!(
-        results[2]["diagnostics"][0]["kind"], "local_binding",
+        results[2]["definitions"][0]["kind"], "local_variable",
         "{value}"
     );
+    assert!(results[2]["definitions"][0].get("fqn").is_none(), "{value}");
     for result in &results[3..] {
         assert_eq!(result["status"], "no_definition", "{value}");
     }
@@ -678,9 +681,15 @@ object Consumer {
         value["results"][0]["definitions"][0]["fqn"], "lib.Factory$.typeText",
         "{value}"
     );
+    // Reads after the generator's source expression resolve lexically to the
+    // enumerator binder (#1569) rather than to the imported decoy.
     for result in &value["results"].as_array().expect("definition results")[1..] {
-        assert_eq!(result["status"], "no_definition", "{value}");
-        assert_eq!(result["diagnostics"][0]["kind"], "local_binding", "{value}");
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"][0]["kind"], "local_variable",
+            "{value}"
+        );
+        assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
     }
 }
 
@@ -2856,8 +2865,15 @@ object Stream {
         assert_eq!(result["status"], "resolved", "{value}");
         assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
     }
+    // The call through `val cons = ...` resolves lexically to the local binder
+    // (#1569); no indexed `cons` decoy may leak through.
     for result in &results[2..] {
-        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"][0]["kind"], "local_variable",
+            "{value}"
+        );
+        assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
     }
 }
 

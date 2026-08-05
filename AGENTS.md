@@ -47,6 +47,14 @@ For release preparation, tagging, publication, recovery, and version policy, fol
 
 # Crate dependency boundaries
 
+Do not create a new workspace crate only to reorganize code. Create one only
+when a clear dependency, compilation, publication, or ownership boundary
+requires it. Record the reason in the change that adds the crate.
+
+When a change adds a publishable crate, update the release crate inventory in
+`CONTRIBUTING.md`. Bootstrap the crate on crates.io before the next version
+release. Configure its trusted publisher at the same time.
+
 ## Do not reintroduce the nlp dependency stack into brokk-bifrost-analysis
 
 Issue #1548 prevents a change to the `nlp` feature from invalidating the largest workspace compilation unit.
@@ -223,7 +231,7 @@ In apply mode, the script automatically removes only directories that have the h
 
 Old manually named `bifrost-*` directories remain report-only. To remove them, first review them and then explicitly add `--include-unmanaged`.
 
-For `bifrost_reference_differential`, use `--cache-mode ephemeral` for a one-time smoke test that must not write `.bifrost/cache/bifrost_cache.db`.
+For `bifrost_reference_differential`, use `--cache-mode ephemeral` for a one-time smoke test that must not write `.bifrost/cache/bifrost_cache.v<N>.db`.
 
 Use the default `--cache-mode persisted` for an intentionally warmed or resumable corpus campaign.
 

@@ -2,7 +2,7 @@ mod common;
 
 use brokk_bifrost_analysis::Language;
 use brokk_bifrost_policy::{PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files};
-use common::InlineTestProject;
+use common::{FixtureCorpus, InlineTestProject};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -27,10 +27,18 @@ fn mcp_server_binary() -> &'static str {
         .expect("Cargo did not provide an MCP server binary")
 }
 
-fn repository_fixture_root(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures")
-        .join(name)
+/// A checked-in fixture corpus, copied outside the repository.
+///
+/// A server rooted at `<checkout>/tests/fixtures/<name>` resolves the
+/// developer's real `.bifrost/cache` database, which every other Bifrost build
+/// on the machine also writes (issue #1588). The copy is a workspace root of
+/// its own, so the spawned server's cache lives and dies with the test.
+fn repository_fixture(name: &str) -> FixtureCorpus {
+    FixtureCorpus::copied_from(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(name),
+    )
 }
 
 fn assert_same_canonical_path(actual: &str, expected: &std::path::Path) {
@@ -870,7 +878,8 @@ fn bifrost_defaults_to_cwd_searchtools_server() {
 
 #[test]
 fn bifrost_mcp_dispatches_distinct_location_navigation_results() {
-    let fixture_root = repository_fixture_root("testcode-java");
+    let fixture = repository_fixture("testcode-java");
+    let fixture_root = fixture.root().to_path_buf();
     let mut child = spawn_server(&fixture_root, "symbol", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
@@ -1459,7 +1468,8 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
 
 #[test]
 fn bifrost_split_servers_publish_expected_tool_sets() {
-    let fixture_root = repository_fixture_root("testcode-java");
+    let fixture = repository_fixture("testcode-java");
+    let fixture_root = fixture.root().to_path_buf();
     let core_expected = [
         "search_symbols",
         "get_symbol_sources",
@@ -1754,7 +1764,8 @@ fn bifrost_semantic_search_fails_cleanly_without_models() {
 
 #[test]
 fn bifrost_split_servers_reject_tools_outside_their_registry() {
-    let fixture_root = repository_fixture_root("testcode-java");
+    let fixture = repository_fixture("testcode-java");
+    let fixture_root = fixture.root().to_path_buf();
 
     assert_unknown_tool(
         &fixture_root,
@@ -1784,7 +1795,8 @@ fn bifrost_split_servers_reject_tools_outside_their_registry() {
 
 #[test]
 fn bifrost_mcp_rename_symbol_returns_structured_edit_set() {
-    let fixture_root = repository_fixture_root("testcode-java");
+    let fixture = repository_fixture("testcode-java");
+    let fixture_root = fixture.root().to_path_buf();
     let before_a = fs::read_to_string(fixture_root.join("A.java")).expect("read A.java");
     let mut child = spawn_server(&fixture_root, "core", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
@@ -1841,7 +1853,8 @@ fn bifrost_mcp_rename_symbol_returns_structured_edit_set() {
 
 #[test]
 fn bifrost_searchtools_server_supports_runtime_workspace_switch() {
-    let initial_root = repository_fixture_root("testcode-java");
+    let fixture = repository_fixture("testcode-java");
+    let initial_root = fixture.root().to_path_buf();
 
     let switched = TempDir::new().expect("temp dir");
     fs::write(
@@ -1983,7 +1996,8 @@ fn bifrost_searchtools_server_supports_runtime_workspace_switch() {
 
 #[test]
 fn bifrost_searchtools_server_can_hide_line_numbers_in_text_preview() {
-    let fixture_root = repository_fixture_root("testcode-java");
+    let fixture = repository_fixture("testcode-java");
+    let fixture_root = fixture.root().to_path_buf();
 
     let mut child = spawn_server(&fixture_root, "searchtools", &["--no-line-numbers"]);
     let mut stdin = child.stdin.take().expect("stdin");
@@ -2294,7 +2308,8 @@ fn bifrost_mcp_absolute_paths_follow_activated_workspace() {
 
 #[test]
 fn bifrost_mcp_get_summaries_remains_directory_aware() {
-    let fixture_root = repository_fixture_root("testcode-java");
+    let fixture = repository_fixture("testcode-java");
+    let fixture_root = fixture.root().to_path_buf();
 
     let mut child = spawn_server(&fixture_root, "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
@@ -2861,7 +2876,8 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "a withdrawn root must never become analyzer storage"
     );
@@ -3032,7 +3048,8 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "plugin cwd must not become analyzer storage"
     );
@@ -3274,7 +3291,8 @@ fn rootless_mcp_binds_from_codex_sandbox_state_and_revokes_per_call_scope() {
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "plugin cwd must not become analyzer storage"
     );
@@ -3370,7 +3388,8 @@ fn rootless_mcp_rejects_first_codex_workspace_activation_outside_sandbox_on(host
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "rejected activation must not create analyzer state in the escaped root"
     );
@@ -3493,7 +3512,8 @@ fn rootless_mcp_accepts_codex_sandbox_metadata_from_a_compatible_client_on(host:
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "plugin cwd must not become analyzer storage"
     );
@@ -3910,7 +3930,8 @@ fn rootless_mcp_binds_through_mrtr_roots_on_2026_07_28() {
     assert!(
         !plugin_dir
             .path()
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "MRTR activation must not analyze the process working directory"
     );
@@ -3986,7 +4007,8 @@ fn assert_codex_metadata_cannot_bind_before_initialize(
     );
     assert!(
         !sandbox_root
-            .join(".bifrost/cache/bifrost_cache.db")
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
             .exists(),
         "Codex metadata must not grant workspace authority before capability negotiation"
     );

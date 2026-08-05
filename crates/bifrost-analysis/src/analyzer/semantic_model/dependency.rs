@@ -341,6 +341,73 @@ impl std::ops::Deref for DependencyDiscoveryOutcome {
     }
 }
 
+/// The queryable residue of one dependency-discovery run (#1601): the module
+/// and package identities the build declared, and whether discovery could read
+/// all of them.
+///
+/// Discovery is a caller-driven filesystem walk whose cost is unbounded in the
+/// workspace's dependency count, so a query must never trigger it. Retaining
+/// this summary on the analyzer when a host runs discovery gives boundary
+/// refinement a cheap place to read "the build declares this dependency and
+/// nothing indexed it" instead of collapsing it into "nothing is known".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyDiscoveryEvidence {
+    declared_modules: crate::hash::HashSet<String>,
+    truncated: bool,
+}
+
+impl DependencyDiscoveryEvidence {
+    pub fn from_outcome(outcome: &DependencyDiscoveryOutcome) -> Self {
+        let mut declared_modules = crate::hash::HashSet::default();
+        for dependency in &outcome.dependencies {
+            for coordinate in [&dependency.evidence.package, &dependency.evidence.module]
+                .into_iter()
+                .flatten()
+            {
+                declared_modules.insert(coordinate.name.clone());
+            }
+            for artifact in &dependency.artifacts {
+                if let Some(module) = &artifact.module {
+                    declared_modules.insert(module.clone());
+                }
+            }
+        }
+        Self {
+            declared_modules,
+            truncated: !outcome.complete,
+        }
+    }
+
+    /// Whether discovery could not read everything the build declared, so a
+    /// miss against [`Self::declares_module_path`] is not proof of absence.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Whether the build declares `path` or a module containing it: an exact
+    /// declared identity, or one reached by walking the dotted path back
+    /// toward its root (`requests.adapters.HTTPAdapter` is declared when the
+    /// `requests` distribution is). The declared identities are the normalized
+    /// dotted module names discovery itself recorded, so segment-prefix
+    /// containment is their defined structure, not a re-parse of source text.
+    pub fn declares_module_path(&self, path: &str) -> bool {
+        if path.is_empty() {
+            return false;
+        }
+        if self.declared_modules.contains(path) {
+            return true;
+        }
+        let mut prefix = path;
+        while let Some((head, _)) = prefix.rsplit_once('.') {
+            if self.declared_modules.contains(head) {
+                return true;
+            }
+            prefix = head;
+        }
+        false
+    }
+}
+
 impl DependencyPackPreparationOutcome {
     /// Compose successfully prepared dependency evidence into a host-owned
     /// activation request. A cancelled or wholly unavailable partial result

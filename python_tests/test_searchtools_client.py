@@ -43,7 +43,10 @@ from bifrost_searchtools import (
     CodeQueryProfile,
     CodeQueryProfileCacheCounters,
     CodeQueryReferenceSite,
+    CodeQueryBinding,
+    CodeQueryLexicalScope,
     CodeQueryOccurrence,
+    CodeQueryResolutionCandidate,
     CodeQueryReceiverAnalysis,
     CodeQueryResult,
     CodeQueryStructuralFactsCacheCounters,
@@ -1717,6 +1720,155 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIn("[occurrence; binding; binder; value] `r#type`", text)
         self.assertIn("-> render [function] sample.rs", text)
 
+    def test_query_code_parses_the_lexical_environment_rows(self) -> None:
+        """Scope, binding and candidate rows round-trip with their honest gaps.
+
+        The file scope has no ``ast_id`` and no ``kind``; a candidate whose
+        recording seam could not name a tier has ``tier is None``, which means
+        unattributed and never "weakest".
+        """
+        source_range = {
+            "start_line": 3,
+            "start_column": 8,
+            "end_line": 3,
+            "end_column": 12,
+        }
+        result = CodeQueryResult.from_dict(
+            {
+                "results": [
+                    {
+                        "result_type": "lexical_scope",
+                        "id": "scope-digest",
+                        "path": "Sample.java",
+                        "language": "java",
+                        "index": 0,
+                        "range": source_range,
+                        "start_byte": 0,
+                        "end_byte": 200,
+                    },
+                    {
+                        "result_type": "lexical_scope",
+                        "id": "block-digest",
+                        "ast_id": "block-node",
+                        "path": "Sample.java",
+                        "language": "java",
+                        "index": 2,
+                        "kind": "block",
+                        "range": source_range,
+                        "start_byte": 40,
+                        "end_byte": 90,
+                        "parent_index": 1,
+                    },
+                    {
+                        "result_type": "binding",
+                        "id": "binding-digest",
+                        "ast_id": "binder-node",
+                        "path": "Sample.java",
+                        "language": "java",
+                        "name": "rows",
+                        "kind": "local",
+                        "hoisting": "source_order",
+                        "namespace": "value",
+                        "range": source_range,
+                        "start_byte": 50,
+                        "end_byte": 54,
+                        "activation_start_byte": 60,
+                        "activation_end_byte": 90,
+                        "declaring_scope_index": 2,
+                        "source_order": 0,
+                        "visibility": "unknown",
+                    },
+                    {
+                        "result_type": "resolution_candidate",
+                        "id": "candidate-digest",
+                        "ast_id": "reference-node",
+                        "path": "Sample.java",
+                        "language": "java",
+                        "range": source_range,
+                        "start_byte": 70,
+                        "end_byte": 74,
+                        "ordinal": 0,
+                        "outcome": "rejected",
+                        "rejection_reason": "shadowed_by_nearer",
+                        "boundary": "workspace_local",
+                        "visibility": "unknown",
+                        "trace_completeness": "full",
+                        "candidate": {
+                            "candidate_kind": "binding",
+                            "name": "rows",
+                            "path": "Sample.java",
+                        },
+                    },
+                ],
+                "truncated": False,
+            }
+        )
+
+        file_scope, block_scope, binding, candidate = result.results
+        self.assertIsInstance(file_scope, CodeQueryLexicalScope)
+        # The synthesized whole-file scope is the one scope with no AST node.
+        self.assertIsNone(file_scope.ast_id)
+        self.assertIsNone(file_scope.kind)
+        self.assertIsNone(file_scope.parent_index)
+        self.assertEqual(block_scope.parent_index, 1)
+
+        self.assertIsInstance(binding, CodeQueryBinding)
+        # The activation interval starts after the declarator, not at the
+        # binder token, which is what makes read-before-declaration answerable.
+        self.assertGreater(binding.activation_start_byte, binding.start_byte)
+        self.assertEqual(binding.declaring_scope_index, block_scope.index)
+        self.assertFalse(binding.shadowed)
+        self.assertIsNone(binding.import_binder)
+
+        self.assertIsInstance(candidate, CodeQueryResolutionCandidate)
+        self.assertIsNone(candidate.tier)
+        self.assertEqual(candidate.rejection_reason, "shadowed_by_nearer")
+        # A binding candidate carries no declaration, so candidate_target
+        # cannot answer for it.
+        self.assertIsNone(candidate.candidate.unit)
+
+        text = result.render_text()
+        self.assertIn("[lexical_scope #0; file]", text)
+        self.assertIn("[binding; local; source_order] `rows`", text)
+        self.assertIn(
+            "[resolution_candidate; unattributed; rejected] binding `rows`", text
+        )
+
+    def test_query_code_file_rows_carry_the_package_clause(self) -> None:
+        """The package clause is fields on the file row, not a fourth row kind.
+
+        Both fields appear together or not at all, so "no package could be
+        named" never reads as "the file is in the root package".
+        """
+        result = CodeQueryResult.from_dict(
+            {
+                "results": [
+                    {
+                        "result_type": "file",
+                        "path": "api/Widget.java",
+                        "language": "java",
+                        "package_fq": "api",
+                        "package_syntactic": True,
+                    },
+                    {
+                        "result_type": "file",
+                        "path": "script.js",
+                        "language": "javascript",
+                    },
+                ],
+                "truncated": False,
+            }
+        )
+
+        java, script = result.results
+        self.assertEqual(java.package_fq, "api")
+        self.assertTrue(java.package_syntactic)
+        self.assertIsNone(script.package_fq)
+        self.assertIsNone(script.package_syntactic)
+        text = result.render_text()
+        self.assertIn("api/Widget.java [file; java] in api (syntactic)", text)
+        self.assertIn("script.js [file; javascript]", text)
+
     def test_occurrence_diagnostic_codes_are_recognized(self) -> None:
         self.assertEqual(
             CodeQueryDiagnosticCode("occurrence_role_unsupported"),
@@ -1726,6 +1878,27 @@ class SearchToolsClientTest(unittest.TestCase):
             CodeQueryDiagnosticCode("occurrence_resolution_incomplete"),
             CodeQueryDiagnosticCode.OCCURRENCE_RESOLUTION_INCOMPLETE,
         )
+
+    def test_lexical_environment_diagnostic_codes_are_recognized(self) -> None:
+        for label, expected in [
+            (
+                "environment_axis_unsupported",
+                CodeQueryDiagnosticCode.ENVIRONMENT_AXIS_UNSUPPORTED,
+            ),
+            (
+                "environment_derivation_incomplete",
+                CodeQueryDiagnosticCode.ENVIRONMENT_DERIVATION_INCOMPLETE,
+            ),
+            (
+                "environment_row_budget_exhausted",
+                CodeQueryDiagnosticCode.ENVIRONMENT_ROW_BUDGET_EXHAUSTED,
+            ),
+            (
+                "resolution_trace_incomplete",
+                CodeQueryDiagnosticCode.RESOLUTION_TRACE_INCOMPLETE,
+            ),
+        ]:
+            self.assertEqual(CodeQueryDiagnosticCode(label), expected)
 
     def test_symbol_sources_use_original_file_line_numbers(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:

@@ -248,6 +248,7 @@ pub(crate) struct GoEdgeIndex {
     type_alias_targets: HashMap<String, String>,
     direct_member_fqns: HashMap<String, HashMap<String, Vec<String>>>,
     embedded_field_type_fqns: HashMap<String, Vec<String>>,
+    field_type_fqns: HashMap<String, HashMap<String, Vec<String>>>,
     namespace_packages_by_file: HashMap<ProjectFile, NamespacePackages>,
 }
 
@@ -309,6 +310,27 @@ impl GoEdgeIndex {
         let embedded = |owner: &str| self.embedded_field_type_fqns(owner).to_vec();
         match go_unique_indexed_member_candidate_at_nearest_depth(
             owner_fqn, member, &direct, &embedded,
+        ) {
+            GoIndexedMemberLookup::Unique(candidate) => Some(candidate),
+            GoIndexedMemberLookup::Missing | GoIndexedMemberLookup::Ambiguous => None,
+        }
+    }
+
+    /// The declared workspace type fqn of `owner_fqn`'s field `field`, resolved
+    /// through Go's embedded-member promotion at the nearest depth. `None` when
+    /// the field is unknown, its type is not a workspace type, or promotion is
+    /// ambiguous.
+    pub(super) fn unique_field_type_fqn(&self, owner_fqn: &str, field: &str) -> Option<String> {
+        let direct = |owner: &str, field: &str| {
+            self.field_type_fqns
+                .get(owner)
+                .and_then(|fields| fields.get(field))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let embedded = |owner: &str| self.embedded_field_type_fqns(owner).to_vec();
+        match go_unique_indexed_member_candidate_at_nearest_depth(
+            owner_fqn, field, &direct, &embedded,
         ) {
             GoIndexedMemberLookup::Unique(candidate) => Some(candidate),
             GoIndexedMemberLookup::Missing | GoIndexedMemberLookup::Ambiguous => None,
@@ -463,7 +485,7 @@ fn build_go_edge_index_from_parsed(
     let indexed_files: Vec<ProjectFile> =
         parsed_files.iter().map(|(file, _)| file.clone()).collect();
     let declaration_facts = collect_go_declaration_facts(analyzer, &indexed_files);
-    let embedded_field_type_fqns = collect_go_embedded_field_type_fqns(
+    let field_type_facts = collect_go_field_type_facts(
         analyzer,
         parsed_files,
         &package_names,
@@ -479,7 +501,8 @@ fn build_go_edge_index_from_parsed(
         type_alias_targets,
         type_units: declaration_facts.type_units,
         direct_member_fqns: declaration_facts.direct_member_fqns,
-        embedded_field_type_fqns,
+        embedded_field_type_fqns: field_type_facts.embedded_by_owner,
+        field_type_fqns: field_type_facts.field_types_by_owner,
         namespace_packages_by_file,
     }
 }
@@ -601,15 +624,26 @@ fn resolve_go_alias_fqn(aliases: &HashMap<String, String>, fq_name: &str) -> Str
     current
 }
 
-fn collect_go_embedded_field_type_fqns(
+struct GoFieldTypeFacts {
+    /// Embedded field/interface type fqns per owner, for member promotion.
+    embedded_by_owner: HashMap<String, Vec<String>>,
+    /// Declared type fqn(s) per (owner fqn, field name), for named and embedded
+    /// struct fields whose type resolves to a workspace type. Lets a scan carry
+    /// a field-derived local (`s := pi.field`) forward as the field's type.
+    field_types_by_owner: HashMap<String, HashMap<String, Vec<String>>>,
+}
+
+fn collect_go_field_type_facts(
     analyzer: &GoAnalyzer,
     parsed_files: &[(ProjectFile, &ParsedFile)],
     package_names: &HashMap<ProjectFile, String>,
     dir_index: &ParentDirIndex,
     workspace_paths: &GoWorkspacePathIndex,
     type_fqns: &HashSet<String>,
-) -> HashMap<String, Vec<String>> {
+) -> GoFieldTypeFacts {
     let mut embedded_by_owner: HashMap<String, Vec<String>> = HashMap::default();
+    let mut field_types_by_owner: HashMap<String, HashMap<String, Vec<String>>> =
+        HashMap::default();
     let resolver = GoEdgeTypeResolver {
         analyzer,
         package_names,
@@ -627,13 +661,26 @@ fn collect_go_embedded_field_type_fqns(
             .into_iter()
             .filter(|unit| unit.is_field())
         {
-            let Some(type_text) = go_embedded_field_unit_type_text(analyzer, &field, Some(parsed))
-            else {
-                continue;
-            };
             // Structured owner pop on `field`'s own `fq()`, not a re-split of
             // its rendered fqn string — same reasoning as the owner cut above.
             let Some(owner_fqn) = crate::analyzer::default_parent_fq_name(&field) else {
+                continue;
+            };
+            let field_name = field.identifier().to_string();
+            if let Some(field_type_fqn) = go_field_unit_type_text(analyzer, &field, &field_name)
+                .and_then(|type_text| {
+                    resolver.resolve_field_type_fqn(field.source(), &owner_fqn, &type_text)
+                })
+            {
+                field_types_by_owner
+                    .entry(owner_fqn.clone())
+                    .or_default()
+                    .entry(field_name)
+                    .or_default()
+                    .push(field_type_fqn);
+            }
+            let Some(type_text) = go_embedded_field_unit_type_text(analyzer, &field, Some(parsed))
+            else {
                 continue;
             };
             let Some(embedded_fqn) =
@@ -651,7 +698,16 @@ fn collect_go_embedded_field_type_fqns(
         embedded.sort();
         embedded.dedup();
     }
-    embedded_by_owner
+    for fields in field_types_by_owner.values_mut() {
+        for field_types in fields.values_mut() {
+            field_types.sort();
+            field_types.dedup();
+        }
+    }
+    GoFieldTypeFacts {
+        embedded_by_owner,
+        field_types_by_owner,
+    }
 }
 
 fn collect_go_embedded_interface_type_fqns(

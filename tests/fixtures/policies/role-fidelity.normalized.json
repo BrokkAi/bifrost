@@ -9,6 +9,7 @@
         },
         "expect": "none",
         "id": "no-rebinding",
+        "kind": "occurrence",
         "namespace": null,
         "require_target": false,
         "role": "binder"
@@ -23,9 +24,9 @@
             "regex": "^logger$"
           }
         },
-        "schema_version": 8
+        "schema_version": 9
       },
-      "schema_version": 8,
+      "schema_version": 9,
       "type": "inline"
     },
     "type": "assertion"

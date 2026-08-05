@@ -1685,6 +1685,8 @@ fn shared_provenance_and_diagnostic_presentation_preserves_order_and_deduplicate
     let item = CodeQueryResultItem {
         value: CodeQueryResultValue::File {
             value: CodeQueryFile {
+                package_fq: None,
+                package_syntactic: None,
                 path: "src/app.ts".to_string(),
                 language: "typescript",
             },

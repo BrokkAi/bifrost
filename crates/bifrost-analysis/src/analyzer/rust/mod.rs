@@ -236,9 +236,39 @@ impl RustAnalyzer {
         )
     }
 
+    fn cargo_routes_while(
+        &self,
+        keep_going: &(impl Fn() -> bool + Sync),
+    ) -> Option<Arc<RustCargoRouteIndex>> {
+        self.cargo_routes.get_or_build_while(
+            keep_going,
+            || self.build_cargo_routes_while(true, keep_going),
+            || self.build_cargo_routes_while(false, keep_going),
+        )
+    }
+
     fn build_cargo_routes(&self, parallel: bool) -> RustCargoRouteIndex {
+        self.build_cargo_routes_while(parallel, &|| true)
+            .expect("uninterrupted Rust Cargo-route construction")
+    }
+
+    fn build_cargo_routes_while(
+        &self,
+        parallel: bool,
+        keep_going: &(impl Fn() -> bool + Sync),
+    ) -> Option<RustCargoRouteIndex> {
         let files: Vec<_> = self.get_analyzed_files().into_iter().collect();
-        RustCargoRouteIndex::build(&files, |file| self.prepared_syntax(file), parallel)
+        RustCargoRouteIndex::build_while(
+            &files,
+            |file| self.prepared_syntax(file),
+            parallel,
+            keep_going,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cargo_routes_ready_for_test(&self) -> bool {
+        self.cargo_routes.is_ready()
     }
 
     pub(crate) fn candidates_in_same_cargo_target_root(

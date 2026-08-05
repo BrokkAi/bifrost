@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-const SQLITE_IN_LIMIT: usize = 500;
+const SQLITE_PAIR_BATCH: usize = 400;
 
 /// Resolve the cache shared by every worktree of a primary repository.
 pub fn semantic_db_path(workspace_root: &Path) -> PathBuf {
@@ -59,33 +59,10 @@ pub struct FileChunkIn<'a> {
     pub vector_hash: [u8; 32],
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct FileChunkRow {
-    pub blob_oid: String,
-    pub rel_path: String,
-    pub chunk_ord: i64,
-    pub symbol: String,
-    pub start_line: Option<i64>,
-    pub end_line: Option<i64>,
-    pub fts_tokens: String,
-    pub vector_hash: [u8; 32],
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct VectorRow {
-    pub vector_hash: [u8; 32],
-    pub code: Vec<u8>,
-}
-
 impl SemanticStore {
     pub fn open(db_path: &Path) -> Result<Self> {
         let conn = brokk_bifrost_analysis::cache_db::open_unified_connection(db_path)
             .map_err(StoreError::new)?;
-        conn.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS active_vectors(
-                 vector_hash BLOB PRIMARY KEY
-             ) WITHOUT ROWID, STRICT;",
-        )?;
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: db_path.to_path_buf(),
@@ -153,29 +130,29 @@ impl SemanticStore {
         Ok(wiped)
     }
 
-    /// Return path/OID pairs that have not been materialized. Existing rows are
-    /// fetched in OID batches rather than by one point query per source file.
+    /// Return exact path/OID pairs that have not been materialized.
     pub fn missing_files(&self, files: &[(String, String)]) -> Result<Vec<(String, String)>> {
         let conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let mut oid_seen = HashSet::new();
-        let oids: Vec<&String> = files
-            .iter()
-            .map(|(oid, _)| oid)
-            .filter(|oid| oid_seen.insert((*oid).clone()))
-            .collect();
         let mut existing = HashSet::new();
-        for batch in oids.chunks(SQLITE_IN_LIMIT) {
-            let placeholders = std::iter::repeat_n("?", batch.len())
+        for batch in files.chunks(SQLITE_PAIR_BATCH) {
+            let placeholders = std::iter::repeat_n("(?, ?)", batch.len())
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT blob_oid, rel_path FROM semantic_files
-                 WHERE blob_oid IN ({placeholders})"
+                "WITH requested(blob_oid, rel_path) AS (VALUES {placeholders})
+                 SELECT files.blob_oid, files.rel_path
+                 FROM requested
+                 JOIN semantic_files AS files
+                   ON files.blob_oid = requested.blob_oid
+                  AND files.rel_path = requested.rel_path"
             );
             let mut stmt = conn.prepare(&sql)?;
-            let values = batch
-                .iter()
-                .map(|oid| rusqlite::types::Value::Text((*oid).clone()));
+            let values = batch.iter().flat_map(|(oid, path)| {
+                [
+                    rusqlite::types::Value::Text(oid.clone()),
+                    rusqlite::types::Value::Text(path.clone()),
+                ]
+            });
             let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
@@ -281,122 +258,6 @@ impl SemanticStore {
         Ok(())
     }
 
-    /// Load every cached path variant for the requested OIDs. The active-index
-    /// caller selects only exact `(OID, path)` pairs in its worktree.
-    pub fn chunks_for_oids(&self, oids: &[String]) -> Result<Vec<FileChunkRow>> {
-        let conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let mut output = Vec::new();
-        let mut seen = HashSet::new();
-        let unique: Vec<&String> = oids.iter().filter(|oid| seen.insert(*oid)).collect();
-        for batch in unique.chunks(SQLITE_IN_LIMIT) {
-            let placeholders = std::iter::repeat_n("?", batch.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "SELECT blob_oid, rel_path, chunk_ord, symbol, start_line, end_line,
-                        fts_tokens, vector_hash
-                 FROM semantic_file_chunks
-                 WHERE blob_oid IN ({placeholders})
-                 ORDER BY blob_oid, rel_path, chunk_ord"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let values = batch
-                .iter()
-                .map(|oid| rusqlite::types::Value::Text((*oid).clone()));
-            let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
-            while let Some(row) = rows.next()? {
-                output.push(FileChunkRow {
-                    blob_oid: row.get(0)?,
-                    rel_path: row.get(1)?,
-                    chunk_ord: row.get(2)?,
-                    symbol: row.get(3)?,
-                    start_line: row.get(4)?,
-                    end_line: row.get(5)?,
-                    fts_tokens: row.get(6)?,
-                    vector_hash: decode_key_blob(row.get::<_, Vec<u8>>(7)?)?,
-                });
-            }
-        }
-        Ok(output)
-    }
-
-    pub fn set_active_vector_hashes(&self, hashes: &HashSet<[u8; 32]>) -> Result<()> {
-        let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM active_vectors", [])?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO active_vectors(vector_hash) VALUES(?1)
-                 ON CONFLICT(vector_hash) DO NOTHING",
-            )?;
-            for hash in hashes {
-                stmt.execute(params![hash.as_slice()])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn add_active_vectors(&self, hashes: &[[u8; 32]]) -> Result<()> {
-        self.change_active_vectors(hashes, true)
-    }
-
-    pub fn remove_active_vectors(&self, hashes: &[[u8; 32]]) -> Result<()> {
-        self.change_active_vectors(hashes, false)
-    }
-
-    fn change_active_vectors(&self, hashes: &[[u8; 32]], add: bool) -> Result<()> {
-        if hashes.is_empty() {
-            return Ok(());
-        }
-        let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let tx = conn.transaction()?;
-        let sql = if add {
-            "INSERT INTO active_vectors(vector_hash) VALUES(?1)
-             ON CONFLICT(vector_hash) DO NOTHING"
-        } else {
-            "DELETE FROM active_vectors WHERE vector_hash = ?1"
-        };
-        {
-            let mut stmt = tx.prepare(sql)?;
-            for hash in hashes {
-                stmt.execute(params![hash.as_slice()])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn scan_active_vectors(
-        &self,
-        batch_size: usize,
-        visit: &mut dyn FnMut(Vec<VectorRow>),
-    ) -> Result<()> {
-        let effective_batch = batch_size.max(1);
-        let conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT vectors.vector_hash, vectors.vector
-             FROM semantic_vectors AS vectors
-             JOIN active_vectors AS active USING(vector_hash)",
-        )?;
-        let mut rows = stmt.query([])?;
-        let mut batch = Vec::with_capacity(effective_batch);
-        while let Some(row) = rows.next()? {
-            batch.push(VectorRow {
-                vector_hash: decode_key_blob(row.get::<_, Vec<u8>>(0)?)?,
-                code: row.get(1)?,
-            });
-            if batch.len() == effective_batch {
-                visit(std::mem::take(&mut batch));
-                batch = Vec::with_capacity(effective_batch);
-            }
-        }
-        if !batch.is_empty() {
-            visit(batch);
-        }
-        Ok(())
-    }
-
     pub fn gc(&self, live: &HashSet<String>) -> Result<()> {
         self.gc_with(|oid| live.contains(oid)).map(|_| ())
     }
@@ -440,15 +301,6 @@ impl SemanticStore {
             .filter(|value| *value > 0)
             .map(|value| brokk_bifrost_analysis::cache_db::now_unix_seconds() - value))
     }
-}
-
-fn decode_key_blob(blob: Vec<u8>) -> Result<[u8; 32]> {
-    blob.try_into().map_err(|value: Vec<u8>| {
-        StoreError::new(format!(
-            "expected 32-byte key blob, got {} bytes",
-            value.len()
-        ))
-    })
 }
 
 #[cfg(test)]
@@ -500,10 +352,17 @@ mod tests {
             ])
             .unwrap();
 
-        let rows = store.chunks_for_oids(&[oid.to_string()]).unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].rel_path, "src/a.rs");
-        assert_eq!(rows[1].rel_path, "src/b.rs");
+        let stored_paths = store
+            .conn
+            .lock()
+            .unwrap()
+            .prepare("SELECT rel_path FROM semantic_files WHERE blob_oid = ?1 ORDER BY rel_path")
+            .unwrap()
+            .query_map([oid], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(stored_paths, ["src/a.rs", "src/b.rs"]);
         assert_eq!(
             store
                 .missing_files(&[
@@ -513,23 +372,6 @@ mod tests {
                 .unwrap(),
             vec![(oid.to_string(), "src/c.rs".to_string())]
         );
-    }
-
-    #[test]
-    fn active_vector_scan_is_connection_local_and_batched() {
-        let (_temp, store) = open_temp();
-        store
-            .upsert_vectors(&[([1; 32], vec![1.0]), ([2; 32], vec![2.0])])
-            .unwrap();
-        store
-            .set_active_vector_hashes(&HashSet::from([[2; 32]]))
-            .unwrap();
-        let mut seen = Vec::new();
-        store
-            .scan_active_vectors(1, &mut |rows| seen.extend(rows))
-            .unwrap();
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].vector_hash, [2; 32]);
     }
 
     #[test]
@@ -566,7 +408,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.gc_with(|oid| oid == keep).unwrap(), 1);
-        assert_eq!(store.chunks_for_oids(&[drop.to_string()]).unwrap(), vec![]);
+        let remaining: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_files WHERE blob_oid = ?1",
+                [drop],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
         assert_eq!(
             store.missing_vector_hashes(&[[2; 32]]).unwrap(),
             vec![[2; 32]]
@@ -584,12 +436,13 @@ mod tests {
             .unwrap();
 
         assert!(store.ensure_index_compatible("fp2", "ck1", "bm1").unwrap());
-        assert!(
-            store
-                .chunks_for_oids(&[oid.to_string()])
-                .unwrap()
-                .is_empty()
-        );
+        let semantic_files: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM semantic_files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(semantic_files, 0);
         assert_eq!(
             store.missing_vector_hashes(&[[1; 32]]).unwrap(),
             vec![[1; 32]]
@@ -640,7 +493,7 @@ mod tests {
         let actual = semantic_db_path(&worktree_root);
         assert_eq!(
             actual.file_name().and_then(|name| name.to_str()),
-            Some(brokk_bifrost_analysis::cache_db::CACHE_DB_FILE_NAME)
+            Some(brokk_bifrost_analysis::cache_db::cache_db_file_name())
         );
         let actual_root = actual
             .parent()

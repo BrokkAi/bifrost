@@ -4724,7 +4724,17 @@ fn run() {
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    // The shadowing `let Foo` wins and resolves to its own binder (#1569);
+    // the glob-imported struct must not leak through.
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["kind"], "local_variable",
+        "{value}"
+    );
+    assert!(
+        value["results"][0]["definitions"][0].get("fqn").is_none(),
+        "{value}"
+    );
 }
 
 #[test]
@@ -4964,7 +4974,17 @@ fn run() {
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    // The pattern binding wins and resolves to its own binder (#1569); the
+    // glob-imported struct must not leak through.
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["kind"], "local_variable",
+        "{value}"
+    );
+    assert!(
+        value["results"][0]["definitions"][0].get("fqn").is_none(),
+        "{value}"
+    );
 }
 
 #[test]
@@ -5671,7 +5691,6 @@ where
         "writer> Borrowed",
         "let _ = Item",
         "let _ = Acquire",
-        "produced.root",
     ] {
         let start = source.find(marker).expect("reference marker");
         let value = lookup(project.root(), &location_reference("lib.rs", source, start));
@@ -5680,6 +5699,21 @@ where
             "{marker}: {value}"
         );
     }
+
+    // The `produced` receiver read resolves lexically to its `let` binder
+    // (#1569) instead of leaking the `Decoy.root` field.
+    let produced = source.find("produced.root").expect("reference marker");
+    let value = lookup(
+        project.root(),
+        &location_reference("lib.rs", source, produced),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["kind"], "local_variable",
+        "{value}"
+    );
+    assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
 
     for (marker, expected_fqn, expected_kind) in [
         ("local_macro!", "local_macro", "macro"),
@@ -11351,8 +11385,28 @@ bench.start();
         );
     }
 
+    // The `path` local read resolves lexically to its `const` binder (#1569)
+    // instead of falling back to the indexed `ArboristNode.path` field.
+    let local_read = lookup(
+        project.root(),
+        &location_reference("app.js", source, source.find("+ path;").unwrap() + 2),
+    );
+    assert_eq!(
+        local_read["results"][0]["status"], "resolved",
+        "{local_read}"
+    );
+    assert_eq!(
+        local_read["results"][0]["definitions"][0]["kind"], "local_variable",
+        "{local_read}"
+    );
+    assert!(
+        local_read["results"][0]["definitions"][0]
+            .get("fqn")
+            .is_none(),
+        "{local_read}"
+    );
+
     for start in [
-        source.find("+ path;").unwrap() + 2,
         source.find("  path;\n").unwrap() + 2,
         source.find("{ createConnection:").unwrap() + 2,
         source.find("get value()").unwrap() + "get ".len(),
@@ -11440,12 +11494,15 @@ unrelated();
         .file("app.js", source)
         .build();
 
+    // The nested hoisted declarations win over the indexed `member.*`
+    // fallbacks and resolve lexically to their declaration names (#1569).
     for marker in ["  pause();", "  generator();", "  LocalClass;"] {
         let start = source.find(marker).expect("nested declaration reference") + 2;
         let value = lookup(project.root(), &location_reference("app.js", source, start));
         let result = &value["results"][0];
-        assert_eq!(result["status"], "no_definition", "{value}");
-        assert_eq!(result["diagnostics"][0]["kind"], "local_binding", "{value}");
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
+        assert_eq!(result["definitions"][0]["path"], "app.js", "{value}");
     }
 
     let qualified = source.rfind("member.pause").expect("qualified member call");
@@ -11755,9 +11812,28 @@ const options = { createConnection: run };
         );
     }
 
+    // The `local` read resolves lexically to its `const` binder (#1569).
+    let local_read = lookup(
+        project.root(),
+        &location_reference("app.ts", source, source.find("+ local;").unwrap() + 2),
+    );
+    assert_eq!(
+        local_read["results"][0]["status"], "resolved",
+        "{local_read}"
+    );
+    assert_eq!(
+        local_read["results"][0]["definitions"][0]["kind"], "local_variable",
+        "{local_read}"
+    );
+    assert!(
+        local_read["results"][0]["definitions"][0]
+            .get("fqn")
+            .is_none(),
+        "{local_read}"
+    );
+
     for start in [
         source.find("Record { value").unwrap() + "Record { ".len(),
-        source.find("+ local;").unwrap() + 2,
         source.find("{ createConnection:").unwrap() + 2,
     ] {
         let value = lookup(project.root(), &location_reference("app.ts", source, start));
@@ -11811,9 +11887,11 @@ function render(entries: unknown[], fallback: string) {
             let start = line_start + marker.find(identifier).expect("identifier in marker");
             let value = lookup(project.root(), &location_reference("app.ts", source, start));
             let result = &value["results"][0];
-            assert_eq!(result["status"], "no_definition", "{value}");
-            assert!(result["definitions"].is_null(), "{value}");
-            assert_eq!(result["diagnostics"][0]["kind"], "local_binding", "{value}");
+            // Loop-body reads resolve lexically to the for-of binders (#1569);
+            // the same-named indexed fields must not leak through.
+            assert_eq!(result["status"], "resolved", "{value}");
+            assert_eq!(result["definitions"][0]["name"], *identifier, "{value}");
+            assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
         }
     }
 
@@ -15061,8 +15139,18 @@ public class JSONReaderUTF8 {
             project.root(),
             &location_reference("com/alibaba/fastjson2/JSONReaderJSONB.java", source, start),
         );
+        // The active local binding shadows both fields and resolves to its
+        // own binder (#1569).
         assert_eq!(
-            value["results"][0]["status"], "no_definition",
+            value["results"][0]["status"], "resolved",
+            "the active lexical binding must shadow both fields: {marker}: {value}"
+        );
+        assert_eq!(
+            value["results"][0]["definitions"][0]["kind"], "local_variable",
+            "the active lexical binding must shadow both fields: {marker}: {value}"
+        );
+        assert!(
+            value["results"][0]["definitions"][0].get("fqn").is_none(),
             "the active lexical binding must shadow both fields: {marker}: {value}"
         );
     }
@@ -15243,143 +15331,6 @@ public class SentenceSourceIndexer implements AutoCloseable {
 }
 
 #[test]
-fn java_lombok_data_getter_resolves_to_backing_field() {
-    let project = InlineTestProject::with_language(Language::Java)
-        .file(
-            "app/Person.java",
-            r#"
-package app;
-
-import lombok.Data;
-
-@Data
-public class Person {
-    private final String name;
-}
-"#,
-        )
-        .file(
-            "app/UsePerson.java",
-            r#"
-package app;
-
-public class UsePerson {
-    String run(Person person) {
-        return person.getName();
-    }
-}
-"#,
-        )
-        .build();
-
-    let line = "        return person.getName();";
-    let value = lookup(
-        project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/UsePerson.java","line":6,"column":{}}}]}}"#,
-            column_of(line, "getName")
-        ),
-    );
-
-    let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "app.Person.name",
-        "{value}"
-    );
-    assert_eq!(result["definitions"][0]["kind"], "field", "{value}");
-}
-
-#[test]
-fn java_lombok_data_boolean_getter_resolves_is_accessor_to_backing_field() {
-    let project = InlineTestProject::with_language(Language::Java)
-        .file(
-            "app/Person.java",
-            r#"
-package app;
-
-import lombok.Data;
-
-@Data
-public class Person {
-    private final boolean ready;
-}
-"#,
-        )
-        .file(
-            "app/UsePerson.java",
-            r#"
-package app;
-
-public class UsePerson {
-    boolean run(Person person) {
-        return person.isReady();
-    }
-}
-"#,
-        )
-        .build();
-
-    let line = "        return person.isReady();";
-    let value = lookup(
-        project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/UsePerson.java","line":6,"column":{}}}]}}"#,
-            column_of(line, "isReady")
-        ),
-    );
-
-    let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "app.Person.ready",
-        "{value}"
-    );
-}
-
-#[test]
-fn java_lombok_data_is_getter_requires_boolean_backing_field() {
-    let project = InlineTestProject::with_language(Language::Java)
-        .file(
-            "app/Person.java",
-            r#"
-package app;
-
-import lombok.Data;
-
-@Data
-public class Person {
-    private final String ready;
-}
-"#,
-        )
-        .file(
-            "app/UsePerson.java",
-            r#"
-package app;
-
-public class UsePerson {
-    boolean run(Person person) {
-        return person.isReady();
-    }
-}
-"#,
-        )
-        .build();
-
-    let line = "        return person.isReady();";
-    let value = lookup(
-        project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/UsePerson.java","line":6,"column":{}}}]}}"#,
-            column_of(line, "isReady")
-        ),
-    );
-
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
-}
-
-#[test]
 fn java_missing_getter_without_lombok_does_not_guess_field() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
@@ -15407,48 +15358,6 @@ public class UsePerson {
         .build();
 
     let line = "        return person.getName();";
-    let value = lookup(
-        project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/UsePerson.java","line":6,"column":{}}}]}}"#,
-            column_of(line, "getName")
-        ),
-    );
-
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
-}
-
-#[test]
-fn java_lombok_accessor_name_field_access_does_not_resolve_backing_field() {
-    let project = InlineTestProject::with_language(Language::Java)
-        .file(
-            "app/Person.java",
-            r#"
-package app;
-
-import lombok.Data;
-
-@Data
-public class Person {
-    private final String name;
-}
-"#,
-        )
-        .file(
-            "app/UsePerson.java",
-            r#"
-package app;
-
-public class UsePerson {
-    Object run(Person person) {
-        return person.getName;
-    }
-}
-"#,
-        )
-        .build();
-
-    let line = "        return person.getName;";
     let value = lookup(
         project.root(),
         &format!(
@@ -16369,7 +16278,7 @@ public interface Handler {
 }
 
 #[test]
-fn java_local_value_returns_no_definition() {
+fn java_local_value_resolves_to_the_local_binder() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
             "app/UseLocal.java",
@@ -16395,7 +16304,16 @@ public class UseLocal {
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    // A bare local read resolves lexically to its binder (#1569).
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["kind"], "local_variable",
+        "{value}"
+    );
+    assert!(
+        value["results"][0]["definitions"][0].get("fqn").is_none(),
+        "{value}"
+    );
 }
 
 #[test]
@@ -20379,7 +20297,7 @@ fn csharp_external_using_reports_boundary() {
 }
 
 #[test]
-fn csharp_local_value_returns_no_definition() {
+fn csharp_local_value_resolves_to_the_local_binder() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
             "App.cs",
@@ -20396,7 +20314,16 @@ fn csharp_local_value_returns_no_definition() {
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    // A bare local read resolves lexically to its binder (#1569).
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["kind"], "local_variable",
+        "{value}"
+    );
+    assert!(
+        value["results"][0]["definitions"][0].get("fqn").is_none(),
+        "{value}"
+    );
 }
 
 #[test]
@@ -23227,7 +23154,7 @@ fn cpp_extensionless_angle_include_with_unrelated_basename_reports_boundary() {
 }
 
 #[test]
-fn cpp_local_value_returns_no_definition() {
+fn cpp_local_value_resolves_to_the_local_binder() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file("app.cpp", "void run() { int value = 1; value++; }\n")
         .build();
@@ -23241,7 +23168,16 @@ fn cpp_local_value_returns_no_definition() {
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    // A bare local read resolves lexically to its binder (#1569).
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["kind"], "local_variable",
+        "{value}"
+    );
+    assert!(
+        value["results"][0]["definitions"][0].get("fqn").is_none(),
+        "{value}"
+    );
 }
 
 #[test]
@@ -25171,7 +25107,14 @@ void construct() { widget(); }
         assert_eq!(result["definitions"][0]["kind"], "function", "{value}");
     }
     assert_eq!(results[2]["status"], "no_declaration", "{value}");
-    assert_eq!(results[3]["status"], "no_declaration", "{value}");
+    // The call through the local lambda resolves lexically to its binder
+    // (#1569); no same-named member or free function leaks through.
+    assert_eq!(results[3]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[3]["definitions"][0]["kind"], "local_variable",
+        "{value}"
+    );
+    assert!(results[3]["definitions"][0].get("fqn").is_none(), "{value}");
     assert_eq!(results[4]["status"], "resolved", "{value}");
     assert_eq!(results[4]["definitions"][0]["fqn"], "widget", "{value}");
 
@@ -25718,7 +25661,17 @@ fn scala_uppercase_local_call_shadows_same_package_object_apply() {
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    // The call through `val Factory = ...` resolves lexically to the local
+    // binder (#1569); the same-package object's apply must not leak through.
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["kind"], "local_variable",
+        "{value}"
+    );
+    assert!(
+        value["results"][0]["definitions"][0].get("fqn").is_none(),
+        "{value}"
+    );
 }
 
 #[test]
@@ -28460,7 +28413,7 @@ fn scala_external_imported_function_call_reports_boundary() {
 }
 
 #[test]
-fn scala_local_value_returns_no_definition() {
+fn scala_local_value_resolves_to_the_local_binder() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
             "App.scala",
@@ -28477,21 +28430,14 @@ fn scala_local_value_returns_no_definition() {
         ),
     );
 
+    // A bare local read resolves lexically to its binder (#1569).
     let result = &value["results"][0];
-    assert_eq!(result["status"], "no_definition", "{value}");
-    let message = result["diagnostics"][0]["message"]
-        .as_str()
-        .expect("definition diagnostic");
-    assert!(
-        message.contains("Requested location: App.scala:1:"),
-        "{message}"
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["kind"], "local_variable",
+        "{value}"
     );
-    assert!(message.contains("> 1 | object App"), "{message}");
-    assert!(message.contains("^ requested line 1, column"), "{message}");
-    assert!(
-        message.contains("retry get_definitions_by_location"),
-        "{message}"
-    );
+    assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
 }
 
 #[test]
@@ -28513,7 +28459,17 @@ fn scala_uppercase_local_value_shadows_workspace_type() {
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    // The shadowing local wins and resolves to its own binder (#1569); the
+    // workspace type must not leak through.
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["kind"], "local_variable",
+        "{value}"
+    );
+    assert!(
+        value["results"][0]["definitions"][0].get("fqn").is_none(),
+        "{value}"
+    );
 }
 
 #[test]
@@ -28581,7 +28537,7 @@ class Service:
 }
 
 #[test]
-fn valid_local_value_returns_no_definition() {
+fn valid_local_value_resolves_to_the_local_binder() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
             "app.ts",
@@ -28603,7 +28559,16 @@ export function run() {
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    // A bare local read resolves lexically to its binder (#1569).
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["kind"], "local_variable",
+        "{value}"
+    );
+    assert!(
+        value["results"][0]["definitions"][0].get("fqn").is_none(),
+        "{value}"
+    );
 }
 
 #[test]
@@ -31886,7 +31851,6 @@ fun use(declared: Declared) {
     let cases = [
         ("class Declared", 6, "declaration_site"),
         ("import first", 7, "package_reference"),
-        ("println(shadowed)", 8, "local_binding"),
         ("handler.member()", 8, "receiver_type_unknown"),
         ("declared.missing()", 9, "no_indexed_definition"),
         ("missingFunction()", 0, "no_indexed_definition"),
@@ -31910,6 +31874,24 @@ fun use(declared: Declared) {
             "{marker} must return no definitions: {value}"
         );
     }
+
+    // A shadowed local read is not an abstention: it resolves lexically to
+    // its own binder (#1569) without guessing a workspace symbol.
+    let shadowed = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("println(shadowed)").expect("shadowed read") + 8,
+        ),
+    );
+    let result = &shadowed["results"][0];
+    assert_eq!(result["status"], "resolved", "{shadowed}");
+    assert_eq!(
+        result["definitions"][0]["kind"], "local_variable",
+        "{shadowed}"
+    );
+    assert!(result["definitions"][0].get("fqn").is_none(), "{shadowed}");
 
     // Ambiguity is its own answer, not a failure to look hard enough.
     let ambiguous = r#"package app

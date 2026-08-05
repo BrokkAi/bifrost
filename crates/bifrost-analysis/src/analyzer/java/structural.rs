@@ -3,14 +3,16 @@
 //! This maps tree-sitter-java node types to Bifrost's normalized structural
 //! vocabulary and extracts role edges from AST fields.
 
-use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, first_named_child, is_field_of,
+    field_name_in_parent, first_named_child, is_field_of, nearest_ancestor, node_range,
 };
 use crate::analyzer::structural::{
-    NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
+    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS,
+    HoistingClass, LexicalEnvironmentSupport, NormalizedKind, OccurrenceRole,
+    OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
 };
+use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
 
 #[derive(Debug, Default)]
@@ -20,6 +22,7 @@ pub(crate) static JAVA_STRUCTURAL_SPEC: JavaStructuralSpec = JavaStructuralSpec;
 
 const JAVA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("method_invocation", NormalizedKind::Call),
+    ("method_reference", NormalizedKind::Call),
     ("object_creation_expression", NormalizedKind::Call),
     ("field_access", NormalizedKind::FieldAccess),
     ("method_declaration", NormalizedKind::Method),
@@ -61,6 +64,11 @@ const JAVA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("enhanced_for_statement", NormalizedKind::ForLoop),
     ("while_statement", NormalizedKind::WhileLoop),
     ("do_statement", NormalizedKind::WhileLoop),
+    // Java scopes statements with `block`; `switch_block` is the statement
+    // list of a switch, and both are separate nodes from the callable, class,
+    // and loop declarations that already become facts.
+    ("block", NormalizedKind::Block),
+    ("switch_block", NormalizedKind::Block),
     ("annotation", NormalizedKind::Decorator),
     ("marker_annotation", NormalizedKind::Decorator),
 ];
@@ -224,6 +232,99 @@ fn java_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
     Some(role)
 }
 
+/// The binding one Java binder token introduces, and the interval it is in
+/// effect over.
+///
+/// Java has four shapes and they differ only in that interval:
+///
+/// - A formal or lambda parameter is in effect over its whole callable, which
+///   is exactly the declaring scope, so it is `ScopeWide`. This is what makes a
+///   parameter reachable from inside the body block even though the parameter
+///   list sits outside that block's byte range.
+/// - A local is in effect from the end of its declaration statement to the end
+///   of its block (`SourceOrder`), which is why a read above the declaration
+///   reaches nothing.
+/// - A `catch` parameter is in effect over the catch clause's body, and a
+///   try-with-resources resource over the try block — both `DeclaredHead`,
+///   because the interval is a named sub-range of the declaring scope rather
+///   than a suffix of it.
+fn java_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+    let form = nearest_ancestor(binder, |kind| {
+        matches!(
+            kind,
+            "formal_parameter"
+                | "spread_parameter"
+                | "receiver_parameter"
+                | "inferred_parameters"
+                | "lambda_expression"
+                | "catch_formal_parameter"
+                | "resource"
+                | "variable_declarator"
+                | "type_pattern"
+        )
+    })?;
+    match form.kind() {
+        "formal_parameter"
+        | "spread_parameter"
+        | "receiver_parameter"
+        | "inferred_parameters"
+        | "lambda_expression" => Some(BindingActivation {
+            kind: BindingKind::Parameter,
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
+        }),
+        "catch_formal_parameter" => {
+            let clause = nearest_ancestor(form, |kind| kind == "catch_clause")?;
+            let body = clause.child_by_field_name("body")?;
+            Some(BindingActivation {
+                kind: BindingKind::CatchOrResource,
+                hoisting: HoistingClass::DeclaredHead,
+                activation: node_range(body),
+            })
+        }
+        "resource" => {
+            let statement = nearest_ancestor(form, |kind| kind == "try_with_resources_statement")?;
+            let body = statement.child_by_field_name("body")?;
+            Some(BindingActivation {
+                kind: BindingKind::CatchOrResource,
+                hoisting: HoistingClass::DeclaredHead,
+                activation: node_range(body),
+            })
+        }
+        "type_pattern" => {
+            // `if (o instanceof String s)` binds `s` for the guarded branch.
+            // The grammar does not mark that branch, so the honest interval is
+            // the enclosing condition's statement, which the pattern's nearest
+            // statement ancestor states exactly.
+            let statement = nearest_ancestor(form, |kind| {
+                matches!(kind, "if_statement" | "while_statement" | "do_statement")
+            })?;
+            Some(BindingActivation {
+                kind: BindingKind::PatternBinder,
+                hoisting: HoistingClass::DeclaredHead,
+                activation: node_range(statement),
+            })
+        }
+        _ => {
+            // A local declarator: in effect from the end of the statement that
+            // declares it. A `for` init declaration ends before the condition,
+            // so the loop's own header sees the variable.
+            let declaration =
+                nearest_ancestor(form, |kind| kind == "local_variable_declaration").unwrap_or(form);
+            Some(BindingActivation {
+                kind: BindingKind::Local,
+                hoisting: HoistingClass::SourceOrder,
+                activation: Range {
+                    start_byte: declaration.end_byte(),
+                    end_byte: scope.end_byte,
+                    start_line: declaration.end_position().row + 1,
+                    end_line: scope.end_line,
+                },
+            })
+        }
+    }
+}
+
 impl StructuralSpec for JavaStructuralSpec {
     fn language(&self) -> Language {
         Language::Java
@@ -239,12 +340,24 @@ impl StructuralSpec for JavaStructuralSpec {
             || node.child_by_field_name("value").is_some()
     }
 
+    fn generator_construct(&self, node: Node<'_>, _kind: NormalizedKind) -> Option<&'static str> {
+        (node.kind() == "method_reference").then_some("java_method_reference")
+    }
+
     fn supports_role(&self, role: Role) -> bool {
         role != Role::Kwarg
     }
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
         &JAVA_OCCURRENCE_ROLE_SUPPORT
+    }
+
+    fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
+        &DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS
+    }
+
+    fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+        java_binding_activation(binder, scope)
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
@@ -278,6 +391,21 @@ impl StructuralSpec for JavaStructuralSpec {
                             if let Some(name) = expression_name_node(type_node) {
                                 sink.set_name(name);
                             }
+                        }
+                    }
+                    "method_reference" => {
+                        let mut cursor = node.walk();
+                        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+                        if let Some((member, receivers)) = children.split_last()
+                            && let Some(receiver) = receivers.last()
+                        {
+                            attach_terminal_callee(sink, *member, Some(*member));
+                            attach_role_with_derived_name(
+                                sink,
+                                Role::Receiver,
+                                *receiver,
+                                expression_name_node,
+                            );
                         }
                     }
                     _ => {}
@@ -378,8 +506,56 @@ mod structural_spec_tests {
     use super::*;
 
     use crate::analyzer::structural::adapter_helpers::{
-        assert_occurrence_role, occurrence_roles_of,
+        assert_occurrence_role, block_facts_of, occurrence_roles_of,
     };
+
+    /// Java's scope-forming statement lists are `block` and `switch_block`.
+    /// The class body is neither: it is a member list, and the declarations in
+    /// it are already facts of their own.
+    #[test]
+    fn java_blocks_and_switch_blocks_become_scope_facts() {
+        let source = concat!(
+            "class Widget {\n",
+            "    void render(int size) {\n",
+            "        if (size > 0) {\n",
+            "            log(size);\n",
+            "        }\n",
+            "        switch (size) {\n",
+            "            default:\n",
+            "                break;\n",
+            "        }\n",
+            "    }\n",
+            "}\n",
+        );
+
+        assert_eq!(
+            block_facts_of(
+                &JAVA_STRUCTURAL_SPEC,
+                &tree_sitter_java::LANGUAGE.into(),
+                source,
+            ),
+            vec![
+                concat!(
+                    "{\n",
+                    "        if (size > 0) {\n",
+                    "            log(size);\n",
+                    "        }\n",
+                    "        switch (size) {\n",
+                    "            default:\n",
+                    "                break;\n",
+                    "        }\n",
+                    "    }",
+                ),
+                concat!("{\n", "            log(size);\n", "        }"),
+                concat!(
+                    "{\n",
+                    "            default:\n",
+                    "                break;\n",
+                    "        }",
+                ),
+            ]
+        );
+    }
 
     /// The four positions #1473 names for Java: a declaration head, a bound
     /// parameter, an annotation operand consumed as a type, and the tail of an

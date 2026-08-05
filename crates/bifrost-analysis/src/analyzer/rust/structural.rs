@@ -1,13 +1,15 @@
 //! Rust structural spec for `query_code`.
 
-use crate::analyzer::Language;
 use crate::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, first_named_child, is_field_of,
+    field_name_in_parent, first_named_child, is_field_of, nearest_ancestor, node_range,
 };
 use crate::analyzer::structural::{
-    NormalizedKind, OccurrenceRole, OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
+    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS,
+    HoistingClass, LexicalEnvironmentSupport, NormalizedKind, OccurrenceRole,
+    OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
 };
+use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
 
 #[derive(Debug, Default)]
@@ -15,8 +17,19 @@ pub(crate) struct RustStructuralSpec;
 
 pub(crate) static RUST_STRUCTURAL_SPEC: RustStructuralSpec = RustStructuralSpec;
 
+fn macro_arguments(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("arguments").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "token_tree")
+    })
+}
+
 const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("call_expression", NormalizedKind::Call),
+    ("macro_invocation", NormalizedKind::Call),
+    ("attribute", NormalizedKind::Decorator),
+    ("field_declaration", NormalizedKind::Declaration),
     ("field_expression", NormalizedKind::FieldAccess),
     ("function_item", NormalizedKind::Function),
     ("function_signature_item", NormalizedKind::Function),
@@ -48,6 +61,9 @@ const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("for_expression", NormalizedKind::ForLoop),
     ("while_expression", NormalizedKind::WhileLoop),
     ("loop_expression", NormalizedKind::Loop),
+    // Every Rust scope-forming statement list is a `block`: function bodies,
+    // loop and conditional bodies, and bare blocks in expression position.
+    ("block", NormalizedKind::Block),
 ];
 
 fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
@@ -142,6 +158,30 @@ fn function_item_is_method(node: Node<'_>) -> bool {
         }
     }
     false
+}
+
+fn is_inside_derive_attribute(node: Node<'_>, source: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "token_tree" => current = parent.parent(),
+            "attribute" => {
+                return first_named_child(parent).is_some_and(|name| {
+                    name.kind() == "identifier" && name.utf8_text(source.as_bytes()) == Ok("derive")
+                });
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn derive_path_module(node: Node<'_>) -> Option<Node<'_>> {
+    let separator = node.prev_sibling()?;
+    (separator.kind() == "::")
+        .then(|| separator.prev_named_sibling())
+        .flatten()
+        .filter(|module| module.kind() == "identifier")
 }
 
 static RUST_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE
@@ -253,6 +293,72 @@ fn rust_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
     Some(role)
 }
 
+/// The binding one Rust binder token introduces, and the interval it is in
+/// effect over.
+///
+/// This generalizes the intervals `analyzer::rust::lexical_scope` already
+/// computes for its private shadowing queries: a `let` is in effect from the
+/// end of its declaration to the end of its block, so re-binding the same name
+/// is two bindings with adjacent intervals; a `match` arm's pattern is in
+/// effect over that arm only; a `for` pattern over the loop body; and
+/// parameters over their whole callable.
+fn rust_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+    let form = nearest_ancestor(binder, |kind| {
+        matches!(
+            kind,
+            "let_declaration"
+                | "let_condition"
+                | "for_expression"
+                | "match_arm"
+                | "parameter"
+                | "closure_parameters"
+                | "self_parameter"
+        )
+    })?;
+    match form.kind() {
+        "parameter" | "closure_parameters" | "self_parameter" => Some(BindingActivation {
+            kind: BindingKind::Parameter,
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
+        }),
+        "for_expression" => {
+            let body = form.child_by_field_name("body")?;
+            Some(BindingActivation {
+                kind: BindingKind::LoopVariable,
+                hoisting: HoistingClass::DeclaredHead,
+                activation: node_range(body),
+            })
+        }
+        "match_arm" => Some(BindingActivation {
+            kind: BindingKind::PatternBinder,
+            hoisting: HoistingClass::DeclaredHead,
+            activation: node_range(form),
+        }),
+        "let_condition" => {
+            // `if let Some(x) = value { .. }` binds for the whole conditional
+            // expression, which is the smallest range the grammar states.
+            let owner = nearest_ancestor(form, |kind| {
+                matches!(kind, "if_expression" | "while_expression")
+            })?;
+            Some(BindingActivation {
+                kind: BindingKind::PatternBinder,
+                hoisting: HoistingClass::DeclaredHead,
+                activation: node_range(owner),
+            })
+        }
+        _ => Some(BindingActivation {
+            kind: BindingKind::Local,
+            hoisting: HoistingClass::SourceOrder,
+            activation: Range {
+                start_byte: form.end_byte(),
+                end_byte: scope.end_byte,
+                start_line: form.end_position().row + 1,
+                end_line: scope.end_line,
+            },
+        }),
+    }
+}
+
 impl StructuralSpec for RustStructuralSpec {
     fn language(&self) -> Language {
         Language::Rust
@@ -267,9 +373,14 @@ impl StructuralSpec for RustStructuralSpec {
         node: Node<'_>,
         kind: NormalizedKind,
         _enclosing: Option<NormalizedKind>,
-        _source: &str,
+        source: &str,
     ) -> NormalizedKind {
-        if kind == NormalizedKind::Function && function_item_is_method(node) {
+        if kind == NormalizedKind::Identifier
+            && node.kind() == "identifier"
+            && is_inside_derive_attribute(node, source)
+        {
+            NormalizedKind::Decorator
+        } else if kind == NormalizedKind::Function && function_item_is_method(node) {
             NormalizedKind::Method
         } else {
             kind
@@ -310,6 +421,14 @@ impl StructuralSpec for RustStructuralSpec {
         &RUST_OCCURRENCE_ROLE_SUPPORT
     }
 
+    fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
+        &DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS
+    }
+
+    fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
+        rust_binding_activation(binder, scope)
+    }
+
     /// `r#type` is the identifier `type` wearing the raw-identifier escape the
     /// lexer already accepted as one token.
     fn decode_spelling(&self, raw: &str) -> Option<String> {
@@ -321,8 +440,40 @@ impl StructuralSpec for RustStructuralSpec {
             sink.occurrence_role(node, role);
         }
         match kind {
+            NormalizedKind::Decorator => {
+                let name = if node.kind() == "attribute" {
+                    first_named_child(node)
+                } else {
+                    expression_name_node(node)
+                };
+                if let Some(name) = name {
+                    sink.set_name(name);
+                }
+                if node.kind() == "attribute"
+                    && let Some(value) = node.child_by_field_name("value")
+                {
+                    sink.role(Role::Arg, value);
+                }
+                if node.kind() == "identifier"
+                    && let Some(module) = derive_path_module(node)
+                {
+                    sink.role_named(Role::Module, module, module);
+                }
+            }
+            NormalizedKind::Declaration if node.kind() == "field_declaration" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    sink.set_name(name);
+                }
+            }
             NormalizedKind::Call => {
-                if let Some(function) = node.child_by_field_name("function") {
+                if node.kind() == "macro_invocation" {
+                    if let Some(macro_name) = node.child_by_field_name("macro") {
+                        attach_terminal_callee(sink, macro_name, expression_name_node(macro_name));
+                    }
+                    if let Some(arguments) = macro_arguments(node) {
+                        attach_positional_argument_roles(sink, arguments, expression_name_node);
+                    }
+                } else if let Some(function) = node.child_by_field_name("function") {
                     attach_terminal_callee(sink, function, expression_name_node(function));
                     let target = call_function_target(function);
                     if target.kind() == "field_expression"
@@ -337,7 +488,9 @@ impl StructuralSpec for RustStructuralSpec {
                     }
                     attach_scoped_receiver(sink, target);
                 }
-                if let Some(arguments) = node.child_by_field_name("arguments") {
+                if node.kind() != "macro_invocation"
+                    && let Some(arguments) = node.child_by_field_name("arguments")
+                {
                     attach_positional_argument_roles(sink, arguments, expression_name_node);
                 }
             }
@@ -428,8 +581,43 @@ mod structural_spec_tests {
     use super::*;
 
     use crate::analyzer::structural::adapter_helpers::{
-        assert_occurrence_role, occurrence_roles_of,
+        assert_occurrence_role, block_facts_of, occurrence_roles_of,
     };
+
+    /// Every Rust scope-forming statement list is a `block`, whether it is a
+    /// function body, a conditional body, or a bare block in expression
+    /// position.
+    #[test]
+    fn rust_blocks_become_scope_facts_wherever_they_appear() {
+        let source = concat!(
+            "fn demo(flag: bool) {\n",
+            "    if flag {\n",
+            "        work();\n",
+            "    }\n",
+            "    let value = { 1 };\n",
+            "}\n",
+        );
+
+        assert_eq!(
+            block_facts_of(
+                &RUST_STRUCTURAL_SPEC,
+                &tree_sitter_rust::LANGUAGE.into(),
+                source,
+            ),
+            vec![
+                concat!(
+                    "{\n",
+                    "    if flag {\n",
+                    "        work();\n",
+                    "    }\n",
+                    "    let value = { 1 };\n",
+                    "}",
+                ),
+                concat!("{\n", "        work();\n", "    }"),
+                "{ 1 }",
+            ]
+        );
+    }
 
     /// Raw identifiers are the Rust-specific trap #1473 names: `r#type` is one
     /// `identifier` token in a pattern position, so it must classify as a
@@ -487,6 +675,75 @@ mod structural_spec_tests {
                 "rust emitted undeclared role {role:?} for {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn rust_retains_structured_derive_and_field_attribute_facts() {
+        let source = concat!(
+            "use getset::Getters;\n",
+            "#[derive(Getters)]\n",
+            "struct Record {\n",
+            "    #[get = \"pub\"]\n",
+            "    value: String,\n",
+            "}\n",
+        );
+        let facts = crate::analyzer::structural::extract::extract_file_facts(
+            &RUST_STRUCTURAL_SPEC,
+            &tree_sitter_rust::LANGUAGE.into(),
+            source,
+        )
+        .unwrap();
+        let derive = facts
+            .nodes()
+            .iter()
+            .enumerate()
+            .find(|(_, node)| {
+                node.kind == NormalizedKind::Decorator
+                    && node
+                        .name
+                        .is_some_and(|name| name.text(facts.source()) == "Getters")
+            })
+            .map(|(index, _)| u32::try_from(index).unwrap())
+            .expect("derive path decorator");
+        assert_eq!(
+            facts
+                .role_targets(derive, Role::Module)
+                .filter_map(|target| target.name)
+                .map(|name| name.text(facts.source()))
+                .collect::<Vec<_>>(),
+            Vec::<&str>::new()
+        );
+        assert!(facts.nodes().iter().any(|node| {
+            node.kind == NormalizedKind::Decorator
+                && node
+                    .name
+                    .is_some_and(|name| name.text(facts.source()) == "get")
+        }));
+        let getter = facts
+            .nodes()
+            .iter()
+            .enumerate()
+            .find(|(_, node)| {
+                node.kind == NormalizedKind::Decorator
+                    && node
+                        .name
+                        .is_some_and(|name| name.text(facts.source()) == "get")
+            })
+            .map(|(index, _)| u32::try_from(index).unwrap())
+            .expect("get attribute");
+        assert_eq!(
+            facts
+                .role_targets(getter, Role::Arg)
+                .map(|target| target.span.text(facts.source()))
+                .collect::<Vec<_>>(),
+            vec!["\"pub\""]
+        );
+        assert!(facts.nodes().iter().any(|node| {
+            node.kind == NormalizedKind::Declaration
+                && node
+                    .name
+                    .is_some_and(|name| name.text(facts.source()) == "value")
+        }));
     }
 
     #[test]

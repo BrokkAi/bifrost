@@ -25,7 +25,9 @@ use std::sync::OnceLock;
 use tree_sitter::Language as TsLanguage;
 
 const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v6-structured-code-unit-identity";
+// v7: `ImportInfo` gained `binder_span` (#1600), which changes the bincode
+// layout of every persisted import row.
+const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v7-import-binder-span";
 
 /// Returns the analysis epoch for a language as a hex string.
 ///
@@ -294,11 +296,15 @@ macro_rules! lang_epoch {
     };
 }
 
+// Salt bumped (#1611): Java `ImportInfo` paths now record a static import as
+// `StructuredImportPathKind::StaticMember`. Rows persisted before this change
+// labeled every import `Namespace`, and consumers that now branch on the kind
+// would read a warm workspace's static imports as ordinary type imports.
 lang_epoch!(
     Java,
     "java",
     "treesitter/java/",
-    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07;callable-arity-metadata-2026-07;annotated-spread-parameter-metadata-2026-07;compact-record-constructors-2026-07;fq-interned-segments-2026-07"
+    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07;callable-arity-metadata-2026-07;annotated-spread-parameter-metadata-2026-07;compact-record-constructors-2026-07;fq-interned-segments-2026-07;field-modifier-metadata-2026-08;static-import-path-kind-2026-08"
 );
 // Salt bumped: Go `package_name` is now the canonical import path, changing
 // every persisted Go `fq_name`. Forces stale rows to be re-analyzed.
@@ -438,7 +444,7 @@ lang_epoch!(
     Rust,
     "rust",
     "treesitter/rust/",
-    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07"
+    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08"
 );
 // Salt bumped after #1420: namespace-level structural traversal now emits
 // conditionally declared free functions that older PHP blobs omitted.

@@ -27,6 +27,7 @@ mod dataflow_summaries;
 mod dataflow_tabulation;
 mod dependency_semantic_pack;
 mod external_artifact_pack;
+mod generated_behavior_models;
 mod icfg_contract;
 mod js_ts_dependency_semantic_pack;
 mod jvm_standard_library_pack;

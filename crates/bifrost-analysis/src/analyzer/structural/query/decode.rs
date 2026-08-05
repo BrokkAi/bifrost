@@ -1,13 +1,15 @@
 use super::ir::{
-    CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery, CodeQueryPlan,
-    CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed, DEFAULT_LIMIT, HierarchyTraversal,
-    MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
-    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
-    MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
-    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
-    OccurrenceFilter, OccurrenceSeed, Pattern, QueryError, QueryStep, ReceiverTraversalFilter,
-    ReferenceTraversalFilter, SetOperator, StringPredicate, TaintTraversal, TypestateTraversal,
-    ValueFlowTraversal, WitnessTraversal,
+    BindingFilter, BindingSeed, CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter,
+    CandidateFilter, CandidateOutcomeLabel, CodeQuery, CodeQueryPlan, CodeQueryPlanSource,
+    CodeQueryResultDetail, CodeQuerySeed, DEFAULT_LIMIT, HierarchyTraversal,
+    MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH,
+    MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
+    MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
+    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, OccurrenceFilter, OccurrenceSeed, Pattern,
+    QueryError, QueryStep, ReachingBindingOptions, ReceiverTraversalFilter,
+    ReferenceTraversalFilter, ScopeFilter, ScopeSeed, SetOperator, StringPredicate, TaintTraversal,
+    TypestateTraversal, UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal, WitnessTraversal,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
@@ -17,6 +19,9 @@ use super::schema::{
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
 use crate::analyzer::structural::occurrences::{Namespace, OccurrenceClass, OccurrenceRole};
+use crate::analyzer::structural::resolution::{
+    BindingKind, BoundaryStatus, HoistingClass, PrecedenceTier, RejectionReason,
+};
 use crate::schema_version::SchemaVersionRegistry;
 use regex::Regex;
 use serde_json::{Map, Value};
@@ -112,6 +117,8 @@ struct QueryFields<'a> {
     inside_decl: Option<&'a Value>,
     not_inside: Option<&'a Value>,
     occurrences: Option<&'a Value>,
+    scopes: Option<&'a Value>,
+    bindings: Option<&'a Value>,
     steps: Option<&'a Value>,
     limit: Option<&'a Value>,
     result_detail: Option<&'a Value>,
@@ -142,6 +149,8 @@ fn collect_query_fields<'a>(
             QueryField::InsideDecl => fields.inside_decl = Some(value),
             QueryField::NotInside => fields.not_inside = Some(value),
             QueryField::Occurrences => fields.occurrences = Some(value),
+            QueryField::Scopes => fields.scopes = Some(value),
+            QueryField::Bindings => fields.bindings = Some(value),
             QueryField::Steps => fields.steps = Some(value),
             QueryField::Limit => fields.limit = Some(value),
             QueryField::ResultDetail => fields.result_detail = Some(value),
@@ -191,6 +200,8 @@ fn decode_plan(
     let sources = [
         ("match", fields.root),
         ("occurrences", fields.occurrences),
+        ("scopes", fields.scopes),
+        ("bindings", fields.bindings),
         ("union", fields.union),
         ("intersect", fields.intersect),
         ("except", fields.except),
@@ -202,7 +213,7 @@ fn decode_plan(
     if present.is_empty() {
         return Err(QueryError::new(
             child_path(path, "match"),
-            "one of match, occurrences, union, intersect, or except is required",
+            "one of match, occurrences, scopes, bindings, union, intersect, or except is required",
         ));
     }
     if present.len() > 1 {
@@ -306,6 +317,40 @@ fn decode_plan(
                 .transpose()?
                 .unwrap_or_default(),
             filter: decode_occurrence_filter(object, &occurrences_path)?,
+        }))
+    } else if let Some(value) = fields.scopes {
+        let scopes_path = child_path(path, "scopes");
+        reject_structural_containment(&fields, path, "scope_of")?;
+        let object = as_object(value, &scopes_path)?;
+        CodeQueryPlanSource::Scopes(Box::new(ScopeSeed {
+            where_globs: fields
+                .where_globs
+                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .transpose()?
+                .unwrap_or_default(),
+            languages: fields
+                .languages
+                .map(|value| decode_languages(value, &child_path(path, "languages")))
+                .transpose()?
+                .unwrap_or_default(),
+            filter: decode_scope_filter(object, &scopes_path)?,
+        }))
+    } else if let Some(value) = fields.bindings {
+        let bindings_path = child_path(path, "bindings");
+        reject_structural_containment(&fields, path, "bindings_in")?;
+        let object = as_object(value, &bindings_path)?;
+        CodeQueryPlanSource::Bindings(Box::new(BindingSeed {
+            where_globs: fields
+                .where_globs
+                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .transpose()?
+                .unwrap_or_default(),
+            languages: fields
+                .languages
+                .map(|value| decode_languages(value, &child_path(path, "languages")))
+                .transpose()?
+                .unwrap_or_default(),
+            filter: decode_binding_filter(object, &bindings_path)?,
         }))
     } else {
         for (label, value) in [
@@ -449,6 +494,204 @@ fn decode_occurrence_filter(
         namespaces: decode_axis(object, path, "namespace", "namespace", |label| {
             Namespace::from_label(label)
         })?,
+    })
+}
+
+/// A non-structural seed cannot take structural containment patterns, for the
+/// same reason the occurrence seed cannot: containment over its rows is a real
+/// step, so the containment verifier exists exactly once.
+fn reject_structural_containment(
+    fields: &QueryFields<'_>,
+    path: &str,
+    alternative_step: &str,
+) -> Result<(), QueryError> {
+    for (label, value) in [
+        ("inside", fields.inside),
+        ("inside_decl", fields.inside_decl),
+        ("not_inside", fields.not_inside),
+    ] {
+        if value.is_some() {
+            return Err(QueryError::new(
+                child_path(path, label),
+                format!(
+                    "structural containment requires a match source; use {alternative_step} over a structural query"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Decode one constrained-value axis that accepts either a single label or an
+/// array of labels. Shared by every lexical-environment filter for the same
+/// reason the occurrence decoder shares its own: one place validates a label.
+fn decode_environment_axis<T: PartialEq>(
+    object: &Map<String, Value>,
+    path: &str,
+    field: &str,
+    noun: &str,
+    from_label: impl Fn(&str) -> Option<T>,
+) -> Result<Vec<T>, QueryError> {
+    let Some(value) = object.get(field) else {
+        return Ok(Vec::new());
+    };
+    let field_path = child_path(path, field);
+    let entries: Vec<&Value> = match value {
+        Value::Array(entries) => entries.iter().collect(),
+        Value::String(_) => vec![value],
+        _ => {
+            return Err(QueryError::new(
+                field_path,
+                format!("expected a {noun} label or an array of {noun} labels"),
+            ));
+        }
+    };
+    if entries.is_empty() {
+        return Err(QueryError::new(
+            field_path,
+            format!("{field} must not be empty"),
+        ));
+    }
+    if entries.len() > MAX_ENVIRONMENT_FILTER_ENTRIES {
+        return Err(QueryError::new(
+            field_path,
+            format!("at most {MAX_ENVIRONMENT_FILTER_ENTRIES} {noun} labels are allowed"),
+        ));
+    }
+    let mut decoded = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.into_iter().enumerate() {
+        let entry_path = index_path(&field_path, index);
+        let label = entry
+            .as_str()
+            .ok_or_else(|| QueryError::new(&entry_path, format!("expected a {noun} label")))?;
+        let decoded_entry = from_label(label)
+            .ok_or_else(|| QueryError::new(&entry_path, format!("unknown {noun} {label:?}")))?;
+        if !decoded.contains(&decoded_entry) {
+            decoded.push(decoded_entry);
+        }
+    }
+    Ok(decoded)
+}
+
+fn reject_unknown_filter_fields(
+    object: &Map<String, Value>,
+    path: &str,
+    accepted: &[&str],
+    noun: &str,
+) -> Result<(), QueryError> {
+    for key in object.keys() {
+        if !accepted.contains(&key.as_str()) {
+            return Err(QueryError::new(
+                child_path(path, key),
+                format!("unknown field in {noun} filter object"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn decode_scope_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<ScopeFilter, QueryError> {
+    reject_unknown_filter_fields(object, path, &["kind"], "lexical scope")?;
+    Ok(ScopeFilter {
+        kinds: decode_environment_axis(object, path, "kind", "normalized kind", |label| {
+            NormalizedKind::from_label(label)
+        })?,
+    })
+}
+
+pub(super) fn decode_binding_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<BindingFilter, QueryError> {
+    reject_unknown_filter_fields(object, path, &["kind", "name", "hoisting", "op"], "binding")?;
+    let names = decode_environment_axis(object, path, "name", "binding name", |label| {
+        (!label.is_empty() && label.len() <= MAX_BINDING_NAME_LENGTH).then(|| label.to_string())
+    })?;
+    Ok(BindingFilter {
+        kinds: decode_environment_axis(object, path, "kind", "binding kind", |label| {
+            BindingKind::from_label(label)
+        })?,
+        names,
+        hoisting: decode_environment_axis(object, path, "hoisting", "hoisting class", |label| {
+            HoistingClass::from_label(label)
+        })?,
+    })
+}
+
+pub(super) fn decode_candidate_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<CandidateFilter, QueryError> {
+    reject_unknown_filter_fields(
+        object,
+        path,
+        &["tier", "outcome", "boundary", "op"],
+        "resolution candidate",
+    )?;
+    // `unattributed` is a value of the tier axis rather than the absence of a
+    // filter, because a trace row whose seam could not name a tier is a real
+    // answer an author must be able to select without it colliding with a tier.
+    #[derive(PartialEq)]
+    enum TierEntry {
+        Unattributed,
+        Named(PrecedenceTier),
+    }
+    let tier_entries = decode_environment_axis(object, path, "tier", "precedence tier", |label| {
+        if label == UNATTRIBUTED_TIER_LABEL {
+            Some(TierEntry::Unattributed)
+        } else {
+            PrecedenceTier::from_label(label).map(TierEntry::Named)
+        }
+    })?;
+    #[derive(PartialEq)]
+    enum OutcomeEntry {
+        Coarse(CandidateOutcomeLabel),
+        Reason(RejectionReason),
+    }
+    let outcome_entries = decode_environment_axis(
+        object,
+        path,
+        "outcome",
+        "candidate outcome",
+        |label| match label {
+            "selected" => Some(OutcomeEntry::Coarse(CandidateOutcomeLabel::Selected)),
+            "rejected" => Some(OutcomeEntry::Coarse(CandidateOutcomeLabel::Rejected)),
+            _ => RejectionReason::from_label(label).map(OutcomeEntry::Reason),
+        },
+    )?;
+    Ok(CandidateFilter {
+        unattributed_tier: tier_entries.contains(&TierEntry::Unattributed),
+        tiers: tier_entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                TierEntry::Named(tier) => Some(tier),
+                TierEntry::Unattributed => None,
+            })
+            .collect(),
+        outcomes: outcome_entries
+            .iter()
+            .filter_map(|entry| match entry {
+                OutcomeEntry::Coarse(outcome) => Some(*outcome),
+                OutcomeEntry::Reason(_) => None,
+            })
+            .collect(),
+        rejection_reasons: outcome_entries
+            .iter()
+            .filter_map(|entry| match entry {
+                OutcomeEntry::Reason(reason) => Some(*reason),
+                OutcomeEntry::Coarse(_) => None,
+            })
+            .collect(),
+        boundaries: decode_environment_axis(
+            object,
+            path,
+            "boundary",
+            "boundary status",
+            BoundaryStatus::from_label,
+        )?,
     })
 }
 
@@ -653,6 +896,9 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             step,
             QueryStep::OccurrencesOf(_) | QueryStep::OccurrencesIn(_)
         );
+        let binding = matches!(step, QueryStep::BindingsIn(_));
+        let candidate = matches!(step, QueryStep::CandidatesOf(_));
+        let reaching = matches!(step, QueryStep::ReachingBinding(_));
         for key in object.keys() {
             match QueryStepField::from_label(key) {
                 Some(QueryStepField::Op) => {}
@@ -677,6 +923,17 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::OccurrenceNamespaces,
                 ) if occurrence => {}
                 Some(
+                    QueryStepField::BindingKinds
+                    | QueryStepField::BindingNames
+                    | QueryStepField::BindingHoisting,
+                ) if binding => {}
+                Some(
+                    QueryStepField::CandidateTiers
+                    | QueryStepField::CandidateOutcomes
+                    | QueryStepField::CandidateBoundaries,
+                ) if candidate => {}
+                Some(QueryStepField::IncludeShadowed) if reaching => {}
+                Some(
                     QueryStepField::ReferenceKinds
                     | QueryStepField::Proof
                     | QueryStepField::Surface,
@@ -699,7 +956,14 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::MaxBytes
                     | QueryStepField::OccurrenceClasses
                     | QueryStepField::OccurrenceRoles
-                    | QueryStepField::OccurrenceNamespaces,
+                    | QueryStepField::OccurrenceNamespaces
+                    | QueryStepField::BindingKinds
+                    | QueryStepField::BindingNames
+                    | QueryStepField::BindingHoisting
+                    | QueryStepField::IncludeShadowed
+                    | QueryStepField::CandidateTiers
+                    | QueryStepField::CandidateOutcomes
+                    | QueryStepField::CandidateBoundaries,
                 )
                 | None => {
                     return Err(QueryError::new(
@@ -716,6 +980,24 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 QueryStep::OccurrencesIn(_) => QueryStep::OccurrencesIn(filter),
                 _ => unreachable!("occurrence step filtered above"),
             };
+        } else if binding {
+            step = QueryStep::BindingsIn(decode_binding_filter(object, &entry_path)?);
+        } else if candidate {
+            step = QueryStep::CandidatesOf(decode_candidate_filter(object, &entry_path)?);
+        } else if reaching {
+            let include_shadowed = match object.get("include_shadowed") {
+                Some(value) => {
+                    if value.as_bool() != Some(true) {
+                        return Err(QueryError::new(
+                            child_path(&entry_path, "include_shadowed"),
+                            "include_shadowed must be true when present",
+                        ));
+                    }
+                    true
+                }
+                None => false,
+            };
+            step = QueryStep::ReachingBinding(ReachingBindingOptions { include_shadowed });
         } else if witness {
             let decode_bound = |field: &str| -> Result<Option<usize>, QueryError> {
                 object

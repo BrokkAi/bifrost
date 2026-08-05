@@ -5,9 +5,29 @@ import {
   confirmReleaseVersion,
   normalizeReleaseTag,
   readCargoVersion,
+  syncBifrostDependencyVersions,
   validatePyprojectVersionInheritance,
   validateWorkspaceVersionInheritance,
 } from "./release-version.mjs";
+
+test("synchronizes exact internal Bifrost dependency versions", () => {
+  const manifest = [
+    '[dependencies]',
+    'brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.21" }',
+    'brokk-bifrost-nlp = { path = "../bifrost-nlp", version = "=0.8.21", optional = true }',
+    'tree-sitter-java = "0.23.5"',
+  ].join("\n");
+
+  assert.equal(
+    syncBifrostDependencyVersions(manifest, "0.8.22"),
+    [
+      '[dependencies]',
+      'brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22" }',
+      'brokk-bifrost-nlp = { path = "../bifrost-nlp", version = "=0.8.22", optional = true }',
+      'tree-sitter-java = "0.23.5"',
+    ].join("\n"),
+  );
+});
 
 test("reads only the workspace package version from Cargo.toml", () => {
   const manifest = [
