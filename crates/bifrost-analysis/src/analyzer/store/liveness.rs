@@ -46,6 +46,35 @@ impl Liveness {
             .map_err(|err| err.to_string())
     }
 
+    /// Resolve a complete analyzer file set with one Git index and dirty-tree
+    /// scan. This is the startup path for large repositories. Point resolution
+    /// reads every file and is reserved for small watcher updates (#1620).
+    pub fn oids_for_files(&self, files: &[ProjectFile]) -> Result<HashMap<ProjectFile, Oid>> {
+        let repo = self.repo.lock().expect("liveness repo mutex poisoned");
+        let mut requested = Vec::with_capacity(files.len());
+        let mut files_by_rel = map_with_capacity(files.len());
+        for file in files {
+            let abs_path = file.abs_path();
+            let rel_path = abs_path.strip_prefix(&self.workdir).map_err(|_| {
+                format!(
+                    "project file {} is not under git workdir {}",
+                    abs_path.display(),
+                    self.workdir.display()
+                )
+            })?;
+            // Git paths use forward slashes on every host. This conversion is
+            // at the Git API boundary; internal paths remain Path/PathBuf.
+            let rel = rel_path.to_string_lossy().replace('\\', "/");
+            requested.push(rel.clone());
+            files_by_rel.insert(rel, file.clone());
+        }
+        let resolved = gitblob::working_tree_oid_values(&repo, &requested)?;
+        Ok(resolved
+            .into_iter()
+            .filter_map(|(rel, oid)| files_by_rel.remove(&rel).map(|file| (file, oid)))
+            .collect())
+    }
+
     /// Full live view; rebuilt when the Git index bytes or overlay generation change.
     pub fn snapshot(&self) -> Result<Arc<LiveSnapshot>> {
         let repo = self.repo.lock().expect("liveness repo mutex poisoned");
@@ -93,7 +122,7 @@ impl Liveness {
                 changed |= overlay.paths.remove(&file).is_some();
                 continue;
             }
-            let Some(state) = PathState::new(entry.oid, entry.validation, &file) else {
+            let Some(state) = PathState::new(entry.oid, entry.validation, &file, true) else {
                 changed |= overlay.paths.remove(&file).is_some();
                 continue;
             };
@@ -189,9 +218,17 @@ impl PartialEq for PathState {
 impl Eq for PathState {}
 
 impl PathState {
-    fn new(oid: Oid, validation: LivePathValidation, file: &ProjectFile) -> Option<Self> {
+    fn new(
+        oid: Oid,
+        validation: LivePathValidation,
+        file: &ProjectFile,
+        revalidate_filesystem: bool,
+    ) -> Option<Self> {
         let stat = match validation {
-            LivePathValidation::Filesystem => Some(FileStat::from_path(&file.abs_path())?),
+            LivePathValidation::Filesystem if revalidate_filesystem => {
+                Some(FileStat::from_path(&file.abs_path())?)
+            }
+            LivePathValidation::Filesystem => None,
             LivePathValidation::Overlay => None,
         };
         Some(Self {
@@ -289,7 +326,12 @@ impl LivePathMap {
         let mut guard = self.state.lock().expect("live path map mutex poisoned");
         let mut changed = false;
         for entry in entries {
-            let Some(path_state) = PathState::new(entry.oid, entry.validation, &entry.file) else {
+            let Some(path_state) = PathState::new(
+                entry.oid,
+                entry.validation,
+                &entry.file,
+                self.revalidate_filesystem,
+            ) else {
                 changed |= guard.paths.remove(&entry.file).is_some();
                 continue;
             };
@@ -307,7 +349,12 @@ impl LivePathMap {
     pub fn replace_all(&self, entries: impl IntoIterator<Item = LivePathEntry>) {
         let mut next_paths = HashMap::default();
         for entry in entries {
-            if let Some(path_state) = PathState::new(entry.oid, entry.validation, &entry.file) {
+            if let Some(path_state) = PathState::new(
+                entry.oid,
+                entry.validation,
+                &entry.file,
+                self.revalidate_filesystem,
+            ) {
                 next_paths.insert(entry.file, path_state);
             }
         }

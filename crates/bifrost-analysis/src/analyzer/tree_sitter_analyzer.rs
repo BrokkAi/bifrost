@@ -2776,47 +2776,57 @@ where
         store_context: &AnalyzerStoreContext,
         replace_live_paths: bool,
     ) -> Result<HashMap<ProjectFile, Oid>, String> {
-        type PlannedLiveOid = Option<(ProjectFile, Oid, LivePathEntry)>;
-
-        let plan_one = |file: &ProjectFile| -> Result<PlannedLiveOid, String> {
-            let has_overlay = project.has_overlay(file);
-            if !file.exists() && !has_overlay {
-                return Ok(None);
-            }
-            let (oid, entry) = if has_overlay {
+        let _scope = profiling::scope("TreeSitterAnalyzer::resolve_live_oids");
+        let mut planned = Vec::with_capacity(files.len());
+        let mut disk_files = Vec::with_capacity(files.len());
+        for file in files {
+            if project.has_overlay(file) {
                 let source = project.read_source(file).map_err(|err| err.to_string())?;
                 let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
                     .map_err(|err| err.to_string())?;
-                (oid, LivePathEntry::overlay(file.clone(), oid))
-            } else if let Some(liveness) = store_context.liveness.as_ref() {
-                let Some(oid) = liveness.oid_for_path(file)? else {
-                    return Ok(None);
-                };
-                (oid, LivePathEntry::filesystem(file.clone(), oid))
+                planned.push((file.clone(), oid, LivePathEntry::overlay(file.clone(), oid)));
             } else {
+                disk_files.push(file.clone());
+            }
+        }
+
+        if let Some(liveness) = store_context.liveness.as_ref() {
+            for (file, oid) in liveness.oids_for_files(&disk_files)? {
+                planned.push((file.clone(), oid, LivePathEntry::filesystem(file, oid)));
+            }
+        } else {
+            let plan_one = |file: &ProjectFile| -> Result<Option<_>, String> {
+                if !file.exists() {
+                    return Ok(None);
+                }
                 let bytes = std::fs::read(file.abs_path()).map_err(|err| err.to_string())?;
                 let oid =
                     Oid::hash_object(ObjectType::Blob, &bytes).map_err(|err| err.to_string())?;
-                (oid, LivePathEntry::overlay(file.clone(), oid))
+                Ok(Some((
+                    file.clone(),
+                    oid,
+                    LivePathEntry::overlay(file.clone(), oid),
+                )))
             };
-            Ok(Some((file.clone(), oid, entry)))
-        };
-        let planned = if files.len() <= 1 {
-            files.iter().map(&plan_one).collect::<Vec<_>>()
-        } else {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(config.parallelism().clamp(1, files.len()))
-                .build()
-                .map_err(|err| format!("failed to build live OID thread pool: {err}"))?;
-            pool.install(|| files.par_iter().map(&plan_one).collect::<Vec<_>>())
-        };
+            let resolved = if disk_files.len() <= 1 {
+                disk_files.iter().map(&plan_one).collect::<Vec<_>>()
+            } else {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(config.parallelism().clamp(1, disk_files.len()))
+                    .build()
+                    .map_err(|err| format!("failed to build live OID thread pool: {err}"))?;
+                pool.install(|| disk_files.par_iter().map(&plan_one).collect::<Vec<_>>())
+            };
+            for result in resolved {
+                if let Some(entry) = result? {
+                    planned.push(entry);
+                }
+            }
+        }
 
         let mut out = map_with_capacity(files.len());
         let mut live_entries = Vec::with_capacity(files.len());
-        for result in planned {
-            let Some((file, oid, entry)) = result? else {
-                continue;
-            };
+        for (file, oid, entry) in planned {
             live_entries.push(entry);
             out.insert(file, oid);
         }

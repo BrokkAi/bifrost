@@ -11,7 +11,10 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use git2::{IndexEntry, ObjectType, Oid, Repository, Status, StatusOptions};
+use git2::{
+    AttrCheckFlags, AttrValue, DiffOptions, IndexEntry, ObjectType, Oid, Repository, Status,
+    StatusOptions,
+};
 use growable_bloom_filter::GrowableBloom;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -86,13 +89,61 @@ pub fn working_tree_oids(
     repo: &Repository,
     rel_paths: &[String],
 ) -> Result<HashMap<String, String>> {
+    Ok(working_tree_oid_values(repo, rel_paths)?
+        .into_iter()
+        .map(|(path, oid)| (path, oid.to_string()))
+        .collect())
+}
+
+/// Resolve many working-tree paths with one Git index and dirty-tree scan.
+///
+/// Clean tracked files use the index OID without reading their bytes. Dirty,
+/// untracked, and content-transformed files use the bytes visible to the
+/// analyzer. Missing files are absent from the result. This is the startup
+/// identity path for large analyzers: do not replace it with repeated point
+/// resolution, which reads every clean source file (#1620).
+pub fn working_tree_oid_values(
+    repo: &Repository,
+    rel_paths: &[String],
+) -> Result<HashMap<String, Oid>> {
+    let started = std::time::Instant::now();
     let workdir = workdir(repo)?;
-    let index = repo.index().map_err(|e| e.to_string())?;
+    let mut index = repo.index().map_err(|e| e.to_string())?;
+    // A long-lived Bifrost process can observe an external Git command.
+    index.read(true).map_err(|e| e.to_string())?;
+    let dirty = dirty_worktree_paths(repo)?;
+    let index_oids: HashMap<String, Oid> = index
+        .iter()
+        .map(|entry| Ok((index_path_to_string(&entry)?, entry.id)))
+        .collect::<Result<_>>()?;
 
     let mut out = HashMap::with_capacity(rel_paths.len());
+    let mut hashed = 0usize;
     for rel in rel_paths {
-        let oid = resolve_path_oid(workdir, &index, rel)?;
-        out.insert(rel.clone(), oid.to_string());
+        let path = Path::new(rel);
+        let index_oid = index_oids.get(rel).copied();
+        let use_worktree =
+            dirty.contains(rel) || index_oid.is_none() || has_content_transform(repo, path)?;
+        let oid = if use_worktree {
+            match hash_working_file(workdir, rel) {
+                Ok(oid) => oid,
+                Err(_) if !workdir.join(path).is_file() => continue,
+                Err(error) => return Err(error),
+            }
+        } else {
+            index_oid.expect("clean tracked path has an index OID")
+        };
+        hashed += usize::from(use_worktree);
+        out.insert(rel.clone(), oid);
+    }
+    if crate::profiling::enabled() {
+        crate::profiling::note(format!(
+            "git_identity files={} index={} hashed={} elapsed_ms={:.1}",
+            rel_paths.len(),
+            out.len().saturating_sub(hashed),
+            hashed,
+            started.elapsed().as_secs_f64() * 1000.0,
+        ));
     }
     Ok(out)
 }
@@ -108,15 +159,12 @@ pub fn working_tree_oids_targeted(
 /// Resolve every path in the index to the blob OID for its current working-tree
 /// bytes.
 pub fn working_tree_oids_full(repo: &Repository) -> Result<HashMap<String, String>> {
-    let workdir = workdir(repo)?;
     let index = repo.index().map_err(|e| e.to_string())?;
-    let mut out = HashMap::with_capacity(index.len());
-    for entry in index.iter() {
-        let rel = index_path_to_string(&entry)?;
-        let oid = resolve_index_entry_oid(workdir, &entry)?;
-        out.insert(rel, oid.to_string());
-    }
-    Ok(out)
+    let rel_paths = index
+        .iter()
+        .map(|entry| index_path_to_string(&entry))
+        .collect::<Result<Vec<_>>>()?;
+    working_tree_oids(repo, &rel_paths)
 }
 
 /// Resolve one path to the OID of its current working-tree bytes. Returns
@@ -371,6 +419,51 @@ fn dirty_paths(repo: &Repository) -> Result<HashSet<String>> {
     Ok(dirty)
 }
 
+fn dirty_worktree_paths(repo: &Repository) -> Result<HashSet<String>> {
+    let mut options = DiffOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_typechange(true)
+        .ignore_submodules(true)
+        .skip_binary_check(true);
+    let mut index = repo.index().map_err(|error| error.to_string())?;
+    index.read(true).map_err(|error| error.to_string())?;
+    let diff = repo
+        .diff_index_to_workdir(Some(&index), Some(&mut options))
+        .map_err(|error| error.to_string())?;
+    let mut dirty = HashSet::new();
+    for delta in diff.deltas() {
+        if let Some(path) = delta.old_file().path() {
+            dirty.insert(path.to_string_lossy().into_owned());
+        }
+        if let Some(path) = delta.new_file().path() {
+            dirty.insert(path.to_string_lossy().into_owned());
+        }
+    }
+    Ok(dirty)
+}
+
+fn has_content_transform(repo: &Repository, path: &Path) -> Result<bool> {
+    for name in ["filter", "ident", "working-tree-encoding"] {
+        let value = repo
+            .get_attr(path, name, AttrCheckFlags::FILE_THEN_INDEX)
+            .map_err(|error| {
+                format!(
+                    "reading Git attribute {name} for {}: {error}",
+                    path.display()
+                )
+            })?;
+        if !matches!(
+            AttrValue::from_string(value),
+            AttrValue::False | AttrValue::Unspecified
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn dirty_flags() -> Status {
     Status::WT_MODIFIED
         | Status::WT_NEW
@@ -383,7 +476,14 @@ fn dirty_flags() -> Status {
 }
 
 fn hash_working_file(workdir: &Path, rel: &str) -> Result<Oid> {
+    #[cfg(test)]
+    HASH_WORKING_FILE_CALLS.with(|calls| calls.set(calls.get() + 1));
     Oid::hash_file(ObjectType::Blob, workdir.join(rel)).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+thread_local! {
+    static HASH_WORKING_FILE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Throwaway repositories for tests. Unconditional rather than `#[cfg(test)]`
@@ -431,6 +531,14 @@ mod tests {
     use super::test_repo::{commit_all, init_repo};
     use super::*;
 
+    fn reset_hash_calls() {
+        HASH_WORKING_FILE_CALLS.with(|calls| calls.set(0));
+    }
+
+    fn hash_calls() -> usize {
+        HASH_WORKING_FILE_CALLS.with(std::cell::Cell::get)
+    }
+
     #[test]
     fn clean_file_oid_matches_git_hash_object() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -438,12 +546,18 @@ mod tests {
         std::fs::write(temp.path().join("a.txt"), "hello\n").unwrap();
         commit_all(&repo, "init");
 
+        reset_hash_calls();
         let oids = working_tree_oids(&repo, &["a.txt".to_string()]).unwrap();
         assert_eq!(
             oids["a.txt"],
             Oid::hash_object(ObjectType::Blob, b"hello\n")
                 .unwrap()
                 .to_string()
+        );
+        assert_eq!(
+            hash_calls(),
+            0,
+            "clean tracked content must use its index OID"
         );
     }
 
@@ -455,6 +569,7 @@ mod tests {
         commit_all(&repo, "init");
         std::fs::write(temp.path().join("a.txt"), "changed\n").unwrap();
 
+        reset_hash_calls();
         let oids = working_tree_oids(&repo, &["a.txt".to_string()]).unwrap();
         assert_eq!(
             oids["a.txt"],
@@ -462,6 +577,7 @@ mod tests {
                 .unwrap()
                 .to_string()
         );
+        assert_eq!(hash_calls(), 1);
 
         let uncommitted = uncommitted_oids(temp.path()).unwrap();
         assert!(uncommitted.contains(&oids["a.txt"]));

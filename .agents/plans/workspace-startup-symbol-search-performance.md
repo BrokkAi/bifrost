@@ -15,8 +15,8 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 - [x] (2026-08-05) Profiled warm Apache Camel setup and a no-match symbol search.
 - [x] (2026-08-05) Identified per-file tracked-content hashing in analyzer liveness.
 - [x] (2026-08-05) Identified whole-cache declaration enumeration in symbol search.
-- [ ] Add focused timing and work-count instrumentation for setup and search stages.
-- [ ] Replace analyzer startup point hashing with one Git-index and dirty-tree identity snapshot.
+- [ ] Add focused timing and work-count instrumentation for setup and search stages (completed: bulk Git identity and live-OID scopes; remaining: cache hydration, semantic packs, and search storage reads).
+- [x] (2026-08-05) Replaced analyzer startup point hashing with one Git-index and dirty-tree identity scan.
 - [ ] Reuse one shared workspace file listing for language detection and analyzer enumeration.
 - [ ] Measure and remove unnecessary semantic-pack activation work.
 - [ ] Add an exact SQLite active-workspace identity design that supports concurrent workspaces.
@@ -45,6 +45,9 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 - Observation: Debug Apache Camel timings are 9.73 seconds for setup and 24.04 seconds for a no-match search.
   Evidence: `BIFROST_TIMING=1` reported 5.38 seconds for `WorkspaceAnalyzer::build`, 4.35 seconds for semantic-pack activation, and 24.029 seconds for `search_symbols.resolve`.
 
+- Observation: The core Git plumbing already had the required dependencies but its bulk APIs still called the hashing point path.
+  Evidence: `working_tree_oids` iterated through `resolve_path_oid`, and `resolve_index_entry_oid` always called `Oid::hash_file`.
+
 ## Decision Log
 
 - Decision: Correct the identity design instead of adding eager router startup.
@@ -66,6 +69,8 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 ## Outcomes & Retrospective
 
 Profiling and design are complete. Implementation remains.
+
+The first implementation milestone now resolves all requested paths with one index reload and one index-to-worktree diff. Core tests prove that clean tracked content causes zero calls to the working-file hasher. Analyzer liveness tests pass.
 
 ## Context and Orientation
 
@@ -148,3 +153,5 @@ Extend `AnalyzerStore` with transactional active-workspace publication and activ
 Extend `SearchSymbolPatternBatch` with safe mandatory-literal information derived from the compiled pattern. An absent literal means no storage literal filter. It must never remove a valid regular-expression match.
 
 Revision note: 2026-08-05. Created this plan after profiling showed that lazy multi-workspace startup exposed older identity and global-search costs. The user approved all six remediation items.
+
+Revision note: 2026-08-05. Recorded the completed bulk Git identity milestone and its focused validation.
