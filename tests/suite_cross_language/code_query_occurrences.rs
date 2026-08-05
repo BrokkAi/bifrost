@@ -742,13 +742,10 @@ fn conformance_java_static_qualifiers_and_shadowing_locals_keep_their_roles() {
                 "resolved".into()
             ),
             // Near-miss: an unrelated local of the same spelling, one method
-            // away. It binds, then reads -- it is never a receiver.
+            // away. It binds, then reads -- it is never a receiver. The read
+            // resolves lexically to its own binder (#1569), never to the type.
             ("binder".into(), "value".into(), "none".into()),
-            (
-                "value_reference".into(),
-                "value".into(),
-                "unresolved".into()
-            ),
+            ("value_reference".into(), "value".into(), "lexical".into()),
         ],
         "the qualifier and the shadowing local never trade roles: {:?}",
         rows(&value)

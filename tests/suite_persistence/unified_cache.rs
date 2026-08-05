@@ -65,7 +65,7 @@ fn put_semantic(store: &SemanticStore, oid: Oid, vector_hash: [u8; 32]) {
 #[test]
 fn family_scoped_invalidation_keeps_other_family_rows() {
     let temp = tempfile::tempdir().unwrap();
-    let db_path = temp.path().join(cache_db::CACHE_DB_FILE_NAME);
+    let db_path = temp.path().join(cache_db::cache_db_file_name());
     let semantic = SemanticStore::open(&db_path).unwrap();
     let analyzer = AnalyzerStore::open_persistent(&db_path).unwrap();
     let semantic_oid = Oid::hash_object(ObjectType::Blob, b"semantic").unwrap();
@@ -165,7 +165,7 @@ fn first_unified_open_deletes_legacy_cache_files() {
             .unwrap();
     }
 
-    let db_path = brokk.join(cache_db::CACHE_DB_FILE_NAME);
+    let db_path = brokk.join(cache_db::cache_db_file_name());
     let _store = AnalyzerStore::open_persistent(&db_path).unwrap();
     for name in [
         cache_db::LEGACY_SEMANTIC_DB_FILE_NAME,

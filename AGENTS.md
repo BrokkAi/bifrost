@@ -223,7 +223,7 @@ In apply mode, the script automatically removes only directories that have the h
 
 Old manually named `bifrost-*` directories remain report-only. To remove them, first review them and then explicitly add `--include-unmanaged`.
 
-For `bifrost_reference_differential`, use `--cache-mode ephemeral` for a one-time smoke test that must not write `.bifrost/cache/bifrost_cache.db`.
+For `bifrost_reference_differential`, use `--cache-mode ephemeral` for a one-time smoke test that must not write `.bifrost/cache/bifrost_cache.v<N>.db`.
 
 Use the default `--cache-mode persisted` for an intentionally warmed or resumable corpus campaign.
 

@@ -640,7 +640,7 @@ mod tests {
         let actual = semantic_db_path(&worktree_root);
         assert_eq!(
             actual.file_name().and_then(|name| name.to_str()),
-            Some(brokk_bifrost_analysis::cache_db::CACHE_DB_FILE_NAME)
+            Some(brokk_bifrost_analysis::cache_db::cache_db_file_name())
         );
         let actual_root = actual
             .parent()

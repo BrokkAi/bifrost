@@ -212,10 +212,6 @@ impl<'a> JavaResolutionSession<'a> {
         self.query_rows(|| analyzer.signature_metadata(unit))
     }
 
-    fn source(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<String> {
-        self.query_optional_row(|| analyzer.get_source(unit, false))
-    }
-
     fn read_source(&self, file: &ProjectFile) -> Option<String> {
         self.query_optional_row(|| file.read_to_string().ok())
     }
@@ -861,7 +857,6 @@ fn resolve_java_method_invocation(
                 &owner,
                 name,
                 JavaMemberLookupKind::Method,
-                true,
                 Some(arity),
             );
         }
@@ -895,7 +890,6 @@ fn resolve_java_method_invocation(
             &owner,
             name,
             JavaMemberLookupKind::Method,
-            true,
             Some(arity),
         );
         if outcome
@@ -976,7 +970,6 @@ fn resolve_java_method_reference(
             &owner,
             member,
             JavaMemberLookupKind::Method,
-            true,
             None,
         );
     }
@@ -1215,6 +1208,17 @@ fn java_callable_accepts_arity(
         .accepts(actual)
 }
 
+fn java_signature_metadata(
+    analyzer: &dyn IAnalyzer,
+    session: Option<&JavaResolutionSession<'_>>,
+    unit: &CodeUnit,
+) -> Vec<crate::analyzer::SignatureMetadata> {
+    match session {
+        Some(session) => session.signature_metadata(analyzer, unit),
+        None => analyzer.signature_metadata(unit),
+    }
+}
+
 fn java_argument_count(node: Node<'_>) -> usize {
     node.child_by_field_name("arguments")
         .map(|arguments| arguments.named_child_count())
@@ -1261,7 +1265,6 @@ fn resolve_java_field_access(
             &owner,
             field,
             JavaMemberLookupKind::Field,
-            false,
             None,
         );
     }
@@ -1315,7 +1318,6 @@ fn resolve_java_bare_identifier(
             &owner,
             name,
             JavaMemberLookupKind::Field,
-            false,
             None,
         );
         if outcome.status != DefinitionLookupStatus::NoDefinition {
@@ -1390,33 +1392,37 @@ fn java_receiver_type_for_java(
         }
         "identifier" => {
             let name = java_node_text(object, source);
-            java_type_of_identifier_before(
+            // One scope-aware seeding pass answers both questions: the
+            // identifier's precise local type, and whether any binding on the
+            // active lexical path shadows the spelling. A binding in a sibling
+            // scope must not block resolving the name as a type (#1569).
+            let bindings = java_bindings_before_scoped(
                 analyzer,
                 java,
                 session,
                 file,
                 source,
                 root,
-                name,
                 object.start_byte(),
-            )
-            .or_else(|| {
-                java_lambda_parameter_type_before(
-                    analyzer,
-                    java,
-                    session,
-                    file,
-                    source,
-                    root,
-                    name,
-                    object.start_byte(),
-                )
-            })
-            .or_else(|| {
-                (!java_identifier_binding_before(session, source, root, name, object.start_byte()))
-                    .then(|| session.resolve_type_name_in_file(java, file, name))
-                    .flatten()
-            })
+            );
+            first_precise(&bindings, name)
+                .or_else(|| {
+                    java_lambda_parameter_type_before(
+                        analyzer,
+                        java,
+                        session,
+                        file,
+                        source,
+                        root,
+                        name,
+                        object.start_byte(),
+                    )
+                })
+                .or_else(|| {
+                    (!bindings.is_shadowed(name))
+                        .then(|| session.resolve_type_name_in_file(java, file, name))
+                        .flatten()
+                })
         }
         // A method-call receiver (`getABC().i`) is typed by the called method's
         // declared return type.
@@ -1434,8 +1440,9 @@ fn java_receiver_type_for_java(
             let qualified_name = format!("{}.{}", owner.fq_name(), field);
             let candidates = session.fqn(&qualified_name);
             if let Some(field_unit) = candidates.iter().find(|unit| unit.is_field()) {
-                let type_text =
-                    java_field_type_text_from_source(analyzer, Some(session), field_unit)?;
+                let type_text = java_signature_metadata(analyzer, Some(session), field_unit)
+                    .into_iter()
+                    .find_map(|metadata| metadata.return_type_text().map(str::to_owned))?;
                 return session
                     .fqn(&format!("{}.{}", owner.fq_name(), type_text))
                     .into_iter()
@@ -2467,89 +2474,12 @@ fn java_owner_and_member(path: &str) -> Option<(String, String)> {
     Some((owner_parts.join("."), member.clone()))
 }
 
-fn java_identifier_binding_before(
-    session: &JavaResolutionSession<'_>,
-    source: &str,
-    root: Node<'_>,
-    name: &str,
-    before_byte: usize,
-) -> bool {
-    let mut found = false;
-    collect_java_identifier_binding_before(
-        session,
-        source,
-        root,
-        name,
-        before_byte,
-        true,
-        &mut found,
-    );
-    found
-}
-
-fn collect_java_identifier_binding_before(
-    session: &JavaResolutionSession<'_>,
-    source: &str,
-    node: Node<'_>,
-    name: &str,
-    before_byte: usize,
-    include_fields: bool,
-    found: &mut bool,
-) {
-    if *found {
-        return;
-    }
-    let root = node;
-    let mut next = Some(root);
-    while let Some(node) = next {
-        if !session.charge_scope_step() {
-            return;
-        }
-        if node.start_byte() >= before_byte {
-            next = java_next_named_preorder(root, node, false);
-            continue;
-        }
-        match node.kind() {
-            "local_variable_declaration" | "field_declaration"
-                if include_fields || node.kind() == "local_variable_declaration" =>
-            {
-                let mut cursor = node.walk();
-                for child in node.named_children(&mut cursor) {
-                    if !session.charge_scope_step() {
-                        return;
-                    }
-                    if child.kind() == "variable_declarator"
-                        && let Some(name_node) = child.child_by_field_name("name")
-                        && name_node.start_byte() < before_byte
-                        && java_node_text(name_node, source) == name
-                    {
-                        *found = true;
-                        return;
-                    }
-                }
-            }
-            "formal_parameter" => {
-                if let Some(name_node) = node.child_by_field_name("name")
-                    && name_node.start_byte() < before_byte
-                    && java_node_text(name_node, source) == name
-                {
-                    *found = true;
-                    return;
-                }
-            }
-            _ => {}
-        }
-        next = java_next_named_preorder(root, node, true);
-    }
-}
-
 fn java_member_candidates(
     analyzer: &dyn IAnalyzer,
     session: &JavaResolutionSession<'_>,
     owner: &CodeUnit,
     member: &str,
     kind: JavaMemberLookupKind,
-    allow_generated_accessors: bool,
     arity: Option<usize>,
 ) -> DefinitionLookupOutcome {
     let support: &dyn BoundedDefinitionLookup = session;
@@ -2566,20 +2496,6 @@ fn java_member_candidates(
         return candidates_outcome(candidates);
     }
     let mut fallback_candidates = (!candidates.is_empty()).then_some(candidates);
-
-    if allow_generated_accessors {
-        let generated_accessor_candidates = java_lombok_accessor_field_candidates_for_arity(
-            analyzer,
-            support,
-            Some(session),
-            owner,
-            member,
-            arity,
-        );
-        if !generated_accessor_candidates.is_empty() {
-            return candidates_outcome(generated_accessor_candidates);
-        }
-    }
 
     if let Some(provider) = analyzer.type_hierarchy_provider() {
         let mut seen = HashSet::default();
@@ -2641,357 +2557,6 @@ fn java_filter_member_candidates(
             JavaMemberLookupKind::Type => unit.is_class(),
         })
         .collect()
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum JavaAccessorKind {
-    Getter,
-    Setter,
-}
-
-struct JavaAccessorProperty {
-    kind: JavaAccessorKind,
-    field_name: String,
-    requires_boolean_field: bool,
-    arity: usize,
-}
-
-pub(crate) fn java_lombok_accessor_field_candidates(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    owner: &CodeUnit,
-    member: &str,
-) -> Vec<CodeUnit> {
-    java_lombok_accessor_field_candidates_for_arity(analyzer, support, None, owner, member, None)
-}
-
-pub(crate) fn java_lombok_generated_accessor_field_candidates(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    owner: &CodeUnit,
-    member: &str,
-    arity: Option<usize>,
-) -> Vec<CodeUnit> {
-    if java_accessor_property(member).is_none() {
-        return Vec::new();
-    }
-    let declared_methods = java_filter_member_candidates(
-        support.fqn(&format!("{}.{}", owner.fq_name(), member)),
-        JavaMemberLookupKind::Method,
-    );
-    let declared_method_wins = match arity {
-        Some(arity) => declared_methods
-            .iter()
-            .any(|method| java_callable_accepts_arity(analyzer, None, method, arity)),
-        None => !declared_methods.is_empty(),
-    };
-    if declared_method_wins {
-        return Vec::new();
-    }
-    java_lombok_accessor_field_candidates_for_arity(analyzer, support, None, owner, member, arity)
-}
-
-fn java_lombok_accessor_field_candidates_for_arity(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    session: Option<&JavaResolutionSession<'_>>,
-    owner: &CodeUnit,
-    member: &str,
-    arity: Option<usize>,
-) -> Vec<CodeUnit> {
-    let Some(accessor) = java_accessor_property(member) else {
-        return Vec::new();
-    };
-    if arity.is_some_and(|arity| arity != accessor.arity) {
-        return Vec::new();
-    }
-    let mut fields: Vec<_> = support
-        .fqn(&format!("{}.{}", owner.fq_name(), accessor.field_name))
-        .into_iter()
-        .filter(CodeUnit::is_field)
-        .collect();
-    sort_units(&mut fields);
-    fields.dedup();
-    if accessor.requires_boolean_field {
-        fields.retain(|field| java_field_is_boolean(analyzer, session, field));
-    }
-    if fields.is_empty() {
-        return Vec::new();
-    }
-
-    let owner_has_accessor_annotation =
-        java_source(analyzer, session, owner).is_some_and(|source| {
-            java_class_source_has_lombok_accessor_annotation(session, &source, accessor.kind)
-        });
-    if owner_has_accessor_annotation {
-        return fields;
-    }
-
-    fields
-        .into_iter()
-        .filter(|field| {
-            java_source(analyzer, session, field).is_some_and(|source| {
-                java_field_source_has_lombok_accessor_annotation(session, &source, accessor.kind)
-            })
-        })
-        .collect()
-}
-
-fn java_accessor_property(member: &str) -> Option<JavaAccessorProperty> {
-    let (kind, suffix, requires_boolean_field) = if let Some(suffix) = member.strip_prefix("get") {
-        (JavaAccessorKind::Getter, suffix, false)
-    } else if let Some(suffix) = member.strip_prefix("is") {
-        (JavaAccessorKind::Getter, suffix, true)
-    } else {
-        let suffix = member.strip_prefix("set")?;
-        (JavaAccessorKind::Setter, suffix, false)
-    };
-    if suffix.is_empty()
-        || !suffix
-            .chars()
-            .next()
-            .is_some_and(|first| first.is_ascii_uppercase())
-    {
-        return None;
-    }
-    Some(JavaAccessorProperty {
-        kind,
-        field_name: java_bean_decapitalize(suffix),
-        requires_boolean_field,
-        arity: usize::from(kind == JavaAccessorKind::Setter),
-    })
-}
-
-fn java_field_is_boolean(
-    analyzer: &dyn IAnalyzer,
-    session: Option<&JavaResolutionSession<'_>>,
-    field: &CodeUnit,
-) -> bool {
-    let signature = field
-        .signature()
-        .map(str::to_string)
-        .or_else(|| java_signatures(analyzer, session, field).first().cloned());
-    let type_text = java_field_type_text_from_source(analyzer, session, field).or_else(|| {
-        signature.as_deref().and_then(|signature| {
-            java_field_type_text_from_signature(signature, field.identifier())
-        })
-    });
-    type_text
-        .as_deref()
-        .and_then(java_raw_type_name)
-        .is_some_and(|raw| matches!(raw.as_str(), "boolean" | "Boolean"))
-}
-
-fn java_field_type_text_from_source(
-    analyzer: &dyn IAnalyzer,
-    session: Option<&JavaResolutionSession<'_>>,
-    field: &CodeUnit,
-) -> Option<String> {
-    let source = java_source(analyzer, session, field)?;
-    let wrapped = format!("class __BifrostLombokField {{\n{source}\n}}");
-    let tree = java_parse_source(session, &wrapped)?;
-    let root = tree.root_node();
-    let mut next = Some(root);
-    while let Some(node) = next {
-        if !java_charge_resolution_scope(session) {
-            return None;
-        }
-        if node.kind() == "field_declaration"
-            && let Some(type_node) = node.child_by_field_name("type")
-        {
-            return Some(java_node_text(type_node, &wrapped).trim().to_string());
-        }
-        next = java_next_named_preorder(root, node, true);
-    }
-    None
-}
-
-fn java_bean_decapitalize(name: &str) -> String {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    if first.is_ascii_uppercase()
-        && chars
-            .clone()
-            .next()
-            .is_some_and(|second| second.is_ascii_uppercase())
-    {
-        return name.to_string();
-    }
-    let mut out = String::with_capacity(name.len());
-    out.push(first.to_ascii_lowercase());
-    out.extend(chars);
-    out
-}
-
-fn java_class_source_has_lombok_accessor_annotation(
-    session: Option<&JavaResolutionSession<'_>>,
-    source: &str,
-    kind: JavaAccessorKind,
-) -> bool {
-    java_source_declaration_has_lombok_accessor_annotation(
-        session,
-        source,
-        &[
-            "class_declaration",
-            "record_declaration",
-            "enum_declaration",
-            "interface_declaration",
-        ],
-        kind,
-    )
-}
-
-fn java_field_source_has_lombok_accessor_annotation(
-    session: Option<&JavaResolutionSession<'_>>,
-    source: &str,
-    kind: JavaAccessorKind,
-) -> bool {
-    if java_source_declaration_has_lombok_accessor_annotation(
-        session,
-        source,
-        &["field_declaration"],
-        kind,
-    ) {
-        return true;
-    }
-    let wrapped = format!("class __BifrostLombokAccessor {{\n{source}\n}}");
-    java_source_declaration_has_lombok_accessor_annotation(
-        session,
-        &wrapped,
-        &["field_declaration"],
-        kind,
-    )
-}
-
-fn java_source_declaration_has_lombok_accessor_annotation(
-    session: Option<&JavaResolutionSession<'_>>,
-    source: &str,
-    declaration_kinds: &[&str],
-    kind: JavaAccessorKind,
-) -> bool {
-    let Some(tree) = java_parse_source(session, source) else {
-        return false;
-    };
-    let root = tree.root_node();
-    let mut next = Some(root);
-    while let Some(node) = next {
-        if !java_charge_resolution_scope(session) {
-            return false;
-        }
-        if declaration_kinds.contains(&node.kind())
-            && java_modifiers_have_lombok_accessor_annotation(session, node, source, kind)
-        {
-            return true;
-        }
-        next = java_next_named_preorder(root, node, true);
-    }
-    false
-}
-
-fn java_source(
-    analyzer: &dyn IAnalyzer,
-    session: Option<&JavaResolutionSession<'_>>,
-    unit: &CodeUnit,
-) -> Option<String> {
-    match session {
-        Some(session) => session.source(analyzer, unit),
-        None => analyzer.get_source(unit, false),
-    }
-}
-
-fn java_signatures(
-    analyzer: &dyn IAnalyzer,
-    session: Option<&JavaResolutionSession<'_>>,
-    unit: &CodeUnit,
-) -> Vec<String> {
-    match session {
-        Some(session) => session.signatures(analyzer, unit),
-        None => analyzer.signatures(unit),
-    }
-}
-
-fn java_signature_metadata(
-    analyzer: &dyn IAnalyzer,
-    session: Option<&JavaResolutionSession<'_>>,
-    unit: &CodeUnit,
-) -> Vec<crate::analyzer::SignatureMetadata> {
-    match session {
-        Some(session) => session.signature_metadata(analyzer, unit),
-        None => analyzer.signature_metadata(unit),
-    }
-}
-
-fn java_parse_source(session: Option<&JavaResolutionSession<'_>>, source: &str) -> Option<Tree> {
-    match session {
-        Some(session) => session.parse_java_source(source),
-        None => parse_java_tree(source),
-    }
-}
-
-fn java_charge_resolution_scope(session: Option<&JavaResolutionSession<'_>>) -> bool {
-    session.is_none_or(JavaResolutionSession::charge_scope_step)
-}
-
-fn java_modifiers_have_lombok_accessor_annotation(
-    session: Option<&JavaResolutionSession<'_>>,
-    declaration: Node<'_>,
-    source: &str,
-    kind: JavaAccessorKind,
-) -> bool {
-    let Some(modifiers) = java_named_child_by_kind(session, declaration, "modifiers") else {
-        return false;
-    };
-    let mut cursor = modifiers.walk();
-    for child in modifiers.named_children(&mut cursor) {
-        if !java_charge_resolution_scope(session) {
-            return false;
-        }
-        if matches!(child.kind(), "annotation" | "marker_annotation")
-            && java_annotation_short_name(child, source)
-                .is_some_and(|name| java_lombok_annotation_generates_accessor(&name, kind))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn java_named_child_by_kind<'tree>(
-    session: Option<&JavaResolutionSession<'_>>,
-    node: Node<'tree>,
-    kind: &str,
-) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if !java_charge_resolution_scope(session) {
-            return None;
-        }
-        if child.kind() == kind {
-            return Some(child);
-        }
-    }
-    None
-}
-
-fn java_annotation_short_name(annotation: Node<'_>, source: &str) -> Option<String> {
-    let raw = if let Some(name_node) = annotation.child_by_field_name("name") {
-        java_node_text(name_node, source)
-    } else {
-        java_node_text(annotation, source)
-    };
-    let trimmed = raw.trim().trim_start_matches('@');
-    java_terminal_segment(trimmed)
-}
-
-fn java_lombok_annotation_generates_accessor(name: &str, kind: JavaAccessorKind) -> bool {
-    match name {
-        "Data" | "Value" => kind == JavaAccessorKind::Getter,
-        "Getter" => kind == JavaAccessorKind::Getter,
-        "Setter" => kind == JavaAccessorKind::Setter,
-        _ => false,
-    }
 }
 
 fn java_static_import_candidates(

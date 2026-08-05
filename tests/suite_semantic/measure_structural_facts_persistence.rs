@@ -353,7 +353,9 @@ fn structural_facts_cold_extraction_and_warm_persisted_hydration() {
         .expect("canonicalize structural persistence benchmark root");
     generate_workspace(&root, file_count, calls_per_file);
     initialize_git_workspace(&root);
-    let database = root.join(".bifrost/cache/bifrost_cache.db");
+    let database = root
+        .join(".bifrost/cache")
+        .join(brokk_bifrost::cache_db::cache_db_file_name());
     let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::TypeScript));
     let config = AnalyzerConfig {
         parallelism: Some(parallelism),

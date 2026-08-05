@@ -272,6 +272,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             | "function_definition"
             | "lambda_expression"
             | "for_statement"
+            | "for_range_loop"
             | "while_statement"
             | "if_statement"
     );
@@ -319,6 +320,7 @@ fn seed_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     match node.kind() {
         "parameter_declaration" | "optional_parameter_declaration" => seed_typed_binding(node, ctx),
         "declaration" | "field_declaration" => seed_variable_declaration(node, ctx),
+        "for_range_loop" => seed_range_binding(node, ctx),
         "using_declaration" => seed_using_enum(node, ctx),
         _ => {}
     }
@@ -415,6 +417,26 @@ fn seed_typed_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !parameter_belongs_to_callable_scope(node) {
         return;
     }
+    let Some(declarator) = node.child_by_field_name("declarator") else {
+        return;
+    };
+    let Some(name) = extract_variable_name(declarator, ctx.source) else {
+        return;
+    };
+    if has_function_scope_ancestor(node) {
+        ctx.local_shadows.declare_shadow(name.clone());
+    }
+    if ctx.spec.kind == TargetKind::Type {
+        ctx.bindings.declare_shadow(name);
+        return;
+    }
+    let type_node = node
+        .child_by_field_name("type")
+        .or_else(|| first_type_child(node));
+    seed_binding_from_type_or_value(&name, type_node, None, ctx);
+}
+
+fn seed_range_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(declarator) = node.child_by_field_name("declarator") else {
         return;
     };
@@ -2444,6 +2466,8 @@ fn inherited_injected_class_qualifier_scope<'tree>(
     None
 }
 
+/// Resolve each qualified type component against the inverse target while
+/// preserving C++ lexical-tier precedence and structured alias identity.
 fn target_guided_qualifier_type_scopes<'tree>(
     node: Node<'tree>,
     ctx: &ScanCtx<'_>,
@@ -2456,11 +2480,34 @@ fn target_guided_qualifier_type_scopes<'tree>(
     }
     let target = physically_visible_type_target(ctx)?;
     let qualified = qualified_owner_components(node, ctx.source)?;
+    // Prefer the C++ lexical tier that exactly matches a candidate's indexed
+    // scope before falling back to suffix recovery.  A short unqualified
+    // owner can have a same-spelled class in a nested namespace (for example
+    // `ThreadDetails` and `Ui::ThreadDetails`).  Suffix-only matching treats
+    // both as possible owners and then fails closed, even though the
+    // translation unit's lexical scope selects the global class.  Keep the
+    // suffix path for malformed namespace sentinels, where the parser does
+    // not expose every indexed scope component.
+    let lexical_scope = match enclosing_lexical_scope_components(
+        node,
+        ctx.analyzer,
+        ctx.visibility,
+        ctx.file,
+        ctx.source,
+    ) {
+        LexicalScopeResolution::Resolved(scope) => scope,
+        LexicalScopeResolution::Ambiguous | LexicalScopeResolution::Missing => {
+            enclosing_namespace_components(node, ctx.source)
+        }
+    };
     let mut matches = Vec::new();
     for component_count in 1..=qualified.names.len() {
         let components = &qualified.names[..component_count];
+        let lexical_tiers = lexical_component_tiers(components, qualified.global, &lexical_scope)
+            .collect::<Vec<_>>();
         let name = components.last()?;
         let mut candidates = Vec::new();
+        let mut exact_candidates = Vec::new();
         for candidate in ctx
             .visibility
             .visible_identifier_candidates(ctx.file, name)
@@ -2477,7 +2524,16 @@ fn target_guided_qualifier_type_scopes<'tree>(
             {
                 continue;
             }
+            let exact_lexical_scope = lexical_tiers
+                .iter()
+                .any(|expected| expected == &candidate_components);
             candidates.push(candidate.clone());
+            if exact_lexical_scope {
+                exact_candidates.push(candidate.clone());
+            }
+        }
+        if !exact_candidates.is_empty() {
+            candidates = exact_candidates;
         }
         // A typedef spelling can qualify nested C++ members while forward
         // lookup canonicalizes that spelling to its underlying class. Preserve

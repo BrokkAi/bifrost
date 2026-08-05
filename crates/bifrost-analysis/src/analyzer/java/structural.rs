@@ -20,6 +20,7 @@ pub(crate) static JAVA_STRUCTURAL_SPEC: JavaStructuralSpec = JavaStructuralSpec;
 
 const JAVA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("method_invocation", NormalizedKind::Call),
+    ("method_reference", NormalizedKind::Call),
     ("object_creation_expression", NormalizedKind::Call),
     ("field_access", NormalizedKind::FieldAccess),
     ("method_declaration", NormalizedKind::Method),
@@ -239,6 +240,10 @@ impl StructuralSpec for JavaStructuralSpec {
             || node.child_by_field_name("value").is_some()
     }
 
+    fn generator_construct(&self, node: Node<'_>, _kind: NormalizedKind) -> Option<&'static str> {
+        (node.kind() == "method_reference").then_some("java_method_reference")
+    }
+
     fn supports_role(&self, role: Role) -> bool {
         role != Role::Kwarg
     }
@@ -278,6 +283,21 @@ impl StructuralSpec for JavaStructuralSpec {
                             if let Some(name) = expression_name_node(type_node) {
                                 sink.set_name(name);
                             }
+                        }
+                    }
+                    "method_reference" => {
+                        let mut cursor = node.walk();
+                        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+                        if let Some((member, receivers)) = children.split_last()
+                            && let Some(receiver) = receivers.last()
+                        {
+                            attach_terminal_callee(sink, *member, Some(*member));
+                            attach_role_with_derived_name(
+                                sink,
+                                Role::Receiver,
+                                *receiver,
+                                expression_name_node,
+                            );
                         }
                     }
                     _ => {}

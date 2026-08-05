@@ -8,6 +8,13 @@ use git2::{Repository, Signature};
 use serde_json::Value;
 use tempfile::TempDir;
 
+use crate::common::ScratchCacheDir;
+
+/// The shared Java corpus, in place inside the repository.
+///
+/// A process rooted here resolves the checkout's own `.bifrost/cache`
+/// database, so every spawned command that uses it must carry a
+/// [`ScratchCacheDir`] (issue #1588).
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -100,7 +107,9 @@ fn snapshot_tree(root: &Path, objects: &Path, path: &str, contents: &str) -> Str
 
 #[test]
 fn tool_get_summaries_prints_structured_json_without_content() {
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let output = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--tool")
@@ -132,7 +141,9 @@ fn tool_get_summaries_prints_structured_json_without_content() {
 
 #[test]
 fn code_query_repl_accepts_piped_sexp_commands() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let mut child = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--repl")
@@ -450,7 +461,9 @@ fn tool_get_symbol_sources_git_history_prefix_collision_selects_longest_path() {
 
 #[test]
 fn tool_get_symbol_sources_does_not_treat_colon_selectors_as_git_history() {
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let output = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--tool")
@@ -500,7 +513,9 @@ fn tool_get_symbol_sources_does_not_treat_colon_selectors_as_git_history() {
 
 #[test]
 fn tool_no_line_numbers_suppresses_line_prefixes() {
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let output = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--tool")
@@ -531,7 +546,9 @@ fn tool_no_line_numbers_suppresses_line_prefixes() {
 
 #[test]
 fn tool_normalizes_absolute_paths_inside_workspace() {
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let output = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--tool")
@@ -565,7 +582,9 @@ fn tool_rejects_absolute_paths_outside_workspace() {
     let outside_file = outside.path().join("Outside.java");
     fs::write(&outside_file, "class Outside {}\n").expect("write outside file");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let output = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--tool")
@@ -582,7 +601,9 @@ fn tool_rejects_absolute_paths_outside_workspace() {
 
 #[test]
 fn tool_sources_limit_workspace_to_selected_files() {
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let output = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--tool")
@@ -620,7 +641,9 @@ fn tool_sources_limit_workspace_to_selected_files() {
 #[test]
 fn tool_sources_accept_absolute_workspace_paths() {
     let source = fixture_root().join("A.java");
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let output = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--tool")
@@ -701,7 +724,9 @@ fn tool_sources_reject_absolute_paths_outside_workspace() {
     let outside_file = outside.path().join("Outside.java");
     fs::write(&outside_file, "class Outside {}\n").expect("write outside file");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let output = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--tool")
@@ -720,7 +745,9 @@ fn tool_sources_reject_absolute_paths_outside_workspace() {
 
 #[test]
 fn tool_sources_reject_empty_glob_matches() {
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let output = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--tool")
@@ -739,7 +766,9 @@ fn tool_sources_reject_empty_glob_matches() {
 
 #[test]
 fn tool_unknown_tool_is_reported() {
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let output = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--tool")
@@ -754,7 +783,9 @@ fn tool_unknown_tool_is_reported() {
 
 #[test]
 fn removed_search_ast_tool_name_is_reported_as_unknown() {
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let output = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--tool")
@@ -1077,7 +1108,9 @@ fn diff_snapshot_object_dir_is_rejected_for_lsp() {
 
 #[test]
 fn query_code_tool_returns_structural_matches() {
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let output = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--tool")
@@ -1106,7 +1139,9 @@ fn query_code_tool_returns_structural_matches() {
 
 #[test]
 fn query_code_tool_returns_versioned_explain_and_profile_reports() {
-    let explain = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let explain = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--tool")
@@ -1131,7 +1166,9 @@ fn query_code_tool_returns_versioned_explain_and_profile_reports() {
     );
     assert!(explain["structuredContent"].get("results").is_none());
 
-    let profile = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let profile = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--tool")
@@ -1291,7 +1328,9 @@ fn query_file_rejects_tool_mode_flags() {
 
 #[test]
 fn tool_cannot_be_combined_with_mcp() {
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let output = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--tool")
@@ -1311,7 +1350,9 @@ fn tool_cannot_be_combined_with_mcp() {
 
 #[test]
 fn tool_sources_require_tool_mode() {
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let cache = ScratchCacheDir::new();
+    let output = cache
+        .command(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--sources")

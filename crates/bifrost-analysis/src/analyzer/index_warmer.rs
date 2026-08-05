@@ -5,6 +5,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::analyzer::WorkspaceAnalyzer;
+use crate::profiling;
 
 /// Coalescing background warmer for the lazily built per-generation query
 /// indexes (#1442). The Rust type-hierarchy and usage indexes take double-
@@ -60,6 +61,7 @@ impl IndexWarmer {
                 let mut next = Some(snapshot);
                 while let Some(current) = next.take() {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _scope = profiling::scope("mcp_cold.query_index_construction");
                         current.warm_query_indexes();
                     }));
                     let mut state = warmer.state.lock().expect("index warmer lock poisoned");

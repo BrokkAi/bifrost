@@ -611,6 +611,7 @@ pub(crate) fn most_important_project_files_with_cancellation(
     top_k: usize,
     cancellation: Option<&crate::CancellationToken>,
 ) -> (Vec<ProjectFile>, HistoryRankingStatus) {
+    let _cold_scope = profiling::scope("mcp_cold.git_history_relevance_setup");
     let _scope = profiling::scope("relevance::most_important_project_files");
     if top_k == 0 || candidates.is_empty() {
         return (Vec::new(), HistoryRankingStatus::Complete);

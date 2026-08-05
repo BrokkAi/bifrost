@@ -1247,6 +1247,96 @@ fn active_generator_rule_emits_a_typed_model_declaration_with_rule_provenance() 
 }
 
 #[test]
+fn repeated_argument_captures_emit_ordered_declarations_with_authored_anchors() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/app/Order.java",
+            "package app; class Order { void make() { build(first, second); } }",
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut source: Value = serde_json::from_slice(GENERATOR_RULES_JSON).unwrap();
+    let rule = &mut source["shards"][0]["payload"]["rules"][0];
+    rule["trigger"] = json!({ "kind": "language_construct", "construct": "call" });
+    rule["captures"] = json!([
+      {
+        "name": "owner_id",
+        "binding": {
+          "source": { "kind": "enclosing_declaration" },
+          "projection": "stable_id"
+        },
+        "value_kind": "stable_id",
+        "cardinality": "one"
+      },
+      {
+        "name": "argument",
+        "binding": {
+          "source": { "kind": "arguments", "from": 0 },
+          "projection": "stable_id"
+        },
+        "value_kind": "stable_id",
+        "cardinality": "many"
+      }
+    ]);
+    rule["emissions"] = json!([{
+      "kind": "declaration",
+      "id": { "op": "capture", "name": "argument" },
+      "name": { "op": "literal", "value": "generated" },
+      "anchor": { "op": "capture", "name": "argument" },
+      "declaration": {
+        "kind": "member",
+        "owner": { "op": "capture", "name": "owner_id" },
+        "member_kind": "method",
+        "visibility": "public"
+      }
+    }]);
+
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    catalog
+        .register_session_pack(
+            &compiled_from_value(&source),
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "repeated-generator-fixture".to_owned(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        acquire_active_semantic_models(
+            analyzer.analyzer(),
+            &catalog,
+            None,
+            &generator_activation_request(),
+            &CancellationToken::default(),
+        ),
+        SemanticModelRuntimeOutcome::Ready { .. }
+    ));
+
+    let overlay = analyzer.analyzer().semantic_model_overlay().unwrap();
+    let first = overlay.symbols_with_id("app.Order.make.first");
+    let second = overlay.symbols_with_id("app.Order.make.second");
+    assert_eq!(first.disposition, SemanticModelOverlayDisposition::Unique);
+    assert_eq!(second.disposition, SemanticModelOverlayDisposition::Unique);
+    let SemanticModelLocation::Authored(first_anchor) = &first.records[0].location else {
+        panic!("the first repeated declaration needs an authored anchor");
+    };
+    let SemanticModelLocation::Authored(second_anchor) = &second.records[0].location else {
+        panic!("the second repeated declaration needs an authored anchor");
+    };
+    assert_eq!(first_anchor.path, "src/app/Order.java");
+    assert_eq!(first_anchor.symbol, "app.Order.make.first");
+    assert!(first_anchor.range.start_byte < second_anchor.range.start_byte);
+    assert_eq!(
+        first.records[0].provenance.rule_id.as_deref(),
+        Some("rule.builder")
+    );
+    assert_eq!(
+        second.records[0].provenance.rule_id.as_deref(),
+        Some("rule.builder")
+    );
+}
+
+#[test]
 fn unqualified_model_name_is_indexed_once() {
     let (_project, analyzer) = inline_analyzer();
     let mut source: Value = serde_json::from_slice(DECLARATIONS_JSON).unwrap();

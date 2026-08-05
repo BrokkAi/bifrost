@@ -545,17 +545,42 @@ fn definition_candidate_from_range_base(
 }
 
 pub(super) fn semantic_model_definition_candidate(
+    analyzer: &dyn IAnalyzer,
     symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
 ) -> DefinitionCandidate {
     let range = symbol.location.range();
+    let columns = match &symbol.location {
+        crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor) => analyzer
+            .project()
+            .file_by_rel_path(std::path::Path::new(&anchor.path))
+            .and_then(|file| analyzer.project().read_source(&file).ok())
+            .map(|source| {
+                let line_starts = compute_line_starts(&source);
+                (
+                    crate::text_utils::line_column_for_offset(
+                        &source,
+                        &line_starts,
+                        anchor.range.start_byte,
+                    )
+                    .1,
+                    crate::text_utils::line_column_for_offset(
+                        &source,
+                        &line_starts,
+                        anchor.range.end_byte,
+                    )
+                    .1,
+                )
+            }),
+        crate::analyzer::semantic_model::SemanticModelLocation::Model(_) => None,
+    };
     DefinitionCandidate {
         name: symbol.name.clone(),
         fqn: Some(symbol.qualified_name.clone()),
         path: symbol.location.identity().to_string(),
         start_line: range.start_line,
-        start_column: None,
+        start_column: columns.map(|(start, _)| start),
         end_line: range.end_line,
-        end_column: None,
+        end_column: columns.map(|(_, end)| end),
         kind: format!("{:?}", symbol.kind).to_ascii_lowercase(),
         signature: symbol.signature.clone(),
         language: symbol.language.clone(),
