@@ -29,7 +29,7 @@ The local and Ubuntu benchmarks now pass with `BIFROST_BENCHMARK_MCP_RMCP=on`. A
 - [x] (2026-08-05 16:26Z) Committed the promotion as `9ed529336`, pushed the branch, and opened ready pull request #1669.
 - [x] (2026-08-05 16:57Z) Reproduced the legacy CI failure and isolated the default-host test from the lane's inherited rollback selector.
 - [x] (2026-08-05 16:57Z) Passed 125 MCP unit tests, 32 MCP integration tests, matching-toolchain doctests, formatting, affected-package Clippy, and final policy review.
-- [ ] Commit and push the legacy-test repair, then confirm both MCP contract lanes on pull request #1669.
+- [x] (2026-08-05 17:07Z) Committed and pushed the repair as `2d3a7c9b4`. Both MCP contract lanes passed in run `31027910155`.
 
 ## Surprises & Discoveries
 
@@ -142,7 +142,7 @@ GitHub Actions run `31020949528` passed its targeted `interactive-latency` job o
 
 This branch supplies the required RMCP promotion evidence. The user then authorized the selector change on this branch. The validated implementation now makes RMCP the unset default and retains explicit `off` for rollback. The hand-written host remains present and tested. Commit `9ed529336` is pushed. Ready pull request #1669 targets `master` and closes issue #1581.
 
-The first pull request CI run exposed one test-isolation error. The default-host discovery test inherited `off` from the legacy matrix lane, so it tested the rollback host instead of the unset default. The repair builds the same child command, removes only that selector, and leaves every shared rollback test under the legacy host. Both selector contexts now pass locally. The complete legacy CI command passes 125 unit tests and 32 integration tests.
+The first pull request CI run exposed one test-isolation error. The default-host discovery test inherited `off` from the legacy matrix lane, so it tested the rollback host instead of the unset default. The repair builds the same child command, removes only that selector, and leaves every shared rollback test under the legacy host. Both selector contexts pass locally. The complete legacy CI command passes 125 unit tests and 32 integration tests. GitHub Actions run `31027910155` confirms that both the RMCP and legacy rollback contract jobs pass.
 
 ## Context and Orientation
 
@@ -319,6 +319,8 @@ The important remote results are:
 
 The downloaded artifact is `/private/tmp/rmcp-benchmark-31020949528.wxNpCO`. The report is `run-20260805T154739Z.json`. The GitHub run is `https://github.com/BrokkAi/bifrost/actions/runs/31020949528`.
 
+The legacy-test repair passed both MCP contract jobs in GitHub Actions run `31027910155` on commit `2d3a7c9b4`. The legacy rollback job is `92381865412`. The RMCP job is `92381865446`.
+
 ## Interfaces and Dependencies
 
 Do not add a crate or third-party dependency.
@@ -341,4 +343,4 @@ The exact private type names for retained entries can change during implementati
 
 `crates/bifrost-analysis/src/searchtools/scan_usages.rs` must keep `ScanUsagesExecutionContext::with_cancellation_and_max_duration` and both public request fields unchanged. Only the default constant and its explanation change.
 
-Revision note, 2026-08-05: Created the initial plan from the failed RMCP promotion run. The plan separates real response-budget work from bounded profile capture. Recorded the first checkpoint commit before source implementation. Corrected the benchmark unit-test target. Recorded the completed transport-capture, scan-budget, local validation, and local benchmark milestones. Added the successful Ubuntu interactive result and artifact evidence. Removed the invalid broad-manifest repo selector from the replay command. Added Milestone 6 after the user authorized promotion on this branch. Recorded the completed selector, rollback, behavior-test, Clippy, package-test, doctest, and policy gates. Recorded promotion commit `9ed529336` and ready pull request #1669. Added Milestone 7 for the legacy-lane environment-isolation repair and its validation.
+Revision note, 2026-08-05: Created the initial plan from the failed RMCP promotion run. The plan separates real response-budget work from bounded profile capture. Recorded the first checkpoint commit before source implementation. Corrected the benchmark unit-test target. Recorded the completed transport-capture, scan-budget, local validation, and local benchmark milestones. Added the successful Ubuntu interactive result and artifact evidence. Removed the invalid broad-manifest repo selector from the replay command. Added Milestone 6 after the user authorized promotion on this branch. Recorded the completed selector, rollback, behavior-test, Clippy, package-test, doctest, and policy gates. Recorded promotion commit `9ed529336` and ready pull request #1669. Added Milestone 7 for the legacy-lane environment-isolation repair and its validation. Recorded the green RMCP and legacy rollback contract jobs from run `31027910155`.
