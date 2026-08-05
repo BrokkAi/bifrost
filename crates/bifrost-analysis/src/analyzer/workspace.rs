@@ -29,6 +29,23 @@ impl EmptyAnalyzer {
 use crate::analyzer::CodeUnitIndex;
 
 impl CodeUnitIndex for EmptyAnalyzer {
+    fn enclosing_code_unit(
+        &self,
+        _file: &crate::analyzer::ProjectFile,
+        _range: &crate::analyzer::Range,
+    ) -> Option<crate::analyzer::CodeUnit> {
+        None
+    }
+
+    fn enclosing_code_unit_for_lines(
+        &self,
+        _file: &crate::analyzer::ProjectFile,
+        _start_line: usize,
+        _end_line: usize,
+    ) -> Option<crate::analyzer::CodeUnit> {
+        None
+    }
+
     fn all_declarations(&self) -> Box<dyn Iterator<Item = crate::analyzer::CodeUnit> + '_> {
         Box::new(std::iter::empty())
     }
@@ -124,23 +141,6 @@ impl IAnalyzer for EmptyAnalyzer {
 
     fn import_statements(&self, _file: &crate::analyzer::ProjectFile) -> Vec<String> {
         Vec::new()
-    }
-
-    fn enclosing_code_unit(
-        &self,
-        _file: &crate::analyzer::ProjectFile,
-        _range: &crate::analyzer::Range,
-    ) -> Option<crate::analyzer::CodeUnit> {
-        None
-    }
-
-    fn enclosing_code_unit_for_lines(
-        &self,
-        _file: &crate::analyzer::ProjectFile,
-        _start_line: usize,
-        _end_line: usize,
-    ) -> Option<crate::analyzer::CodeUnit> {
-        None
     }
 
     fn is_access_expression(

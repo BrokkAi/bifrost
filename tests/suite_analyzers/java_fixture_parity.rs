@@ -1,7 +1,5 @@
 use brokk_bifrost::CodeUnitIndex;
-use brokk_bifrost::{
-    IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language, ProjectFile, TestProject,
-};
+use brokk_bifrost::{ImportAnalysisProvider, JavaAnalyzer, Language, ProjectFile, TestProject};
 
 fn fixture_analyzer() -> JavaAnalyzer {
     let root = std::env::current_dir()

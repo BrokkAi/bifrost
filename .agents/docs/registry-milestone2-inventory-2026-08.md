@@ -113,12 +113,11 @@ the search adjudication (section 4).
 ### 3.2 Core-typed but outside the definition
 
 * Syntax/parse-tree queries, not declaration-index reads: `parse_errors`,
-  `semantic_diagnostics`, `declaration_syntax_kind`, `enclosing_code_unit`,
-  `enclosing_code_unit_for_lines`, `is_access_expression`, `find_nearest_declaration`,
-  `extract_call_receiver`. These are the closest calls in the whole inventory --
-  `enclosing_code_unit` in particular looks like index navigation -- but decision 4
-  enumerates four operations and location-to-declaration lookup is none of them; every
-  one of these needs a parse tree the index does not hold.
+  `semantic_diagnostics`, `declaration_syntax_kind`, `is_access_expression`,
+  `find_nearest_declaration`, `extract_call_receiver`. These are the closest calls in
+  the whole inventory, and one of them did not survive re-examination:
+  `enclosing_code_unit` and `enclosing_code_unit_for_lines` were listed here on
+  2026-08-04 and moved to `CodeUnitIndex` on 2026-08-05, see the decision log.
 * Import facts, not declarations: `import_statements`, `import_statements_of`.
 * Test classification: `contains_tests`, `in_test_region`, `file_is_test_only`,
   `get_test_modules`, `test_files_to_code_units`.
@@ -334,3 +333,35 @@ CompactRowsBuilder}`, `hash::{HashMap, HashSet}`.
   ten analysis files had the import placed inside their `#[cfg(test)]` module because only
   their tests need it. `IAnalyzer::<m>` / `<Self as IAnalyzer>::<m>` qualified calls in 17
   files became `CodeUnitIndex::<m>`. No call expression changed shape.
+* 2026-08-05 (reopened): `enclosing_code_unit` and `enclosing_code_unit_for_lines` move
+  to `CodeUnitIndex`, reversing the 2026-08-04 entry above. That entry rested on "they
+  answer from a parse tree", which is an implementation argument about how
+  `TreeSitterAnalyzer` happens to compute the answer, not a semantic one about what the
+  operation is. Semantically "which declaration encloses this location" is a query over
+  the declaration index: its inputs are a `ProjectFile` and a `Range`, its output is a
+  `CodeUnit`, and the real body already answers it by scanning `declarations` and
+  `ranges` -- both `CodeUnitIndex` methods -- rather than by walking a syntax tree. The
+  Go extraction pilot supplied the cost of getting it wrong: `usages/go_graph/hits.rs`
+  attributes every usage hit through `IAnalyzer::enclosing_code_unit`, so with no
+  `CodeUnitIndex` equivalent the extractor/hits pair (650 LOC) could not follow Go out of
+  analysis, and the same coupling would have repeated for each of the eleven remaining
+  languages. Decision 4's four enumerated operations are read as a description of the
+  membership test, not an exhaustive list; location-to-declaration lookup is index
+  navigation and is now a fifth. `enclosing_code_unit_for_lines` moves with it: identical
+  shape (file plus location in, `Option<CodeUnit>` out), the same implementors implement
+  the pair identically, and a language scan calls it (`kotlin/diagnostics.rs`).
+  `is_access_expression`, `find_nearest_declaration` and `declaration_syntax_kind` stay:
+  they were listed as siblings but share neither the shape (a syntax predicate, a
+  `DeclarationInfo`, a tree-sitter node kind) nor a language-scan caller, and moving them
+  would be speculative. Both moved methods stay required (no default), as they were on
+  `IAnalyzer`; all 17 implementors relocate their existing body from the `IAnalyzer` impl
+  block to the `CodeUnitIndex` one with no change to the body.
+* 2026-08-05: `DefinitionNameLookup` added to core beside `CodeUnitIndex`
+  (`analyzer/definition_lookup.rs`), implemented for `DefinitionIndexHandle` in analysis.
+  It is not an inventory method -- `global_usage_definition_index` stays on `IAnalyzer`
+  per section 3.1, and the handle stays in analysis -- but it is the same adjudication
+  applied to a return type: a language scan that only needs "does the workspace define
+  this fully-qualified name" should not have to name the usages resolution model to ask.
+  The trait is shaped from `go/diagnostics.rs`'s call sites, which are all
+  `!handle.fqn(name).is_empty()`, so the method is a `bool` existence query rather than a
+  `Vec<CodeUnit>` the caller discards.

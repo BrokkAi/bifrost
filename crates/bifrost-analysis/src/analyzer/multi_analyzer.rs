@@ -581,6 +581,24 @@ impl TestDetectionProvider for MultiAnalyzer {}
 use crate::analyzer::CodeUnitIndex;
 
 impl CodeUnitIndex for MultiAnalyzer {
+    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
+        self.delegate_for_file(file)
+            .and_then(|delegate| delegate.analyzer().enclosing_code_unit(file, range))
+    }
+
+    fn enclosing_code_unit_for_lines(
+        &self,
+        file: &ProjectFile,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<CodeUnit> {
+        self.delegate_for_file(file).and_then(|delegate| {
+            delegate
+                .analyzer()
+                .enclosing_code_unit_for_lines(file, start_line, end_line)
+        })
+    }
+
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         match self.delegate_for_file(file) {
             Some(delegate) => delegate.analyzer().top_level_declarations(file),
@@ -1027,24 +1045,6 @@ impl IAnalyzer for MultiAnalyzer {
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().import_statements(file))
             .unwrap_or_default()
-    }
-
-    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
-        self.delegate_for_file(file)
-            .and_then(|delegate| delegate.analyzer().enclosing_code_unit(file, range))
-    }
-
-    fn enclosing_code_unit_for_lines(
-        &self,
-        file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.delegate_for_file(file).and_then(|delegate| {
-            delegate
-                .analyzer()
-                .enclosing_code_unit_for_lines(file, start_line, end_line)
-        })
     }
 
     fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {

@@ -4,7 +4,7 @@ use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
     DeclarationInfo, DefinitionIndexHandle, ExceptionHandlingAnalysis, ExceptionSmellWeights,
-    GlobalUsageDefinitionIndex, ImportAnalysisProvider, ParseError, Project, ProjectFile, Range,
+    GlobalUsageDefinitionIndex, ImportAnalysisProvider, ParseError, Project, ProjectFile,
     SearchSymbolCandidate, SemanticDiagnostic, TestAssertionAnalysis, TestAssertionSmell,
     TestAssertionWeights, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
     UsageFactsIndex, metrics_from_declarations,
@@ -439,15 +439,6 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     fn import_statements(&self, _file: &ProjectFile) -> Vec<String> {
         Vec::new()
     }
-
-    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit>;
-
-    fn enclosing_code_unit_for_lines(
-        &self,
-        file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit>;
 
     fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool;
 

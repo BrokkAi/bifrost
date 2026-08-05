@@ -832,6 +832,24 @@ impl TypeAliasProvider for ScalaAnalyzer {
 use crate::analyzer::CodeUnitIndex;
 
 impl CodeUnitIndex for ScalaAnalyzer {
+    fn enclosing_code_unit(
+        &self,
+        file: &ProjectFile,
+        range: &crate::analyzer::Range,
+    ) -> Option<CodeUnit> {
+        self.inner.enclosing_code_unit(file, range)
+    }
+
+    fn enclosing_code_unit_for_lines(
+        &self,
+        file: &ProjectFile,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<CodeUnit> {
+        self.inner
+            .enclosing_code_unit_for_lines(file, start_line, end_line)
+    }
+
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.top_level_declarations(file)
     }
@@ -1073,24 +1091,6 @@ impl IAnalyzer for ScalaAnalyzer {
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
         self.inner.extract_call_receiver(reference)
-    }
-
-    fn enclosing_code_unit(
-        &self,
-        file: &ProjectFile,
-        range: &crate::analyzer::Range,
-    ) -> Option<CodeUnit> {
-        self.inner.enclosing_code_unit(file, range)
-    }
-
-    fn enclosing_code_unit_for_lines(
-        &self,
-        file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.inner
-            .enclosing_code_unit_for_lines(file, start_line, end_line)
     }
 
     fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {

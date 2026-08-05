@@ -3,10 +3,9 @@
 //! whole-workspace inverted pass are built on.
 //!
 //! What is *not* here: the two scan drivers. The forward scan
-//! (`go_graph/extractor.rs`) attributes each hit through
-//! `IAnalyzer::enclosing_code_unit`, and the inverted pass
-//! (`go_graph/inverted.rs`) threads an `EdgeCollector`; both are analysis-owned
-//! types with no core equivalent, so those files stay in
+//! (`go_graph/extractor.rs`) threads a `ScanCtx` carrying a `&dyn IAnalyzer`,
+//! and the inverted pass (`go_graph/inverted.rs`) threads an `EdgeCollector`;
+//! both are analysis-owned types, so those files stay in
 //! `brokk-bifrost-analysis` and call into this module.
 
 pub mod ast;

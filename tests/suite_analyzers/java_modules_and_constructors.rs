@@ -1,7 +1,5 @@
 use brokk_bifrost::CodeUnitIndex;
-use brokk_bifrost::{
-    CodeUnitType, IAnalyzer, JavaAnalyzer, Language, ProjectFile, Range, TestProject,
-};
+use brokk_bifrost::{CodeUnitType, JavaAnalyzer, Language, ProjectFile, Range, TestProject};
 
 fn analyzer_for(files: &[(&str, &str)]) -> JavaAnalyzer {
     let temp = tempfile::tempdir().unwrap();

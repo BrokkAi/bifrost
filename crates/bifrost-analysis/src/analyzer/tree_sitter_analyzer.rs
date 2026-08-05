@@ -7521,6 +7521,62 @@ impl<A> crate::analyzer::CodeUnitIndex for TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
+    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
+        self.enclosing_code_unit_query_count
+            .fetch_add(1, Ordering::Relaxed);
+        if range.start_byte >= range.end_byte {
+            return None;
+        }
+
+        self.fetch_file_state(file)?
+            .declarations
+            .iter()
+            .cloned()
+            .filter_map(|code_unit| {
+                let best_range = self
+                    .ranges(&code_unit)
+                    .into_iter()
+                    .find(|candidate| candidate.contains(range))?;
+                Some((best_range.end_byte - best_range.start_byte, code_unit))
+            })
+            .min_by(|(left_span, left), (right_span, right)| {
+                left_span
+                    .cmp(right_span)
+                    .then_with(|| {
+                        enclosing_code_unit_rank(left).cmp(&enclosing_code_unit_rank(right))
+                    })
+                    .then_with(|| left.fq_name().cmp(&right.fq_name()))
+                    .then_with(|| left.kind().cmp(&right.kind()))
+                    .then_with(|| left.source().rel_path().cmp(right.source().rel_path()))
+            })
+            .map(|(_, code_unit)| code_unit)
+    }
+
+    fn enclosing_code_unit_for_lines(
+        &self,
+        file: &ProjectFile,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<CodeUnit> {
+        let line_range = Range {
+            start_byte: 0,
+            end_byte: usize::MAX,
+            start_line,
+            end_line,
+        };
+        self.declarations(file)
+            .into_iter()
+            .filter_map(|code_unit| {
+                let best_range = self.ranges(&code_unit).into_iter().find(|candidate| {
+                    candidate.start_line <= line_range.start_line
+                        && candidate.end_line >= line_range.end_line
+                })?;
+                Some((best_range.end_line - best_range.start_line, code_unit))
+            })
+            .min_by_key(|(span, _)| *span)
+            .map(|(_, code_unit)| code_unit)
+    }
+
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.fetch_file_state(file)
             .map(|state| {
@@ -7981,62 +8037,6 @@ where
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.snapshot_caches())
-    }
-
-    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
-        self.enclosing_code_unit_query_count
-            .fetch_add(1, Ordering::Relaxed);
-        if range.start_byte >= range.end_byte {
-            return None;
-        }
-
-        self.fetch_file_state(file)?
-            .declarations
-            .iter()
-            .cloned()
-            .filter_map(|code_unit| {
-                let best_range = self
-                    .ranges(&code_unit)
-                    .into_iter()
-                    .find(|candidate| candidate.contains(range))?;
-                Some((best_range.end_byte - best_range.start_byte, code_unit))
-            })
-            .min_by(|(left_span, left), (right_span, right)| {
-                left_span
-                    .cmp(right_span)
-                    .then_with(|| {
-                        enclosing_code_unit_rank(left).cmp(&enclosing_code_unit_rank(right))
-                    })
-                    .then_with(|| left.fq_name().cmp(&right.fq_name()))
-                    .then_with(|| left.kind().cmp(&right.kind()))
-                    .then_with(|| left.source().rel_path().cmp(right.source().rel_path()))
-            })
-            .map(|(_, code_unit)| code_unit)
-    }
-
-    fn enclosing_code_unit_for_lines(
-        &self,
-        file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        let line_range = Range {
-            start_byte: 0,
-            end_byte: usize::MAX,
-            start_line,
-            end_line,
-        };
-        self.declarations(file)
-            .into_iter()
-            .filter_map(|code_unit| {
-                let best_range = self.ranges(&code_unit).into_iter().find(|candidate| {
-                    candidate.start_line <= line_range.start_line
-                        && candidate.end_line >= line_range.end_line
-                })?;
-                Some((best_range.end_line - best_range.start_line, code_unit))
-            })
-            .min_by_key(|(span, _)| *span)
-            .map(|(_, code_unit)| code_unit)
     }
 
     fn is_access_expression(

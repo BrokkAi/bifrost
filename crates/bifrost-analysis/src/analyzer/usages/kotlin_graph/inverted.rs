@@ -168,7 +168,7 @@ impl KotlinResolutionCtx for KotlinEdgeScan<'_, '_> {
     }
 
     /// Answered from the per-file class-span index rather than from
-    /// `IAnalyzer::enclosing_code_unit`, because a whole-workspace pass already
+    /// `CodeUnitIndex::enclosing_code_unit`, because a whole-workspace pass already
     /// built the index and would otherwise pay for the same answer twice per
     /// reference.
     fn enclosing_owner_fq_names(&mut self, node: Node<'_>) -> Vec<String> {

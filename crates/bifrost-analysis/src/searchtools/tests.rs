@@ -85,6 +85,19 @@ impl CountingAnalyzer {
 use crate::analyzer::CodeUnitIndex;
 
 impl CodeUnitIndex for CountingAnalyzer {
+    fn enclosing_code_unit(&self, _file: &ProjectFile, _range: &Range) -> Option<CodeUnit> {
+        None
+    }
+
+    fn enclosing_code_unit_for_lines(
+        &self,
+        _file: &ProjectFile,
+        _start_line: usize,
+        _end_line: usize,
+    ) -> Option<CodeUnit> {
+        None
+    }
+
     fn indexed_source(&self, _file: &ProjectFile) -> Option<String> {
         None
     }
@@ -168,19 +181,6 @@ impl IAnalyzer for CountingAnalyzer {
 
     fn import_statements_of(&self, _file: &ProjectFile) -> Vec<String> {
         Vec::new()
-    }
-
-    fn enclosing_code_unit(&self, _file: &ProjectFile, _range: &Range) -> Option<CodeUnit> {
-        None
-    }
-
-    fn enclosing_code_unit_for_lines(
-        &self,
-        _file: &ProjectFile,
-        _start_line: usize,
-        _end_line: usize,
-    ) -> Option<CodeUnit> {
-        None
     }
 
     fn is_access_expression(

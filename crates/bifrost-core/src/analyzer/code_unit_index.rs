@@ -2,8 +2,9 @@
 //!
 //! [`CodeUnitIndex`] is the half of the analyzer contract that answers from the
 //! declaration index alone: enumerating declarations, resolving names to them,
-//! rendering their sources, skeletons and signatures, and navigating
-//! parent/child structure. Every signature here closes over this crate's model
+//! rendering their sources, skeletons and signatures, navigating parent/child
+//! structure, and answering which declaration encloses a source location.
+//! Every signature here closes over this crate's model
 //! types, which is what lets it sit below `brokk-bifrost-analysis` and lets
 //! generic index consumers (`capabilities`, `pool_memo`) live here too.
 //!
@@ -185,6 +186,19 @@ pub trait CodeUnitIndex: Send + Sync {
     fn ranges(&self, _code_unit: &CodeUnit) -> Vec<Range> {
         Vec::new()
     }
+
+    /// The innermost declaration whose range encloses `range`, or `None` when
+    /// no indexed declaration covers it.
+    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit>;
+
+    /// [`CodeUnitIndex::enclosing_code_unit`] over a line span, for callers
+    /// holding row positions rather than byte offsets.
+    fn enclosing_code_unit_for_lines(
+        &self,
+        file: &ProjectFile,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<CodeUnit>;
 
     fn ranges_of(&self, code_unit: &CodeUnit) -> Vec<Range> {
         self.ranges(code_unit)
