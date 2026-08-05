@@ -4677,6 +4677,8 @@ fn evaluate_match_query_candidates(
     match query.validate_steps() {
         Ok(
             QueryValueKind::ReceiverAnalysis
+            | QueryValueKind::ReceiverOutcome
+            | QueryValueKind::ReceiverEvidence
             | QueryValueKind::Procedure
             | QueryValueKind::ProgramPoint
             | QueryValueKind::ControlEdge
@@ -5201,7 +5203,9 @@ fn terminal_presentation(
         | CodeQueryResultValue::FlowEndpoint { .. }
         | CodeQueryResultValue::FlowWitness { .. }
         | CodeQueryResultValue::TaintFinding { .. }
-        | CodeQueryResultValue::ReceiverAnalysis { .. } => return Err(()),
+        | CodeQueryResultValue::ReceiverAnalysis { .. }
+        | CodeQueryResultValue::ReceiverOutcome { .. }
+        | CodeQueryResultValue::ReceiverEvidence { .. } => return Err(()),
         CodeQueryResultValue::Occurrence { value } => (
             DetailedCodeQueryDomain::Occurrence,
             value.path.as_str(),
@@ -5851,6 +5855,8 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::CallSite { .. } => "call_site",
         CodeQueryResultRef::ExpressionSite { .. } => "expression_site",
         CodeQueryResultRef::ReceiverAnalysis { .. } => "receiver_analysis",
+        CodeQueryResultRef::ReceiverOutcome { .. } => "receiver_outcome",
+        CodeQueryResultRef::ReceiverEvidence { .. } => "receiver_evidence",
         CodeQueryResultRef::Occurrence { .. } => "occurrence",
         CodeQueryResultRef::LexicalScope { .. } => "lexical_scope",
         CodeQueryResultRef::Binding { .. } => "binding",
@@ -5881,6 +5887,8 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::CallSite { path, .. }
         | CodeQueryResultRef::ExpressionSite { path, .. }
         | CodeQueryResultRef::ReceiverAnalysis { path, .. }
+        | CodeQueryResultRef::ReceiverOutcome { path, .. }
+        | CodeQueryResultRef::ReceiverEvidence { path, .. }
         | CodeQueryResultRef::Occurrence { path, .. }
         | CodeQueryResultRef::LexicalScope { path, .. }
         | CodeQueryResultRef::Binding { path, .. }
@@ -5937,7 +5945,9 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::FlowEndpoint
         | DetailedCodeQueryDomain::FlowWitness
         | DetailedCodeQueryDomain::TaintFinding
-        | DetailedCodeQueryDomain::ReceiverAnalysis => None,
+        | DetailedCodeQueryDomain::ReceiverAnalysis
+        | DetailedCodeQueryDomain::ReceiverOutcome
+        | DetailedCodeQueryDomain::ReceiverEvidence => None,
     }
 }
 
@@ -6102,6 +6112,11 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, outcome.as_bytes());
             update_optional_hash(&mut hasher, capture.as_deref());
         }
+        DetailedCodeQueryKey::ReceiverOutcome { id, site_id }
+        | DetailedCodeQueryKey::ReceiverEvidence { id, site_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, site_id.as_bytes());
+        }
     }
     let digest: [u8; 32] = hasher.finalize().into();
     let mut encoded = String::with_capacity(64);
@@ -6148,6 +6163,8 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::CallSite => "call_site",
         DetailedCodeQueryDomain::ExpressionSite => "expression_site",
         DetailedCodeQueryDomain::ReceiverAnalysis => "receiver_analysis",
+        DetailedCodeQueryDomain::ReceiverOutcome => "receiver_outcome",
+        DetailedCodeQueryDomain::ReceiverEvidence => "receiver_evidence",
         DetailedCodeQueryDomain::Occurrence => "occurrence",
         DetailedCodeQueryDomain::ReferenceEdge => "reference_edge",
         DetailedCodeQueryDomain::LexicalScope => "lexical_scope",

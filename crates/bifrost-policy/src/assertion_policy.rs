@@ -271,16 +271,28 @@ pub fn validate_relational_assertion_plan(
                 });
             }
             RowBindingSource::Expansion { from, step } => {
-                if !domains.contains_key(from) {
+                let Some(source_domain) = domains.get(from).copied() else {
                     return Err(RelationalAssertionPlanError::ForwardBinding {
                         binding: binding.name.as_str().to_string(),
                         referenced: from.as_str().to_string(),
                     });
+                };
+                match (source_domain, step) {
+                    (
+                        DetailedCodeQueryDomain::ReceiverAnalysis,
+                        crate::definition::RowExpansionStep::ReceiverOutcome,
+                    ) => DetailedCodeQueryDomain::ReceiverOutcome,
+                    (
+                        DetailedCodeQueryDomain::ReceiverAnalysis,
+                        crate::definition::RowExpansionStep::ReceiverEvidence,
+                    ) => DetailedCodeQueryDomain::ReceiverEvidence,
+                    _ => {
+                        return Err(RelationalAssertionPlanError::ExpansionDomainUnavailable {
+                            binding: binding.name.as_str().to_string(),
+                            step: step.label(),
+                        });
+                    }
                 }
-                return Err(RelationalAssertionPlanError::ExpansionDomainUnavailable {
-                    binding: binding.name.as_str().to_string(),
-                    step: step.label(),
-                });
             }
         };
         domains.insert(&binding.name, domain);

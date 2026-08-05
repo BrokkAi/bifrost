@@ -4634,6 +4634,149 @@ service.run();
         file_result.results[0].value,
         CodeQueryResultValue::File { ref value } if value.path == "app.ts"
     ));
+
+    let outcome_query = CodeQuery::from_json(&json!({
+        "match": { "kind": "call", "callee": { "name": "run" } },
+        "steps": [
+            { "op": "receiver_targets" },
+            { "op": "receiver_outcome" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("outcome query");
+    let outcome = execute_with_receiver_budget_for_test(
+        &analyzer,
+        &outcome_query,
+        ReceiverAnalysisBudget::tiny(),
+    );
+    assert!(matches!(
+        outcome.results.as_slice(),
+        [CodeQueryResultItem {
+            value: CodeQueryResultValue::ReceiverOutcome { value },
+            ..
+        }] if value.outcome == "exceeded_budget"
+            && value.coverage == "truncated"
+            && value.candidate_count == 0
+            && value.site_id == value.id
+    ));
+
+    let evidence_query = CodeQuery::from_json(&json!({
+        "match": { "kind": "call", "callee": { "name": "run" } },
+        "steps": [
+            { "op": "receiver_targets" },
+            { "op": "receiver_evidence" }
+        ]
+    }))
+    .expect("evidence query");
+    let evidence = execute_with_receiver_budget_for_test(
+        &analyzer,
+        &evidence_query,
+        ReceiverAnalysisBudget::tiny(),
+    );
+    assert!(evidence.results.is_empty());
+}
+
+#[test]
+fn receiver_evidence_rows_join_to_their_mandatory_outcome() {
+    let source = r#"class Service { run() {} }
+export function caller(service: Service) { service.run(); }
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
+    file.write(source).expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let query = |terminal| {
+        CodeQuery::from_json(&json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [
+                { "op": "receiver_targets" },
+                { "op": terminal }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("receiver row query")
+    };
+
+    let outcome = execute(&analyzer, &query("receiver_outcome"));
+    let evidence = execute(&analyzer, &query("receiver_evidence"));
+    let CodeQueryResultValue::ReceiverOutcome { value: outcome } = &outcome.results[0].value else {
+        panic!("expected receiver outcome")
+    };
+    assert_eq!(outcome.outcome, "precise");
+    assert_eq!(outcome.coverage, "exhaustive");
+    assert_eq!(outcome.candidate_count, 1);
+    assert!(outcome.site_ast_id.is_some());
+    assert_eq!(evidence.results.len(), 1, "{}", evidence.render_text());
+    let CodeQueryResultValue::ReceiverEvidence { value: evidence } = &evidence.results[0].value
+    else {
+        panic!("expected receiver evidence")
+    };
+    assert_eq!(evidence.site_id, outcome.site_id);
+    assert_eq!(evidence.ordinal, 0);
+    assert_eq!(evidence.chain_hop, 0);
+    assert_eq!(evidence.proof, "precise");
+    assert_eq!(evidence.completeness, "exhaustive");
+    assert!(evidence.declaration_id.is_some());
+}
+
+#[test]
+fn receiver_factory_evidence_is_a_stable_parent_linked_chain() {
+    let source = r#"class Service { run() {} }
+function makeService() { return new Service(); }
+export function caller() { const service = makeService(); service.run(); }
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+        .write(source)
+        .expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let query = CodeQuery::from_json(&json!({
+        "match": {
+            "kind": "call",
+            "callee": { "name": "run" },
+            "receiver": { "capture": "receiver" }
+        },
+        "steps": [
+            { "op": "points_to", "capture": "receiver" },
+            { "op": "receiver_evidence" }
+        ],
+        "result_detail": "full"
+    }))
+    .expect("factory evidence query");
+
+    let first = execute(&analyzer, &query);
+    let second = execute(&analyzer, &query);
+    assert_eq!(first.results.len(), 2, "{}", first.render_text());
+    let rows = first
+        .results
+        .iter()
+        .map(|item| match &item.value {
+            CodeQueryResultValue::ReceiverEvidence { value } => value,
+            _ => panic!("expected receiver evidence"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows[0].evidence_kind, "factory_return");
+    assert!(rows[0].factory_id.is_some());
+    assert_eq!(rows[0].parent_evidence_id, None);
+    assert_eq!(
+        rows[1].parent_evidence_id.as_deref(),
+        Some(rows[0].id.as_str())
+    );
+    assert_eq!(rows[1].chain_hop, 1);
+    let second_ids = second
+        .results
+        .iter()
+        .map(|item| match &item.value {
+            CodeQueryResultValue::ReceiverEvidence { value } => value.id.as_str(),
+            _ => panic!("expected receiver evidence"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        second_ids,
+        rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>()
+    );
 }
 
 #[test]

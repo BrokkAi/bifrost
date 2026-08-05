@@ -606,14 +606,16 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::GeneratedBy
         | QueryStep::ImplementationOf
         | QueryStep::ExportTarget
-        | QueryStep::EdgeTarget => {}
+        | QueryStep::EdgeTarget
+        | QueryStep::SegmentTarget
+        | QueryStep::ReceiverOutcome
+        | QueryStep::ReceiverEvidence => {}
         QueryStep::DeclarationStateOf(filter) => {
             object.extend(declaration_state_filter_to_json(filter));
         }
         QueryStep::EdgesOf(filter) | QueryStep::EdgesFrom(filter) => {
             object.extend(edge_filter_to_json(filter));
         }
-        QueryStep::SegmentTarget => {}
         QueryStep::OccurrencesOf(filter) | QueryStep::OccurrencesIn(filter) => {
             object.extend(occurrence_filter_to_json(filter));
         }

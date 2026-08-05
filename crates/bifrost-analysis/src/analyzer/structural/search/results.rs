@@ -296,6 +296,14 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryReceiverAnalysis>,
     },
+    ReceiverOutcome {
+        #[serde(flatten)]
+        value: Box<CodeQueryReceiverOutcome>,
+    },
+    ReceiverEvidence {
+        #[serde(flatten)]
+        value: Box<CodeQueryReceiverEvidence>,
+    },
     Occurrence {
         #[serde(flatten)]
         value: Box<CodeQueryOccurrence>,
@@ -1417,6 +1425,9 @@ pub struct CodeQueryExpressionSite {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CodeQueryReceiverAnalysis {
+    pub site_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_ast_id: Option<String>,
     pub analysis_kind: &'static str,
     pub path: String,
     pub language: &'static str,
@@ -1434,6 +1445,57 @@ pub struct CodeQueryReceiverAnalysis {
     pub reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<&'static str>,
+}
+
+/// The mandatory terminal row for one receiver/value analysis site. Evidence
+/// rows may be empty, but this row always states why and whether that absence
+/// is exhaustive.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryReceiverOutcome {
+    pub id: String,
+    pub site_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub analysis_kind: &'static str,
+    pub outcome: &'static str,
+    pub coverage: &'static str,
+    pub candidate_count: usize,
+    pub candidates_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_unsupported: Option<&'static str>,
+    pub setup_nodes: usize,
+    pub summary_expansions: usize,
+    pub scope_nodes: usize,
+}
+
+/// One typed receiver value retained for a site. Nested factory returns are
+/// flattened into a parent-linked chain instead of nested presentation data.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryReceiverEvidence {
+    pub id: String,
+    pub site_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_evidence_id: Option<String>,
+    pub ordinal: usize,
+    pub chain_hop: usize,
+    pub evidence_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration_fq_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub factory_id: Option<String>,
+    pub proof: &'static str,
+    pub completeness: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1656,6 +1718,21 @@ pub enum CodeQueryResultRef {
         outcome: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
         capture: Option<String>,
+    },
+    ReceiverOutcome {
+        id: String,
+        site_id: String,
+        path: String,
+        range: CodeQueryRange,
+        outcome: &'static str,
+        coverage: &'static str,
+    },
+    ReceiverEvidence {
+        id: String,
+        site_id: String,
+        path: String,
+        range: CodeQueryRange,
+        evidence_kind: &'static str,
     },
     Occurrence {
         id: String,
@@ -2580,6 +2657,8 @@ pub enum DetailedCodeQueryDomain {
     CallSite,
     ExpressionSite,
     ReceiverAnalysis,
+    ReceiverOutcome,
+    ReceiverEvidence,
     Occurrence,
     LexicalScope,
     Binding,
@@ -2608,6 +2687,8 @@ pub const ALL_DETAILED_CODE_QUERY_DOMAINS: &[DetailedCodeQueryDomain] = &[
     DetailedCodeQueryDomain::CallSite,
     DetailedCodeQueryDomain::ExpressionSite,
     DetailedCodeQueryDomain::ReceiverAnalysis,
+    DetailedCodeQueryDomain::ReceiverOutcome,
+    DetailedCodeQueryDomain::ReceiverEvidence,
     DetailedCodeQueryDomain::Occurrence,
     DetailedCodeQueryDomain::LexicalScope,
     DetailedCodeQueryDomain::Binding,
@@ -2740,6 +2821,8 @@ impl DetailedCodeQueryDomain {
             QueryValueKind::CallSite => Self::CallSite,
             QueryValueKind::ExpressionSite => Self::ExpressionSite,
             QueryValueKind::ReceiverAnalysis => Self::ReceiverAnalysis,
+            QueryValueKind::ReceiverOutcome => Self::ReceiverOutcome,
+            QueryValueKind::ReceiverEvidence => Self::ReceiverEvidence,
             QueryValueKind::Occurrence => Self::Occurrence,
             QueryValueKind::LexicalScope => Self::LexicalScope,
             QueryValueKind::Binding => Self::Binding,
@@ -2767,6 +2850,8 @@ impl DetailedCodeQueryDomain {
             Self::CallSite => "call_site",
             Self::ExpressionSite => "expression_site",
             Self::ReceiverAnalysis => "receiver_analysis",
+            Self::ReceiverOutcome => "receiver_outcome",
+            Self::ReceiverEvidence => "receiver_evidence",
             Self::Occurrence => "occurrence",
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
@@ -2866,9 +2951,34 @@ impl DetailedCodeQueryDomain {
                 CodeQueryRowField::optional("parameter_name", Scalar::String),
             ],
             Self::ReceiverAnalysis => code_query_row_fields![
+                CodeQueryRowField::required("site_id", Scalar::StableId),
+                CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
                 CodeQueryRowField::required("analysis_kind", Scalar::ConstrainedEnum),
                 CodeQueryRowField::required("outcome", Scalar::ConstrainedEnum),
                 CodeQueryRowField::optional("capture", Scalar::String),
+            ],
+            Self::ReceiverOutcome => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("site_id", Scalar::StableId),
+                CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
+                CodeQueryRowField::required("analysis_kind", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("outcome", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("candidate_count", Scalar::Integer),
+                CodeQueryRowField::required("candidates_truncated", Scalar::Boolean),
+                CodeQueryRowField::optional("semantic_unsupported", Scalar::ConstrainedEnum),
+            ],
+            Self::ReceiverEvidence => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("site_id", Scalar::StableId),
+                CodeQueryRowField::optional("parent_evidence_id", Scalar::StableId),
+                CodeQueryRowField::required("ordinal", Scalar::Integer),
+                CodeQueryRowField::required("chain_hop", Scalar::Integer),
+                CodeQueryRowField::required("evidence_kind", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("declaration_id", Scalar::DeclarationIdentity),
+                CodeQueryRowField::optional("factory_id", Scalar::DeclarationIdentity),
+                CodeQueryRowField::required("proof", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("completeness", Scalar::ConstrainedEnum),
             ],
             Self::Occurrence => code_query_row_fields![
                 CodeQueryRowField::required("id", Scalar::StableId),
@@ -2954,6 +3064,8 @@ impl CodeQueryResultValue {
             Self::CallSite { .. } => DetailedCodeQueryDomain::CallSite,
             Self::ExpressionSite { .. } => DetailedCodeQueryDomain::ExpressionSite,
             Self::ReceiverAnalysis { .. } => DetailedCodeQueryDomain::ReceiverAnalysis,
+            Self::ReceiverOutcome { .. } => DetailedCodeQueryDomain::ReceiverOutcome,
+            Self::ReceiverEvidence { .. } => DetailedCodeQueryDomain::ReceiverEvidence,
             Self::Occurrence { .. } => DetailedCodeQueryDomain::Occurrence,
             Self::LexicalScope { .. } => DetailedCodeQueryDomain::LexicalScope,
             Self::Binding { .. } => DetailedCodeQueryDomain::Binding,
@@ -3160,11 +3272,75 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::ReceiverAnalysis { value }, "analysis_kind") => {
             Some(Scalar::ConstrainedEnum(value.analysis_kind))
         }
+        (CodeQueryResultValue::ReceiverAnalysis { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::ReceiverAnalysis { value }, "site_ast_id") => {
+            value.site_ast_id.as_deref().map(Scalar::StableId)
+        }
         (CodeQueryResultValue::ReceiverAnalysis { value }, "outcome") => {
             Some(Scalar::ConstrainedEnum(value.outcome))
         }
         (CodeQueryResultValue::ReceiverAnalysis { value }, "capture") => {
             value.capture.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::ReceiverOutcome { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::ReceiverOutcome { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::ReceiverOutcome { value }, "site_ast_id") => {
+            value.site_ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ReceiverOutcome { value }, "analysis_kind") => {
+            Some(Scalar::ConstrainedEnum(value.analysis_kind))
+        }
+        (CodeQueryResultValue::ReceiverOutcome { value }, "outcome") => {
+            Some(Scalar::ConstrainedEnum(value.outcome))
+        }
+        (CodeQueryResultValue::ReceiverOutcome { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::ReceiverOutcome { value }, "candidate_count") => {
+            Some(Scalar::Integer(value.candidate_count as u64))
+        }
+        (CodeQueryResultValue::ReceiverOutcome { value }, "candidates_truncated") => {
+            Some(Scalar::Boolean(value.candidates_truncated))
+        }
+        (CodeQueryResultValue::ReceiverOutcome { value }, "semantic_unsupported") => {
+            value.semantic_unsupported.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::ReceiverEvidence { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::ReceiverEvidence { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::ReceiverEvidence { value }, "parent_evidence_id") => {
+            value.parent_evidence_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ReceiverEvidence { value }, "ordinal") => {
+            Some(Scalar::Integer(value.ordinal as u64))
+        }
+        (CodeQueryResultValue::ReceiverEvidence { value }, "chain_hop") => {
+            Some(Scalar::Integer(value.chain_hop as u64))
+        }
+        (CodeQueryResultValue::ReceiverEvidence { value }, "evidence_kind") => {
+            Some(Scalar::ConstrainedEnum(value.evidence_kind))
+        }
+        (CodeQueryResultValue::ReceiverEvidence { value }, "declaration_id") => value
+            .declaration_id
+            .as_deref()
+            .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::ReceiverEvidence { value }, "factory_id") => {
+            value.factory_id.as_deref().map(Scalar::DeclarationIdentity)
+        }
+        (CodeQueryResultValue::ReceiverEvidence { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::ReceiverEvidence { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
         }
         (CodeQueryResultValue::Occurrence { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::Occurrence { value }, "ast_id") => {
@@ -3370,6 +3546,14 @@ pub enum DetailedCodeQueryKey {
         analysis_kind: String,
         outcome: String,
         capture: Option<String>,
+    },
+    ReceiverOutcome {
+        id: String,
+        site_id: String,
+    },
+    ReceiverEvidence {
+        id: String,
+        site_id: String,
     },
     Occurrence {
         id: String,
@@ -3581,6 +3765,14 @@ impl DetailedCodeQueryResult {
                             DetailedCodeQueryKey::ReceiverAnalysis { .. }
                         )
                         | (
+                            DetailedCodeQueryDomain::ReceiverOutcome,
+                            DetailedCodeQueryKey::ReceiverOutcome { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::ReceiverEvidence,
+                            DetailedCodeQueryKey::ReceiverEvidence { .. }
+                        )
+                        | (
                             DetailedCodeQueryDomain::Occurrence,
                             DetailedCodeQueryKey::Occurrence { .. }
                         )
@@ -3741,6 +3933,8 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::CallSite { .. }
         | CodeQueryResultValue::ExpressionSite { .. }
         | CodeQueryResultValue::ReceiverAnalysis { .. }
+        | CodeQueryResultValue::ReceiverOutcome { .. }
+        | CodeQueryResultValue::ReceiverEvidence { .. }
         | CodeQueryResultValue::Occurrence { .. }
         | CodeQueryResultValue::LexicalScope { .. }
         | CodeQueryResultValue::Binding { .. }
@@ -3793,6 +3987,8 @@ fn assert_detailed_terminal_identities(
             DetailedCodeQueryDomain::File
                 | DetailedCodeQueryDomain::ExpressionSite
                 | DetailedCodeQueryDomain::ReceiverAnalysis
+                | DetailedCodeQueryDomain::ReceiverOutcome
+                | DetailedCodeQueryDomain::ReceiverEvidence
                 // An occurrence's identity is its own content-scoped digest,
                 // carried in the typed key rather than in a semantic-artifact
                 // identity candidate. The three lexical-environment domains
@@ -3844,6 +4040,8 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::CallSite { .. }
         | DetailedCodeQueryKey::ExpressionSite { .. }
         | DetailedCodeQueryKey::ReceiverAnalysis { .. }
+        | DetailedCodeQueryKey::ReceiverOutcome { .. }
+        | DetailedCodeQueryKey::ReceiverEvidence { .. }
         | DetailedCodeQueryKey::Occurrence { .. }
         | DetailedCodeQueryKey::LexicalScope { .. }
         | DetailedCodeQueryKey::Binding { .. }
@@ -3878,6 +4076,8 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::CallSite { .. }
                 | CodeQueryResultValue::ExpressionSite { .. }
                 | CodeQueryResultValue::ReceiverAnalysis { .. }
+                | CodeQueryResultValue::ReceiverOutcome { .. }
+                | CodeQueryResultValue::ReceiverEvidence { .. }
                 | CodeQueryResultValue::Occurrence { .. }
                 | CodeQueryResultValue::LexicalScope { .. }
                 | CodeQueryResultValue::Binding { .. }
@@ -4094,6 +4294,29 @@ impl CodeQueryResult {
                         for detail in value.render_detail_lines() {
                             out.push_str(&format!("  {detail}\n"));
                         }
+                    }
+                    CodeQueryResultValue::ReceiverOutcome { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [receiver outcome; {}; {}; {}] candidates={}; site={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.analysis_kind,
+                            value.outcome,
+                            value.coverage,
+                            value.candidate_count,
+                            value.site_id
+                        ));
+                    }
+                    CodeQueryResultValue::ReceiverEvidence { value } => {
+                        out.push_str(&format!(
+                            "[receiver evidence; {}; {}; {}] site={} id={}\n",
+                            value.evidence_kind,
+                            value.proof,
+                            value.completeness,
+                            value.site_id,
+                            value.id
+                        ));
                     }
                     CodeQueryResultValue::Occurrence { value } => {
                         out.push_str(&format!(
