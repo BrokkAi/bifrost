@@ -19,17 +19,22 @@
 
 use super::facts::FileFacts;
 use super::kinds::NormalizedKind;
+use super::lexical_environment::{
+    EnvironmentFileResult, ReachingBindingOutcome, environment_for_file, reaching_binding,
+};
 use super::occurrences::{
     ALL_OCCURRENCE_ROLES, Namespace, OccurrenceClass, OccurrenceRole, OccurrenceRoleSupport,
 };
+use super::resolution::{PrecedenceTier, RejectionReason};
 use super::spec::StructuralSpec;
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::semantic::{ContentIdentity, LengthDelimitedDigest};
 use crate::analyzer::structural_spec_for;
 use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus,
-    resolve_definition_batch_with_source_and_cancellation,
+    DefinitionLookupRequest, DefinitionLookupStatus, ResolutionTraceResult, TraceCandidate,
+    TraceCandidateRef, resolve_definition_batch_with_source_and_cancellation,
+    resolve_definition_batch_with_trace,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
@@ -66,6 +71,22 @@ pub(crate) fn occurrence_id(
     digest.finish().to_string()
 }
 
+/// What a caller wants derived beyond the rows themselves.
+///
+/// Candidates are opt-in because they cost a second pass over the file's
+/// lexical environment and force the definition batch to run with a trace
+/// recorder installed. A caller that does not ask pays neither.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OccurrenceDerivationOptions {
+    /// Attach the resolution trace to every reference-class row.
+    pub candidates: bool,
+}
+
+impl OccurrenceDerivationOptions {
+    pub const ROWS_ONLY: Self = Self { candidates: false };
+    pub const WITH_CANDIDATES: Self = Self { candidates: true };
+}
+
 /// One classified identifier position.
 #[derive(Debug, Clone)]
 pub struct OccurrenceRow {
@@ -83,6 +104,10 @@ pub struct OccurrenceRow {
     /// Present only when the adapter's decoding changes the spelling.
     pub decoded_spelling: Option<String>,
     pub target: OccurrenceTarget,
+    /// The candidates the resolver considered for this reference, present only
+    /// when the caller asked for them and only on reference-class rows. `None`
+    /// means "not derived", never "none considered".
+    pub candidates: Option<ResolutionTraceResult>,
 }
 
 impl OccurrenceRow {
@@ -187,6 +212,27 @@ pub fn occurrences_for_file(
     file: &ProjectFile,
     cancellation: &CancellationToken,
 ) -> Result<OccurrenceFileResult, OccurrencesCancelled> {
+    occurrences_for_file_with_options(
+        analyzer,
+        file,
+        OccurrenceDerivationOptions::ROWS_ONLY,
+        cancellation,
+    )
+}
+
+/// [`occurrences_for_file`], with the derivation the caller wants.
+///
+/// With [`OccurrenceDerivationOptions::WITH_CANDIDATES`] every reference-class
+/// row also carries the resolution trace: the candidates the resolver
+/// considered, their tiers, their outcomes, and how far the lookup could see.
+/// The `OccurrenceTarget` collapse is unchanged -- candidates are additive, and
+/// no row's target moves because a caller asked for them.
+pub fn occurrences_for_file_with_options(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    options: OccurrenceDerivationOptions,
+    cancellation: &CancellationToken,
+) -> Result<OccurrenceFileResult, OccurrencesCancelled> {
     if cancellation.is_cancelled() {
         return Err(OccurrencesCancelled);
     }
@@ -220,7 +266,7 @@ pub fn occurrences_for_file(
     if cancellation.is_cancelled() {
         return Err(OccurrencesCancelled);
     }
-    resolve_reference_targets(analyzer, file, &facts, &mut rows, cancellation)?;
+    resolve_reference_targets(analyzer, file, &facts, &mut rows, options, cancellation)?;
 
     Ok(OccurrenceFileResult {
         rows,
@@ -300,6 +346,7 @@ fn classify_rows(
                 raw_spelling,
                 decoded_spelling,
                 target: OccurrenceTarget::None,
+                candidates: None,
             });
         }
     }
@@ -335,6 +382,7 @@ fn resolve_reference_targets(
     file: &ProjectFile,
     facts: &FileFacts,
     rows: &mut [OccurrenceRow],
+    options: OccurrenceDerivationOptions,
     cancellation: &CancellationToken,
 ) -> Result<(), OccurrencesCancelled> {
     let reference_indices: Vec<usize> = rows
@@ -358,13 +406,23 @@ fn resolve_reference_targets(
         })
         .collect();
     let source: Arc<str> = Arc::from(facts.source());
-    let outcomes = resolve_definition_batch_with_source_and_cancellation(
-        analyzer,
-        requests,
-        file.clone(),
-        source,
-        cancellation,
-    );
+    let (outcomes, traces): (Vec<_>, Vec<_>) = if options.candidates {
+        resolve_definition_batch_with_trace(analyzer, requests, file.clone(), source, cancellation)
+            .into_iter()
+            .map(|(outcome, trace)| (outcome, Some(trace)))
+            .unzip()
+    } else {
+        (
+            resolve_definition_batch_with_source_and_cancellation(
+                analyzer,
+                requests,
+                file.clone(),
+                source,
+                cancellation,
+            ),
+            Vec::new(),
+        )
+    };
     if cancellation.is_cancelled() {
         return Err(OccurrencesCancelled);
     }
@@ -376,21 +434,78 @@ fn resolve_reference_targets(
         reference_indices.len()
     );
 
-    for (&index, outcome) in reference_indices.iter().zip(outcomes) {
+    // One environment per file, never per reference row: deriving it re-parses
+    // the source the facts snapshot carries, so a per-row call would re-parse
+    // the file once for every reference in it.
+    let environment = options
+        .candidates
+        .then(|| environment_for_file(analyzer, file));
+
+    for (position, &index) in reference_indices.iter().enumerate() {
+        let outcome = &outcomes[position];
         rows[index].target = if !outcome.definitions.is_empty() {
-            OccurrenceTarget::Resolved(outcome.definitions)
-        } else if let Some(lexical) = outcome.lexical_definition {
+            OccurrenceTarget::Resolved(outcome.definitions.clone())
+        } else if let Some(lexical) = outcome.lexical_definition.clone() {
             OccurrenceTarget::Lexical(Box::new(lexical))
         } else {
             OccurrenceTarget::Unresolved(outcome.status)
         };
+        if let Some(mut trace) = traces.get(position).cloned().flatten() {
+            if let Some(environment) = environment.as_ref() {
+                append_shadowed_bindings(environment, &rows[index], &mut trace);
+            }
+            rows[index].candidates = Some(trace);
+        }
     }
     Ok(())
 }
 
+/// Add the bindings the lexical environment says are shadowed at this position.
+///
+/// The resolver's own lexical fast path stops at the nearest binder and never
+/// enumerates the ones it passed, so the losers come from the reaching-binding
+/// algorithm instead -- the same derivation, asked for the whole answer rather
+/// than the winner. This is a producer consulting a producer, not the trace
+/// re-deciding anything: the winner it reports must be the binder the resolver
+/// already selected, and rows are added only when it is.
+fn append_shadowed_bindings(
+    environment: &EnvironmentFileResult,
+    row: &OccurrenceRow,
+    trace: &mut ResolutionTraceResult,
+) {
+    let OccurrenceTarget::Lexical(selected) = &row.target else {
+        return;
+    };
+    let ReachingBindingOutcome::Shadowed { winner, shadowed } = reaching_binding(
+        environment,
+        row.effective_spelling(),
+        row.range.start_byte,
+        Some(row.namespace),
+    ) else {
+        return;
+    };
+    if environment.bindings[winner].range != selected.name_range {
+        return;
+    }
+    trace.candidates.extend(shadowed.into_iter().map(|index| {
+        let binding = &environment.bindings[index];
+        TraceCandidate::rejected(
+            TraceCandidateRef::Binding {
+                file: binding.file.clone(),
+                node: binding.node,
+                name: binding.name.clone(),
+            },
+            Some(PrecedenceTier::LexicalBinding),
+            RejectionReason::ShadowedByNearer,
+        )
+    }));
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::resolution::{BoundaryStatus, EnvironmentAxis};
     use super::*;
+    use crate::analyzer::usages::get_definition::TraceCompleteness;
     use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject, WorkspaceAnalyzer};
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -442,6 +557,16 @@ mod tests {
             occurrences_for_file(
                 self.workspace.analyzer(),
                 &self.file,
+                &CancellationToken::new(),
+            )
+            .expect("uncancelled occurrence derivation")
+        }
+
+        fn traced_result(&self) -> OccurrenceFileResult {
+            occurrences_for_file_with_options(
+                self.workspace.analyzer(),
+                &self.file,
+                OccurrenceDerivationOptions::WITH_CANDIDATES,
                 &CancellationToken::new(),
             )
             .expect("uncancelled occurrence derivation")
@@ -911,6 +1036,266 @@ mod tests {
         assert!(
             matches!(outcome, Err(OccurrencesCancelled)),
             "a cancelled request must not yield rows"
+        );
+    }
+
+    fn trace_of<'rows>(
+        rows: &'rows [OccurrenceRow],
+        start_byte: usize,
+        label: &str,
+    ) -> &'rows ResolutionTraceResult {
+        expect_row(rows, start_byte, label)
+            .candidates
+            .as_ref()
+            .unwrap_or_else(|| panic!("no trace attached to {label}"))
+    }
+
+    fn rejections(trace: &ResolutionTraceResult, reason: RejectionReason) -> Vec<&TraceCandidate> {
+        trace
+            .rejected()
+            .filter(|row| row.outcome.rejection() == Some(reason))
+            .collect()
+    }
+
+    /// A caller that does not ask for candidates gets none, and the rows it
+    /// does get are unchanged. This is the "existing consumers pay nothing"
+    /// contract stated as behavior rather than as an intention.
+    #[test]
+    fn candidates_are_absent_unless_the_caller_asks_for_them() {
+        let source = "fn render(label: &str) -> usize {\n    label.len()\n}\n";
+        let fixture = Fixture::new(Language::Rust, "src/app.rs", source);
+
+        let plain = fixture.result();
+        assert!(
+            plain.rows.iter().all(|row| row.candidates.is_none()),
+            "an unasked derivation must attach no trace"
+        );
+
+        let traced = fixture.traced_result();
+        assert!(
+            traced
+                .rows
+                .iter()
+                .filter(|row| row.class == OccurrenceClass::Reference)
+                .all(|row| row.candidates.is_some()),
+            "every reference row of a traced derivation carries its trace"
+        );
+        assert!(
+            traced
+                .rows
+                .iter()
+                .filter(|row| row.class != OccurrenceClass::Reference)
+                .all(|row| row.candidates.is_none()),
+            "only reference-class rows have candidates to report"
+        );
+        assert_eq!(
+            plain.rows.len(),
+            traced.rows.len(),
+            "asking for candidates must not change which rows exist"
+        );
+    }
+
+    /// The mined `61c223586` shape: an inner binding shadows an outer one of
+    /// the same name. The read between them selects the inner binder at the
+    /// lexical tier, and the outer binder is reported as a rejected candidate
+    /// with the reason that discarded it.
+    #[test]
+    fn a_shadowed_rust_binding_is_reported_as_rejected_beside_the_selected_local() {
+        let source = concat!(
+            "fn render() -> usize {\n",
+            "    let label = 1;\n",
+            "    {\n",
+            "        let label = 2;\n",
+            "        return label;\n",
+            "    }\n",
+            "}\n",
+        );
+        let fixture = Fixture::new(Language::Rust, "src/app.rs", source);
+        let result = fixture.traced_result();
+        let trace = trace_of(&result.rows, fixture.at("label;"), "shadowed read");
+
+        assert_eq!(
+            trace.completeness,
+            TraceCompleteness::Full,
+            "Rust declares the rejection axis, so its trace claims Full"
+        );
+        assert!(
+            trace.selects_at(PrecedenceTier::LexicalBinding),
+            "the inner binder is the selection: {:?}",
+            trace.candidates
+        );
+        let shadowed = rejections(trace, RejectionReason::ShadowedByNearer);
+        assert_eq!(
+            shadowed.len(),
+            1,
+            "exactly the outer binder loses: {:?}",
+            trace.candidates
+        );
+        assert_eq!(shadowed[0].tier, Some(PrecedenceTier::LexicalBinding));
+        match &shadowed[0].candidate {
+            TraceCandidateRef::Binding { name, .. } => assert_eq!(name, "label"),
+            other => panic!("a shadowed binder is an environment binding row, got {other:?}"),
+        }
+    }
+
+    /// Java resolves a simple type name against single-type imports before
+    /// on-demand ones, so an explicit import selects at its tier and the
+    /// wildcard routes it beat are recorded as rejected peers.
+    #[test]
+    fn an_explicit_java_import_selects_over_the_wildcard_routes_it_beat() {
+        let source = concat!(
+            "package app;\n",
+            "import app.model.Widget;\n",
+            "import app.other.*;\n",
+            "class Caller {\n",
+            "    Widget build() { return null; }\n",
+            "}\n",
+        );
+        let fixture = Fixture::with_supporting_files(
+            Language::Java,
+            "app/Caller.java",
+            source,
+            &[
+                (
+                    "app/model/Widget.java",
+                    "package app.model;\npublic class Widget {}\n",
+                ),
+                (
+                    "app/other/Widget.java",
+                    "package app.other;\npublic class Widget {}\n",
+                ),
+            ],
+        );
+        let result = fixture.traced_result();
+        let trace = trace_of(&result.rows, fixture.at("Widget build"), "return type");
+
+        assert!(
+            trace.selects_at(PrecedenceTier::ExplicitImport),
+            "the single-type import is the winning tier: {:?}",
+            trace.candidates
+        );
+        let wildcard: Vec<_> = trace
+            .rejected()
+            .filter(|row| row.tier == Some(PrecedenceTier::WildcardImport))
+            .collect();
+        assert_eq!(
+            wildcard.len(),
+            1,
+            "the one on-demand import is the rejected peer: {:?}",
+            trace.candidates
+        );
+        assert_eq!(
+            wildcard[0].outcome.rejection(),
+            Some(RejectionReason::ShadowedByNearer)
+        );
+        match &wildcard[0].candidate {
+            // Java's `ImportInfo` carries no parser-derived path, so the route
+            // is named by the wildcard marker rather than by a target it cannot
+            // state without parsing the raw snippet.
+            TraceCandidateRef::ImportBinder { name, .. } => {
+                assert_eq!(
+                    name,
+                    crate::analyzer::usages::get_definition::trace::WILDCARD_ROUTE_NAME
+                );
+            }
+            other => panic!("a rejected import route is an import binder, got {other:?}"),
+        }
+    }
+
+    /// A reference that leaves the workspace reports how far the lookup could
+    /// see, and never reports a selection at the fallback tier the anti-fallback
+    /// contract forbids.
+    #[test]
+    fn a_boundary_reference_reports_its_boundary_and_never_a_name_only_fallback() {
+        let source = concat!(
+            "package app;\n",
+            "import com.absent.Gadget;\n",
+            "class Caller {\n",
+            "    Gadget build() { return null; }\n",
+            "}\n",
+        );
+        let fixture = Fixture::new(Language::Java, "app/Caller.java", source);
+        let result = fixture.traced_result();
+        let trace = trace_of(&result.rows, fixture.at("Gadget build"), "external type");
+
+        let external: Vec<_> = trace
+            .candidates
+            .iter()
+            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
+            .collect();
+        assert!(
+            !external.is_empty(),
+            "a boundary outcome always reports the route it took: {:?}",
+            trace.candidates
+        );
+        assert!(
+            external
+                .iter()
+                .all(|row| row.boundary != BoundaryStatus::WorkspaceLocal),
+            "a boundary row is by definition not workspace-local: {external:?}"
+        );
+        assert!(
+            !trace.selects_at(PrecedenceTier::NameOnlyFallback),
+            "nothing may be selected at the forbidden fallback tier: {:?}",
+            trace.candidates
+        );
+    }
+
+    /// Python and JS/TS reach the shared outcome constructors but no tier of
+    /// their resolvers reports what it discarded, so their traces say so
+    /// instead of letting an absent rejection row read as "nothing lost".
+    #[test]
+    fn a_language_without_tier_tracing_reports_selection_only() {
+        let python = Fixture::new(
+            Language::Python,
+            "src/app.py",
+            "def render(label):\n    return label\n",
+        );
+        let python_result = python.traced_result();
+        assert_eq!(
+            trace_of(&python_result.rows, python.at("label\n"), "python read").completeness,
+            TraceCompleteness::SelectionOnly
+        );
+
+        let js = Fixture::new(
+            Language::JavaScript,
+            "src/app.js",
+            "function render(label) {\n    return label;\n}\n",
+        );
+        let js_result = js.traced_result();
+        assert_eq!(
+            trace_of(&js_result.rows, js.at("label;"), "javascript read").completeness,
+            TraceCompleteness::SelectionOnly
+        );
+    }
+
+    /// An adapter that has not learned the candidate axes must surface that
+    /// through the capability spine. An empty trace from an uninstrumented
+    /// language would read exactly like "the resolver considered nothing".
+    #[test]
+    fn an_uninstrumented_language_reports_the_candidate_axes_unsupported() {
+        let fixture = Fixture::new(
+            Language::Scala,
+            "src/app.scala",
+            "class Widget { def render(label: String): String = label }\n",
+        );
+        let support = crate::analyzer::structural_spec_for(Language::Scala)
+            .expect("Scala has a structural adapter")
+            .lexical_environment_support();
+        assert!(
+            !support.is_supported(EnvironmentAxis::CandidateSelection),
+            "Scala must not claim a selection axis it does not answer"
+        );
+        assert!(!support.is_supported(EnvironmentAxis::CandidateRejection));
+
+        let result = fixture.traced_result();
+        assert!(
+            !result.completeness.is_complete(),
+            "an adapter with no occurrence roles can never report Complete"
+        );
+        assert!(
+            result.rows.is_empty(),
+            "no rows means no traces, which is the honest answer here"
         );
     }
 

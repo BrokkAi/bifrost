@@ -1,5 +1,7 @@
 use super::*;
 use crate::analyzer::jvm::external::JvmExternalType;
+use crate::analyzer::structural::resolution::{PrecedenceTier, RejectionReason};
+use crate::analyzer::usages::get_definition::trace;
 use crate::analyzer::{
     ImportInfo, StructuredImportPath, StructuredImportPathKind, build_reverse_file_index,
 };
@@ -283,14 +285,18 @@ impl JavaAnalyzer {
             // A matching single-type import constrains this name even when its
             // declaration is outside the indexed workspace.
             if normalized == imported_name {
-                return source_type_by_fqn(import_path);
+                let unit = source_type_by_fqn(import_path);
+                trace_explicit_import_win(file, normalized, unit.as_ref(), &imports);
+                return unit;
             }
             if let Some(rest) = normalized
                 .strip_prefix(imported_name)
                 .and_then(|rest| rest.strip_prefix('.'))
             {
                 let nested_fqn = format!("{import_path}.{rest}");
-                return source_type_by_fqn(&nested_fqn);
+                let unit = source_type_by_fqn(&nested_fqn);
+                trace_explicit_import_win(file, normalized, unit.as_ref(), &imports);
+                return unit;
             }
         }
 
@@ -304,16 +310,21 @@ impl JavaAnalyzer {
             let package = import_path.trim_end_matches(".*");
             let fqn = format!("{package}.{normalized}");
             if let Some(unit) = source_type_by_fqn(&fqn) {
+                trace_tier(normalized, &unit, PrecedenceTier::WildcardImport);
                 return Some(unit);
             }
         }
 
         let same_package_fqn = self.same_package_fqn(file, normalized);
-        source_type_by_fqn(&same_package_fqn).or_else(|| {
+        let unit = source_type_by_fqn(&same_package_fqn).or_else(|| {
             self.file_is_in_default_package(file)
                 .then(|| source_type_by_fqn(normalized))
                 .flatten()
-        })
+        });
+        if let Some(unit) = unit.as_ref() {
+            trace_tier(normalized, unit, PrecedenceTier::PackageOrModule);
+        }
+        unit
     }
 
     fn forward_source_type_by_fqn(&self, fqn: &str) -> Option<CodeUnit> {
@@ -731,6 +742,57 @@ pub(super) fn parse_import_info(node: Node<'_>, source: &str, raw: String) -> Im
             declaration_start_byte: node.start_byte(),
         }),
     }
+}
+
+/// Stage the tier a type-name lookup resolved at, so the outcome constructor
+/// this unit flows into records it at that tier.
+///
+/// The staging is guarded twice, because `resolve_type_name_with` also runs for
+/// receiver types and owners on the way to an answer: only a lookup for the
+/// name the traced resolver path is currently resolving stages anything, and
+/// the staged tier is spent only by an outcome that reports this very unit.
+fn trace_tier(normalized: &str, unit: &CodeUnit, tier: PrecedenceTier) {
+    if trace::recording() && trace::deep_scope_is(normalized) {
+        trace::stage_tier(tier, vec![unit.fq_name()]);
+    }
+}
+
+/// Record Java's strongest import tier winning, together with the on-demand
+/// import routes that were therefore never consulted.
+///
+/// Java resolves a simple type name against single-type imports before
+/// on-demand (`.*`) imports, which is why the wildcard loop below runs only
+/// when this loop found nothing. The wildcard routes are the resolver's own
+/// enumerated import list, not a re-derivation, so recording them as rejected
+/// peers reports a decision the resolver made rather than inventing one.
+///
+/// The rejected route is named by the wildcard marker rather than by a target,
+/// because Java's `ImportInfo` carries no parser-derived path (`parse_import_info`
+/// leaves `path` empty) and recovering the package from the raw snippet would be
+/// exactly the source-text parsing this repository forbids.
+fn trace_explicit_import_win(
+    file: &ProjectFile,
+    normalized: &str,
+    unit: Option<&CodeUnit>,
+    imports: &[ImportInfo],
+) {
+    if !trace::recording() || !trace::deep_scope_is(normalized) {
+        return;
+    }
+    if let Some(unit) = unit {
+        trace::stage_tier(PrecedenceTier::ExplicitImport, vec![unit.fq_name()]);
+    }
+    trace::record_all(imports.iter().filter(|import| import.is_wildcard).map(|_| {
+        trace::TraceCandidate::rejected(
+            trace::TraceCandidateRef::ImportBinder {
+                file: file.clone(),
+                node: None,
+                name: trace::WILDCARD_ROUTE_NAME.to_owned(),
+            },
+            Some(PrecedenceTier::WildcardImport),
+            RejectionReason::ShadowedByNearer,
+        )
+    }));
 }
 
 pub(super) fn non_static_import_path(import: &ImportInfo) -> Option<&str> {

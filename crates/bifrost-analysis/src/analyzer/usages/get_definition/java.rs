@@ -431,6 +431,13 @@ fn resolve_java_in_session(
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> BoundedJavaResolution<DefinitionLookupOutcome> {
+    // Java's tier ladder resolves the reference this site names, so the deep
+    // scope covers the whole dispatch: the type-name tiers in
+    // `java::imports::resolve_type_name_with`, the member tier, the
+    // static-import tier and the boundary gate. A nested lookup for another
+    // name -- a receiver type, an owner -- falls outside it and therefore
+    // attributes nothing to this reference.
+    let _deep = trace::DeepScope::enter(&site.text);
     if !session.observe_cancellation() {
         return session.finish(no_definition(
             "java_resolution_cancelled",

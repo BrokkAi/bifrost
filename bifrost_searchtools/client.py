@@ -198,10 +198,14 @@ class SearchToolsClient:
     ) -> CodeQueryResponse:
         """Query normalized code structure across supported languages.
 
-        The compatible head is schema version 8, which adds the ``occurrences``
+        The compatible head is schema version 9, which adds the ``scopes``
+        and ``bindings`` sources plus the ``scope_of``, ``scope_ancestors``,
+        ``bindings_in``, ``reaching_binding``, ``binding_occurrence``,
+        ``candidates_of``, and ``candidate_target`` steps, and puts the package
+        clause on the file row. Schema version 8 added the ``occurrences``
         source plus the ``occurrences_in``, ``occurrences_of``, and
-        ``occurrence_target`` steps; schema version 7 remains available as an
-        exact pin. Pass ``schema_version=2`` to
+        ``occurrence_target`` steps; both it and version 7 remain available as
+        exact pins. Pass ``schema_version=2`` to
         pin the pre-CFG vocabulary or ``schema_version=3`` for CFG without
         typestate. A query starts with normalized syntactic
         structure or a typed set of complete query branches, then optionally

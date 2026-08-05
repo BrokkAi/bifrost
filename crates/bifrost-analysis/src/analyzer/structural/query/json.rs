@@ -1,6 +1,7 @@
 use super::ir::{
-    CallInputSelector, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed,
-    HierarchyTraversal, OccurrenceFilter, OccurrenceSeed, Pattern, QueryStep, StringPredicate,
+    BindingFilter, BindingSeed, CallInputSelector, CandidateFilter, CodeQuery, CodeQueryPlan,
+    CodeQueryPlanSource, CodeQuerySeed, HierarchyTraversal, OccurrenceFilter, OccurrenceSeed,
+    Pattern, QueryStep, ScopeFilter, ScopeSeed, StringPredicate, UNATTRIBUTED_TIER_LABEL,
 };
 use super::schema::{
     CallTraversalCompleteness, reference_kind_label, usage_proof_label, usage_surface_label,
@@ -43,6 +44,8 @@ fn plan_to_json(plan: &CodeQueryPlan) -> Map<String, Value> {
     let mut object = match &plan.source {
         CodeQueryPlanSource::Seed(seed) => seed_to_json(seed),
         CodeQueryPlanSource::Occurrences(seed) => occurrence_seed_to_json(seed),
+        CodeQueryPlanSource::Scopes(seed) => scope_seed_to_json(seed),
+        CodeQueryPlanSource::Bindings(seed) => binding_seed_to_json(seed),
         CodeQueryPlanSource::Set { op, branches } => {
             let mut object = Map::new();
             object.insert(
@@ -186,6 +189,171 @@ impl OccurrenceSeed {
     }
 }
 
+pub(super) fn scope_filter_to_json(filter: &ScopeFilter) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.kinds.is_empty() {
+        object.insert(
+            "kind".to_string(),
+            Value::Array(
+                filter
+                    .kinds
+                    .iter()
+                    .map(|kind| json!(kind.label()))
+                    .collect(),
+            ),
+        );
+    }
+    object
+}
+
+pub(super) fn binding_filter_to_json(filter: &BindingFilter) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.kinds.is_empty() {
+        object.insert(
+            "kind".to_string(),
+            Value::Array(
+                filter
+                    .kinds
+                    .iter()
+                    .map(|kind| json!(kind.label()))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.names.is_empty() {
+        object.insert(
+            "name".to_string(),
+            Value::Array(filter.names.iter().map(|name| json!(name)).collect()),
+        );
+    }
+    if !filter.hoisting.is_empty() {
+        object.insert(
+            "hoisting".to_string(),
+            Value::Array(
+                filter
+                    .hoisting
+                    .iter()
+                    .map(|class| json!(class.label()))
+                    .collect(),
+            ),
+        );
+    }
+    object
+}
+
+pub(super) fn candidate_filter_to_json(filter: &CandidateFilter) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.tiers.is_empty() || filter.unattributed_tier {
+        // `unattributed` renders first because the registry lists it first, so
+        // one canonical JSON exists for one authored filter whatever the order
+        // the author spelled the labels in.
+        let mut tiers: Vec<Value> = Vec::new();
+        if filter.unattributed_tier {
+            tiers.push(json!(UNATTRIBUTED_TIER_LABEL));
+        }
+        tiers.extend(filter.tiers.iter().map(|tier| json!(tier.label())));
+        object.insert("tier".to_string(), Value::Array(tiers));
+    }
+    if !filter.outcomes.is_empty() || !filter.rejection_reasons.is_empty() {
+        let mut outcomes: Vec<Value> = filter
+            .outcomes
+            .iter()
+            .map(|outcome| json!(outcome.label()))
+            .collect();
+        outcomes.extend(
+            filter
+                .rejection_reasons
+                .iter()
+                .map(|reason| json!(reason.label())),
+        );
+        object.insert("outcome".to_string(), Value::Array(outcomes));
+    }
+    if !filter.boundaries.is_empty() {
+        object.insert(
+            "boundary".to_string(),
+            Value::Array(
+                filter
+                    .boundaries
+                    .iter()
+                    .map(|status| json!(status.label()))
+                    .collect(),
+            ),
+        );
+    }
+    object
+}
+
+fn scope_seed_to_json(seed: &ScopeSeed) -> Map<String, Value> {
+    let mut object = environment_seed_scope_json(&seed.where_globs, &seed.languages);
+    object.insert(
+        "scopes".to_string(),
+        Value::Object(scope_filter_to_json(&seed.filter)),
+    );
+    object
+}
+
+fn binding_seed_to_json(seed: &BindingSeed) -> Map<String, Value> {
+    let mut object = environment_seed_scope_json(&seed.where_globs, &seed.languages);
+    object.insert(
+        "bindings".to_string(),
+        Value::Object(binding_filter_to_json(&seed.filter)),
+    );
+    object
+}
+
+/// The `where`/`languages` prefix every non-structural seed renders identically.
+fn environment_seed_scope_json(
+    where_globs: &[glob::Pattern],
+    languages: &[crate::analyzer::Language],
+) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !where_globs.is_empty() {
+        object.insert(
+            "where".to_string(),
+            Value::Array(
+                where_globs
+                    .iter()
+                    .map(|glob| Value::String(glob.as_str().to_string()))
+                    .collect(),
+            ),
+        );
+    }
+    if !languages.is_empty() {
+        object.insert(
+            "languages".to_string(),
+            Value::Array(
+                languages
+                    .iter()
+                    .map(|language| Value::String(language.config_label().to_string()))
+                    .collect(),
+            ),
+        );
+    }
+    object
+}
+
+impl ScopeSeed {
+    pub(crate) fn to_canonical_json(&self) -> Value {
+        Value::Object(scope_seed_to_json(self))
+    }
+
+    pub(crate) fn canonical_cache_key(&self) -> String {
+        serde_json::to_string(&self.to_canonical_json())
+            .expect("canonical scope seed is serializable")
+    }
+}
+
+impl BindingSeed {
+    pub(crate) fn to_canonical_json(&self) -> Value {
+        Value::Object(binding_seed_to_json(self))
+    }
+
+    pub(crate) fn canonical_cache_key(&self) -> String {
+        serde_json::to_string(&self.to_canonical_json())
+            .expect("canonical binding seed is serializable")
+    }
+}
+
 impl CodeQuerySeed {
     pub(crate) fn to_canonical_json(&self) -> Value {
         Value::Object(seed_to_json(self))
@@ -224,9 +392,24 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::ImportersOf
         | QueryStep::Members
         | QueryStep::Owner
-        | QueryStep::OccurrenceTarget => {}
+        | QueryStep::OccurrenceTarget
+        | QueryStep::ScopeOf
+        | QueryStep::ScopeAncestors
+        | QueryStep::BindingOccurrence
+        | QueryStep::CandidateTarget => {}
         QueryStep::OccurrencesOf(filter) | QueryStep::OccurrencesIn(filter) => {
             object.extend(occurrence_filter_to_json(filter));
+        }
+        QueryStep::BindingsIn(filter) => {
+            object.extend(binding_filter_to_json(filter));
+        }
+        QueryStep::CandidatesOf(filter) => {
+            object.extend(candidate_filter_to_json(filter));
+        }
+        QueryStep::ReachingBinding(options) => {
+            if options.include_shadowed {
+                object.insert("include_shadowed".to_string(), Value::Bool(true));
+            }
         }
         QueryStep::Typestate(traversal) => {
             object.insert(

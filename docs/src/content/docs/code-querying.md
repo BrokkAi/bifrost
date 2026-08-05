@@ -61,6 +61,15 @@ Semantic declaration steps intentionally stop at the analyzer's indexed declarat
 | `occurrences-in` | `occurrences_in` | structural match or file → occurrence | Return the occurrences lexically inside a matching node or a file. |
 | `occurrences-of` | `occurrences_of` | declaration → occurrence | Return the declaration's own name occurrence plus every reference-class occurrence resolving to it. |
 | `occurrence-target` | `occurrence_target` | occurrence → declaration | Walk a reference-class occurrence back to what it resolved to. |
+| `scopes` | `scopes` | (source) → lexical scope | Seed lexical scope rows straight from workspace facts, filtered by `kind`. |
+| `bindings` | `bindings` | (source) → binding | Seed lexical binding rows straight from workspace facts, filtered by `kind`, `name`, and `hoisting`. |
+| `scope-of` | `scope_of` | binding, occurrence, or structural match → lexical scope | Return the innermost lexical scope that owns the input. |
+| `scope-ancestors` | `scope_ancestors` | lexical scope → lexical scope | Walk outward through the enclosing scopes, excluding the scope itself. |
+| `bindings-in` | `bindings_in` | lexical scope or structural match → binding | Return the bindings declared in the scope, or whose binder token lies inside the match. |
+| `reaching-binding` | `reaching_binding` | occurrence → binding | Return the binding of the occurrence's name in effect at its exact position. |
+| `binding-occurrence` | `binding_occurrence` | binding → occurrence | Walk back to the binder-class occurrence of the binding's declaring token. |
+| `candidates-of` | `candidates_of` | occurrence → resolution candidate | Return the candidates the resolver considered, with tier, outcome, and boundary. |
+| `candidate-target` | `candidate_target` | resolution candidate → declaration | Project unit-backed candidates to declarations; partial by construction. |
 | `file-of` | `file_of` | structural match or semantic source value → file | Move from code, a declaration, reference, call, input expression, or receiver analysis to its project file. |
 | `imports-of` | `imports_of` | file → file | Follow one resolved direct project-local import. |
 | `importers-of` | `importers_of` | file → file | Find every project file with a resolved direct import of that file. |
@@ -72,6 +81,10 @@ For CFG inspection, `(cfg-edge-target (cfg-successor-edges (cfg-entry (procedure
 For registered typestate, `(witness :max-steps 32 :max-bytes 16384 (typestate :protocol-ref "embedding:resource-lifecycle" (procedure-of (function :name "lifecycle"))))` returns only the bounded witnesses retained by the same solver run. Findings and witnesses carry stable protocol/binding hashes, canonical subjects, certainty, proof/completeness, uncertainty, exact ranges, and omission metadata, but no severity or policy presentation. The host must pre-register the alias against the current workspace generation and exact procedure root; otherwise results/profile mode returns a typed incomplete diagnostic. Explain mode can still plan the query without resolving or running the registration.
 
 For typed occurrences, `(occurrences :role binder (language "rust"))` is not the spelling: `occurrences` is a *source*, so it is wrapped rather than wrapping, as in `(language "rust" (occurrences :role binder))`. Each row says what the parser thinks one identifier token is at one exact position, with the resolved target for reference-class rows. Its `ast_id` is the content-scoped identity of the underlying AST node, equal to the `ast_id` a full-detail structural capture over the same node reports, so captures and occurrences join on one opaque string instead of on coincident ranges or spellings. Occurrence support is declared per language and per role; a query naming a role an adapter does not classify is reported incomplete rather than answered with zero rows.
+
+For the lexical environment, `(scope-of (reaching-binding (occurrences :role receiver_position)))` answers the question the whole family exists for: which binding of this name is actually in effect at this position, and where was it declared? The reaching binding is computed from activation intervals and scope ancestry, never from source-order co-presence, so a rebinding, a shadowing outer name and a read before a declaration all give different answers. `scopes` and `bindings` are *sources* like `occurrences`, so they are wrapped rather than wrapping.
+
+For resolution candidates, `(candidates-of :outcome selected (occurrences :class reference))` lists what the resolver considered for each reference, with a precedence tier, an outcome, and a boundary status. Three things are deliberately not inferable from an empty answer: a candidate with no tier is *unattributed* rather than weakest (the `:tier unattributed` filter selects those rows); a trace whose `trace_completeness` is `selection_only` says nothing by omitting a rejection; and `candidate-target` answers only for unit-backed candidates, because a lexical binding and an external route carry no workspace declaration at all. Each of the three reports an `incomplete` diagnostic rather than a clean empty result where it matters.
 
 The engine has one semantic query model: `CodeQuery`. Different input formats must lower into that same model before execution.
 

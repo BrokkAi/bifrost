@@ -7,8 +7,8 @@
 
 use crate::common::InlineTestProject;
 use brokk_bifrost::analyzer::structural::{
-    CodeQuery, CodeQueryDiagnosticCode, CodeQueryResponse, CodeQueryResult, execute_workspace,
-    execute_workspace_request,
+    CodeQuery, CodeQueryDiagnosticCode, CodeQueryResponse, CodeQueryResult, SCHEMA_VERSION,
+    execute_workspace, execute_workspace_request,
 };
 use brokk_bifrost::{AnalyzerConfig, WorkspaceAnalyzer};
 use serde_json::{Value, json};
@@ -412,7 +412,7 @@ fn rql_and_json_occurrence_queries_round_trip_to_the_same_canonical_form() {
 /// The schema bump is load-bearing: a document pinned to the previous head
 /// must not silently gain the new forms.
 #[test]
-fn schema_version_seven_rejects_the_occurrence_surface_while_unpinned_resolves_to_eight() {
+fn schema_version_seven_rejects_the_occurrence_surface_while_unpinned_resolves_to_the_head() {
     let pinned_seed = CodeQuery::from_json(&json!({
         "schema_version": 7,
         "occurrences": { "role": ["binder"] }
@@ -433,9 +433,12 @@ fn schema_version_seven_rejects_the_occurrence_surface_while_unpinned_resolves_t
         "schema 7 predates occurrences_in as well"
     );
 
+    // The head moves as the lineage grows; what this pins is that an unpinned
+    // document lands on it and that the occurrence surface is available there.
     let unpinned = CodeQuery::from_json(&json!({ "occurrences": { "role": ["binder"] } }))
         .expect("an unpinned document resolves to the compatible head");
-    assert_eq!(unpinned.schema_version, 8);
+    assert_eq!(unpinned.schema_version, SCHEMA_VERSION);
+    const { assert!(SCHEMA_VERSION >= 8) };
 }
 
 /// Unknown constrained values are rejected at decode time with the field path,
