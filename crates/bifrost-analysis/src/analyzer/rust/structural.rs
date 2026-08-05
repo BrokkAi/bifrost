@@ -4,6 +4,9 @@ use crate::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
     field_name_in_parent, first_named_child, is_field_of, nearest_ancestor, node_range,
 };
+use crate::analyzer::structural::adapter_helpers::{
+    linear_chain_tokens, qualified_chain_root, spelled_generic_arity,
+};
 use crate::analyzer::structural::{
     BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS,
     HoistingClass, LexicalEnvironmentSupport, NormalizedKind, OccurrenceRole,
@@ -12,6 +15,15 @@ use crate::analyzer::structural::{
 use crate::analyzer::structural::{DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
+
+/// The left-nested qualified-path chains of the Rust grammar, paired with the
+/// field that names each link's own segment. A turbofish link
+/// (`Vec::<u8>::new`) wraps its inner path in `generic_type`, which the chain
+/// walk unwraps.
+const RUST_PATH_CHAIN: &[(&str, Option<&str>)] = &[
+    ("scoped_identifier", Some("name")),
+    ("scoped_type_identifier", Some("name")),
+];
 
 #[derive(Debug, Default)]
 pub(crate) struct RustStructuralSpec;
@@ -440,6 +452,25 @@ impl StructuralSpec for RustStructuralSpec {
 
     fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
         rust_binding_activation(binder, scope)
+    }
+
+    fn qualified_path_root<'tree>(&self, token: Node<'tree>) -> Option<Node<'tree>> {
+        if !matches!(token.kind(), "identifier" | "type_identifier") {
+            return None;
+        }
+        qualified_chain_root(token, RUST_PATH_CHAIN)
+    }
+
+    fn path_segment_tokens<'tree>(&self, root: Node<'tree>) -> Vec<Node<'tree>> {
+        linear_chain_tokens(root, RUST_PATH_CHAIN, &["generic_type", "generic_function"])
+    }
+
+    fn segment_generic_arity(&self, token: Node<'_>) -> Option<u32> {
+        spelled_generic_arity(
+            token,
+            RUST_PATH_CHAIN,
+            &["generic_type", "generic_function"],
+        )
     }
 
     /// `r#type` is the identifier `type` wearing the raw-identifier escape the

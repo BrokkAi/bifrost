@@ -309,6 +309,27 @@ impl StructuralSpec for PythonStructuralSpec {
         python_binding_activation(binder, scope)
     }
 
+    /// Python's one qualified-path chain is `dotted_name`, which is flat
+    /// rather than left-nested: its named children are the segments in order.
+    fn qualified_path_root<'tree>(&self, token: Node<'tree>) -> Option<Node<'tree>> {
+        if token.kind() != "identifier" {
+            return None;
+        }
+        token
+            .parent()
+            .filter(|parent| parent.kind() == "dotted_name")
+    }
+
+    fn path_segment_tokens<'tree>(&self, root: Node<'tree>) -> Vec<Node<'tree>> {
+        if root.kind() != "dotted_name" {
+            return Vec::new();
+        }
+        let mut cursor = root.walk();
+        root.named_children(&mut cursor)
+            .filter(|child| child.kind() == "identifier")
+            .collect()
+    }
+
     /// Python only classifies a scope segment inside a `dotted_name`, and every
     /// non-tail segment of a dotted name is a module.
     fn occurrence_namespace(

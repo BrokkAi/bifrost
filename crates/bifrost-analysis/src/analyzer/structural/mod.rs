@@ -16,6 +16,8 @@
 //!   occurrence roles plus definition resolution (issue #1473).
 //! - [`lexical_environment`]: per-file scope, binding, import-binder and
 //!   package rows, plus the reaching-binding algorithm over them (issue #1474).
+//! - [`qualified_paths`]: per-file qualified-path and path-segment rows with
+//!   opt-in per-segment prefix resolution (issue #1475).
 //! - [`planner`]: positive-anchor candidate pruning (negation never prunes).
 //! - [`provider`]: the capability trait analyzers expose, plus the
 //!   source-hash-validated facts cache behind it.
@@ -36,6 +38,7 @@ pub mod matcher;
 pub mod occurrence_rows;
 pub mod planner;
 pub mod provider;
+pub mod qualified_paths;
 pub mod query;
 pub mod rune_ir;
 pub mod search;
@@ -95,6 +98,12 @@ pub use occurrences::{
     OccurrenceRoleSupport, OccurrenceSupport, default_occurrence_namespace,
 };
 pub use provider::{StructuralFactsCache, StructuralSearchProvider, StructuralSearchSnapshotCache};
+pub use qualified_paths::{
+    PathSegmentRow, QUALIFIED_PATH_PRODUCER_AXES, QualifiedPathCompleteness,
+    QualifiedPathDerivationOptions, QualifiedPathIncompleteReason, QualifiedPathRow,
+    QualifiedPathsCancelled, QualifiedPathsFileResult, SegmentPrefixResolution,
+    qualified_paths_for_file,
+};
 pub use query::{
     CodeQuery, CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
     CodeQuerySeed, DEFAULT_LIMIT, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,

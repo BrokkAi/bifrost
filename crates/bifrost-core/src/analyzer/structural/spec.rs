@@ -128,6 +128,41 @@ pub trait StructuralSpec: Send + Sync + 'static {
         default_occurrence_namespace(role, declares)
     }
 
+    /// The root node of the qualified-path chain `token` participates in: the
+    /// outermost chain node (a `scoped_identifier`, `dotted_name`,
+    /// `nested_identifier`, or language equivalent) whose ordered segments
+    /// include this token. `None` when the token is not part of a qualified
+    /// path — including when it is a bare single identifier, which is not a
+    /// path.
+    ///
+    /// Must not cross a branching construct: for a Rust
+    /// `use a::{B, C}` the shared prefix chain is one path and each list item
+    /// stands alone, because a path is a linear sequence of segments.
+    fn qualified_path_root<'tree>(&self, _token: Node<'tree>) -> Option<Node<'tree>> {
+        None
+    }
+
+    /// Every segment token of the qualified-path chain rooted at `root`, in
+    /// source order, read from the grammar's own chain structure (AST fields,
+    /// never text splitting). Includes segment tokens that are not facts
+    /// (Rust's `crate`/`self`/`super` path keywords), so ordinals state the
+    /// real position of each segment within the path.
+    ///
+    /// The default is empty, which the derivation layer treats as "this
+    /// adapter cannot enumerate the chain" — the path is skipped and the
+    /// file's path axis reports incomplete, never a partial ordering.
+    fn path_segment_tokens<'tree>(&self, _root: Node<'tree>) -> Vec<Node<'tree>> {
+        Vec::new()
+    }
+
+    /// The number of generic (type) arguments the source spells at `token`'s
+    /// segment position, read from the grammar's argument-list field. `None`
+    /// means no generic arguments are spelled there — which is a statement
+    /// about the source text, not about the declaration's own arity.
+    fn segment_generic_arity(&self, _token: Node<'_>) -> Option<u32> {
+        None
+    }
+
     /// The spelling `raw` denotes once the grammar's identifier escaping is
     /// removed (Rust's `r#type` is the identifier `type`).
     ///

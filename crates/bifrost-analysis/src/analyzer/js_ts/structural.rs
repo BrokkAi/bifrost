@@ -4,6 +4,9 @@ use crate::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
     field_name_in_parent, first_named_child, nearest_ancestor, node_range,
 };
+use crate::analyzer::structural::adapter_helpers::{
+    linear_chain_tokens, qualified_chain_root, spelled_generic_arity,
+};
 use crate::analyzer::structural::{
     BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, HoistingClass,
     LexicalEnvironmentSupport, Namespace, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport,
@@ -12,6 +15,15 @@ use crate::analyzer::structural::{
 use crate::analyzer::structural::{DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
+
+/// The left-nested qualified chains of both grammars: expression namespace
+/// qualifiers (`nested_identifier`, naming its segment through `property`)
+/// and TypeScript qualified type names (`nested_type_identifier`, through
+/// `name`).
+const JS_TS_PATH_CHAIN: &[(&str, Option<&str>)] = &[
+    ("nested_identifier", Some("property")),
+    ("nested_type_identifier", Some("name")),
+];
 
 #[derive(Debug)]
 pub(crate) struct JsTsStructuralSpec {
@@ -479,6 +491,24 @@ impl StructuralSpec for JsTsStructuralSpec {
 
     fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
         js_ts_binding_activation(binder, scope)
+    }
+
+    fn qualified_path_root<'tree>(&self, token: Node<'tree>) -> Option<Node<'tree>> {
+        if !matches!(
+            token.kind(),
+            "identifier" | "property_identifier" | "type_identifier"
+        ) {
+            return None;
+        }
+        qualified_chain_root(token, JS_TS_PATH_CHAIN)
+    }
+
+    fn path_segment_tokens<'tree>(&self, root: Node<'tree>) -> Vec<Node<'tree>> {
+        linear_chain_tokens(root, JS_TS_PATH_CHAIN, &[])
+    }
+
+    fn segment_generic_arity(&self, token: Node<'_>) -> Option<u32> {
+        spelled_generic_arity(token, JS_TS_PATH_CHAIN, &["generic_type"])
     }
 
     /// The only scope segments this adapter classifies come from
