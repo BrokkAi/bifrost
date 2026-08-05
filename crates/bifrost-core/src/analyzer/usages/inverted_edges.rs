@@ -17,12 +17,102 @@
 //! `K = UsageNodeKey` so endpoints carry the file. There is one implementation of
 //! every accounting rule -- only the key type differs.
 
+use crate::analyzer::code_unit_index::CodeUnitIndex;
+use crate::analyzer::model::Range;
 use crate::analyzer::{CodeUnit, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::find_line_index_for_offset;
 use std::collections::BTreeMap;
 use std::hash::Hash;
 use tree_sitter::{Node, Tree};
+
+/// Per-file index of class-like declaration spans, for attributing an
+/// unqualified / `this` / `self` reference to its enclosing class. Sources the
+/// analyzer's own fqns, so nested classes resolve to whatever fqn the analyzer
+/// emits.
+#[derive(Clone)]
+pub struct ClassRangeIndex {
+    ranges: Vec<(usize, usize, CodeUnit, String)>,
+}
+
+impl ClassRangeIndex {
+    /// The general constructor: every class-like declaration paired with each
+    /// span it occupies. Callers that hold a declaration index use
+    /// [`Self::build`]; callers that already have the declarations and ranges
+    /// in hand (a persisted file state, say) pass them straight in.
+    pub fn from_class_spans(spans: impl IntoIterator<Item = (CodeUnit, Range)>) -> Self {
+        let ranges = spans
+            .into_iter()
+            .map(|(unit, range)| {
+                let fqn = unit.fq_name();
+                (range.start_byte, range.end_byte, unit, fqn)
+            })
+            .collect();
+        Self { ranges }
+    }
+
+    pub fn build(index: &dyn CodeUnitIndex, file: &ProjectFile) -> Self {
+        Self::from_class_spans(
+            index
+                .declarations(file)
+                .into_iter()
+                .filter(|unit| unit.is_class())
+                .flat_map(|unit| {
+                    index
+                        .ranges(&unit)
+                        .into_iter()
+                        .map(move |range| (unit.clone(), range))
+                }),
+        )
+    }
+
+    /// The fqn of the smallest class declaration containing `byte`.
+    pub fn enclosing(&self, byte: usize) -> Option<&str> {
+        self.ranges
+            .iter()
+            .filter(|(start, end, _, _)| *start <= byte && byte < *end)
+            .min_by_key(|(start, end, _, _)| end - start)
+            .map(|(_, _, _, fqn)| fqn.as_str())
+    }
+
+    /// The exact declaration identity of the smallest class containing `byte`.
+    pub fn enclosing_unit(&self, byte: usize) -> Option<&CodeUnit> {
+        self.ranges
+            .iter()
+            .filter(|(start, end, _, _)| *start <= byte && byte < *end)
+            .min_by_key(|(start, end, _, _)| end - start)
+            .map(|(_, _, unit, _)| unit)
+    }
+
+    /// The indexed class-like declaration whose parser span is exactly
+    /// `[start, end)`. Local templates have no entry and are resolved from
+    /// their parser-recorded supertypes by the Scala usage scanners.
+    pub fn unit_for_exact_span(&self, start: usize, end: usize) -> Option<&CodeUnit> {
+        self.ranges
+            .iter()
+            .find(|(range_start, range_end, _, _)| *range_start == start && *range_end == end)
+            .map(|(_, _, unit, _)| unit)
+    }
+
+    /// Apply `resolve` to class/object declarations containing `byte`, choosing
+    /// the successful result from the innermost owner. This preserves exact
+    /// analyzer identities without allocating or reconstructing lexical parents
+    /// from rendered fqns.
+    pub fn find_in_enclosing_units<T>(
+        &self,
+        byte: usize,
+        mut resolve: impl FnMut(&CodeUnit) -> Option<T>,
+    ) -> Option<T> {
+        self.ranges
+            .iter()
+            .filter(|(start, end, _, _)| *start <= byte && byte < *end)
+            .filter_map(|(start, end, unit, _)| {
+                resolve(unit).map(|resolved| (end - start, resolved))
+            })
+            .min_by_key(|(length, _)| *length)
+            .map(|(_, resolved)| resolved)
+    }
+}
 
 /// Broad semantic category of a proven usage reference. The categories stay
 /// deliberately small so every supported grammar can classify sites without

@@ -26,7 +26,6 @@ use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::LazyLock;
 
 const DEFAULT_MIN_SCORE: i32 = 8;
 const DEFAULT_MAX_FINDINGS: usize = 40;
@@ -332,7 +331,10 @@ fn dead_code_candidates(
                     continue;
                 }
                 if code_unit_language(&definition) == Language::CSharp
-                    && csharp_implicit_entry_point(analyzer, &definition)
+                    && crate::analyzer::usages::csharp_graph::csharp_implicit_entry_point(
+                        analyzer,
+                        &definition,
+                    )
                 {
                     continue;
                 }
@@ -359,7 +361,10 @@ fn dead_code_candidates(
                     continue;
                 }
                 if code_unit_language(&declaration) == Language::CSharp
-                    && csharp_implicit_entry_point(analyzer, &declaration)
+                    && crate::analyzer::usages::csharp_graph::csharp_implicit_entry_point(
+                        analyzer,
+                        &declaration,
+                    )
                 {
                     continue;
                 }
@@ -1519,42 +1524,11 @@ fn cpp_implicit_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> b
     crate::analyzer::usages::cpp_graph::is_cpp_global_main(analyzer, candidate)
 }
 
-fn csharp_implicit_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
-    if !candidate.is_function() {
-        return false;
-    }
-    csharp_main_entry_point(analyzer, candidate) || csharp_test_entry_point(analyzer, candidate)
-}
-
-fn csharp_test_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
-    let source = analyzer.get_source(candidate, true).unwrap_or_default();
-    csharp_source_has_test_attribute(&source)
-}
-
-fn csharp_main_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
-    if candidate.identifier() != "Main" {
-        return false;
-    }
-    let source = analyzer.get_source(candidate, true).unwrap_or_default();
-    let header = declaration_header(&source);
-    contains_java_visibility_modifier(header, "static")
-}
-
-fn csharp_source_has_test_attribute(source: &str) -> bool {
-    static TEST_ATTR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(
-            r"\[(?:[A-Za-z_][A-Za-z0-9_.]*\.)?(?:Test|Fact|Theory|TestMethod)(?:Attribute)?(?:\s*\(|\s*\])",
-        )
-        .expect("valid csharp test regex")
-    });
-    TEST_ATTR_RE.is_match(source)
-}
-
-fn declaration_header(source: &str) -> &str {
+pub(crate) fn declaration_header(source: &str) -> &str {
     source.split('{').next().unwrap_or(source)
 }
 
-fn contains_java_visibility_modifier(source: &str, modifier: &str) -> bool {
+pub(crate) fn contains_java_visibility_modifier(source: &str, modifier: &str) -> bool {
     source
         .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
         .any(|token| token == modifier)

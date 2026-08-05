@@ -37,7 +37,11 @@ use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::code_quality::dead_code_smells::{
+    contains_java_visibility_modifier, declaration_header,
+};
 use crate::hash::HashSet;
+use std::sync::LazyLock;
 
 pub(crate) fn build_csharp_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
@@ -125,4 +129,44 @@ impl UsageAnalyzer for CSharpUsageGraphStrategy {
         self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
             .into_fuzzy_result()
     }
+}
+
+/// C#'s implicit entry points: a `static Main`, and any method carrying an
+/// xUnit/NUnit/MSTest attribute. Both are reachable without an in-workspace
+/// caller, so dead-code scoring must not report them.
+///
+/// This lives here rather than inline in `dead_code_smells.rs` for the reason
+/// Go's `go_implicit_entry_point` and C++'s `is_cpp_global_main` do: the
+/// knowledge is which attribute spellings a C# test runner honors, which is
+/// language knowledge, and a framework file carrying it is one the next
+/// language extraction has to find by hand.
+pub(crate) fn csharp_implicit_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    if !candidate.is_function() {
+        return false;
+    }
+    csharp_main_entry_point(analyzer, candidate) || csharp_test_entry_point(analyzer, candidate)
+}
+
+fn csharp_test_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    let source = analyzer.get_source(candidate, true).unwrap_or_default();
+    csharp_source_has_test_attribute(&source)
+}
+
+fn csharp_main_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    if candidate.identifier() != "Main" {
+        return false;
+    }
+    let source = analyzer.get_source(candidate, true).unwrap_or_default();
+    let header = declaration_header(&source);
+    contains_java_visibility_modifier(header, "static")
+}
+
+fn csharp_source_has_test_attribute(source: &str) -> bool {
+    static TEST_ATTR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"\[(?:[A-Za-z_][A-Za-z0-9_.]*\.)?(?:Test|Fact|Theory|TestMethod)(?:Attribute)?(?:\s*\(|\s*\])",
+        )
+        .expect("valid csharp test regex")
+    });
+    TEST_ATTR_RE.is_match(source)
 }

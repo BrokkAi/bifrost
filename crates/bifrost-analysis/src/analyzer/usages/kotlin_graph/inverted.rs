@@ -58,8 +58,8 @@ use crate::analyzer::tree_walk::{
 use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
-    build_file_declarations, build_file_declarations_from_state, classify_reference_node,
-    parse_and_collect_with_declarations,
+    build_file_declarations, build_file_declarations_from_state, class_range_index_from_state,
+    classify_reference_node, parse_and_collect_with_declarations,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::same_owner::route_same_owner;
@@ -103,7 +103,7 @@ where
             .map(build_file_declarations_from_state)
             .unwrap_or_else(|| build_file_declarations(analyzer, file));
         let class_ranges = state
-            .map(ClassRangeIndex::build_from_state)
+            .map(class_range_index_from_state)
             .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
         parse_and_collect_with_declarations(file, nodes, &language, declarations, |input| {
             let names = KotlinNameResolver::new(analyzer, file, input.root(), input.source);
