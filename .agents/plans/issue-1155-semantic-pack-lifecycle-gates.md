@@ -11,7 +11,8 @@ Issue #1155 requires one reproducible gate for the complete semantic-pack lifecy
 - [x] (2026-08-05 10:20Z) Read `AGENTS.md` and `.agents/PLANS.md`.
 - [x] (2026-08-05 10:22Z) Fetched `origin`, moved the clean detached HEAD to `origin/master`, and live-checked issues #1155 and #1144.
 - [x] (2026-08-05 10:32Z) Reconciled the stale issue body with current master and recent semantic-pack history.
-- [ ] Add stable structured lifecycle phase measurements to the existing semantic-pack runtime, catalog, matcher, and overlay path.
+- [x] (2026-08-05 10:58Z) Added stable structured activation selection, decode, matcher, candidate, retained-byte, index, and SQL measurements.
+- [ ] Add overlay publication timing and retained-overlay measurement to the structured lifecycle report.
 - [ ] Add the correctness matrix and negative outcome gate with exact witnesses.
 - [ ] Add lifecycle sample collection, aggregation, budgets, cross-process reuse, corruption recovery, and garbage-collection checks.
 - [ ] Validate current published UsageBench cases and add only missing generated-behavior or negative coverage.
@@ -32,6 +33,9 @@ Issue #1155 requires one reproducible gate for the complete semantic-pack lifecy
 - Observation: The old catalog storage benchmark compares storage forms. It does not exercise the production catalog lifecycle.
   Evidence: `tests/suite_semantic/measure_semantic_pack_catalog.rs` uses a private benchmark-only SQLite schema.
 
+- Observation: One durable activation uses five catalog SQL statements for this fixture.
+  Evidence: Two selector queries plus lease acquisition, object load, and lease release produced `catalog_sql_statements = 5`; three in-memory matches did not change the counter.
+
 ## Decision Log
 
 - Decision: Do not add another model format, pack compiler, generated model, or navigation adapter.
@@ -50,9 +54,13 @@ Issue #1155 requires one reproducible gate for the complete semantic-pack lifecy
   Rationale: An inactive, empty, corrupt, incompatible, cancelled, or exhausted model must not pass because it is fast.
   Date/Author: 2026-08-05 / Codex
 
+- Decision: Count statements at the production catalog methods that issue them.
+  Rationale: This gives stable exact activation counts without a process-global SQLite trace callback. The matcher cannot access the catalog.
+  Date/Author: 2026-08-05 / Codex
+
 ## Outcomes & Retrospective
 
-The reconciliation milestone is complete. Implementation and measurement remain.
+The reconciliation milestone and the activation instrumentation milestone are complete. The focused runtime suite passes 13 tests.
 
 ## Context and Orientation
 
@@ -112,3 +120,5 @@ The first pinned Bifrost revision is `2bf15296f` from `origin/master` on 2026-08
 Use the existing `SemanticPackCatalog`, `SemanticModelActivationRequest`, `SemanticModelActivationReport`, `ResolvedActiveSemanticModels`, and `SemanticModelOverlay`. Add measurement fields or a closely related stable measurement value only where the production boundary supplies exact data. Use `rusqlite` tracing or a production catalog statement counter for SQL counts. Do not make matcher queries call the catalog.
 
 Revision note: Created after the current-master reconciliation. It limits this lane to the remaining lifecycle gate and its evidence.
+
+Revision note: Updated after activation instrumentation. It records the exact SQL boundary and leaves overlay timing for the next milestone.
