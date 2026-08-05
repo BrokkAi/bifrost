@@ -1,5 +1,7 @@
 use brokk_bifrost_core::analyzer::CodeUnitIndex;
-use brokk_bifrost_core::analyzer::capabilities::{ImportAnalysisProvider, TypeAliasProvider};
+use brokk_bifrost_core::analyzer::capabilities::{
+    ImportAnalysisProvider, TypeAliasProvider, TypeHierarchyProvider,
+};
 use brokk_bifrost_core::analyzer::common::node_ident_text;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::usages::model::{
@@ -31,7 +33,9 @@ use crate::usage_index::{RustUsageIndex, exported_targets_from_files};
 /// The usage index is deliberately absent: [`RustUsageIndex::build`] and
 /// everything it calls take this trait, so the build cannot re-enter the cell it
 /// is filling. Code that runs once the index exists takes [`RustUsageSource`].
-pub trait RustAnalysisSource: CodeUnitIndex + ImportAnalysisProvider + TypeAliasProvider {
+pub trait RustAnalysisSource:
+    CodeUnitIndex + ImportAnalysisProvider + TypeAliasProvider + TypeHierarchyProvider
+{
     /// The same index this trait already extends, for handing to the free
     /// functions whose whole input is a declaration store.
     fn code_units(&self) -> &dyn CodeUnitIndex;
@@ -59,6 +63,25 @@ pub trait RustUsageSource: RustAnalysisSource {
     fn usage_index(&self) -> Arc<RustUsageIndex>;
 
     fn reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext>;
+
+    /// [`Self::reference_context_of`], abandoning the build when `progress`
+    /// reports the caller has stopped caring. The whole-workspace inverted pass
+    /// uses this to drop work for files a filter has already rejected.
+    fn reference_context_of_with_progress(
+        &self,
+        file: &ProjectFile,
+        progress: &dyn Fn() -> bool,
+    ) -> Option<Arc<RustReferenceContext>>;
+
+    /// The forward-scan counterpart of [`Self::reference_context_of`], built
+    /// from the same binder but resolving through the forward export index.
+    fn forward_reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext>;
+
+    fn forward_reference_context_of_with_progress(
+        &self,
+        file: &ProjectFile,
+        progress: &dyn Fn() -> bool,
+    ) -> Option<Arc<RustReferenceContext>>;
 }
 
 #[derive(Clone, Copy, Debug)]

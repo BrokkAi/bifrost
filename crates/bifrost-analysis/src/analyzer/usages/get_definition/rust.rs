@@ -19,6 +19,7 @@ use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_rust::field_roles::{
     RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
 };
+use brokk_bifrost_rust::graph_support::RustUsageSource;
 use brokk_bifrost_rust::lexical_scope;
 use std::cell::RefCell;
 
@@ -88,7 +89,7 @@ impl RustDefinitionProvider for AnalyzerRustDefinitionProvider<'_> {
 
     fn forward_reference_context(
         &self,
-        rust: &RustAnalyzer,
+        rust: &dyn RustUsageSource,
         file: &ProjectFile,
     ) -> Option<std::sync::Arc<RustReferenceContext>> {
         match self.session {
@@ -99,24 +100,24 @@ impl RustDefinitionProvider for AnalyzerRustDefinitionProvider<'_> {
         }
     }
 
-    fn ranges(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<Range> {
+    fn ranges(&self, index: &dyn CodeUnitIndex, unit: &CodeUnit) -> Vec<Range> {
         match self.session {
             Some(session) => {
                 session.query_limited_rows(|limit| self.rust.ranges_limited(unit, limit))
             }
-            None => analyzer.ranges(unit),
+            None => index.ranges(unit),
         }
     }
 
     fn signature_metadata(
         &self,
-        analyzer: &dyn IAnalyzer,
+        index: &dyn CodeUnitIndex,
         unit: &CodeUnit,
     ) -> Vec<SignatureMetadata> {
         match self.session {
             Some(session) => session
                 .query_limited_rows(|limit| self.rust.signature_metadata_limited(unit, limit)),
-            None => analyzer.signature_metadata(unit),
+            None => index.signature_metadata(unit),
         }
     }
 

@@ -68,18 +68,15 @@ pub use rustdoc_artifact::RustdocJsonPackProducer;
 use brokk_bifrost_rust::graph_support::RustPackageFileIndex;
 pub use brokk_bifrost_rust::graph_support::RustReferenceContext;
 pub(crate) use brokk_bifrost_rust::graph_support::{
-    exact_member, forward_export_fqn_from_files, has_rust_value_constructor,
-    is_rust_const_or_static_declaration, is_rust_enum_declaration,
-    is_rust_export_visible_declaration, is_rust_public_like_declaration, is_rust_trait_declaration,
+    forward_export_fqn_from_files, has_rust_value_constructor, is_rust_const_or_static_declaration,
+    is_rust_enum_declaration, is_rust_public_like_declaration, is_rust_trait_declaration,
     is_rust_trait_impl_member_declaration, resolve_imported_export_from_binder_forward,
     resolve_module_files, resolve_module_package, resolve_visible_import_targets_forward,
     rust_associated_type_declaration_for_exact_node, trait_implementer_names,
 };
 
 use brokk_bifrost_rust::hierarchy::RustHierarchyIndex;
-pub(crate) use brokk_bifrost_rust::hierarchy::{
-    canonical_rust_hierarchy_type, rust_trait_for_impl_member,
-};
+pub(crate) use brokk_bifrost_rust::hierarchy::canonical_rust_hierarchy_type;
 pub use brokk_bifrost_rust::lexical_scope::{
     reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
     rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
@@ -452,6 +449,26 @@ impl brokk_bifrost_rust::graph_support::RustUsageSource for RustAnalyzer {
 
     fn reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext> {
         self.reference_context_of(file)
+    }
+
+    fn reference_context_of_with_progress(
+        &self,
+        file: &ProjectFile,
+        progress: &dyn Fn() -> bool,
+    ) -> Option<Arc<RustReferenceContext>> {
+        self.reference_context_of_with_progress(file, progress)
+    }
+
+    fn forward_reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext> {
+        self.forward_reference_context_of(file)
+    }
+
+    fn forward_reference_context_of_with_progress(
+        &self,
+        file: &ProjectFile,
+        progress: &dyn Fn() -> bool,
+    ) -> Option<Arc<RustReferenceContext>> {
+        self.forward_reference_context_of_with_progress(file, progress)
     }
 }
 
