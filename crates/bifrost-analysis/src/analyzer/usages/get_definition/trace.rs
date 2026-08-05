@@ -46,7 +46,9 @@ use std::sync::Arc;
 ///
 /// A candidate is not always a workspace declaration: a lexical binding has no
 /// `CodeUnit`, and an import route that lost to a stronger tier is named by the
-/// binder it introduced rather than by a target the resolver never looked up.
+/// binder it introduced -- plus the parser-derived target path the route
+/// pointed at, where the adapter recorded one -- rather than by a resolution
+/// the resolver never performed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraceCandidateRef {
     /// An indexed workspace declaration.
@@ -66,10 +68,14 @@ pub enum TraceCandidateRef {
     /// An import route. `node` is the binder token's facts-arena node where the
     /// adapter records one; `name` is the local name the import binds, or the
     /// wildcard marker for an on-demand import, which binds no single name.
+    /// `target_segments` is the parser-derived path the route pointed at; an
+    /// empty list is a stated gap (the adapter recorded no structured path),
+    /// never a claim that the import has no target.
     ImportBinder {
         file: ProjectFile,
         node: Option<u32>,
         name: String,
+        target_segments: Vec<String>,
     },
     /// The route out of the workspace a boundary outcome took, named by the
     /// reference spelling. It is a candidate in the sense that matters here:

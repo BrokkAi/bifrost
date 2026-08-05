@@ -107,6 +107,89 @@ pub(crate) fn cpp_callable_definitions_share_identity_evidence(
             && cpp_header_body_files_are_related(analyzer, left.source(), right.source()))
 }
 
+/// Return whether `node` is one of the names declared by a range-for
+/// declarator. Follow only declarator fields. This keeps identifiers in array
+/// bounds and attributes in the range-for header as references.
+pub(crate) fn cpp_is_range_for_binding_name(node: Node<'_>) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        let Some(parent) = candidate.parent() else {
+            return false;
+        };
+        if parent.kind() == "for_range_loop" {
+            return parent
+                .child_by_field_name("declarator")
+                .is_some_and(|declarator| {
+                    cpp_range_for_declarator_contains_name(declarator, node)
+                });
+        }
+        current = Some(parent);
+    }
+    false
+}
+
+fn cpp_range_for_declarator_contains_name(declarator: Node<'_>, target: Node<'_>) -> bool {
+    let mut pending = vec![declarator];
+    while let Some(candidate) = pending.pop() {
+        match candidate.kind() {
+            "identifier" | "field_identifier" => {
+                if cpp_same_node(candidate, target) {
+                    return true;
+                }
+            }
+            "structured_binding_declarator" => {
+                let mut cursor = candidate.walk();
+                if candidate
+                    .named_children(&mut cursor)
+                    .any(|name| cpp_same_node(name, target))
+                {
+                    return true;
+                }
+            }
+            "pointer_declarator"
+            | "reference_declarator"
+            | "array_declarator"
+            | "attributed_declarator"
+            | "parenthesized_declarator"
+            | "function_declarator"
+            | "init_declarator" => {
+                if let Some(inner) = cpp_range_for_inner_declarator(candidate) {
+                    pending.push(inner);
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn cpp_range_for_inner_declarator(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("declarator").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).find(|child| {
+            matches!(
+                child.kind(),
+                "identifier"
+                    | "field_identifier"
+                    | "structured_binding_declarator"
+                    | "pointer_declarator"
+                    | "reference_declarator"
+                    | "array_declarator"
+                    | "attributed_declarator"
+                    | "parenthesized_declarator"
+                    | "function_declarator"
+                    | "init_declarator"
+            )
+        })
+    })
+}
+
+fn cpp_same_node(left: Node<'_>, right: Node<'_>) -> bool {
+    left.id() == right.id()
+        && left.start_byte() == right.start_byte()
+        && left.end_byte() == right.end_byte()
+}
+
 /// Direct include evidence relates one header declaration to one implementation
 /// file without pretending that every external name in a workspace belongs to
 /// one linker unit.

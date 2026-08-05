@@ -447,9 +447,6 @@ impl RenderText for UsageGraphResult {
 fn render_scan_usages_entry_text(entry: &ScanUsagesEntry) -> String {
     let label = render_scan_usages_input(&entry.input);
     let mut lines = vec![format!("{}: {}", label, entry.status.as_str())];
-    if !entry.complete {
-        lines.push("  note: incomplete result; narrow paths or use a more specific selector for exhaustive detail.".to_string());
-    }
     if let Some(message) = &entry.message {
         lines.push(format!("  message: {message}"));
     }

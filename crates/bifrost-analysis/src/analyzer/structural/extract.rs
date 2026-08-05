@@ -101,7 +101,8 @@ pub(crate) fn extract_file_facts_limited(
     // tree-sitter node produced each fact so pass 2 can resolve role targets.
     let mut nodes: Vec<NormalizedNode> = Vec::new();
     let mut fact_by_ts_node: HashMap<usize, u32> = HashMap::default();
-    let mut fact_sources: Vec<(Node<'_>, u32)> = Vec::new();
+    let mut fact_sources: Vec<Option<Node<'_>>> = Vec::new();
+    let mut embedded_occurrence_roles = Vec::new();
 
     enum ExtractionFrame<'tree> {
         Enter(Node<'tree>, Option<u32>),
@@ -141,8 +142,55 @@ pub(crate) fn extract_file_facts_limited(
                         subtree_end: fact_id + 1,
                     });
                     fact_by_ts_node.insert(node.id(), fact_id);
-                    fact_sources.push((node, fact_id));
+                    fact_sources.push(Some(node));
                     parent_for_children = Some(fact_id);
+
+                    let embedded = spec.embedded_leaf_facts(node, kind, source, cancellation);
+                    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                        return LimitedFileFacts::Cancelled;
+                    }
+                    let anchor = node_range(node);
+                    let mut previous_end = anchor.start_byte;
+                    for fact in embedded {
+                        assert!(
+                            fact.range.start_byte < fact.range.end_byte
+                                && anchor.start_byte <= fact.range.start_byte
+                                && fact.range.end_byte <= anchor.end_byte
+                                && (anchor.start_byte < fact.range.start_byte
+                                    || fact.range.end_byte < anchor.end_byte),
+                            "embedded fact range {:?} must be nonempty and contained by anchor {:?}",
+                            fact.range,
+                            anchor
+                        );
+                        assert!(
+                            fact.range.start_byte >= previous_end,
+                            "embedded facts must be ordered and non-overlapping: previous end {previous_end}, next {:?}",
+                            fact.range
+                        );
+                        assert!(
+                            source.is_char_boundary(fact.range.start_byte)
+                                && source.is_char_boundary(fact.range.end_byte),
+                            "embedded fact range {:?} must use UTF-8 boundaries",
+                            fact.range
+                        );
+                        if nodes.len() == max_fact_nodes {
+                            return LimitedFileFacts::Exceeded {
+                                minimum_fact_nodes: max_fact_nodes.saturating_add(1),
+                            };
+                        }
+                        let embedded_id = nodes.len() as u32;
+                        nodes.push(NormalizedNode {
+                            kind: fact.kind,
+                            construct: None,
+                            range: fact.range,
+                            parent: Some(fact_id),
+                            name: None,
+                            subtree_end: embedded_id + 1,
+                        });
+                        fact_sources.push(None);
+                        embedded_occurrence_roles.push((embedded_id, fact.occurrence_role));
+                        previous_end = fact.range.end_byte;
+                    }
                 }
                 stack.push(ExtractionFrame::NextChild(node, parent_for_children, 0));
             }
@@ -172,35 +220,38 @@ pub(crate) fn extract_file_facts_limited(
     let max_roles = max_fact_nodes.saturating_sub(nodes.len());
     let mut roles = CompactRowsBuilder::with_capacity(nodes.len(), 0);
     // Occurrence roles are addressed by the classified node, which is not
-    // necessarily the fact currently being extracted, so they are gathered flat
-    // and bucketed below. They are bounded by the node arena rather than by
-    // `max_roles`: an adapter classifies nodes, never synthesizes them.
-    let mut occurrence_roles: Vec<(u32, OccurrenceRole)> = Vec::new();
-    for (node, fact_id) in fact_sources {
+    // necessarily the fact currently being extracted. Embedded leaf facts
+    // already carry their classifications because their secondary parse trees
+    // do not survive pass one. All classifications are gathered flat and
+    // bucketed below.
+    let mut occurrence_roles: Vec<(u32, OccurrenceRole)> = embedded_occurrence_roles;
+    for (fact_id, source_node) in fact_sources.into_iter().enumerate() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return LimitedFileFacts::Cancelled;
         }
-        debug_assert_eq!(fact_id as usize, roles.rows());
-        let kind = nodes[fact_id as usize].kind;
-        let mut sink = RoleSink::new(
-            &fact_by_ts_node,
-            roles.values_mut(),
-            &mut occurrence_roles,
-            max_roles,
-            cancellation,
-        );
-        spec.extract(node, kind, &mut sink);
-        let (name, stop) = sink.into_parts();
-        match stop {
-            Some(RoleSinkStop::Exceeded) => {
-                return LimitedFileFacts::Exceeded {
-                    minimum_fact_nodes: max_fact_nodes.saturating_add(1),
-                };
+        debug_assert_eq!(fact_id, roles.rows());
+        if let Some(node) = source_node {
+            let kind = nodes[fact_id].kind;
+            let mut sink = RoleSink::new(
+                &fact_by_ts_node,
+                roles.values_mut(),
+                &mut occurrence_roles,
+                max_roles,
+                cancellation,
+            );
+            spec.extract(node, kind, &mut sink);
+            let (name, stop) = sink.into_parts();
+            match stop {
+                Some(RoleSinkStop::Exceeded) => {
+                    return LimitedFileFacts::Exceeded {
+                        minimum_fact_nodes: max_fact_nodes.saturating_add(1),
+                    };
+                }
+                Some(RoleSinkStop::Cancelled) => return LimitedFileFacts::Cancelled,
+                None => {}
             }
-            Some(RoleSinkStop::Cancelled) => return LimitedFileFacts::Cancelled,
-            None => {}
+            nodes[fact_id].name = name;
         }
-        nodes[fact_id as usize].name = name;
         roles.finish_row();
     }
 
@@ -291,5 +342,65 @@ mod tests {
         for id in 0..facts.nodes().len() as u32 {
             assert_eq!(decoded.occurrence_roles(id), facts.occurrence_roles(id));
         }
+    }
+
+    #[test]
+    fn embedded_facts_preserve_identity_containment_limits_and_snapshots() {
+        let spec = &crate::analyzer::python::structural::PYTHON_STRUCTURAL_SPEC;
+        let grammar = tree_sitter_python::LANGUAGE.into();
+        let source = concat!(
+            "class Widget:\n",
+            "    pass\n",
+            "def render(widget: \"Widget\") -> None:\n",
+            "    pass\n",
+        );
+        let facts = extract_file_facts(spec, &grammar, source).expect("python fixture extracts");
+        let deferred_start = source.find("Widget\"").expect("deferred Widget");
+        let embedded_id = facts
+            .nodes()
+            .iter()
+            .position(|node| {
+                node.kind == super::super::kinds::NormalizedKind::Identifier
+                    && node.range.start_byte == deferred_start
+                    && node.range.end_byte == deferred_start + "Widget".len()
+            })
+            .expect("embedded identifier fact") as u32;
+        let parent = facts.node(embedded_id).parent.expect("embedded parent");
+        assert_eq!(
+            facts.node(parent).kind,
+            super::super::kinds::NormalizedKind::StringLiteral
+        );
+        assert!(facts.is_ancestor(parent, embedded_id));
+        assert_eq!(
+            facts.occurrence_roles(embedded_id),
+            &[OccurrenceRole::TypeOperand]
+        );
+
+        let repeated = extract_file_facts(spec, &grammar, source).expect("repeat extracts");
+        assert_eq!(
+            repeated.node(embedded_id).range,
+            facts.node(embedded_id).range
+        );
+        assert_eq!(
+            repeated.occurrence_roles(embedded_id),
+            facts.occurrence_roles(embedded_id)
+        );
+
+        let payload = facts.encode_snapshot().expect("facts encode");
+        let decoded =
+            FileFacts::decode_snapshot(source.to_owned(), &payload).expect("facts decode");
+        assert_eq!(
+            decoded.node(embedded_id).range,
+            facts.node(embedded_id).range
+        );
+        assert_eq!(
+            decoded.occurrence_roles(embedded_id),
+            facts.occurrence_roles(embedded_id)
+        );
+
+        assert!(matches!(
+            extract_file_facts_limited(spec, &grammar, source, facts.nodes().len() - 1, None,),
+            LimitedFileFacts::Exceeded { .. }
+        ));
     }
 }

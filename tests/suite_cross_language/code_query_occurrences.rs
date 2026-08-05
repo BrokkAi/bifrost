@@ -764,43 +764,80 @@ fn conformance_java_static_qualifiers_and_shadowing_locals_keep_their_roles() {
 /// identifier spellings (Rust).
 ///
 /// Minimized from `031e3be78` ("Resolve non-class Python annotation usages").
-/// The invariant is one-directional and worth stating exactly: string content
-/// never enters the occurrence domain, so neither a deferred (quoted)
-/// annotation nor an ordinary string of the same content can be mistaken for a
-/// type operand. Deferred annotations are consequently *not* classified today;
-/// see the ExecPlan's Surprises section for the recorded follow-up.
+/// The outer AST proves which string is an annotation before its contents are
+/// parsed as a type expression. The deferred operand therefore resolves like
+/// the direct operand, while the ordinary string stays outside the occurrence
+/// domain.
 #[test]
-fn conformance_quoted_annotations_and_strings_never_become_type_operands() {
-    let value = all_occurrences(&[(
-        "src/deferred.py",
-        concat!(
-            "class Widget:\n",
-            "    pass\n",
-            "\n",
-            "def direct(widget: Widget) -> int:\n",
-            "    return 1\n",
-            "\n",
-            "def deferred(widget: \"Widget\") -> int:\n",
-            "    return 2\n",
-            "\n",
-            "name = \"Widget\"\n",
-        ),
-    )]);
+fn conformance_deferred_annotations_are_type_operands_but_strings_are_not() {
+    let source = concat!(
+        "class Widget:\n",
+        "    pass\n",
+        "class Gadget:\n",
+        "    pass\n",
+        "\n",
+        "def direct(widget: Widget) -> int:\n",
+        "    return 1\n",
+        "\n",
+        "def deferred(widget: \"Widget\") -> int:\n",
+        "    return 2\n",
+        "\n",
+        "def compound(widget: \"Widget | Gadget\") -> int:\n",
+        "    return 3\n",
+        "\n",
+        "name = \"Widget\"\n",
+    );
+    let value = all_occurrences(&[("src/deferred.py", source)]);
 
     assert_eq!(
         classified(&value, "Widget"),
         vec![
             ("declaration_name".into(), "type".into(), "none".into()),
             ("type_operand".into(), "type".into(), "resolved".into()),
+            ("type_operand".into(), "type".into(), "resolved".into()),
+            ("type_operand".into(), "type".into(), "resolved".into()),
         ],
-        "only the unquoted annotation is an identifier occurrence: {:?}",
+        "direct and deferred annotations must classify alike: {:?}",
         rows(&value)
     );
+    assert_eq!(
+        resolved_targets(&value, "Widget"),
+        vec![
+            "src.deferred.Widget".to_string(),
+            "src.deferred.Widget".to_string(),
+            "src.deferred.Widget".to_string(),
+        ]
+    );
+    assert_eq!(
+        classified(&value, "Gadget"),
+        vec![
+            ("declaration_name".into(), "type".into(), "none".into()),
+            ("type_operand".into(), "type".into(), "resolved".into()),
+        ]
+    );
+    assert_eq!(
+        resolved_targets(&value, "Gadget"),
+        vec!["src.deferred.Gadget".to_string()]
+    );
+
+    let quoted_starts: Vec<_> = source.match_indices("\"Widget\"").collect();
+    let deferred_start = quoted_starts[0].0 + 1;
+    let ordinary_start = quoted_starts[1].0 + 1;
+    let widget_ranges: Vec<_> = rows(&value)
+        .iter()
+        .filter(|row| row["raw_spelling"] == "Widget")
+        .map(|row| {
+            (
+                row["start_byte"].as_u64().expect("start byte") as usize,
+                row["end_byte"].as_u64().expect("end byte") as usize,
+            )
+        })
+        .collect();
+    assert!(widget_ranges.contains(&(deferred_start, deferred_start + "Widget".len())));
     assert!(
-        !rows(&value)
+        widget_ranges
             .iter()
-            .any(|row| row["raw_spelling"] == "\"Widget\""),
-        "a string literal is never an occurrence, whatever it spells"
+            .all(|(start, _)| *start != ordinary_start)
     );
 }
 

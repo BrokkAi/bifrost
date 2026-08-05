@@ -210,7 +210,8 @@ fn resolve_hierarchy_type_index(
             continue;
         };
         if normalized == imported_name
-            && let Some(index) = hierarchy_type_index(types_by_fq_name, import_path)
+            && let Some(index) =
+                hierarchy_type_index(types_by_fq_name, &import_path.render_segments("."))
         {
             return Some(index);
         }
@@ -218,7 +219,7 @@ fn resolve_hierarchy_type_index(
             .strip_prefix(imported_name)
             .and_then(|rest| rest.strip_prefix('.'))
         {
-            let nested_fqn = format!("{import_path}.{rest}");
+            let nested_fqn = format!("{}.{rest}", import_path.render_segments("."));
             if let Some(index) = hierarchy_type_index(types_by_fq_name, &nested_fqn) {
                 return Some(index);
             }
@@ -232,8 +233,7 @@ fn resolve_hierarchy_type_index(
         if !import.is_wildcard {
             continue;
         }
-        let package = import_path.trim_end_matches(".*");
-        let fqn = format!("{package}.{normalized}");
+        let fqn = format!("{}.{normalized}", import_path.render_segments("."));
         if let Some(index) = hierarchy_type_index(types_by_fq_name, &fqn) {
             return Some(index);
         }

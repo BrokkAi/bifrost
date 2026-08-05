@@ -10046,14 +10046,18 @@ fn render_resolution_candidate(
             ast_id: node
                 .map(|node| super::occurrence_rows::ast_id(occurrence.content_identity, node)),
         },
-        TraceCandidateRef::ImportBinder { file, node, name } => {
-            CodeQueryCandidateRef::ImportBinder {
-                name: name.clone(),
-                path: rel_path_string(file),
-                ast_id: node
-                    .map(|node| super::occurrence_rows::ast_id(occurrence.content_identity, node)),
-            }
-        }
+        TraceCandidateRef::ImportBinder {
+            file,
+            node,
+            name,
+            target_segments,
+        } => CodeQueryCandidateRef::ImportBinder {
+            name: name.clone(),
+            path: rel_path_string(file),
+            ast_id: node
+                .map(|node| super::occurrence_rows::ast_id(occurrence.content_identity, node)),
+            target_segments: target_segments.clone(),
+        },
         TraceCandidateRef::ExternalRoute { name } => {
             CodeQueryCandidateRef::ExternalRoute { name: name.clone() }
         }

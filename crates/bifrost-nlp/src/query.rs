@@ -251,19 +251,6 @@ pub fn semantic_search(
         Err(err) => return Err(err),
     };
     let wait_ready_ms = wait_started.elapsed().as_secs_f64() * 1_000.0;
-    let Some(store) = indexer.store() else {
-        if timed_out {
-            notes.push("semantic index store is not loaded yet".to_string());
-            return Ok(SemanticSearchResult::empty(
-                notes,
-                profile,
-                requested_leg_counts,
-                wait_ready_ms,
-                started,
-            ));
-        }
-        return Err("semantic index store unavailable".to_string());
-    };
     let Some(embedder) = indexer.embedder() else {
         if timed_out {
             notes.push("embedding model is not loaded yet".to_string());
@@ -296,26 +283,24 @@ pub fn semantic_search(
     };
     let analyzer = workspace.analyzer();
 
-    // 1. Exhaustive vector scan over the active set. The store streams batches
-    //    (producer); cosine is scored in parallel (consumers); each direct
+    // 1. Exhaustive vector scan over the active set. SQLite streams batches;
+    //    cosine is scored in parallel; each direct
     //    document vector is then resolved to its function occurrences.
     let (query_vector, embedding_timing) = embedder.embed_query_timed(query)?;
     let scorer = super::quant::query_scorer(&query_vector);
     let mut hash_scores: Vec<([u8; 32], f32)> = Vec::new();
-    store
-        .scan_active_vectors(SCAN_BATCH, &mut |batch| {
-            let scored: Vec<([u8; 32], f32)> = batch
-                .par_iter()
-                .filter_map(|row| {
-                    scorer
-                        .score(&row.code)
-                        .ok()
-                        .map(|score| (row.vector_hash, score))
-                })
-                .collect();
-            hash_scores.extend(scored);
-        })
-        .map_err(|err| err.to_string())?;
+    active.scan_vectors(SCAN_BATCH, &mut |batch| {
+        let scored: Vec<([u8; 32], f32)> = batch
+            .par_iter()
+            .filter_map(|row| {
+                scorer
+                    .score(&row.code)
+                    .ok()
+                    .map(|score| (row.vector_hash, score))
+            })
+            .collect();
+        hash_scores.extend(scored);
+    })?;
     let mut vector_by_symbol: HashMap<String, f32> = HashMap::new();
     let mut symbol_file: HashMap<String, String> = HashMap::new();
     for (hash, score) in &hash_scores {
