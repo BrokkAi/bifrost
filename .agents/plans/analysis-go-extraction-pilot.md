@@ -191,6 +191,23 @@ else the language's unit pins are the evidence (Ruby/Kotlin precedent).
       follow it) and ~2,540 is production shim plus retained analyzer-bound
       tests. Move rate 41% of the 39.9k seam, 68% of the seam outside the parks.
       Three census-missed lowerings were needed; see the decision log.
+- [x] Py-2 (Python extraction): `brokk-bifrost-python` created and wired. 10,129
+      LOC in the crate -- the whole `analyzer/python/` band minus the three parks
+      (bindings, declarations, syntax, structural, test detection, clones tokens,
+      adapter answers, imports, graph support with Py-1's two source traits,
+      usage index, diagnostics) plus all four `usages/python_graph/` scans -- and
+      the `.scm` assets ship from the crate with the Python epoch salt bumped.
+      Analysis Python residue 10,445, of which 7,974 is parked by design
+      (`semantic.rs` 3,427; `external.rs` 1,795; the definition/type routes
+      2,747) and 2,471 is production shim plus the analyzer-bound tests that
+      follow it (`mod.rs` 990, `python_graph.rs` 340, `diagnostics.rs` 352 of
+      which ~320 is the retained fixture suite, `structural.rs` 214 all tests,
+      `cache.rs` 151, `imports.rs` 193, `adapter.rs` 130, `lexical_scope.rs` 43,
+      `hierarchy.rs` 28). Move rate 49% of the 20.6k seam, 93% of the seam
+      outside the parks -- the highest in the fleet so far, because Py-1 had
+      already retired the R1-class inherent block. Three census-missed couplings
+      were resolved by lowering; see the decision log.
+
 
 ## Decision log
 
@@ -244,3 +261,35 @@ else the language's unit pins are the evidence (Ruby/Kotlin precedent).
   route's park on `ResolutionSession`/`LimitedQueryRows`/`DefinitionBatchContext`
   and need nothing new of their own once that park lifts. Recorded rather than
   improvised around, per the pilot's own handling of census-missed couplings.
+- 2026-08-05 (Py-2): three census-missed couplings resolved by lowering pure code
+  to core, the R2 pattern. (1) `analyzer/test_assertions.rs` (the per-language
+  assertion-smell shaping) is pure functions over core's own `TestAssertionSmell`
+  and `TestAssertionWeights`, and Java and Ruby need it where they are, so it
+  moved to `core::analyzer::test_assertions` with analysis re-exporting the old
+  path. (2) `tree_walk::subtree_contains` likewise, beside the preorder family
+  already in core. (3) `usages::common::enclosing_owner_chain`, used by
+  java/csharp/cpp as well. All three are verbatim moves; no caller outside the
+  Python seam changed.
+- 2026-08-05 (Py-2): `PythonLexicalScopeInventory::collect_bounded` seeded its
+  parameter set from `lexical_definitions::formal_parameter_slots_for_owner_bounded`,
+  which dispatches through the analysis-side language registry and so cannot be
+  lowered. Rather than keep the 993-LOC binding inventory in analysis for one
+  call, `collect_bounded` now takes the parameter-name stream, and a 43-LOC
+  `analyzer/python/lexical_scope.rs` forwarder computes the layout under the
+  caller's own `scope_step` meter. The metering order and the `None`-on-stop
+  behaviour are unchanged.
+- 2026-08-05 (Py-2): the Python usage-graph scans take a `PythonGraphSource`
+  *alongside* the `PythonUsageSource`, not instead of it. The census's
+  "all `CodeUnitIndex`" reading of `python_graph/extractor.rs` is right about the
+  trait, but the `&dyn IAnalyzer` those scans held is the *dispatching* analyzer:
+  in a mixed workspace that is a `MultiAnalyzer`, whose `definitions` merges every
+  language's shards and whose `get_ancestors` crosses language boundaries.
+  Collapsing it onto the Python analyzer would have silently narrowed
+  cross-language resolution. `PythonGraphSource` therefore carries the
+  dispatching analyzer's `CodeUnitIndex`, `TypeHierarchyProvider` and
+  `ImportAnalysisProvider` -- the `GoGraphSource` shape -- plus a *callback* for
+  the global definition index, because that index builds on first access and only
+  `resolve_receiver_type`'s last fallback reads it. Recording this because a
+  handle would have been the obvious simplification and would have moved a
+  workspace-wide index build onto every Python scan, invisibly to the suite: only
+  the C# graph and persistence tests assert build counts.

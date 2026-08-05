@@ -500,6 +500,19 @@ jobs:
       contents: read
       id-token: write
 
+  publish-crate-python:
+    name: publish python language crate after core
+    needs: [release-context, promotion-evidence, publish-crate-core]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-python
+    permissions:
+      contents: read
+      id-token: write
+
   publish-crate-rust:
     name: publish rust language crate after core
     needs: [release-context, promotion-evidence, publish-crate-core]
@@ -514,8 +527,8 @@ jobs:
       id-token: write
 
   publish-crate-analysis:
-    name: publish analysis crate after core, go and rust
-    needs: [release-context, promotion-evidence, publish-crate-core, publish-crate-go, publish-crate-rust]
+    name: publish analysis crate after core, go, python and rust
+    needs: [release-context, promotion-evidence, publish-crate-core, publish-crate-go, publish-crate-python, publish-crate-rust]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
