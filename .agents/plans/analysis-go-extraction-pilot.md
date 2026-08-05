@@ -345,3 +345,68 @@ else the language's unit pins are the evidence (Ruby/Kotlin precedent).
   bounded-resolution path names it, so it is a fleet decision, not a C# one.
   Recording it here because it is the single highest-leverage item left in the
   stage-3 backlog: one 252-LOC lowering unlocks the largest parked band.
+- 2026-08-05 (W7): the Cs-2 prerequisite is done. `ResolutionSession` and
+  `BoundedResolution` are `brokk_bifrost_core::analyzer::usages::
+  resolution_session`, re-exported at `get_definition::`; the move is 19
+  `pub(crate)` -> `pub` widenings and one import path, `ResolutionStop` and
+  `ResolutionState` staying private. With it, C# went from Scenario A to
+  Scenario B in one commit: `csharp_graph/{resolver,extractor,inverted,hits}.rs`
+  are `brokk_bifrost_csharp::graph`, the eleven single-bodied session-naming
+  inners moved unchanged, and the five DIVERGED `*_in_session` families moved as
+  they are, both spellings, divergence preserved. Literal streams 426/426.
+- 2026-08-05 (W7): `rust_graph/{extractor,hits}.rs` STOP again, and R2's stated
+  park reason understates it in a way worth correcting, because it reads as six
+  functions waiting on `ResolutionSession` -- the exact shape that turned out to
+  be true for C# and is not true here. Two measurements say so.
+
+  First, the six items' transitive closure inside `get_definition/rust.rs` is
+  **79 items / ~2,749 lines**, 37 % of that 7,374-LOC file, and only **4 items /
+  153 lines** of it are reachable *from the six alone*
+  (`rust_expression_type_definition_{fqn,candidates}_cached`,
+  `rust_field_definition_type_candidates_cached`,
+  `rust_type_definition_candidates_for_fqn`). The other 75 -- including
+  `rust_expression_type_fqn_mode` (~300 lines), `rust_visible_import_resolution`,
+  `rust_collect_binding_type_fqn`, `rust_bounded_scoped_callable_candidates` --
+  are shared with the point-lookup route. There is nothing here to *move*: the
+  closure would have to be extracted and left working for the rest of the file,
+  which is the R1-class rewrite of the definition route itself.
+
+  Second, the closure is not session-shaped. `DefinitionBatchContext` never
+  appears in the file; `LimitedQueryRows` is never named; `TreeSitterAnalyzer` is
+  never named; `ResolutionSession` appears in exactly 2 of the 79 members and is
+  core as of this workstream's first commit. What the closure actually names is
+  the analyzer: `IAnalyzer` in 28 members, `RustAnalyzer` as a by-value parameter
+  type in 18 functions, `resolve_analyzer::<RustAnalyzer>` at 6 downcast sites
+  (rust.rs:4641, 5177, 5621, 6261, 6319, 6327), six analysis-only
+  `RustAnalyzer::*_limited` accessors, and -- through
+  `rust_declaration_matches` -> `AnalyzerRustDefinitionProvider` -- the
+  analysis-side provider that holds `&RustAnalyzer` and `&ResolutionSession`
+  together. So the lowering that converted C# from Scenario A to Scenario B in
+  one step moves this park not at all.
+
+  The alternative to moving the closure is a callback trait over the six-method
+  type-lookup surface, threaded with a `&mut RustTypeLookupCache` through the
+  scan walk. That is the new abstraction the fleet rules forbid, and it would
+  put a mutable analysis-side cache in a language-crate signature. `hits.rs`
+  follows `extractor.rs` because it is written against `extractor::ScanCtx`, and
+  `ScanCtx` is where the `RustTypeLookupCache` is stored (extractor.rs:1316).
+- 2026-08-05 (W7): `rust_graph/inverted.rs` (1,270 LOC) is the exception inside
+  that STOP and is worth funding as its own pass. It imports **none** of the
+  six. Its whole analysis-resident surface is the shape every moved scan has
+  already taken: `&dyn IAnalyzer` + `&RustAnalyzer` (a `RustGraphSource` beside
+  the existing `RustUsageSource`), one `IAnalyzer::global_usage_definition_index`
+  call, a `DefinitionIndexHandle` field used only for `.fqn` -- which
+  `RustDefinitionProvider` already covers, and which `rust_graph/resolver.rs`
+  already implements for that handle -- `usages::same_owner::route_same_owner`,
+  and the `build_edge_output`/`parse_and_collect` fan-out that stays shim-side
+  by design. Its `RustReferenceContext` methods (`resolve_bare`,
+  `resolve_scoped`, `resolve_scoped_owner`) are already in the Rust crate. Two
+  small prerequisites: `analyzer/tree_walk.rs`'s `TreeWalkAction` /
+  `walk_tree_iterative` are still analysis-side (core's `tree_walk` has only the
+  preorder family and `subtree_contains`) and are pure, so they lower the R2
+  way; and it imports five pure helpers from its two blocked siblings
+  (`extractor::{first_generic_type_argument, rust_reference_namespace,
+  type_node_last_segment}`, `hits::{rust_path_is_leading_absolute,
+  rust_path_segments}`) that belong in the crate beside Go's `graph/ast.rs`
+  regardless. Scoped alone it is a Go-shaped W2 move with no definition-route
+  dependency at all.
