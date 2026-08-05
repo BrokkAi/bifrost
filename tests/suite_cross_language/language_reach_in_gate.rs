@@ -156,7 +156,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
     // class of leak that `ScalaExportInfo` was until it moved to the core model layer.
     // Follow-up: lower `BoundedJavaResolution` with the extraction plan.
     (
-        "analyzer/usages/receiver_query.rs",
+        "analyzer/usages/receiver_query/mod.rs",
         "Java resolution-session route; follow-up",
     ),
     // The #1474 resolution trace's boundary and import evidence: `boundary_evidence`
@@ -484,13 +484,44 @@ fn scan_file<'a>(file: &Path, rel: &'a str, exempt: bool) -> FileScan<'a> {
     file_scan
 }
 
+/// A `#[cfg(test)] mod` subtree is exempt from policing, but its files must
+/// still be accounted for or the completeness check misreads them as missed.
+/// Test modules can be directories with their own submodules (the structural
+/// search suite split into one), so this descends purely for accounting.
+fn account_test_module(file: &Path, walked: &mut BTreeSet<PathBuf>) {
+    if !walked.insert(file.to_path_buf()) {
+        return;
+    }
+    let source = std::fs::read_to_string(file).expect("readable test module file");
+    let parsed = syn::parse_file(&source)
+        .unwrap_or_else(|error| panic!("{} does not parse as Rust: {error}", file.display()));
+    let dir = file
+        .parent()
+        .expect("source files have a parent directory")
+        .join(if file.file_name().is_some_and(|name| name == "mod.rs") {
+            String::new()
+        } else {
+            file.file_stem()
+                .expect("source files have a stem")
+                .to_string_lossy()
+                .into_owned()
+        });
+    for item in &parsed.items {
+        if let syn::Item::Mod(module) = item {
+            if module.content.is_none() {
+                account_test_module(&module_file(&dir.join(module.ident.to_string())), walked);
+            }
+        }
+    }
+}
+
 fn scan(file: &Path, root: &Path, violations: &mut Vec<Violation>, walked: &mut BTreeSet<PathBuf>) {
     assert!(walked.insert(file.to_path_buf()), "{file:?} walked twice");
     let rel = relative(file, root);
     let scanned = scan_file(file, &rel, is_exempt(&rel));
     violations.extend(scanned.violations);
     for child in scanned.test_only_children {
-        walked.insert(module_file(&child));
+        account_test_module(&module_file(&child), walked);
     }
     for child in scanned.children {
         scan(&module_file(&child), root, violations, walked);
