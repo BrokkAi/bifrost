@@ -22,7 +22,7 @@ After this work, each large RQL analyzer file has one clear task. The public API
 - [x] (2026-08-05) Milestone 3: Split structural search execution into eight owned modules and keep the facade below 4,000 lines.
 - [x] (2026-08-05) Milestone 4: Split the large structural and cross-language test modules into nine behavior files and two small facades.
 - [x] (2026-08-05) Milestone 5: Extract assertion evaluation, CVSS evidence helpers, typestate compilation failures, and evaluator tests.
-- [ ] Milestone 6: Run all focused and repository validation gates.
+- [x] (2026-08-05) Milestone 6: Run formatting, focused tests, strict workspace Clippy, file-size review, and the final policy gate.
 
 ## Surprises & Discoveries
 
@@ -49,6 +49,12 @@ After this work, each large RQL analyzer file has one clear task. The public API
 
 - Observation: The default Cargo and Clippy executables use incompatible LLVM builds on this host.
   Evidence: Cargo used LLVM 22.1.2 and Clippy used LLVM 22.1.6. The consistent Homebrew toolchain passed the isolated strict workspace gate.
+
+- Observation: The final policy run is reliable but the repository policy gate is not clean.
+  Evidence: `bifrost.code-smells` completed all 12 policies with no diagnostics, status `finding`, exit status 1, and 282 repository findings. Five findings in changed files point to unchanged operations present at `dc0ba96f2`.
+
+- Observation: The first final policy request remained at the interactive latency threshold.
+  Evidence: The first request took about 5.2 seconds and the immediate warm rerun took about 2.8 seconds. The evidence is recorded on issue #1452.
 
 ## Decision Log
 
@@ -83,6 +89,8 @@ Milestone 3 replaced the 12,543-line structural search engine with a 3,992-line 
 Milestone 4 replaced the 5,156-line structural-search test file with four files from 905 to 1,501 lines and a 34-line facade. It replaced the 6,454-line cross-language pipeline test file with five files from 620 to 2,994 lines and a 42-line facade. All 93 structural-search tests and 116 cross-language pipeline tests pass after the move.
 
 Milestone 5 reduced the policy evaluator from 8,089 to 3,959 lines. Assertion evaluation is 2,348 lines. CVSS evidence and typestate compilation helpers are 79 and 51 lines. Evaluator tests are 1,648 lines. All 294 active policy library tests pass. The policy doctest gate also passes with a consistent Rustup toolchain.
+
+The final file-size review found no selected file above 4,000 lines. Formatting, whitespace checks, all focused tests, all selected compile targets, policy doctests, and strict workspace Clippy pass. The final Bifrost policy run completed reliably, but its repository-wide status is `finding`, not `clean`. The five changed-file findings are pre-existing loop-local sorting or serialization operations. This sweep did not change their behavior. The repository also has 277 findings outside changed files, so changing these five would not make this architecture task's policy gate clean.
 
 ## Context and Orientation
 
@@ -238,3 +246,5 @@ Revision note (2026-08-05, Milestone 3): Recorded the execution split, the 3,992
 Revision note (2026-08-05, Milestone 4): Recorded the two behavior-based test splits, file sizes, and passing test groups.
 
 Revision note (2026-08-05, Milestone 5): Recorded the policy evaluator split, helper ownership, file sizes, and passing policy tests.
+
+Revision note (2026-08-05, Milestone 6): Recorded final validation, the reliable finding policy result, pre-existing changed-file findings, and issue #1452 timing evidence.
