@@ -3380,7 +3380,9 @@ where
     /// The retained source text of an analyzed file. Structural search
     /// re-parses from this instead of touching disk.
     pub(crate) fn file_source(&self, file: &ProjectFile) -> Option<String> {
-        self.structural_file_state(file)
+        self.source_snapshot_file_state(file)
+            .or_else(|| self.fetch_file_state(file))
+            .or_else(|| self.fetch_file_state_from_current_source(file))
             .map(|state| state.source.clone())
             .or_else(|| self.project.read_source(file).ok())
     }
@@ -3742,7 +3744,7 @@ where
             .source_snapshot_file_state(file)
             .or_else(|| self.fetch_file_state(file));
         let Some(source) = self.current_source(file) else {
-            return indexed;
+            return indexed.or_else(|| self.fetch_file_state_from_current_source(file));
         };
         if indexed
             .as_ref()
@@ -3761,6 +3763,11 @@ where
         let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()?;
         let key = Self::transient_cache_key(oid, file);
         self.fetch_file_state_for_key_with_source(file, &key, Some(&source))
+    }
+
+    fn fetch_file_state_from_current_source(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
+        self.current_source(file)
+            .and_then(|source| self.fetch_file_state_from_source(file, source))
     }
 
     fn same_source_ignoring_crlf(left: &str, right: &str) -> bool {
@@ -8047,8 +8054,22 @@ where
         self.materialization_records_of(file)
     }
 
-    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.structural_file_state(file)
+            .map(|state| {
+                state
+                    .declarations
+                    .iter()
+                    .filter(|unit| !unit.is_file_scope())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        self.fetch_file_state(file)
+            .or_else(|| self.fetch_file_state_from_current_source(file))
             .map(|state| {
                 state
                     .declarations
@@ -8258,6 +8279,17 @@ where
     }
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
+        self.source_snapshot_file_state(code_unit.source())
+            .or_else(|| self.fetch_file_state(code_unit.source()))
+            .and_then(|state| state.ranges.get(code_unit).cloned())
+            .or_else(|| {
+                self.fetch_file_state_from_current_source(code_unit.source())
+                    .and_then(|state| state.ranges.get(code_unit).cloned())
+            })
+            .unwrap_or_default()
+    }
+
+    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
         self.structural_file_state(code_unit.source())
             .and_then(|state| state.ranges.get(code_unit).cloned())
             .unwrap_or_default()

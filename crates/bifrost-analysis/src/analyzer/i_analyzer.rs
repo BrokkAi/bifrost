@@ -804,6 +804,13 @@ pub trait IAnalyzer: Send + Sync + Any {
         self.declarations(file)
     }
 
+    /// Declarations for a source-location query. Persisted analyzers can
+    /// override this when the working-tree source needs a compatible range
+    /// projection without changing ordinary snapshot queries.
+    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        self.get_declarations(file)
+    }
+
     fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
         self.definitions(fq_name).collect()
     }
@@ -818,6 +825,12 @@ pub trait IAnalyzer: Send + Sync + Any {
 
     fn ranges_of(&self, code_unit: &CodeUnit) -> Vec<Range> {
         self.ranges(code_unit)
+    }
+
+    /// Ranges for a source-location query. Persisted analyzers can override
+    /// this when the working-tree source needs a compatible range projection.
+    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
+        self.ranges_of(code_unit)
     }
 
     fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
