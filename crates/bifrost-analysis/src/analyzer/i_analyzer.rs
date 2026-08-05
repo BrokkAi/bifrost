@@ -254,6 +254,14 @@ impl AnalyzerSnapshotCaches {
             .retain_dependency_discovery_evidence(languages, evidence);
     }
 
+    pub(crate) fn invalidate_dependency_pack_state(
+        &self,
+        languages: &[crate::analyzer::Language],
+    ) -> bool {
+        self.semantic_models
+            .invalidate_dependency_pack_state(languages)
+    }
+
     fn dependency_discovery_evidence(
         &self,
         language: crate::analyzer::Language,

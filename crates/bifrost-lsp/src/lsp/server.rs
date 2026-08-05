@@ -1935,6 +1935,12 @@ fn handle_notification(
             }
             if !changed.is_empty() {
                 state.workspace = state.workspace.update(&changed);
+                // The new analyzer generation has no retained dependency proof
+                // until the host activation lifecycle publishes it. Refresh all
+                // prior diagnostic documents now, so stale errors cannot remain.
+                for uri in state.published_diagnostic_uris.clone() {
+                    publish_diagnostics_for_state(connection, state, &uri)?;
+                }
             }
             Ok(())
         }

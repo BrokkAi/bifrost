@@ -209,8 +209,9 @@ pub use tree_sitter_analyzer::{
 pub use typescript::TypescriptAnalyzer;
 pub(crate) use usage_facts::UsageFactsIndex;
 pub use workspace::{
-    EmptyAnalyzer, PythonSemanticModelActivationOutcome, PythonSemanticModelWorkspaceContext,
-    WorkspaceAnalyzer,
+    DependencyPackActivationOutcome, DependencyPackEcosystem, DependencyPackEcosystemOutcome,
+    DependencyPackWorkspaceContext, EmptyAnalyzer, PythonSemanticModelActivationOutcome,
+    PythonSemanticModelWorkspaceContext, WorkspaceAnalyzer,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

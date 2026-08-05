@@ -878,8 +878,13 @@ impl SemanticModelRuntimeOutcome {
 
 pub(crate) struct SemanticModelRuntimeCache {
     values: CompleteValueCache<String, ResolvedActiveSemanticModels>,
-    overlay: Mutex<Option<PublishedSemanticModelOverlay>>,
-    dependency_evidence: Mutex<HashMap<Language, Arc<super::DependencyDiscoveryEvidence>>>,
+    published: Mutex<PublishedSemanticModelState>,
+}
+
+#[derive(Default)]
+struct PublishedSemanticModelState {
+    overlay: Option<PublishedSemanticModelOverlay>,
+    dependency_evidence: HashMap<Language, Arc<super::DependencyDiscoveryEvidence>>,
 }
 
 struct PublishedSemanticModelOverlay {
@@ -906,26 +911,26 @@ impl SemanticModelRuntimeCache {
                 max_retained_bytes,
                 |_, active| u32::try_from(active.retained_bytes()).unwrap_or(u32::MAX),
             ),
-            overlay: Mutex::new(None),
-            dependency_evidence: Mutex::new(HashMap::default()),
+            published: Mutex::new(PublishedSemanticModelState::default()),
         }
     }
 
-    /// Retain one discovery run's evidence for every language its ecosystem
-    /// serves (Python; JavaScript and TypeScript together). A later run for
-    /// the same ecosystem replaces the earlier evidence.
+    /// Retain one discovery run's evidence for every language its ecosystem serves.
+    /// Production hosts use the atomic activation method instead.
     pub(crate) fn retain_dependency_discovery_evidence(
         &self,
         languages: &[Language],
         evidence: super::DependencyDiscoveryEvidence,
     ) {
         let evidence = Arc::new(evidence);
-        let mut slot = self
-            .dependency_evidence
+        let mut published = self
+            .published
             .lock()
-            .expect("dependency-discovery evidence mutex poisoned");
+            .expect("semantic-model publication mutex poisoned");
         for language in languages {
-            slot.insert(*language, Arc::clone(&evidence));
+            published
+                .dependency_evidence
+                .insert(*language, Arc::clone(&evidence));
         }
     }
 
@@ -933,17 +938,32 @@ impl SemanticModelRuntimeCache {
         &self,
         language: Language,
     ) -> Option<Arc<super::DependencyDiscoveryEvidence>> {
-        self.dependency_evidence
+        self.published
             .lock()
-            .expect("dependency-discovery evidence mutex poisoned")
+            .expect("semantic-model publication mutex poisoned")
+            .dependency_evidence
             .get(&language)
             .cloned()
     }
 
-    pub(crate) fn overlay(&self) -> Option<Arc<SemanticModelOverlay>> {
-        self.overlay
+    pub(crate) fn invalidate_dependency_pack_state(&self, languages: &[Language]) -> bool {
+        let mut published = self
+            .published
             .lock()
-            .expect("semantic-model overlay mutex poisoned")
+            .expect("semantic-model publication mutex poisoned");
+        let mut evidence_changed = false;
+        for language in languages {
+            evidence_changed |= published.dependency_evidence.remove(language).is_some();
+        }
+        let overlay_changed = published.overlay.take().is_some();
+        evidence_changed || overlay_changed
+    }
+
+    pub(crate) fn overlay(&self) -> Option<Arc<SemanticModelOverlay>> {
+        self.published
+            .lock()
+            .expect("semantic-model publication mutex poisoned")
+            .overlay
             .as_ref()
             .map(|published| Arc::clone(&published.overlay))
     }
@@ -952,18 +972,20 @@ impl SemanticModelRuntimeCache {
         &self,
         analyzer: &dyn IAnalyzer,
         active: &Arc<ResolvedActiveSemanticModels>,
+        dependency_evidence: Option<&[(Box<[Language]>, super::DependencyDiscoveryEvidence)]>,
         cancellation: &CancellationToken,
         max_combined_retained_bytes: u64,
     ) -> Result<Arc<SemanticModelOverlay>, SemanticModelOverlayBuildError> {
         {
-            let slot = self
-                .overlay
+            let published = self
+                .published
                 .lock()
-                .expect("semantic-model overlay mutex poisoned");
-            if let Some(published) = slot.as_ref()
-                && Arc::ptr_eq(&published.active, active)
+                .expect("semantic-model publication mutex poisoned");
+            if dependency_evidence.is_none()
+                && let Some(overlay) = published.overlay.as_ref()
+                && Arc::ptr_eq(&overlay.active, active)
             {
-                return Ok(Arc::clone(&published.overlay));
+                return Ok(Arc::clone(&overlay.overlay));
             }
         }
         let overlay = Arc::new(SemanticModelOverlay::build(
@@ -972,16 +994,27 @@ impl SemanticModelRuntimeCache {
             cancellation,
             max_combined_retained_bytes,
         )?);
-        let mut slot = self
-            .overlay
+        let mut published = self
+            .published
             .lock()
-            .expect("semantic-model overlay mutex poisoned");
-        if let Some(published) = slot.as_ref()
-            && Arc::ptr_eq(&published.active, active)
+            .expect("semantic-model publication mutex poisoned");
+        if dependency_evidence.is_none()
+            && let Some(current) = published.overlay.as_ref()
+            && Arc::ptr_eq(&current.active, active)
         {
-            return Ok(Arc::clone(&published.overlay));
+            return Ok(Arc::clone(&current.overlay));
         }
-        *slot = Some(PublishedSemanticModelOverlay {
+        if let Some(evidence) = dependency_evidence {
+            for (languages, value) in evidence {
+                let value = Arc::new(value.clone());
+                for language in languages {
+                    published
+                        .dependency_evidence
+                        .insert(*language, Arc::clone(&value));
+                }
+            }
+        }
+        published.overlay = Some(PublishedSemanticModelOverlay {
             active: Arc::clone(active),
             overlay: Arc::clone(&overlay),
         });
@@ -1328,6 +1361,26 @@ pub fn acquire_active_semantic_models(
     request: &SemanticModelActivationRequest,
     cancellation: &CancellationToken,
 ) -> SemanticModelRuntimeOutcome {
+    acquire_active_semantic_models_with_evidence(
+        analyzer,
+        catalog,
+        persistence,
+        request,
+        None,
+        cancellation,
+    )
+}
+
+/// Acquire and atomically publish one generation's overlay and discovery evidence.
+/// A failed acquisition leaves the previously complete publication unchanged.
+pub fn acquire_active_semantic_models_with_evidence(
+    analyzer: &dyn IAnalyzer,
+    catalog: &SemanticPackCatalog,
+    persistence: Option<SemanticModelActivationPersistence<'_>>,
+    request: &SemanticModelActivationRequest,
+    dependency_evidence: Option<&[(Box<[Language]>, super::DependencyDiscoveryEvidence)]>,
+    cancellation: &CancellationToken,
+) -> SemanticModelRuntimeOutcome {
     let request_key = match runtime_request_key(request) {
         Ok(key) => key,
         Err(reason) => {
@@ -1369,16 +1422,17 @@ pub fn acquire_active_semantic_models(
             if !analyzer.snapshot_generations_match(&generations) {
                 return stale_generation_outcome(request.limits);
             }
+            if let Err(error) = publish_active_models(catalog, persistence, &value) {
+                return catalog_lifecycle_error(request.limits, "publish", error);
+            }
             if let Err(error) = caches.semantic_models().publish_overlay(
                 analyzer,
                 &value,
+                dependency_evidence,
                 cancellation,
                 request.limits.max_retained_bytes,
             ) {
                 return overlay_build_outcome(&value, error, request.limits);
-            }
-            if let Err(error) = publish_active_models(catalog, persistence, &value) {
-                return catalog_lifecycle_error(request.limits, "publish", error);
             }
             SemanticModelRuntimeOutcome::Ready {
                 active: value,
@@ -1394,16 +1448,17 @@ pub fn acquire_active_semantic_models(
                 return stale_generation_outcome(request.limits);
             }
             let active = Arc::new(active);
+            if let Err(error) = publish_active_models(catalog, persistence, &active) {
+                return catalog_lifecycle_error(request.limits, "publish", error);
+            }
             if let Err(error) = caches.semantic_models().publish_overlay(
                 analyzer,
                 &active,
+                dependency_evidence,
                 cancellation,
                 request.limits.max_retained_bytes,
             ) {
                 return overlay_build_outcome(&active, error, request.limits);
-            }
-            if let Err(error) = publish_active_models(catalog, persistence, &active) {
-                return catalog_lifecycle_error(request.limits, "publish", error);
             }
             permit.publish_complete(Arc::clone(&active));
             SemanticModelRuntimeOutcome::Ready {

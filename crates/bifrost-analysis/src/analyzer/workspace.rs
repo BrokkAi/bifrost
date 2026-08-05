@@ -1,15 +1,20 @@
 use crate::analyzer::semantic_model::{
-    DependencyDiscoveryEvidence, DependencyDiscoveryOutcome, DependencyPackLimits,
-    DependencyPackPreparationOutcome, SemanticModelActivationPersistence,
+    DependencyDiscoveryEvidence, DependencyDiscoveryOutcome, DependencyPackAdapter,
+    DependencyPackLimits, DependencyPackPreparationOutcome, SemanticModelActivationPersistence,
     SemanticModelActivationRequest, SemanticModelRuntimeOutcome, SemanticPackCatalog,
-    acquire_active_semantic_models, prepare_dependency_semantic_packs,
+    acquire_active_semantic_models_with_evidence, prepare_dependency_semantic_packs,
 };
 use crate::analyzer::store::StoreError;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerDelegate, BuildProgress, CSharpAnalyzer, CppAnalyzer, GoAnalyzer,
-    IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, KotlinAnalyzer, Language, MultiAnalyzer,
-    PhpAnalyzer, Project, PythonAnalyzer, PythonDependencyPackAdapter, RubyAnalyzer, RustAnalyzer,
-    ScalaAnalyzer, TypescriptAnalyzer, resolve_python_semantic_pack_dependencies,
+    AnalyzerConfig, AnalyzerDelegate, BuildProgress, CSharpAnalyzer, CSharpDependencyPackAdapter,
+    CppAnalyzer, GoAnalyzer, GoDependencyPackAdapter, IAnalyzer, JavaAnalyzer, JavascriptAnalyzer,
+    JsTsDependencyPackAdapter, JvmDependencyPackAdapter, KotlinAnalyzer, Language, MultiAnalyzer,
+    PhpAnalyzer, Project, PythonAnalyzer, PythonDependencyPackAdapter, RubyAnalyzer,
+    RubyDependencyPackAdapter, RustAnalyzer, RustDependencyPackAdapter, ScalaAnalyzer,
+    TypescriptAnalyzer, resolve_csharp_semantic_pack_dependencies,
+    resolve_go_semantic_pack_dependencies, resolve_js_ts_semantic_pack_dependencies,
+    resolve_jvm_semantic_pack_dependencies, resolve_python_semantic_pack_dependencies,
+    resolve_ruby_semantic_pack_dependencies, resolve_rust_semantic_pack_dependencies,
 };
 use crate::profiling;
 use std::collections::{BTreeMap, BTreeSet};
@@ -165,11 +170,11 @@ pub enum WorkspaceAnalyzer {
     Multi(Box<MultiAnalyzer>),
 }
 
-/// Caller-owned state needed to activate explicitly configured Python API packs.
+/// Caller-owned state needed to activate explicitly configured dependency packs.
 /// Constructing a workspace never opens a semantic-pack catalog or discovers an
-/// interpreter; hosts must opt in by supplying this context.
+/// ecosystem; hosts must opt in by supplying this context.
 #[derive(Clone, Copy)]
-pub struct PythonSemanticModelWorkspaceContext<'a> {
+pub struct DependencyPackWorkspaceContext<'a> {
     pub catalog: &'a SemanticPackCatalog,
     pub persistence: Option<SemanticModelActivationPersistence<'a>>,
     pub activation: &'a SemanticModelActivationRequest,
@@ -177,11 +182,70 @@ pub struct PythonSemanticModelWorkspaceContext<'a> {
     pub cancellation: &'a crate::CancellationToken,
 }
 
+pub type PythonSemanticModelWorkspaceContext<'a> = DependencyPackWorkspaceContext<'a>;
+
 #[derive(Debug)]
 pub struct PythonSemanticModelActivationOutcome {
     pub discovery: DependencyDiscoveryOutcome,
     pub preparation: Option<DependencyPackPreparationOutcome>,
     pub runtime: Option<SemanticModelRuntimeOutcome>,
+}
+
+/// One dependency ecosystem whose exact local evidence a host can activate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DependencyPackEcosystem {
+    Jvm,
+    DotNet,
+    Npm,
+    Python,
+    Go,
+    Cargo,
+    Ruby,
+}
+
+impl DependencyPackEcosystem {
+    pub fn languages(self) -> &'static [Language] {
+        match self {
+            Self::Jvm => &[Language::Java, Language::Kotlin, Language::Scala],
+            Self::DotNet => &[Language::CSharp],
+            Self::Npm => &[Language::JavaScript, Language::TypeScript],
+            Self::Python => &[Language::Python],
+            Self::Go => &[Language::Go],
+            Self::Cargo => &[Language::Rust],
+            Self::Ruby => &[Language::Ruby],
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DependencyPackEcosystemOutcome {
+    pub ecosystem: DependencyPackEcosystem,
+    pub discovery: DependencyDiscoveryOutcome,
+    pub preparation: Option<DependencyPackPreparationOutcome>,
+}
+
+/// Result of one host-owned activation transaction.
+#[derive(Debug)]
+pub struct DependencyPackActivationOutcome {
+    pub ecosystems: Vec<DependencyPackEcosystemOutcome>,
+    pub runtime: Option<SemanticModelRuntimeOutcome>,
+    /// Hosts must refresh published diagnostics when this value is true.
+    pub diagnostic_refresh_required: bool,
+}
+
+impl DependencyPackActivationOutcome {
+    pub fn complete(&self) -> bool {
+        self.ecosystems.iter().all(|outcome| {
+            outcome.discovery.complete
+                && outcome
+                    .preparation
+                    .as_ref()
+                    .is_some_and(|preparation| preparation.complete)
+        }) && self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| matches!(runtime, SemanticModelRuntimeOutcome::Ready { .. }))
+    }
 }
 
 impl PythonSemanticModelActivationOutcome {
@@ -196,6 +260,169 @@ impl PythonSemanticModelActivationOutcome {
 }
 
 impl WorkspaceAnalyzer {
+    /// Discover, prepare, and publish exact local dependency packs as one
+    /// analyzer-generation transaction. Diagnostic requests only read the
+    /// published result and never call this host-owned method.
+    pub fn activate_dependency_packs(
+        &self,
+        config: &AnalyzerConfig,
+        ecosystems: &[DependencyPackEcosystem],
+        context: DependencyPackWorkspaceContext<'_>,
+    ) -> DependencyPackActivationOutcome {
+        let mut outcomes = Vec::with_capacity(ecosystems.len());
+        let mut activation = context.activation.clone();
+        let mut publication_evidence = Vec::with_capacity(ecosystems.len());
+
+        for ecosystem in ecosystems.iter().copied() {
+            let mut limits = context.limits;
+            if ecosystem == DependencyPackEcosystem::Python
+                && let Some(environment) = &config.python.environment
+            {
+                limits.max_artifacts_per_dependency = limits
+                    .max_artifacts_per_dependency
+                    .max(environment.limits.max_files_per_distribution);
+            }
+            let (discovery, adapter): (DependencyDiscoveryOutcome, &dyn DependencyPackAdapter) =
+                match ecosystem {
+                    DependencyPackEcosystem::Jvm => (
+                        resolve_jvm_semantic_pack_dependencies(
+                            &config.jvm,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &JvmDependencyPackAdapter,
+                    ),
+                    DependencyPackEcosystem::DotNet => (
+                        resolve_csharp_semantic_pack_dependencies(
+                            &config.csharp,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &CSharpDependencyPackAdapter,
+                    ),
+                    DependencyPackEcosystem::Npm => (
+                        resolve_js_ts_semantic_pack_dependencies(
+                            &config.js_ts.dependency_discovery,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &JsTsDependencyPackAdapter,
+                    ),
+                    DependencyPackEcosystem::Python => (
+                        resolve_python_semantic_pack_dependencies(
+                            &config.python,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &PythonDependencyPackAdapter,
+                    ),
+                    DependencyPackEcosystem::Go => (
+                        resolve_go_semantic_pack_dependencies(
+                            &config.go,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &GoDependencyPackAdapter,
+                    ),
+                    DependencyPackEcosystem::Cargo => (
+                        resolve_rust_semantic_pack_dependencies(
+                            &config.rust,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &RustDependencyPackAdapter,
+                    ),
+                    DependencyPackEcosystem::Ruby => (
+                        resolve_ruby_semantic_pack_dependencies(
+                            &config.ruby,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &RubyDependencyPackAdapter,
+                    ),
+                };
+            if discovery.cancelled || !discovery.complete {
+                outcomes.push(DependencyPackEcosystemOutcome {
+                    ecosystem,
+                    discovery,
+                    preparation: None,
+                });
+                return DependencyPackActivationOutcome {
+                    ecosystems: outcomes,
+                    runtime: None,
+                    diagnostic_refresh_required: false,
+                };
+            }
+            let preparation = prepare_dependency_semantic_packs(
+                context.catalog,
+                adapter,
+                &discovery.dependencies,
+                &limits,
+                Some(context.cancellation),
+            );
+            if !preparation.complete {
+                outcomes.push(DependencyPackEcosystemOutcome {
+                    ecosystem,
+                    discovery,
+                    preparation: Some(preparation),
+                });
+                return DependencyPackActivationOutcome {
+                    ecosystems: outcomes,
+                    runtime: None,
+                    diagnostic_refresh_required: false,
+                };
+            }
+            activation
+                .evidence
+                .extend(preparation.evidence.iter().cloned());
+            publication_evidence.push((
+                ecosystem.languages().to_vec().into_boxed_slice(),
+                DependencyDiscoveryEvidence::from_outcome(&discovery),
+            ));
+            outcomes.push(DependencyPackEcosystemOutcome {
+                ecosystem,
+                discovery,
+                preparation: Some(preparation),
+            });
+        }
+
+        activation.evidence.sort();
+        activation.evidence.dedup();
+        let runtime = acquire_active_semantic_models_with_evidence(
+            self.analyzer(),
+            context.catalog,
+            context.persistence,
+            &activation,
+            Some(&publication_evidence),
+            context.cancellation,
+        );
+        let diagnostic_refresh_required =
+            matches!(runtime, SemanticModelRuntimeOutcome::Ready { .. });
+        DependencyPackActivationOutcome {
+            ecosystems: outcomes,
+            runtime: Some(runtime),
+            diagnostic_refresh_required,
+        }
+    }
+
+    /// Invalidate published proof after a host observes changed dependency inputs.
+    pub fn invalidate_dependency_pack_state(&self, ecosystems: &[DependencyPackEcosystem]) -> bool {
+        let languages = ecosystems
+            .iter()
+            .flat_map(|ecosystem| ecosystem.languages().iter().copied())
+            .collect::<Vec<_>>();
+        self.analyzer()
+            .snapshot_caches()
+            .is_some_and(|caches| caches.invalidate_dependency_pack_state(&languages))
+    }
+
     /// Discover, prepare, and publish Python environment facts into this
     /// workspace's existing snapshot. A disabled environment is a successful
     /// no-op; cancellation and unavailable preparation deliberately leave any
@@ -205,48 +432,17 @@ impl WorkspaceAnalyzer {
         config: &AnalyzerConfig,
         context: PythonSemanticModelWorkspaceContext<'_>,
     ) -> PythonSemanticModelActivationOutcome {
-        let mut limits = context.limits;
-        if let Some(environment) = &config.python.environment {
-            limits.max_artifacts_per_dependency = limits
-                .max_artifacts_per_dependency
-                .max(environment.limits.max_files_per_distribution);
-        }
-        let discovery = resolve_python_semantic_pack_dependencies(
-            &config.python,
-            self.analyzer().project(),
-            &limits,
-            Some(context.cancellation),
-        );
-        self.retain_dependency_discovery_evidence(&[Language::Python], &discovery);
-        if discovery.cancelled || discovery.dependencies.is_empty() {
-            return PythonSemanticModelActivationOutcome {
-                discovery,
-                preparation: None,
-                runtime: None,
-            };
-        }
-        let preparation = prepare_dependency_semantic_packs(
-            context.catalog,
-            &PythonDependencyPackAdapter,
-            &discovery.dependencies,
-            &limits,
-            Some(context.cancellation),
-        );
-        let runtime = preparation
-            .compose_activation_request(context.activation.clone())
-            .map(|activation| {
-                acquire_active_semantic_models(
-                    self.analyzer(),
-                    context.catalog,
-                    context.persistence,
-                    &activation,
-                    context.cancellation,
-                )
-            });
+        let outcome =
+            self.activate_dependency_packs(config, &[DependencyPackEcosystem::Python], context);
+        let mut ecosystems = outcome.ecosystems.into_iter();
+        let ecosystem = ecosystems
+            .next()
+            .expect("Python activation always records its ecosystem outcome");
+        debug_assert!(ecosystems.next().is_none());
         PythonSemanticModelActivationOutcome {
-            discovery,
-            preparation: Some(preparation),
-            runtime,
+            discovery: ecosystem.discovery,
+            preparation: ecosystem.preparation,
+            runtime: outcome.runtime,
         }
     }
 
@@ -259,7 +455,7 @@ impl WorkspaceAnalyzer {
     ///
     /// A cancelled discovery retains nothing: its outcome is a statement about
     /// the cancellation, not about the build.
-    pub fn retain_dependency_discovery_evidence(
+    pub(crate) fn retain_dependency_discovery_evidence(
         &self,
         languages: &[Language],
         discovery: &DependencyDiscoveryOutcome,
