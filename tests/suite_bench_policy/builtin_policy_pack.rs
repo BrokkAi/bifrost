@@ -235,13 +235,6 @@ export function nestedSmell(rows) {
     }
   }
 }
-
-export function invariantSort(items, groups) {
-  for (const group of groups) {
-    items.sort();
-  }
-  return items.length;
-}
 "#;
 
 const JAVASCRIPT_NEAR_MISSES: &str = r#"export function safe(value) {
@@ -519,15 +512,13 @@ fn expected_finding_lines(policy_id: &str) -> BTreeMap<&'static str, Vec<u64>> {
             ("positive.ts", &[2, 3]),
         ],
         "bifrost.correctness.unsafe-deserialization" => &[("positive.py", &[13, 14])],
-        "bifrost.performance.loop-invariant-sort" => &[
+        "bifrost.performance.sort-in-loop" => &[
             ("positive.py", &[18]),
-            ("deferred.py", &[10]),
             ("Positive.java", &[4]),
-            ("Deferred.java", &[6]),
-            ("positive.js", &[40]),
             ("positive.ts", &[20]),
-            ("deferred.ts", &[4]),
             ("positive.rs", &[3, 4, 5, 6, 7, 8, 9]),
+            ("positive.tsx", &[3]),
+            ("tsx/positive.tsx", &[3]),
         ],
         "bifrost.performance.regex-compile-in-loop" => &[
             ("positive.py", &[19]),

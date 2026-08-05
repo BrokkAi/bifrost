@@ -10,10 +10,13 @@
 //!
 //! `tests/fixtures/policies/loop-invariant-receiver.rqlp` asks the real
 //! question, and this module is the evidence that it separates the true
-//! positive from every dominant false-positive family in that corpus. The rule
-//! is deliberately *not* added to the built-in pack: it claims one language,
-//! and the pack bar requires proven near-misses per claimed language plus
-//! re-verification on every adapter graduation. Promoting it is a follow-up.
+//! positive from every dominant false-positive family in that corpus, for all
+//! five claimed languages (#1598 graduated the prototype's proof from Rust to
+//! Rust, Python, Java, TypeScript, and JavaScript). The rule is *still* not in
+//! the built-in pack, but no longer for proof reasons: workspace-scale
+//! assertion evaluation exhausts the pipeline row budget on this repository
+//! and took a 68-minute release-build pack run, so promotion waits on that
+//! capability. The rule header records the numbers.
 //!
 //! Each near-miss must be clean for the right reason, so every test asserts the
 //! run's completion before its findings.
@@ -33,9 +36,7 @@ use brokk_bifrost::{
 
 /// The checked-in prototype rule, read rather than inlined so the file that
 /// ships is the file that is tested.
-const RULE: &str = include_str!(
-    "../../crates/bifrost-policy/policy-packs/bifrost.code-smells/policies/loop-invariant-sort.rqlp"
-);
+const RULE: &str = include_str!("../fixtures/policies/loop-invariant-receiver.rqlp");
 
 fn run_rule(source: &str) -> PolicyRun {
     run_source(RULE, Language::Rust, "src/order.rs", source)
@@ -664,5 +665,19 @@ fn javascript_rebinding_inside_the_loop_is_not_a_finding() {
         Language::JavaScript,
         "src/order.js",
         JAVASCRIPT_NEAR_MISS_REBINDING,
+    );
+}
+
+/// A workspace with no subjects must be clean, complete, and cheap. Before the
+/// empty-path guard in the assertion evaluator, a subject-less run seeded its
+/// occurrence/binding/scope queries with an empty exact-path list -- an
+/// unrestricted seed -- and scanned every file in the workspace, inheriting
+/// completeness verdicts (and hours of work) from files the policy had
+/// nothing to say about.
+#[test]
+fn a_workspace_with_no_subjects_is_clean_and_complete() {
+    assert_clean(
+        "no subjects",
+        "pub fn order(values: Vec<usize>) -> usize {\n    values.len()\n}\n",
     );
 }

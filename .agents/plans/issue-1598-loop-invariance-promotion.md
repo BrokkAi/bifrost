@@ -14,20 +14,25 @@ After this change, the pack ships `bifrost.performance.loop-invariant-sort` (rep
 
 - [x] (2026-08-05) Studied the prototype rule, its suite, the `assert-reaching` vocabulary (`:role receiver_position`, `:relative-to` capture), the occurrence-role registry, and the old `sort-in-loop` selectors.
 - [x] (2026-08-05) Authored this plan.
-- [ ] Milestone 1: promoted rule source in the pack with explicit schema pins; prototype suite re-pointed at the pack file; Rust fixtures passing unchanged.
-- [ ] Milestone 2: per-language positive + near-miss fixtures for every claimed language; claim trimmed to what passes.
-- [ ] Milestone 3: pack manifest (new entry, `sort-in-loop` removed, semantic hash, version 2.0.0), `builtin_policy_pack.rs` expectations updated, pack docs updated.
-- [ ] Milestone 4: fix the precedence.rs ready-set re-sort at the root; drop all `sort-in-loop` suppressions; re-run the gate clean; validation sweep; PR.
+- [x] (2026-08-05) Milestone 1: rule source with explicit schema pins (policy 1, RQL 9); suite re-pointed; Rust fixtures passing unchanged.
+- [x] (2026-08-05) Milestone 2: per-language positive + near-miss fixtures — all five attempted languages (Rust, Python, Java, TypeScript, JavaScript) proved the pair contract; nothing needed trimming. The receiver was additionally constrained to identifiers (see Decision Log).
+- [x] (2026-08-05) Milestone 3: pack integration was built and tested end to end (manifest 2.0.0, expectations, docs) and then *deliberately unwound* after Milestone 4's gate measurements — see the Decision Log entry on parking the promotion. The pack ships unchanged; the proven rule lives at `tests/fixtures/policies/loop-invariant-receiver.rqlp` as the promotion candidate.
+- [x] (2026-08-05) Milestone 4: precedence.rs ready-set re-sort fixed at the root (binary-search insertion); three assertion-evaluator defects found and fixed; workspace-scale gate measured (68m49s release, `pipeline_row_budget` + `partial_discovery` -> inconclusive), which blocks the pack flip; scale blocker filed as a follow-up issue and recorded on #1598.
 
 ## Surprises & Discoveries
 
 - Observation: the old `sort-in-loop` selects Python/Java/TS by file glob (`where "*.py" ... (call :callee (name "sort"))`) rather than per-language filters, and does not claim JavaScript. The promoted rule uses explicit `language` filters throughout.
   Evidence: `crates/bifrost-policy/policy-packs/bifrost.code-smells/policies/sort-in-loop.rqlp` on master.
+- Observation: promotion exposed three defects in the #1604 assertion evaluator, all invisible to its single-file conformance tests. (1) The occurrence-to-reaching-binding join was keyed by canonical AST id alone, so two files with identical content (the duplicated TSX pack fixtures) collided and tripped the construction-point path assertion; the key is now path-qualified. (2) A subject-less assertion policy seeded its occurrence/binding/scope queries with an empty exact-path list, which is an *unrestricted* seed: the policy scanned every file in the workspace — the whole-repository gate ran for three hours before being killed, and `--root crates/bifrost-core` (zero subjects) could not finish in 120s while the naive sleep rule took 2.3s. The evaluator now skips the row-family queries entirely when there are no subjects (vacuously-held asserts, verdict from the subject query), and the query builders assert non-empty paths at the construction point. (3) With that fixed, mixed workspaces still went inconclusive: `[...values].sort()` in `scripts/*.mjs` has an expression receiver with no occurrence identity, and the soundness posture correctly refuses to guess — so the rule's subject now requires an *identifier* receiver, making "named receivers only" the tested claim instead of an accidental run-killer.
+  Evidence: killed background run bvhxrj5zk (138 CPU-minutes, no output); probe timings in this session (core: >120s before, 6s complete after; scripts: inconclusive before, re-verified after); `a_workspace_with_no_subjects_is_clean_and_complete` in the promoted suite.
 
 ## Decision Log
 
 - Decision: Replace `bifrost.performance.sort-in-loop` with a new id, `bifrost.performance.loop-invariant-sort`, rather than changing the analysis under the old id or shipping both.
   Rationale: The id should say what the rule proves; "sort-in-loop" names lexical containment, which is exactly the discredited question. Shipping both would double-report every true positive. Backward compatibility is explicitly not a requirement in this repository; the suppression file consequences are handled in Milestone 4.
+  Date/Author: 2026-08-05, session with dbakereffendi.
+- Decision: The subject requires an identifier receiver (`:receiver (identifier :capture "target")`), so the rule addresses named receivers only.
+  Rationale: An expression receiver (`[...values].sort()`) carries no occurrence identity, and the assertion evaluator's soundness posture — correctly — makes a capture without identity an inconclusive run rather than a guess. Constraining the subject turns that from a workspace-dependent run-killer into a stated, tested scope boundary; expression receivers are fresh values per evaluation anyway, so nothing the rule wants is lost.
   Date/Author: 2026-08-05, session with dbakereffendi.
 - Decision: Receiver-form sorts only in this promotion (`x.sort*()` with `assert-reaching :role receiver_position`); argument-form sorts (`sorted(xs)` in Python, `Collections.sort(list)` in Java) are recorded as a future extension, not claimed.
   Rationale: The argument form needs a differently-rooted capture and role (`value_reference` on an argument), doubling the fixture matrix. The receiver form is what the prototype proved and what the 160-finding corpus consisted of. Claiming less and proving all of it beats claiming more.
@@ -48,9 +53,17 @@ After this change, the pack ships `bifrost.performance.loop-invariant-sort` (rep
   Rationale: The prototype suite's comment already states "the file that ships is the file that is tested"; after promotion the shipped file is the pack file, and a divergent copy would rot.
   Date/Author: 2026-08-05, session with dbakereffendi.
 
+- Decision: Park the pack flip; land the proven rule as the checked-in candidate plus the evaluator fixes, and file the workspace-scale assertion evaluation blocker separately.
+  Rationale: The release-build pack run on this repository took 68m49s and the rule concluded `inconclusive` (`pipeline_row_budget`, `partial_discovery`): at ~60 subject files the assertion path's single-pipeline row materialization exhausts the policy row budget, so the rule cannot conclude at exactly the scale the pack must serve, and the runtime alone violates the repository's latency rules. Shipping the naive rule's replacement in that state would trade a false-positive problem for an unreliable-gate problem.
+  Date/Author: 2026-08-05, session with dbakereffendi.
+
 ## Outcomes & Retrospective
 
-Not yet started; to be written as milestones complete.
+Complete as a proof-and-fixes change; the pack flip itself is parked. What landed: the candidate rule at full strength (five languages, identifier receivers, explicit schema pins) with its 22-test pair-contract suite; three real assertion-evaluator fixes (path-qualified binding joins, the empty-path unrestricted-seed scan that made a subject-less policy walk the whole workspace, and the construction-point guards that prevent it recurring); and the precedence.rs root-cause fix that removes the corpus's one true positive from the codebase instead of suppressing it.
+
+What did not land, and why: shipping the rule in `bifrost.code-smells` was fully built (pack 2.0.0, manifest hash, expectations, docs) and then unwound, because the workspace-scale measurement said no: a release-build pack run on this repository took 68m49s and the rule still ended `inconclusive` on `pipeline_row_budget` + `partial_discovery` — the assertion path materializes every occurrence/binding/scope row for all subject files through one query pipeline, and ~60 subject files (several over 10k lines) exhaust both the budget and any reasonable latency envelope. A default-pack rule that turns every gate into an hour-long unreliable run is a worse product than the naive rule it replaces. The flip resumes when assertion evaluation can batch per file with per-file completion accounting and the lexical layer's per-file cost is understood.
+
+Lesson: single-file conformance proved the semantics but said nothing about scale; the gate measurement was the promotion's real acceptance test, and doing it before opening the PR is what kept an hour-long regression out of the default pack.
 
 ## Context and Orientation
 

@@ -374,12 +374,12 @@ fn built_in_pack_and_category_selectors_run_valid_batches() {
             "bifrost.performance.database-call-in-loop",
             "bifrost.performance.expensive-operation-in-nested-loop",
             "bifrost.performance.file-read-in-loop",
-            "bifrost.performance.loop-invariant-sort",
             "bifrost.performance.network-call-in-loop",
             "bifrost.performance.parsing-in-loop",
             "bifrost.performance.regex-compile-in-loop",
             "bifrost.performance.serialization-in-loop",
             "bifrost.performance.sleep-in-loop",
+            "bifrost.performance.sort-in-loop",
             "bifrost.performance.subprocess-in-loop",
         ]
     );
