@@ -58,6 +58,7 @@ mod ruby_semantic_diagnostics;
 mod rust_dependency_semantic_pack;
 mod scala_semantic_diagnostics;
 mod semantic_cfg_contract;
+mod semantic_diagnostic_proof_conformance;
 mod semantic_ir_contract;
 mod semantic_language_conformance;
 mod semantic_model_authoring;
