@@ -274,9 +274,9 @@ fn declaration_bounded_containment_has_shared_help_and_version_ranges() {
     let json = r#"{"schema_version":4,"match":{"kind":"call"},"inside_decl":{"kind":"loop"}}"#;
     let diagnostic = validate_query_source(json)
         .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("requires schema version 5"))
+        .find(|diagnostic| diagnostic.code == "unsupported-schema-version")
         .expect("version diagnostic");
-    assert_eq!(&json[diagnostic.range], r#""inside_decl""#);
+    assert_eq!(&json[diagnostic.range], "4");
 }
 
 #[test]
@@ -332,7 +332,7 @@ fn typed_pipeline_help_and_json_diagnostics_use_shared_schema() {
     assert!(file_of_help.description.contains("receiver analyses"));
     assert!(validate_query_source(rql).is_empty());
 
-    let json = r#"{"schema_version":2,"match":{"kind":"call"},"steps":[{"op":"file_of"}]}"#;
+    let json = r#"{"schema_version":1,"match":{"kind":"call"},"steps":[{"op":"file_of"}]}"#;
     for token in ["steps", "op", "file_of"] {
         let offset = json.find(token).unwrap();
         let help =
@@ -349,20 +349,11 @@ fn typed_pipeline_help_and_json_diagnostics_use_shared_schema() {
     );
     assert!(validate_query_source(json).is_empty());
 
-    let invalid = r#"{"schema_version":2,"match":{"kind":"call"},"steps":[{"op":"imports_of"}]}"#;
+    let invalid = r#"{"schema_version":1,"match":{"kind":"call"},"steps":[{"op":"imports_of"}]}"#;
     let diagnostic = validate_query_source(invalid).pop().expect("diagnostic");
     assert_eq!(diagnostic.code, "invalid-query");
     assert_eq!(&invalid[diagnostic.range], r#"{"op":"imports_of"}"#);
     assert!(diagnostic.message.contains("requires file"));
-
-    let version_two =
-        r#"{"schema_version":2,"match":{"kind":"function"},"steps":[{"op":"procedure_of"}]}"#;
-    let diagnostic = validate_query_source(version_two)
-        .pop()
-        .expect("diagnostic");
-    assert_eq!(diagnostic.code, "invalid-query");
-    assert_eq!(&version_two[diagnostic.range], r#""procedure_of""#);
-    assert!(diagnostic.message.contains("requires schema version 3"));
 }
 
 #[test]
@@ -423,13 +414,6 @@ fn typestate_step_help_and_diagnostics_are_range_precise() {
     }
     assert!(validate_query_source(json).is_empty());
 
-    let version_three = r#"{"schema_version":3,"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"typestate","protocol_ref":"test:lifecycle"}]}"#;
-    let diagnostic = validate_query_source(version_three)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("requires schema version 4"))
-        .expect("schema-version diagnostic");
-    assert_eq!(&version_three[diagnostic.range], r#""typestate""#);
-
     let invalid_ref = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"typestate","protocol_ref":"missing-separator"}]}"#;
     let diagnostic = validate_query_source(invalid_ref)
         .into_iter()
@@ -459,13 +443,6 @@ fn value_flow_help_and_diagnostics_are_range_precise() {
     }
     assert!(validate_query_source(json).is_empty());
 
-    let version_five = r#"{"schema_version":5,"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"value_flow","plan_ref":"test:flow"}]}"#;
-    let diagnostic = validate_query_source(version_five)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("requires schema version 6"))
-        .expect("schema-version diagnostic");
-    assert_eq!(&version_five[diagnostic.range], r#""value_flow""#);
-
     let invalid_ref = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"value_flow","plan_ref":"missing-separator"}]}"#;
     let diagnostic = validate_query_source(invalid_ref)
         .into_iter()
@@ -486,7 +463,7 @@ fn taint_help_and_diagnostics_are_range_precise() {
     }
     assert!(validate_query_source(rql).is_empty());
 
-    let json = r#"{"schema_version":7,"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"taint","taint_ref":"test:flow"}]}"#;
+    let json = r#"{"schema_version":1,"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"taint","taint_ref":"test:flow"}]}"#;
     for token in ["taint", "taint_ref"] {
         let offset = json.find(token).unwrap();
         let help = query_source_help_at(json, offset)
@@ -494,13 +471,6 @@ fn taint_help_and_diagnostics_are_range_precise() {
         assert!(!help.description.is_empty());
     }
     assert!(validate_query_source(json).is_empty());
-
-    let version_six = r#"{"schema_version":6,"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"taint","taint_ref":"test:flow"}]}"#;
-    let diagnostic = validate_query_source(version_six)
-        .into_iter()
-        .find(|diagnostic| diagnostic.message.contains("requires schema version 7"))
-        .expect("schema-version diagnostic");
-    assert_eq!(&version_six[diagnostic.range], r#""taint""#);
 
     let invalid_ref = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"taint","taint_ref":"missing-separator"}]}"#;
     let diagnostic = validate_query_source(invalid_ref)

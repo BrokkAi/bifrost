@@ -26,91 +26,15 @@ use super::ir::{
     UNATTRIBUTED_TIER_LABEL,
 };
 
-const RQL_INITIAL_SCHEMA_VERSION: u32 = 2;
-const RQL_CFG_SCHEMA_VERSION: u32 = 3;
-const RQL_TYPESTATE_SCHEMA_VERSION: u32 = 4;
-const RQL_DECLARATION_CONTAINMENT_SCHEMA_VERSION: u32 = 5;
-const RQL_VALUE_FLOW_SCHEMA_VERSION: u32 = 6;
-const RQL_TAINT_SCHEMA_VERSION: u32 = 7;
-/// Occurrence rows, the three occurrence steps, and capture AST ids (#1473).
-const RQL_OCCURRENCE_SCHEMA_VERSION: u32 = 8;
-/// Lexical scope, binding and resolution-candidate rows, their two seeds and
-/// seven steps, and the package clause on the file row (#1474).
-const RQL_RESOLUTION_SCHEMA_VERSION: u32 = 9;
-/// Qualified-path and path-segment rows, the `paths` seed, and the
-/// `segments-of`/`segment-target` steps (#1475).
-const RQL_IDENTITY_SCHEMA_VERSION: u32 = 10;
-/// Canonical reference-edge rows and the edges-of / edges-from / edge-target
-/// steps (#1479). Version 11 because #1475 claimed 10 on a divergent branch,
-/// the same renumbering the #1473/#1474 merge recorded for version 2.
-const RQL_REFERENCE_EDGE_SCHEMA_VERSION: u32 = 11;
-/// Declaration materialization: generation sites, exports, declaration state,
-/// implementation linkage (issue #1476). Renumbered twice at merge time:
-/// from 10 to 11 because #1475 claimed 10 first, then from 11 to 12 because
-/// #1479 landed on master with 11 while this slice was still in flight.
-const RQL_MATERIALIZATION_SCHEMA_VERSION: u32 = 12;
-/// Mandatory receiver outcome rows and parent-linked receiver evidence rows.
-const RQL_RECEIVER_EVIDENCE_SCHEMA_VERSION: u32 = 13;
-const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
-    SchemaVersionDescriptor::new(RQL_INITIAL_SCHEMA_VERSION, None, true),
-    SchemaVersionDescriptor::new(
-        RQL_CFG_SCHEMA_VERSION,
-        Some(RQL_INITIAL_SCHEMA_VERSION),
-        true,
-    ),
-    SchemaVersionDescriptor::new(
-        RQL_TYPESTATE_SCHEMA_VERSION,
-        Some(RQL_CFG_SCHEMA_VERSION),
-        true,
-    ),
-    SchemaVersionDescriptor::new(
-        RQL_DECLARATION_CONTAINMENT_SCHEMA_VERSION,
-        Some(RQL_TYPESTATE_SCHEMA_VERSION),
-        true,
-    ),
-    SchemaVersionDescriptor::new(
-        RQL_VALUE_FLOW_SCHEMA_VERSION,
-        Some(RQL_DECLARATION_CONTAINMENT_SCHEMA_VERSION),
-        true,
-    ),
-    SchemaVersionDescriptor::new(
-        RQL_TAINT_SCHEMA_VERSION,
-        Some(RQL_VALUE_FLOW_SCHEMA_VERSION),
-        true,
-    ),
-    SchemaVersionDescriptor::new(
-        RQL_OCCURRENCE_SCHEMA_VERSION,
-        Some(RQL_TAINT_SCHEMA_VERSION),
-        true,
-    ),
-    SchemaVersionDescriptor::new(
-        RQL_RESOLUTION_SCHEMA_VERSION,
-        Some(RQL_OCCURRENCE_SCHEMA_VERSION),
-        true,
-    ),
-    SchemaVersionDescriptor::new(
-        RQL_IDENTITY_SCHEMA_VERSION,
-        Some(RQL_RESOLUTION_SCHEMA_VERSION),
-        true,
-    ),
-    SchemaVersionDescriptor::new(
-        RQL_REFERENCE_EDGE_SCHEMA_VERSION,
-        Some(RQL_IDENTITY_SCHEMA_VERSION),
-        true,
-    ),
-    SchemaVersionDescriptor::new(
-        RQL_MATERIALIZATION_SCHEMA_VERSION,
-        Some(RQL_REFERENCE_EDGE_SCHEMA_VERSION),
-        true,
-    ),
-    SchemaVersionDescriptor::new(
-        RQL_RECEIVER_EVIDENCE_SCHEMA_VERSION,
-        Some(RQL_MATERIALIZATION_SCHEMA_VERSION),
-        true,
-    ),
-];
+/// The single RQL schema version. The pre-1.0 lineage (versions 2 through 13,
+/// every step auto-compatible with the next) carried no information, so it
+/// was collapsed to this one version. Mint a new version only when an
+/// existing query stops parsing or changes meaning.
+const RQL_SCHEMA_VERSION: u32 = 1;
+const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] =
+    &[SchemaVersionDescriptor::new(RQL_SCHEMA_VERSION, None, true)];
 
-const _: () = assert!(RQL_RECEIVER_EVIDENCE_SCHEMA_VERSION as u64 == SCHEMA_VERSION);
+const _: () = assert!(RQL_SCHEMA_VERSION as u64 == SCHEMA_VERSION);
 
 static RQL_SCHEMA_VERSION_REGISTRY: OnceLock<SchemaVersionRegistry> = OnceLock::new();
 
@@ -119,10 +43,6 @@ pub(crate) fn rql_schema_version_registry() -> &'static SchemaVersionRegistry {
         SchemaVersionRegistry::new(RQL_SCHEMA_VERSIONS)
             .expect("the compiled-in RQL schema lineage must be valid")
     })
-}
-
-pub(super) const fn oldest_rql_schema_version() -> u64 {
-    RQL_SCHEMA_VERSIONS[0].version as u64
 }
 
 pub fn supported_query_schema_versions() -> Vec<u64> {
@@ -348,22 +268,12 @@ impl CodeQueryExecutionMode {
     }
 }
 
-macro_rules! minimum_schema_version {
-    () => {
-        RQL_INITIAL_SCHEMA_VERSION as u64
-    };
-    ($version:literal) => {
-        $version
-    };
-}
-
 macro_rules! query_step_ops {
     ($($variant:ident {
         label: $label:literal,
         signature: $signature:literal,
         description: $description:literal
         $(, semantic: [$($semantic:ident),*])?
-        $(, since: $since:literal)?
         $(,)?
     })+) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,12 +308,6 @@ macro_rules! query_step_ops {
             pub fn description(self) -> &'static str {
                 match self {
                     $(Self::$variant => $description,)+
-                }
-            }
-
-            pub const fn minimum_schema_version(self) -> u64 {
-                match self {
-                    $(Self::$variant => minimum_schema_version!($($since)?),)+
                 }
             }
 
@@ -491,17 +395,17 @@ pub enum QuerySemanticFacet {
 
 query_step_ops! {
     EnclosingDecl { label: "enclosing_decl", signature: "structural_match -> declaration", description: "Map structural matches to their smallest real enclosing declarations." }
-    ProcedureOf { label: "procedure_of", signature: "structural_match|declaration -> procedure", description: "Resolve each source-backed input to its smallest enclosing executable procedure.", semantic: [Procedures], since: 3, }
-    CfgEntry { label: "cfg_entry", signature: "procedure -> program_point", description: "Return the validated entry program point of each procedure.", semantic: [Procedures, ProgramPoints], since: 3, }
-    CfgExits { label: "cfg_exits", signature: "procedure -> program_point", description: "Return the validated normal and exceptional exit program points of each procedure.", semantic: [Procedures, ProgramPoints], since: 3, }
-    CfgSuccessorEdges { label: "cfg_successor_edges", signature: "program_point -> control_edge", description: "Return one-hop outgoing control edges from each program point.", semantic: [Procedures, ProgramPoints, ControlEdges], since: 3, }
-    CfgPredecessorEdges { label: "cfg_predecessor_edges", signature: "program_point -> control_edge", description: "Return one-hop incoming control edges to each program point.", semantic: [Procedures, ProgramPoints, ControlEdges], since: 3, }
-    CfgEdgeSource { label: "cfg_edge_source", signature: "control_edge -> program_point", description: "Project each control edge to its source program point.", semantic: [Procedures, ProgramPoints, ControlEdges], since: 3, }
-    CfgEdgeTarget { label: "cfg_edge_target", signature: "control_edge -> program_point", description: "Project each control edge to its target program point.", semantic: [Procedures, ProgramPoints, ControlEdges], since: 3, }
-    Typestate { label: "typestate", signature: "procedure -> typestate_finding", description: "Run one registered diagnostic-neutral typestate analysis for the exact procedure root.", semantic: [Procedures, Typestate], since: 4, }
-    ValueFlow { label: "value_flow", signature: "procedure -> flow_endpoint", description: "Run one registered diagnostic-neutral value-flow plan for the exact procedure root.", semantic: [Procedures, ValueFlow], since: 6, }
-    Taint { label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint], since: 7, }
-    Witness { label: "witness", signature: "typestate_finding|flow_endpoint -> typestate_witness|flow_witness", description: "Project bounded retained evidence from each typestate finding or reached flow endpoint without rerunning analysis.", since: 4, }
+    ProcedureOf { label: "procedure_of", signature: "structural_match|declaration -> procedure", description: "Resolve each source-backed input to its smallest enclosing executable procedure.", semantic: [Procedures] }
+    CfgEntry { label: "cfg_entry", signature: "procedure -> program_point", description: "Return the validated entry program point of each procedure.", semantic: [Procedures, ProgramPoints] }
+    CfgExits { label: "cfg_exits", signature: "procedure -> program_point", description: "Return the validated normal and exceptional exit program points of each procedure.", semantic: [Procedures, ProgramPoints] }
+    CfgSuccessorEdges { label: "cfg_successor_edges", signature: "program_point -> control_edge", description: "Return one-hop outgoing control edges from each program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    CfgPredecessorEdges { label: "cfg_predecessor_edges", signature: "program_point -> control_edge", description: "Return one-hop incoming control edges to each program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    CfgEdgeSource { label: "cfg_edge_source", signature: "control_edge -> program_point", description: "Project each control edge to its source program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    CfgEdgeTarget { label: "cfg_edge_target", signature: "control_edge -> program_point", description: "Project each control edge to its target program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    Typestate { label: "typestate", signature: "procedure -> typestate_finding", description: "Run one registered diagnostic-neutral typestate analysis for the exact procedure root.", semantic: [Procedures, Typestate] }
+    ValueFlow { label: "value_flow", signature: "procedure -> flow_endpoint", description: "Run one registered diagnostic-neutral value-flow plan for the exact procedure root.", semantic: [Procedures, ValueFlow] }
+    Taint { label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint] }
+    Witness { label: "witness", signature: "typestate_finding|flow_endpoint -> typestate_witness|flow_witness", description: "Project bounded retained evidence from each typestate finding or reached flow endpoint without rerunning analysis." }
     FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, or receiver analyses to their workspace files." }
     ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
@@ -520,28 +424,28 @@ query_step_ops! {
     ReceiverTargets { label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site|occurrence -> receiver_analysis", description: "Analyze a bounded receiver value using adapter-provided structured facts." }
     PointsTo { label: "points_to", signature: "structural_match|reference_site|expression_site|occurrence -> receiver_analysis", description: "Analyze bounded value provenance using adapter-provided structured facts." }
     MemberTargets { label: "member_targets", signature: "structural_match|reference_site|occurrence -> receiver_analysis", description: "Resolve exact member declarations through bounded structured receiver facts." }
-    ReceiverOutcome { label: "receiver_outcome", signature: "receiver_analysis -> receiver_outcome", description: "Project the mandatory terminal outcome row for each receiver analysis.", since: 13, }
-    ReceiverEvidence { label: "receiver_evidence", signature: "receiver_analysis -> receiver_evidence", description: "Project zero or more parent-linked typed receiver evidence rows.", since: 13, }
-    OccurrencesOf { label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it.", since: 8, }
-    OccurrencesIn { label: "occurrences_in", signature: "structural_match|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or file.", since: 8, }
-    OccurrenceTarget { label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences.", since: 8, }
-    ScopeOf { label: "scope_of", signature: "binding|occurrence|structural_match -> lexical_scope", description: "Return the innermost lexical scope that owns each binding, occurrence, or structural match.", since: 9, }
-    ScopeAncestors { label: "scope_ancestors", signature: "lexical_scope -> lexical_scope", description: "Return the enclosing lexical scopes of each scope, innermost first, excluding the scope itself.", since: 9, }
-    BindingsIn { label: "bindings_in", signature: "lexical_scope|structural_match -> binding", description: "Return the bindings declared in each lexical scope, or in the scopes inside each structural match.", since: 9, }
-    ReachingBinding { label: "reaching_binding", signature: "occurrence -> binding", description: "Return the binding of the occurrence's name that is in effect at its exact position.", since: 9, }
-    BindingOccurrence { label: "binding_occurrence", signature: "binding -> occurrence", description: "Return the binder-class occurrence row of each binding's declaring token.", since: 9, }
-    CandidatesOf { label: "candidates_of", signature: "occurrence -> resolution_candidate", description: "Return the candidates the resolver considered for each reference-class occurrence, with tier, outcome, and boundary.", since: 9, }
-    CandidateTarget { label: "candidate_target", signature: "resolution_candidate -> declaration", description: "Project the workspace declarations of unit-backed resolution candidates.", since: 9, }
-    EdgesOf { label: "edges_of", signature: "declaration -> reference_edge", description: "Return the canonical inverse reference edges of each declaration: every usage site the usage index enumerates, with kind, proof, usage kind, and owner relation.", since: 11, }
-    EdgesFrom { label: "edges_from", signature: "occurrence -> reference_edge", description: "Return the canonical forward reference edges of each occurrence: the resolver's own resolved targets for that exact token, with kind, proof, usage kind, and owner relation.", since: 11, }
-    EdgeTarget { label: "edge_target", signature: "reference_edge -> declaration", description: "Project each reference edge to its exact indexed target declaration.", since: 11, }
-    SegmentsOf { label: "segments_of", signature: "qualified_path -> path_segment", description: "Return each path's ordered segment rows with decoded text, spelled generic arity, and (with :resolved true) each segment's own prefix resolution.", since: 10, }
-    SegmentTarget { label: "segment_target", signature: "path_segment -> declaration", description: "Project the workspace declarations each path segment's own position resolves to.", since: 10, }
-    Generates { label: "generates", signature: "generation_site -> declaration_state", description: "Return the declaration-state rows of the declarations each generation site materializes.", since: 12, }
-    GeneratedBy { label: "generated_by", signature: "declaration|declaration_state -> generation_site", description: "Return the generation site that materialized each generated declaration.", since: 12, }
-    DeclarationStateOf { label: "declaration_state_of", signature: "declaration -> declaration_state", description: "Return each declaration's state row: origin, declaration-only flag, and configuration gate.", since: 12, }
-    ImplementationOf { label: "implementation_of", signature: "declaration_state|declaration -> declaration", description: "Return the runnable implementation a declaration-only signature links to.", since: 12, }
-    ExportTarget { label: "export_target", signature: "export -> declaration", description: "Project the declaration an export row materialized, where the analyzer models one.", since: 12, }
+    ReceiverOutcome { label: "receiver_outcome", signature: "receiver_analysis -> receiver_outcome", description: "Project the mandatory terminal outcome row for each receiver analysis." }
+    ReceiverEvidence { label: "receiver_evidence", signature: "receiver_analysis -> receiver_evidence", description: "Project zero or more parent-linked typed receiver evidence rows." }
+    OccurrencesOf { label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it." }
+    OccurrencesIn { label: "occurrences_in", signature: "structural_match|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or file." }
+    OccurrenceTarget { label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences." }
+    ScopeOf { label: "scope_of", signature: "binding|occurrence|structural_match -> lexical_scope", description: "Return the innermost lexical scope that owns each binding, occurrence, or structural match." }
+    ScopeAncestors { label: "scope_ancestors", signature: "lexical_scope -> lexical_scope", description: "Return the enclosing lexical scopes of each scope, innermost first, excluding the scope itself." }
+    BindingsIn { label: "bindings_in", signature: "lexical_scope|structural_match -> binding", description: "Return the bindings declared in each lexical scope, or in the scopes inside each structural match." }
+    ReachingBinding { label: "reaching_binding", signature: "occurrence -> binding", description: "Return the binding of the occurrence's name that is in effect at its exact position." }
+    BindingOccurrence { label: "binding_occurrence", signature: "binding -> occurrence", description: "Return the binder-class occurrence row of each binding's declaring token." }
+    CandidatesOf { label: "candidates_of", signature: "occurrence -> resolution_candidate", description: "Return the candidates the resolver considered for each reference-class occurrence, with tier, outcome, and boundary." }
+    CandidateTarget { label: "candidate_target", signature: "resolution_candidate -> declaration", description: "Project the workspace declarations of unit-backed resolution candidates." }
+    EdgesOf { label: "edges_of", signature: "declaration -> reference_edge", description: "Return the canonical inverse reference edges of each declaration: every usage site the usage index enumerates, with kind, proof, usage kind, and owner relation." }
+    EdgesFrom { label: "edges_from", signature: "occurrence -> reference_edge", description: "Return the canonical forward reference edges of each occurrence: the resolver's own resolved targets for that exact token, with kind, proof, usage kind, and owner relation." }
+    EdgeTarget { label: "edge_target", signature: "reference_edge -> declaration", description: "Project each reference edge to its exact indexed target declaration." }
+    SegmentsOf { label: "segments_of", signature: "qualified_path -> path_segment", description: "Return each path's ordered segment rows with decoded text, spelled generic arity, and (with :resolved true) each segment's own prefix resolution." }
+    SegmentTarget { label: "segment_target", signature: "path_segment -> declaration", description: "Project the workspace declarations each path segment's own position resolves to." }
+    Generates { label: "generates", signature: "generation_site -> declaration_state", description: "Return the declaration-state rows of the declarations each generation site materializes." }
+    GeneratedBy { label: "generated_by", signature: "declaration|declaration_state -> generation_site", description: "Return the generation site that materialized each generated declaration." }
+    DeclarationStateOf { label: "declaration_state_of", signature: "declaration -> declaration_state", description: "Return each declaration's state row: origin, declaration-only flag, and configuration gate." }
+    ImplementationOf { label: "implementation_of", signature: "declaration_state|declaration -> declaration", description: "Return the runnable implementation a declaration-only signature links to." }
+    ExportTarget { label: "export_target", signature: "export -> declaration", description: "Project the declaration an export row materialized, where the analyzer models one." }
 }
 
 macro_rules! rql_form_description {
@@ -562,15 +466,6 @@ macro_rules! rql_form_step {
     };
 }
 
-macro_rules! rql_form_minimum_schema_version {
-    ($step:ident $(, $since:literal)?) => {
-        QueryStepOp::$step.minimum_schema_version()
-    };
-    ($(, $since:literal)?) => {
-        minimum_schema_version!($($since)?)
-    };
-}
-
 macro_rules! rql_forms {
     ($($variant:ident {
         labels: [$primary:literal $(, $alias:literal)* $(,)?],
@@ -579,7 +474,6 @@ macro_rules! rql_forms {
         signature: $signature:literal,
         description: $description:tt
         $(, step: $step:ident)?
-        $(, since: $since:literal)?
         $(,)?
     })+) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -632,12 +526,6 @@ macro_rules! rql_forms {
             pub fn description(self) -> &'static str {
                 match self {
                     $(Self::$variant => rql_form_description!($description),)+
-                }
-            }
-
-            pub const fn minimum_schema_version(self) -> u64 {
-                match self {
-                    $(Self::$variant => rql_form_minimum_schema_version!($($step)? $(, $since)?),)+
                 }
             }
 
@@ -793,7 +681,6 @@ rql_forms! {
         shape: Pattern,
         signature: "(inside-decl container-pattern query)",
         description: "Require the root match to be inside a matching container without crossing a callable declaration.",
-        since: 5,
     }
     NotInside {
         labels: ["not-inside"],
@@ -1070,7 +957,6 @@ rql_forms! {
         signature: "(receiver-outcome query)",
         description: (QueryStepOp::ReceiverOutcome),
         step: ReceiverOutcome,
-        since: 13,
     }
     ReceiverEvidence {
         labels: ["receiver-evidence", "receiver_evidence"],
@@ -1079,7 +965,6 @@ rql_forms! {
         signature: "(receiver-evidence query)",
         description: (QueryStepOp::ReceiverEvidence),
         step: ReceiverEvidence,
-        since: 13,
     }
     Occurrences {
         labels: ["occurrences", "occurrence"],
@@ -1087,7 +972,6 @@ rql_forms! {
         shape: Query,
         signature: "(occurrences [:class ...] [:role ...] [:namespace ...])",
         description: "Seed classified identifier occurrences directly from workspace facts.",
-        since: 8,
     }
     OccurrencesOf {
         labels: ["occurrences-of", "occurrences_of"],
@@ -1119,7 +1003,6 @@ rql_forms! {
         shape: Query,
         signature: "(scopes [:kind ...])",
         description: "Seed lexical scope rows directly from workspace facts.",
-        since: 9,
     }
     Bindings {
         labels: ["bindings", "binding"],
@@ -1127,7 +1010,6 @@ rql_forms! {
         shape: Query,
         signature: "(bindings [:kind ...] [:name ...] [:hoisting ...])",
         description: "Seed lexical binding rows directly from workspace facts.",
-        since: 9,
     }
     Paths {
         labels: ["paths", "path"],
@@ -1135,7 +1017,6 @@ rql_forms! {
         shape: Query,
         signature: "(paths [:min-segments N])",
         description: "Seed qualified-path rows directly from workspace facts.",
-        since: 10,
     }
     SegmentsOf {
         labels: ["segments-of", "segments_of"],
@@ -1215,7 +1096,6 @@ rql_forms! {
         shape: Query,
         signature: "(generation-sites [:kind ...] [:input ...])",
         description: "Seed generation-site rows directly from recorded materialization provenance.",
-        since: 12,
     }
     Exports {
         labels: ["exports", "export"],
@@ -1223,7 +1103,6 @@ rql_forms! {
         shape: Query,
         signature: "(exports [:form ...] [:name ...])",
         description: "Seed export rows directly from recorded materialization provenance.",
-        since: 12,
     }
     Generates {
         labels: ["generates"],
@@ -1944,68 +1823,23 @@ mod tests {
         assert_eq!(
             resolve_rql_schema_version(None).unwrap(),
             SchemaVersionResolution {
-                version: 13,
+                version: 1,
                 origin: SchemaVersionOrigin::ImplicitCompatible,
             }
         );
         assert_eq!(
-            resolve_rql_schema_version(Some(2)).unwrap(),
+            resolve_rql_schema_version(Some(1)).unwrap(),
             SchemaVersionResolution {
-                version: 2,
-                origin: SchemaVersionOrigin::Explicit,
-            }
-        );
-        assert_eq!(
-            resolve_rql_schema_version(Some(3)).unwrap(),
-            SchemaVersionResolution {
-                version: 3,
-                origin: SchemaVersionOrigin::Explicit,
-            }
-        );
-        assert_eq!(
-            resolve_rql_schema_version(Some(4)).unwrap(),
-            SchemaVersionResolution {
-                version: 4,
-                origin: SchemaVersionOrigin::Explicit,
-            }
-        );
-        assert_eq!(
-            resolve_rql_schema_version(Some(5)).unwrap(),
-            SchemaVersionResolution {
-                version: 5,
-                origin: SchemaVersionOrigin::Explicit,
-            }
-        );
-        assert_eq!(
-            resolve_rql_schema_version(Some(6)).unwrap(),
-            SchemaVersionResolution {
-                version: 6,
+                version: 1,
                 origin: SchemaVersionOrigin::Explicit,
             }
         );
 
-        assert_eq!(
-            resolve_rql_schema_version(Some(7)).unwrap(),
-            SchemaVersionResolution {
-                version: 7,
-                origin: SchemaVersionOrigin::Explicit,
-            }
-        );
-
-        assert_eq!(
-            resolve_rql_schema_version(Some(8)).unwrap(),
-            SchemaVersionResolution {
-                version: 8,
-                origin: SchemaVersionOrigin::Explicit,
-            }
-        );
-
-        let error = resolve_rql_schema_version(Some(1)).unwrap_err();
-        assert_eq!(error.requested, 1);
-        assert_eq!(
-            error.supported,
-            vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-        );
+        for retired in [0, 2, 5, 13, 14] {
+            let error = resolve_rql_schema_version(Some(retired)).unwrap_err();
+            assert_eq!(error.requested, retired);
+            assert_eq!(error.supported, vec![1]);
+        }
     }
 
     #[test]
@@ -2014,7 +1848,6 @@ mod tests {
         for form in ALL_RQL_FORMS {
             assert!(!form.signature().is_empty());
             assert!(!form.description().is_empty());
-            assert!((2..=SCHEMA_VERSION).contains(&form.minimum_schema_version()));
             for label in form.labels() {
                 assert!(forms.insert(*label), "duplicate form label {label}");
                 assert_eq!(RqlForm::from_label(label), Some(*form));
@@ -2026,7 +1859,6 @@ mod tests {
             assert!(step_ops.insert(op.label()), "duplicate query step op");
             assert!(!op.signature().is_empty());
             assert!(!op.description().is_empty());
-            assert!((2..=SCHEMA_VERSION).contains(&op.minimum_schema_version()));
             assert_eq!(QueryStepOp::from_label(op.label()), Some(*op));
         }
         for form in ALL_RQL_FORMS {
@@ -2034,7 +1866,6 @@ mod tests {
                 continue;
             };
             assert_eq!(form.description(), op.description());
-            assert_eq!(form.minimum_schema_version(), op.minimum_schema_version());
             assert_eq!(
                 ALL_RQL_FORMS
                     .iter()
