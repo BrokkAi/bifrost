@@ -19,6 +19,7 @@ mod code_query_lexical_environment;
 mod code_query_occurrences;
 mod code_query_pipelines;
 mod code_query_public_api;
+mod code_query_reference_edges;
 mod code_query_resolution_conformance;
 mod code_query_tutorials;
 mod code_query_typestate;
