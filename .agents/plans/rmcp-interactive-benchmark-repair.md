@@ -15,9 +15,9 @@ After this change, `scripts/run-interactive-latency.sh --profile` must pass with
 - [x] (2026-08-05 14:55Z) Refreshed `origin`, confirmed a clean detached worktree, and created `dave/rmcp-interactive-benchmark-repair` from `origin/master` at `aef3d746c`.
 - [x] (2026-08-05 14:55Z) Reproduced and inspected the prior branch benchmark evidence from GitHub Actions run `31010981510`.
 - [x] (2026-08-05 14:55Z) Ran the initial `bifrost.code-smells` policy scan. It completed with 280 repository findings and no diagnostics. Eight existing findings touch planned files, but none touch planned edit locations.
-- [ ] Commit this initial ExecPlan as the first checkpoint.
-- [ ] Add deterministic tests for transport timing retention after raw-tail truncation.
-- [ ] Add bounded transport timing retention to the benchmark stderr drain.
+- [x] (2026-08-05 14:58Z) Committed this initial ExecPlan as checkpoint `54a4b00de`.
+- [x] (2026-08-05 15:07Z) Added deterministic tests for split timing lines, raw-tail truncation, request cursors, duplicate samples, and unterminated input.
+- [x] (2026-08-05 15:07Z) Added bounded transport timing retention and canonical profile-artifact timing lines.
 - [ ] Restore the default usage-scan execution budget from five seconds to three seconds.
 - [ ] Run focused formatting, unit, integration, and policy checks.
 - [ ] Run the local release interactive benchmark with RMCP enabled.
@@ -40,6 +40,12 @@ After this change, `scripts/run-interactive-latency.sh --profile` must pass with
 
 - Observation: The repository has no named executable repository policy root.
   Evidence: `.bifrost/` contains only `policy-scope.json` and `suppressions.json`. The policy validation note in `.agents/docs/issue-1204-policy-pack-validation.md` also records no canonical repository root.
+
+- Observation: The benchmark module tests belong to the root library, not the `bifrost` CLI binary.
+  Evidence: `cargo test --bin bifrost benchmark::mcp_session::tests` ran zero tests. `cargo test -p brokk-bifrost --lib benchmark::mcp_session::tests` ran 15 tests.
+
+- Observation: Three existing stderr-drain tests need local socket access.
+  Evidence: The sandbox run failed at `TcpListener::bind` with `Operation not permitted`. The same 15-test command passed outside the socket sandbox.
 
 ## Decision Log
 
@@ -129,8 +135,8 @@ Commit Milestone 1 with only this plan:
 After Milestone 2 source changes, run:
 
     cargo fmt --all -- --check
-    cargo test --bin bifrost benchmark::mcp_session::tests
-    cargo test --bin bifrost benchmark::mcp_iteration::tests
+    cargo test -p brokk-bifrost --lib benchmark::mcp_session::tests
+    cargo test -p brokk-bifrost --lib benchmark::mcp_iteration::tests
     cargo test -p brokk-bifrost-mcp --test bifrost_mcp_server profiled_tool_calls_emit_all_transport_phases -- --nocapture
 
 Expect all selected tests to pass. The wire test runs once against RMCP and once against the legacy host.
@@ -228,4 +234,4 @@ The exact private type names for retained entries can change during implementati
 
 `crates/bifrost-analysis/src/searchtools/scan_usages.rs` must keep `ScanUsagesExecutionContext::with_cancellation_and_max_duration` and both public request fields unchanged. Only the default constant and its explanation change.
 
-Revision note, 2026-08-05: Created the initial plan from the failed RMCP promotion run. The plan separates real response-budget work from bounded profile capture and keeps the selector promotion outside this branch.
+Revision note, 2026-08-05: Created the initial plan from the failed RMCP promotion run. The plan separates real response-budget work from bounded profile capture and keeps the selector promotion outside this branch. Recorded the first checkpoint commit before source implementation. Corrected the benchmark unit-test target and recorded the completed transport-capture milestone.
