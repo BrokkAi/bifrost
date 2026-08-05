@@ -83,9 +83,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+mod edges;
 mod environment;
-mod expansions;
+pub(crate) mod expansions;
 mod occurrences;
+use edges::{EdgeKey, EdgeTraversalCache, EdgeValue};
 mod paths;
 use environment::{
     BindingKey, BindingValue, CandidateKey, CandidateValue, EnvironmentTraversalCache, ScopeKey,
@@ -136,7 +138,9 @@ use expansions::{
 use super::lexical_environment::ReachingBindingOutcome;
 use super::occurrence_rows::{OccurrenceRow, OccurrenceTarget};
 use super::occurrences::OccurrenceClass;
-use super::query::{BindingFilter, CandidateFilter, OccurrenceFilter, OccurrenceSeed, ScopeFilter};
+use super::query::{
+    BindingFilter, CandidateFilter, EdgeFilter, OccurrenceFilter, OccurrenceSeed, ScopeFilter,
+};
 use crate::analyzer::semantic::ContentIdentity;
 use crate::analyzer::usages::get_definition::TraceCandidateRef;
 pub use results::CodeQueryBinding;
@@ -186,6 +190,7 @@ pub use results::CodeQueryQualifiedPath;
 pub use results::CodeQueryRange;
 pub use results::CodeQueryReceiverAnalysis;
 pub use results::CodeQueryReceiverValue;
+pub use results::CodeQueryReferenceEdge;
 pub use results::CodeQueryReferenceSite;
 pub use results::CodeQueryResolutionCandidate;
 pub use results::CodeQueryResponse;
@@ -472,6 +477,7 @@ enum PipelineValue {
     LexicalScope(ScopeValue),
     Binding(BindingValue),
     ResolutionCandidate(Box<CandidateValue>),
+    ReferenceEdge(Box<EdgeValue>),
     QualifiedPath(PathValue),
     PathSegment(SegmentValue),
 }
@@ -512,6 +518,7 @@ enum PipelineKey {
     LexicalScope(ScopeKey),
     Binding(BindingKey),
     ResolutionCandidate(CandidateKey),
+    ReferenceEdge(EdgeKey),
     QualifiedPath(PathKey),
     PathSegment(SegmentKey),
 }
@@ -549,6 +556,7 @@ impl PipelineValue {
             Self::LexicalScope(value) => PipelineKey::LexicalScope(value.key()),
             Self::Binding(value) => PipelineKey::Binding(value.key()),
             Self::ResolutionCandidate(value) => PipelineKey::ResolutionCandidate(value.key()),
+            Self::ReferenceEdge(value) => PipelineKey::ReferenceEdge(value.key()),
             Self::QualifiedPath(value) => PipelineKey::QualifiedPath(value.key()),
             Self::PathSegment(value) => PipelineKey::PathSegment(value.key()),
         }
@@ -768,6 +776,7 @@ enum PipelineTraceValue {
     LexicalScope(ScopeValue),
     Binding(BindingValue),
     ResolutionCandidate(Box<CandidateValue>),
+    ReferenceEdge(Box<EdgeValue>),
     QualifiedPath(PathValue),
     PathSegment(SegmentValue),
 }
@@ -1464,6 +1473,7 @@ struct QueryExecutionState<'a> {
     call_cache: CallTraversalCache,
     occurrence_cache: OccurrenceTraversalCache,
     environment_cache: EnvironmentTraversalCache,
+    edge_cache: EdgeTraversalCache,
     path_cache: PathTraversalCache,
     receiver_facts: HashMap<ProjectFile, Arc<FileFacts>>,
     semantic: Option<SemanticQueryContext<'a>>,
@@ -2179,6 +2189,7 @@ fn execute_internal_with_analysis_strategy(
         reference_cache: ReferenceTraversalCache::default(),
         occurrence_cache: OccurrenceTraversalCache::default(),
         environment_cache: EnvironmentTraversalCache::default(),
+        edge_cache: EdgeTraversalCache::default(),
         path_cache: PathTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
         receiver_facts: HashMap::default(),
@@ -2721,6 +2732,31 @@ fn detailed_evidence_for_pipeline_value(
                 provenance: Vec::new(),
             }
         }
+        PipelineValue::ReferenceEdge(value) => {
+            let row = &value.row;
+            let byte_span = row.site.range.start_byte..row.site.range.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::ReferenceEdge,
+                key: DetailedCodeQueryKey::ReferenceEdge {
+                    id: value.id(),
+                    ast_id: row.site.ast_id.clone(),
+                    target_fq_name: value.target.unit.fq_name(),
+                    provenance: row.provenance.label().to_string(),
+                },
+                file: row.site.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: row
+                    .site
+                    .enclosing
+                    .as_ref()
+                    .and_then(|unit| stable_owner_candidate_for_unit(&row.site.file, unit)),
+                provenance: Vec::new(),
+            }
+        }
         PipelineValue::ResolutionCandidate(value) => {
             let row = &value.occurrence;
             let byte_span = row.range.start_byte..row.range.end_byte;
@@ -2846,6 +2882,7 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::PathSegment(value) => Some(value.file()),
         PipelineValue::Binding(value) => Some(value.file()),
         PipelineValue::ResolutionCandidate(value) => Some(value.file()),
+        PipelineValue::ReferenceEdge(value) => Some(value.file()),
         PipelineValue::File(_) | PipelineValue::ReceiverAnalysis(_) => None,
     }
 }
@@ -2952,6 +2989,7 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::ResolutionCandidate(value) => {
             files.insert(value.file().clone());
         }
+        PipelineValue::ReferenceEdge(value) => collect_edge_source_files(value, files),
         PipelineValue::QualifiedPath(value) => {
             files.insert(value.file().clone());
         }
@@ -2988,12 +3026,21 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
         PipelineTraceValue::ResolutionCandidate(value) => {
             files.insert(value.file().clone());
         }
+        PipelineTraceValue::ReferenceEdge(value) => collect_edge_source_files(value, files),
         PipelineTraceValue::QualifiedPath(value) => {
             files.insert(value.file().clone());
         }
         PipelineTraceValue::PathSegment(value) => {
             files.insert(value.file().clone());
         }
+    }
+}
+
+fn collect_edge_source_files(value: &EdgeValue, files: &mut BTreeSet<ProjectFile>) {
+    files.insert(value.row.site.file.clone());
+    files.insert(value.target.unit.source().clone());
+    if let Some(enclosing) = &value.enclosing {
+        files.insert(enclosing.unit.source().clone());
     }
 }
 
@@ -3216,6 +3263,21 @@ fn detailed_trace_provenance_ref(
                 },
                 &row.file,
                 row.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::ReferenceEdge(value) => {
+            let row = &value.row;
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::ReferenceEdge,
+                DetailedCodeQueryKey::ReferenceEdge {
+                    id: value.id(),
+                    ast_id: row.site.ast_id.clone(),
+                    target_fq_name: value.target.unit.fq_name(),
+                    provenance: row.provenance.label().to_string(),
+                },
+                &row.site.file,
+                row.site.range,
                 cache,
             )
         }
@@ -4172,6 +4234,7 @@ fn execute_parallel_seed_union(
                     reference_cache: ReferenceTraversalCache::default(),
                     occurrence_cache: OccurrenceTraversalCache::default(),
                     environment_cache: EnvironmentTraversalCache::default(),
+                    edge_cache: EdgeTraversalCache::default(),
                     path_cache: PathTraversalCache::default(),
                     call_cache: CallTraversalCache::default(),
                     receiver_facts: HashMap::default(),
@@ -4451,6 +4514,8 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
             | CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
             | CodeQueryDiagnosticCode::ResolutionTraceIncomplete
+            | CodeQueryDiagnosticCode::EdgeAxisUnsupported
+            | CodeQueryDiagnosticCode::EdgeDerivationIncomplete
             | CodeQueryDiagnosticCode::PathDerivationIncomplete => {
                 Some(QueryOperatorTermination::AnalysisIncomplete)
             }
@@ -6212,8 +6277,8 @@ fn apply_plan_step(
                     | PipelineValue::LexicalScope(_)
                     | PipelineValue::Binding(_)
                     | PipelineValue::ResolutionCandidate(_)
-                    | PipelineValue::QualifiedPath(_)
-                    | PipelineValue::PathSegment(_) => None,
+                    | PipelineValue::ReferenceEdge(_) => None,
+                    PipelineValue::QualifiedPath(_) | PipelineValue::PathSegment(_) => None,
                 })
                 .sum();
             if let Some(profile) = &mut state.cache_profile {
@@ -6247,25 +6312,26 @@ fn apply_plan_step(
                     (&mut state.cache_profile, cache_observation)
                 {
                     if cache_hit {
-                        let replayed_edges = rows
-                            .iter()
-                            .filter_map(|row| match &row.value {
-                                PipelineValue::File(file) => Some(graph.importer_count(file)),
-                                PipelineValue::StructuralMatch(_)
-                                | PipelineValue::Declaration(_)
-                                | PipelineValue::Semantic(_)
-                                | PipelineValue::ReferenceSite(_)
-                                | PipelineValue::CallSite(_)
-                                | PipelineValue::ExpressionSite(_)
-                                | PipelineValue::ReceiverAnalysis(_)
-                                | PipelineValue::Occurrence(_)
-                                | PipelineValue::LexicalScope(_)
-                                | PipelineValue::Binding(_)
-                                | PipelineValue::ResolutionCandidate(_)
-                                | PipelineValue::QualifiedPath(_)
-                                | PipelineValue::PathSegment(_) => None,
-                            })
-                            .sum();
+                        let replayed_edges =
+                            rows.iter()
+                                .filter_map(|row| match &row.value {
+                                    PipelineValue::File(file) => Some(graph.importer_count(file)),
+                                    PipelineValue::StructuralMatch(_)
+                                    | PipelineValue::Declaration(_)
+                                    | PipelineValue::Semantic(_)
+                                    | PipelineValue::ReferenceSite(_)
+                                    | PipelineValue::CallSite(_)
+                                    | PipelineValue::ExpressionSite(_)
+                                    | PipelineValue::ReceiverAnalysis(_)
+                                    | PipelineValue::Occurrence(_)
+                                    | PipelineValue::LexicalScope(_)
+                                    | PipelineValue::Binding(_)
+                                    | PipelineValue::ResolutionCandidate(_)
+                                    | PipelineValue::ReferenceEdge(_) => None,
+                                    PipelineValue::QualifiedPath(_)
+                                    | PipelineValue::PathSegment(_) => None,
+                                })
+                                .sum();
                         profile
                             .import_reverse
                             .record_hit(Some(cache_complete), replayed_edges);
@@ -6319,8 +6385,8 @@ fn apply_plan_step(
                         | PipelineValue::LexicalScope(_)
                         | PipelineValue::Binding(_)
                         | PipelineValue::ResolutionCandidate(_)
-                        | PipelineValue::QualifiedPath(_)
-                        | PipelineValue::PathSegment(_) => None,
+                        | PipelineValue::ReferenceEdge(_) => None,
+                        PipelineValue::QualifiedPath(_) | PipelineValue::PathSegment(_) => None,
                     })
                     .collect::<Vec<_>>();
                 frontier.sort_by_key(rel_path_string);
@@ -6426,6 +6492,7 @@ fn apply_plan_step(
         &mut state.call_cache,
         &mut state.occurrence_cache,
         &mut state.environment_cache,
+        &mut state.edge_cache,
         &mut state.path_cache,
         &mut state.receiver_facts,
         &mut state.semantic,
@@ -6917,6 +6984,7 @@ fn apply_pipeline_step(
     call_cache: &mut CallTraversalCache,
     occurrence_cache: &mut OccurrenceTraversalCache,
     environment_cache: &mut EnvironmentTraversalCache,
+    edge_cache: &mut EdgeTraversalCache,
     path_cache: &mut PathTraversalCache,
     receiver_facts: &mut HashMap<ProjectFile, Arc<FileFacts>>,
     semantic: &mut Option<SemanticQueryContext<'_>>,
@@ -7832,6 +7900,40 @@ fn apply_pipeline_step(
                     diagnostics,
                     &mut row_exhausted,
                 )
+            }
+            (PipelineValue::Declaration(declaration), QueryStep::EdgesOf(filter)) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                inverse_edge_expansions(
+                    analyzer,
+                    edge_cache,
+                    indexed,
+                    declaration,
+                    filter,
+                    cancellation,
+                    diagnostics,
+                )
+            }
+            (PipelineValue::Occurrence(value), QueryStep::EdgesFrom(filter)) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                forward_edge_expansions(
+                    analyzer,
+                    edge_cache,
+                    indexed,
+                    value,
+                    filter,
+                    cancellation,
+                    diagnostics,
+                    &mut row_exhausted,
+                )
+            }
+            (PipelineValue::ReferenceEdge(value), QueryStep::EdgeTarget) => {
+                vec![pipeline_expansion(PipelineValue::Declaration(
+                    value.target.clone(),
+                ))]
             }
             (PipelineValue::ResolutionCandidate(value), QueryStep::CandidateTarget) => {
                 let indexed = indexed_declarations
@@ -9468,6 +9570,9 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::ResolutionCandidate(value) => {
             Some(PipelineTraceValue::ResolutionCandidate(value.clone()))
         }
+        PipelineValue::ReferenceEdge(value) => {
+            Some(PipelineTraceValue::ReferenceEdge(value.clone()))
+        }
         PipelineValue::QualifiedPath(value) => {
             Some(PipelineTraceValue::QualifiedPath(value.clone()))
         }
@@ -9558,6 +9663,9 @@ fn render_pipeline_item(
         PipelineValue::ResolutionCandidate(value) => CodeQueryResultValue::ResolutionCandidate {
             value: Box::new(render_resolution_candidate(analyzer, &value, detail, cache)),
         },
+        PipelineValue::ReferenceEdge(value) => CodeQueryResultValue::ReferenceEdge {
+            value: Box::new(render_reference_edge(analyzer, &value, detail, cache)),
+        },
         PipelineValue::QualifiedPath(value) => CodeQueryResultValue::QualifiedPath {
             value: Box::new(render_qualified_path(analyzer, &value, cache)),
         },
@@ -9615,6 +9723,9 @@ fn render_provenance(
                     }
                     PipelineTraceValue::ResolutionCandidate(value) => {
                         render_candidate_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::ReferenceEdge(value) => {
+                        render_edge_ref(analyzer, value, cache)
                     }
                     PipelineTraceValue::QualifiedPath(value) => {
                         render_qualified_path_ref(analyzer, value, cache)
@@ -10052,6 +10163,145 @@ fn candidate_expansions(
             )))
         })
         .collect()
+}
+
+/// The canonical inverse edges of one declaration, filtered and indexed.
+///
+/// A row whose target cannot be located as an exact indexed declaration is
+/// omitted with an `EdgeDerivationIncomplete` diagnostic rather than silently
+/// dropped: the derivation asserted an edge, and losing it without a trace
+/// would be the silent gap the domain exists to remove.
+fn inverse_edge_expansions(
+    analyzer: &dyn IAnalyzer,
+    edge_cache: &mut EdgeTraversalCache,
+    indexed: &mut IndexedDeclarations,
+    declaration: &DeclarationValue,
+    filter: &EdgeFilter,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Vec<PipelineExpansion> {
+    let result = edge_cache.inverse_for(analyzer, &declaration.unit, cancellation);
+    let language = crate::analyzer::common::language_for_file(declaration.unit.source());
+    edge_cache.report_completeness(&declaration.unit.fq_name(), language, &result, diagnostics);
+    edge_row_expansions(analyzer, indexed, &result, filter, None, diagnostics)
+}
+
+/// The canonical forward edges of one reference occurrence: the file's forward
+/// derivation narrowed to rows whose site is that exact AST node.
+#[allow(clippy::too_many_arguments)]
+fn forward_edge_expansions(
+    analyzer: &dyn IAnalyzer,
+    edge_cache: &mut EdgeTraversalCache,
+    indexed: &mut IndexedDeclarations,
+    value: &OccurrenceValue,
+    filter: &EdgeFilter,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    row_exhausted: &mut bool,
+) -> Vec<PipelineExpansion> {
+    let row = &value.row;
+    let Some(result) = edge_cache.forward_for(analyzer, &row.file, cancellation) else {
+        *row_exhausted = true;
+        return Vec::new();
+    };
+    let language = crate::analyzer::common::language_for_file(&row.file);
+    edge_cache.report_completeness(&rel_path_string(&row.file), language, &result, diagnostics);
+    let site_ast_id = row.ast_id();
+    edge_row_expansions(
+        analyzer,
+        indexed,
+        &result,
+        filter,
+        Some(site_ast_id.as_str()),
+        diagnostics,
+    )
+}
+
+fn edge_row_expansions(
+    analyzer: &dyn IAnalyzer,
+    indexed: &mut IndexedDeclarations,
+    result: &super::reference_edges::EdgeDerivationResult,
+    filter: &EdgeFilter,
+    site_ast_id: Option<&str>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Vec<PipelineExpansion> {
+    let mut expansions = Vec::new();
+    let mut omitted = 0usize;
+    let mut omitted_language = None;
+    for row in &result.edges {
+        if let Some(site_ast_id) = site_ast_id
+            && row.site.ast_id.as_deref() != Some(site_ast_id)
+        {
+            continue;
+        }
+        if !filter.matches(row) {
+            continue;
+        }
+        let Some(target) = indexed.get(analyzer, &row.target) else {
+            omitted += 1;
+            omitted_language
+                .get_or_insert_with(|| crate::analyzer::common::language_for_file(&row.site.file));
+            continue;
+        };
+        let enclosing = row
+            .site
+            .enclosing
+            .as_ref()
+            .and_then(|unit| indexed.get(analyzer, unit));
+        expansions.push(pipeline_expansion(PipelineValue::ReferenceEdge(Box::new(
+            EdgeValue {
+                row: Arc::new(row.clone()),
+                target,
+                enclosing,
+            },
+        ))));
+    }
+    if omitted > 0 {
+        let language = omitted_language.expect("an omitted edge names its language");
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::EdgeDerivationIncomplete,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: language.config_label(),
+            message: format!(
+                "{omitted} derived reference edge{} had no exact indexed target declaration and were omitted",
+                if omitted == 1 { "" } else { "s" }
+            ),
+        });
+    }
+    expansions
+}
+
+fn render_reference_edge(
+    analyzer: &dyn IAnalyzer,
+    value: &EdgeValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryReferenceEdge {
+    let row = &value.row;
+    let range = render_source_range(analyzer, &row.site.file, &row.site.range, cache);
+    let target = render_declaration(analyzer, &value.target, detail, cache);
+    let enclosing = value
+        .enclosing
+        .as_ref()
+        .map(|declaration| render_declaration(analyzer, declaration, detail, cache));
+    edges::public_edge(value, range, target, enclosing)
+}
+
+fn render_edge_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &EdgeValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let row = &value.row;
+    CodeQueryResultRef::ReferenceEdge {
+        id: value.id(),
+        ast_id: row.site.ast_id.clone(),
+        path: rel_path_string(&row.site.file),
+        range: render_source_range(analyzer, &row.site.file, &row.site.range, cache),
+        target_fq_name: value.target.unit.fq_name(),
+        provenance: row.provenance.label(),
+    }
 }
 
 fn render_occurrence(
@@ -10947,6 +11197,7 @@ fn provider_supports_feature(
         QueryFeature::Role(role) => provider.structural_supports_role(role),
         QueryFeature::OccurrenceRole(role) => provider.structural_supports_occurrence_role(role),
         QueryFeature::EnvironmentAxis(axis) => provider.structural_supports_environment_axis(axis),
+        QueryFeature::EdgeAxis(axis) => provider.structural_supports_edge_axis(axis),
         QueryFeature::IdentityAxis(axis) => provider.structural_supports_identity_axis(axis),
         QueryFeature::RouteRelation(relation) => {
             provider.structural_supports_route_relation(relation)

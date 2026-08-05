@@ -1,7 +1,7 @@
 use super::ir::{
     BindingFilter, BindingSeed, CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter,
     CandidateFilter, CandidateOutcomeLabel, CodeQuery, CodeQueryPlan, CodeQueryPlanSource,
-    CodeQueryResultDetail, CodeQuerySeed, DEFAULT_LIMIT, HierarchyTraversal,
+    CodeQueryResultDetail, CodeQuerySeed, DEFAULT_LIMIT, EdgeFilter, HierarchyTraversal,
     MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH,
     MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
     MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
@@ -15,9 +15,11 @@ use super::ir::{
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
     StringPredicateField, call_traversal_completeness_from_label, reference_kind_from_label,
-    rql_schema_version_registry, usage_proof_from_label, usage_surface_from_label,
+    rql_schema_version_registry, usage_kind_from_label, usage_proof_from_label,
+    usage_surface_from_label,
 };
 use crate::analyzer::Language;
+use crate::analyzer::structural::edges::{OwnerRelation, SiteClass};
 use crate::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
 use crate::analyzer::structural::occurrences::{Namespace, OccurrenceClass, OccurrenceRole};
 use crate::analyzer::structural::resolution::{
@@ -667,6 +669,81 @@ pub(super) fn decode_binding_filter(
     })
 }
 
+pub(super) fn decode_edge_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<EdgeFilter, QueryError> {
+    reject_unknown_filter_fields(
+        object,
+        path,
+        &[
+            "reference_kinds",
+            "proof",
+            "surface",
+            "usage",
+            "relation",
+            "site_class",
+            "op",
+        ],
+        "reference edge",
+    )?;
+    let proof = object
+        .get("proof")
+        .map(|value| {
+            let field_path = child_path(path, "proof");
+            let label = value
+                .as_str()
+                .ok_or_else(|| QueryError::new(&field_path, "expected proven or unproven"))?;
+            usage_proof_from_label(label)
+                .ok_or_else(|| QueryError::new(&field_path, "expected proven or unproven"))
+        })
+        .transpose()?;
+    let surface = object
+        .get("surface")
+        .map(|value| {
+            let field_path = child_path(path, "surface");
+            let label = value.as_str().ok_or_else(|| {
+                QueryError::new(&field_path, "expected external_usages or lsp_references")
+            })?;
+            usage_surface_from_label(label).ok_or_else(|| {
+                QueryError::new(&field_path, "expected external_usages or lsp_references")
+            })
+        })
+        .transpose()?;
+    Ok(EdgeFilter {
+        reference_kinds: decode_environment_axis(
+            object,
+            path,
+            "reference_kinds",
+            "reference kind",
+            reference_kind_from_label,
+        )?,
+        proof,
+        surface,
+        usage_kinds: decode_environment_axis(
+            object,
+            path,
+            "usage",
+            "usage kind",
+            usage_kind_from_label,
+        )?,
+        relations: decode_environment_axis(
+            object,
+            path,
+            "relation",
+            "owner relation",
+            OwnerRelation::from_label,
+        )?,
+        site_classes: decode_environment_axis(
+            object,
+            path,
+            "site_class",
+            "site class",
+            SiteClass::from_label,
+        )?,
+    })
+}
+
 pub(super) fn decode_candidate_filter(
     object: &Map<String, Value>,
     path: &str,
@@ -945,6 +1022,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         let binding = matches!(step, QueryStep::BindingsIn(_));
         let candidate = matches!(step, QueryStep::CandidatesOf(_));
         let reaching = matches!(step, QueryStep::ReachingBinding(_));
+        let edge = matches!(step, QueryStep::EdgesOf(_) | QueryStep::EdgesFrom(_));
         let segments = matches!(step, QueryStep::SegmentsOf(_));
         for key in object.keys() {
             match QueryStepField::from_label(key) {
@@ -987,6 +1065,14 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::Surface,
                 ) if reference => {}
                 Some(
+                    QueryStepField::ReferenceKinds
+                    | QueryStepField::Proof
+                    | QueryStepField::Surface
+                    | QueryStepField::EdgeUsageKinds
+                    | QueryStepField::EdgeRelations
+                    | QueryStepField::EdgeSiteClasses,
+                ) if edge => {}
+                Some(
                     QueryStepField::Depth
                     | QueryStepField::Transitive
                     | QueryStepField::ReferenceKinds
@@ -1012,6 +1098,9 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::CandidateTiers
                     | QueryStepField::CandidateOutcomes
                     | QueryStepField::CandidateBoundaries
+                    | QueryStepField::EdgeUsageKinds
+                    | QueryStepField::EdgeRelations
+                    | QueryStepField::EdgeSiteClasses
                     | QueryStepField::Resolved,
                 )
                 | None => {
@@ -1061,6 +1150,13 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 None => false,
             };
             step = QueryStep::ReachingBinding(ReachingBindingOptions { include_shadowed });
+        } else if edge {
+            let filter = decode_edge_filter(object, &entry_path)?;
+            step = match step {
+                QueryStep::EdgesOf(_) => QueryStep::EdgesOf(filter),
+                QueryStep::EdgesFrom(_) => QueryStep::EdgesFrom(filter),
+                _ => unreachable!("edge step filtered above"),
+            };
         } else if witness {
             let decode_bound = |field: &str| -> Result<Option<usize>, QueryError> {
                 object

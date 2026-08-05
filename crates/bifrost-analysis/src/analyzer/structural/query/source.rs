@@ -1,5 +1,6 @@
 //! Source-oriented parsing, validation, and help for unsaved RQL documents.
 
+use super::super::edges::{OwnerRelation, SiteClass};
 use super::ir::MAX_BINDING_NAME_LENGTH;
 use super::schema::{
     ALL_PATTERN_FIELDS, ALL_QUERY_FIELDS, ALL_QUERY_STEP_FIELDS, ALL_QUERY_STEP_OPS, ALL_RQL_FORMS,
@@ -8,8 +9,8 @@ use super::schema::{
     RqlProperty, SCOPE_SEED_RQL_LABELS, ScopeFilterField, StringPredicateField,
     binding_option_for_rql_label, candidate_option_for_rql_label, environment_filter_labels,
     occurrence_filter_labels, occurrence_option_for_rql_label, oldest_rql_schema_version,
-    reference_kind_from_label, rql_schema_version_registry, usage_proof_from_label,
-    usage_surface_from_label,
+    reference_kind_from_label, rql_schema_version_registry, usage_kind_from_label,
+    usage_proof_from_label, usage_surface_from_label,
 };
 use super::sexp::{parse_query_sexp, query_to_json};
 use super::{
@@ -1097,6 +1098,9 @@ fn validate_wrapper(
             EnvironmentOptionKind::ReachingBinding,
             analysis,
         ),
+        RqlForm::EdgesOf | RqlForm::EdgesFrom => {
+            validate_edge_wrapper(form, args, query, analysis);
+        }
         RqlForm::SegmentsOf => {
             validate_segments_of_options(&args[..args.len().saturating_sub(1)], analysis);
         }
@@ -1104,6 +1108,7 @@ fn validate_wrapper(
         | RqlForm::ScopeAncestors
         | RqlForm::BindingOccurrence
         | RqlForm::CandidateTarget
+        | RqlForm::EdgeTarget
         | RqlForm::SegmentTarget => {
             if args.len() != 1 {
                 analysis.error(
@@ -1730,6 +1735,148 @@ fn validate_reference_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analys
     }
 }
 
+fn validate_edge_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &mut Analysis) {
+    let options = &args[..args.len().saturating_sub(1)];
+    if !options.len().is_multiple_of(2) {
+        analysis.error(
+            options
+                .last()
+                .map_or_else(|| query.range.clone(), |arg| arg.range.clone()),
+            "wrong-value-shape",
+            format!(
+                "{} expects option/value pairs followed by a query",
+                form.label()
+            ),
+        );
+        return;
+    }
+
+    let mut seen = HashSet::new();
+    for pair in options.chunks_exact(2) {
+        let key = &pair[0];
+        let value = &pair[1];
+        let Some(label) = key.as_symbol().and_then(|symbol| symbol.strip_prefix(':')) else {
+            analysis.error(
+                key.range.clone(),
+                "unknown-property",
+                "edge traversal option names must be keywords",
+            );
+            continue;
+        };
+        let canonical = label.replace('-', "_");
+        if !seen.insert(canonical.clone()) {
+            analysis.error(
+                key.range.clone(),
+                "duplicate-property",
+                format!("duplicate edge traversal option '{label}'"),
+            );
+            continue;
+        }
+        match canonical.as_str() {
+            "reference_kinds" => {
+                analysis.add_help(
+                    key.range.clone(),
+                    ":reference-kinds [kind ...]",
+                    QueryStepField::ReferenceKinds.description(),
+                );
+                validate_rql_reference_kinds(value, analysis);
+            }
+            "proof" => {
+                analysis.add_help(
+                    key.range.clone(),
+                    ":proof proven | unproven",
+                    QueryStepField::Proof.description(),
+                );
+                validate_rql_reference_scalar(value, "proof", usage_proof_from_label, analysis);
+            }
+            "surface" => {
+                analysis.add_help(
+                    key.range.clone(),
+                    ":surface external-usages | lsp-references",
+                    QueryStepField::Surface.description(),
+                );
+                validate_rql_reference_scalar(value, "surface", usage_surface_from_label, analysis);
+            }
+            "usage" => {
+                analysis.add_help(
+                    key.range.clone(),
+                    ":usage [kind ...]",
+                    QueryStepField::EdgeUsageKinds.description(),
+                );
+                validate_rql_label_vector(value, "usage kind", usage_kind_from_label, analysis);
+            }
+            "relation" => {
+                analysis.add_help(
+                    key.range.clone(),
+                    ":relation [relation ...]",
+                    QueryStepField::EdgeRelations.description(),
+                );
+                validate_rql_label_vector(
+                    value,
+                    "owner relation",
+                    OwnerRelation::from_label,
+                    analysis,
+                );
+            }
+            "site_class" => {
+                analysis.add_help(
+                    key.range.clone(),
+                    ":site-class [class ...]",
+                    QueryStepField::EdgeSiteClasses.description(),
+                );
+                validate_rql_label_vector(value, "site class", SiteClass::from_label, analysis);
+            }
+            _ => analysis.error(
+                key.range.clone(),
+                "unknown-property",
+                "edge traversal accepts only :reference-kinds, :proof, :surface, :usage, :relation, and :site-class",
+            ),
+        }
+    }
+}
+
+/// Validate one vector of constrained labels against a vocabulary.
+fn validate_rql_label_vector<T>(
+    value: &Expr,
+    noun: &str,
+    parse: impl Fn(&str) -> Option<T>,
+    analysis: &mut Analysis,
+) {
+    let ExprKind::Vector(items) = &value.kind else {
+        analysis.error(
+            value.range.clone(),
+            "wrong-value-shape",
+            format!("{noun} list must be a non-empty vector"),
+        );
+        return;
+    };
+    if items.is_empty() {
+        analysis.error(
+            value.range.clone(),
+            "wrong-value-shape",
+            format!("{noun} list must be a non-empty vector"),
+        );
+    }
+    for item in items {
+        let Some(label) = item.as_symbol().or_else(|| item.as_string()) else {
+            analysis.error(
+                item.range.clone(),
+                "wrong-value-shape",
+                format!("{noun} must be a symbol"),
+            );
+            continue;
+        };
+        let canonical = label.replace('-', "_");
+        if parse(&canonical).is_none() {
+            analysis.error(
+                item.range.clone(),
+                "invalid-query-step-option",
+                format!("unknown {noun} '{label}'"),
+            );
+        }
+    }
+}
+
 fn validate_rql_reference_kinds(value: &Expr, analysis: &mut Analysis) {
     let ExprKind::Vector(items) = &value.kind else {
         analysis.error(
@@ -2058,6 +2205,9 @@ fn validate_property_value(
         | super::schema::ValueShape::OccurrenceClassList
         | super::schema::ValueShape::OccurrenceRoleList
         | super::schema::ValueShape::NamespaceList
+        | super::schema::ValueShape::UsageKindList
+        | super::schema::ValueShape::OwnerRelationList
+        | super::schema::ValueShape::SiteClassList
         | super::schema::ValueShape::ScopeFilter
         | super::schema::ValueShape::BindingFilter
         | super::schema::ValueShape::PathFilter

@@ -666,7 +666,7 @@ fn reference_hits_from_bounded_sample(
         .collect()
 }
 
-pub(super) fn reference_hits_for_target(
+pub(crate) fn reference_hits_for_target(
     analyzer: &dyn IAnalyzer,
     result: FuzzyResult,
     target: &CodeUnit,
@@ -1016,7 +1016,7 @@ pub(super) fn scan_outbound_reference_hits(
     (hits, exhausted)
 }
 
-fn classify_reference_kind(
+pub(crate) fn classify_reference_kind(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     start_byte: usize,
