@@ -22,7 +22,7 @@ Observability: after the final milestone, `cargo test --test suite_cross_languag
 - [x] (2026-08-05) Branch `dave/github-issue-1475-735047` confirmed even with `origin/master` at `d338f34f8`, which contains the complete #1473 and #1474 foundations (occurrence rows, environment rows, resolution trace, RQL schema 9, assertion kind).
 - [x] (2026-08-05) Codebase survey completed (identity model, path-segment machinery, indirection machinery); findings recorded in Context and Orientation below.
 - [x] (2026-08-05) ExecPlan drafted.
-- [ ] Milestone 1 — core route/identity vocabulary and capability axes.
+- [x] (2026-08-05) Milestone 1 — core route/identity vocabulary and capability axes. Landed as one code commit plus this plan update: `crates/bifrost-core/src/analyzer/structural/routes.rs` with the four vocabularies, `CanonicalIdentity`/`CanonicalSegment(Kind)`, the two-table `IdentityRouteSupport`, and the required `StructuralSpec::identity_route_support` with all eleven adapter tables; `QueryFeature::{IdentityAxis, RouteRelation}` through the capability spine with the two provider predicates. Validation recorded in Outcomes & Retrospective.
 - [ ] Milestone 2 — qualified-path derivation layer with per-segment prefix resolution.
 - [ ] Milestone 3 — canonical identity projection and route relation derivation.
 - [ ] Milestone 4 — RQL/JSON typed domain exposure, schema version 10.
@@ -66,9 +66,23 @@ Findings from the pre-plan survey (2026-08-05). Update this section as implement
   Rationale: this is the smallest definition that catches the mined shape (forward and inverse disagreeing about one edge) without designing a multi-snapshot assertion surface the issue explicitly defers.
   Date/Author: 2026-08-05, Fable 5.
 
+- Decision (M1): route relations are a second claim table inside `IdentityRouteSupport` rather than an `IdentityAxis::RouteRelations` axis. An axis form would have forced every adapter into all-or-nothing route claims, and the per-relation shape ("re-exports yes, partial parts no") is the honest one for all six claiming adapters; the capability spine gets a separate `QueryFeature::RouteRelation` so a diagnostic names the missing relation, not a blanket axis.
+  Rationale: the claim granularity must match the machinery granularity, or a supported claim vouches for unimplemented relations.
+  Date/Author: 2026-08-05, Fable 5.
+- Decision (M1): `CanonicalSegmentKind` is a separate serializable vocabulary rather than serde on the interner's `SegmentKind`. The interner kind's `persist_tag` numbers are an on-disk cache contract; giving the same type a wire representation would couple the cache format to the query surface, and the one-way `From<SegmentKind>` conversion keeps drift impossible in the direction that matters.
+  Rationale: one type per contract; a conversion is cheaper than a coupling.
+  Date/Author: 2026-08-05, Fable 5.
+- Decision (M1): `CanonicalIdentity::generic_arity` distinguishes `None` ("the language records no arity here") from `Some(0)` ("recorded, and there are none"), and the unit test pins all three pairwise inequalities. A generic/nongeneric sibling decoy must compare unequal only on recorded evidence, never on a defaulted zero.
+  Rationale: the absence-is-not-zero rule both siblings recorded, applied to identity.
+  Date/Author: 2026-08-05, Fable 5.
+
 ## Outcomes & Retrospective
 
-To be written at each milestone completion.
+Milestone 1 (2026-08-05, commit "Add the identity-route vocabulary and capability axes"). What exists now that did not: the typed route/identity vocabulary in `crates/bifrost-core/src/analyzer/structural/routes.rs` (`RouteHopKind` with the nine mandated relations, `SegmentResolutionStatus`, `RouteTermination`, `IdentityAxis`, the two-table `IdentityRouteSupport`, and `CanonicalIdentity` with its `CanonicalSegment`/`CanonicalSegmentKind` wire projection and `from_fq` interner decode); a required `StructuralSpec::identity_route_support` that all eleven adapters answer (the deep four chain their own relation claims onto the shared `DEEP_IDENTITY_AXES` base, C# claims partial parts, C++ declaration-definition peers, the rest all-unsupported); and `QueryFeature::{IdentityAxis, RouteRelation}` wired through `capabilities.rs`, the `provider_supports_feature` dispatch and two new required `StructuralSearchProvider` predicates, parked behind `allow(dead_code)` until the Milestone 4 query surface produces them.
+
+Validation, verbatim: `cargo test -p brokk-bifrost-core --lib` — 166 passed, 1 failed (`cache_db::tests::streaming_reader_has_a_small_non_mmap_page_cache`, the known pre-existing failure); `cargo test -p brokk-bifrost-analysis --lib structural` — 339 passed, 0 failed, 2 ignored; `cargo test --test suite_cross_language` — 362 passed, 0 failed; `cargo clippy --workspace --all-targets -- -D warnings` — clean (with the rustup PATH ahead of Homebrew). `cargo fmt` applied.
+
+What Milestone 2 must know. The vocabulary re-exports live on `crate::analyzer::structural` in `brokk-bifrost-analysis` (the whole `routes` module plus the flat names). `IdentityRouteSupport` has two claim surfaces — `supports_axis` and `supports_relation` — and the derivation layer must consult `PathSegments`/`SegmentResolution` per file exactly as `lexical_environment.rs` consults its axes. `CanonicalIdentity::from_fq` panics on an empty `FqName` by design. The one external implementor of `StructuralSearchProvider` outside the crate is the planner test fake in `tests/suite_cross_language/structural_search_planner.rs`; a new required provider method must be added there too or the suite fails to compile (it did, and clippy caught it because plain `cargo check -p` does not compile root-harness test binaries).
 
 ## Context and Orientation
 
