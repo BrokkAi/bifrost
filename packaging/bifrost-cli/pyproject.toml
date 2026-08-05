@@ -36,6 +36,7 @@ build-backend = "maturin"
 
 [tool.maturin]
 bindings = "bin"
+data = "wheel-data"
 manifest-path = "../../Cargo.toml"
 strip = true
 targets = [{ name = "bifrost", kind = "bin" }]

@@ -49,6 +49,8 @@ const RQL_REFERENCE_EDGE_SCHEMA_VERSION: u32 = 11;
 /// from 10 to 11 because #1475 claimed 10 first, then from 11 to 12 because
 /// #1479 landed on master with 11 while this slice was still in flight.
 const RQL_MATERIALIZATION_SCHEMA_VERSION: u32 = 12;
+/// Mandatory receiver outcome rows and parent-linked receiver evidence rows.
+const RQL_RECEIVER_EVIDENCE_SCHEMA_VERSION: u32 = 13;
 const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
     SchemaVersionDescriptor::new(RQL_INITIAL_SCHEMA_VERSION, None, true),
     SchemaVersionDescriptor::new(
@@ -101,9 +103,14 @@ const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
         Some(RQL_REFERENCE_EDGE_SCHEMA_VERSION),
         true,
     ),
+    SchemaVersionDescriptor::new(
+        RQL_RECEIVER_EVIDENCE_SCHEMA_VERSION,
+        Some(RQL_MATERIALIZATION_SCHEMA_VERSION),
+        true,
+    ),
 ];
 
-const _: () = assert!(RQL_MATERIALIZATION_SCHEMA_VERSION as u64 == SCHEMA_VERSION);
+const _: () = assert!(RQL_RECEIVER_EVIDENCE_SCHEMA_VERSION as u64 == SCHEMA_VERSION);
 
 static RQL_SCHEMA_VERSION_REGISTRY: OnceLock<SchemaVersionRegistry> = OnceLock::new();
 
@@ -510,9 +517,11 @@ query_step_ops! {
     CallSitesTo { label: "call_sites_to", signature: "declaration -> call_site", description: "Return structured call sites whose resolved callee is each input declaration." }
     CallSitesFrom { label: "call_sites_from", signature: "declaration -> call_site", description: "Return structured call sites lexically owned by each input declaration." }
     CallInput { label: "call_input", signature: "call_site -> expression_site", description: "Project one direct receiver or formal-parameter input from each call site." }
-    ReceiverTargets { label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site -> receiver_analysis", description: "Analyze a bounded receiver value using adapter-provided structured facts." }
-    PointsTo { label: "points_to", signature: "structural_match|reference_site|expression_site -> receiver_analysis", description: "Analyze bounded value provenance using adapter-provided structured facts." }
-    MemberTargets { label: "member_targets", signature: "structural_match|reference_site -> receiver_analysis", description: "Resolve exact member declarations through bounded structured receiver facts." }
+    ReceiverTargets { label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site|occurrence -> receiver_analysis", description: "Analyze a bounded receiver value using adapter-provided structured facts." }
+    PointsTo { label: "points_to", signature: "structural_match|reference_site|expression_site|occurrence -> receiver_analysis", description: "Analyze bounded value provenance using adapter-provided structured facts." }
+    MemberTargets { label: "member_targets", signature: "structural_match|reference_site|occurrence -> receiver_analysis", description: "Resolve exact member declarations through bounded structured receiver facts." }
+    ReceiverOutcome { label: "receiver_outcome", signature: "receiver_analysis -> receiver_outcome", description: "Project the mandatory terminal outcome row for each receiver analysis.", since: 13, }
+    ReceiverEvidence { label: "receiver_evidence", signature: "receiver_analysis -> receiver_evidence", description: "Project zero or more parent-linked typed receiver evidence rows.", since: 13, }
     OccurrencesOf { label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it.", since: 8, }
     OccurrencesIn { label: "occurrences_in", signature: "structural_match|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or file.", since: 8, }
     OccurrenceTarget { label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences.", since: 8, }
@@ -687,6 +696,8 @@ macro_rules! rql_forms {
                     | Self::ReceiverTargets
                     | Self::PointsTo
                     | Self::MemberTargets
+                    | Self::ReceiverOutcome
+                    | Self::ReceiverEvidence
                     | Self::Occurrences
                     | Self::OccurrencesOf
                     | Self::OccurrencesIn
@@ -1051,6 +1062,24 @@ rql_forms! {
         signature: "(member-targets [:capture name] query)",
         description: (QueryStepOp::MemberTargets),
         step: MemberTargets,
+    }
+    ReceiverOutcome {
+        labels: ["receiver-outcome", "receiver_outcome"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(receiver-outcome query)",
+        description: (QueryStepOp::ReceiverOutcome),
+        step: ReceiverOutcome,
+        since: 13,
+    }
+    ReceiverEvidence {
+        labels: ["receiver-evidence", "receiver_evidence"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(receiver-evidence query)",
+        description: (QueryStepOp::ReceiverEvidence),
+        step: ReceiverEvidence,
+        since: 13,
     }
     Occurrences {
         labels: ["occurrences", "occurrence"],
@@ -1915,7 +1944,7 @@ mod tests {
         assert_eq!(
             resolve_rql_schema_version(None).unwrap(),
             SchemaVersionResolution {
-                version: 12,
+                version: 13,
                 origin: SchemaVersionOrigin::ImplicitCompatible,
             }
         );
@@ -1973,7 +2002,10 @@ mod tests {
 
         let error = resolve_rql_schema_version(Some(1)).unwrap_err();
         assert_eq!(error.requested, 1);
-        assert_eq!(error.supported, vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(
+            error.supported,
+            vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        );
     }
 
     #[test]

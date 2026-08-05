@@ -705,15 +705,13 @@ pub(crate) struct ScanUsagesExecutionContext {
     max_callsites: usize,
 }
 
-// Leave two seconds of the seven-second product envelope for cooperative
+// Leave two seconds of the five-second product envelope for cooperative
 // shutdown, rendering, response delivery, and short non-interruptible cache
 // lookups that may already be in flight when the deadline is observed.
 //
-// Raised from 3s: even after fixing the underlying candidate-discovery cost
-// (#1257), a full scan on a large workspace can still land just over a 3s
-// budget. 5s gives that case enough headroom without reopening the
-// interactive-latency work #1228/#1255 did.
-const SCAN_USAGES_MAX_DURATION: Duration = Duration::from_secs(5);
+// This default bounds interactive work. Batch callers that need a more complete
+// large-workspace scan can use the explicit max_duration_secs override.
+const SCAN_USAGES_MAX_DURATION: Duration = Duration::from_secs(3);
 
 /// Upper bound on a caller-requested `max_duration_secs` override (see
 /// [`ScanUsagesByReferenceParams::max_duration_secs`]). Keeps a budget override an escape hatch for
@@ -723,7 +721,7 @@ pub(crate) const SCAN_USAGES_MAX_DURATION_CEILING: Duration = Duration::from_sec
 // #1337: tests that pin the *count/byte*-based budget behavior (demote-to-summary,
 // candidate-file truncation, too-many-callsites) go through the public service surface,
 // which always applies the real [`SCAN_USAGES_MAX_DURATION`] wall-clock deadline. Under
-// box load, real elapsed time can cross that 5s deadline before the count/byte limit the
+// box load, real elapsed time can cross that deadline before the count/byte limit the
 // test actually means to exercise is reached, flipping the observed `incomplete_reason`
 // (or completeness) out from under the assertions -- flaky, not a real product bug. This
 // flag lets such tests disable the wall-clock deadline deterministically (no `Instant`

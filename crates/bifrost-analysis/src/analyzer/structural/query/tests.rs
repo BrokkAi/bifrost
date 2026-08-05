@@ -1079,6 +1079,45 @@ fn composed_structural_capture_must_exist_in_every_branch() {
 }
 
 #[test]
+fn receiver_analysis_projects_typed_outcome_and_evidence_rows() {
+    let outcome =
+        CodeQuery::from_sexp(r#"(receiver-outcome (receiver-targets (call :callee "run")))"#)
+            .expect("receiver outcome RQL");
+    assert_eq!(
+        outcome.validate_steps().unwrap(),
+        QueryValueKind::ReceiverOutcome
+    );
+    assert_eq!(outcome.schema_version, RECEIVER_EVIDENCE_SCHEMA_VERSION);
+
+    let evidence = parse_ok(json!({
+        "schema_version": RECEIVER_EVIDENCE_SCHEMA_VERSION,
+        "match": { "kind": "call", "callee": { "name": "run" } },
+        "steps": [
+            { "op": "receiver_targets" },
+            { "op": "receiver_evidence" }
+        ]
+    }));
+    assert_eq!(
+        evidence.validate_steps().unwrap(),
+        QueryValueKind::ReceiverEvidence
+    );
+    assert_eq!(
+        evidence.to_canonical_json()["steps"][1]["op"],
+        "receiver_evidence"
+    );
+
+    let error = error_of(json!({
+        "schema_version": RECEIVER_EVIDENCE_SCHEMA_VERSION - 1,
+        "match": { "kind": "call", "callee": { "name": "run" } },
+        "steps": [
+            { "op": "receiver_targets" },
+            { "op": "receiver_outcome" }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].op");
+}
+
+#[test]
 fn parses_configured_hierarchy_and_member_steps() {
     let query = parse_ok(json!({
         "match": { "kind": "class" },

@@ -166,6 +166,13 @@ pub(crate) struct AnalyzerStoreContext {
     pub(crate) liveness: Option<Arc<Liveness>>,
     pub(crate) live_paths: Arc<LivePathMap>,
     pub(crate) generations: Arc<HashMap<String, GenerationId>>,
+    pub(crate) startup_cache_validation: StartupCacheValidation,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum StartupCacheValidation {
+    FullIntegrity,
+    AtomicPublication,
 }
 
 pub(crate) struct StructuralSnapshotKey {
@@ -208,6 +215,7 @@ fn store_context_from_store(project: &dyn Project, store: AnalyzerStore) -> Anal
         liveness,
         live_paths: Arc::new(LivePathMap::default()),
         generations: Arc::new(HashMap::default()),
+        startup_cache_validation: StartupCacheValidation::FullIntegrity,
     }
 }
 
@@ -2795,8 +2803,10 @@ where
         store_context: &AnalyzerStoreContext,
         replace_live_paths: bool,
     ) -> Result<HashMap<ProjectFile, Oid>, String> {
+        let _scope = profiling::scope("TreeSitterAnalyzer::resolve_live_oids");
         type PlannedLiveOid = Option<(ProjectFile, Oid, LivePathEntry)>;
 
+        let liveness = store_context.liveness.as_ref();
         let plan_one = |file: &ProjectFile| -> Result<PlannedLiveOid, String> {
             let has_overlay = project.has_overlay(file);
             if !file.exists() && !has_overlay {
@@ -2807,7 +2817,9 @@ where
                 let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
                     .map_err(|err| err.to_string())?;
                 (oid, LivePathEntry::overlay(file.clone(), oid))
-            } else if let Some(liveness) = store_context.liveness.as_ref() {
+            } else if let Some(liveness) = liveness {
+                // Point resolution hashes the bytes currently on disk, so an
+                // incremental update observes the edit that triggered it.
                 let Some(oid) = liveness.oid_for_path(file)? else {
                     return Ok(None);
                 };
@@ -2820,15 +2832,40 @@ where
             };
             Ok(Some((file.clone(), oid, entry)))
         };
-        let planned = if files.len() <= 1 {
-            files.iter().map(&plan_one).collect::<Vec<_>>()
-        } else {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(config.parallelism().clamp(1, files.len()))
-                .build()
-                .map_err(|err| format!("failed to build live OID thread pool: {err}"))?;
-            pool.install(|| files.par_iter().map(&plan_one).collect::<Vec<_>>())
-        };
+        let plan_parallel =
+            |subset: &[ProjectFile]| -> Result<Vec<Result<PlannedLiveOid, String>>, String> {
+                if subset.len() <= 1 {
+                    return Ok(subset.iter().map(&plan_one).collect());
+                }
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(config.parallelism().clamp(1, subset.len()))
+                    .build()
+                    .map_err(|err| format!("failed to build live OID thread pool: {err}"))?;
+                Ok(pool.install(|| subset.par_iter().map(&plan_one).collect()))
+            };
+
+        let planned =
+            if replace_live_paths && let Some(liveness) = liveness {
+                // Startup and full-sweep reconciles project every disk file with
+                // one shared Git identity scan instead of hashing each clean file.
+                // Incremental updates stay on point resolution above: they carry
+                // few files and must observe the edit that triggered them without
+                // depending on the startup scan.
+                let (overlay_files, disk_files): (Vec<ProjectFile>, Vec<ProjectFile>) = files
+                    .iter()
+                    .cloned()
+                    .partition(|file| project.has_overlay(file));
+                let mut planned = plan_parallel(&overlay_files)?;
+                planned.extend(liveness.oids_for_files(&disk_files)?.into_iter().map(
+                    |(file, oid)| {
+                        let entry = LivePathEntry::filesystem(file.clone(), oid);
+                        Ok(Some((file, oid, entry)))
+                    },
+                ));
+                planned
+            } else {
+                plan_parallel(files)?
+            };
 
         let mut out = map_with_capacity(files.len());
         let mut live_entries = Vec::with_capacity(files.len());
@@ -2882,28 +2919,40 @@ where
                 None,
             ));
         }
-        let state = Self::reconcile_file_states(
-            project,
-            adapter,
-            config,
-            store_context,
-            ReconcileFileStates {
-                files: analyzable_files.clone(),
-                replace_live_paths: true,
-                progress: progress.clone(),
-                dirty_file_states: HashMap::default(),
-                dirty_path_symbol_rows: HashMap::default(),
-            },
-        );
-        state
-            .dirty_path_symbol_rows
-            .lock()
-            .expect("dirty path-symbol mutex poisoned")
-            .extend(Self::sync_path_symbol_units(
-                adapter,
-                &analyzable_files,
-                store_context,
+        let state = {
+            let _scope = profiling::scope(format!(
+                "TreeSitterAnalyzer::{:?}::reconcile_file_states",
+                adapter.language()
             ));
+            Self::reconcile_file_states(
+                project,
+                adapter,
+                config,
+                store_context,
+                ReconcileFileStates {
+                    files: analyzable_files.clone(),
+                    replace_live_paths: true,
+                    progress: progress.clone(),
+                    dirty_file_states: HashMap::default(),
+                    dirty_path_symbol_rows: HashMap::default(),
+                },
+            )
+        };
+        {
+            let _scope = profiling::scope(format!(
+                "TreeSitterAnalyzer::{:?}::sync_path_symbol_units",
+                adapter.language()
+            ));
+            state
+                .dirty_path_symbol_rows
+                .lock()
+                .expect("dirty path-symbol mutex poisoned")
+                .extend(Self::sync_path_symbol_units(
+                    adapter,
+                    &analyzable_files,
+                    store_context,
+                ));
+        }
 
         if let Some(progress) = progress.as_ref() {
             let total = analyzable_files.len();
@@ -3079,8 +3128,10 @@ where
         let mut fresh_parse_errors = HashMap::default();
         let mut seeded_file_states = Vec::new();
         let mut persistence_stats = PersistBatchStats::default();
-        let oid_plan =
-            Self::resolve_live_oids(project, &files, config, store_context, replace_live_paths);
+        let oid_plan = {
+            let _scope = profiling::scope("reconcile.resolve_live_oids");
+            Self::resolve_live_oids(project, &files, config, store_context, replace_live_paths)
+        };
         match oid_plan {
             Ok(file_oids) => {
                 let all_blob_keys: Vec<_> = files
@@ -3091,10 +3142,22 @@ where
                             .map(|oid| (*oid, adapter.storage_language_key_for_file(file)))
                     })
                     .collect();
-                let missing = match store_context.store.missing_parsed_blob_keys_at_generations(
-                    &all_blob_keys,
-                    store_context.generations.as_ref(),
-                ) {
+                let _missing_scope = profiling::scope("reconcile.find_missing_blobs");
+                let missing_result = match store_context.startup_cache_validation {
+                    StartupCacheValidation::FullIntegrity => {
+                        store_context.store.missing_parsed_blob_keys_at_generations(
+                            &all_blob_keys,
+                            store_context.generations.as_ref(),
+                        )
+                    }
+                    StartupCacheValidation::AtomicPublication => store_context
+                        .store
+                        .missing_published_parsed_blob_keys_at_generations(
+                            &all_blob_keys,
+                            store_context.generations.as_ref(),
+                        ),
+                };
+                let missing = match missing_result {
                     Ok(missing) => missing,
                     Err(_) => {
                         let mut seen = HashSet::default();
@@ -3105,6 +3168,7 @@ where
                     }
                 };
                 let missing_blob_keys: HashSet<(Oid, String)> = missing.iter().cloned().collect();
+                drop(_missing_scope);
 
                 if let Some(progress) = progress.as_ref() {
                     progress(BuildProgressEvent::new(
@@ -3254,7 +3318,11 @@ where
                     }
                 }
             }
-            Err(_) => {
+            Err(error) => {
+                profiling::note(format!(
+                    "resolve_live_oids failed; reconciling {:?} without live identities: {error}",
+                    adapter.language()
+                ));
                 for (file, state) in Self::analyze_files(adapter, project, config, files, progress)
                 {
                     let Some(state) = state else {
@@ -6546,6 +6614,9 @@ where
         self.full_declaration_scan_count
             .fetch_add(1, Ordering::Relaxed);
         let langs = self.storage_language_keys_for_queries();
+        let live_snapshot = self.live_snapshot();
+        let active_oids = live_snapshot.oids().collect::<Vec<_>>();
+        let literal_substrings = patterns.literal_ascii_substrings();
         // Phase one enumerates only the names a pattern can match. Phase two
         // hydrates the full candidate projection for the keys that matched, so
         // signature text, primary ranges, and `CodeUnit` construction cost
@@ -6556,6 +6627,8 @@ where
                 .search_candidate_name_rows_for_langs(
                     &langs,
                     self.store_context.generations.as_ref(),
+                    &active_oids,
+                    literal_substrings.as_deref(),
                     cancellation,
                 ),
             format!(
@@ -6563,11 +6636,8 @@ where
                 patterns.patterns().len()
             ),
         )?;
-        let resolver = QueryResolver::from_snapshot(
-            self.adapter.as_ref(),
-            self.project.root(),
-            self.live_snapshot(),
-        );
+        let resolver =
+            QueryResolver::from_snapshot(self.adapter.as_ref(), self.project.root(), live_snapshot);
         let mut complete = name_rows.complete;
         let mut inspected = name_rows.inspected;
         let matched = resolver.match_candidate_names_cancellable(
@@ -7648,6 +7718,12 @@ impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
+    fn invalidate_cached_file_identities(&self) {
+        if let Some(liveness) = self.store_context.liveness.as_ref() {
+            liveness.invalidate_startup_oids();
+        }
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         let mut cache = self.query_read_cache_write();
         let was_active = cache.is_active();
@@ -8930,6 +9006,7 @@ mod tests {
             liveness: None,
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
 
         let error = match TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
@@ -9423,6 +9500,7 @@ mod tests {
                 "python".to_string(),
                 GenerationId::BOOTSTRAP,
             )])),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -9577,6 +9655,7 @@ mod tests {
                 "python".to_string(),
                 GenerationId::BOOTSTRAP,
             )])),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -9655,6 +9734,7 @@ mod tests {
                 "python".to_string(),
                 GenerationId::BOOTSTRAP,
             )])),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -10736,6 +10816,7 @@ mod tests {
                 "python".to_string(),
                 GenerationId::BOOTSTRAP,
             )])),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -11106,6 +11187,7 @@ mod tests {
             liveness: None,
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
         let config = AnalyzerConfig::default();
 

@@ -15,12 +15,14 @@ pub use brokk_bifrost_analysis::{
     AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CancellationToken, CapabilityProvider,
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeQuery, CodeQueryExecutionLimits,
     CodeQueryExecutionMode, CodeQueryExplain, CodeQueryProfile, CodeQueryResponse, CodeUnit,
-    CodeUnitType, CppAnalyzer, DeclarationInfo, DeclarationKind, EmptyAnalyzer, FileSetProject,
-    FilesystemProject, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer,
-    JavascriptAnalyzer, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
-    JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalDependencies, JvmMavenCoordinate,
-    KotlinAnalyzer, Language, MultiAnalyzer, MultiRootProject, NavigationOperation, OverlayProject,
-    ParseError, ParseErrorKind, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range,
+    CodeUnitType, CppAnalyzer, DeclarationInfo, DeclarationKind, DependencyPackActivationOutcome,
+    DependencyPackEcosystem, DependencyPackEcosystemOutcome, DependencyPackWorkspaceContext,
+    EmptyAnalyzer, FileSetProject, FilesystemProject, GoAnalyzer, IAnalyzer,
+    ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer, JvmAnalyzerConfig,
+    JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
+    JvmExternalDependencies, JvmMavenCoordinate, KotlinAnalyzer, Language, MultiAnalyzer,
+    MultiRootProject, NavigationOperation, OverlayProject, ParseError, ParseErrorKind, PhpAnalyzer,
+    Project, ProjectFile, PythonAnalyzer, PythonSemanticModelWorkspaceContext, Range,
     RenderedSummary, RubyAnalyzer, RubyAnalyzerConfig, RubyDependencyApiEvidence,
     RubyDependencyPackAdapter, RubyGemApiArtifact, RustAnalyzer, RustAnalyzerConfig,
     RustDependencyApiEvidence, RustDependencyPackAdapter, RustPackageApiArtifact,
@@ -42,7 +44,7 @@ pub use brokk_bifrost_analysis::{
 pub use brokk_bifrost_lsp::lsp;
 pub use brokk_bifrost_mcp::{
     mcp_cli, mcp_common, mcp_core, mcp_extended, mcp_nlp, mcp_registry, mcp_slopcop, mcp_text,
-    scoped_project, searchtools_service, tool_arguments,
+    rmcp_host, scoped_project, searchtools_service, tool_arguments,
 };
 #[cfg(feature = "nlp")]
 pub use brokk_bifrost_nlp as nlp;

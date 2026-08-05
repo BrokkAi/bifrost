@@ -17,6 +17,8 @@ use brokk_bifrost_mcp::benchmark_api::{
 
 const STDERR_TAIL_CAPACITY_BYTES: usize = 256 * 1024;
 const STDERR_READ_BUFFER_BYTES: usize = 8 * 1024;
+const TRANSPORT_TIMING_LINE_MAX_BYTES: usize = 16 * 1024;
+const RETAINED_TRANSPORT_TIMING_LINES: usize = 1024;
 const PROFILE_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(5);
 const MCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_BUFFERED_MCP_RESPONSES: usize = 16;
@@ -33,6 +35,7 @@ pub struct StderrCursor {
 pub struct CapturedStderr {
     pub text: String,
     pub truncated: bool,
+    pub transport_timings: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -43,12 +46,22 @@ struct StderrChunk {
 }
 
 #[derive(Debug)]
+struct RetainedTransportTiming {
+    start_sequence: u64,
+    line: String,
+}
+
+#[derive(Debug)]
 struct StderrTail {
     chunks: VecDeque<StderrChunk>,
     bytes: usize,
     capacity: usize,
     next_sequence: u64,
     read_error: Option<String>,
+    transport_timings: VecDeque<RetainedTransportTiming>,
+    transport_line: Vec<u8>,
+    transport_line_start_sequence: Option<u64>,
+    transport_line_overflowed: bool,
 }
 
 impl StderrTail {
@@ -59,12 +72,17 @@ impl StderrTail {
             capacity,
             next_sequence: 0,
             read_error: None,
+            transport_timings: VecDeque::new(),
+            transport_line: Vec::new(),
+            transport_line_start_sequence: None,
+            transport_line_overflowed: false,
         }
     }
 
     fn push(&mut self, mut bytes: Vec<u8>) {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
+        self.retain_transport_timings(sequence, &bytes);
         if self.capacity == 0 {
             self.chunks.clear();
             self.bytes = 0;
@@ -87,6 +105,47 @@ impl StderrTail {
             bytes,
             prefix_truncated,
         });
+    }
+
+    fn retain_transport_timings(&mut self, sequence: u64, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let newline = bytes.iter().position(|byte| *byte == b'\n');
+            let segment_end = newline.unwrap_or(bytes.len());
+            let segment = &bytes[..segment_end];
+            if self.transport_line_start_sequence.is_none() {
+                self.transport_line_start_sequence = Some(sequence);
+            }
+            if !self.transport_line_overflowed {
+                let remaining =
+                    TRANSPORT_TIMING_LINE_MAX_BYTES.saturating_sub(self.transport_line.len());
+                if segment.len() <= remaining {
+                    self.transport_line.extend_from_slice(segment);
+                } else {
+                    self.transport_line.clear();
+                    self.transport_line_overflowed = true;
+                }
+            }
+
+            let Some(newline) = newline else {
+                return;
+            };
+            if !self.transport_line_overflowed && is_transport_timing_line(&self.transport_line) {
+                let start_sequence = self
+                    .transport_line_start_sequence
+                    .expect("a completed stderr line has a start sequence");
+                self.transport_timings.push_back(RetainedTransportTiming {
+                    start_sequence,
+                    line: String::from_utf8_lossy(&self.transport_line).into_owned(),
+                });
+                while self.transport_timings.len() > RETAINED_TRANSPORT_TIMING_LINES {
+                    self.transport_timings.pop_front();
+                }
+            }
+            self.transport_line.clear();
+            self.transport_line_start_sequence = None;
+            self.transport_line_overflowed = false;
+            bytes = &bytes[newline + 1..];
+        }
     }
 
     fn cursor(&self) -> StderrCursor {
@@ -116,8 +175,37 @@ impl StderrTail {
         CapturedStderr {
             text: String::from_utf8_lossy(&bytes).replace(BENCHMARK_PROFILE_BOUNDARY_MARKER, ""),
             truncated,
+            transport_timings: self
+                .transport_timings
+                .iter()
+                .filter(|timing| timing.start_sequence >= cursor.next_sequence)
+                .map(|timing| timing.line.clone())
+                .collect(),
         }
     }
+}
+
+fn is_transport_timing_line(line: &[u8]) -> bool {
+    const TIMING_PREFIX: &[u8] = b"[bifrost-timing]";
+    const DURATION_SUFFIX: &[u8] = b" ms)";
+    const PHASE_MARKERS: [&[u8]; 4] = [
+        b"mcp_request.queue_wait[",
+        b"mcp_request.execution[",
+        b"mcp_request.response_queue_wait[",
+        b"mcp_request.writer_delivery[",
+    ];
+
+    contains_bytes(line, TIMING_PREFIX)
+        && contains_bytes(line, DURATION_SUFFIX)
+        && PHASE_MARKERS
+            .iter()
+            .any(|marker| contains_bytes(line, marker))
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 struct StderrDrain {
@@ -933,6 +1021,95 @@ mod tests {
         let captured = tail.capture_since(cursor);
         assert_eq!(captured.text, "23456789");
         assert!(captured.truncated);
+    }
+
+    #[test]
+    fn issue_1631_transport_timings_survive_raw_tail_truncation() {
+        let mut tail = StderrTail::new(160);
+        let cursor = tail.cursor();
+        tail.push(b"[bifrost-timing] DURATION mcp_request.queue_wa".to_vec());
+        tail.push(b"it[scan_usages_by_location] (0.0 ms)\n".to_vec());
+        tail.push(b"[bifrost-timing] DURATION sql_definition_candidates (1.0 ms)\n".to_vec());
+        tail.push(vec![b'x'; 1024]);
+        tail.push(b"\n".to_vec());
+        tail.push(
+            b"[bifrost-timing] END mcp_request.execution[scan_usages_by_location] (3001.0 ms)\n"
+                .to_vec(),
+        );
+        tail.push(
+            b"[bifrost-timing] DURATION mcp_request.response_queue_wait[scan_usages_by_location] (0.1 ms)\n"
+                .to_vec(),
+        );
+        tail.push(
+            b"[bifrost-timing] END mcp_request.writer_delivery[scan_usages_by_location] (0.2 ms)\n"
+                .to_vec(),
+        );
+
+        let captured = tail.capture_since(cursor);
+        assert!(captured.truncated);
+        assert!(!captured.text.contains("queue_wait"));
+        assert_eq!(captured.transport_timings.len(), 4);
+        assert!(captured.transport_timings[0].contains("queue_wait"));
+        assert!(captured.transport_timings[1].contains("execution"));
+        assert!(captured.transport_timings[2].contains("response_queue_wait"));
+        assert!(captured.transport_timings[3].contains("writer_delivery"));
+    }
+
+    #[test]
+    fn transport_timing_capture_respects_the_request_cursor() {
+        let mut tail = StderrTail::new(1024);
+        tail.push(b"[bifrost-timing] DURATION mcp_request.queue_wait[old] (0.0 ms)\n".to_vec());
+        let cursor = tail.cursor();
+        tail.push(b"[bifrost-timing] END mcp_request.execution[current] (1.0 ms)\n".to_vec());
+
+        let captured = tail.capture_since(cursor);
+        assert_eq!(captured.transport_timings.len(), 1);
+        assert!(captured.transport_timings[0].contains("execution[current]"));
+    }
+
+    #[test]
+    fn transport_timing_capture_bounds_an_unterminated_line() {
+        let mut tail = StderrTail::new(16);
+        let cursor = tail.cursor();
+        tail.push(vec![b'x'; TRANSPORT_TIMING_LINE_MAX_BYTES + 1]);
+
+        assert!(tail.transport_line.is_empty());
+        assert!(tail.transport_line_overflowed);
+
+        tail.push(b"\n".to_vec());
+        tail.push(b"[bifrost-timing] DURATION mcp_request.queue_wait[current] (0.0 ms)\n".to_vec());
+
+        let captured = tail.capture_since(cursor);
+        assert_eq!(captured.transport_timings.len(), 1);
+        assert!(captured.transport_timings[0].contains("queue_wait[current]"));
+    }
+
+    #[test]
+    fn transport_timing_capture_keeps_a_bounded_line_record() {
+        let mut tail = StderrTail::new(0);
+        let cursor = tail.cursor();
+        for index in 0..=RETAINED_TRANSPORT_TIMING_LINES {
+            tail.push(
+                format!(
+                    "[bifrost-timing] DURATION mcp_request.queue_wait[tool-{index}] (0.0 ms)\n"
+                )
+                .into_bytes(),
+            );
+        }
+
+        let captured = tail.capture_since(cursor);
+        assert_eq!(
+            captured.transport_timings.len(),
+            RETAINED_TRANSPORT_TIMING_LINES
+        );
+        assert!(captured.transport_timings[0].contains("queue_wait[tool-1]"));
+        let last_tool = format!("queue_wait[tool-{RETAINED_TRANSPORT_TIMING_LINES}]");
+        assert!(
+            captured
+                .transport_timings
+                .last()
+                .is_some_and(|line| line.contains(&last_tool))
+        );
     }
 
     #[test]

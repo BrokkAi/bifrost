@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
+use crate::analyzer::structural::resolution::BoundaryStatus;
 use crate::hash::{HashMap, HashSet};
 use crate::path_normalization::NormalizePath;
 
@@ -2680,6 +2681,351 @@ pub struct SemanticDiagnostic {
     pub source: &'static str,
     pub kind: &'static str,
     pub message: String,
+}
+
+/// The structured surface that a semantic name lookup checked.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticDiagnosticDomain {
+    LexicalScope { file: PathBuf, range: Range },
+    Module { name: String },
+    Package { name: String },
+    Type { name: String },
+    MemberSurface { owner: String, member: String },
+}
+
+/// Complete evidence that a symbol does not exist in a checked domain.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SemanticAbsenceProof {
+    pub range: Range,
+    pub domain: SemanticDiagnosticDomain,
+    pub boundary: BoundaryStatus,
+}
+
+/// A typed cause that prevents a semantic lookup from proving absence.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticDiagnosticIncompleteReason {
+    MissingDependencyDiscovery { boundary: BoundaryStatus },
+    StaleGeneration { expected: u64, actual: u64 },
+    Cancelled,
+    Truncated,
+    UnsupportedSemantics { detail: String },
+    DynamicBehavior { detail: String },
+    RuntimeUnavailable { detail: String },
+    CorruptSemanticPack { detail: String },
+    UnsupportedGeneratedSurface { detail: String },
+}
+
+/// The result of one structured lookup made while collecting diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticDiagnosticOutcome {
+    Resolved {
+        range: Range,
+        boundary: BoundaryStatus,
+    },
+    Ambiguous {
+        range: Range,
+        boundaries: Vec<BoundaryStatus>,
+    },
+    Absent(SemanticAbsenceProof),
+    Incomplete {
+        range: Option<Range>,
+        reasons: Vec<SemanticDiagnosticIncompleteReason>,
+    },
+}
+
+/// Whether every diagnostic candidate in one request had complete evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticDiagnosticReportStatus {
+    Complete,
+    Incomplete,
+}
+
+/// Semantic diagnostics and the structured proof or suppression result behind them.
+///
+/// The fields stay private so a caller cannot add an error without a complete
+/// [`SemanticAbsenceProof`]. Parse diagnostics use a separate LSP path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticDiagnosticReport {
+    diagnostics: Vec<SemanticDiagnostic>,
+    outcomes: Vec<SemanticDiagnosticOutcome>,
+    status: SemanticDiagnosticReportStatus,
+}
+
+impl Default for SemanticDiagnosticReport {
+    fn default() -> Self {
+        Self {
+            diagnostics: Vec::new(),
+            outcomes: Vec::new(),
+            status: SemanticDiagnosticReportStatus::Complete,
+        }
+    }
+}
+
+impl SemanticDiagnosticReport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Convert diagnostics that a language collector proved absent from the
+    /// complete workspace-local lexical surface it checked.
+    pub fn from_workspace_absences(
+        file: &ProjectFile,
+        diagnostics: Vec<SemanticDiagnostic>,
+    ) -> Self {
+        let mut report = Self::new();
+        for diagnostic in diagnostics {
+            let range = diagnostic.range;
+            report.push_absent(
+                SemanticAbsenceProof {
+                    range,
+                    domain: SemanticDiagnosticDomain::LexicalScope {
+                        file: file.rel_path().to_path_buf(),
+                        range,
+                    },
+                    boundary: BoundaryStatus::WorkspaceLocal,
+                },
+                diagnostic,
+            );
+        }
+        report
+    }
+
+    pub fn push_resolved(&mut self, range: Range, boundary: BoundaryStatus) {
+        self.outcomes
+            .push(SemanticDiagnosticOutcome::Resolved { range, boundary });
+    }
+
+    pub fn push_ambiguous(&mut self, range: Range, boundaries: Vec<BoundaryStatus>) {
+        assert!(!boundaries.is_empty(), "ambiguity must name a boundary");
+        self.outcomes
+            .push(SemanticDiagnosticOutcome::Ambiguous { range, boundaries });
+    }
+
+    pub fn push_absent(&mut self, proof: SemanticAbsenceProof, diagnostic: SemanticDiagnostic) {
+        assert!(
+            matches!(
+                proof.boundary,
+                BoundaryStatus::WorkspaceLocal | BoundaryStatus::ExternalIndexed
+            ),
+            "absence proof requires a complete boundary"
+        );
+        assert_eq!(
+            proof.range, diagnostic.range,
+            "absence proof and diagnostic must identify the same source range"
+        );
+        self.outcomes.push(SemanticDiagnosticOutcome::Absent(proof));
+        self.diagnostics.push(diagnostic);
+    }
+
+    pub fn push_incomplete(
+        &mut self,
+        range: Option<Range>,
+        reasons: Vec<SemanticDiagnosticIncompleteReason>,
+    ) {
+        assert!(
+            !reasons.is_empty(),
+            "incomplete outcome must state a reason"
+        );
+        self.outcomes
+            .push(SemanticDiagnosticOutcome::Incomplete { range, reasons });
+        self.status = SemanticDiagnosticReportStatus::Incomplete;
+    }
+
+    pub fn diagnostics(&self) -> &[SemanticDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn outcomes(&self) -> &[SemanticDiagnosticOutcome] {
+        &self.outcomes
+    }
+
+    pub fn status(&self) -> SemanticDiagnosticReportStatus {
+        self.status
+    }
+
+    pub fn into_diagnostics(self) -> Vec<SemanticDiagnostic> {
+        self.diagnostics
+    }
+}
+
+impl std::ops::Deref for SemanticDiagnosticReport {
+    type Target = [SemanticDiagnostic];
+
+    fn deref(&self) -> &Self::Target {
+        self.diagnostics()
+    }
+}
+
+impl IntoIterator for SemanticDiagnosticReport {
+    type Item = SemanticDiagnostic;
+    type IntoIter = std::vec::IntoIter<SemanticDiagnostic>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.diagnostics.into_iter()
+    }
+}
+
+#[cfg(test)]
+mod semantic_diagnostic_report_tests {
+    use super::*;
+
+    fn range(start_byte: usize) -> Range {
+        Range {
+            start_byte,
+            end_byte: start_byte + 1,
+            start_line: 1,
+            end_line: 1,
+        }
+    }
+
+    fn diagnostic(range: Range) -> SemanticDiagnostic {
+        SemanticDiagnostic {
+            range,
+            source: "test",
+            kind: "unrecognized_symbol",
+            message: "Unrecognized symbol `Missing`".to_string(),
+        }
+    }
+
+    #[test]
+    fn report_emits_only_a_diagnostic_with_complete_absence_proof() {
+        let location = range(2);
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_resolved(location, BoundaryStatus::ExternalIndexed);
+        report.push_ambiguous(
+            location,
+            vec![
+                BoundaryStatus::WorkspaceLocal,
+                BoundaryStatus::ExternalIndexed,
+            ],
+        );
+        report.push_incomplete(
+            Some(location),
+            vec![SemanticDiagnosticIncompleteReason::Cancelled],
+        );
+
+        assert!(report.diagnostics().is_empty());
+        assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
+
+        report.push_absent(
+            SemanticAbsenceProof {
+                range: location,
+                domain: SemanticDiagnosticDomain::Type {
+                    name: "example.Owner".to_string(),
+                },
+                boundary: BoundaryStatus::ExternalIndexed,
+            },
+            diagnostic(location),
+        );
+
+        assert_eq!(report.diagnostics(), &[diagnostic(location)]);
+        assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
+        assert_eq!(report.outcomes().len(), 4);
+        assert!(matches!(
+            report.outcomes().last(),
+            Some(SemanticDiagnosticOutcome::Absent(proof))
+                if proof.boundary == BoundaryStatus::ExternalIndexed
+        ));
+    }
+
+    #[test]
+    fn report_retains_each_typed_incomplete_reason_without_an_error() {
+        let reasons = vec![
+            SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                boundary: BoundaryStatus::ExternalDeclaredUnindexed,
+            },
+            SemanticDiagnosticIncompleteReason::StaleGeneration {
+                expected: 4,
+                actual: 3,
+            },
+            SemanticDiagnosticIncompleteReason::Cancelled,
+            SemanticDiagnosticIncompleteReason::Truncated,
+            SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "macro expansion".to_string(),
+            },
+            SemanticDiagnosticIncompleteReason::DynamicBehavior {
+                detail: "runtime member".to_string(),
+            },
+            SemanticDiagnosticIncompleteReason::RuntimeUnavailable {
+                detail: "pack activation unavailable".to_string(),
+            },
+            SemanticDiagnosticIncompleteReason::CorruptSemanticPack {
+                detail: "invalid manifest".to_string(),
+            },
+            SemanticDiagnosticIncompleteReason::UnsupportedGeneratedSurface {
+                detail: "generated sources are not indexed".to_string(),
+            },
+        ];
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_incomplete(Some(range(7)), reasons.clone());
+
+        assert!(report.diagnostics().is_empty());
+        assert_eq!(
+            report.outcomes(),
+            &[SemanticDiagnosticOutcome::Incomplete {
+                range: Some(range(7)),
+                reasons,
+            }]
+        );
+    }
+
+    #[test]
+    fn workspace_conversion_records_the_checked_lexical_domain() {
+        let file = ProjectFile::new(std::env::current_dir().unwrap(), "src/Main.java");
+        let location = range(11);
+        let report =
+            SemanticDiagnosticReport::from_workspace_absences(&file, vec![diagnostic(location)]);
+
+        assert_eq!(report.diagnostics(), &[diagnostic(location)]);
+        assert_eq!(report.status(), SemanticDiagnosticReportStatus::Complete);
+        assert!(matches!(
+            report.outcomes(),
+            [SemanticDiagnosticOutcome::Absent(SemanticAbsenceProof {
+                range,
+                domain: SemanticDiagnosticDomain::LexicalScope { file, range: domain_range },
+                boundary: BoundaryStatus::WorkspaceLocal,
+            })] if *range == location
+                && file == &PathBuf::from("src/Main.java")
+                && *domain_range == location
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "absence proof and diagnostic must identify the same source range")]
+    fn report_rejects_an_error_without_matching_absence_evidence() {
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_absent(
+            SemanticAbsenceProof {
+                range: range(1),
+                domain: SemanticDiagnosticDomain::Module {
+                    name: "example".to_string(),
+                },
+                boundary: BoundaryStatus::WorkspaceLocal,
+            },
+            diagnostic(range(2)),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "absence proof requires a complete boundary")]
+    fn report_rejects_absence_at_an_unknown_boundary() {
+        let location = range(3);
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_absent(
+            SemanticAbsenceProof {
+                range: location,
+                domain: SemanticDiagnosticDomain::Package {
+                    name: "unknown.external".to_string(),
+                },
+                boundary: BoundaryStatus::ExternalUnknown,
+            },
+            diagnostic(location),
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

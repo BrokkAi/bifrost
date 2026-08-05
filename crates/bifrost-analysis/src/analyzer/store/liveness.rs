@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use git2::{ObjectType, Oid, Repository};
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 use crate::analyzer::ProjectFile;
@@ -15,6 +16,7 @@ type Result<T> = std::result::Result<T, String>;
 pub struct Liveness {
     repo: Mutex<Repository>,
     workdir: PathBuf,
+    startup_identity: Mutex<Option<Arc<gitblob::WorkingTreeIdentity>>>,
     snapshot: Mutex<Option<MemoizedSnapshot>>,
     overlay: Mutex<OverlayState>,
 }
@@ -29,6 +31,7 @@ impl Liveness {
         Ok(Self {
             repo: Mutex::new(repo),
             workdir,
+            startup_identity: Mutex::new(None),
             snapshot: Mutex::new(None),
             overlay: Mutex::new(OverlayState::default()),
         })
@@ -44,6 +47,68 @@ impl Liveness {
         Oid::hash_file(ObjectType::Blob, abs_path)
             .map(Some)
             .map_err(|err| err.to_string())
+    }
+
+    /// Resolve a complete analyzer file set with one Git index and dirty-tree
+    /// scan. This is the startup path for large repositories. Point resolution
+    /// reads every file and is reserved for small watcher updates.
+    pub fn oids_for_files(&self, files: &[ProjectFile]) -> Result<HashMap<ProjectFile, Oid>> {
+        let identity = {
+            let mut guard = self
+                .startup_identity
+                .lock()
+                .expect("liveness startup identity mutex poisoned");
+            if guard.is_none() {
+                let repo = self.repo.lock().expect("liveness repo mutex poisoned");
+                *guard = Some(Arc::new(gitblob::working_tree_identity(&repo)?));
+            }
+            Arc::clone(
+                guard
+                    .as_ref()
+                    .expect("startup identity was initialized above"),
+            )
+        };
+
+        // Apache Camel has tens of thousands of Java files. Keep the lock only
+        // around the one-time Git scan, then let language analyzers project
+        // their file sets in parallel. Only requested dirty files are hashed,
+        // so an unreadable file elsewhere in the worktree (for example another
+        // process's live database) cannot fail this projection.
+        let planned = files
+            .par_iter()
+            .map(|file| {
+                let rel_path = self.rel_path_from_workdir(file)?;
+                // Git paths use forward slashes on every host. This conversion
+                // stays at the Git API boundary.
+                let rel = rel_path.to_string_lossy().replace('\\', "/");
+                let abs_path = self.workdir.join(&rel_path);
+                if let Some(oid) = identity.clean_index_oid(&rel, &abs_path) {
+                    return Ok(Some((file.clone(), oid)));
+                }
+                // Dirty, untracked, ignored, or edited after the scan: the
+                // visible working bytes are the identity.
+                if !abs_path.is_file() {
+                    return Ok(None);
+                }
+                Oid::hash_file(ObjectType::Blob, &abs_path)
+                    .map(|oid| Some((file.clone(), oid)))
+                    .map_err(|err| err.to_string())
+            })
+            .collect::<Vec<Result<Option<(ProjectFile, Oid)>>>>();
+        let mut resolved = map_with_capacity(files.len());
+        for entry in planned {
+            if let Some((file, oid)) = entry? {
+                resolved.insert(file, oid);
+            }
+        }
+        Ok(resolved)
+    }
+
+    pub fn invalidate_startup_oids(&self) {
+        *self
+            .startup_identity
+            .lock()
+            .expect("liveness startup identity mutex poisoned") = None;
     }
 
     /// Full live view; rebuilt when the Git index bytes or overlay generation change.
@@ -93,7 +158,7 @@ impl Liveness {
                 changed |= overlay.paths.remove(&file).is_some();
                 continue;
             }
-            let Some(state) = PathState::new(entry.oid, entry.validation, &file) else {
+            let Some(state) = PathState::new(entry.oid, entry.validation, &file, true) else {
                 changed |= overlay.paths.remove(&file).is_some();
                 continue;
             };
@@ -189,9 +254,17 @@ impl PartialEq for PathState {
 impl Eq for PathState {}
 
 impl PathState {
-    fn new(oid: Oid, validation: LivePathValidation, file: &ProjectFile) -> Option<Self> {
+    fn new(
+        oid: Oid,
+        validation: LivePathValidation,
+        file: &ProjectFile,
+        revalidate_filesystem: bool,
+    ) -> Option<Self> {
         let stat = match validation {
-            LivePathValidation::Filesystem => Some(FileStat::from_path(&file.abs_path())?),
+            LivePathValidation::Filesystem if revalidate_filesystem => {
+                Some(FileStat::from_path(&file.abs_path())?)
+            }
+            LivePathValidation::Filesystem => None,
             LivePathValidation::Overlay => None,
         };
         Some(Self {
@@ -289,7 +362,12 @@ impl LivePathMap {
         let mut guard = self.state.lock().expect("live path map mutex poisoned");
         let mut changed = false;
         for entry in entries {
-            let Some(path_state) = PathState::new(entry.oid, entry.validation, &entry.file) else {
+            let Some(path_state) = PathState::new(
+                entry.oid,
+                entry.validation,
+                &entry.file,
+                self.revalidate_filesystem,
+            ) else {
                 changed |= guard.paths.remove(&entry.file).is_some();
                 continue;
             };
@@ -307,7 +385,12 @@ impl LivePathMap {
     pub fn replace_all(&self, entries: impl IntoIterator<Item = LivePathEntry>) {
         let mut next_paths = HashMap::default();
         for entry in entries {
-            if let Some(path_state) = PathState::new(entry.oid, entry.validation, &entry.file) {
+            if let Some(path_state) = PathState::new(
+                entry.oid,
+                entry.validation,
+                &entry.file,
+                self.revalidate_filesystem,
+            ) {
                 next_paths.insert(entry.file, path_state);
             }
         }
@@ -357,6 +440,10 @@ pub struct LiveSnapshot {
 }
 
 impl LiveSnapshot {
+    pub(crate) fn oids(&self) -> impl Iterator<Item = Oid> + '_ {
+        self.oid_to_paths.keys().copied()
+    }
+
     pub fn paths_for_oid(&self, oid: Oid) -> &[ProjectFile] {
         self.oid_to_paths
             .get(&oid)
@@ -626,6 +713,116 @@ mod tests {
         assert_eq!(
             resolved,
             Oid::hash_object(ObjectType::Blob, b"fn main() {}\n").unwrap()
+        );
+    }
+
+    #[test]
+    fn concurrent_bulk_oid_projection_preserves_nested_workspace_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        let module = temp.path().join("module");
+        std::fs::create_dir(&module).unwrap();
+        std::fs::write(module.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(module.join("b.py"), "def b(): pass\n").unwrap();
+        commit_all(&repo, "init");
+
+        let file_a = project_file(&module, "a.rs");
+        let file_b = project_file(&module, "b.py");
+        let index = repo.index().unwrap();
+        let oid_a = index.get_path(Path::new("module/a.rs"), 0).unwrap().id;
+        let oid_b = index.get_path(Path::new("module/b.py"), 0).unwrap().id;
+        let liveness = Arc::new(Liveness::new(repo).unwrap());
+
+        let (resolved_a, resolved_b) = std::thread::scope(|scope| {
+            let liveness_a = Arc::clone(&liveness);
+            let file_a_for_thread = file_a.clone();
+            let a = scope.spawn(move || liveness_a.oids_for_files(&[file_a_for_thread]));
+            let liveness_b = Arc::clone(&liveness);
+            let file_b_for_thread = file_b.clone();
+            let b = scope.spawn(move || liveness_b.oids_for_files(&[file_b_for_thread]));
+            (a.join().unwrap().unwrap(), b.join().unwrap().unwrap())
+        });
+
+        assert_eq!(resolved_a.get(&file_a), Some(&oid_a));
+        assert_eq!(resolved_b.get(&file_b), Some(&oid_b));
+    }
+
+    #[test]
+    fn bulk_oid_projection_observes_edits_after_the_startup_scan() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("a.rs"), "fn old() {}\n").unwrap();
+        commit_all(&repo, "init");
+
+        let file = project_file(temp.path(), "a.rs");
+        let liveness = Liveness::new(repo).unwrap();
+        let before = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            before.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn old() {}\n").unwrap())
+        );
+
+        // A full-refresh sweep after an out-of-band edit reuses the memoized
+        // startup scan; the stat check must reject the stale index OID.
+        std::fs::write(temp.path().join("a.rs"), "fn refreshed() {}\n").unwrap();
+        let after = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            after.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn refreshed() {}\n").unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bulk_oid_projection_ignores_unreadable_files_outside_the_request() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        commit_all(&repo, "init");
+
+        // An untracked, unreadable file elsewhere in the worktree models
+        // another process's live database (for example a locked SQLite file
+        // under `.bifrost/cache` on Windows). It must not fail the scan for
+        // files the analyzer actually requested.
+        let locked = temp.path().join("locked.db");
+        std::fs::write(&locked, "junk").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let file = project_file(temp.path(), "a.rs");
+        let liveness = Liveness::new(repo).unwrap();
+        let resolved = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            resolved.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn a() {}\n").unwrap())
+        );
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[test]
+    fn ignored_requested_file_uses_its_working_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join(".gitignore"), "generated.rs\n").unwrap();
+        commit_all(&repo, "init");
+        std::fs::write(temp.path().join("generated.rs"), "fn generated() {}\n").unwrap();
+
+        let file = project_file(temp.path(), "generated.rs");
+        let liveness = Liveness::new(repo).unwrap();
+        let resolved = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            resolved.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn generated() {}\n").unwrap())
         );
     }
 
@@ -906,6 +1103,34 @@ mod tests {
         assert_eq!(
             snapshot.oid_for_path(&file),
             Some(Oid::hash_object(ObjectType::Blob, b"fn dirty() {}\n").unwrap())
+        );
+    }
+
+    #[test]
+    fn invalidating_startup_oids_refreshes_bulk_working_tree_identities() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("a.rs"), "fn old() {}\n").unwrap();
+        commit_all(&repo, "init");
+
+        let file = project_file(temp.path(), "a.rs");
+        let liveness = Liveness::new(repo).unwrap();
+        let initial = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            initial.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn old() {}\n").unwrap())
+        );
+
+        std::fs::write(temp.path().join("a.rs"), "fn refreshed() {}\n").unwrap();
+        liveness.invalidate_startup_oids();
+        let refreshed = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            refreshed.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn refreshed() {}\n").unwrap())
         );
     }
 }
