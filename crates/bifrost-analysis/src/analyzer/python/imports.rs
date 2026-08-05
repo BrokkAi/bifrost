@@ -878,6 +878,8 @@ pub(super) fn python_import_details(import: &ImportInfo) -> Option<PythonImportD
             module: join_python_import_segments(&path.segments),
             alias: import.alias.clone(),
         }),
+        // Python has no static imports; the variant belongs to Java.
+        StructuredImportPathKind::StaticMember => None,
         StructuredImportPathKind::ImportFrom => {
             let (name, module_segments) = if import.is_wildcard {
                 ("*".to_string(), path.segments.as_slice())

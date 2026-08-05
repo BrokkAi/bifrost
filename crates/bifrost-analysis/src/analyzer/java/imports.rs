@@ -130,11 +130,8 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             return matched_imports;
         }
 
-        let import_packages: HashSet<String> = all_imports
-            .iter()
-            .map(|import| extract_package_from_import(&import.raw_snippet))
-            .filter(|package| !package.is_empty())
-            .collect();
+        let import_packages: HashSet<String> =
+            all_imports.iter().filter_map(import_package).collect();
 
         unresolved_identifiers.retain(|identifier| {
             if !identifier.contains('.') {
@@ -152,10 +149,9 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         let mut resolved_via_wildcard = HashSet::default();
         for identifier in &unresolved_identifiers {
             for import in &wildcard_imports {
-                let package = extract_package_from_import(&import.raw_snippet);
-                if package.is_empty() {
+                let Some(package) = import_package(import) else {
                     continue;
-                }
+                };
 
                 let lookup_name = format!("{package}.{identifier}");
                 if self
@@ -307,7 +303,7 @@ impl JavaAnalyzer {
             // A matching single-type import constrains this name even when its
             // declaration is outside the indexed workspace.
             if normalized == imported_name {
-                let unit = source_type_by_fqn(import_path);
+                let unit = source_type_by_fqn(&import_path.render_segments("."));
                 trace_explicit_import_win(file, normalized, unit.as_ref(), &imports);
                 return unit.into_iter().collect();
             }
@@ -315,7 +311,7 @@ impl JavaAnalyzer {
                 .strip_prefix(imported_name)
                 .and_then(|rest| rest.strip_prefix('.'))
             {
-                let nested_fqn = format!("{import_path}.{rest}");
+                let nested_fqn = format!("{}.{rest}", import_path.render_segments("."));
                 let unit = source_type_by_fqn(&nested_fqn);
                 trace_explicit_import_win(file, normalized, unit.as_ref(), &imports);
                 return unit.into_iter().collect();
@@ -330,8 +326,7 @@ impl JavaAnalyzer {
             if !import.is_wildcard {
                 continue;
             }
-            let package = import_path.trim_end_matches(".*");
-            let fqn = format!("{package}.{normalized}");
+            let fqn = format!("{}.{normalized}", import_path.render_segments("."));
             if let Some(unit) = source_type_by_fqn(&fqn)
                 && !wildcard_candidates.contains(&unit)
             {
@@ -444,8 +439,11 @@ impl JavaAnalyzer {
         };
 
         for import in imports {
-            if let Some(raw) = static_import_path(import) {
-                if raw
+            if let Some(path) = static_import_path(import) {
+                // A static import names a member (or `*`) past the type, so
+                // the target type's FQN must be a strict dotted prefix.
+                if path
+                    .render_segments(".")
                     .strip_prefix(&target_type_fqn)
                     .is_some_and(|suffix| suffix.starts_with('.'))
                 {
@@ -453,7 +451,7 @@ impl JavaAnalyzer {
                 }
                 continue;
             }
-            let Some(raw) = non_static_import_path(import) else {
+            let Some(path) = non_static_import_path(import) else {
                 continue;
             };
 
@@ -461,13 +459,17 @@ impl JavaAnalyzer {
                 if import.identifier.as_deref() == Some(target_name.as_str()) {
                     return true;
                 }
-                if raw.contains(&format!(".{}.", target_name)) {
+                // An interior segment (neither the leading package root nor
+                // the imported terminal) naming the target type marks a
+                // nested-type import through it.
+                let segments = &path.segments;
+                if segments.len() > 2 && segments[1..segments.len() - 1].contains(&target_name) {
                     return true;
                 }
                 continue;
             }
 
-            let import_package = raw.trim_end_matches(".*");
+            let import_package = path.render_segments(".");
             if import_package == target_package
                 || import_package == format!("{}.{}", target_package, target_name)
             {
@@ -505,14 +507,15 @@ impl JavaAnalyzer {
             };
 
             if !import.is_wildcard {
-                if let Some(code_unit) = self.source_type_by_fqn(import_path) {
+                if let Some(code_unit) = self.source_type_by_fqn(&import_path.render_segments("."))
+                {
                     resolved.insert(code_unit.identifier().to_string(), code_unit);
                 }
                 continue;
             }
 
-            let package_name = import_path.trim_end_matches(".*");
-            for code_unit in self.source_types_in_package(package_name) {
+            let package_name = import_path.render_segments(".");
+            for code_unit in self.source_types_in_package(&package_name) {
                 let identifier = code_unit.identifier().to_string();
                 if resolved.contains_key(&identifier)
                     && !wildcard_resolved.contains_key(&identifier)
@@ -661,8 +664,8 @@ impl JavaAnalyzer {
 
             if !import.is_wildcard {
                 if import.identifier.as_deref() == Some(name)
-                    && let Some(external_type) =
-                        external.resolve_explicit_import(import_path, access_package)
+                    && let Some(external_type) = external
+                        .resolve_explicit_import(&import_path.render_segments("."), access_package)
                 {
                     return Some(external_type.clone());
                 }
@@ -679,9 +682,9 @@ impl JavaAnalyzer {
                 continue;
             }
 
-            let package_name = import_path.trim_end_matches(".*");
+            let package_name = import_path.render_segments(".");
             let Some(external_type) =
-                external.resolve_wildcard_import(package_name, name, access_package)
+                external.resolve_wildcard_import(&package_name, name, access_package)
             else {
                 continue;
             };
@@ -760,10 +763,21 @@ pub(super) fn parse_import_info(node: Node<'_>, source: &str, raw: String) -> Im
             }
         }
     }
-    let is_wildcard = node
-        .children(&mut node.walk())
-        .any(|child| child.kind() == "asterisk");
+    let mut is_wildcard = false;
+    let mut is_static = false;
+    for child in node.children(&mut node.walk()) {
+        match child.kind() {
+            "asterisk" => is_wildcard = true,
+            "static" => is_static = true,
+            _ => {}
+        }
+    }
     let identifier = (!is_wildcard).then(|| segments.last().cloned()).flatten();
+    let kind = if is_static {
+        StructuredImportPathKind::StaticMember
+    } else {
+        StructuredImportPathKind::Namespace
+    };
 
     ImportInfo {
         raw_snippet: raw,
@@ -772,7 +786,7 @@ pub(super) fn parse_import_info(node: Node<'_>, source: &str, raw: String) -> Im
         alias: None,
         path: (!segments.is_empty()).then_some(StructuredImportPath {
             segments,
-            kind: Some(StructuredImportPathKind::Namespace),
+            kind: Some(kind),
             lexical_prefixes: Vec::new(),
             lexical_scopes: Vec::new(),
             declaration_start_byte: node.start_byte(),
@@ -808,10 +822,10 @@ fn trace_tier(normalized: &str, units: &[CodeUnit], tier: PrecedenceTier) {
 /// enumerated import list, not a re-derivation, so recording them as rejected
 /// peers reports a decision the resolver made rather than inventing one.
 ///
-/// The rejected route is named by the wildcard marker rather than by a target,
-/// because Java's `ImportInfo` carries no parser-derived path (`parse_import_info`
-/// leaves `path` empty) and recovering the package from the raw snippet would be
-/// exactly the source-text parsing this repository forbids.
+/// The rejected route is named by the wildcard marker rather than by a
+/// target: an on-demand route is rejected as a tier, and naming each
+/// package the tier never consulted would imply per-route decisions the
+/// resolver did not make.
 fn trace_explicit_import_win(
     file: &ProjectFile,
     normalized: &str,
@@ -837,40 +851,29 @@ fn trace_explicit_import_win(
     }));
 }
 
-pub(super) fn non_static_import_path(import: &ImportInfo) -> Option<&str> {
-    let path = import_path_from_raw(&import.raw_snippet);
-    if path.starts_with("static ") {
-        return None;
+/// The parser-derived path of a non-static import, or `None` for a static
+/// import (or a malformed declaration that produced no segments). For an
+/// on-demand (`.*`) import the segments name the package; the asterisk is
+/// not a segment.
+pub(super) fn non_static_import_path(import: &ImportInfo) -> Option<&StructuredImportPath> {
+    let path = import.path.as_ref()?;
+    (path.kind != Some(StructuredImportPathKind::StaticMember)).then_some(path)
+}
+
+/// The parser-derived path of a static import, or `None` otherwise.
+fn static_import_path(import: &ImportInfo) -> Option<&StructuredImportPath> {
+    let path = import.path.as_ref()?;
+    (path.kind == Some(StructuredImportPathKind::StaticMember)).then_some(path)
+}
+
+/// The package prefix an import makes visible: every segment for an
+/// on-demand (`.*`) import, every segment but the terminal member or type
+/// name otherwise. `None` when no package segments remain.
+fn import_package(import: &ImportInfo) -> Option<String> {
+    let path = import.path.as_ref()?;
+    if import.is_wildcard {
+        return Some(path.render_segments("."));
     }
-
-    Some(path)
-}
-
-fn static_import_path(import: &ImportInfo) -> Option<&str> {
-    import_path_from_raw(&import.raw_snippet)
-        .strip_prefix("static ")
-        .map(str::trim)
-}
-
-fn import_path_from_raw(raw: &str) -> &str {
-    raw.trim()
-        .strip_prefix("import ")
-        .unwrap_or(raw.trim())
-        .strip_suffix(';')
-        .unwrap_or(raw.trim())
-        .trim()
-}
-
-fn extract_package_from_import(raw: &str) -> String {
-    let trimmed = import_path_from_raw(raw);
-    let trimmed = trimmed.strip_prefix("static ").unwrap_or(trimmed).trim();
-
-    if let Some(package) = trimmed.strip_suffix(".*") {
-        return package.trim().to_string();
-    }
-
-    trimmed
-        .rsplit_once('.')
-        .map(|(package, _)| package.trim().to_string())
-        .unwrap_or_default()
+    let (_, package) = path.segments.split_last()?;
+    (!package.is_empty()).then(|| package.join("."))
 }
