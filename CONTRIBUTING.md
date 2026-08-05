@@ -156,16 +156,21 @@ directory instead of hand-editing checksums.
 
 To cut a release:
 
-1. Select a known-stable commit from `master` and create a dedicated RC branch
+1. Audit every publishable workspace crate against
+   [`docs/release-crates.md`](docs/release-crates.md). Confirm that each crate
+   exists on crates.io and has the required trusted publisher. Bootstrap any
+   new crate before release preparation. Do not use the version release to
+   create a crate for the first time.
+2. Select a known-stable commit from `master` and create a dedicated RC branch
    from that exact commit, for example `dave/v0.8.22-rc`. Push the branch so the
    candidate and any subsequent stabilization fixes are preserved remotely.
    Do not merge the moving `master` tip into the RC branch during stabilization;
    bring over only changes that are deliberately required for the release.
-2. On the RC branch, bump `[workspace.package].version` in `Cargo.toml`, run the
+3. On the RC branch, bump `[workspace.package].version` in `Cargo.toml`, run the
    version-sync command above, and review the generated metadata. Release
    workflows generate the Rust dependency report from the tagged `Cargo.lock`;
    it is not committed.
-3. If skills, agents, launcher files, MCP config, or plugin manifests changed,
+4. If skills, agents, launcher files, MCP config, or plugin manifests changed,
    regenerate and validate the generated plugin bundles:
 
    ```bash
@@ -181,13 +186,13 @@ To cut a release:
    bundles, and parseability of the Codex and Claude marketplace files. It also
    checks `plugins/bifrost-agent/bifrost-release.json`, so run it after that
    release metadata has been prepared for the version being validated.
-4. Sync the release version projection and every stabilization fix from the RC
+5. Sync the release version projection and every stabilization fix from the RC
    branch back to `master`. An RC-only fix is not complete until its equivalent
    has landed on `master`; use a cherry-pick or an equivalent focused commit and
    resolve any conflicts against current `master` deliberately. Changes that
    land on `master` after the branch point remain outside the release unless
    they are explicitly selected for the RC branch.
-5. After the RC branch is frozen and validated, tag the validated RC commit -
+6. After the RC branch is frozen and validated, tag the validated RC commit -
    not the current `master` tip - and push the tag:
 
    ```bash
