@@ -14,7 +14,7 @@ use brokk_bifrost_analysis::analyzer::structural::CodeQuery;
 use brokk_bifrost_analysis::analyzer::structural::occurrences::{
     Namespace, OccurrenceClass, OccurrenceRole,
 };
-use brokk_bifrost_analysis::analyzer::structural::{BoundaryStatus, PrecedenceTier};
+use brokk_bifrost_analysis::analyzer::structural::{BoundaryStatus, PrecedenceTier, RouteHopKind};
 use brokk_bifrost_analysis::schema_version::SchemaVersionResolution;
 
 pub const POLICY_DOCUMENT_SCHEMA_VERSION: u32 = 1;
@@ -119,6 +119,9 @@ pub enum PolicyAssert {
     Resolution(ResolutionAssert),
     Reaching(ReachingAssert),
     Boundary(BoundaryAssert),
+    Canonical(CanonicalAssert),
+    Route(RouteAssert),
+    RoundTrip(RoundTripAssert),
 }
 
 impl PolicyAssert {
@@ -128,6 +131,9 @@ impl PolicyAssert {
             Self::Resolution(assertion) => &assertion.id,
             Self::Reaching(assertion) => &assertion.id,
             Self::Boundary(assertion) => &assertion.id,
+            Self::Canonical(assertion) => &assertion.id,
+            Self::Route(assertion) => &assertion.id,
+            Self::RoundTrip(assertion) => &assertion.id,
         }
     }
 
@@ -138,6 +144,9 @@ impl PolicyAssert {
             Self::Resolution(assertion) => &assertion.at,
             Self::Reaching(assertion) => &assertion.at,
             Self::Boundary(assertion) => &assertion.at,
+            Self::Canonical(assertion) => &assertion.at,
+            Self::Route(assertion) => &assertion.at,
+            Self::RoundTrip(assertion) => &assertion.at,
         }
     }
 
@@ -150,6 +159,9 @@ impl PolicyAssert {
             Self::Resolution(assertion) => assertion.role,
             Self::Reaching(assertion) => assertion.role,
             Self::Boundary(assertion) => assertion.role,
+            Self::Canonical(assertion) => assertion.role,
+            Self::Route(assertion) => assertion.role,
+            Self::RoundTrip(assertion) => assertion.role,
         }
     }
 
@@ -159,6 +171,9 @@ impl PolicyAssert {
             Self::Resolution(_) => "resolution",
             Self::Reaching(_) => "reaching",
             Self::Boundary(_) => "boundary",
+            Self::Canonical(_) => "canonical",
+            Self::Route(_) => "route",
+            Self::RoundTrip(_) => "round_trip",
         }
     }
 }
@@ -312,6 +327,88 @@ impl BoundaryAssert {
             "no name_only_fallback selection at or past {}",
             self.forbid_fallback_past.label()
         )
+    }
+}
+
+/// Require two captures' resolved declarations to share (or not share) one
+/// canonical identity.
+///
+/// This is the decoy separator: two spellings whose displays coincide but
+/// whose owner segments, namespaces, or generic arities differ compare
+/// unequal, and the comparison never consults a rendering.
+#[derive(Debug, Clone)]
+pub struct CanonicalAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub role: OccurrenceRole,
+    /// The second capture whose resolved declarations are compared against.
+    pub equals: String,
+    /// The occurrence role of the second capture's token.
+    pub equals_role: OccurrenceRole,
+    /// `true` inverts the requirement: the two selections must share no
+    /// canonical identity.
+    pub distinct: bool,
+}
+
+impl CanonicalAssert {
+    pub fn expectation(&self) -> String {
+        if self.distinct {
+            format!(
+                "no shared canonical identity with capture `{}`",
+                self.equals
+            )
+        } else {
+            format!("a shared canonical identity with capture `{}`", self.equals)
+        }
+    }
+}
+
+/// Require an identity route from the subject's site to a second capture's
+/// declaration, optionally requiring one hop kind on the route and excluding
+/// another from the traversal.
+#[derive(Debug, Clone)]
+pub struct RouteAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub role: OccurrenceRole,
+    /// The capture whose resolved declarations the route must terminate at.
+    pub to: String,
+    /// The occurrence role of the target capture's token.
+    pub to_role: OccurrenceRole,
+    /// When present, at least one hop of this kind must appear on the route.
+    pub via: Option<RouteHopKind>,
+    /// When present, the traversal never follows hops of this kind, so a
+    /// route that needs one does not exist for this assert.
+    pub forbid: Option<RouteHopKind>,
+}
+
+impl RouteAssert {
+    pub fn expectation(&self) -> String {
+        let mut text = format!("an identity route to capture `{}`", self.to);
+        if let Some(via) = self.via {
+            text.push_str(&format!(" via {}", via.label()));
+        }
+        if let Some(forbid) = self.forbid {
+            text.push_str(&format!(", never via {}", forbid.label()));
+        }
+        text
+    }
+}
+
+/// Require forward resolution and inverse enumeration to round-trip the
+/// subject site: every terminal declaration the forward traversal reaches
+/// must reach the site back through inverse enumeration over the involved
+/// files.
+#[derive(Debug, Clone)]
+pub struct RoundTripAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub role: OccurrenceRole,
+}
+
+impl RoundTripAssert {
+    pub fn expectation(&self) -> String {
+        "forward and inverse routes round-trip the subject site".to_string()
     }
 }
 

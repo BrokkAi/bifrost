@@ -721,7 +721,62 @@ fn policy_assert_to_json(assertion: &PolicyAssert) -> Value {
         PolicyAssert::Resolution(assertion) => resolution_assert_to_json(assertion),
         PolicyAssert::Reaching(assertion) => reaching_assert_to_json(assertion),
         PolicyAssert::Boundary(assertion) => boundary_assert_to_json(assertion),
+        PolicyAssert::Canonical(assertion) => canonical_assert_to_json(assertion),
+        PolicyAssert::Route(assertion) => route_assert_to_json(assertion),
+        PolicyAssert::RoundTrip(assertion) => round_trip_assert_to_json(assertion),
     }
+}
+
+fn canonical_assert_to_json(assertion: &CanonicalAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("canonical"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(&mut object, "role", json!(assertion.role.label()));
+    insert(&mut object, "equals", json!(assertion.equals));
+    insert(
+        &mut object,
+        "equals_role",
+        json!(assertion.equals_role.label()),
+    );
+    insert(&mut object, "distinct", json!(assertion.distinct));
+    Value::Object(object)
+}
+
+fn route_assert_to_json(assertion: &RouteAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("route"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(&mut object, "role", json!(assertion.role.label()));
+    insert(&mut object, "to", json!(assertion.to));
+    insert(&mut object, "to_role", json!(assertion.to_role.label()));
+    insert(
+        &mut object,
+        "via",
+        match assertion.via {
+            Some(hop) => json!(hop.label()),
+            None => Value::Null,
+        },
+    );
+    insert(
+        &mut object,
+        "forbid",
+        match assertion.forbid {
+            Some(hop) => json!(hop.label()),
+            None => Value::Null,
+        },
+    );
+    Value::Object(object)
+}
+
+fn round_trip_assert_to_json(assertion: &RoundTripAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("round_trip"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(&mut object, "role", json!(assertion.role.label()));
+    Value::Object(object)
 }
 
 fn resolution_assert_to_json(assertion: &ResolutionAssert) -> Value {

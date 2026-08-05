@@ -723,6 +723,23 @@ pub trait IAnalyzer: Send + Sync + Any {
         Vec::new()
     }
 
+    /// The physical parts of a declaration the language spells in several
+    /// pieces (a C# `partial` type), including `code_unit` itself. `None`
+    /// means this analyzer does not model partial declarations at all —
+    /// which is different from `Some(vec![code_unit])`, a modeled declaration
+    /// with exactly one part (issue #1475).
+    fn partial_declaration_parts(&self, _code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
+        None
+    }
+
+    /// The concrete members that implement an abstract member (a Rust trait
+    /// member's impl items). `None` means this analyzer does not model the
+    /// implementation relation, or `code_unit` is not an abstract member it
+    /// can enumerate implementations for (issue #1475).
+    fn abstract_member_implementations(&self, _code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
+        None
+    }
+
     fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.top_level_declarations(file)
     }

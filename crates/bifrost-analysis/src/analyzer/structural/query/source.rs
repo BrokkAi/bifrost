@@ -638,6 +638,12 @@ fn validate_wrapper(
         validate_environment_options(form, args, kind, analysis);
         return;
     }
+    // `paths` is a source too: its whole argument list is a filter block.
+    if form == RqlForm::Paths {
+        analysis.path(rql_query_child_path(path, "paths"), head_range.clone());
+        validate_path_source_options(args, analysis);
+        return;
+    }
     let Some(query) = args.last() else {
         return;
     };
@@ -1091,10 +1097,14 @@ fn validate_wrapper(
             EnvironmentOptionKind::ReachingBinding,
             analysis,
         ),
+        RqlForm::SegmentsOf => {
+            validate_segments_of_options(&args[..args.len().saturating_sub(1)], analysis);
+        }
         RqlForm::ScopeOf
         | RqlForm::ScopeAncestors
         | RqlForm::BindingOccurrence
-        | RqlForm::CandidateTarget => {
+        | RqlForm::CandidateTarget
+        | RqlForm::SegmentTarget => {
             if args.len() != 1 {
                 analysis.error(
                     query.range.clone(),
@@ -1104,7 +1114,7 @@ fn validate_wrapper(
             }
         }
         RqlForm::Occurrences => unreachable!("the occurrence source returns above"),
-        RqlForm::Scopes | RqlForm::Bindings => {
+        RqlForm::Scopes | RqlForm::Bindings | RqlForm::Paths => {
             unreachable!("the environment sources return above")
         }
         RqlForm::Name
@@ -1116,6 +1126,96 @@ fn validate_wrapper(
         | RqlForm::NotKind => unreachable!("predicate cannot be a query wrapper"),
     }
     validate_rql_query(query, path, analysis, depth, plan_budget);
+}
+
+/// Validate the option pairs of the `(paths ...)` source: only
+/// `:min-segments` with a positive integer.
+fn validate_path_source_options(args: &[Expr], analysis: &mut Analysis) {
+    if !args.len().is_multiple_of(2) {
+        if let Some(last) = args.last() {
+            analysis.error(
+                last.range.clone(),
+                "wrong-value-shape",
+                "(paths ...) filter options must be name/value pairs",
+            );
+        }
+        return;
+    }
+    for pair in args.chunks_exact(2) {
+        let Some(key) = pair[0].as_symbol() else {
+            analysis.error(
+                pair[0].range.clone(),
+                "wrong-value-shape",
+                "(paths ...) option names must be symbols",
+            );
+            continue;
+        };
+        if key != ":min-segments" && key != ":min_segments" {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                "(paths ...) accepts only :min-segments",
+            );
+            continue;
+        }
+        analysis.add_help(
+            pair[0].range.clone(),
+            ":min-segments N",
+            "Keep only paths with at least this many segments.",
+        );
+        let valid = matches!(&pair[1].kind, ExprKind::Number(count) if *count > 0);
+        if !valid {
+            analysis.error(
+                pair[1].range.clone(),
+                "wrong-value-shape",
+                ":min-segments takes a positive integer",
+            );
+        }
+    }
+}
+
+/// Validate the option pairs of `(segments-of ...)`: only `:resolved true`.
+fn validate_segments_of_options(args: &[Expr], analysis: &mut Analysis) {
+    if !args.len().is_multiple_of(2) {
+        if let Some(last) = args.last() {
+            analysis.error(
+                last.range.clone(),
+                "wrong-value-shape",
+                "(segments-of ...) options must be name/value pairs before the query",
+            );
+        }
+        return;
+    }
+    for pair in args.chunks_exact(2) {
+        let Some(key) = pair[0].as_symbol() else {
+            analysis.error(
+                pair[0].range.clone(),
+                "wrong-value-shape",
+                "(segments-of ...) option names must be symbols",
+            );
+            continue;
+        };
+        if key != ":resolved" {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                "(segments-of ...) accepts only :resolved",
+            );
+            continue;
+        }
+        analysis.add_help(
+            pair[0].range.clone(),
+            ":resolved true",
+            super::schema::QueryStepField::Resolved.description(),
+        );
+        if !matches!(&pair[1].kind, ExprKind::Symbol(text) if text == "true") {
+            analysis.error(
+                pair[1].range.clone(),
+                "wrong-value-shape",
+                ":resolved must be true when present",
+            );
+        }
+    }
 }
 
 fn validate_receiver_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &mut Analysis) {
@@ -1960,6 +2060,7 @@ fn validate_property_value(
         | super::schema::ValueShape::NamespaceList
         | super::schema::ValueShape::ScopeFilter
         | super::schema::ValueShape::BindingFilter
+        | super::schema::ValueShape::PathFilter
         | super::schema::ValueShape::BindingKindList
         | super::schema::ValueShape::BindingNameList
         | super::schema::ValueShape::HoistingClassList
@@ -2506,6 +2607,7 @@ fn validate_json_query(
                 EnvironmentOptionKind::Binding,
                 analysis,
             ),
+            QueryField::Paths => validate_json_path_filter(child, &child_path, analysis),
             QueryField::Steps => validate_json_steps(child, &child_path, analysis),
             QueryField::Limit => {
                 if child
@@ -3046,6 +3148,41 @@ fn validate_json_occurrence_axis(
 /// Validate one lexical-environment filter object (a `scopes`/`bindings` seed
 /// body, or the option block of `bindings_in`/`candidates_of`) against the
 /// registries (#1474).
+/// Validate the JSON `paths` seed filter: only `min_segments` with a
+/// positive integer.
+fn validate_json_path_filter(value: &spanned::Value, path: &str, analysis: &mut Analysis) {
+    let Some(object) = value.as_object() else {
+        analysis.error(
+            value.range(),
+            "wrong-value-shape",
+            "paths must be a filter object",
+        );
+        return;
+    };
+    for (key, child) in object {
+        analysis.path(join_path(path, key.get_ref()), child.range());
+        if key.get_ref().as_str() != "min_segments" {
+            analysis.error(
+                key.range(),
+                "unknown-property",
+                format!("unknown qualified path filter property '{key}'; paths accepts only min_segments"),
+            );
+            continue;
+        }
+        if child
+            .as_number()
+            .and_then(serde_json::Number::as_u64)
+            .is_none_or(|count| count == 0)
+        {
+            analysis.error(
+                child.range(),
+                "wrong-value-shape",
+                "min_segments must be a positive integer",
+            );
+        }
+    }
+}
+
 fn validate_json_environment_filter(
     value: &spanned::Value,
     path: &str,

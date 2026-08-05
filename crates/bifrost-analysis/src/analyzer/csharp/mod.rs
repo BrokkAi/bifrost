@@ -2033,6 +2033,13 @@ impl IAnalyzer for CSharpAnalyzer {
         self.inner.signature_metadata(code_unit)
     }
 
+    fn partial_declaration_parts(&self, code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
+        if !code_unit.is_class() {
+            return None;
+        }
+        Some(self.partial_type_parts(code_unit))
+    }
+
     fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
         self.inner.get_analyzed_files()
     }
