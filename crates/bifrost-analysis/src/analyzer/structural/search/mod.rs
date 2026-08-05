@@ -39,8 +39,8 @@ use super::query::schema::{reference_kind_label, usage_proof_label};
 use super::query::{
     CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
     CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
-    CodeQuerySeed, HierarchyTraversal, Pattern, QueryError, QueryStep, ReferenceTraversalFilter,
-    SetOperator,
+    CodeQuerySeed, HierarchyTraversal, PathFilter, Pattern, QueryError, QueryStep,
+    ReferenceTraversalFilter, SetOperator,
 };
 use crate::analyzer::reference_candidates::{
     ReferenceCandidateRanges, reference_candidate_ranges, reference_candidate_ranges_cancellable,
@@ -86,11 +86,16 @@ use std::time::{Duration, Instant};
 mod environment;
 mod expansions;
 mod occurrences;
+mod paths;
 use environment::{
     BindingKey, BindingValue, CandidateKey, CandidateValue, EnvironmentTraversalCache, ScopeKey,
     ScopeValue,
 };
 use occurrences::{OccurrenceKey, OccurrenceTraversalCache, OccurrenceValue};
+use paths::{
+    PATH_QUERY_AXES, PathKey, PathTraversalCache, PathValue, RESOLVED_PATH_QUERY_AXES, SegmentKey,
+    SegmentValue, public_path, public_segment,
+};
 mod results;
 mod semantic;
 mod taint;
@@ -170,12 +175,14 @@ pub use results::CodeQueryLexicalScope;
 pub use results::CodeQueryMatch;
 pub use results::CodeQueryOccurrence;
 pub use results::CodeQueryOccurrenceTarget;
+pub use results::CodeQueryPathSegment;
 pub use results::CodeQueryProcedure;
 pub use results::CodeQueryProgramPoint;
 pub use results::CodeQueryProgramPointBoundary;
 pub use results::CodeQueryProgramPointRef;
 pub use results::CodeQueryProvenance;
 pub use results::CodeQueryProvenanceStep;
+pub use results::CodeQueryQualifiedPath;
 pub use results::CodeQueryRange;
 pub use results::CodeQueryReceiverAnalysis;
 pub use results::CodeQueryReceiverValue;
@@ -465,6 +472,8 @@ enum PipelineValue {
     LexicalScope(ScopeValue),
     Binding(BindingValue),
     ResolutionCandidate(Box<CandidateValue>),
+    QualifiedPath(PathValue),
+    PathSegment(SegmentValue),
 }
 
 #[derive(Debug, Clone)]
@@ -503,6 +512,8 @@ enum PipelineKey {
     LexicalScope(ScopeKey),
     Binding(BindingKey),
     ResolutionCandidate(CandidateKey),
+    QualifiedPath(PathKey),
+    PathSegment(SegmentKey),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -538,6 +549,8 @@ impl PipelineValue {
             Self::LexicalScope(value) => PipelineKey::LexicalScope(value.key()),
             Self::Binding(value) => PipelineKey::Binding(value.key()),
             Self::ResolutionCandidate(value) => PipelineKey::ResolutionCandidate(value.key()),
+            Self::QualifiedPath(value) => PipelineKey::QualifiedPath(value.key()),
+            Self::PathSegment(value) => PipelineKey::PathSegment(value.key()),
         }
     }
 }
@@ -755,6 +768,8 @@ enum PipelineTraceValue {
     LexicalScope(ScopeValue),
     Binding(BindingValue),
     ResolutionCandidate(Box<CandidateValue>),
+    QualifiedPath(PathValue),
+    PathSegment(SegmentValue),
 }
 
 #[derive(Debug, Clone)]
@@ -1449,6 +1464,7 @@ struct QueryExecutionState<'a> {
     call_cache: CallTraversalCache,
     occurrence_cache: OccurrenceTraversalCache,
     environment_cache: EnvironmentTraversalCache,
+    path_cache: PathTraversalCache,
     receiver_facts: HashMap<ProjectFile, Arc<FileFacts>>,
     semantic: Option<SemanticQueryContext<'a>>,
     import_graph: Option<RequestLocalDirectImportGraph>,
@@ -2163,6 +2179,7 @@ fn execute_internal_with_analysis_strategy(
         reference_cache: ReferenceTraversalCache::default(),
         occurrence_cache: OccurrenceTraversalCache::default(),
         environment_cache: EnvironmentTraversalCache::default(),
+        path_cache: PathTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
         receiver_facts: HashMap::default(),
         semantic: workspace.filter(|_| requires_semantic).map(|workspace| {
@@ -2727,6 +2744,45 @@ fn detailed_evidence_for_pipeline_value(
                 provenance: Vec::new(),
             }
         }
+        PipelineValue::QualifiedPath(value) => {
+            let row = value.row();
+            let byte_span = row.range.start_byte..row.range.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::QualifiedPath,
+                key: DetailedCodeQueryKey::QualifiedPath {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                },
+                file: row.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::PathSegment(value) => {
+            let row = value.row();
+            let byte_span = row.range.start_byte..row.range.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::PathSegment,
+                key: DetailedCodeQueryKey::PathSegment {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                    ordinal: row.ordinal,
+                },
+                file: row.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
     }
 }
 
@@ -2786,6 +2842,8 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::ExpressionSite(site) => Some(&site.call_site.0.file),
         PipelineValue::Occurrence(value) => Some(value.file()),
         PipelineValue::LexicalScope(value) => Some(value.file()),
+        PipelineValue::QualifiedPath(value) => Some(value.file()),
+        PipelineValue::PathSegment(value) => Some(value.file()),
         PipelineValue::Binding(value) => Some(value.file()),
         PipelineValue::ResolutionCandidate(value) => Some(value.file()),
         PipelineValue::File(_) | PipelineValue::ReceiverAnalysis(_) => None,
@@ -2894,6 +2952,12 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::ResolutionCandidate(value) => {
             files.insert(value.file().clone());
         }
+        PipelineValue::QualifiedPath(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::PathSegment(value) => {
+            files.insert(value.file().clone());
+        }
     }
 }
 
@@ -2922,6 +2986,12 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
             files.insert(value.file().clone());
         }
         PipelineTraceValue::ResolutionCandidate(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::QualifiedPath(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::PathSegment(value) => {
             files.insert(value.file().clone());
         }
     }
@@ -3143,6 +3213,33 @@ fn detailed_trace_provenance_ref(
                     id: value.id(),
                     ast_id: row.ast_id(),
                     ordinal: value.ordinal,
+                },
+                &row.file,
+                row.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::QualifiedPath(value) => {
+            let row = value.row();
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::QualifiedPath,
+                DetailedCodeQueryKey::QualifiedPath {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                },
+                &row.file,
+                row.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::PathSegment(value) => {
+            let row = value.row();
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::PathSegment,
+                DetailedCodeQueryKey::PathSegment {
+                    id: value.id(),
+                    ast_id: row.ast_id(),
+                    ordinal: row.ordinal,
                 },
                 &row.file,
                 row.range,
@@ -3605,6 +3702,40 @@ fn execute_plan(
                 execution
             }
         }
+        (PhysicalQueryOperator::PathScan, LogicalQueryOperator::PathSeed(seed)) => {
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::CancellationBeforeWork,
+                );
+                cancelled_plan_execution()
+            } else {
+                let execution = execute_path_seed(
+                    &seed.filter,
+                    &seed.where_globs,
+                    &seed.languages,
+                    terminal_cap,
+                    state,
+                    limits,
+                    diagnostics,
+                );
+                if terminal_cap.is_some_and(|cap| execution.rows.len() >= cap) {
+                    push_operator_termination(
+                        &mut terminations,
+                        QueryOperatorTermination::TerminalCap,
+                    );
+                }
+                self_truncated = execution.truncated;
+                if execution.cancelled {
+                    disposition = QueryOperatorDisposition::Cancelled;
+                }
+                execution
+            }
+        }
         (PhysicalQueryOperator::SeedScan, LogicalQueryOperator::Seed(seed)) => {
             if state
                 .cancellation
@@ -4041,6 +4172,7 @@ fn execute_parallel_seed_union(
                     reference_cache: ReferenceTraversalCache::default(),
                     occurrence_cache: OccurrenceTraversalCache::default(),
                     environment_cache: EnvironmentTraversalCache::default(),
+                    path_cache: PathTraversalCache::default(),
                     call_cache: CallTraversalCache::default(),
                     receiver_facts: HashMap::default(),
                     semantic: None,
@@ -4281,7 +4413,8 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::TypestateCapabilityUnsupported
             | CodeQueryDiagnosticCode::ValueFlowCapabilityUnsupported
             | CodeQueryDiagnosticCode::OccurrenceRoleUnsupported
-            | CodeQueryDiagnosticCode::EnvironmentAxisUnsupported => {
+            | CodeQueryDiagnosticCode::EnvironmentAxisUnsupported
+            | CodeQueryDiagnosticCode::IdentityAxisUnsupported => {
                 Some(QueryOperatorTermination::UnsupportedAnalysis)
             }
             CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted
@@ -4317,7 +4450,8 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::ReferenceAnalysisFailed
             | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
             | CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
-            | CodeQueryDiagnosticCode::ResolutionTraceIncomplete => {
+            | CodeQueryDiagnosticCode::ResolutionTraceIncomplete
+            | CodeQueryDiagnosticCode::PathDerivationIncomplete => {
                 Some(QueryOperatorTermination::AnalysisIncomplete)
             }
             CodeQueryDiagnosticCode::InvalidPlan
@@ -4945,6 +5079,120 @@ fn execute_environment_seed(
                     language: "workspace",
                     message: format!(
                         "lexical environment seed reached its {desired_rows}-row cap; narrow the filter, languages, or where globs"
+                    ),
+                });
+                break;
+            }
+            state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(1);
+            insert_pipeline_row(&mut rows, &mut indexes, value, Vec::new(), false);
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    PlanExecution {
+        rows,
+        truncated,
+        cancelled: false,
+        pipeline_halted: false,
+    }
+}
+
+fn execute_path_seed(
+    filter: &PathFilter,
+    where_globs: &[glob::Pattern],
+    languages: &[Language],
+    terminal_cap: Option<usize>,
+    state: &mut QueryExecutionState<'_>,
+    limits: CodeQueryExecutionLimits,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> PlanExecution {
+    let budget_cap = limits
+        .max_pipeline_rows
+        .saturating_sub(state.budget.pipeline_rows);
+    let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
+    if desired_rows == 0 {
+        push_pipeline_budget_diagnostic(diagnostics, &state.budget);
+        return PlanExecution {
+            rows: Vec::new(),
+            truncated: true,
+            cancelled: false,
+            pipeline_halted: false,
+        };
+    }
+
+    let mut files: Vec<ProjectFile> = state
+        .analyzer
+        .analyzed_files()
+        .into_iter()
+        .filter(|file| {
+            let language = crate::analyzer::common::language_for_file(file);
+            (languages.is_empty() || languages.contains(&language))
+                && (where_globs.is_empty() || {
+                    let path = rel_path_string(file);
+                    where_globs.iter().any(|glob| glob.matches(&path))
+                })
+        })
+        .collect();
+    files.sort();
+
+    let mut rows: Vec<PipelineRow> = Vec::new();
+    let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
+    let mut truncated = false;
+    for file in files {
+        if state
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return cancelled_plan_execution();
+        }
+        let mut projected = state.budget;
+        projected.scanned_files = projected.scanned_files.saturating_add(1);
+        if projected.scanned_files > limits.max_scanned_files {
+            push_budget_diagnostic(diagnostics, &projected);
+            truncated = true;
+            break;
+        }
+        state.budget.scanned_files = projected.scanned_files;
+
+        let Some(result) =
+            state
+                .path_cache
+                .paths_for(state.analyzer, &file, false, state.cancellation)
+        else {
+            return cancelled_plan_execution();
+        };
+        state
+            .path_cache
+            .report_completeness(&file, &result, PATH_QUERY_AXES, diagnostics);
+        let values: Vec<PipelineValue> = result
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                filter
+                    .min_segments
+                    .is_none_or(|minimum| row.segment_count >= minimum)
+            })
+            .map(|(index, _)| {
+                PipelineValue::QualifiedPath(PathValue {
+                    file: file.clone(),
+                    result: Arc::clone(&result),
+                    index,
+                })
+            })
+            .collect();
+        for value in values {
+            if rows.len() >= desired_rows {
+                truncated = true;
+                diagnostics.push(CodeQueryDiagnostic {
+                    code: CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: "workspace",
+                    message: format!(
+                        "qualified path seed reached its {desired_rows}-row cap; narrow the filter, languages, or where globs"
                     ),
                 });
                 break;
@@ -5963,7 +6211,9 @@ fn apply_plan_step(
                     | PipelineValue::Occurrence(_)
                     | PipelineValue::LexicalScope(_)
                     | PipelineValue::Binding(_)
-                    | PipelineValue::ResolutionCandidate(_) => None,
+                    | PipelineValue::ResolutionCandidate(_)
+                    | PipelineValue::QualifiedPath(_)
+                    | PipelineValue::PathSegment(_) => None,
                 })
                 .sum();
             if let Some(profile) = &mut state.cache_profile {
@@ -6011,7 +6261,9 @@ fn apply_plan_step(
                                 | PipelineValue::Occurrence(_)
                                 | PipelineValue::LexicalScope(_)
                                 | PipelineValue::Binding(_)
-                                | PipelineValue::ResolutionCandidate(_) => None,
+                                | PipelineValue::ResolutionCandidate(_)
+                                | PipelineValue::QualifiedPath(_)
+                                | PipelineValue::PathSegment(_) => None,
                             })
                             .sum();
                         profile
@@ -6066,7 +6318,9 @@ fn apply_plan_step(
                         | PipelineValue::Occurrence(_)
                         | PipelineValue::LexicalScope(_)
                         | PipelineValue::Binding(_)
-                        | PipelineValue::ResolutionCandidate(_) => None,
+                        | PipelineValue::ResolutionCandidate(_)
+                        | PipelineValue::QualifiedPath(_)
+                        | PipelineValue::PathSegment(_) => None,
                     })
                     .collect::<Vec<_>>();
                 frontier.sort_by_key(rel_path_string);
@@ -6172,6 +6426,7 @@ fn apply_plan_step(
         &mut state.call_cache,
         &mut state.occurrence_cache,
         &mut state.environment_cache,
+        &mut state.path_cache,
         &mut state.receiver_facts,
         &mut state.semantic,
         &mut state.budget,
@@ -6662,6 +6917,7 @@ fn apply_pipeline_step(
     call_cache: &mut CallTraversalCache,
     occurrence_cache: &mut OccurrenceTraversalCache,
     environment_cache: &mut EnvironmentTraversalCache,
+    path_cache: &mut PathTraversalCache,
     receiver_facts: &mut HashMap<ProjectFile, Arc<FileFacts>>,
     semantic: &mut Option<SemanticQueryContext<'_>>,
     budget: &mut CodeQueryExecutionBudget,
@@ -7585,6 +7841,94 @@ fn apply_pipeline_step(
                     .and_then(|unit| indexed.get(analyzer, unit))
                     .map(|declaration| {
                         vec![pipeline_expansion(PipelineValue::Declaration(declaration))]
+                    })
+                    .unwrap_or_default()
+            }
+            (PipelineValue::QualifiedPath(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
+            }
+            (PipelineValue::PathSegment(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
+            }
+            (PipelineValue::QualifiedPath(value), QueryStep::SegmentsOf(options)) => {
+                // A resolved request derives the file's resolved variant and
+                // re-anchors this path's segments in it, so the rows carry
+                // statuses; a plain request reuses the result the path row
+                // already shares.
+                let derived = if options.resolved {
+                    path_cache
+                        .paths_for(analyzer, &value.file, true, cancellation)
+                        .map(|result| (result, RESOLVED_PATH_QUERY_AXES))
+                } else {
+                    Some((Arc::clone(&value.result), PATH_QUERY_AXES))
+                };
+                let Some((result, axes)) = derived else {
+                    // Only cancellation makes the derivation refuse; the
+                    // surrounding loop's own cancellation check reports it,
+                    // and an empty expansion list adds nothing meanwhile.
+                    continue;
+                };
+                path_cache.report_completeness(&value.file, &result, axes, diagnostics);
+                let terminal = value.row().terminal_node;
+                result
+                    .segments
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| row.path_terminal_node == terminal)
+                    .map(|(index, _)| {
+                        pipeline_expansion(PipelineValue::PathSegment(SegmentValue {
+                            file: value.file.clone(),
+                            result: Arc::clone(&result),
+                            index,
+                        }))
+                    })
+                    .collect()
+            }
+            (PipelineValue::PathSegment(value), QueryStep::SegmentTarget) => {
+                // The step needs each segment's own resolution; a row from a
+                // rows-only derivation is re-anchored in the resolved variant
+                // by its (path, ordinal) identity.
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                let row = value.row();
+                let resolved_row;
+                let resolution = if row.resolution.is_some() {
+                    row.resolution.as_ref()
+                } else {
+                    match path_cache.paths_for(analyzer, &value.file, true, cancellation) {
+                        Some(result) => {
+                            path_cache.report_completeness(
+                                &value.file,
+                                &result,
+                                RESOLVED_PATH_QUERY_AXES,
+                                diagnostics,
+                            );
+                            resolved_row = result
+                                .segments
+                                .iter()
+                                .find(|candidate| {
+                                    candidate.path_terminal_node == row.path_terminal_node
+                                        && candidate.ordinal == row.ordinal
+                                })
+                                .cloned();
+                            resolved_row
+                                .as_ref()
+                                .and_then(|row| row.resolution.as_ref())
+                        }
+                        None => None,
+                    }
+                };
+                resolution
+                    .map(|resolution| {
+                        resolution
+                            .targets
+                            .iter()
+                            .filter_map(|unit| indexed.get(analyzer, unit))
+                            .map(|declaration| {
+                                pipeline_expansion(PipelineValue::Declaration(declaration))
+                            })
+                            .collect::<Vec<_>>()
                     })
                     .unwrap_or_default()
             }
@@ -9124,6 +9468,10 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::ResolutionCandidate(value) => {
             Some(PipelineTraceValue::ResolutionCandidate(value.clone()))
         }
+        PipelineValue::QualifiedPath(value) => {
+            Some(PipelineTraceValue::QualifiedPath(value.clone()))
+        }
+        PipelineValue::PathSegment(value) => Some(PipelineTraceValue::PathSegment(value.clone())),
     }
 }
 
@@ -9210,6 +9558,12 @@ fn render_pipeline_item(
         PipelineValue::ResolutionCandidate(value) => CodeQueryResultValue::ResolutionCandidate {
             value: Box::new(render_resolution_candidate(analyzer, &value, detail, cache)),
         },
+        PipelineValue::QualifiedPath(value) => CodeQueryResultValue::QualifiedPath {
+            value: Box::new(render_qualified_path(analyzer, &value, cache)),
+        },
+        PipelineValue::PathSegment(value) => CodeQueryResultValue::PathSegment {
+            value: Box::new(render_path_segment(analyzer, &value, cache)),
+        },
     };
     CodeQueryResultItem {
         value,
@@ -9261,6 +9615,12 @@ fn render_provenance(
                     }
                     PipelineTraceValue::ResolutionCandidate(value) => {
                         render_candidate_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::QualifiedPath(value) => {
+                        render_qualified_path_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::PathSegment(value) => {
+                        render_path_segment_ref(analyzer, value, cache)
                     }
                 },
                 via: step.via.as_ref().map(|via| match via {
@@ -9821,6 +10181,57 @@ fn render_scope_ref(
         path: rel_path_string(&row.file),
         range: render_source_range(analyzer, &row.file, &row.range, cache),
         index: row.index,
+    }
+}
+
+fn render_qualified_path(
+    analyzer: &dyn IAnalyzer,
+    value: &PathValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryQualifiedPath {
+    let row = value.row();
+    let range = render_source_range(analyzer, &row.file, &row.range, cache);
+    public_path(value, range)
+}
+
+fn render_path_segment(
+    analyzer: &dyn IAnalyzer,
+    value: &SegmentValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryPathSegment {
+    let row = value.row();
+    let range = render_source_range(analyzer, &row.file, &row.range, cache);
+    public_segment(value, range)
+}
+
+fn render_qualified_path_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &PathValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let row = value.row();
+    CodeQueryResultRef::QualifiedPath {
+        id: value.id(),
+        ast_id: row.ast_id(),
+        path: rel_path_string(&row.file),
+        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        segment_count: row.segment_count,
+    }
+}
+
+fn render_path_segment_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &SegmentValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let row = value.row();
+    CodeQueryResultRef::PathSegment {
+        id: value.id(),
+        ast_id: row.ast_id(),
+        path: rel_path_string(&row.file),
+        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        ordinal: row.ordinal,
+        text: row.text.clone(),
     }
 }
 

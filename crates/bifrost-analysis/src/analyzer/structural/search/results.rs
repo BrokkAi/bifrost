@@ -311,6 +311,14 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryResolutionCandidate>,
     },
+    QualifiedPath {
+        #[serde(flatten)]
+        value: Box<CodeQueryQualifiedPath>,
+    },
+    PathSegment {
+        #[serde(flatten)]
+        value: Box<CodeQueryPathSegment>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1057,6 +1065,60 @@ pub struct CodeQueryResolutionCandidate {
     pub external_target: Option<String>,
 }
 
+/// One qualified-path chain (#1475): a linear sequence of segments the
+/// grammar records, anchored at its terminal segment token.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryQualifiedPath {
+    pub id: String,
+    /// The terminal segment token's AST identity — the equijoin key with
+    /// captures and occurrence rows over the same token.
+    pub ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub segment_count: u32,
+}
+
+/// One segment of one qualified path (#1475).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryPathSegment {
+    pub id: String,
+    /// The segment token's AST identity; absent for a segment the kind table
+    /// does not admit as a fact (Rust's `crate`/`self`/`super` path
+    /// keywords), whose position in the path is real but whose structural
+    /// identity is genuinely absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    /// The owning path's terminal AST identity — the group key back to its
+    /// qualified-path row.
+    pub path_ast_id: String,
+    /// 0-based position within the path, counting every spelled segment.
+    pub ordinal: u32,
+    /// Decoded identifier text: a quoted or punctuation-bearing identifier is
+    /// one segment and is never re-split.
+    pub text: String,
+    /// Stated by the adapter's classification or decided by resolution;
+    /// absent means "not stated", never a guessed value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<&'static str>,
+    /// The generic argument count the source spells at this segment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generic_arity: Option<u32>,
+    /// Present exactly when segment resolution was derived; `null` means
+    /// "not derived", never "nothing considered".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_count: Option<usize>,
+}
+
 /// What a candidate row points at. Two of the five shapes carry no workspace
 /// declaration, which is why `candidate-target` is partial by construction.
 #[derive(Debug, Clone, Serialize)]
@@ -1499,6 +1561,22 @@ pub enum CodeQueryResultRef {
         tier: Option<&'static str>,
         outcome: &'static str,
     },
+    QualifiedPath {
+        id: String,
+        ast_id: String,
+        path: String,
+        range: CodeQueryRange,
+        segment_count: u32,
+    },
+    PathSegment {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ast_id: Option<String>,
+        path: String,
+        range: CodeQueryRange,
+        ordinal: u32,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1594,6 +1672,8 @@ pub enum CodeQueryDiagnosticCode {
     EnvironmentDerivationIncomplete,
     EnvironmentRowBudgetExhausted,
     ResolutionTraceIncomplete,
+    IdentityAxisUnsupported,
+    PathDerivationIncomplete,
     ResultLimitReached,
     BroadQuery,
 }
@@ -1667,6 +1747,8 @@ impl CodeQueryDiagnosticCode {
             Self::EnvironmentDerivationIncomplete => "environment_derivation_incomplete",
             Self::EnvironmentRowBudgetExhausted => "environment_row_budget_exhausted",
             Self::ResolutionTraceIncomplete => "resolution_trace_incomplete",
+            Self::IdentityAxisUnsupported => "identity_axis_unsupported",
+            Self::PathDerivationIncomplete => "path_derivation_incomplete",
             Self::ResultLimitReached => "result_limit_reached",
             Self::BroadQuery => "broad_query",
         }
@@ -2331,6 +2413,8 @@ pub enum DetailedCodeQueryDomain {
     LexicalScope,
     Binding,
     ResolutionCandidate,
+    QualifiedPath,
+    PathSegment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2410,6 +2494,15 @@ pub enum DetailedCodeQueryKey {
         id: String,
         ast_id: String,
         ordinal: usize,
+    },
+    QualifiedPath {
+        id: String,
+        ast_id: String,
+    },
+    PathSegment {
+        id: String,
+        ast_id: Option<String>,
+        ordinal: u32,
     },
 }
 
@@ -2586,6 +2679,14 @@ impl DetailedCodeQueryResult {
                             DetailedCodeQueryDomain::ResolutionCandidate,
                             DetailedCodeQueryKey::ResolutionCandidate { .. }
                         )
+                        | (
+                            DetailedCodeQueryDomain::QualifiedPath,
+                            DetailedCodeQueryKey::QualifiedPath { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::PathSegment,
+                            DetailedCodeQueryKey::PathSegment { .. }
+                        )
                 ),
                 "detailed CodeQuery domain and typed key must agree"
             );
@@ -2710,7 +2811,9 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::Occurrence { .. }
         | CodeQueryResultValue::LexicalScope { .. }
         | CodeQueryResultValue::Binding { .. }
-        | CodeQueryResultValue::ResolutionCandidate { .. } => None,
+        | CodeQueryResultValue::ResolutionCandidate { .. }
+        | CodeQueryResultValue::QualifiedPath { .. }
+        | CodeQueryResultValue::PathSegment { .. } => None,
     }
 }
 
@@ -2759,7 +2862,9 @@ fn assert_detailed_terminal_identities(
                 | DetailedCodeQueryDomain::Occurrence
                 | DetailedCodeQueryDomain::LexicalScope
                 | DetailedCodeQueryDomain::Binding
-                | DetailedCodeQueryDomain::ResolutionCandidate,
+                | DetailedCodeQueryDomain::ResolutionCandidate
+                | DetailedCodeQueryDomain::QualifiedPath
+                | DetailedCodeQueryDomain::PathSegment,
             DetailedCodeQueryProvenanceIdentities::None,
         ) | (
             DetailedCodeQueryDomain::ReferenceSite,
@@ -2791,7 +2896,9 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::Occurrence { .. }
         | DetailedCodeQueryKey::LexicalScope { .. }
         | DetailedCodeQueryKey::Binding { .. }
-        | DetailedCodeQueryKey::ResolutionCandidate { .. } => None,
+        | DetailedCodeQueryKey::ResolutionCandidate { .. }
+        | DetailedCodeQueryKey::QualifiedPath { .. }
+        | DetailedCodeQueryKey::PathSegment { .. } => None,
     }
 }
 
@@ -2818,7 +2925,9 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::Occurrence { .. }
                 | CodeQueryResultValue::LexicalScope { .. }
                 | CodeQueryResultValue::Binding { .. }
-                | CodeQueryResultValue::ResolutionCandidate { .. } => None,
+                | CodeQueryResultValue::ResolutionCandidate { .. }
+                | CodeQueryResultValue::QualifiedPath { .. }
+                | CodeQueryResultValue::PathSegment { .. } => None,
             })
             .collect()
     }
@@ -3109,6 +3218,41 @@ impl CodeQueryResult {
                             "  boundary {}, trace {}\n",
                             value.boundary, value.trace_completeness
                         ));
+                    }
+                    CodeQueryResultValue::QualifiedPath { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [qualified_path; {} segments]\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.segment_count,
+                        ));
+                    }
+                    CodeQueryResultValue::PathSegment { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [path_segment #{}] `{}`{}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.ordinal,
+                            value.text,
+                            match value.generic_arity {
+                                Some(arity) => format!(" <{arity} generic args>"),
+                                None => String::new(),
+                            },
+                        ));
+                        if let Some(namespace) = value.namespace {
+                            out.push_str(&format!("  namespace {namespace}\n"));
+                        }
+                        if let Some(status) = value.resolution_status {
+                            out.push_str(&format!(
+                                "  resolves: {status}{}\n",
+                                match value.target_count {
+                                    Some(count) if count > 0 => format!(" ({count} target(s))"),
+                                    _ => String::new(),
+                                }
+                            ));
+                        }
                     }
                 }
                 if let Some(summary) = result.provenance_summary() {

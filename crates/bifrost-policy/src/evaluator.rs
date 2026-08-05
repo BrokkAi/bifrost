@@ -3417,6 +3417,10 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::LexicalScope
             | QueryValueKind::Binding
             | QueryValueKind::ResolutionCandidate
+            // A qualified path and its segments are parser facts about exact
+            // token chains, the same argument again (#1475).
+            | QueryValueKind::QualifiedPath
+            | QueryValueKind::PathSegment
             | QueryValueKind::File,
         ) => {}
         Err(_) => {
@@ -3932,6 +3936,24 @@ fn terminal_presentation(
             // The row is an exact record of what the resolver considered at
             // this position. Whether that consideration was *complete* is the
             // trace's own completeness field, not this location's proof state.
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::QualifiedPath { value } => (
+            DetailedCodeQueryDomain::QualifiedPath,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::PathSegment { value } => (
+            DetailedCodeQueryDomain::PathSegment,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            // The segment row is a parser fact; whether its prefix *resolved*
+            // is the row's own resolution status, not this location's proof.
             ProofState::Proven,
             ProofReason::DirectStructuralMatch,
         ),
@@ -4491,6 +4513,8 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::LexicalScope { .. } => "lexical_scope",
         CodeQueryResultRef::Binding { .. } => "binding",
         CodeQueryResultRef::ResolutionCandidate { .. } => "resolution_candidate",
+        CodeQueryResultRef::QualifiedPath { .. } => "qualified_path",
+        CodeQueryResultRef::PathSegment { .. } => "path_segment",
     }
 }
 
@@ -4514,7 +4538,9 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::Occurrence { path, .. }
         | CodeQueryResultRef::LexicalScope { path, .. }
         | CodeQueryResultRef::Binding { path, .. }
-        | CodeQueryResultRef::ResolutionCandidate { path, .. } => path,
+        | CodeQueryResultRef::ResolutionCandidate { path, .. }
+        | CodeQueryResultRef::QualifiedPath { path, .. }
+        | CodeQueryResultRef::PathSegment { path, .. } => path,
     }
 }
 
@@ -4547,6 +4573,8 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::ResolutionCandidate => {
             Some(MatchResultDomain::ResolutionCandidate)
         }
+        DetailedCodeQueryDomain::QualifiedPath => Some(MatchResultDomain::QualifiedPath),
+        DetailedCodeQueryDomain::PathSegment => Some(MatchResultDomain::PathSegment),
         DetailedCodeQueryDomain::Procedure
         | DetailedCodeQueryDomain::ProgramPoint
         | DetailedCodeQueryDomain::ControlEdge
@@ -4633,6 +4661,19 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
         } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, ast_id.as_bytes());
+            update_hash(&mut hasher, &ordinal.to_be_bytes());
+        }
+        DetailedCodeQueryKey::QualifiedPath { id, ast_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, ast_id.as_bytes());
+        }
+        DetailedCodeQueryKey::PathSegment {
+            id,
+            ast_id,
+            ordinal,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_optional_hash(&mut hasher, ast_id.as_deref());
             update_hash(&mut hasher, &ordinal.to_be_bytes());
         }
         DetailedCodeQueryKey::ReferenceSite {
@@ -4723,6 +4764,8 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::LexicalScope => "lexical_scope",
         DetailedCodeQueryDomain::Binding => "binding",
         DetailedCodeQueryDomain::ResolutionCandidate => "resolution_candidate",
+        DetailedCodeQueryDomain::QualifiedPath => "qualified_path",
+        DetailedCodeQueryDomain::PathSegment => "path_segment",
         DetailedCodeQueryDomain::File => "file",
     }
 }
@@ -4804,7 +4847,9 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
         | CodeQueryDiagnosticCode::EnvironmentAxisUnsupported
         | CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
-        | CodeQueryDiagnosticCode::ResolutionTraceIncomplete => {
+        | CodeQueryDiagnosticCode::ResolutionTraceIncomplete
+        | CodeQueryDiagnosticCode::IdentityAxisUnsupported
+        | CodeQueryDiagnosticCode::PathDerivationIncomplete => {
             PolicyIncompleteReason::CapabilityIncomplete
         }
         CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted
