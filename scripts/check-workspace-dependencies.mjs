@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 const FACADE = "brokk-bifrost";
 const CORE = "brokk-bifrost-core";
 const GO = "brokk-bifrost-go";
+const RUST = "brokk-bifrost-rust";
 const ANALYSIS = "brokk-bifrost-analysis";
 const NLP = "brokk-bifrost-nlp";
 const POLICY = "brokk-bifrost-policy";
@@ -18,6 +19,7 @@ const EXPECTED_MEMBERS = new Set([
   FACADE,
   CORE,
   GO,
+  RUST,
   ANALYSIS,
   NLP,
   POLICY,
@@ -27,13 +29,16 @@ const EXPECTED_MEMBERS = new Set([
   SEMANTIC_PACKS,
 ]);
 // Core is the bottom of the graph and depends on no workspace package; the
-// analysis crate sits directly on it. Policy and nlp sit directly on analysis
-// as siblings (#1548) so that neither can be pulled into the analysis
-// compilation unit again.
+// analysis crate sits directly on it. The per-language crates (go, rust) sit
+// between the two and depend on core alone -- that is what keeps a language's
+// knowledge out of the analysis compilation unit. Policy and nlp sit directly
+// on analysis as siblings (#1548) so that neither can be pulled into the
+// analysis compilation unit again.
 const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
   [GO, new Set([CORE])],
-  [ANALYSIS, new Set([CORE, GO])],
+  [RUST, new Set([CORE])],
+  [ANALYSIS, new Set([CORE, GO, RUST])],
   [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
@@ -45,7 +50,8 @@ const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
 const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
   [GO, new Set([CORE])],
-  [ANALYSIS, new Set([CORE, GO])],
+  [RUST, new Set([CORE])],
+  [ANALYSIS, new Set([CORE, GO, RUST])],
   [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
@@ -66,6 +72,10 @@ const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
   ],
   [
     GO,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [
+    RUST,
     new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
   ],
   [

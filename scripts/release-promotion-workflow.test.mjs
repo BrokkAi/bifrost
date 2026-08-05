@@ -164,6 +164,7 @@ test("promotion evidence covers validation before every external publisher", () 
     "release",
     "publish-crate-core",
     "publish-crate-go",
+    "publish-crate-rust",
     "publish-crate-analysis",
     "publish-wheels",
     "publish-agent-plugin",
@@ -200,13 +201,17 @@ test("promotion evidence covers validation before every external publisher", () 
     /dist\/bifrost-semantic-packs-\$\{\{ needs\.release-context\.outputs\.tag \}\}\.tar\.gz/u,
   );
 
-  assert.match(
-    jobBlock(release, "publish-crate-go"),
-    /^    needs: \[release-context, promotion-evidence, publish-crate-core\]$/mu,
-  );
+  // Each language crate publishes straight after core; analysis waits for all
+  // of them, because it names every one with an exact `=` requirement.
+  for (const language of ["go", "rust"]) {
+    assert.match(
+      jobBlock(release, `publish-crate-${language}`),
+      /^    needs: \[release-context, promotion-evidence, publish-crate-core\]$/mu,
+    );
+  }
   assert.match(
     jobBlock(release, "publish-crate-analysis"),
-    /^    needs: \[release-context, promotion-evidence, publish-crate-core, publish-crate-go\]$/mu,
+    /^    needs: \[release-context, promotion-evidence, publish-crate-core, publish-crate-go, publish-crate-rust\]$/mu,
   );
   // Publish order mirrors the workspace dependency DAG (#1548): analysis, then
   // its direct dependents policy/nlp/semantic-packs, then runtime (which needs
