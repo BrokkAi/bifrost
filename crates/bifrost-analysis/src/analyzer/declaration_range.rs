@@ -184,33 +184,56 @@ fn declaration_name_node_for_line_range<'tree>(
     content: &str,
     support: Option<&'static dyn crate::analyzer::languages::LanguageSupport>,
 ) -> Option<Node<'tree>> {
-    let mut best: Option<(usize, Node<'tree>)> = None;
+    let mut best: Option<(usize, usize, usize, Node<'tree>)> = None;
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        let node_start_line = node.start_position().row;
-        let node_end_line = node.end_position().row;
-        if node_start_line > range.start_line || node_end_line < range.end_line {
-            continue;
-        }
-        if let Some(name_node) = declaration_name_node(node, identifier, content, support) {
+        if let Some(name_node) =
+            declaration_name_node_from_fields(node, identifier, content, support)
+        {
+            let line_distance = declaration_line_distance(node, range);
             let span = node.end_byte().saturating_sub(node.start_byte());
-            if best.is_none_or(|(best_span, _)| span < best_span) {
-                best = Some((span, name_node));
+            let start_byte = node.start_byte();
+            let candidate = (line_distance, span, start_byte, name_node);
+            if best.is_none_or(|current| {
+                (candidate.0, candidate.1, candidate.2) < (current.0, current.1, current.2)
+            }) {
+                best = Some(candidate);
             }
         }
         let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if child.start_position().row <= range.start_line
-                && child.end_position().row >= range.end_line
-            {
-                stack.push(child);
-            }
-        }
+        stack.extend(node.named_children(&mut cursor));
     }
-    best.map(|(_, name_node)| name_node)
+    best.map(|(_, _, _, name_node)| name_node)
 }
 
-fn declaration_name_node<'tree>(
+fn declaration_line_distance(node: Node<'_>, range: &Range) -> usize {
+    let start = node.start_position().row;
+    let end = node.end_position().row;
+    [
+        line_interval_distance(start, end, range.start_line, range.end_line),
+        line_interval_distance(start + 1, end + 1, range.start_line, range.end_line),
+    ]
+    .into_iter()
+    .min()
+    .expect("line distance candidates are non-empty")
+}
+
+fn line_interval_distance(
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> usize {
+    if left_end < right_start {
+        right_start.saturating_sub(left_end)
+    } else if right_end < left_start {
+        left_start.saturating_sub(right_end)
+    } else {
+        0
+    }
+}
+
+fn declaration_name_node_from_fields<'tree>(
     declaration_node: Node<'tree>,
     identifier: &str,
     content: &str,
@@ -231,16 +254,26 @@ fn declaration_name_node<'tree>(
                 stack.push(child);
             }
         }
-        // Some grammars wrap an assignment declaration in a fieldless statement
-        // node. Descend through that unambiguous wrapper so the assignment's
-        // structured `left` field wins over the whole-node text fallback.
+        // Some grammars wrap an assignment declaration in a fieldless
+        // statement node. Descend through that unambiguous wrapper so the
+        // assignment's structured `left` field wins over text matching.
         if node.named_child_count() == 1
             && let Some(child) = node.named_child(0)
         {
             stack.push(child);
         }
     }
-    matching_identifier_node(declaration_node, identifier, content, support)
+    None
+}
+
+fn declaration_name_node<'tree>(
+    declaration_node: Node<'tree>,
+    identifier: &str,
+    content: &str,
+    support: Option<&'static dyn LanguageSupport>,
+) -> Option<Node<'tree>> {
+    declaration_name_node_from_fields(declaration_node, identifier, content, support)
+        .or_else(|| matching_identifier_node(declaration_node, identifier, content, support))
 }
 
 fn matching_identifier_node<'tree>(
@@ -351,8 +384,8 @@ mod tests {
                 // the current source representation.
                 start_byte: source.len() + start_byte,
                 end_byte: source.len() + end_byte,
-                start_line: 1,
-                end_line: 3,
+                start_line: 2,
+                end_line: 4,
             },
         )
         .expect("declaration name");
