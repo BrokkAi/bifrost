@@ -14,6 +14,8 @@
 //! - [`matcher`]: pattern evaluation with captures and containment.
 //! - [`occurrence_rows`]: per-file occurrence rows derived from the arena's
 //!   occurrence roles plus definition resolution (issue #1473).
+//! - [`lexical_environment`]: per-file scope, binding, import-binder and
+//!   package rows, plus the reaching-binding algorithm over them (issue #1474).
 //! - [`planner`]: positive-anchor candidate pruning (negation never prunes).
 //! - [`provider`]: the capability trait analyzers expose, plus the
 //!   source-hash-validated facts cache behind it.
@@ -29,6 +31,7 @@ pub(crate) mod execution;
 pub mod extract;
 pub mod facts;
 pub(crate) mod index;
+pub mod lexical_environment;
 pub mod matcher;
 pub mod occurrence_rows;
 pub mod planner;
@@ -42,7 +45,7 @@ pub mod search;
 // consumes them stays here. `adapter_helpers` is split rather than moved: its
 // production mechanics went to core, its test assertions stayed (see that
 // module).
-pub use brokk_bifrost_core::analyzer::structural::{kinds, occurrences, spec};
+pub use brokk_bifrost_core::analyzer::structural::{kinds, occurrences, resolution, spec};
 
 pub use analysis_context::{
     MAX_PROTOCOL_NAME_BYTES, MAX_PROTOCOL_NAMESPACE_BYTES, MAX_PROTOCOL_REF_BYTES,
@@ -79,9 +82,15 @@ pub use execution::{
 };
 pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
 pub use kinds::{ALL_KINDS, NormalizedKind, Role};
+pub use lexical_environment::{
+    BindingRow, ENVIRONMENT_PRODUCER_AXES, EnvironmentCompleteness, EnvironmentFileResult,
+    EnvironmentIncompleteReason, ImportBinderDetail, PackageClauseRow, ReachingBindingOutcome,
+    ScopeAnchor, ScopeRow, WILDCARD_IMPORT_NAME, environment_for_file, reaching_binding,
+};
 pub use occurrence_rows::{
-    OccurrenceCompleteness, OccurrenceFileResult, OccurrenceIncompleteReason, OccurrenceRow,
-    OccurrenceTarget, OccurrencesCancelled, occurrences_for_file,
+    OccurrenceCompleteness, OccurrenceDerivationOptions, OccurrenceFileResult,
+    OccurrenceIncompleteReason, OccurrenceRow, OccurrenceTarget, OccurrencesCancelled,
+    occurrences_for_file, occurrences_for_file_with_options,
 };
 pub use occurrences::{
     ALL_OCCURRENCE_ROLES, NO_OCCURRENCE_ROLE_SUPPORT, Namespace, OccurrenceClass, OccurrenceRole,
@@ -90,12 +99,20 @@ pub use occurrences::{
 pub use provider::{StructuralFactsCache, StructuralSearchProvider, StructuralSearchSnapshotCache};
 pub use query::{
     CodeQuery, CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
-    CodeQuerySeed, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
-    MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES,
-    MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS,
-    MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError,
-    QueryStep, QueryValueKind, ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION,
-    SetOperator, StringPredicate,
+    CodeQuerySeed, DEFAULT_LIMIT, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,
+    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH,
+    MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
+    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern,
+    QueryError, QueryStep, QueryValueKind, ReceiverTraversalFilter, ReferenceTraversalFilter,
+    SCHEMA_VERSION, SetOperator, StringPredicate,
+};
+pub use resolution::{
+    ALL_BINDING_KINDS, ALL_BOUNDARY_STATUSES, ALL_DECLARED_VISIBILITIES, ALL_ENVIRONMENT_AXES,
+    ALL_HOISTING_CLASSES, ALL_PRECEDENCE_TIERS, ALL_REJECTION_REASONS, BindingActivation,
+    BindingKind, BoundaryStatus, CandidateOutcome, DEEP_LEXICAL_ENVIRONMENT_SUPPORT,
+    DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS, DeclaredVisibility, EnvironmentAxis,
+    EnvironmentSupport, HoistingClass, LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
+    PrecedenceTier, RejectionReason,
 };
 pub use rune_ir::{
     RenderedRuneIr, RuneIrError, RuneIrLanguage, RuneIrLimits, RuneIrSelection,

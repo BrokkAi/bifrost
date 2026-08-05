@@ -267,6 +267,7 @@ pub(super) fn csharp_import_info(raw: String) -> ImportInfo {
         identifier,
         alias: None,
         path: None,
+        binder_span: None,
     }
 }
 
@@ -295,6 +296,7 @@ pub(super) fn csharp_import_info_from_using_directive(
             identifier: Some(target),
             alias: None,
             path: None,
+            binder_span: None,
         });
     }
     csharp_using_alias_from_node(node, source).map(|(alias, target)| ImportInfo {
@@ -303,6 +305,7 @@ pub(super) fn csharp_import_info_from_using_directive(
         identifier: Some(target),
         alias: Some(alias),
         path: None,
+        binder_span: None,
     })
 }
 

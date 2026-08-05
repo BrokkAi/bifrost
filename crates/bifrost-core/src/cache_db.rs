@@ -312,13 +312,34 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
 /// created the DB and holds the writer open for the store's lifetime.
 pub fn open_readonly_connection(db_path: &Path) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
+    let db_path = canonicalize_cache_db_parent(db_path)?;
     let conn = Connection::open_with_flags(
-        db_path,
+        &db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
     install_busy_timeout(&conn)?;
     configure_readonly_connection(&conn)?;
+    Ok(conn)
+}
+
+/// Open an initialized cache with a read-only main database and a writable
+/// temporary schema.
+///
+/// Active semantic-search state belongs to one worktree. It must not enter the
+/// shared cache. The SQLite read-only flag prevents persistent writes, while a
+/// writable TEMP schema permits connection-local membership and FTS tables.
+pub fn open_readonly_temp_connection(db_path: &Path) -> Result<Connection> {
+    ensure_safe_cache_path(db_path)?;
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|err| format!("cache DB active-session SQLite error: {err}"))?;
+    install_busy_timeout(&conn)?;
+    configure_readonly_page_cache(&conn)?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|err| format!("cache DB active-session SQLite error: {err}"))?;
     Ok(conn)
 }
 
@@ -331,8 +352,9 @@ pub fn open_readonly_connection(db_path: &Path) -> Result<Connection> {
 /// analyzer queries.
 pub fn open_streaming_readonly_connection(db_path: &Path) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
+    let db_path = canonicalize_cache_db_parent(db_path)?;
     let conn = Connection::open_with_flags(
-        db_path,
+        &db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
@@ -349,19 +371,37 @@ pub fn open_streaming_readonly_connection(db_path: &Path) -> Result<Connection> 
     Ok(conn)
 }
 
+fn canonicalize_cache_db_parent(db_path: &Path) -> Result<PathBuf> {
+    let parent = db_path
+        .parent()
+        .ok_or_else(|| format!("cache DB path has no parent: {}", db_path.display()))?;
+    let file_name = db_path
+        .file_name()
+        .ok_or_else(|| format!("cache DB path has no file name: {}", db_path.display()))?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|err| format!("cache DB I/O error: {err}"))?;
+    Ok(parent.join(file_name))
+}
+
 /// Apply the pragmas that matter for a read-only WAL connection. Deliberately
 /// omits every write/schema-mutating pragma the writer path runs
 /// (`journal_mode`, `auto_vacuum`, `foreign_keys`, `wal_autocheckpoint`,
 /// `synchronous`, …): those are either persistent file properties already
 /// established by the writer or illegal to set on a read-only handle.
 fn configure_readonly_connection(conn: &Connection) -> Result<()> {
+    configure_readonly_page_cache(conn)?;
+    conn.pragma_update(None, "query_only", "ON")
+        .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
+    Ok(())
+}
+
+fn configure_readonly_page_cache(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "temp_store", "MEMORY")
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
     conn.pragma_update(None, "cache_size", -65536)
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
     conn.pragma_update(None, "mmap_size", 268435456i64)
-        .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
-    conn.pragma_update(None, "query_only", "ON")
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
     conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
     Ok(())
@@ -1498,6 +1538,31 @@ mod tests {
             conn.query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn active_session_can_write_temp_but_not_main() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(cache_db_file_name());
+        let _writer = open_unified_connection(&db_path).unwrap();
+        let conn = open_readonly_temp_connection(&db_path).unwrap();
+
+        conn.execute_batch(
+            "CREATE TEMP TABLE active_test(value TEXT PRIMARY KEY) WITHOUT ROWID, STRICT;
+             INSERT INTO active_test VALUES('ok');",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT value FROM active_test", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "ok"
+        );
+        assert!(
+            conn.execute("UPDATE cache_state SET last_gc_at = 1 WHERE id = 1", [])
+                .is_err()
         );
     }
 

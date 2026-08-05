@@ -604,6 +604,10 @@ pub(super) enum ScanUsageTargetResolution {
         symbol: String,
         overloads: Vec<CodeUnit>,
     },
+    Modeled {
+        symbol: String,
+        definition: ResolvedUsageDefinition,
+    },
     NotFound(NotFoundInput),
     Ambiguous(AmbiguousUsageSymbol),
     Failure(UsageFailureInfo),
@@ -1247,6 +1251,68 @@ pub(super) fn resolve_scan_usages_target(
 
     let range_context = DeclarationNameRangeContext::new(&file, source);
 
+    if let Some(overlay) = analyzer.semantic_model_overlay() {
+        let path = rel_path_string(&file);
+        let mut modeled = overlay
+            .symbols_at_authored_path(&path)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                let crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor) =
+                    &symbol.location
+                else {
+                    return false;
+                };
+                let range = crate::analyzer::Range {
+                    start_byte: anchor.range.start_byte,
+                    end_byte: anchor.range.end_byte,
+                    start_line: anchor.range.start_line,
+                    end_line: anchor.range.end_line,
+                };
+                scan_usages_target_matches_range(selection, range)
+                    && selector.is_none_or(|requested| {
+                        symbol.id == requested
+                            || symbol.name == requested
+                            || symbol.qualified_name == requested
+                    })
+            })
+            .collect::<Vec<_>>();
+        modeled.sort_by(|left, right| left.id.cmp(&right.id));
+        modeled.dedup_by(|left, right| left.id == right.id);
+        if modeled.len() == 1 && !modeled[0].provenance.ambiguous {
+            let symbol = modeled[0];
+            return ScanUsageTargetResolution::Modeled {
+                symbol: symbol.qualified_name.clone(),
+                definition: ResolvedUsageDefinition {
+                    fq_name: symbol.qualified_name.clone(),
+                    path,
+                    line: symbol.location.range().start_line,
+                },
+            };
+        }
+        if !modeled.is_empty() {
+            let candidate_targets = modeled
+                .iter()
+                .map(|symbol| symbol.qualified_name.clone())
+                .collect::<Vec<_>>();
+            return ScanUsageTargetResolution::Ambiguous(AmbiguousUsageSymbol {
+                symbol: scan_usages_target_label(&target),
+                short_name: target.symbol.clone().unwrap_or_default(),
+                candidate_targets,
+                candidate_details: Vec::new(),
+                candidate_details_total: None,
+                candidate_details_truncated: false,
+                candidates: Vec::new(),
+                candidate_files_truncated: false,
+                definition_sites_excluded: None,
+                note: Some(
+                    "Ambiguous modeled location; provide an exact model declaration selector."
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+
     // The selector to match is an explicit parameter (not closed over) so the
     // same pool computation can be re-run with `selector_arg: None` below for
     // the not_found corrective hint, which asks "what's actually here" rather
@@ -1743,7 +1809,7 @@ pub(crate) fn scan_usages_by_location_with_context(
         .enumerate()
         .map(|(index, target)| ScanUsageRequest::target(index, target))
         .collect();
-    scan_usages_backend(
+    let mut result = scan_usages_backend(
         analyzer,
         ScanUsagesSurface::Location,
         params.include_tests,
@@ -1752,7 +1818,9 @@ pub(crate) fn scan_usages_by_location_with_context(
         targets,
         params.include_same_owner,
         context,
-    )
+    );
+    attach_model_relations(analyzer, &mut result);
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1857,6 +1925,27 @@ pub(super) fn scan_usages_backend(
                     symbol,
                     overloads,
                     location_selected: true,
+                });
+            }
+            ScanUsageTargetResolution::Modeled { symbol, definition } => {
+                work_entries.push(ScanUsagesWorkEntry::Usage {
+                    request,
+                    state: SymbolUsageRenderState::new(
+                        symbol,
+                        Some(definition),
+                        false,
+                        0,
+                        Vec::new(),
+                        0,
+                        Vec::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                        include_same_owner,
+                    ),
+                    candidate_files_sample: None,
+                    target_is_method: false,
+                    incomplete_reason: None,
                 });
             }
             ScanUsageTargetResolution::NotFound(item) => {
@@ -3575,6 +3664,99 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
             != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
         {
             if symbol.disposition
+                == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
+                && authored_target
+                && whole_workspace
+            {
+                let authored_name = entry.fq_name.as_deref().unwrap_or_default();
+                let mut reverse_relations = overlay
+                    .relations()
+                    .iter()
+                    .filter(|relation| {
+                        relation.kind == "navigates_to" && relation.to == authored_name
+                    })
+                    .collect::<Vec<_>>();
+                reverse_relations.sort_by(|left, right| left.id.cmp(&right.id));
+                if reverse_relations
+                    .iter()
+                    .any(|relation| relation.provenance.ambiguous)
+                {
+                    entry.notes.push(
+                        "Conflicting modeled relations were omitted; authored usage resolution retained precedence."
+                            .to_string(),
+                    );
+                    continue;
+                }
+                let mut modeled_references = BTreeMap::<String, Vec<UsageLocation>>::new();
+                for relation in &reverse_relations {
+                    let source = overlay.symbols_with_id(&relation.from);
+                    if source.disposition
+                        != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                    {
+                        continue;
+                    }
+                    for file in authored_model_references(analyzer, &overlay, source.records[0]) {
+                        modeled_references
+                            .entry(file.path)
+                            .or_default()
+                            .extend(file.hits);
+                    }
+                }
+                let mut modeled_references = modeled_references
+                    .into_iter()
+                    .map(|(path, mut hits)| {
+                        hits.sort_by_key(|hit| (hit.line, hit.column));
+                        hits.dedup_by(|left, right| {
+                            left.line == right.line && left.column == right.column
+                        });
+                        UsageFileGroup {
+                            path,
+                            hits,
+                            hit_count: None,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let authored_hits = modeled_references
+                    .iter()
+                    .map(|file| file.hits.len())
+                    .sum::<usize>();
+                if authored_hits != 0 {
+                    entry.files.append(&mut modeled_references);
+                    entry
+                        .files
+                        .sort_by(|left, right| left.path.cmp(&right.path));
+                    entry.total_hits = Some(
+                        entry
+                            .total_hits
+                            .unwrap_or_default()
+                            .saturating_add(authored_hits),
+                    );
+                    entry.status = ScanUsagesStatus::Found;
+                    entry.notes.push(
+                        "Generated accessors were matched through modeled navigation relations."
+                            .to_owned(),
+                    );
+                }
+                let total_model_relations = reverse_relations.len();
+                entry.model_relations = reverse_relations
+                    .into_iter()
+                    .take(MAX_MODEL_RELATIONS_PER_SYMBOL)
+                    .cloned()
+                    .collect();
+                entry.model_relations_omitted =
+                    total_model_relations.saturating_sub(entry.model_relations.len());
+                if !entry.model_relations.is_empty() {
+                    entry.total_hits = Some(
+                        entry
+                            .total_hits
+                            .unwrap_or_default()
+                            .saturating_add(entry.model_relations.len()),
+                    );
+                    entry.status = ScanUsagesStatus::Found;
+                }
+                continue;
+            }
+            if symbol.disposition
                 == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict
             {
                 if authored_target {
@@ -3594,8 +3776,7 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
         }
         let model_symbol = symbol.records[0];
         if whole_workspace {
-            let authored_references =
-                go_authored_model_references(analyzer, &overlay, model_symbol);
+            let authored_references = authored_model_references(analyzer, &overlay, model_symbol);
             let authored_hits = authored_references
                 .iter()
                 .map(|file| file.hits.len())
@@ -3615,7 +3796,7 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
                 );
                 entry.status = ScanUsagesStatus::Found;
                 entry.notes.push(
-                    "Workspace Go references were matched from structured import selectors."
+                    "Workspace references were matched through structured definition resolution."
                         .to_owned(),
                 );
             }
@@ -3675,6 +3856,126 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
     }
     fit_model_relations_to_response_budget(result);
     result.summary = build_scan_usages_summary(&result.results);
+}
+
+fn authored_model_references(
+    analyzer: &dyn IAnalyzer,
+    overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+) -> Vec<UsageFileGroup> {
+    use crate::analyzer::structural::{NormalizedKind, Role};
+    use crate::searchtools::navigation::{
+        DefinitionReferenceQuery, GetDefinitionParams, get_definitions_by_location,
+    };
+
+    if symbol.language == "go" {
+        return go_authored_model_references(analyzer, overlay, symbol);
+    }
+    if !symbol.externally_visible() {
+        return Vec::new();
+    }
+
+    let mut grouped = BTreeMap::<String, Vec<UsageLocation>>::new();
+    for provider in analyzer
+        .structural_search_providers()
+        .into_iter()
+        .filter(|provider| provider.structural_language().config_label() == symbol.language)
+    {
+        let mut files = provider.structural_files();
+        files.sort();
+        files.dedup();
+        for file in files {
+            let Some(facts) = provider.structural_facts(&file) else {
+                continue;
+            };
+            let mut spans = Vec::new();
+            for (index, node) in facts.nodes().iter().enumerate() {
+                if !matches!(
+                    node.kind,
+                    NormalizedKind::Call | NormalizedKind::FieldAccess
+                ) {
+                    continue;
+                }
+                if let Some(name) = node.name
+                    && name.text(facts.source()) == symbol.name
+                {
+                    spans.push(name);
+                }
+                let node_id = u32::try_from(index).expect("structural fact IDs fit u32");
+                spans.extend(
+                    facts
+                        .roles(node_id)
+                        .iter()
+                        .filter(|target| target.role == Role::Kwarg)
+                        .filter_map(|target| target.keyword)
+                        .filter(|keyword| keyword.text(facts.source()) == symbol.name),
+                );
+            }
+            spans.sort_by_key(|span| (span.start_byte, span.end_byte));
+            spans.dedup();
+            let lines = facts.source().lines().collect::<Vec<_>>();
+            for span in spans {
+                let (line, column) = facts.line_column_of_byte(span.start_byte);
+                let result = get_definitions_by_location(
+                    analyzer,
+                    GetDefinitionParams {
+                        references: vec![DefinitionReferenceQuery {
+                            path: file.rel_path().to_string_lossy().replace('\\', "/"),
+                            line: Some(line),
+                            column: Some(column),
+                        }],
+                    },
+                );
+                let resolves_to_symbol = result.results.first().is_some_and(|result| {
+                    result.definitions.iter().any(|candidate| {
+                        candidate
+                            .semantic_model
+                            .as_ref()
+                            .is_some_and(|provenance| provenance.record_id == symbol.id)
+                    })
+                });
+                if !resolves_to_symbol {
+                    continue;
+                }
+                let range = crate::analyzer::Range {
+                    start_byte: span.start_byte,
+                    end_byte: span.end_byte,
+                    start_line: line,
+                    end_line: facts.line_of_byte(span.end_byte),
+                };
+                let enclosing = analyzer
+                    .enclosing_code_unit(&file, &range)
+                    .map(|unit| unit.fq_name())
+                    .unwrap_or_default();
+                grouped
+                    .entry(crate::path_utils::rel_path_string(&file))
+                    .or_default()
+                    .push(UsageLocation {
+                        line,
+                        column: Some(column),
+                        end_line: Some(range.end_line),
+                        end_column: Some(column.saturating_add(span.end_byte - span.start_byte)),
+                        enclosing,
+                        kind: None,
+                        snippet: lines
+                            .get(line.saturating_sub(1))
+                            .map(|line| (*line).to_owned()),
+                        confidence: 1.0,
+                    });
+            }
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(path, mut hits)| {
+            hits.sort_by_key(|hit| (hit.line, hit.column));
+            UsageFileGroup {
+                path,
+                hits,
+                hit_count: None,
+            }
+        })
+        .collect()
 }
 
 fn go_authored_model_references(

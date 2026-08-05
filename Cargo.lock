@@ -178,7 +178,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 
 [[package]]
 name = "brokk-bifrost"
-version = "0.8.21"
+version = "0.8.22"
 dependencies = [
  "bincode",
  "brokk-bifrost-analysis",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-analysis"
-version = "0.8.21"
+version = "0.8.22"
 dependencies = [
  "arc-swap",
  "bincode",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-core"
-version = "0.8.21"
+version = "0.8.22"
 dependencies = [
  "bincode",
  "git2",
@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-go"
-version = "0.8.21"
+version = "0.8.22"
 dependencies = [
  "brokk-bifrost-core",
  "rayon",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-lsp"
-version = "0.8.21"
+version = "0.8.22"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-policy",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-mcp"
-version = "0.8.21"
+version = "0.8.22"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-nlp",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-nlp"
-version = "0.8.21"
+version = "0.8.22"
 dependencies = [
  "brokk-bifrost-analysis",
  "fastrq",
@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-policy"
-version = "0.8.21"
+version = "0.8.22"
 dependencies = [
  "brokk-bifrost-analysis",
  "cap-std",
@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-runtime"
-version = "0.8.21"
+version = "0.8.22"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-policy",
@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-rust"
-version = "0.8.21"
+version = "0.8.22"
 dependencies = [
  "brokk-bifrost-core",
  "glob",
@@ -471,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-semantic-packs"
-version = "0.8.21"
+version = "0.8.22"
 dependencies = [
  "brokk-bifrost-analysis",
  "semver",

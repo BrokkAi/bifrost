@@ -25,9 +25,9 @@ exclude = [
 name = "brokk_bifrost_analysis"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.21" }
-brokk-bifrost-go = { path = "../bifrost-go", version = "=0.8.21" }
-brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.8.21" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22" }
+brokk-bifrost-go = { path = "../bifrost-go", version = "=0.8.22" }
+brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.8.22" }
 arc-swap = "1.7.1"
 bincode = "1.3.3"
 cap-std = { version = "4.0.2", default-features = false }
@@ -97,8 +97,8 @@ test-support = ["brokk-bifrost-core/test-support", "brokk-bifrost-go/test-suppor
 # Cargo unifies this with the plain `[dependencies]` entry above for this
 # crate's test targets, which is what makes `CancellationToken`'s
 # `cancel_after_checks_for_test` hooks exist while the unit tests are built.
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.21", features = ["test-support"] }
-brokk-bifrost-go = { path = "../bifrost-go", version = "=0.8.21", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22", features = ["test-support"] }
+brokk-bifrost-go = { path = "../bifrost-go", version = "=0.8.22", features = ["test-support"] }
 filetime = "0.2"
 jsonschema = { version = "0.48.0", default-features = false }
 pretty_assertions = "1.4.1"

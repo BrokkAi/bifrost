@@ -142,6 +142,13 @@ pub fn parse_go_import_spec(node: Node<'_>, source: &str) -> Option<ImportInfo> 
         None => format!("import \"{path}\""),
     };
 
+    // A renamed import binds its alias token. Without one, the bound name is
+    // the path's last component, spelled only inside the string literal, so
+    // there is no token of its own to anchor.
+    let binder_span = node
+        .child_by_field_name("name")
+        .map(brokk_bifrost_core::analyzer::common::node_span);
+
     Some(ImportInfo {
         raw_snippet,
         is_wildcard: false,
@@ -154,6 +161,7 @@ pub fn parse_go_import_spec(node: Node<'_>, source: &str) -> Option<ImportInfo> 
             lexical_scopes: Vec::new(),
             declaration_start_byte: node.start_byte(),
         }),
+        binder_span,
     })
 }
 

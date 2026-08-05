@@ -62,6 +62,13 @@ fn put_semantic(store: &SemanticStore, oid: Oid, vector_hash: [u8; 32]) {
         .unwrap();
 }
 
+fn has_semantic(store: &SemanticStore, oid: Oid) -> bool {
+    store
+        .missing_files(&[(oid.to_string(), "src/symbol.py".to_string())])
+        .unwrap()
+        .is_empty()
+}
+
 #[test]
 fn family_scoped_invalidation_keeps_other_family_rows() {
     let temp = tempfile::tempdir().unwrap();
@@ -94,12 +101,7 @@ fn family_scoped_invalidation_keeps_other_family_rows() {
             .ensure_index_compatible("fp2", "chunker1", "bm251")
             .unwrap()
     );
-    assert!(
-        semantic
-            .chunks_for_oids(&[semantic_oid.to_string()])
-            .unwrap()
-            .is_empty()
-    );
+    assert!(!has_semantic(&semantic, semantic_oid));
     assert!(analyzer.contains_blob(java_oid, "java").unwrap());
     assert!(analyzer.contains_blob(python_oid, "python").unwrap());
 
@@ -109,13 +111,7 @@ fn family_scoped_invalidation_keeps_other_family_rows() {
         .unwrap();
     assert!(!analyzer.contains_blob(java_oid, "java").unwrap());
     assert!(analyzer.contains_blob(python_oid, "python").unwrap());
-    assert_eq!(
-        semantic
-            .chunks_for_oids(&[semantic_oid.to_string()])
-            .unwrap()
-            .len(),
-        1
-    );
+    assert!(has_semantic(&semantic, semantic_oid));
 }
 
 #[test]
@@ -207,17 +203,6 @@ fn forced_gc_sweeps_both_families_in_one_pass() {
     assert!(outcome.ran);
     assert!(analyzer.contains_blob(reachable, "python").unwrap());
     assert!(!analyzer.contains_blob(unreachable, "python").unwrap());
-    assert_eq!(
-        semantic
-            .chunks_for_oids(&[reachable.to_string()])
-            .unwrap()
-            .len(),
-        1
-    );
-    assert!(
-        semantic
-            .chunks_for_oids(&[unreachable.to_string()])
-            .unwrap()
-            .is_empty()
-    );
+    assert!(has_semantic(&semantic, reachable));
+    assert!(!has_semantic(&semantic, unreachable));
 }

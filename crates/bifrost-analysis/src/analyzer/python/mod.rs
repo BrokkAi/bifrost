@@ -14,6 +14,10 @@ mod tests;
 mod usage_index;
 use crate::analyzer::Range;
 
+pub(crate) use syntax::{
+    python_deferred_annotation_identifier_ranges, python_node_is_in_annotation,
+};
+
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };

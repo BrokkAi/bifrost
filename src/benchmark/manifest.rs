@@ -1235,7 +1235,11 @@ impl QueryCodeTraits {
                 // An occurrence seed carries no pattern, so it contributes no
                 // structural workload trait beyond the typed traversal already
                 // recorded above.
-                CodeQueryPlanSource::Occurrences(_) => {}
+                // The same is true of the two lexical-environment seeds: they
+                // carry a constrained-value filter, not a structural pattern.
+                CodeQueryPlanSource::Occurrences(_)
+                | CodeQueryPlanSource::Scopes(_)
+                | CodeQueryPlanSource::Bindings(_) => {}
                 CodeQueryPlanSource::Set { branches, .. } => plans.extend(branches),
             }
         }

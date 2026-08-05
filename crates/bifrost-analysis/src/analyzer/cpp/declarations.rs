@@ -1687,11 +1687,29 @@ impl<'a> CppVisitor<'a> {
             }
             return;
         };
-        let name = normalize_cpp_whitespace(node_text(name_node, self.source));
+        // Diagnostic corpora contain deliberately ill-formed global namespace
+        // definitions such as `namespace ::outer::inner {}`. Tree-sitter keeps
+        // the leading global `::` as the first anonymous child. Honor that AST
+        // boundary instead of appending the name to the lexical namespace;
+        // appending produced legacy names such as `outer::::outer::inner`, which
+        // could not round-trip through the structured FqName boundary.
+        let explicitly_global = name_node
+            .child(0)
+            .is_some_and(|child| !child.is_named() && child.kind() == "::");
+        let name = if explicitly_global {
+            let marker = name_node.child(0).expect("checked global namespace marker");
+            normalize_cpp_whitespace(
+                self.source
+                    .get(marker.end_byte()..name_node.end_byte())
+                    .expect("namespace marker and name share one source range"),
+            )
+        } else {
+            normalize_cpp_whitespace(node_text(name_node, self.source))
+        };
         if name.is_empty() {
             return;
         }
-        let full_name = if scope.package_name.is_empty() {
+        let full_name = if explicitly_global || scope.package_name.is_empty() {
             name
         } else {
             format!("{}::{}", scope.package_name, name)
@@ -2823,6 +2841,7 @@ impl<'a> CppVisitor<'a> {
             identifier: None,
             alias: None,
             path: None,
+            binder_span: None,
         });
     }
 
@@ -2953,6 +2972,7 @@ pub(crate) fn recover_quoted_includes(
             identifier: None,
             alias: None,
             path: None,
+            binder_span: None,
         });
     }
 }
@@ -3402,7 +3422,21 @@ fn split_cpp_name(raw_name: &str, scope: &ScopeInfo) -> (Option<String>, String,
     // split below yields owner_parts `[""]`, constructing a unit with an empty
     // owner chain (`short ".X"`) that the FqName boundary assert rejects.
     let cleaned = cleaned.trim_start_matches("::");
-    let parts: Vec<_> = cleaned.split("::").collect();
+    // Parser recovery can preserve two adjacent scope operators around a
+    // missing component (for example `X::/**/::method` in compiler diagnostic
+    // fixtures). Empty components are syntax-recovery artifacts, never C++
+    // owners. Keeping one as the final owner constructed `short_name=".method"`
+    // and violated the structured package/short boundary during a large LLVM
+    // workspace build. This is the same legacy-string-to-FqName bridge as the
+    // ordinary split above; discard only components that the delimiter itself
+    // proves empty.
+    let parts: Vec<_> = cleaned
+        .split("::")
+        .filter(|component| !component.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return (None, cleaned.to_string(), scope.package_name.clone());
+    }
     if parts.len() > 1 {
         let name = parts.last().unwrap_or(&cleaned).to_string();
         let owner_parts = &parts[..parts.len() - 1];
@@ -8221,6 +8255,56 @@ Node* ::arangodb::aql::ExecutionPlan::createNode(Args&&... args) { return nullpt
                 && unit.short_name() == "ExecutionPlan.createNode"
                 && unit.fq_name() == "arangodb::aql.ExecutionPlan.createNode"
         }));
+    }
+
+    #[test]
+    fn explicit_global_namespace_recovery_does_not_duplicate_lexical_scope() {
+        // Clang's diagnostic suite intentionally contains this ill-formed
+        // spelling. The analyzer must retain the parser's explicit-global AST
+        // boundary instead of constructing `cwg311::::cwg311::X`.
+        let parsed = parse_cpp_declarations(
+            r#"
+namespace cwg311 {
+namespace X { namespace Y {} }
+namespace ::cwg311::X {}
+}
+"#,
+            "explicit-global-namespace.cpp",
+        );
+
+        assert!(parsed.declarations().iter().any(|unit| {
+            unit.kind() == CodeUnitType::Module
+                && unit.short_name() == "cwg311::X"
+                && unit.fq_name() == "cwg311::X"
+        }));
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .all(|unit| !unit.short_name().contains("::::")),
+            "recovered namespace names must not retain empty scope components: {:#?}",
+            parsed.declarations()
+        );
+    }
+
+    #[test]
+    fn repeated_scope_separator_does_not_create_empty_function_owner() {
+        let scope = ScopeInfo {
+            package_name: "X".to_string(),
+            module: None,
+            class_unit: None,
+            template_signature: None,
+            template_metadata: None,
+            declarations_are_fields: false,
+            recovered_specialization_member_scope: false,
+            visible_using_namespaces: Vec::new(),
+        };
+
+        let (owner, name, package) = split_cpp_name("X::::doit", &scope);
+
+        assert_eq!(owner, None);
+        assert_eq!(name, "doit");
+        assert_eq!(package, "X");
     }
 
     #[test]

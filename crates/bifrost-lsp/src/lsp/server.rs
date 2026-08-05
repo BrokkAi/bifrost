@@ -1351,6 +1351,9 @@ fn run_rql_query_result(
                     CodeQueryResultValue::ExpressionSite { value } => &value.path,
                     CodeQueryResultValue::ReceiverAnalysis { value } => &value.path,
                     CodeQueryResultValue::Occurrence { value } => &value.path,
+                    CodeQueryResultValue::LexicalScope { value } => &value.path,
+                    CodeQueryResultValue::Binding { value } => &value.path,
+                    CodeQueryResultValue::ResolutionCandidate { value } => &value.path,
                 };
                 RunRqlQueryResultItem {
                     uri: path_to_uri_string(&workspace_root.join(path)),

@@ -10,6 +10,9 @@ use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::occurrences::{
     NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport,
 };
+use brokk_bifrost_core::analyzer::structural::resolution::{
+    LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
+};
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
 use tree_sitter::Node;
 
@@ -196,6 +199,10 @@ impl StructuralSpec for GoStructuralSpec {
     /// for an occurrence role here report incomplete rather than clean-empty.
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
         &NO_OCCURRENCE_ROLE_SUPPORT
+    }
+
+    fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
+        &NO_LEXICAL_ENVIRONMENT_SUPPORT
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {

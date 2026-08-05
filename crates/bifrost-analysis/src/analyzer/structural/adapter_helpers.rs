@@ -13,7 +13,7 @@
 pub(crate) use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_argument_role_with_derived_name, attach_positional_argument_roles,
     attach_role_with_derived_name, attach_terminal_callee, field_name_in_parent, first_named_child,
-    is_field_of, is_spread_argument_node,
+    is_field_of, is_spread_argument_node, nearest_ancestor, node_range,
 };
 
 #[cfg(test)]
@@ -32,6 +32,48 @@ pub fn assert_kind_table_matches_grammar(
             "node type {name:?} (mapped to {kind:?}) does not exist in {grammar_name}"
         );
     }
+}
+
+/// Every [`NormalizedKind::Block`] fact a spec produces for `source`, as its
+/// exact source text in fact (pre-order) order.
+///
+/// A scope is only usable as a join key if its arena subtree agrees with its
+/// byte range, so this also asserts the arena invariant for every block it
+/// returns: the nodes at `(id + 1)..subtree_end` are exactly the facts whose
+/// range lies inside the block. An adapter test therefore only has to state
+/// which statement lists it expects.
+#[cfg(test)]
+pub(crate) fn block_facts_of<'source>(
+    spec: &dyn super::spec::StructuralSpec,
+    grammar: &tree_sitter::Language,
+    source: &'source str,
+) -> Vec<&'source str> {
+    let facts = super::extract::extract_file_facts(spec, grammar, source)
+        .expect("structural extraction should succeed for the fixture");
+    let mut blocks = Vec::new();
+    for id in 0..facts.nodes().len() as u32 {
+        let node = facts.node(id);
+        if node.kind != NormalizedKind::Block {
+            continue;
+        }
+        for other in 0..facts.nodes().len() as u32 {
+            let candidate = facts.node(other);
+            let inside_range = candidate.range.start_byte >= node.range.start_byte
+                && candidate.range.end_byte <= node.range.end_byte;
+            let inside_subtree = other > id && other < node.subtree_end;
+            assert_eq!(
+                inside_subtree,
+                inside_range && other != id,
+                "block at {:?} disagrees with its subtree at node {other} ({:?} {:?}); subtree_end {}",
+                node.range,
+                candidate.kind,
+                candidate.range,
+                node.subtree_end
+            );
+        }
+        blocks.push(&source[node.range.start_byte..node.range.end_byte]);
+    }
+    blocks
 }
 
 /// Every occurrence role a spec classifies for `source`, as

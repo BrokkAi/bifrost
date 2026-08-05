@@ -7,9 +7,10 @@
 //! two types live down here where the spec trait itself does.
 
 use crate::analyzer::structural::kinds::Role;
+use serde::{Deserialize, Serialize};
 
 /// A byte span into the file's source text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
     pub start_byte: usize,
     pub end_byte: usize,

@@ -109,7 +109,7 @@ pub fn extract_file_chunks(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> File
     let chunks = functions
         .into_iter()
         .filter_map(|(unit, enclosing_class)| {
-            let source_text = analyzer.get_source(&unit, true)?;
+            let source_text = normalize_line_endings(analyzer.get_source(&unit, true)?);
             if source_text.trim().is_empty() {
                 return None;
             }
@@ -136,6 +136,13 @@ pub fn extract_file_chunks(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> File
         .collect();
 
     FileChunks { file_path, chunks }
+}
+
+fn normalize_line_endings(source: String) -> String {
+    if !source.as_bytes().contains(&b'\r') {
+        return source;
+    }
+    source.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 #[cfg(test)]
@@ -191,6 +198,16 @@ mod tests {
                 "    def do_work(self):\n        pass",
             ),
             "pkg/mod.py/Worker/do_work\nclass Worker:    def do_work(self):\n        pass"
+        );
+    }
+
+    #[test]
+    fn semantic_source_uses_one_line_ending_form() {
+        let lf = "fn run() {\n    work();\n}\n".to_string();
+        assert_eq!(normalize_line_endings(lf.clone()), lf);
+        assert_eq!(
+            normalize_line_endings("fn run() {\r\n    work();\r}\r\n".to_string()),
+            "fn run() {\n    work();\n}\n"
         );
     }
 

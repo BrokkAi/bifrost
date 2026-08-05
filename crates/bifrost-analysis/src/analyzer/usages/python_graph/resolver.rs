@@ -1,4 +1,7 @@
 use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::python::{
+    python_deferred_annotation_identifier_ranges, python_node_is_in_annotation,
+};
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::model::{ImportBinder, ImportKind};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer};
@@ -206,7 +209,7 @@ pub(in crate::analyzer::usages) fn annotation_reference_candidates(
     }
 
     let mut candidates = match node.kind() {
-        "identifier" | "string_content" => {
+        "identifier" => {
             let mut candidates = resolve_bare_annotation_symbol(
                 analyzer,
                 py,
@@ -223,6 +226,34 @@ pub(in crate::analyzer::usages) fn annotation_reference_candidates(
                     node_text(node, source),
                     target_self_file,
                 ));
+            }
+            candidates
+        }
+        "string_content" => {
+            let Some(string) = node.parent() else {
+                return Some(Vec::new());
+            };
+            let Some(ranges) = python_deferred_annotation_identifier_ranges(string, source, None)
+            else {
+                return Some(Vec::new());
+            };
+            let mut candidates = Vec::new();
+            for range in ranges {
+                let Some(symbol) = source.get(range.start_byte..range.end_byte) else {
+                    continue;
+                };
+                let mut symbol_candidates =
+                    resolve_bare_annotation_symbol(analyzer, py, file, source, node, symbol);
+                if symbol_candidates.is_empty() {
+                    symbol_candidates.extend(resolve_receiver_type(
+                        analyzer,
+                        py,
+                        file,
+                        symbol,
+                        target_self_file,
+                    ));
+                }
+                candidates.extend(symbol_candidates);
             }
             candidates
         }
@@ -413,27 +444,7 @@ fn is_annotation_reference_node(node: Node<'_>) -> bool {
     if !matches!(node.kind(), "identifier" | "attribute" | "string_content") {
         return false;
     }
-
-    let start = node.start_byte();
-    let end = node.end_byte();
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        let annotation = match parent.kind() {
-            "function_definition" => parent.child_by_field_name("return_type"),
-            "typed_parameter" | "typed_default_parameter" | "assignment" => {
-                parent.child_by_field_name("type")
-            }
-            _ => None,
-        };
-        if let Some(annotation) = annotation
-            && annotation.start_byte() <= start
-            && end <= annotation.end_byte()
-        {
-            return true;
-        }
-        current = parent;
-    }
-    false
+    python_node_is_in_annotation(node)
 }
 
 /// Resolve the class constructed by a Python call callee without interpreting

@@ -123,7 +123,8 @@ fn a_forbidden_occurrence_produces_one_multi_location_finding() {
     };
     assert_eq!(evidence.asserted_role(), "value_reference");
     assert_eq!(evidence.expected_class(), "none");
-    assert_eq!(evidence.expected_cardinality(), "(exactly 0)");
+    assert_eq!(evidence.expectation(), "(exactly 0)");
+    assert_eq!(evidence.assert_kind(), "occurrence");
     assert_eq!(evidence.actual_count(), 1);
     assert_eq!(evidence.anchor().assert_id(), "no-reads");
     assert!(
@@ -159,7 +160,7 @@ fn an_absent_required_occurrence_points_at_the_subject_node() {
         panic!("assertion policies produce assertion evidence");
     };
     assert_eq!(evidence.actual_count(), 0);
-    assert_eq!(evidence.expected_cardinality(), "(exactly 1)");
+    assert_eq!(evidence.expectation(), "(exactly 1)");
 
     let relationships = finding
         .related()

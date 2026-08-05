@@ -13,10 +13,23 @@ use super::kinds::{NormalizedKind, Role};
 use super::occurrences::{
     Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
 };
-use crate::analyzer::Language;
+use super::resolution::{BindingActivation, LexicalEnvironmentSupport};
+use crate::analyzer::{Language, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 use tree_sitter::{Language as TsLanguage, Node};
+
+/// One source-backed leaf fact parsed from an opaque region of a primary node.
+///
+/// The descriptor is owned because the secondary parse tree does not survive
+/// structural extraction. The extraction engine inserts the fact directly
+/// below the primary node passed to [`StructuralSpec::embedded_leaf_facts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddedLeafFact {
+    pub kind: NormalizedKind,
+    pub range: Range,
+    pub occurrence_role: OccurrenceRole,
+}
 
 pub trait StructuralSpec: Send + Sync + 'static {
     fn language(&self) -> Language;
@@ -46,6 +59,14 @@ pub trait StructuralSpec: Send + Sync + 'static {
         true
     }
 
+    /// A grammar-backed construct label for semantic generator rules.
+    ///
+    /// The label describes source syntax only. It must not describe generated
+    /// behavior. Adapters must derive it from the tree-sitter node and fields.
+    fn generator_construct(&self, _node: Node<'_>, _kind: NormalizedKind) -> Option<&'static str> {
+        None
+    }
+
     /// Whether this adapter can model `role` precisely enough to evaluate a
     /// query that asks for it.
     fn supports_role(&self, _role: Role) -> bool {
@@ -59,6 +80,36 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// Adapters that do not classify occurrences yet return
     /// [`super::occurrences::NO_OCCURRENCE_ROLE_SUPPORT`].
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport;
+
+    /// Which parts of a file's lexical environment this adapter answers:
+    /// its scope tree, the interval each binding is in effect over, the local
+    /// names its imports introduce, its package clause, and what its resolver
+    /// reports about the candidates it considered.
+    ///
+    /// Deliberately has no default, for the same reason as
+    /// [`Self::occurrence_role_support`]: the table is total, so a default
+    /// would let a new adapter (or a new axis) advertise support nobody
+    /// implemented. Adapters that derive no environment yet return
+    /// [`super::resolution::NO_LEXICAL_ENVIRONMENT_SUPPORT`].
+    fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport;
+
+    /// What binding `binder` introduces into the scope whose range is `scope`,
+    /// and over which byte interval it is in effect.
+    ///
+    /// `binder` is the identifier token the adapter classified as
+    /// [`OccurrenceRole::Binder`]; `scope` is the range of the innermost
+    /// scope-forming fact that contains it, which is the scope the binding is
+    /// declared in.
+    ///
+    /// `None` means the adapter cannot state an interval for this binder. The
+    /// file's `BindingIntervals` axis then becomes incomplete and reaching
+    /// bindings over it refuse to answer — an interval is never guessed. The
+    /// default is `None` for exactly that reason: an adapter that declares the
+    /// axis supported but implements nothing reports incomplete rather than
+    /// wrong.
+    fn binding_activation(&self, _binder: Node<'_>, _scope: Range) -> Option<BindingActivation> {
+        None
+    }
 
     /// The namespace an occurrence of `role` resolves in, where `declares` is
     /// the normalized kind of the fact this token names -- the enclosing fact
@@ -83,6 +134,22 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// the presence of a decoded spelling as "this token was escaped".
     fn decode_spelling(&self, _raw: &str) -> Option<String> {
         None
+    }
+
+    /// Parse source-backed leaf facts hidden inside an otherwise opaque node.
+    ///
+    /// The returned facts must be non-overlapping, ordered by source position,
+    /// and strictly contained by `node`. They become direct normalized children
+    /// of that node. Adapters must use a structured parser and must return no
+    /// fact when an exact source range is unavailable.
+    fn embedded_leaf_facts(
+        &self,
+        _node: Node<'_>,
+        _kind: NormalizedKind,
+        _source: &str,
+        _cancellation: Option<&CancellationToken>,
+    ) -> Vec<EmbeddedLeafFact> {
+        Vec::new()
     }
 
     /// Whether this adapter can produce facts satisfying `kind`.

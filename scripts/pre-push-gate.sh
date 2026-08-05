@@ -36,6 +36,22 @@ fi
 # Tests must never download models or spawn semantic indexer threads.
 export BIFROST_SEMANTIC_INDEX=off
 
+# Cargo can find a rustup-managed compiler while PATH finds a Homebrew rustdoc.
+# Pin both tools to one sysroot so their crate metadata remains compatible.
+if [ -z "${RUSTC:-}" ]; then
+  export RUSTC="$(command -v rustc)"
+fi
+rust_sysroot="$("${RUSTC}" --print sysroot)"
+export PATH="${rust_sysroot}/bin:${PATH}"
+export RUSTC="${rust_sysroot}/bin/rustc"
+if [ -z "${RUSTDOC:-}" ]; then
+  export RUSTDOC="${rust_sysroot}/bin/rustdoc"
+fi
+if [ ! -x "${RUSTDOC}" ]; then
+  echo "pre-push-gate: matching rustdoc is not executable: ${RUSTDOC}" >&2
+  exit 1
+fi
+
 gate_started=$(date +%s)
 step() { echo "[pre-push-gate +$(( $(date +%s) - gate_started ))s] $*"; }
 
@@ -44,7 +60,8 @@ cargo fmt --check
 
 # The nlp+python build tree is large; warn (do not fail) below the headroom
 # CLAUDE.md recommends for all-features builds.
-available_gib=$(df --output=avail -BG "${repo_root}" | tail -1 | tr -dc '0-9')
+available_kib=$(df -Pk "${repo_root}" | awk 'NR == 2 { print $4 }')
+available_gib=$(( ${available_kib:-0} / 1024 / 1024 ))
 if [ "${available_gib:-0}" -lt 60 ]; then
   step "WARNING: ${available_gib}GiB free; the isolated all-features clippy build may exhaust disk"
 fi

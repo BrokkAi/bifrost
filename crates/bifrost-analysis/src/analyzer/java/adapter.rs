@@ -130,7 +130,7 @@ impl LanguageAdapter for JavaAdapter {
                 "import_declaration" => {
                     let raw = node_text(child, source).trim().to_string();
                     parsed.import_statements.push(raw.clone());
-                    parsed.imports.push(parse_import_info(raw));
+                    parsed.imports.push(parse_import_info(child, source, raw));
                 }
                 "class_declaration"
                 | "interface_declaration"

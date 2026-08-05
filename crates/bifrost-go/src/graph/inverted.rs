@@ -522,6 +522,9 @@ fn infer_names_from_values(
                 Some(locals),
             );
             if tokens.is_empty() {
+                tokens = field_selector_type_tokens(*value, ctx, locals);
+            }
+            if tokens.is_empty() {
                 tokens = ctx.expression_type_tokens(*value);
             }
             if !tokens.is_empty() {
@@ -536,6 +539,37 @@ fn infer_names_from_values(
             }
         })
         .collect()
+}
+
+/// The type fqn(s) a `base.field` initializer denotes: `base` is a local whose
+/// type was precisely inferred and `field` is an indexed struct field with a
+/// workspace type. Mirrors the forward scan's field-derived local receiver
+/// seeding (#1611) with the actual type fqn instead of the owner sentinel.
+fn field_selector_type_tokens(
+    value: Node<'_>,
+    ctx: &FileScan<'_>,
+    locals: &LocalInferenceEngine<String>,
+) -> Vec<String> {
+    if value.kind() != "selector_expression" {
+        return Vec::new();
+    }
+    let Some((qualifier, _qualifier_node, field_node)) = selector_parts(value, ctx.source) else {
+        return Vec::new();
+    };
+    let receiver = receiver_symbol_from_qualifier(&qualifier);
+    let resolution = locals.resolve_symbol(receiver);
+    let Some(types) = resolution.as_precise() else {
+        return Vec::new();
+    };
+    let field = node_text(field_node, ctx.source);
+    let mut tokens: Vec<String> = types
+        .iter()
+        .filter(|type_fqn| type_fqn.as_str() != SELF_RECEIVER_TOKEN)
+        .filter_map(|type_fqn| ctx.index.unique_field_type_fqn(type_fqn, field))
+        .collect();
+    tokens.sort();
+    tokens.dedup();
+    tokens
 }
 
 fn apply_inferred_bindings(

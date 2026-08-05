@@ -146,6 +146,18 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "analyzer/usages/receiver_query.rs",
         "Java resolution-session route; follow-up",
     ),
+    // The #1474 resolution trace's boundary and import evidence: `boundary_evidence`
+    // and its import-declaration companion each answer "is this name external, and
+    // does the build say so?" per language, which is Java's `external_boundary_evidence`
+    // for Java and the semantic overlay plus dependency-discovery evidence elsewhere.
+    // Same class as `get_definition/mod.rs`: a per-language implementation set living
+    // in a framework file, not a dispatch a single capability method would absorb --
+    // the Java arm needs a resolver-typed answer the other arms have no analogue for.
+    // Follow-up: revisit alongside `receiver_query.rs` with the extraction plan.
+    (
+        "analyzer/usages/get_definition/trace.rs",
+        "per-language external-boundary evidence set (census section 6); follow-up",
+    ),
 ];
 
 /// Files whose whole job is to know every language.

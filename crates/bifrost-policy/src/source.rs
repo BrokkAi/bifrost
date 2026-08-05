@@ -16,8 +16,8 @@ use brokk_bifrost_analysis::analyzer::structural::query::sexp::{
     code_query_from_expr, validate_policy_selector_expr,
 };
 use brokk_bifrost_analysis::analyzer::structural::{
-    MAX_CAPTURE_LENGTH,
-    occurrences::{Namespace, OccurrenceRole},
+    MAX_CAPTURE_LENGTH, PrecedenceTier,
+    occurrences::{Namespace, OccurrenceClass, OccurrenceRole},
 };
 use brokk_bifrost_analysis::schema_version::SchemaVersionResolution;
 use brokk_bifrost_analysis::sexp::{Expr, ExprKind, SexpParseLimits, parse_sexp_with_limits};
@@ -1114,12 +1114,12 @@ impl Decoder {
         let mut asserts = Vec::with_capacity(entries.len());
         let mut ids = HashSet::with_capacity(entries.len());
         for entry in entries {
-            let value = decode_occurrence_assert(entry)?;
-            if !ids.insert(value.id.as_str().to_string()) {
+            let value = decode_policy_assert(entry)?;
+            if !ids.insert(value.id().as_str().to_string()) {
                 return Err(source_error(
                     "duplicate-entry-id",
                     entry.range.clone(),
-                    format!("duplicate assert ID `{}`", value.id),
+                    format!("duplicate assert ID `{}`", value.id()),
                 ));
             }
             asserts.push(value);
@@ -4233,6 +4233,186 @@ fn decode_boolean(expr: &Expr, what: &str) -> Result<bool, PolicySourceError> {
     }
 }
 
+/// The four assert families share one authored sequence, so the record head is
+/// what selects the family. A head that is not one of them is rejected by
+/// `select_record` with the accepted spellings named.
+fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> {
+    let record = select_record(
+        expr,
+        &[
+            PolicyRecord::Assert,
+            PolicyRecord::AssertResolution,
+            PolicyRecord::AssertReaching,
+            PolicyRecord::AssertBoundary,
+        ],
+        "assert record",
+    )?;
+    match record {
+        PolicyRecord::Assert => Ok(PolicyAssert::Occurrence(decode_occurrence_assert(expr)?)),
+        PolicyRecord::AssertResolution => {
+            Ok(PolicyAssert::Resolution(decode_resolution_assert(expr)?))
+        }
+        PolicyRecord::AssertReaching => Ok(PolicyAssert::Reaching(decode_reaching_assert(expr)?)),
+        PolicyRecord::AssertBoundary => Ok(PolicyAssert::Boundary(decode_boundary_assert(expr)?)),
+        other => unreachable!("select_record returned {other:?}"),
+    }
+}
+
+/// The capture name shared by every assert family, bounded once.
+fn decode_assert_capture(expr: &Expr, what: &str) -> Result<String, PolicySourceError> {
+    let name = expect_token(expr, what)?.to_string();
+    if name.is_empty() || name.len() > MAX_CAPTURE_LENGTH {
+        return Err(source_error(
+            "invalid-capture-name",
+            expr.range.clone(),
+            format!(
+                "assert capture name must be from 1 through {MAX_CAPTURE_LENGTH} bytes, found {}",
+                name.len()
+            ),
+        ));
+    }
+    Ok(name)
+}
+
+/// A resolution candidate exists only for a reference, so an assert about one
+/// at a role that is never a reference can never hold and is rejected here
+/// rather than evaluated to a fixed verdict.
+fn decode_reference_role(expr: &Expr, what: &str) -> Result<OccurrenceRole, PolicySourceError> {
+    let role = decode_occurrence_role(expr)?;
+    if role.class() != OccurrenceClass::Reference {
+        return Err(source_error(
+            "assert-role-class-mismatch",
+            expr.range.clone(),
+            format!(
+                "{what} is about how a reference resolves, but occurrence role `{}` is always class `{}`",
+                role.label(),
+                role.class().label()
+            ),
+        ));
+    }
+    Ok(role)
+}
+
+fn decode_precedence_tier(expr: &Expr) -> Result<PrecedenceTier, PolicySourceError> {
+    let token = expect_token(expr, "precedence tier")?;
+    expect_atom(expr, AtomDomain::PrecedenceTier, "precedence tier")?;
+    Ok(PrecedenceTier::from_label(token)
+        .expect("the RQLP precedence-tier atoms mirror the analyzer registry labels"))
+}
+
+fn decode_resolution_assert(expr: &Expr) -> Result<ResolutionAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertResolution,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let role = decode_reference_role(fields.required("role"), "`assert-resolution`")?;
+    let expect_tier_expr = fields.required("expect-tier");
+    let expect_tier = decode_precedence_tier(expect_tier_expr)?;
+    let at_least = fields
+        .get("at-least")
+        .map(|value| decode_boolean(value, "assert at-least flag"))
+        .transpose()?
+        .unwrap_or(false);
+    let forbid_tier_expr = fields.get("forbid-tier");
+    let forbid_tier = forbid_tier_expr.map(decode_precedence_tier).transpose()?;
+    let require_unique = fields
+        .get("require-unique")
+        .map(|value| decode_boolean(value, "assert require-unique flag"))
+        .transpose()?
+        .unwrap_or(false);
+    let assertion = ResolutionAssert {
+        id,
+        at,
+        role,
+        expect_tier,
+        at_least,
+        forbid_tier,
+        require_unique,
+    };
+    // An assert no tier can satisfy is an authoring error, not a rule that
+    // always fires: its verdict was fixed before any row was read.
+    if !assertion.is_satisfiable() {
+        return Err(source_error(
+            "contradictory-assert-tier",
+            forbid_tier_expr.unwrap_or(expect_tier_expr).range.clone(),
+            format!(
+                "no precedence tier satisfies `{}`, so the assert can never hold",
+                assertion.expectation()
+            ),
+        ));
+    }
+    Ok(assertion)
+}
+
+fn decode_reaching_assert(expr: &Expr) -> Result<ReachingAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertReaching,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let role = decode_reference_role(fields.required("role"), "`assert-reaching`")?;
+    let containment = match expect_atom(
+        fields.required("declared"),
+        AtomDomain::DeclaredContainment,
+        "declared containment",
+    )? {
+        PolicyAtomValue::DeclaredInside => DeclaredContainment::Inside,
+        PolicyAtomValue::DeclaredOutside => DeclaredContainment::Outside,
+        value => unreachable!("DeclaredContainment registry returned {value:?}"),
+    };
+    let relative_to_expr = fields.required("relative-to");
+    let relative_to = decode_assert_capture(relative_to_expr, "assert related capture name")?;
+    // A node is trivially inside itself and never outside itself, so comparing
+    // a capture against itself states a verdict rather than a rule.
+    if relative_to == at {
+        return Err(source_error(
+            "contradictory-assert-containment",
+            relative_to_expr.range.clone(),
+            format!(
+                "`:relative-to` names the same capture as `:at` (`{at}`), whose containment is fixed"
+            ),
+        ));
+    }
+    Ok(ReachingAssert {
+        id,
+        at,
+        role,
+        containment,
+        relative_to,
+    })
+}
+
+fn decode_boundary_assert(expr: &Expr) -> Result<BoundaryAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertBoundary,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let role = decode_reference_role(fields.required("role"), "`assert-boundary`")?;
+    let forbid_fallback_past = match expect_atom(
+        fields.required("forbid-fallback-past"),
+        AtomDomain::BoundaryStrength,
+        "boundary strength",
+    )? {
+        PolicyAtomValue::BoundaryDeclaredUnindexed => BoundaryStrength::ExternalDeclaredUnindexed,
+        PolicyAtomValue::BoundaryUnknown => BoundaryStrength::ExternalUnknown,
+        value => unreachable!("BoundaryStrength registry returned {value:?}"),
+    };
+    Ok(BoundaryAssert {
+        id,
+        at,
+        role,
+        forbid_fallback_past,
+    })
+}
+
 fn decode_occurrence_assert(expr: &Expr) -> Result<OccurrenceAssert, PolicySourceError> {
     let fields = RecordCursor::parse(
         expr,
@@ -4240,18 +4420,7 @@ fn decode_occurrence_assert(expr: &Expr) -> Result<OccurrenceAssert, PolicySourc
         DecodeContext::policy(PolicyAnalysisKind::Assertion),
     )?;
     let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
-    let at_expr = fields.required("at");
-    let at = expect_token(at_expr, "assert capture name")?.to_string();
-    if at.is_empty() || at.len() > MAX_CAPTURE_LENGTH {
-        return Err(source_error(
-            "invalid-capture-name",
-            at_expr.range.clone(),
-            format!(
-                "assert capture name must be from 1 through {MAX_CAPTURE_LENGTH} bytes, found {}",
-                at.len()
-            ),
-        ));
-    }
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
     let role = decode_occurrence_role(fields.required("role"))?;
     let expect_expr = fields.required("expect");
     let expect = decode_expected_occurrence(expect_expr)?;

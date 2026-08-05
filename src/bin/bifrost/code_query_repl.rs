@@ -688,6 +688,32 @@ fn query_summary_text(query: &CodeQuery) -> String {
     parts.join("; ")
 }
 
+/// The `where`/`languages` prefix every non-structural seed summarises the same
+/// way, so the three seeds do not drift apart in the REPL banner.
+fn environment_seed_scope_summary(
+    where_globs: &[glob::Pattern],
+    languages: &[brokk_bifrost::analyzer::Language],
+) -> Vec<String> {
+    let mut parts = Vec::new();
+    if !where_globs.is_empty() {
+        let globs = where_globs
+            .iter()
+            .map(|glob| format!("\"{}\"", sanitize_terminal_text(glob.as_str())))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("where {globs}"));
+    }
+    if !languages.is_empty() {
+        let labels = languages
+            .iter()
+            .map(|language| language.config_label())
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("language {labels}"));
+    }
+    parts
+}
+
 fn plan_summary_text(plan: &CodeQueryPlan) -> String {
     let mut parts = match &plan.source {
         CodeQueryPlanSource::Seed(seed) => {
@@ -770,6 +796,58 @@ fn plan_summary_text(plan: &CodeQueryPlan) -> String {
                 if !values.is_empty() {
                     parts.push(format!("{label} {}", values.join(", ")));
                 }
+            }
+            parts
+        }
+        CodeQueryPlanSource::Scopes(seed) => {
+            let mut parts = vec!["lexical scope query".to_string()];
+            parts.extend(environment_seed_scope_summary(
+                &seed.where_globs,
+                &seed.languages,
+            ));
+            if !seed.filter.kinds.is_empty() {
+                parts.push(format!(
+                    "kind {}",
+                    seed.filter
+                        .kinds
+                        .iter()
+                        .map(|kind| kind.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            parts
+        }
+        CodeQueryPlanSource::Bindings(seed) => {
+            let mut parts = vec!["binding query".to_string()];
+            parts.extend(environment_seed_scope_summary(
+                &seed.where_globs,
+                &seed.languages,
+            ));
+            if !seed.filter.kinds.is_empty() {
+                parts.push(format!(
+                    "kind {}",
+                    seed.filter
+                        .kinds
+                        .iter()
+                        .map(|kind| kind.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !seed.filter.names.is_empty() {
+                parts.push(format!("name {}", seed.filter.names.join(", ")));
+            }
+            if !seed.filter.hoisting.is_empty() {
+                parts.push(format!(
+                    "hoisting {}",
+                    seed.filter
+                        .hoisting
+                        .iter()
+                        .map(|class| class.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
             }
             parts
         }
@@ -1130,6 +1208,62 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                     for detail in value.target.render_detail_lines() {
                         out.push_str(&format!("  {}\n", sanitize_terminal_text(&detail)));
                     }
+                }
+                CodeQueryResultValue::LexicalScope { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} #{} ({})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "lexical scope:", use_color),
+                        value.index,
+                        value.kind.unwrap_or("file"),
+                    ));
+                    if let Some(parent) = value.parent_index {
+                        out.push_str(&format!("  inside scope #{parent}\n"));
+                    }
+                }
+                CodeQueryResultValue::Binding { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let name = sanitize_terminal_text(&value.name);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} `{}` ({}; {}){}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "binding:", use_color),
+                        paint(Style::new().bold(), &name, use_color),
+                        value.kind,
+                        value.hoisting,
+                        if value.shadowed { " shadowed" } else { "" },
+                    ));
+                    out.push_str(&format!(
+                        "  declared in scope #{}\n",
+                        value.declaring_scope_index
+                    ));
+                }
+                CodeQueryResultValue::ResolutionCandidate { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let name = sanitize_terminal_text(value.candidate.name());
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} `{}` ({}; {}; {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "candidate:", use_color),
+                        paint(Style::new().bold(), &name, use_color),
+                        value.tier.unwrap_or("unattributed"),
+                        value.outcome,
+                        value.candidate.label(),
+                    ));
+                    if let Some(reason) = value.rejection_reason {
+                        out.push_str(&format!("  rejected: {reason}\n"));
+                    }
+                    out.push_str(&format!(
+                        "  boundary {}, trace {}\n",
+                        value.boundary, value.trace_completeness
+                    ));
                 }
             }
             if let Some(summary) = result.provenance_summary() {

@@ -5,7 +5,7 @@
 //! crate cannot name.
 
 use crate::analyzer::cognitive_complexity;
-use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
+use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile};
 use brokk_bifrost_rust::adapter::{
     RUST_COGNITIVE_CONFIG, RUST_FILE_EXTENSION, rust_extract_call_receiver,
     rust_unit_has_explicit_qualifier,
@@ -69,6 +69,14 @@ impl LanguageAdapter for RustAdapter {
         content_qualifier
             .is_empty()
             .then(|| rust_file_package_fq(file))
+    }
+
+    fn code_unit_package_is_path_derived(
+        &self,
+        code_unit: &CodeUnit,
+        _content_qualifier: &str,
+    ) -> bool {
+        !rust_unit_has_explicit_qualifier(code_unit)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

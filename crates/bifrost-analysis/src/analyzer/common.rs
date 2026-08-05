@@ -1,6 +1,6 @@
 pub(crate) use brokk_bifrost_core::analyzer::common::{
-    IdentifierSigil, node_ident_text, node_source_text, node_source_text_trimmed,
-    parse_source_region,
+    IdentifierSigil, node_ident_text, node_source_text, node_source_text_trimmed, node_span,
+    parse_source_range_with_cancellation, parse_source_region,
 };
 pub use brokk_bifrost_core::analyzer::common::{language_for_file, language_for_target};
 // Rust's identifier sigil and `r#` strip moved with the language: the sigil to

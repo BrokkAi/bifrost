@@ -516,6 +516,28 @@ The observable outcomes are:
   recovered images, enforce exact cardinalities, run `PRAGMA quick_check`, and publish the clean
   final manifest. Remaining: finish and verify the serial source prewarms, shared dw10 cache,
   sizes, and integrity.
+- [ ] (2026-08-04, full CodeScale comparison) The 69-task Luna/max baseline is frozen and audited
+  at concurrency 20 with a 1,800-second agent timeout and 200-turn safety ceiling: 41 successes,
+  15 test failures, and 13 agent failures. It contains exactly the requested 69 unique task IDs;
+  all cells used Bedrock Luna at maximum reasoning in baseline mode and made zero semantic calls.
+  Twelve agent failures are legitimate 1,800-second timeouts and one is invalid output. The three
+  cells truncated by the superseded 900-second configuration were rerun to non-timeout terminal
+  results: `ccx-crossorg-220` and `ccx-dep-trace-171` failed tests after 1,337 and 1,449 seconds,
+  while `ccx-crossorg-295` succeeded after 1,668 seconds. The two nominal successes from official
+  source-empty images were archived and replaced by source-backed test failures. The concurrent
+  semantic-natural dw10 arm remains live in serial prewarm; agent execution begins automatically
+  after all ready records reconcile. Its immutable runtime includes the content-preserving outer
+  Git view and disables opportunistic single-repository GC for the cross-repository shared cache.
+- [ ] (2026-08-04, CodeScale C++ recovery) The semantic prewarmer published ten ready records,
+  then stopped on `ccx-onboard-103` when GCC/LLVM diagnostic fixtures triggered two structured
+  C++ name assertions. Bifrost `bac47d42` honors tree-sitter's explicit-global namespace token
+  instead of duplicating the lexical namespace and removes delimiter-proven empty components
+  from malformed recovered member qualifiers. All 21 C++ declaration tests pass. Both the
+  profiler and agent Bifrost were rebuilt, immutable runtime `runtime-bac47d42.tgz` was
+  published, and the full queue resumed with the ten completed records intact. The real GCC/LLVM
+  image crossed the former five-minute panic boundary and began writing embeddings after 377
+  seconds, proving the repaired analyzer drained both malformed fixtures. Remaining: complete
+  readiness and run the 69 semantic cells.
 - [x] (2026-08-03 15:27Z, extraction profile) Profiled the live Flink prewarm without stopping
   it. The earlier Kafka source spent 1,525.4 seconds in extraction versus 193.3 seconds in the
   overlapped embed stage. During Flink extraction all four GPUs were idle while a ten-second
@@ -580,6 +602,23 @@ The observable outcomes are:
 
 ## Surprises & Discoveries
 
+- Observation: compiler diagnostic repositories exercise intentionally malformed C++ namespace
+  and member qualifiers during ordinary whole-workspace indexing, so error-recovery identities
+  must satisfy the same structured-name invariants as valid source.
+  Evidence: `ccx-onboard-103` panicked concurrently on Clang's
+  `namespace ::cwg311::X {}` nested inside `namespace cwg311` and on a recovered function with
+  `package_name="X"`, `short_name=".doit"`. The first path had appended an explicitly global
+  name to its lexical package; the second retained an empty component between adjacent recovered
+  scope operators. Focused regressions reproduce both name-construction shapes.
+
+- Observation: two official `grep_hard` task images intentionally contain no local source even
+  though this comparison gives the agent local symbol and semantic tools.
+  Evidence: `ccx-crossorg-218` declares scikit-learn through `SOURCEGRAPH_REPOS`, while
+  `ccx-crossorg-219` declares Prometheus and Grafana; neither image materializes those trees
+  under `/workspace`. The original no-semantic cells nevertheless returned `SUCCESS`, which is
+  possible from model memory or guessing but is not comparable to source-backed cells. Exactly
+  these two results were archived without deletion and scheduled again with prepared sources.
+
 - Observation: bounded pipeline channel depth did not bound Kubernetes prewarm memory because
   each channel element could contain an arbitrarily large 64-file extraction, and `embed_group`
   converted every cache-missing component in that extraction into one logical request. The final
@@ -643,6 +682,20 @@ The observable outcomes are:
   `benchmarks/csb_org_crossorg/...`, while recursive discovery also finds `benchmarks/csb/...`.
   Forty-one of the 42 official task TOMLs rely on harness resource defaults, and several use an
   uppercase `CCX-*` declared ID with a lowercase directory.
+
+- Observation: CodeScale artifact images do not all expose the advertised `TASK_REPO_ROOT` as
+  a Git worktree. `ccx-crossorg-217` advertises `/workspace` but contains the shallow Django
+  checkout at `/workspace/django--674eda1c`; the current semantic profiler analyzes 2,997 files
+  and then fails with `semantic search requires a git repository`.
+  Evidence: the first corrected full-arm preflight completed Camel under cache schema 14, then
+  failed exactly at Bifrost's Git discovery for `ccx-crossorg-217` before any Luna cell started.
+
+- Observation: opportunistic cache GC is scoped to one `git2::Repository`, while the CodeScale
+  preparation campaign deliberately stores unrelated repository blobs in one explicit cache DB.
+  A long-lived semantic process can therefore classify other task repositories' rows as dead.
+  Evidence: `crates/bifrost-core/src/cache_gc.rs` snapshots every semantic/analyzer row in the
+  database and retains only OIDs reachable from the repository passed to that one process; the
+  shared dw10 database currently contains 230,251 semantic blob identities.
 
 - Observation: Bedrock Mantle's native Anthropic Messages endpoint serves
   `anthropic.claude-opus-4-7` even though the OpenAI-compatible Bedrock model listings used in
@@ -951,6 +1004,27 @@ The observable outcomes are:
   prefixes.
 
 ## Decision Log
+
+- Decision: for CodeScale tasks whose official image deliberately omits source, mount the source
+  revisions already resolved by the preparation manifest read-only under `/workspace`, and use
+  the identical injection for both control and semantic arms.
+  Rationale: the experiment measures local repository localization, not remote Sourcegraph use.
+  Leaving these cells source-empty would test model memory, while dropping them would silently
+  change the requested 69-task cohort. The immutable preparation manifest provides auditable
+  source identities; applying the same mounts to both arms preserves the treatment contrast.
+  Date/Author: 2026-08-04, Codex.
+
+- Decision: adapt CodeScale artifact workspaces by creating an outer Git commit whose tree is
+  assembled from the existing nested repositories through Git object alternates, and add an
+  explicit operator setting that disables automatic (but not forced) cache GC for the global
+  evaluation cache.
+  Rationale: pointing Bifrost at one nested repository would omit the other repositories in
+  multi-repository tasks. Copying or re-hashing giant source trees would waste disk and time.
+  A synthetic outer tree preserves `/workspace`-relative paths and all nested repository
+  metadata while reusing their existing objects. Automatic GC cannot prove liveness across an
+  unrelated-repository global DB, so this exceptional campaign must opt out explicitly rather
+  than weakening ordinary repository-local GC.
+  Date/Author: 2026-08-04, Codex.
 
 - Decision: bound semantic materialization at two complementary levels: extraction groups use
   both source bytes and file count, while each logical embedding call uses both raw text bytes and
@@ -2311,3 +2385,16 @@ Revision note, 2026-08-04: Added dual byte/count backpressure after the last Kub
 was OOM-killed despite depth-two channels. The revision bounds outer extraction by source bytes,
 bounds logical embedding requests by raw text bytes and component count, preserves exact token
 bucketing in the Python sidecar, and resumes only the failed final revision after validation.
+
+Revision note, 2026-08-04: Expanded the CodeScaleBench localization campaign from the original
+42-task cost-bounded panel to all 69 `grep_hard` tasks, with concurrency 20 and an 1800-second
+agent timeout. The semantic arm first attempted container-local prewarming through one shared TCP
+sidecar; live profiling showed that endpoint mode bypasses Bifrost's normal multi-device
+`ScheduledEmbedder` and pinned the pass to one physical GPU. The recovery returns to the original
+host-prewarm design: clone the 13 newly required `sg-evals` fixture revisions at concurrency ten,
+run `semantic_index_profile` sequentially over host clones with no endpoint or CUDA override so
+Bifrost spawns one UUID-pinned sidecar per GPU, reuse the incrementally committed dw10 SQLite
+cache, and only then resume the container campaign. A validation prewarm reported four sidecars
+and simultaneous activity on all four GPUs. The earlier LLVM C++ assertion was fixed and tested in
+`bac47d42`; its partial cache remains reusable. The completed 69-cell no-semantic Luna/max arm is
+the control, including corrected 1800-second reruns for the three original 900-second truncations.

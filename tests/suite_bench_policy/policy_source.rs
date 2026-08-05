@@ -131,7 +131,7 @@ fn shipped_examples_cover_every_document_and_analysis_variant() {
         panic!("expected assertion analysis")
     };
     assert_eq!(spec.asserts.len(), 1);
-    assert_eq!(spec.asserts[0].at, "token");
+    assert_eq!(spec.asserts[0].at(), "token");
 
     let RqlpDocument::Policy { definition } =
         parse_fixture("resource-lifecycle.rqlp").into_document()

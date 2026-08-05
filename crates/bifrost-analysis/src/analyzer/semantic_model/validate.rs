@@ -232,13 +232,9 @@ impl Validator {
             ("module", selector.module.as_ref()),
             ("toolchain", selector.toolchain.as_ref()),
         ];
-        if selectors.iter().all(|(_, value)| value.is_none()) {
-            self.error(
-                "selector.empty",
-                path,
-                "selector must identify a package, module, or toolchain",
-            );
-        }
+        // An empty coordinate selector is the explicit language-intrinsic
+        // activation form. Runtime matching still requires matching language
+        // and ecosystem evidence for the shard.
         if let Some(toolchain) = &selector.toolchain
             && !compatible_toolchains
                 .iter()
@@ -917,6 +913,40 @@ impl Validator {
             | RuleTrigger::GeneratorInvocation { name } => {
                 self.qualified_name(&format!("{path}.trigger.name"), name);
             }
+            RuleTrigger::AnnotatedField {
+                annotation,
+                value,
+                excluded_annotations,
+                owner_annotation_path,
+            } => {
+                self.qualified_name(&format!("{path}.trigger.annotation"), annotation);
+                if value.as_ref().is_some_and(String::is_empty) {
+                    self.error(
+                        "trigger.empty_annotation_value",
+                        format!("{path}.trigger.value"),
+                        "an annotation value must not be empty",
+                    );
+                }
+                for (index, excluded) in excluded_annotations.iter().enumerate() {
+                    self.qualified_name(
+                        &format!("{path}.trigger.excluded_annotations[{index}]"),
+                        excluded,
+                    );
+                }
+                if owner_annotation_path.is_empty() {
+                    self.error(
+                        "trigger.empty_owner_annotation_path",
+                        format!("{path}.trigger.owner_annotation_path"),
+                        "owner annotation path must contain at least one identifier",
+                    );
+                }
+                for (index, segment) in owner_annotation_path.iter().enumerate() {
+                    self.language_identifier(
+                        &format!("{path}.trigger.owner_annotation_path[{index}]"),
+                        segment,
+                    );
+                }
+            }
             RuleTrigger::ResolvedOwner { owner } => {
                 self.qualified_name(&format!("{path}.trigger.owner"), owner);
             }
@@ -951,6 +981,7 @@ impl Validator {
                 RuleEmission::Declaration {
                     id,
                     name,
+                    anchor,
                     declaration,
                 } => {
                     self.template(
@@ -965,6 +996,21 @@ impl Validator {
                         &captures,
                         TemplatePosition::LanguageName,
                     );
+                    if let Some(anchor) = anchor {
+                        if !matches!(anchor, TemplateExpression::Capture { .. }) {
+                            self.error(
+                                "anchor.unsupported_expression",
+                                format!("{emission_path}.anchor"),
+                                "an authored anchor must be one direct capture",
+                            );
+                        }
+                        self.template(
+                            &format!("{emission_path}.anchor"),
+                            anchor,
+                            &captures,
+                            TemplatePosition::LanguageName,
+                        );
+                    }
                     match declaration {
                         EmittedDeclaration::Type {
                             type_parameters,
@@ -1003,14 +1049,28 @@ impl Validator {
                             }
                         }
                         EmittedDeclaration::Member {
-                            owner, signature, ..
+                            owner,
+                            member_kind,
+                            signature,
+                            ..
                         } => {
-                            self.template(
-                                &format!("{emission_path}.declaration.owner"),
-                                owner,
-                                &captures,
-                                TemplatePosition::StableId,
-                            );
+                            if let Some(owner) = owner {
+                                self.template(
+                                    &format!("{emission_path}.declaration.owner"),
+                                    owner,
+                                    &captures,
+                                    TemplatePosition::StableId,
+                                );
+                            } else if !matches!(
+                                member_kind,
+                                MemberKind::Function | MemberKind::Macro
+                            ) {
+                                self.error(
+                                    "declaration.owner_required",
+                                    format!("{emission_path}.declaration.owner"),
+                                    "only top-level functions and macros can omit an owner",
+                                );
+                            }
                             if let Some(signature) = signature {
                                 self.template_signature(
                                     &format!("{emission_path}.declaration.signature"),
@@ -1067,7 +1127,11 @@ impl Validator {
         let expected_cardinality = match capture.binding.source {
             CaptureSource::MatchedNode
             | CaptureSource::EnclosingDeclaration
+            | CaptureSource::OwningType
             | CaptureSource::ResolvedOwner => CaptureCardinality::One,
+            CaptureSource::OwnedFields | CaptureSource::OwnedMutableFields => {
+                CaptureCardinality::Many
+            }
             CaptureSource::Argument { .. } | CaptureSource::AnnotationArgument { .. } => {
                 CaptureCardinality::Optional
             }
@@ -1089,7 +1153,8 @@ impl Validator {
             }
             CaptureSource::Argument { .. } | CaptureSource::Arguments { .. } => matches!(
                 trigger,
-                RuleTrigger::MacroInvocation { .. }
+                RuleTrigger::LanguageConstruct { .. }
+                    | RuleTrigger::MacroInvocation { .. }
                     | RuleTrigger::GeneratorInvocation { .. }
                     | RuleTrigger::ResolvedCall { .. }
             ),
@@ -1097,7 +1162,11 @@ impl Validator {
                 trigger,
                 RuleTrigger::ResolvedOwner { .. } | RuleTrigger::ResolvedCall { .. }
             ),
-            CaptureSource::MatchedNode | CaptureSource::EnclosingDeclaration => true,
+            CaptureSource::MatchedNode
+            | CaptureSource::EnclosingDeclaration
+            | CaptureSource::OwningType
+            | CaptureSource::OwnedFields
+            | CaptureSource::OwnedMutableFields => true,
         };
         if !compatible {
             self.error(
@@ -1191,14 +1260,15 @@ impl Validator {
                         format!("{current_path}.name"),
                         format!("capture `{name}` is not a type capture"),
                     ),
-                    Some(capture) if capture.cardinality != CaptureCardinality::One => self.error(
-                        "capture.cardinality",
-                        format!("{current_path}.name"),
-                        format!("capture `{name}` must have cardinality `one` here"),
-                    ),
+                    Some(capture) if capture.cardinality == CaptureCardinality::Optional => self
+                        .error(
+                            "capture.cardinality",
+                            format!("{current_path}.name"),
+                            format!("capture `{name}` must have cardinality `one` here"),
+                        ),
                     Some(_) => {}
                 },
-                TemplateTypeRef::Array { element } => {
+                TemplateTypeRef::Array { element } | TemplateTypeRef::ByRef { element } => {
                     stack.push((element, depth + 1, format!("{current_path}.element")))
                 }
             }
@@ -1221,8 +1291,8 @@ impl Validator {
                 "stable-id templates must begin and end with a lowercase ASCII alphanumeric",
             );
         }
-        let mut stack = vec![(root, 1usize, path.to_owned(), true)];
-        while let Some((expression, depth, current_path, is_root)) = stack.pop() {
+        let mut stack = vec![(root, 1usize, path.to_owned(), true, position)];
+        while let Some((expression, depth, current_path, is_root, position)) = stack.pop() {
             if depth > self.limits.max_depth {
                 self.error(
                     "limit.template_depth",
@@ -1267,11 +1337,12 @@ impl Validator {
                         format!("{current_path}.name"),
                         format!("unknown capture `{name}`"),
                     ),
-                    Some(capture) if capture.cardinality != CaptureCardinality::One => self.error(
-                        "capture.cardinality",
-                        format!("{current_path}.name"),
-                        format!("capture `{name}` must have cardinality `one` here"),
-                    ),
+                    Some(capture) if capture.cardinality == CaptureCardinality::Optional => self
+                        .error(
+                            "capture.cardinality",
+                            format!("{current_path}.name"),
+                            format!("capture `{name}` must have cardinality `one` here"),
+                        ),
                     Some(capture)
                         if matches!(position, TemplatePosition::StableId)
                             && capture.value_kind != CaptureValueKind::StableId =>
@@ -1311,6 +1382,7 @@ impl Validator {
                             depth + 1,
                             format!("{current_path}.values[{index}]"),
                             false,
+                            position,
                         ));
                     }
                 }
@@ -1329,7 +1401,51 @@ impl Validator {
                             "this transform can emit characters forbidden in stable ids",
                         );
                     }
-                    stack.push((value, depth + 1, format!("{current_path}.value"), is_root))
+                    stack.push((
+                        value,
+                        depth + 1,
+                        format!("{current_path}.value"),
+                        is_root,
+                        position,
+                    ))
+                }
+                TemplateExpression::Conditional {
+                    condition,
+                    then_value,
+                    else_value,
+                } => {
+                    let (left, right) = match condition {
+                        super::TemplateCondition::Equals { left, right } => (left, right),
+                        super::TemplateCondition::StartsWith { value, prefix } => (value, prefix),
+                    };
+                    stack.push((
+                        else_value,
+                        depth + 1,
+                        format!("{current_path}.else"),
+                        is_root,
+                        position,
+                    ));
+                    stack.push((
+                        then_value,
+                        depth + 1,
+                        format!("{current_path}.then"),
+                        is_root,
+                        position,
+                    ));
+                    stack.push((
+                        right,
+                        depth + 1,
+                        format!("{current_path}.condition.right"),
+                        false,
+                        TemplatePosition::Condition,
+                    ));
+                    stack.push((
+                        left,
+                        depth + 1,
+                        format!("{current_path}.condition.left"),
+                        false,
+                        TemplatePosition::Condition,
+                    ));
                 }
             }
         }
@@ -1503,6 +1619,7 @@ impl Validator {
 enum TemplatePosition {
     StableId,
     LanguageName,
+    Condition,
 }
 
 fn is_stable_id_fragment(value: &str) -> bool {
@@ -1552,6 +1669,14 @@ fn stable_id_template_boundary(
                 expression = next;
             }
             TemplateExpression::Transform { value, .. } => expression = value,
+            TemplateExpression::Conditional {
+                then_value,
+                else_value,
+                ..
+            } => {
+                return stable_id_template_boundary(then_value, first, max_depth)
+                    && stable_id_template_boundary(else_value, first, max_depth);
+            }
         }
     }
     false

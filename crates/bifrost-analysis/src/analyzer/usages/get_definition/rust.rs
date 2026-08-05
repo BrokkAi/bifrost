@@ -212,6 +212,10 @@ pub(super) fn resolve_rust(
     cache: &mut RustTypeLookupCache,
     operation: Option<NavigationOperation>,
 ) -> DefinitionLookupOutcome {
+    // Every tier below resolves the reference this site names, so the deep
+    // scope covers the whole ladder; a nested lookup for a receiver type or an
+    // owner sits outside it and attributes nothing to this reference.
+    let _deep = trace::DeepScope::enter(&site.text);
     if !support.observe_cancellation() {
         return no_definition("cancelled", "Rust definition resolution was cancelled");
     }
@@ -1005,10 +1009,22 @@ fn resolve_rust_unscoped(
                 rust_scoped_role_candidate(role),
                 site.focus_start_byte,
             ) {
-                ReceiverAnalysisOutcome::Precise(candidates) => candidates
-                    .into_iter()
-                    .filter(|candidate| rust_role_accepts_scoped(rust, role, candidate))
-                    .collect(),
+                ReceiverAnalysisOutcome::Precise(candidates) => {
+                    // The role filter is a namespace decision the resolver
+                    // already makes: a scoped path used as a type does not
+                    // accept a value-namespace item of the same name. Recording
+                    // what it discards is what lets Rust claim the rejection
+                    // axis; nothing here is recomputed.
+                    let (accepted, refused): (Vec<_>, Vec<_>) = candidates
+                        .into_iter()
+                        .partition(|candidate| rust_role_accepts_scoped(rust, role, candidate));
+                    trace_rejected_units(
+                        &refused,
+                        PrecedenceTier::PackageOrModule,
+                        RejectionReason::WrongNamespace,
+                    );
+                    accepted
+                }
                 ReceiverAnalysisOutcome::Ambiguous(_)
                 | ReceiverAnalysisOutcome::Unknown
                 | ReceiverAnalysisOutcome::Unsupported { .. }
@@ -1049,7 +1065,10 @@ fn resolve_rust_unscoped(
                 reference,
                 role,
             ) {
-                RustVisibleImportResolution::Resolved(candidates) => candidates,
+                RustVisibleImportResolution::Resolved(candidates) => {
+                    trace_selected_units(&candidates, PrecedenceTier::ExplicitImport);
+                    candidates
+                }
                 RustVisibleImportResolution::GlobResolved(candidates) => {
                     let local = rust_current_module_candidates(
                         analyzer,
@@ -1062,7 +1081,21 @@ fn resolve_rust_unscoped(
                         reference,
                         role,
                     );
-                    if local.is_empty() { candidates } else { local }
+                    if local.is_empty() {
+                        trace_selected_units(&candidates, PrecedenceTier::WildcardImport);
+                        candidates
+                    } else {
+                        // Both sets are computed here and the module wins, so
+                        // the glob candidates are a rejection the resolver
+                        // performed rather than one this trace invented.
+                        trace_selected_units(&local, PrecedenceTier::PackageOrModule);
+                        trace_rejected_units(
+                            &candidates,
+                            PrecedenceTier::WildcardImport,
+                            RejectionReason::ShadowedByNearer,
+                        );
+                        local
+                    }
                 }
                 RustVisibleImportResolution::BoundButUnindexed => {
                     // An unresolvable import must not blind the reference to a
@@ -1083,7 +1116,20 @@ fn resolve_rust_unscoped(
                             )
                         })
                         .flatten();
+                    // The import route is bound but unindexed, and the workspace
+                    // nonetheless supplies the name: the route loses to a
+                    // workspace declaration, which is a decision this arm makes
+                    // and the trace reports.
                     if let Some(unit) = lexical {
+                        trace_rejected_import_route(
+                            file,
+                            reference,
+                            BoundaryStatus::ExternalDeclaredUnindexed,
+                        );
+                        trace_selected_units(
+                            std::slice::from_ref(&unit),
+                            PrecedenceTier::OwnMember,
+                        );
                         return candidates_outcome(vec![unit]);
                     }
                     let local = rust_current_module_candidates(
@@ -1098,6 +1144,12 @@ fn resolve_rust_unscoped(
                         role,
                     );
                     if !local.is_empty() {
+                        trace_rejected_import_route(
+                            file,
+                            reference,
+                            BoundaryStatus::ExternalDeclaredUnindexed,
+                        );
+                        trace_selected_units(&local, PrecedenceTier::PackageOrModule);
                         return candidates_outcome(local);
                     }
                     if let Some(unit) = rust_enclosing_scope_type_fallback(
@@ -1137,7 +1189,7 @@ fn resolve_rust_unscoped(
                         .flatten();
                     lexical.map_or_else(
                         || {
-                            rust_current_module_candidates(
+                            let module = rust_current_module_candidates(
                                 analyzer,
                                 rust,
                                 support,
@@ -1147,9 +1199,17 @@ fn resolve_rust_unscoped(
                                 site.focus_end_byte,
                                 reference,
                                 role,
-                            )
+                            );
+                            trace_selected_units(&module, PrecedenceTier::PackageOrModule);
+                            module
                         },
-                        |unit| vec![unit],
+                        |unit| {
+                            trace_selected_units(
+                                std::slice::from_ref(&unit),
+                                PrecedenceTier::OwnMember,
+                            );
+                            vec![unit]
+                        },
                     )
                 }
             }
@@ -2274,6 +2334,54 @@ fn rust_role_accepts_current_module(
         }
         RustBareReferenceRole::Macro => candidate.is_macro(),
     }
+}
+
+/// Stage `tier` for the outcome constructor these units flow into.
+///
+/// Nothing is recorded here: the row is minted by the shared seam that builds
+/// the outcome, so a selection the resolver later discards on another path
+/// cannot leave a selected row behind.
+fn trace_selected_units(units: &[CodeUnit], tier: PrecedenceTier) {
+    if trace::recording() && !units.is_empty() {
+        trace::stage_tier(tier, units.iter().map(CodeUnit::fq_name).collect());
+    }
+}
+
+/// Record candidates a tier computed and then discarded.
+fn trace_rejected_units(units: &[CodeUnit], tier: PrecedenceTier, reason: RejectionReason) {
+    if !trace::recording() || units.is_empty() {
+        return;
+    }
+    trace::record_all(units.iter().map(|unit| {
+        trace::TraceCandidate::rejected(
+            trace::TraceCandidateRef::Unit(unit.clone()),
+            Some(tier),
+            reason,
+        )
+    }));
+}
+
+/// Record an import route that bound the name but could not answer for it.
+/// The resolution outcome this arm reads back does not carry the route's
+/// `ImportInfo`, so the route's target stays unstated (an empty list), not
+/// re-derived.
+fn trace_rejected_import_route(file: &ProjectFile, name: &str, boundary: BoundaryStatus) {
+    if !trace::recording() {
+        return;
+    }
+    trace::record(
+        trace::TraceCandidate::rejected(
+            trace::TraceCandidateRef::ImportBinder {
+                file: file.clone(),
+                node: None,
+                name: name.to_owned(),
+                target_segments: Vec::new(),
+            },
+            Some(PrecedenceTier::ExplicitImport),
+            RejectionReason::BoundaryBlocked,
+        )
+        .with_boundary(boundary),
+    );
 }
 
 fn rust_role_accepts_scoped(
