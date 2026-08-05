@@ -9,6 +9,7 @@ use crate::analyzer::structural::{
     INVERSE_REFERENCE_EDGE_SUPPORT, LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
     ReferenceEdgeSupport,
 };
+use crate::analyzer::structural::{IdentityRouteSupport, NO_IDENTITY_ROUTE_SUPPORT};
 use crate::analyzer::structural::{NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport};
 use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, Span, StructuralSpec};
 use tree_sitter::Node;
@@ -204,6 +205,10 @@ impl StructuralSpec for GoStructuralSpec {
 
     fn reference_edge_support(&self) -> &ReferenceEdgeSupport {
         &INVERSE_REFERENCE_EDGE_SUPPORT
+    }
+
+    fn identity_route_support(&self) -> &IdentityRouteSupport {
+        &NO_IDENTITY_ROUTE_SUPPORT
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {

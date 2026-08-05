@@ -72,6 +72,7 @@ fn query_step_input_variants() -> Vec<Value> {
                 && !op.allows_candidate_options()
                 && !op.allows_reaching_binding_options()
                 && !op.allows_edge_options()
+                && !op.allows_segment_options()
                 && op.label() != "call_input"
         })
         .map(|op| op.label())
@@ -158,6 +159,12 @@ fn query_step_input_variants() -> Vec<Value> {
         .iter()
         .copied()
         .filter(|op| op.allows_edge_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let segment_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_segment_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
     let occurrence_classes = occurrence_filter_labels(QueryStepField::OccurrenceClasses);
@@ -430,6 +437,19 @@ fn query_step_input_variants() -> Vec<Value> {
             "required": ["op"],
             "additionalProperties": false
         }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": segment_steps },
+                "resolved": {
+                    "type": "boolean",
+                    "const": true,
+                    "description": QueryStepField::Resolved.description()
+                }
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
     ]
 }
 
@@ -530,6 +550,22 @@ fn scope_seed_filter_schema() -> Value {
         },
         "additionalProperties": false,
         "description": "Seed lexical scope rows straight from workspace facts. Every file contributes a synthesized whole-file scope plus one row per scope-forming node, parent-linked so scope-ancestors is a chain walk."
+    })
+}
+
+/// The `paths` seed's filter object.
+fn path_seed_filter_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "min_segments": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Keep only paths with at least this many segments. A path always has at least two; one segment is a bare identifier, not a path."
+            }
+        },
+        "additionalProperties": false,
+        "description": "Seed qualified-path rows straight from workspace facts: one row per linear chain (a.b.C, a::b::C), anchored at its terminal segment. segments_of returns the ordered decoded segments; with resolved: true each segment carries its own prefix resolution."
     })
 }
 
@@ -634,6 +670,7 @@ fn query_plan_properties(
         "occurrences": occurrence_filter_schema(),
         "scopes": scope_seed_filter_schema(),
         "bindings": binding_seed_filter_schema(),
+        "paths": path_seed_filter_schema(),
         "steps": {
             "type": "array",
             "maxItems": MAX_QUERY_STEPS,
@@ -653,6 +690,7 @@ fn query_plan_source_variants() -> Vec<Value> {
         "occurrences",
         "scopes",
         "bindings",
+        "paths",
         "union",
         "intersect",
         "except",
@@ -669,7 +707,7 @@ fn query_plan_source_variants() -> Vec<Value> {
             // structural-seed-only.
             match source {
                 "match" => {}
-                "occurrences" | "scopes" | "bindings" => {
+                "occurrences" | "scopes" | "bindings" | "paths" => {
                     excluded.extend(["inside", "inside_decl", "not_inside"]);
                 }
                 _ => excluded.extend(seed_scope_fields),
@@ -983,7 +1021,8 @@ mod tests {
                 "scope_ancestors",
                 "binding_occurrence",
                 "candidate_target",
-                "edge_target"
+                "edge_target",
+                "segment_target"
             ])
         );
         assert_eq!(
@@ -1116,7 +1155,7 @@ mod tests {
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
-            json!([2, 3, 4, 5, 6, 7, 8, 9, 10])
+            json!([2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["execution_mode"]["enum"],
@@ -1179,6 +1218,7 @@ mod tests {
                     "occurrences",
                     "scopes",
                     "bindings",
+                    "paths",
                     "union",
                     "intersect",
                     "except",

@@ -198,7 +198,7 @@ class SearchToolsClient:
     ) -> CodeQueryResponse:
         """Query normalized code structure across supported languages.
 
-        The compatible head is schema version 10, which adds the canonical
+        The compatible head is schema version 11, which adds the canonical
         reference-edge domain: ``edges_of`` from a declaration, ``edges_from``
         from an occurrence, and ``edge_target`` back to a declaration. Schema
         version 9 added the ``scopes``

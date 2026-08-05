@@ -7,13 +7,24 @@ use crate::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
     field_name_in_parent, first_named_child, is_field_of, nearest_ancestor, node_range,
 };
+use crate::analyzer::structural::adapter_helpers::{
+    linear_chain_tokens, qualified_chain_root, spelled_generic_arity,
+};
 use crate::analyzer::structural::{
     BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS,
     DEEP_REFERENCE_EDGE_SUPPORT, HoistingClass, LexicalEnvironmentSupport, NormalizedKind,
     OccurrenceRole, OccurrenceRoleSupport, ReferenceEdgeSupport, Role, RoleSink, StructuralSpec,
 };
+use crate::analyzer::structural::{DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
+
+/// The left-nested qualified-name chains of the Java grammar, paired with the
+/// field that names each link's own segment.
+const JAVA_PATH_CHAIN: &[(&str, Option<&str>)] = &[
+    ("scoped_identifier", Some("name")),
+    ("scoped_type_identifier", None),
+];
 
 #[derive(Debug, Default)]
 pub(crate) struct JavaStructuralSpec;
@@ -360,8 +371,36 @@ impl StructuralSpec for JavaStructuralSpec {
         &DEEP_REFERENCE_EDGE_SUPPORT
     }
 
+    fn identity_route_support(&self) -> &IdentityRouteSupport {
+        // Java has no export, re-export, partial, or header/body construct;
+        // its indirections are imports and nested owners.
+        static SUPPORT: IdentityRouteSupport = DEEP_IDENTITY_AXES
+            .supported_relation(RouteHopKind::Import)
+            .supported_relation(RouteHopKind::NestedOwner);
+        &SUPPORT
+    }
+
     fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
         java_binding_activation(binder, scope)
+    }
+
+    fn qualified_path_root<'tree>(&self, token: Node<'tree>) -> Option<Node<'tree>> {
+        if !matches!(token.kind(), "identifier" | "type_identifier") {
+            return None;
+        }
+        qualified_chain_root(token, JAVA_PATH_CHAIN)
+    }
+
+    fn path_segment_tokens<'tree>(&self, root: Node<'tree>) -> Vec<Node<'tree>> {
+        linear_chain_tokens(root, JAVA_PATH_CHAIN, &[])
+    }
+
+    fn segment_generic_arity(&self, token: Node<'_>) -> Option<u32> {
+        spelled_generic_arity(token, JAVA_PATH_CHAIN, &["generic_type"])
+    }
+
+    fn indirection_relation(&self, token: Node<'_>) -> Option<RouteHopKind> {
+        nearest_ancestor(token, |kind| kind == "import_declaration").map(|_| RouteHopKind::Import)
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {

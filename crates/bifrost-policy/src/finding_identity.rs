@@ -38,6 +38,8 @@ pub enum MatchResultDomain {
     Binding,
     ResolutionCandidate,
     ReferenceEdge,
+    QualifiedPath,
+    PathSegment,
     File,
 }
 
@@ -54,6 +56,8 @@ impl MatchResultDomain {
             Self::Binding => "binding",
             Self::ResolutionCandidate => "resolution_candidate",
             Self::ReferenceEdge => "reference_edge",
+            Self::QualifiedPath => "qualified_path",
+            Self::PathSegment => "path_segment",
             Self::File => "file",
         }
     }

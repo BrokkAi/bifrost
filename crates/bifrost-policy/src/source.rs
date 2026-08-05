@@ -18,7 +18,7 @@ use brokk_bifrost_analysis::analyzer::structural::query::sexp::{
     code_query_from_expr, validate_policy_selector_expr,
 };
 use brokk_bifrost_analysis::analyzer::structural::{
-    MAX_CAPTURE_LENGTH, PrecedenceTier,
+    MAX_CAPTURE_LENGTH, PrecedenceTier, RouteHopKind,
     occurrences::{Namespace, OccurrenceClass, OccurrenceRole},
 };
 use brokk_bifrost_analysis::analyzer::structural::{OwnerRelation, SiteClass};
@@ -4250,6 +4250,9 @@ fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> 
             PolicyRecord::AssertBoundary,
             PolicyRecord::AssertEdgeParity,
             PolicyRecord::AssertEdgeClass,
+            PolicyRecord::AssertCanonical,
+            PolicyRecord::AssertRoute,
+            PolicyRecord::AssertRoundTrip,
         ],
         "assert record",
     )?;
@@ -4265,6 +4268,13 @@ fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> 
         }
         PolicyRecord::AssertEdgeClass => {
             Ok(PolicyAssert::EdgeClass(decode_edge_class_assert(expr)?))
+        }
+        PolicyRecord::AssertCanonical => {
+            Ok(PolicyAssert::Canonical(decode_canonical_assert(expr)?))
+        }
+        PolicyRecord::AssertRoute => Ok(PolicyAssert::Route(decode_route_assert(expr)?)),
+        PolicyRecord::AssertRoundTrip => {
+            Ok(PolicyAssert::RoundTrip(decode_round_trip_assert(expr)?))
         }
         other => unreachable!("select_record returned {other:?}"),
     }
@@ -4598,6 +4608,102 @@ fn decode_edge_class_assert(expr: &Expr) -> Result<EdgeClassAssert, PolicySource
         constraint,
         surface,
     })
+}
+
+fn decode_route_hop(expr: &Expr) -> Result<RouteHopKind, PolicySourceError> {
+    let token = expect_token(expr, "route hop kind")?;
+    expect_atom(expr, AtomDomain::RouteHop, "route hop kind")?;
+    Ok(RouteHopKind::from_label(token)
+        .expect("the RQLP route-hop atoms mirror the analyzer registry labels"))
+}
+
+fn decode_canonical_assert(expr: &Expr) -> Result<CanonicalAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertCanonical,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let role = decode_reference_role(fields.required("role"), "`assert-canonical`")?;
+    let equals_expr = fields.required("equals");
+    let equals = decode_assert_capture(equals_expr, "assert compared capture name")?;
+    let equals_role = decode_reference_role(fields.required("equals-role"), "`assert-canonical`")?;
+    let distinct = fields
+        .get("distinct")
+        .map(|value| decode_boolean(value, "assert distinct flag"))
+        .transpose()?
+        .unwrap_or(false);
+    // A selection trivially shares every identity with itself and never none,
+    // so comparing a capture against itself states a verdict, not a rule.
+    if equals == at {
+        return Err(source_error(
+            "contradictory-assert-identity",
+            equals_expr.range.clone(),
+            format!(
+                "`:equals` names the same capture as `:at` (`{at}`), whose identity comparison is fixed"
+            ),
+        ));
+    }
+    Ok(CanonicalAssert {
+        id,
+        at,
+        role,
+        equals,
+        equals_role,
+        distinct,
+    })
+}
+
+fn decode_route_assert(expr: &Expr) -> Result<RouteAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertRoute,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let role = decode_reference_role(fields.required("role"), "`assert-route`")?;
+    let to = decode_assert_capture(fields.required("to"), "assert target capture name")?;
+    let to_role = decode_reference_role(fields.required("to-role"), "`assert-route`")?;
+    let via = fields.get("via").map(decode_route_hop).transpose()?;
+    let forbid_expr = fields.get("forbid");
+    let forbid = forbid_expr.map(decode_route_hop).transpose()?;
+    // A hop kind both required and forbidden fixes the verdict before any row
+    // is read.
+    if let Some(required) = via
+        && Some(required) == forbid
+    {
+        return Err(source_error(
+            "contradictory-assert-route",
+            forbid_expr.expect("forbid was decoded").range.clone(),
+            format!(
+                "`:via` and `:forbid` both name `{}`, so the assert can never hold",
+                required.label()
+            ),
+        ));
+    }
+    Ok(RouteAssert {
+        id,
+        at,
+        role,
+        to,
+        to_role,
+        via,
+        forbid,
+    })
+}
+
+fn decode_round_trip_assert(expr: &Expr) -> Result<RoundTripAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertRoundTrip,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let role = decode_reference_role(fields.required("role"), "`assert-round-trip`")?;
+    Ok(RoundTripAssert { id, at, role })
 }
 
 fn decode_occurrence_assert(expr: &Expr) -> Result<OccurrenceAssert, PolicySourceError> {

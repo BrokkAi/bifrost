@@ -290,7 +290,7 @@ void test("highlights schema-v9 lexical environment forms and filter options", a
   }
 });
 
-void test("highlights schema-v10 reference-edge forms and filter options", async () => {
+void test("highlights schema-v11 reference-edge forms and filter options", async () => {
   const tokens = tokenizeGrammar(
     await grammar(),
     "(edge-target (edges-of :reference-kinds [method_call] :proof proven " +

@@ -33,6 +33,9 @@ Observability: after the final milestone, `cargo nextest run` shows edge queries
 
 ## Surprises & Discoveries
 
+- Observation (post-merge): sibling #1475 (identity routes) merged to master mid-review and claimed schema version 10 on its divergent branch, so the edge domain renumbered to 11 in the merge -- the exact double-claim scenario the #1473/#1474 merge recorded for version 2, now having happened twice in the epic. The renumber touched the lineage registry, the three step ops' `since`, the policy golds, the docs head phrases and their pins, and the MCP version enum; everything else merged as both-siblings-at-the-same-anchor conflicts across 41 files (the two slices extended the same ~16 integration sites, which is the concrete evidence behind the #1662 architectural-sweep issue). Validation after resolution: full featureless nextest 5920 passed, workspace clippy clean, VS Code 83 passed, Python model parse for both new row families.
+
+
 Findings from the pre-plan survey (2026-08-05). Update this section as implementation proceeds.
 
 - Observation: `UsageHit` equality and hashing deliberately exclude the fields this issue wants compared. `crates/bifrost-analysis/src/analyzer/usages/model.rs:11-13` documents that equality keys only `(file, start_offset, end_offset, enclosing)` so duplicate hits from different patterns collapse; `kind`, `proof`, `confidence` and `reference_kind` are excluded. Two hits that disagree on proof or kind therefore dedup to whichever arrived first inside the `BTreeSet<UsageHit>`. A field-for-field parity comparison cannot be built on this identity; the canonical edge row needs its own key that includes the compared fields, and the collapse itself is a place where classification disagreements hide today.

@@ -517,7 +517,9 @@ pub(super) fn selected_site_quality(
             // diagnostics, exactly as for an occurrence.
             | CodeQueryResultValue::LexicalScope { .. }
             | CodeQueryResultValue::Binding { .. }
-            | CodeQueryResultValue::ResolutionCandidate { .. } => {
+            | CodeQueryResultValue::ResolutionCandidate { .. }
+            | CodeQueryResultValue::QualifiedPath { .. }
+            | CodeQueryResultValue::PathSegment { .. } => {
                 (ProofStatus::Proven, EvidenceCompleteness::Complete)
             }
             CodeQueryResultValue::Procedure { .. }

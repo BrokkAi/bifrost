@@ -36,9 +36,13 @@ const RQL_OCCURRENCE_SCHEMA_VERSION: u32 = 8;
 /// Lexical scope, binding and resolution-candidate rows, their two seeds and
 /// seven steps, and the package clause on the file row (#1474).
 const RQL_RESOLUTION_SCHEMA_VERSION: u32 = 9;
+/// Qualified-path and path-segment rows, the `paths` seed, and the
+/// `segments-of`/`segment-target` steps (#1475).
+const RQL_IDENTITY_SCHEMA_VERSION: u32 = 10;
 /// Canonical reference-edge rows and the edges-of / edges-from / edge-target
-/// steps (#1479).
-const RQL_REFERENCE_EDGE_SCHEMA_VERSION: u32 = 10;
+/// steps (#1479). Version 11 because #1475 claimed 10 on a divergent branch,
+/// the same renumbering the #1473/#1474 merge recorded for version 2.
+const RQL_REFERENCE_EDGE_SCHEMA_VERSION: u32 = 11;
 const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
     SchemaVersionDescriptor::new(RQL_INITIAL_SCHEMA_VERSION, None, true),
     SchemaVersionDescriptor::new(
@@ -77,8 +81,13 @@ const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
         true,
     ),
     SchemaVersionDescriptor::new(
-        RQL_REFERENCE_EDGE_SCHEMA_VERSION,
+        RQL_IDENTITY_SCHEMA_VERSION,
         Some(RQL_RESOLUTION_SCHEMA_VERSION),
+        true,
+    ),
+    SchemaVersionDescriptor::new(
+        RQL_REFERENCE_EDGE_SCHEMA_VERSION,
+        Some(RQL_IDENTITY_SCHEMA_VERSION),
         true,
     ),
 ];
@@ -147,6 +156,7 @@ pub enum ValueShape {
     NamespaceList,
     ScopeFilter,
     BindingFilter,
+    PathFilter,
     BindingKindList,
     BindingNameList,
     HoistingClassList,
@@ -197,6 +207,7 @@ impl ValueShape {
             Self::NamespaceList => "one or more naming namespaces",
             Self::ScopeFilter => "a lexical scope kind filter object",
             Self::BindingFilter => "a binding kind/name/hoisting filter object",
+            Self::PathFilter => "a qualified path min-segments filter object",
             Self::BindingKindList => "one or more binding kinds",
             Self::BindingNameList => "one or more exact binding names",
             Self::HoistingClassList => "one or more hoisting classes",
@@ -426,6 +437,10 @@ macro_rules! query_step_ops {
             pub fn allows_reaching_binding_options(self) -> bool {
                 matches!(self, Self::ReachingBinding)
             }
+
+            pub fn allows_segment_options(self) -> bool {
+                matches!(self, Self::SegmentsOf)
+            }
         }
     };
 }
@@ -481,9 +496,11 @@ query_step_ops! {
     BindingOccurrence { label: "binding_occurrence", signature: "binding -> occurrence", description: "Return the binder-class occurrence row of each binding's declaring token.", since: 9, }
     CandidatesOf { label: "candidates_of", signature: "occurrence -> resolution_candidate", description: "Return the candidates the resolver considered for each reference-class occurrence, with tier, outcome, and boundary.", since: 9, }
     CandidateTarget { label: "candidate_target", signature: "resolution_candidate -> declaration", description: "Project the workspace declarations of unit-backed resolution candidates.", since: 9, }
-    EdgesOf { label: "edges_of", signature: "declaration -> reference_edge", description: "Return the canonical inverse reference edges of each declaration: every usage site the usage index enumerates, with kind, proof, usage kind, and owner relation.", since: 10, }
-    EdgesFrom { label: "edges_from", signature: "occurrence -> reference_edge", description: "Return the canonical forward reference edges of each occurrence: the resolver's own resolved targets for that exact token, with kind, proof, usage kind, and owner relation.", since: 10, }
-    EdgeTarget { label: "edge_target", signature: "reference_edge -> declaration", description: "Project each reference edge to its exact indexed target declaration.", since: 10, }
+    EdgesOf { label: "edges_of", signature: "declaration -> reference_edge", description: "Return the canonical inverse reference edges of each declaration: every usage site the usage index enumerates, with kind, proof, usage kind, and owner relation.", since: 11, }
+    EdgesFrom { label: "edges_from", signature: "occurrence -> reference_edge", description: "Return the canonical forward reference edges of each occurrence: the resolver's own resolved targets for that exact token, with kind, proof, usage kind, and owner relation.", since: 11, }
+    EdgeTarget { label: "edge_target", signature: "reference_edge -> declaration", description: "Project each reference edge to its exact indexed target declaration.", since: 11, }
+    SegmentsOf { label: "segments_of", signature: "qualified_path -> path_segment", description: "Return each path's ordered segment rows with decoded text, spelled generic arity, and (with :resolved true) each segment's own prefix resolution.", since: 10, }
+    SegmentTarget { label: "segment_target", signature: "path_segment -> declaration", description: "Project the workspace declarations each path segment's own position resolves to.", since: 10, }
 }
 
 macro_rules! rql_form_description {
@@ -644,6 +661,9 @@ macro_rules! rql_forms {
                     | Self::OccurrenceTarget
                     | Self::Scopes
                     | Self::Bindings
+                    | Self::Paths
+                    | Self::SegmentsOf
+                    | Self::SegmentTarget
                     | Self::ScopeOf
                     | Self::ScopeAncestors
                     | Self::BindingsIn
@@ -1041,6 +1061,30 @@ rql_forms! {
         description: "Seed lexical binding rows directly from workspace facts.",
         since: 9,
     }
+    Paths {
+        labels: ["paths", "path"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(paths [:min-segments N])",
+        description: "Seed qualified-path rows directly from workspace facts.",
+        since: 10,
+    }
+    SegmentsOf {
+        labels: ["segments-of", "segments_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(segments-of [:resolved true] query)",
+        description: (QueryStepOp::SegmentsOf),
+        step: SegmentsOf,
+    }
+    SegmentTarget {
+        labels: ["segment-target", "segment_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(segment-target query)",
+        description: (QueryStepOp::SegmentTarget),
+        step: SegmentTarget,
+    }
     ScopeOf {
         labels: ["scope-of", "scope_of"],
         class: Wrapper,
@@ -1345,6 +1389,7 @@ json_fields! {
     Occurrences { label: "occurrences", shape: OccurrenceFilter, signature: "\"occurrences\": { \"class\": [...], \"role\": [...], \"namespace\": [...] }", description: "Seed classified identifier occurrences directly from workspace facts." }
     Scopes { label: "scopes", shape: ScopeFilter, signature: "\"scopes\": { \"kind\": [...] }", description: "Seed lexical scope rows directly from workspace facts." }
     Bindings { label: "bindings", shape: BindingFilter, signature: "\"bindings\": { \"kind\": [...], \"name\": [...], \"hoisting\": [...] }", description: "Seed lexical binding rows directly from workspace facts." }
+    Paths { label: "paths", shape: PathFilter, signature: "\"paths\": { \"min_segments\": N }", description: "Seed qualified-path rows directly from workspace facts." }
 }
 
 json_fields! {
@@ -1373,6 +1418,7 @@ json_fields! {
     BindingNames { label: "name", shape: BindingNameList, signature: "\"name\": [\"rows\", ...]", description: "Restrict binding rows to one or more exact bound names." }
     BindingHoisting { label: "hoisting", shape: HoistingClassList, signature: "\"hoisting\": [\"scope_wide\", ...]", description: "Restrict binding rows to one or more hoisting classes." }
     IncludeShadowed { label: "include_shadowed", shape: TrueBoolean, signature: "\"include_shadowed\": true", description: "Also return the bindings the reaching binding shadows, instead of the winner alone." }
+    Resolved { label: "resolved", shape: TrueBoolean, signature: "\"resolved\": true", description: "Derive each path segment's own prefix resolution so rows carry a status, targets, and a resolution-decided namespace." }
     CandidateTiers { label: "tier", shape: PrecedenceTierList, signature: "\"tier\": [\"lexical_binding\", \"unattributed\", ...]", description: "Restrict candidate rows to one or more precedence tiers, or to rows whose seam named none." }
     CandidateOutcomes { label: "outcome", shape: CandidateOutcomeList, signature: "\"outcome\": [\"selected\", \"shadowed_by_nearer\", ...]", description: "Restrict candidate rows to one or more coarse outcomes or typed rejection reasons." }
     CandidateBoundaries { label: "boundary", shape: BoundaryStatusList, signature: "\"boundary\": [\"workspace_local\", ...]", description: "Restrict candidate rows to one or more resolution boundary statuses." }
@@ -1707,7 +1753,7 @@ mod tests {
         assert_eq!(
             resolve_rql_schema_version(None).unwrap(),
             SchemaVersionResolution {
-                version: 10,
+                version: 11,
                 origin: SchemaVersionOrigin::ImplicitCompatible,
             }
         );
@@ -1765,7 +1811,7 @@ mod tests {
 
         let error = resolve_rql_schema_version(Some(1)).unwrap_err();
         assert_eq!(error.requested, 1);
-        assert_eq!(error.supported, vec![2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(error.supported, vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     }
 
     #[test]

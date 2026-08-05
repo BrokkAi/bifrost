@@ -2707,6 +2707,8 @@ const fn match_result_domain(value: MatchResultDomain) -> &'static str {
         MatchResultDomain::Binding => "binding",
         MatchResultDomain::ResolutionCandidate => "resolution_candidate",
         MatchResultDomain::ReferenceEdge => "reference edge",
+        MatchResultDomain::QualifiedPath => "qualified_path",
+        MatchResultDomain::PathSegment => "path_segment",
     }
 }
 

@@ -2215,6 +2215,142 @@ CodeQueryResultItem = (
 )
 
 
+@dataclass(frozen=True)
+class CodeQueryQualifiedPath:
+    """One qualified-path chain: a linear sequence of segments (#1475).
+
+    ``ast_id`` is the terminal segment token's AST identity, the equijoin key
+    with captures and occurrence rows over the same token.
+    """
+
+    id: str
+    ast_id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    start_byte: int
+    end_byte: int
+    segment_count: int
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryQualifiedPath:
+        return cls(
+            id=data["id"],
+            ast_id=data["ast_id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            start_byte=data["start_byte"],
+            end_byte=data["end_byte"],
+            segment_count=data["segment_count"],
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[qualified_path; {self.segment_count} segments]"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryPathSegment:
+    """One segment of one qualified path (#1475).
+
+    ``ast_id`` is absent for a segment whose token is not a fact (Rust's
+    ``crate``/``self``/``super`` path keywords): its position in the path is
+    real, its structural identity is genuinely absent. ``namespace`` is absent
+    when neither the adapter's classification nor resolution states one --
+    never a guessed value. ``resolution_status`` is absent when resolution was
+    not derived, which is different from "nothing considered".
+    """
+
+    id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    start_byte: int
+    end_byte: int
+    path_ast_id: str
+    ordinal: int
+    text: str
+    ast_id: str | None = None
+    namespace: str | None = None
+    generic_arity: int | None = None
+    resolution_status: str | None = None
+    target_count: int | None = None
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryPathSegment:
+        return cls(
+            id=data["id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            start_byte=data["start_byte"],
+            end_byte=data["end_byte"],
+            path_ast_id=data["path_ast_id"],
+            ordinal=data["ordinal"],
+            text=data["text"],
+            ast_id=data.get("ast_id"),
+            namespace=data.get("namespace"),
+            generic_arity=data.get("generic_arity"),
+            resolution_status=data.get("resolution_status"),
+            target_count=data.get("target_count"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        header = (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[path_segment #{self.ordinal}] `{self.text}`"
+        )
+        details = []
+        if self.namespace is not None:
+            details.append(f"namespace {self.namespace}")
+        if self.generic_arity is not None:
+            details.append(f"{self.generic_arity} generic args")
+        if self.resolution_status is not None:
+            suffix = ""
+            if self.target_count:
+                suffix = f" ({self.target_count} target(s))"
+            details.append(f"resolves: {self.resolution_status}{suffix}")
+        if details:
+            return "\n".join([header, *(f"  {line}" for line in details)])
+        return header
+
+
+CodeQueryResultItem = (
+    CodeQueryMatch
+    | CodeQueryDeclaration
+    | CodeQueryProcedure
+    | CodeQueryProgramPoint
+    | CodeQueryControlEdge
+    | CodeQueryTypestateFinding
+    | CodeQueryTypestateWitness
+    | CodeQueryFlowEndpoint
+    | CodeQueryFlowWitness
+    | CodeQueryTaintFinding
+    | CodeQueryFile
+    | CodeQueryReferenceSite
+    | CodeQueryCallSite
+    | CodeQueryExpressionSite
+    | CodeQueryReceiverAnalysis
+    | CodeQueryOccurrence
+    | CodeQueryLexicalScope
+    | CodeQueryBinding
+    | CodeQueryResolutionCandidate
+    | CodeQueryQualifiedPath
+    | CodeQueryPathSegment
+)
+
+
 def _code_query_result_item(data: dict) -> CodeQueryResultItem:
     result_type = data.get("result_type")
     if result_type == "structural_match":
@@ -2257,6 +2393,10 @@ def _code_query_result_item(data: dict) -> CodeQueryResultItem:
         return CodeQueryResolutionCandidate.from_dict(data)
     if result_type == "reference_edge":
         return CodeQueryReferenceEdge.from_dict(data)
+    if result_type == "qualified_path":
+        return CodeQueryQualifiedPath.from_dict(data)
+    if result_type == "path_segment":
+        return CodeQueryPathSegment.from_dict(data)
     raise ValueError(f"unknown code query result_type: {result_type!r}")
 
 
@@ -2322,6 +2462,8 @@ class CodeQueryDiagnosticCode(StrEnum):
     RESOLUTION_TRACE_INCOMPLETE = "resolution_trace_incomplete"
     EDGE_AXIS_UNSUPPORTED = "edge_axis_unsupported"
     EDGE_DERIVATION_INCOMPLETE = "edge_derivation_incomplete"
+    IDENTITY_AXIS_UNSUPPORTED = "identity_axis_unsupported"
+    PATH_DERIVATION_INCOMPLETE = "path_derivation_incomplete"
     RESULT_LIMIT_REACHED = "result_limit_reached"
     BROAD_QUERY = "broad_query"
 

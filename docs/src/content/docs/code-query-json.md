@@ -220,9 +220,9 @@ Steps execute in array order and are validated before the workspace is searched:
 | `binding_occurrence` (v9) | binding | occurrence | The binder-class occurrence row of the binding's declaring token. |
 | `candidates_of` (v9) | occurrence | resolution candidate | Candidates the resolver considered; accepts `tier`, `outcome`, and `boundary`. |
 | `candidate_target` (v9) | resolution candidate | declaration | Workspace declarations of unit-backed candidates; partial by construction. |
-| `edges_of` (v10) | declaration | reference edge | The inverse projection: every usage site the usage index enumerates for the declaration; accepts `reference_kinds`, `proof`, `surface`, `usage`, `relation`, and `site_class`. |
-| `edges_from` (v10) | occurrence | reference edge | The forward projection: the resolver's own resolved targets for that exact token; accepts the same six filters. |
-| `edge_target` (v10) | reference edge | declaration | Exact indexed target declaration of each edge. |
+| `edges_of` (v11) | declaration | reference edge | The inverse projection: every usage site the usage index enumerates for the declaration; accepts `reference_kinds`, `proof`, `surface`, `usage`, `relation`, and `site_class`. |
+| `edges_from` (v11) | occurrence | reference edge | The forward projection: the resolver's own resolved targets for that exact token; accepts the same six filters. |
+| `edge_target` (v11) | reference edge | declaration | Exact indexed target declaration of each edge. |
 
 Repeat an import step for multiple hops. Traversal is cycle-safe and deterministic; it does not silently compute a transitive closure.
 
@@ -427,9 +427,9 @@ Seed with the roles you need rather than with a class. `{"class": ["reference"]}
 
 The **package clause** is fields on the file row rather than a fourth row kind, because it is exactly one row per file. `package_fq` and `package_syntactic` appear together; `package_syntactic` is `true` when the language spells the package in the source (Java's `package a.b;`) and `false` when it is derived from the file's path (Python, Rust, JavaScript). Both being absent means no package could be named at all, which is not the same as "the file is in the root package".
 
-### Canonical reference edges (schema v10)
+### Canonical reference edges (schema v11)
 
-Bifrost derives "X uses Y" twice: the resolver derives it forward, from one classified token to the declaration it resolved to, and the usage index derives it backward, from one declaration to the sites that point at it. Schema v10 states both in one row shape so the two answers can be compared instead of merely coexisting.
+Bifrost derives "X uses Y" twice: the resolver derives it forward, from one classified token to the declaration it resolved to, and the usage index derives it backward, from one declaration to the sites that point at it. Schema v11 states both in one row shape so the two answers can be compared instead of merely coexisting.
 
 `edges_of` is the inverse projection and `edges_from` the forward one:
 
@@ -520,6 +520,37 @@ These steps use normalized tree-sitter call shapes and the selected adapter's ex
   ]
 }
 ```
+
+### Qualified paths and their segments (schema v10)
+
+A **qualified path** is one linear chain of segments (`java.util.Map`, `crate::util::Widget`), anchored at its terminal segment token's AST identity. `paths` is a source of its own:
+
+<!-- code-query-test:json:path-seed -->
+```json
+{
+  "languages": ["rust"],
+  "paths": {"min_segments": 3}
+}
+```
+
+Each path row carries `id`, `ast_id` (the terminal segment's identity, the equijoin key with captures and occurrence rows over that token), `path`, `language`, `range`, `start_byte`, `end_byte`, and `segment_count`. A path always has at least two segments; one segment is a bare identifier, not a path.
+
+`segments_of` returns each path's ordered **segment** rows; with `"resolved": true`, one resolver batch per file also answers every segment's own position:
+
+<!-- code-query-test:json:segments-of -->
+```json
+{
+  "languages": ["rust"],
+  "paths": {},
+  "steps": [
+    {"op": "segments_of", "resolved": true}
+  ]
+}
+```
+
+Each segment row carries `path_ast_id` (the group key back to its path), `ordinal`, decoded `text` (a quoted or raw identifier stays one segment and is never re-split), an optional `namespace`, an optional `generic_arity` (the argument count the source spells at that segment: `Map<String, Integer>` spells 2 at `Map`), and -- when resolution was derived -- `resolution_status` (`resolved`, `ambiguous`, `unresolved`, `incomplete`) with `target_count`. `ast_id` is absent for a segment whose token is not a fact (Rust's `crate`/`self`/`super` path keywords): its position in the path is real, its structural identity is genuinely absent. `namespace` is stated only by the adapter's own classification or by what the segment's resolution decides -- a mixed target set decides nothing -- and is otherwise absent, never guessed.
+
+`segment_target` projects each segment's own resolution onto workspace declarations, so "what is `util` in `crate::util::Widget`" is answerable at the segment rather than only at the terminal. A language whose adapter does not answer the path axes reports `identity_axis_unsupported` rather than returning an empty complete answer.
 
 ## Containment And Descendants
 
