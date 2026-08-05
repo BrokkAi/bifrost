@@ -7,6 +7,9 @@ use crate::analyzer::python::bindings::{
     PythonLexicalNameResolution, PythonLexicalScopeInventory,
     python_unambiguous_module_class_binding_bounded,
 };
+use crate::analyzer::python::{
+    python_deferred_annotation_identifier_ranges, python_node_is_in_annotation,
+};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use std::sync::Mutex;
 #[cfg(test)]
@@ -120,6 +123,12 @@ pub(crate) fn resolve_python_bounded(
             ),
         ));
     };
+    if python_is_non_reference_context(node) || python_is_declaration_identifier(node) {
+        return session.finish(no_definition(
+            "declaration_or_import_site",
+            format!("`{}` is not a Python reference site", site.text),
+        ));
+    }
     let outcome = match python_reference_node_bounded(&support, node) {
         Some(PythonReferenceNode::Attribute { object, attribute }) => {
             let member = python_slice(attribute, source);
@@ -156,7 +165,18 @@ pub(crate) fn resolve_python_bounded(
             }
         }
         Some(PythonReferenceNode::Identifier(identifier)) => {
-            let name = python_slice(identifier, source);
+            let Some(name) = python_focused_reference_text(
+                identifier,
+                source,
+                site.focus_start_byte,
+                site.focus_end_byte,
+                cancellation,
+            ) else {
+                return session.finish(no_definition(
+                    "python_reference_shape_unsupported",
+                    format!("`{}` is not a parsed Python reference", site.text),
+                ));
+            };
             let candidates = support.file_identifier(file, name);
             if candidates.is_empty() {
                 no_definition(
@@ -306,8 +326,28 @@ fn python_reference_node_bounded<'tree>(
             Some(PythonReferenceNode::Attribute { object, attribute })
         }
         "identifier" => Some(PythonReferenceNode::Identifier(node)),
+        "string_content" if python_node_is_in_annotation(node) => {
+            Some(PythonReferenceNode::Identifier(node))
+        }
         _ => None,
     }
+}
+
+fn python_focused_reference_text<'source>(
+    node: Node<'_>,
+    source: &'source str,
+    focus_start: usize,
+    focus_end: usize,
+    cancellation: Option<&CancellationToken>,
+) -> Option<&'source str> {
+    if node.kind() != "string_content" {
+        return Some(python_slice(node, source));
+    }
+    let string = node.parent()?;
+    python_deferred_annotation_identifier_ranges(string, source, cancellation)?
+        .into_iter()
+        .any(|range| range.start_byte == focus_start && range.end_byte == focus_end)
+        .then(|| source.get(focus_start..focus_end))?
 }
 
 fn node_range(node: Node<'_>) -> Range {
@@ -1251,7 +1291,18 @@ pub(super) fn resolve_python(
             )
         }
         Some(PythonReferenceNode::Identifier(identifier)) => {
-            let text = python_slice(identifier, source);
+            let Some(text) = python_focused_reference_text(
+                identifier,
+                source,
+                site.focus_start_byte,
+                site.focus_end_byte,
+                None,
+            ) else {
+                return no_definition(
+                    "python_reference_shape_unsupported",
+                    format!("`{}` is not a parsed Python reference", site.text),
+                );
+            };
             if text.is_empty() {
                 return no_definition("no_reference_text", "Python identifier is blank");
             }
@@ -1831,6 +1882,9 @@ fn python_reference_node(node: Node<'_>) -> Option<PythonReferenceNode<'_>> {
             Some(PythonReferenceNode::Attribute { object, attribute })
         }
         "identifier" => Some(PythonReferenceNode::Identifier(node)),
+        "string_content" if python_node_is_in_annotation(node) => {
+            Some(PythonReferenceNode::Identifier(node))
+        }
         _ => None,
     }
 }
@@ -2341,8 +2395,13 @@ fn python_collect_bound_targets(node: Node<'_>, source: &str, out: &mut HashSet<
 }
 
 fn python_is_non_reference_context(node: Node<'_>) -> bool {
+    let deferred_annotation = node.kind() == "string_content" && python_node_is_in_annotation(node);
     let mut parent = Some(node);
     while let Some(current) = parent {
+        if deferred_annotation && matches!(current.kind(), "string" | "string_content") {
+            parent = current.parent();
+            continue;
+        }
         if matches!(
             current.kind(),
             "import_statement"
@@ -2447,6 +2506,41 @@ mod bounded_tests {
         );
 
         assert!(matches!(outcome, BoundedResolution::Cancelled { .. }));
+    }
+
+    #[test]
+    fn bounded_python_ordinary_string_is_not_a_reference() {
+        let source = "class Widget:\n    pass\n\nname = \"Widget\"\n";
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Python, &[("ordinary.py", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "ordinary.py");
+        let tree = parse_python_tree(source).expect("Python tree");
+        let start_byte = source.rfind("Widget").expect("ordinary string content");
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: "Widget".to_string(),
+            range: Range {
+                start_byte,
+                end_byte: start_byte + "Widget".len(),
+                start_line: 4,
+                end_line: 4,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: start_byte + "Widget".len(),
+        };
+        let outcome = resolve_python_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("ordinary string lookup did not complete: {outcome:#?}");
+        };
+        assert!(value.definitions.is_empty(), "{value:#?}");
     }
 
     #[test]
