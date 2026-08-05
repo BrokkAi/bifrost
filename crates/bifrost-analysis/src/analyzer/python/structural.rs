@@ -422,9 +422,76 @@ impl StructuralSpec for PythonStructuralSpec {
 mod structural_spec_tests {
     use super::*;
 
+    use crate::analyzer::common::parse_source_region;
     use crate::analyzer::structural::adapter_helpers::{
         assert_occurrence_role, block_facts_of, occurrence_roles_of,
     };
+
+    #[test]
+    fn deferred_annotation_region_parse_preserves_source_positions() {
+        let source = "def render(widget: \"Widget | list[Gadget]\") -> None:\n    pass\n";
+        let language = tree_sitter_python::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).expect("Python grammar");
+        let tree = parser.parse(source, None).expect("Python source parses");
+
+        let mut content = None;
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "string_content" {
+                content = Some(node);
+                break;
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+        let content = content.expect("deferred annotation content");
+        let inner =
+            parse_source_region(&language, source, content.start_byte(), content.end_byte())
+                .expect("annotation region parses");
+        assert!(!inner.root_node().has_error());
+
+        let mut identifiers = Vec::new();
+        let mut stack = vec![inner.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier" {
+                identifiers.push((
+                    &source[node.start_byte()..node.end_byte()],
+                    node.start_byte(),
+                    node.end_byte(),
+                ));
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+
+        assert_eq!(
+            identifiers,
+            vec![
+                (
+                    "Widget",
+                    source.find("Widget").expect("Widget offset"),
+                    source.find("Widget").expect("Widget offset") + "Widget".len(),
+                ),
+                (
+                    "list",
+                    source.find("list").expect("list offset"),
+                    source.find("list").expect("list offset") + "list".len(),
+                ),
+                (
+                    "Gadget",
+                    source.find("Gadget").expect("Gadget offset"),
+                    source.find("Gadget").expect("Gadget offset") + "Gadget".len(),
+                ),
+            ]
+        );
+    }
 
     /// Python scopes with the indented suite its grammar calls `block`. The
     /// module node is deliberately not a block: a file scope is not a
