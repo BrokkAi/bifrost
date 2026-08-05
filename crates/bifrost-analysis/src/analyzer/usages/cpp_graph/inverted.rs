@@ -50,7 +50,7 @@ use crate::analyzer::cpp::{
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
     classify_reference_node, first_precise, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -73,34 +73,36 @@ where
 {
     let language = tree_sitter_cpp::LANGUAGE.into();
     build_edge_output(files, keep_file, |file| {
-        parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
+        parse_and_collect(analyzer, file, nodes, &language, |input| {
             let ordinary_type_imports = initialized_ordinary_type_imports(
-                parsed.tree.root_node(),
+                input.root(),
                 analyzer,
                 visibility,
                 file,
-                parsed.source.as_str(),
+                input.source,
             );
             let recovered_sentinel_classes =
-                cpp_sentinel_recovered_classes(parsed.tree.root_node(), parsed.source.as_str());
+                cpp_sentinel_recovered_classes(input.root(), input.source);
             let mut ctx = CppScan {
                 analyzer,
                 visibility,
                 file,
-                source: parsed.source.as_str(),
+                source: input.source,
                 ordinary_type_imports,
                 recovered_sentinel_classes,
                 class_ranges: ClassRangeIndex::build(analyzer, file),
                 declaring_member_cache: HashMap::default(),
-                collector,
+                input,
+                edges: PerFileEdges::default(),
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
+            walk(input.root(), &mut ctx, &mut bindings);
+            ctx.edges
         })
     })
 }
 
-struct CppScan<'a, 'b> {
+struct CppScan<'a> {
     analyzer: &'a dyn IAnalyzer,
     visibility: &'a VisibilityIndex<'a>,
     file: &'a ProjectFile,
@@ -109,10 +111,11 @@ struct CppScan<'a, 'b> {
     recovered_sentinel_classes: Vec<CppSentinelRecoveredClass>,
     class_ranges: ClassRangeIndex,
     declaring_member_cache: HashMap<CodeUnit, HashMap<String, EnclosingMemberOwnerResolution>>,
-    collector: &'a mut EdgeCollector<'b>,
+    input: &'a FileEdgeScanInput<'a>,
+    edges: PerFileEdges,
 }
 
-impl CppScan<'_, '_> {
+impl CppScan<'_> {
     /// Resolve a type reference's text to a class `CodeUnit`.
     fn resolve_type(&self, text: &str) -> Option<CodeUnit> {
         self.visibility.resolve_type(self.file, text)
@@ -142,7 +145,8 @@ impl CppScan<'_, '_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.collector.record_kind(
+        self.edges.record_kind(
+            self.input,
             callee,
             classify_reference_node(node),
             node.start_byte(),
@@ -151,8 +155,8 @@ impl CppScan<'_, '_> {
     }
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
-        self.collector
-            .record_unproven_name(name, node.start_byte(), node.end_byte());
+        self.edges
+            .record_unproven_name(self.input, name, node.start_byte(), node.end_byte());
     }
 }
 
@@ -167,7 +171,7 @@ const SCOPE_NODES: &[&str] = &[
     "if_statement",
 ];
 
-fn walk(node: Node<'_>, ctx: &mut CppScan<'_, '_>, bindings: &mut LocalInferenceEngine<CodeUnit>) {
+fn walk(node: Node<'_>, ctx: &mut CppScan<'_>, bindings: &mut LocalInferenceEngine<CodeUnit>) {
     let mut state = (ctx, bindings);
     walk_tree_iterative(
         node,
@@ -185,7 +189,7 @@ fn walk(node: Node<'_>, ctx: &mut CppScan<'_, '_>, bindings: &mut LocalInference
 
 fn walk_enter(
     node: Node<'_>,
-    ctx: &mut CppScan<'_, '_>,
+    ctx: &mut CppScan<'_>,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) -> bool {
     let enters_scope = SCOPE_NODES.contains(&node.kind());
@@ -199,7 +203,7 @@ fn walk_enter(
 
 fn record_reference(
     node: Node<'_>,
-    ctx: &mut CppScan<'_, '_>,
+    ctx: &mut CppScan<'_>,
     bindings: &LocalInferenceEngine<CodeUnit>,
 ) {
     if let Some(return_type) = recovered_macro_return_type_node(node, ctx.source) {
@@ -356,7 +360,7 @@ fn record_reference(
     }
 }
 
-fn record_recovered_macro_return_type_reference(return_type: Node<'_>, ctx: &mut CppScan<'_, '_>) {
+fn record_recovered_macro_return_type_reference(return_type: Node<'_>, ctx: &mut CppScan<'_>) {
     let name = node_text(return_type, ctx.source);
     let Some(scope) = recovered_or_indexed_lexical_scope(return_type, ctx) else {
         ctx.record_unproven(name, return_type);
@@ -429,7 +433,7 @@ fn is_template_argument_type_leaf(node: Node<'_>) -> bool {
 
 fn record_type_reference(
     node: Node<'_>,
-    ctx: &mut CppScan<'_, '_>,
+    ctx: &mut CppScan<'_>,
     bindings: &LocalInferenceEngine<CodeUnit>,
 ) {
     let ordinary_resolution = resolve_type_node_lexically(
@@ -458,7 +462,7 @@ fn record_type_reference(
 
 fn recovered_sentinel_type_resolution(
     node: Node<'_>,
-    ctx: &CppScan<'_, '_>,
+    ctx: &CppScan<'_>,
 ) -> Option<LexicalTypeResolution> {
     let scope = recovered_or_indexed_lexical_scope(node, ctx)?;
     let components = cpp_type_name_components(node, ctx.source)?;
@@ -477,10 +481,7 @@ fn recovered_sentinel_type_resolution(
 /// sentinel recovery is the most precise signal; otherwise use the shared
 /// lexical-scope reconstruction, which falls back to the indexed enclosing
 /// code-unit scope for displaced definitions.
-fn recovered_or_indexed_lexical_scope(
-    node: Node<'_>,
-    ctx: &CppScan<'_, '_>,
-) -> Option<Vec<String>> {
+fn recovered_or_indexed_lexical_scope(node: Node<'_>, ctx: &CppScan<'_>) -> Option<Vec<String>> {
     ctx.recovered_sentinel_scope(node).or_else(|| {
         match enclosing_lexical_scope_components(
             node,
@@ -504,7 +505,7 @@ fn recovered_or_indexed_lexical_scope(
 fn record_recovered_macro_decorated_type_reference(
     scope_node: Node<'_>,
     type_node: Node<'_>,
-    ctx: &mut CppScan<'_, '_>,
+    ctx: &mut CppScan<'_>,
     bindings: &LocalInferenceEngine<CodeUnit>,
 ) {
     let mut resolved = Vec::new();
@@ -544,7 +545,7 @@ fn record_recovered_macro_decorated_type_reference(
 /// proven primary edge.
 fn resolve_inverted_type_node(
     node: Node<'_>,
-    ctx: &CppScan<'_, '_>,
+    ctx: &CppScan<'_>,
     resolution: LexicalTypeResolution,
 ) -> LexicalTypeResolution {
     let Some(arguments) = cpp_template_reference_arguments(node, ctx.source) else {
@@ -590,7 +591,7 @@ fn record_qualified_callable_value(
     global: bool,
     owner_components: &[Node<'_>],
     member_node: Node<'_>,
-    ctx: &mut CppScan<'_, '_>,
+    ctx: &mut CppScan<'_>,
 ) {
     let member_name = node_text(member_node, ctx.source);
     if member_name.is_empty() {
@@ -671,11 +672,7 @@ fn record_qualified_callable_value(
     }
 }
 
-fn record_call(
-    node: Node<'_>,
-    ctx: &mut CppScan<'_, '_>,
-    bindings: &LocalInferenceEngine<CodeUnit>,
-) {
+fn record_call(node: Node<'_>, ctx: &mut CppScan<'_>, bindings: &LocalInferenceEngine<CodeUnit>) {
     let Some(function) = node.child_by_field_name("function") else {
         return;
     };
@@ -847,7 +844,7 @@ fn record_call(
 }
 
 fn resolve_declaring_member_owner_cached(
-    ctx: &mut CppScan<'_, '_>,
+    ctx: &mut CppScan<'_>,
     receiver_owner: &CodeUnit,
     name: &str,
 ) -> EnclosingMemberOwnerResolution {
@@ -873,7 +870,7 @@ fn resolve_declaring_member_owner_cached(
     resolution
 }
 
-fn enclosing_callable_owner(node: Node<'_>, ctx: &CppScan<'_, '_>) -> Option<CodeUnit> {
+fn enclosing_callable_owner(node: Node<'_>, ctx: &CppScan<'_>) -> Option<CodeUnit> {
     let mut current = node.parent();
     while let Some(parent) = current {
         if parent.kind() == "function_definition" {
@@ -912,7 +909,7 @@ fn receiver_is_self_like(receiver: Node<'_>) -> bool {
 }
 
 /// If `node` is the `function` of a namespace-qualified free-function call, its target.
-fn scoped_free_function(node: Node<'_>, ctx: &CppScan<'_, '_>) -> Option<CodeUnit> {
+fn scoped_free_function(node: Node<'_>, ctx: &CppScan<'_>) -> Option<CodeUnit> {
     if node.kind() != "qualified_identifier" {
         return None;
     }
@@ -928,7 +925,7 @@ fn scoped_free_function(node: Node<'_>, ctx: &CppScan<'_, '_>) -> Option<CodeUni
 }
 
 /// If `node` is the `function` of a `X::m(..)` call, the fqn of `X`'s type.
-fn scoped_call_owner(node: Node<'_>, ctx: &CppScan<'_, '_>) -> Option<String> {
+fn scoped_call_owner(node: Node<'_>, ctx: &CppScan<'_>) -> Option<String> {
     if node.kind() != "qualified_identifier" {
         return None;
     }
@@ -959,7 +956,7 @@ fn scoped_call_member(node: Node<'_>, source: &str) -> String {
 
 fn receiver_type_unit(
     receiver: Node<'_>,
-    ctx: &CppScan<'_, '_>,
+    ctx: &CppScan<'_>,
     bindings: &LocalInferenceEngine<CodeUnit>,
     remaining_call_depth: usize,
 ) -> Option<CodeUnit> {
@@ -1009,7 +1006,7 @@ fn receiver_type_unit(
 
 fn seed_declaration(
     node: Node<'_>,
-    ctx: &mut CppScan<'_, '_>,
+    ctx: &mut CppScan<'_>,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
     if recovered_macro_return_type_node(node, ctx.source).is_some()
@@ -1031,7 +1028,7 @@ fn seed_declaration(
 
 fn seed_typed_binding(
     node: Node<'_>,
-    ctx: &CppScan<'_, '_>,
+    ctx: &CppScan<'_>,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
     if !parameter_belongs_to_callable_scope(node) {
@@ -1051,7 +1048,7 @@ fn seed_typed_binding(
 
 fn seed_range_binding(
     node: Node<'_>,
-    ctx: &CppScan<'_, '_>,
+    ctx: &CppScan<'_>,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
     let Some(declarator) = node.child_by_field_name("declarator") else {
@@ -1068,7 +1065,7 @@ fn seed_range_binding(
 
 fn seed_variable_declaration(
     node: Node<'_>,
-    ctx: &CppScan<'_, '_>,
+    ctx: &CppScan<'_>,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
     let type_node = node
@@ -1128,7 +1125,7 @@ fn seed_binding(
     name: &str,
     type_node: Option<Node<'_>>,
     value: Option<Node<'_>>,
-    ctx: &CppScan<'_, '_>,
+    ctx: &CppScan<'_>,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
     if name.is_empty() {
@@ -1155,10 +1152,7 @@ fn seed_binding(
     }
 }
 
-fn resolve_type_node_with_recovered_scope(
-    node: Node<'_>,
-    ctx: &CppScan<'_, '_>,
-) -> Option<CodeUnit> {
+fn resolve_type_node_with_recovered_scope(node: Node<'_>, ctx: &CppScan<'_>) -> Option<CodeUnit> {
     let scope = recovered_or_indexed_lexical_scope(node, ctx)?;
     let components = cpp_type_name_components(node, ctx.source)?;
     let global = is_globally_qualified_cpp_name(node);
@@ -1175,7 +1169,7 @@ fn resolve_type_node_with_recovered_scope(
 }
 
 /// Infer a class type from an initializer expression for `auto`/untyped locals.
-fn infer_type_from_value(node: Node<'_>, ctx: &CppScan<'_, '_>) -> Option<CodeUnit> {
+fn infer_type_from_value(node: Node<'_>, ctx: &CppScan<'_>) -> Option<CodeUnit> {
     infer_cpp_initializer_type(ctx.analyzer, ctx.visibility, ctx.file, ctx.source, node)
 }
 

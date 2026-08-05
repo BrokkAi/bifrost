@@ -7,9 +7,9 @@
 //! without depending on `brokk-bifrost-analysis`.
 //!
 //! The drivers that do need an analyzer handle (the finder, the candidate
-//! providers, the per-language graph strategies, the inverted-edge collector)
-//! stay in `brokk-bifrost-analysis`, which re-exports every module here at its
-//! historical path.
+//! providers, the per-language graph strategies, the inverted-edge build's
+//! file fan-out and declaration indexing) stay in `brokk-bifrost-analysis`,
+//! which re-exports every module here at its historical path.
 
 pub mod common;
 pub mod graph_core;

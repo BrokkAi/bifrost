@@ -27,8 +27,8 @@ use super::resolver::{
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::PythonAnalyzer;
 use crate::analyzer::usages::inverted_edges::{
-    EdgeCollector, UsageEdgeBuildOutput, build_edge_output, classify_reference_node,
-    parse_and_collect,
+    FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
+    classify_reference_node, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::LocalBindingsSnapshot;
 use crate::analyzer::usages::model::ImportKind;
@@ -76,8 +76,8 @@ where
         // Resolution reaches no other file's tree: the import binder, same-file
         // declarations, and the receiver-type facts are all derived from this file
         // plus the analyzer's own (tree-free) caches.
-        parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
-            let source = parsed.source.as_str();
+        parse_and_collect(analyzer, file, nodes, &language, |input| {
+            let source = input.source;
 
             // Per-file resolution context from the import binder. A namespace
             // binding's module_specifier is either the full fqn (for
@@ -143,13 +143,7 @@ where
             // computed by the same routine the forward scan uses, so a typed
             // `recv.method` resolves to the receiver's class fqn.
             let scope_facts = py.usage_scope_facts(file, || {
-                collect_scope_facts_from_parsed_source(
-                    analyzer,
-                    py,
-                    file,
-                    source,
-                    parsed.tree.root_node(),
-                )
+                collect_scope_facts_from_parsed_source(analyzer, py, file, source, input.root())
             });
 
             let mut ctx = PyScan {
@@ -164,9 +158,11 @@ where
                 same_file,
                 scope_facts: scope_facts.as_ref(),
                 canonical_namespace_candidates: &canonical_namespace_candidates,
-                collector,
+                input,
+                edges: PerFileEdges::default(),
             };
-            scan_tree(parsed.tree.root_node(), &mut ctx);
+            scan_tree(input.root(), &mut ctx);
+            ctx.edges
         })
     })
 }
@@ -188,7 +184,7 @@ fn canonical_import_module_fqn(
         .map(|module| module.fq_name())
 }
 
-struct PyScan<'a, 'b> {
+struct PyScan<'a> {
     analyzer: &'a dyn IAnalyzer,
     py: &'a PythonAnalyzer,
     targets: &'a HashSet<String>,
@@ -200,7 +196,8 @@ struct PyScan<'a, 'b> {
     same_file: HashMap<String, String>,
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     canonical_namespace_candidates: &'a Mutex<HashMap<String, Arc<Vec<String>>>>,
-    collector: &'a mut EdgeCollector<'b>,
+    input: &'a FileEdgeScanInput<'a>,
+    edges: PerFileEdges,
 }
 
 struct NamespaceBinding {
@@ -209,7 +206,7 @@ struct NamespaceBinding {
     consumed_attributes: usize,
 }
 
-impl PyScan<'_, '_> {
+impl PyScan<'_> {
     /// The callee fqn a bare name refers to: a named import, a namespace import of
     /// a symbol (module_specifier is the full fqn), or a same-file declaration.
     fn bare_callee(&self, text: &str) -> Option<String> {
@@ -250,7 +247,8 @@ impl PyScan<'_, '_> {
         if !self.targets.contains(&callee) {
             return;
         }
-        self.collector.record_kind(
+        self.edges.record_kind(
+            self.input,
             callee,
             classify_reference_node(node),
             node.start_byte(),
@@ -263,8 +261,12 @@ impl PyScan<'_, '_> {
             return;
         };
         for target in targets {
-            self.collector
-                .record_unproven(target.clone(), node.start_byte(), node.end_byte());
+            self.edges.record_unproven(
+                self.input,
+                target.clone(),
+                node.start_byte(),
+                node.end_byte(),
+            );
         }
     }
 
@@ -295,7 +297,7 @@ impl PyScan<'_, '_> {
     }
 }
 
-fn scan_tree(root: Node<'_>, ctx: &mut PyScan<'_, '_>) {
+fn scan_tree(root: Node<'_>, ctx: &mut PyScan<'_>) {
     // A stack of in-scope local names, one frame per enclosing function. A name
     // bound in any frame shadows a same-named import/declaration.
     let mut scopes: Vec<FunctionScope> = Vec::new();
@@ -304,7 +306,7 @@ fn scan_tree(root: Node<'_>, ctx: &mut PyScan<'_, '_>) {
 
 fn walk(
     node: Node<'_>,
-    ctx: &mut PyScan<'_, '_>,
+    ctx: &mut PyScan<'_>,
     scopes: &mut Vec<FunctionScope>,
     facts: Option<usize>,
 ) {
@@ -462,7 +464,7 @@ fn is_receiver_parameter(scopes: &[FunctionScope], name: &str) -> bool {
         .any(|scope| scope.parameters.contains(name))
 }
 
-fn handle_identifier(node: Node<'_>, ctx: &mut PyScan<'_, '_>, scopes: &[FunctionScope]) {
+fn handle_identifier(node: Node<'_>, ctx: &mut PyScan<'_>, scopes: &[FunctionScope]) {
     // The object of an `attribute` is handled by handle_attribute.
     if node
         .parent()
@@ -482,7 +484,7 @@ fn handle_identifier(node: Node<'_>, ctx: &mut PyScan<'_, '_>, scopes: &[Functio
     }
 }
 
-fn handle_annotation_reference(node: Node<'_>, ctx: &mut PyScan<'_, '_>) -> bool {
+fn handle_annotation_reference(node: Node<'_>, ctx: &mut PyScan<'_>) -> bool {
     let Some(candidates) =
         annotation_reference_candidates(ctx.analyzer, ctx.py, ctx.file, ctx.source, node, false)
     else {
@@ -503,7 +505,7 @@ fn handle_annotation_reference(node: Node<'_>, ctx: &mut PyScan<'_, '_>) -> bool
 
 fn handle_attribute(
     node: Node<'_>,
-    ctx: &mut PyScan<'_, '_>,
+    ctx: &mut PyScan<'_>,
     scopes: &[FunctionScope],
     facts: Option<&LocalBindingsSnapshot<String>>,
 ) {
@@ -604,7 +606,7 @@ fn handle_attribute(
     }
 }
 
-fn handle_keyword_argument(node: Node<'_>, ctx: &mut PyScan<'_, '_>, scopes: &[FunctionScope]) {
+fn handle_keyword_argument(node: Node<'_>, ctx: &mut PyScan<'_>, scopes: &[FunctionScope]) {
     let (Some(name), Some(arguments)) = (node.child_by_field_name("name"), node.parent()) else {
         return;
     };
@@ -648,7 +650,7 @@ fn handle_keyword_argument(node: Node<'_>, ctx: &mut PyScan<'_, '_>, scopes: &[F
     }
 }
 
-fn lexical_class(ctx: &PyScan<'_, '_>, node: Node<'_>) -> Option<CodeUnit> {
+fn lexical_class(ctx: &PyScan<'_>, node: Node<'_>) -> Option<CodeUnit> {
     let range = crate::analyzer::Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),

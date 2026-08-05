@@ -37,7 +37,7 @@ use super::syntax::{
 };
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
     classify_reference_node, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -64,32 +64,35 @@ where
 {
     let language = tree_sitter_php::LANGUAGE_PHP.into();
     build_edge_output(files, keep_file, |file| {
-        parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
-            let ctx = php.file_context_from_source(file, parsed.source.as_str());
+        parse_and_collect(analyzer, file, nodes, &language, |input| {
+            let ctx = php.file_context_from_source(file, input.source);
             let mut scan = PhpScan {
                 analyzer,
                 php,
                 ctx,
-                source: parsed.source.as_str(),
+                source: input.source,
                 class_ranges: ClassRangeIndex::build(analyzer, file),
-                collector,
+                input,
+                edges: PerFileEdges::default(),
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            walk(parsed.tree.root_node(), &mut scan, &mut bindings);
+            walk(input.root(), &mut scan, &mut bindings);
+            scan.edges
         })
     })
 }
 
-struct PhpScan<'a, 'b> {
+struct PhpScan<'a> {
     analyzer: &'a dyn IAnalyzer,
     php: &'a PhpAnalyzer,
     ctx: PhpFileContext,
     source: &'a str,
     class_ranges: ClassRangeIndex,
-    collector: &'a mut EdgeCollector<'b>,
+    input: &'a FileEdgeScanInput<'a>,
+    edges: PerFileEdges,
 }
 
-impl PhpScan<'_, '_> {
+impl PhpScan<'_> {
     fn resolve_type_fqn(&self, text: &str) -> Option<String> {
         resolve_php_type(text, &self.ctx)
     }
@@ -110,7 +113,8 @@ impl PhpScan<'_, '_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.collector.record_kind(
+        self.edges.record_kind(
+            self.input,
             callee,
             classify_reference_node(node),
             node.start_byte(),
@@ -119,7 +123,7 @@ impl PhpScan<'_, '_> {
     }
 }
 
-fn walk(node: Node<'_>, scan: &mut PhpScan<'_, '_>, bindings: &mut LocalInferenceEngine<String>) {
+fn walk(node: Node<'_>, scan: &mut PhpScan<'_>, bindings: &mut LocalInferenceEngine<String>) {
     let enters_scope = is_local_scope(node);
     if enters_scope {
         bindings.enter_scope();
@@ -144,7 +148,7 @@ fn walk(node: Node<'_>, scan: &mut PhpScan<'_, '_>, bindings: &mut LocalInferenc
 
 fn record_reference(
     node: Node<'_>,
-    scan: &mut PhpScan<'_, '_>,
+    scan: &mut PhpScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) {
     match node.kind() {
@@ -197,7 +201,8 @@ fn record_reference(
                     scan,
                     is_same_owner,
                     |scan| {
-                        scan.collector.record_unproven_name(
+                        scan.edges.record_unproven_name(
+                            scan.input,
                             method,
                             name_node.start_byte(),
                             name_node.end_byte(),
@@ -225,7 +230,8 @@ fn record_reference(
                     scan,
                     is_same_owner,
                     |scan| {
-                        scan.collector.record_unproven_name(
+                        scan.edges.record_unproven_name(
+                            scan.input,
                             property,
                             name_node.start_byte(),
                             name_node.end_byte(),
@@ -265,7 +271,8 @@ fn record_reference(
                 scan,
                 is_same_owner,
                 |scan| {
-                    scan.collector.record_unproven_name(
+                    scan.edges.record_unproven_name(
+                        scan.input,
                         method,
                         name_node.start_byte(),
                         name_node.end_byte(),
@@ -279,7 +286,8 @@ fn record_reference(
                             scan.record(callable.fq_name(), name_node);
                         }
                     } else {
-                        scan.collector.record_unproven_name(
+                        scan.edges.record_unproven_name(
+                            scan.input,
                             method,
                             name_node.start_byte(),
                             name_node.end_byte(),
@@ -307,7 +315,8 @@ fn record_reference(
                 scan,
                 is_same_owner,
                 |scan| {
-                    scan.collector.record_unproven_name(
+                    scan.edges.record_unproven_name(
+                        scan.input,
                         member,
                         name_node.start_byte(),
                         name_node.end_byte(),
@@ -342,7 +351,7 @@ fn record_reference(
 
 /// The fqn of the class named by a static call's scope expression: an explicit
 /// type, or `self`/`static`/`parent` → the enclosing class.
-fn scope_class_fqn(scope: Node<'_>, scan: &PhpScan<'_, '_>) -> Option<String> {
+fn scope_class_fqn(scope: Node<'_>, scan: &PhpScan<'_>) -> Option<String> {
     let text = node_text(scope, scan.source);
     static_scope_type_fq_name(
         scan.php,
@@ -358,7 +367,7 @@ fn scope_class_fqn(scope: Node<'_>, scan: &PhpScan<'_, '_>) -> Option<String> {
 /// (chained calls, untyped locals) are skipped — a recall gap, not a wrong edge.
 fn receiver_type_fqn(
     object: Node<'_>,
-    scan: &PhpScan<'_, '_>,
+    scan: &PhpScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
     instance_receiver_type_fq_name(
@@ -377,7 +386,7 @@ fn receiver_type_fqn(
 /// parameter is a shadow so its name is not later read as a static type.
 fn seed_parameters(
     node: Node<'_>,
-    scan: &PhpScan<'_, '_>,
+    scan: &PhpScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     seed_parameter_types(node, scan.source, bindings, |raw| {
@@ -390,7 +399,7 @@ fn seed_parameters(
 /// name (so an untyped local is not later read as a static type).
 fn seed_assignment(
     node: Node<'_>,
-    scan: &mut PhpScan<'_, '_>,
+    scan: &mut PhpScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     let Some((left, right)) = assignment_parts(node) else {
@@ -410,7 +419,7 @@ fn seed_assignment(
     }
 }
 
-fn assignment_receiver_type_fqn(right: Node<'_>, scan: &mut PhpScan<'_, '_>) -> Option<String> {
+fn assignment_receiver_type_fqn(right: Node<'_>, scan: &mut PhpScan<'_>) -> Option<String> {
     match right.kind() {
         "object_creation_expression" => object_creation_type(right)
             .and_then(|type_node| scan.resolve_type_fqn(node_text(type_node, scan.source))),
@@ -436,7 +445,7 @@ fn assignment_receiver_type_fqn(right: Node<'_>, scan: &mut PhpScan<'_, '_>) -> 
     }
 }
 
-fn declared_callable_return_type_fqn(scan: &PhpScan<'_, '_>, callable_fqn: &str) -> Option<String> {
+fn declared_callable_return_type_fqn(scan: &PhpScan<'_>, callable_fqn: &str) -> Option<String> {
     if let Some(return_type) = scan
         .analyzer
         .usage_facts_index()

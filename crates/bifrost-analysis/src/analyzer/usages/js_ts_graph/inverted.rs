@@ -30,8 +30,9 @@ use crate::analyzer::js_ts::syntax::{
 };
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
-    EdgeCollector, UsageEdgeBuildOutput, UsageEdgeWeights, UsageNodeKey, build_edge_output,
-    build_edge_weights, classify_reference_node, collect_file_edges, parse_and_collect,
+    FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, UsageEdgeWeights, UsageNodeKey,
+    build_edge_output, build_edge_weights, classify_reference_node, collect_file_edges,
+    parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{ExportEntry, ImportKind};
@@ -67,71 +68,62 @@ where
         // declaration pass. Receiver analysis can consult the analyzer-cached
         // resolution index, so it is pre-materialized before this parallel scan.
         let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
-        parse_and_collect(
-            analyzer,
-            file,
-            nodes,
-            &parser_language,
-            |parsed, collector| {
-                let source = parsed.source.as_str();
+        parse_and_collect(analyzer, file, nodes, &parser_language, |input| {
+            let source = input.source;
 
-                // Per-file resolution context: which bare names resolve to which
-                // exported name, and which locals are namespace imports.
-                let binder = compute_import_binder(source, &parsed.tree);
-                let mut named_imports: HashMap<String, String> = HashMap::default();
-                let mut namespace_locals: HashSet<String> = HashSet::default();
-                for (local, binding) in binder.all_bindings() {
-                    match binding.kind {
-                        ImportKind::Named => {
-                            named_imports.insert(
-                                local.to_string(),
-                                binding
-                                    .imported_name
-                                    .clone()
-                                    .unwrap_or_else(|| local.to_string()),
-                            );
-                        }
-                        ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => {
-                            namespace_locals.insert(local.to_string());
-                        }
-                        // Default imports need the target module's default-export name.
-                        ImportKind::Default => {}
+            // Per-file resolution context: which bare names resolve to which
+            // exported name, and which locals are namespace imports.
+            let binder = compute_import_binder(source, input.tree);
+            let mut named_imports: HashMap<String, String> = HashMap::default();
+            let mut namespace_locals: HashSet<String> = HashSet::default();
+            for (local, binding) in binder.all_bindings() {
+                match binding.kind {
+                    ImportKind::Named => {
+                        named_imports.insert(
+                            local.to_string(),
+                            binding
+                                .imported_name
+                                .clone()
+                                .unwrap_or_else(|| local.to_string()),
+                        );
                     }
+                    ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => {
+                        namespace_locals.insert(local.to_string());
+                    }
+                    // Default imports need the target module's default-export name.
+                    ImportKind::Default => {}
                 }
-                let declarations = analyzer.declarations(file);
-                let (same_file, browser_globals, lexical_bindings) = file_declaration_names(
-                    analyzer,
-                    language,
-                    &declarations,
-                    parsed.tree.root_node(),
-                    source,
-                );
+            }
+            let declarations = analyzer.declarations(file);
+            let (same_file, browser_globals, lexical_bindings) =
+                file_declaration_names(analyzer, language, &declarations, input.root(), source);
 
-                let definitions = analyzer.global_usage_definition_index();
-                let mut ctx = TsScan {
+            let definitions = analyzer.global_usage_definition_index();
+            let mut ctx = TsScan {
+                source,
+                receiver_provider: JsTsReceiverFactProvider::new(
+                    analyzer,
+                    &definitions,
+                    language,
+                    file,
                     source,
-                    receiver_provider: JsTsReceiverFactProvider::new(
-                        analyzer,
-                        &definitions,
-                        language,
-                        file,
-                        source,
-                        parsed.tree.root_node(),
-                        binder.clone(),
-                    ),
-                    named_imports,
-                    namespace_locals,
-                    same_file,
-                    browser_globals,
-                    lexical_bindings,
-                    type_shadow_scopes: vec![HashSet::default()],
-                    nodes,
-                    collector,
-                };
-                let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
-                scan_node(parsed.tree.root_node(), &mut ctx, &mut locals);
-            },
-        )
+                    input.root(),
+                    binder.clone(),
+                ),
+                named_imports,
+                namespace_locals,
+                same_file,
+                browser_globals,
+                lexical_bindings,
+                type_shadow_scopes: vec![HashSet::default()],
+                nodes,
+                input,
+                edges: PerFileEdges::default(),
+            };
+            let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
+            scan_node(input.root(), &mut ctx, &mut locals);
+            ctx.edges
+        })
     })
 }
 
@@ -184,19 +176,19 @@ where
             analyzer,
             file,
             nodes,
-            &parsed.line_starts,
-            |collector| {
+            &parsed,
+            |input| {
                 let definitions = analyzer.global_usage_definition_index();
                 let mut ctx = ScopedTsScan {
-                    source: parsed.source.as_str(),
+                    source: input.source,
                     receiver_provider: JsTsReceiverFactProvider::new(
                         analyzer,
                         &definitions,
                         language,
                         file,
-                        parsed.source.as_str(),
-                        parsed.tree.root_node(),
-                        compute_import_binder(parsed.source.as_str(), &parsed.tree),
+                        input.source,
+                        input.root(),
+                        compute_import_binder(input.source, input.tree),
                     ),
                     index,
                     declarations: &declarations,
@@ -205,10 +197,12 @@ where
                     browser_globals,
                     lexical_bindings,
                     type_shadow_scopes: vec![HashSet::default()],
-                    collector,
+                    input,
+                    edges: PerFileEdges::default(),
                 };
                 let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
-                scan_scoped_node(parsed.tree.root_node(), &mut ctx, &mut locals);
+                scan_scoped_node(input.root(), &mut ctx, &mut locals);
+                ctx.edges
             },
         ))
     });
@@ -221,7 +215,7 @@ struct ScopedImportBindings {
     namespace: HashMap<String, ProjectFile>,
 }
 
-struct ScopedTsScan<'a, 'b> {
+struct ScopedTsScan<'a> {
     source: &'a str,
     receiver_provider: JsTsReceiverFactProvider<'a, 'a>,
     index: &'a JsTsUsageIndex,
@@ -231,10 +225,11 @@ struct ScopedTsScan<'a, 'b> {
     browser_globals: HashMap<String, UsageNodeKey>,
     lexical_bindings: Option<JsTsLexicalBindingIndex>,
     type_shadow_scopes: Vec<HashSet<String>>,
-    collector: &'a mut EdgeCollector<'b, UsageNodeKey>,
+    input: &'a FileEdgeScanInput<'a, UsageNodeKey>,
+    edges: PerFileEdges<UsageNodeKey>,
 }
 
-impl<'a> ScopedTsScan<'a, '_> {
+impl<'a> ScopedTsScan<'a> {
     fn bare_callee(&self, text: &str, byte: usize) -> Option<UsageNodeKey> {
         if let Some(key) = self.imports.named.get(text) {
             return Some(key.clone());
@@ -308,7 +303,8 @@ impl<'a> ScopedTsScan<'a, '_> {
     }
 
     fn record(&mut self, callee: UsageNodeKey, node: Node<'_>) {
-        self.collector.record_kind(
+        self.edges.record_kind(
+            self.input,
             callee,
             classify_reference_node(node),
             node.start_byte(),
@@ -324,7 +320,7 @@ impl<'a> ScopedTsScan<'a, '_> {
     }
 }
 
-struct TsScan<'a, 'b> {
+struct TsScan<'a> {
     source: &'a str,
     receiver_provider: JsTsReceiverFactProvider<'a, 'a>,
     named_imports: HashMap<String, String>,
@@ -334,10 +330,11 @@ struct TsScan<'a, 'b> {
     lexical_bindings: Option<JsTsLexicalBindingIndex>,
     type_shadow_scopes: Vec<HashSet<String>>,
     nodes: &'a HashSet<String>,
-    collector: &'a mut EdgeCollector<'b>,
+    input: &'a FileEdgeScanInput<'a>,
+    edges: PerFileEdges,
 }
 
-impl TsScan<'_, '_> {
+impl TsScan<'_> {
     fn member_declaration_keys(&self, owner: &str, member: &str) -> Vec<String> {
         let static_key = format!("{owner}.{member}$static");
         if self.nodes.contains(&static_key) {
@@ -752,7 +749,7 @@ fn top_level_name(fqn: &str) -> String {
     fqn.split('.').next().unwrap_or(fqn).to_string()
 }
 
-impl TsScan<'_, '_> {
+impl TsScan<'_> {
     /// The callee fqn a bare name refers to: a named import's exported name, or a
     /// same-file declaration's own name. `None` when the name is neither.
     fn bare_callee(&self, text: &str, byte: usize) -> Option<String> {
@@ -774,7 +771,8 @@ impl TsScan<'_, '_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.collector.record_kind(
+        self.edges.record_kind(
+            self.input,
             callee,
             classify_reference_node(node),
             node.start_byte(),
@@ -783,7 +781,7 @@ impl TsScan<'_, '_> {
     }
 }
 
-fn scan_node(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &mut LocalInferenceEngine<String>) {
+fn scan_node(node: Node<'_>, ctx: &mut TsScan<'_>, locals: &mut LocalInferenceEngine<String>) {
     let mut state = (ctx, locals);
     walk_tree_iterative(
         node,
@@ -802,7 +800,7 @@ fn scan_node(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &mut LocalInferen
 
 fn scan_node_enter(
     node: Node<'_>,
-    ctx: &mut TsScan<'_, '_>,
+    ctx: &mut TsScan<'_>,
     locals: &mut LocalInferenceEngine<String>,
 ) -> Option<bool> {
     let kind = node.kind();
@@ -855,7 +853,7 @@ fn scan_node_enter(
 
 fn scan_scoped_node(
     node: Node<'_>,
-    ctx: &mut ScopedTsScan<'_, '_>,
+    ctx: &mut ScopedTsScan<'_>,
     locals: &mut LocalInferenceEngine<String>,
 ) {
     let mut state = (ctx, locals);
@@ -876,7 +874,7 @@ fn scan_scoped_node(
 
 fn scan_scoped_node_enter(
     node: Node<'_>,
-    ctx: &mut ScopedTsScan<'_, '_>,
+    ctx: &mut ScopedTsScan<'_>,
     locals: &mut LocalInferenceEngine<String>,
 ) -> Option<bool> {
     let kind = node.kind();
@@ -983,11 +981,7 @@ fn declare_pattern_shadows(
     }
 }
 
-fn handle_identifier(
-    node: Node<'_>,
-    ctx: &mut TsScan<'_, '_>,
-    locals: &LocalInferenceEngine<String>,
-) {
+fn handle_identifier(node: Node<'_>, ctx: &mut TsScan<'_>, locals: &LocalInferenceEngine<String>) {
     let text = slice(node, ctx.source);
     let shadowed = if node.kind() == "type_identifier" {
         ctx.is_type_shadowed(text)
@@ -1010,7 +1004,7 @@ fn handle_identifier(
 
 fn handle_scoped_identifier(
     node: Node<'_>,
-    ctx: &mut ScopedTsScan<'_, '_>,
+    ctx: &mut ScopedTsScan<'_>,
     locals: &LocalInferenceEngine<String>,
 ) {
     let text = slice(node, ctx.source);
@@ -1035,7 +1029,7 @@ fn handle_scoped_identifier(
 
 fn handle_nested_type_identifier(
     node: Node<'_>,
-    ctx: &mut TsScan<'_, '_>,
+    ctx: &mut TsScan<'_>,
     _locals: &LocalInferenceEngine<String>,
 ) {
     let Some((module, name)) = nested_type_identifier_parts(node) else {
@@ -1063,7 +1057,7 @@ fn handle_nested_type_identifier(
 
 fn handle_scoped_nested_type_identifier(
     node: Node<'_>,
-    ctx: &mut ScopedTsScan<'_, '_>,
+    ctx: &mut ScopedTsScan<'_>,
     _locals: &LocalInferenceEngine<String>,
 ) {
     let Some((module, name)) = nested_type_identifier_parts(node) else {
@@ -1089,7 +1083,7 @@ fn handle_scoped_nested_type_identifier(
     }
 }
 
-fn type_qualification_owner_callee(module: Node<'_>, ctx: &TsScan<'_, '_>) -> Option<String> {
+fn type_qualification_owner_callee(module: Node<'_>, ctx: &TsScan<'_>) -> Option<String> {
     if module.kind() == "identifier" {
         let module_text = slice(module, ctx.source);
         return (!module_text.is_empty() && !ctx.is_type_shadowed(module_text))
@@ -1102,7 +1096,7 @@ fn type_qualification_owner_callee(module: Node<'_>, ctx: &TsScan<'_, '_>) -> Op
 
 fn scoped_type_qualification_owner_callee(
     module: Node<'_>,
-    ctx: &ScopedTsScan<'_, '_>,
+    ctx: &ScopedTsScan<'_>,
 ) -> Option<UsageNodeKey> {
     if module.kind() == "identifier" {
         let module_text = slice(module, ctx.source);
@@ -1129,7 +1123,7 @@ fn register_lexical_type_shadow(node: Node<'_>, source: &str, scopes: &mut [Hash
     }
 }
 
-fn handle_member(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &LocalInferenceEngine<String>) {
+fn handle_member(node: Node<'_>, ctx: &mut TsScan<'_>, locals: &LocalInferenceEngine<String>) {
     let (Some(object), Some(property)) = (
         node.child_by_field_name("object"),
         node.child_by_field_name("property"),
@@ -1175,7 +1169,7 @@ fn handle_member(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &LocalInferen
     }
 }
 
-fn handle_contextual_object_key(node: Node<'_>, ctx: &mut TsScan<'_, '_>) {
+fn handle_contextual_object_key(node: Node<'_>, ctx: &mut TsScan<'_>) {
     for target in ctx
         .receiver_provider
         .resolve_contextual_object_literal_key_targets(node, ReceiverAnalysisBudget::default())
@@ -1184,7 +1178,7 @@ fn handle_contextual_object_key(node: Node<'_>, ctx: &mut TsScan<'_, '_>) {
     }
 }
 
-fn handle_contextual_object_literal(node: Node<'_>, ctx: &mut TsScan<'_, '_>) {
+fn handle_contextual_object_literal(node: Node<'_>, ctx: &mut TsScan<'_>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         handle_contextual_object_key(child, ctx);
@@ -1193,7 +1187,7 @@ fn handle_contextual_object_literal(node: Node<'_>, ctx: &mut TsScan<'_, '_>) {
 
 fn handle_scoped_member(
     node: Node<'_>,
-    ctx: &mut ScopedTsScan<'_, '_>,
+    ctx: &mut ScopedTsScan<'_>,
     locals: &LocalInferenceEngine<String>,
 ) {
     let (Some(object), Some(property)) = (
@@ -1250,7 +1244,7 @@ fn handle_scoped_member(
     }
 }
 
-fn handle_scoped_contextual_object_key(node: Node<'_>, ctx: &mut ScopedTsScan<'_, '_>) {
+fn handle_scoped_contextual_object_key(node: Node<'_>, ctx: &mut ScopedTsScan<'_>) {
     for target in ctx
         .receiver_provider
         .resolve_contextual_object_literal_key_targets(node, ReceiverAnalysisBudget::default())
@@ -1262,7 +1256,7 @@ fn handle_scoped_contextual_object_key(node: Node<'_>, ctx: &mut ScopedTsScan<'_
     }
 }
 
-fn handle_scoped_contextual_object_literal(node: Node<'_>, ctx: &mut ScopedTsScan<'_, '_>) {
+fn handle_scoped_contextual_object_literal(node: Node<'_>, ctx: &mut ScopedTsScan<'_>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         handle_scoped_contextual_object_key(child, ctx);
@@ -1274,14 +1268,15 @@ fn record_receiver_member(
     object: Node<'_>,
     property: Node<'_>,
     property_text: &str,
-    ctx: &mut TsScan<'_, '_>,
+    ctx: &mut TsScan<'_>,
 ) -> bool {
     if object.kind() == "this" {
         // `this.member` is a same-owner reference (#1138): record it as unproven
         // inbound rather than dropping it (matched-but-unrecorded), so a member
         // reachable only through same-owner access reads INCONCLUSIVE, never
         // confidently dead.
-        ctx.collector.record_unproven_name(
+        ctx.edges.record_unproven_name(
+            ctx.input,
             property_text,
             property.start_byte(),
             property.end_byte(),
@@ -1312,14 +1307,15 @@ fn record_scoped_receiver_member(
     object: Node<'_>,
     property: Node<'_>,
     property_text: &str,
-    ctx: &mut ScopedTsScan<'_, '_>,
+    ctx: &mut ScopedTsScan<'_>,
 ) -> bool {
     if object.kind() == "this" {
         // `this.member` is a same-owner reference (#1138): record it as unproven
         // inbound rather than dropping it (matched-but-unrecorded), so a member
         // reachable only through same-owner access reads INCONCLUSIVE, never
         // confidently dead.
-        ctx.collector.record_unproven_name(
+        ctx.edges.record_unproven_name(
+            ctx.input,
             property_text,
             property.start_byte(),
             property.end_byte(),
@@ -1343,7 +1339,8 @@ fn record_scoped_receiver_member(
         }
         ReceiverAnalysisOutcome::Ambiguous(targets) => {
             for target in targets {
-                ctx.collector.record_unproven(
+                ctx.edges.record_unproven(
+                    ctx.input,
                     UsageNodeKey::new(target.source().clone(), target.fq_name()),
                     property.start_byte(),
                     property.end_byte(),
@@ -1353,7 +1350,8 @@ fn record_scoped_receiver_member(
         }
         ReceiverAnalysisOutcome::Unsupported { .. }
         | ReceiverAnalysisOutcome::ExceededBudget { .. } => {
-            ctx.collector.record_unproven_name(
+            ctx.edges.record_unproven_name(
+                ctx.input,
                 property_text,
                 property.start_byte(),
                 property.end_byte(),
@@ -1361,7 +1359,8 @@ fn record_scoped_receiver_member(
             true
         }
         ReceiverAnalysisOutcome::Unknown => {
-            ctx.collector.record_unproven_name(
+            ctx.edges.record_unproven_name(
+                ctx.input,
                 property_text,
                 property.start_byte(),
                 property.end_byte(),
@@ -1373,7 +1372,7 @@ fn record_scoped_receiver_member(
 
 fn scoped_namespace_member_class(
     node: Node<'_>,
-    ctx: &ScopedTsScan<'_, '_>,
+    ctx: &ScopedTsScan<'_>,
     locals: &LocalInferenceEngine<String>,
 ) -> Option<UsageNodeKey> {
     let object = node.child_by_field_name("object")?;
@@ -1392,7 +1391,7 @@ fn scoped_namespace_member_class(
     ctx.namespace_member_callee(namespace, class_name)
 }
 
-fn handle_jsx(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &LocalInferenceEngine<String>) {
+fn handle_jsx(node: Node<'_>, ctx: &mut TsScan<'_>, locals: &LocalInferenceEngine<String>) {
     record_jsx_attributes(node, ctx);
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
@@ -1408,7 +1407,7 @@ fn handle_jsx(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &LocalInferenceE
     }
 }
 
-fn record_jsx_attributes(node: Node<'_>, ctx: &mut TsScan<'_, '_>) {
+fn record_jsx_attributes(node: Node<'_>, ctx: &mut TsScan<'_>) {
     let mut cursor = node.walk();
     for attribute in node
         .named_children(&mut cursor)
@@ -1431,7 +1430,7 @@ fn record_jsx_attributes(node: Node<'_>, ctx: &mut TsScan<'_, '_>) {
 
 fn handle_scoped_jsx(
     node: Node<'_>,
-    ctx: &mut ScopedTsScan<'_, '_>,
+    ctx: &mut ScopedTsScan<'_>,
     locals: &LocalInferenceEngine<String>,
 ) {
     record_scoped_jsx_attributes(node, ctx);
@@ -1449,7 +1448,7 @@ fn handle_scoped_jsx(
     }
 }
 
-fn record_scoped_jsx_attributes(node: Node<'_>, ctx: &mut ScopedTsScan<'_, '_>) {
+fn record_scoped_jsx_attributes(node: Node<'_>, ctx: &mut ScopedTsScan<'_>) {
     let mut cursor = node.walk();
     for attribute in node
         .named_children(&mut cursor)

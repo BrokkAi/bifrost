@@ -31,7 +31,7 @@ use super::return_type::{
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
     build_file_declarations, build_file_declarations_from_state, classify_reference_node,
     parse_and_collect_with_declarations,
 };
@@ -67,32 +67,28 @@ where
         let class_ranges = state
             .map(ClassRangeIndex::build_from_state)
             .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
-        parse_and_collect_with_declarations(
-            file,
-            nodes,
-            &language,
-            declarations,
-            |parsed, collector| {
-                let mut ctx = JavaScan {
-                    java,
-                    analyzer,
-                    file,
-                    source: parsed.source.as_str(),
-                    root: parsed.tree.root_node(),
-                    class_ranges,
-                    return_type_cache: &return_type_cache,
-                    anonymous_return_cache: &anonymous_return_cache,
-                    file_return_cache: &file_return_cache,
-                    collector,
-                };
-                let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-                walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
-            },
-        )
+        parse_and_collect_with_declarations(file, nodes, &language, declarations, |input| {
+            let mut ctx = JavaScan {
+                java,
+                analyzer,
+                file,
+                source: input.source,
+                root: input.root(),
+                class_ranges,
+                return_type_cache: &return_type_cache,
+                anonymous_return_cache: &anonymous_return_cache,
+                file_return_cache: &file_return_cache,
+                input,
+                edges: PerFileEdges::default(),
+            };
+            let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+            walk(input.root(), &mut ctx, &mut bindings);
+            ctx.edges
+        })
     })
 }
 
-struct JavaScan<'a, 'b> {
+struct JavaScan<'a> {
     java: &'a JavaAnalyzer,
     analyzer: &'a dyn IAnalyzer,
     file: &'a ProjectFile,
@@ -102,10 +98,11 @@ struct JavaScan<'a, 'b> {
     return_type_cache: &'a MethodReturnCache,
     anonymous_return_cache: &'a MethodAnonymousReturnCache,
     file_return_cache: &'a FileReturnCache,
-    collector: &'a mut EdgeCollector<'b>,
+    input: &'a FileEdgeScanInput<'a>,
+    edges: PerFileEdges,
 }
 
-impl JavaScan<'_, '_> {
+impl JavaScan<'_> {
     /// Resolve the nominal identity carried by a structured type node to its fqn.
     fn resolve_type_fqn(&self, node: Node<'_>) -> Option<String> {
         self.resolve_type(node).map(|unit| unit.fq_name())
@@ -160,7 +157,8 @@ impl JavaScan<'_, '_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.collector.record_kind(
+        self.edges.record_kind(
+            self.input,
             callee,
             classify_reference_node(node),
             node.start_byte(),
@@ -169,12 +167,12 @@ impl JavaScan<'_, '_> {
     }
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
-        self.collector
-            .record_unproven_name(name, node.start_byte(), node.end_byte());
+        self.edges
+            .record_unproven_name(self.input, name, node.start_byte(), node.end_byte());
     }
 }
 
-impl JavaReturnTypeContext for JavaScan<'_, '_> {
+impl JavaReturnTypeContext for JavaScan<'_> {
     fn java(&self) -> &JavaAnalyzer {
         self.java
     }
@@ -216,7 +214,7 @@ const SCOPE_NODES: &[&str] = &[
     "for_statement",
 ];
 
-fn walk(node: Node<'_>, ctx: &mut JavaScan<'_, '_>, bindings: &mut LocalInferenceEngine<String>) {
+fn walk(node: Node<'_>, ctx: &mut JavaScan<'_>, bindings: &mut LocalInferenceEngine<String>) {
     let mut state = (ctx, bindings);
     walk_tree_iterative(
         node,
@@ -234,7 +232,7 @@ fn walk(node: Node<'_>, ctx: &mut JavaScan<'_, '_>, bindings: &mut LocalInferenc
 
 fn walk_enter(
     node: Node<'_>,
-    ctx: &mut JavaScan<'_, '_>,
+    ctx: &mut JavaScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) -> bool {
     let enters_scope = SCOPE_NODES.contains(&node.kind());
@@ -251,7 +249,7 @@ fn walk_enter(
 
 fn record_reference(
     node: Node<'_>,
-    ctx: &mut JavaScan<'_, '_>,
+    ctx: &mut JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) {
     match node.kind() {
@@ -347,7 +345,7 @@ fn record_reference(
     }
 }
 
-fn record_constructor_reference(node: Node<'_>, ctx: &mut JavaScan<'_, '_>) {
+fn record_constructor_reference(node: Node<'_>, ctx: &mut JavaScan<'_>) {
     let Some(type_node) = node.child_by_field_name("type") else {
         return;
     };
@@ -357,7 +355,7 @@ fn record_constructor_reference(node: Node<'_>, ctx: &mut JavaScan<'_, '_>) {
 fn record_constructor_reference_for_type(
     type_node: Node<'_>,
     reference_node: Node<'_>,
-    ctx: &mut JavaScan<'_, '_>,
+    ctx: &mut JavaScan<'_>,
 ) {
     let Some(owner) = ctx.resolve_type(type_node) else {
         return;
@@ -386,7 +384,7 @@ fn method_reference_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
 fn method_reference_callee(
     owner_fq_name: &str,
     member: &str,
-    ctx: &JavaScan<'_, '_>,
+    ctx: &JavaScan<'_>,
 ) -> Option<String> {
     let index = ctx.analyzer.global_usage_definition_index();
     let mut candidates = index
@@ -417,7 +415,7 @@ fn method_reference_callee(
 /// through a differently-named variable/type, stays external (#1014 facet B).
 fn method_invocation_receiver_is_same_owner(
     node: Node<'_>,
-    ctx: &JavaScan<'_, '_>,
+    ctx: &JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> bool {
     let Some(enclosing_owner) = ctx.class_ranges.enclosing(node.start_byte()) else {
@@ -448,7 +446,7 @@ fn method_invocation_receiver_is_same_owner(
 /// for an unqualified call — the enclosing class (`this`/inherited).
 fn method_owner_fqn(
     node: Node<'_>,
-    ctx: &JavaScan<'_, '_>,
+    ctx: &JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
     method_owner_fqn_at_depth(node, ctx, bindings, 0)
@@ -456,7 +454,7 @@ fn method_owner_fqn(
 
 fn method_owner_fqn_at_depth(
     node: Node<'_>,
-    ctx: &JavaScan<'_, '_>,
+    ctx: &JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
     depth: usize,
 ) -> Option<String> {
@@ -473,7 +471,7 @@ fn method_owner_fqn_at_depth(
 /// return-type inference.
 fn receiver_type_fqn(
     object: Node<'_>,
-    ctx: &JavaScan<'_, '_>,
+    ctx: &JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
     receiver_type_fqn_at_depth(object, ctx, bindings, 0)
@@ -481,7 +479,7 @@ fn receiver_type_fqn(
 
 fn receiver_type_fqn_at_depth(
     object: Node<'_>,
-    ctx: &JavaScan<'_, '_>,
+    ctx: &JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
     depth: usize,
 ) -> Option<String> {
@@ -537,7 +535,7 @@ fn receiver_type_fqn_at_depth(
 
 fn seed_declarations(
     node: Node<'_>,
-    ctx: &JavaScan<'_, '_>,
+    ctx: &JavaScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     match node.kind() {
@@ -567,7 +565,7 @@ fn seed_declarations(
 
 fn seed_inline_declarations(
     node: Node<'_>,
-    ctx: &JavaScan<'_, '_>,
+    ctx: &JavaScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     match node.kind() {
@@ -581,7 +579,7 @@ fn seed_inline_declarations(
 
 fn seed_variable_declaration(
     node: Node<'_>,
-    ctx: &JavaScan<'_, '_>,
+    ctx: &JavaScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     let resolved_type = node
@@ -624,7 +622,7 @@ fn seed_variable_declaration(
 
 fn seed_typed_binding(
     node: Node<'_>,
-    ctx: &JavaScan<'_, '_>,
+    ctx: &JavaScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     let Some(name) = node.child_by_field_name("name") else {
@@ -650,7 +648,7 @@ fn single_precise_binding(bindings: &LocalInferenceEngine<String>, name: &str) -
 
 fn receiver_type_outcome(
     expression: Node<'_>,
-    ctx: &JavaScan<'_, '_>,
+    ctx: &JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> ReceiverAnalysisOutcome<String> {
     receiver_type_outcome_at_depth(expression, ctx, bindings, 0)
@@ -658,7 +656,7 @@ fn receiver_type_outcome(
 
 fn receiver_type_outcome_at_depth(
     expression: Node<'_>,
-    ctx: &JavaScan<'_, '_>,
+    ctx: &JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
     depth: usize,
 ) -> ReceiverAnalysisOutcome<String> {
@@ -700,7 +698,7 @@ fn receiver_type_outcome_at_depth(
 
 fn method_invocation_return_type_outcome(
     invocation: Node<'_>,
-    ctx: &JavaScan<'_, '_>,
+    ctx: &JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
     depth: usize,
 ) -> ReceiverAnalysisOutcome<String> {

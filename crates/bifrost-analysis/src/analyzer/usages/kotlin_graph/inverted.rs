@@ -57,7 +57,7 @@ use crate::analyzer::tree_walk::{
 };
 use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
     build_file_declarations, build_file_declarations_from_state, classify_reference_node,
     parse_and_collect_with_declarations,
 };
@@ -105,35 +105,26 @@ where
         let class_ranges = state
             .map(ClassRangeIndex::build_from_state)
             .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
-        parse_and_collect_with_declarations(
-            file,
-            nodes,
-            &language,
-            declarations,
-            |parsed, collector| {
-                let names = KotlinNameResolver::new(
-                    analyzer,
-                    file,
-                    parsed.tree.root_node(),
-                    &parsed.source,
-                );
-                let mut scan = KotlinEdgeScan {
-                    analyzer,
-                    source: parsed.source.as_str(),
-                    names: &names,
-                    class_ranges,
-                    bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
-                    declared_type_cache: HashMap::default(),
-                    owner_chain_cache: HashMap::default(),
-                    collector,
-                };
-                walk(parsed.tree.root_node(), &mut scan);
-            },
-        )
+        parse_and_collect_with_declarations(file, nodes, &language, declarations, |input| {
+            let names = KotlinNameResolver::new(analyzer, file, input.root(), input.source);
+            let mut scan = KotlinEdgeScan {
+                analyzer,
+                source: input.source,
+                names: &names,
+                class_ranges,
+                bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
+                declared_type_cache: HashMap::default(),
+                owner_chain_cache: HashMap::default(),
+                input,
+                edges: PerFileEdges::default(),
+            };
+            walk(input.root(), &mut scan);
+            scan.edges
+        })
     })
 }
 
-struct KotlinEdgeScan<'a, 'b> {
+struct KotlinEdgeScan<'a> {
     analyzer: &'a dyn IAnalyzer,
     source: &'a str,
     names: &'a KotlinNameResolver<'a>,
@@ -143,10 +134,11 @@ struct KotlinEdgeScan<'a, 'b> {
     /// Owner chains by the fqn of the innermost enclosing class, so the walk
     /// pays for `parent_of` once per class rather than once per reference.
     owner_chain_cache: HashMap<String, Vec<String>>,
-    collector: &'a mut EdgeCollector<'b>,
+    input: &'a FileEdgeScanInput<'a>,
+    edges: PerFileEdges,
 }
 
-impl KotlinResolutionCtx for KotlinEdgeScan<'_, '_> {
+impl KotlinResolutionCtx for KotlinEdgeScan<'_> {
     fn analyzer(&self) -> &dyn IAnalyzer {
         self.analyzer
     }
@@ -196,9 +188,10 @@ impl KotlinResolutionCtx for KotlinEdgeScan<'_, '_> {
     }
 }
 
-impl KotlinEdgeScan<'_, '_> {
+impl KotlinEdgeScan<'_> {
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.collector.record_kind(
+        self.edges.record_kind(
+            self.input,
             callee,
             classify_reference_node(node),
             node.start_byte(),
@@ -207,12 +200,12 @@ impl KotlinEdgeScan<'_, '_> {
     }
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
-        self.collector
-            .record_unproven_name(name, node.start_byte(), node.end_byte());
+        self.edges
+            .record_unproven_name(self.input, name, node.start_byte(), node.end_byte());
     }
 }
 
-fn walk(root: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
+fn walk(root: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
     walk_tree_iterative(
         root,
         scan,
@@ -236,7 +229,7 @@ fn walk(root: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
 /// Record what each value declaration introduces: its type when the scan can
 /// establish one, otherwise a *shadow* — a binding of unknown type that keeps a
 /// local from being misread as the class it hides.
-fn seed_value_declarations(node: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
+fn seed_value_declarations(node: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
     if !matches!(
         node.kind(),
         "variable_declaration" | "parameter" | "class_parameter" | "parameter_with_optional_type"
@@ -256,7 +249,7 @@ fn seed_value_declarations(node: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
     }
 }
 
-fn binding_type_fq_name(binding: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) -> Option<String> {
+fn binding_type_fq_name(binding: Node<'_>, scan: &mut KotlinEdgeScan<'_>) -> Option<String> {
     if let Some(spelled) = kotlin_binding_type_text(binding, scan.source)
         && let Some(fqn) = scan.names.resolve_type_fqn(&spelled, binding.start_byte())
     {
@@ -276,7 +269,7 @@ fn binding_type_fq_name(binding: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) ->
     receiver_type_fq_name(initializer, scan, 0)
 }
 
-fn record_reference(node: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
+fn record_reference(node: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
     match node.kind() {
         "import_header" => record_import(node, scan),
         "user_type" => record_user_type(node, scan),
@@ -312,7 +305,7 @@ fn record_reference(node: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
 /// same way, and the grammar cannot tell the two apart. The separator is the
 /// value namespace: a binding of the leading name proves the receiver is a value,
 /// and a value's runtime class names no declaration this pass could edge to.
-fn record_class_literal(literal: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
+fn record_class_literal(literal: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
     let segments = match literal.kind() {
         // A bare name, aliased to `type_identifier` by the callable-reference
         // form and left a `simple_identifier` by the navigation one.
@@ -344,7 +337,7 @@ fn record_class_literal(literal: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
 /// Record `import a.b.C` / `import a.b.C as D` at the last path segment.
 ///
 /// A star import names a package, not a declaration, so it records nothing.
-fn record_import(header: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
+fn record_import(header: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
     let segments = kotlin_import_header_segments(header);
     let Some(last) = segments.last().copied() else {
         return;
@@ -354,7 +347,7 @@ fn record_import(header: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
         .map(|segment| node_text(*segment, scan.source))
         .collect::<Vec<_>>()
         .join(".");
-    if path.is_empty() || !scan.collector.contains_node(&path) {
+    if path.is_empty() || !scan.input.is_node(&path) {
         return;
     }
     scan.record(path, last);
@@ -366,7 +359,7 @@ fn record_import(header: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
 /// per segment, so each prefix is resolved in turn: `Outer.Inner` records
 /// `Outer` at its own token and `Outer.Inner` at `Inner`'s, which is what makes
 /// an outer type's usage count include the nested references that named it.
-fn record_user_type(user_type: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
+fn record_user_type(user_type: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
     // A nested `user_type` is reached through its parent's segment walk. Generic
     // arguments sit inside `type_arguments`, not directly under their owner, so
     // they are still visited in their own right.
@@ -381,7 +374,7 @@ fn record_user_type(user_type: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
 
 /// Record one edge per resolving prefix of a dotted type name, so an outer type's
 /// usage count includes the nested references that named it.
-fn record_type_name_segments(segments: &[Node<'_>], scan: &mut KotlinEdgeScan<'_, '_>) {
+fn record_type_name_segments(segments: &[Node<'_>], scan: &mut KotlinEdgeScan<'_>) {
     let mut spelling = String::new();
     for segment in segments {
         let name = node_text(*segment, scan.source);
@@ -400,7 +393,7 @@ fn record_type_name_segments(segments: &[Node<'_>], scan: &mut KotlinEdgeScan<'_
 
 /// Record `class D : Base(1)` — a reference to the superclass and, when the
 /// class declares one, to its constructor.
-fn record_constructor_invocation(node: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
+fn record_constructor_invocation(node: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
     let Some(callee) = kotlin_callee(node) else {
         return;
     };
@@ -413,7 +406,7 @@ fn record_constructor_invocation(node: Node<'_>, scan: &mut KotlinEdgeScan<'_, '
 /// The fqn of the type a callee constructs, for the shapes a constructor call
 /// takes: a bare name, a `user_type` in a supertype list, or a dotted
 /// navigation.
-fn resolve_constructed_type(callee: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) -> Option<String> {
+fn resolve_constructed_type(callee: Node<'_>, scan: &mut KotlinEdgeScan<'_>) -> Option<String> {
     match callee.kind() {
         "simple_identifier" => {
             let name = node_text(callee, scan.source).to_string();
@@ -454,7 +447,7 @@ fn record_constructor_of(
     type_node: Node<'_>,
     reference: Node<'_>,
     arity: usize,
-    scan: &mut KotlinEdgeScan<'_, '_>,
+    scan: &mut KotlinEdgeScan<'_>,
 ) {
     scan.record(owner_fqn.to_string(), type_node);
     let Some(identifier) = owner_fqn.rsplit('.').next() else {
@@ -478,10 +471,7 @@ fn record_constructor_of(
 }
 
 /// The dotted name a navigation spells, when every link of it is a plain name.
-fn dotted_navigation_spelling(
-    navigation: Node<'_>,
-    scan: &KotlinEdgeScan<'_, '_>,
-) -> Option<String> {
+fn dotted_navigation_spelling(navigation: Node<'_>, scan: &KotlinEdgeScan<'_>) -> Option<String> {
     let segments = kotlin_dotted_navigation_segments(navigation)?;
     let names: Vec<&str> = segments
         .iter()
@@ -497,7 +487,7 @@ fn dotted_navigation_spelling(
 /// three ways: it must actually be a navigation receiver, it must not be a
 /// declaration's own name, and it must not be shadowed by a local — `val Base =
 /// 1; Base.length` is a property access on a string, not a reference to a class.
-fn record_bare_identifier(node: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
+fn record_bare_identifier(node: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
     if kotlin_is_declaration_name(node) {
         return;
     }
@@ -523,7 +513,7 @@ fn record_bare_identifier(node: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
 // Calls and members
 // ---------------------------------------------------------------------------
 
-fn record_call(call: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
+fn record_call(call: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
     let Some(callee) = kotlin_callee(call) else {
         return;
     };
@@ -566,7 +556,7 @@ fn record_call(call: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
 
 /// Record `::name`, a callable reference. No arity is applied, so the reference
 /// is judged on the name alone.
-fn record_callable_reference(reference: Node<'_>, scan: &mut KotlinEdgeScan<'_, '_>) {
+fn record_callable_reference(reference: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
     let Some(name_node) = named_children(reference)
         .into_iter()
         .find(|child| child.kind() == "simple_identifier")
@@ -586,7 +576,7 @@ fn record_bare_callable(
     token: Node<'_>,
     name: &str,
     arity: Option<usize>,
-    scan: &mut KotlinEdgeScan<'_, '_>,
+    scan: &mut KotlinEdgeScan<'_>,
 ) {
     // A member named without a receiver is an implicit-`this` reference, which
     // is same-owner under the uniform #1014 policy. The *nearest* enclosing
@@ -600,8 +590,12 @@ fn record_bare_callable(
                 scan,
                 true,
                 |scan| {
-                    scan.collector
-                        .record_unproven(fqn, token.start_byte(), token.end_byte())
+                    scan.edges.record_unproven(
+                        scan.input,
+                        fqn,
+                        token.start_byte(),
+                        token.end_byte(),
+                    )
                 },
                 |scan| scan.record_unproven(name, token),
             );
@@ -633,11 +627,7 @@ fn record_bare_callable(
 /// ancestor's or the companion's rather than one spelled `Receiver.member` —
 /// `member_unit` is the same lookup the query path uses, so the two cannot
 /// disagree about which declaration a call means.
-fn record_member_access(
-    navigation: Node<'_>,
-    scan: &mut KotlinEdgeScan<'_, '_>,
-    arity: Option<usize>,
-) {
+fn record_member_access(navigation: Node<'_>, scan: &mut KotlinEdgeScan<'_>, arity: Option<usize>) {
     let Some(member) = kotlin_navigation_member(navigation) else {
         return;
     };
@@ -683,10 +673,12 @@ fn record_member_access(
         scan,
         same_owner,
         |scan| match &resolved {
-            Some(fqn) => {
-                scan.collector
-                    .record_unproven(fqn.clone(), member.start_byte(), member.end_byte())
-            }
+            Some(fqn) => scan.edges.record_unproven(
+                scan.input,
+                fqn.clone(),
+                member.start_byte(),
+                member.end_byte(),
+            ),
             None => scan.record_unproven(&name, member),
         },
         |scan| match &resolved {

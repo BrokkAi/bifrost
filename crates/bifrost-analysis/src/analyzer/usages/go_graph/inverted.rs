@@ -18,8 +18,8 @@
 //! where the forward scan matches one target it resolves the reference's callee.
 
 use crate::analyzer::usages::inverted_edges::{
-    EdgeCollector, UsageEdgeBuildOutput, build_edge_output, classify_reference_node,
-    parse_and_collect,
+    FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
+    classify_reference_node, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{IAnalyzer, ProjectFile};
@@ -60,34 +60,50 @@ where
     let language = tree_sitter_go::LANGUAGE.into();
     build_edge_output(&files, keep_file, |file| {
         let file_pkg = index.package_name_of(file)?;
-        parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
+        parse_and_collect(analyzer, file, nodes, &language, |input| {
             let (alias_packages, dot_packages) = index.namespace_packages(file);
-            let mut ctx = FileScan {
-                source: parsed.source.as_str(),
-                file_pkg,
-                alias_packages,
-                dot_packages,
-                index,
-                member_callee_cache: HashMap::default(),
-                collector,
-            };
-            let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            scan_node(parsed.tree.root_node(), &mut ctx, &mut locals);
+            scan_go_file(index, file_pkg, alias_packages, dot_packages, input)
         })
     })
 }
 
-struct FileScan<'a, 'b> {
+/// Walk one Go file and return its edge contributions. Pure logic over the
+/// driver-supplied [`FileEdgeScanInput`], the file's package facts, and the
+/// tree-free [`GoEdgeIndex`] — no analyzer handle and no driver state.
+fn scan_go_file(
+    index: &GoEdgeIndex,
+    file_pkg: String,
+    alias_packages: HashMap<String, Vec<String>>,
+    dot_packages: Vec<String>,
+    input: &FileEdgeScanInput<'_>,
+) -> PerFileEdges {
+    let mut ctx = FileScan {
+        source: input.source,
+        file_pkg,
+        alias_packages,
+        dot_packages,
+        index,
+        member_callee_cache: HashMap::default(),
+        input,
+        edges: PerFileEdges::default(),
+    };
+    let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    scan_node(input.root(), &mut ctx, &mut locals);
+    ctx.edges
+}
+
+struct FileScan<'a> {
     source: &'a str,
     file_pkg: String,
     alias_packages: HashMap<String, Vec<String>>,
     dot_packages: Vec<String>,
     index: &'a GoEdgeIndex,
     member_callee_cache: HashMap<(String, String), Vec<String>>,
-    collector: &'a mut EdgeCollector<'b>,
+    input: &'a FileEdgeScanInput<'a>,
+    edges: PerFileEdges,
 }
 
-impl FileScan<'_, '_> {
+impl FileScan<'_> {
     /// Candidate node fqns for a type reference used as a value's type: the type's
     /// class fqn, resolved through the file's package (bare) or imports (qualified).
     fn type_tokens(&self, ty: &TypeRef) -> Vec<String> {
@@ -143,10 +159,11 @@ impl FileScan<'_, '_> {
         callees
     }
 
-    /// Hand a resolved reference to the shared collector, which applies the
+    /// Hand a resolved reference to this file's edge accumulator, which applies the
     /// enclosing-caller attribution, cap counting, and edge dedup.
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.collector.record_kind(
+        self.edges.record_kind(
+            self.input,
             callee,
             classify_reference_node(node),
             node.start_byte(),
@@ -155,23 +172,24 @@ impl FileScan<'_, '_> {
     }
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
-        self.collector
-            .record_unproven_name(name, node.start_byte(), node.end_byte());
+        self.edges
+            .record_unproven_name(self.input, name, node.start_byte(), node.end_byte());
     }
 
     /// Record a resolved callee as unproven inbound (rather than a proven edge):
     /// used for same-owner receiver calls (#1138).
     fn record_unproven_callee(&mut self, callee: String, node: Node<'_>) {
-        self.collector
-            .record_unproven(callee, node.start_byte(), node.end_byte());
+        self.edges
+            .record_unproven(self.input, callee, node.start_byte(), node.end_byte());
     }
 
     fn has_node(&self, node: &String) -> bool {
-        self.collector.contains_node(node)
+        self.input.is_node(node)
     }
 
     fn record_with_caller(&mut self, caller: String, callee: String, node: Node<'_>) {
-        self.collector.record_with_caller_kind(
+        self.edges.record_with_caller_kind(
+            self.input,
             caller,
             callee,
             classify_reference_node(node),
@@ -181,11 +199,7 @@ impl FileScan<'_, '_> {
     }
 }
 
-fn scan_node(
-    node: Node<'_>,
-    ctx: &mut FileScan<'_, '_>,
-    locals: &mut LocalInferenceEngine<String>,
-) {
+fn scan_node(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &mut LocalInferenceEngine<String>) {
     match node.kind() {
         "import_declaration" => return,
         "function_declaration" | "method_declaration" => {
@@ -228,7 +242,7 @@ fn is_top_level_declaration(node: Node<'_>) -> bool {
         .is_some_and(|parent| parent.kind() == "source_file")
 }
 
-fn scan_top_level_value_initializers(node: Node<'_>, ctx: &mut FileScan<'_, '_>) {
+fn scan_top_level_value_initializers(node: Node<'_>, ctx: &mut FileScan<'_>) {
     for_each_value_spec(node, &mut |spec| {
         let names = var_spec_names(spec, ctx.source);
         let values = rhs_expressions(spec);
@@ -257,7 +271,7 @@ fn for_each_value_spec(node: Node<'_>, f: &mut impl FnMut(Node<'_>)) {
     }
 }
 
-fn scan_top_level_initializer_value(node: Node<'_>, caller: &str, ctx: &mut FileScan<'_, '_>) {
+fn scan_top_level_initializer_value(node: Node<'_>, caller: &str, ctx: &mut FileScan<'_>) {
     match node.kind() {
         "func_literal" | "function_declaration" | "method_declaration" => return,
         "selector_expression" | "qualified_type" => {
@@ -276,7 +290,7 @@ fn scan_top_level_initializer_value(node: Node<'_>, caller: &str, ctx: &mut File
     }
 }
 
-fn scan_top_level_initializer_selector(node: Node<'_>, caller: &str, ctx: &mut FileScan<'_, '_>) {
+fn scan_top_level_initializer_selector(node: Node<'_>, caller: &str, ctx: &mut FileScan<'_>) {
     let Some((qualifier, qualifier_node, field_node)) = selector_parts(node, ctx.source) else {
         return;
     };
@@ -295,7 +309,7 @@ fn scan_top_level_initializer_selector(node: Node<'_>, caller: &str, ctx: &mut F
     }
 }
 
-fn scan_top_level_initializer_direct(node: Node<'_>, caller: &str, ctx: &mut FileScan<'_, '_>) {
+fn scan_top_level_initializer_direct(node: Node<'_>, caller: &str, ctx: &mut FileScan<'_>) {
     if is_definition_identifier(node, ctx.source) {
         return;
     }
@@ -317,7 +331,7 @@ fn scan_top_level_initializer_direct(node: Node<'_>, caller: &str, ctx: &mut Fil
 
 fn scan_children(
     node: Node<'_>,
-    ctx: &mut FileScan<'_, '_>,
+    ctx: &mut FileScan<'_>,
     locals: &mut LocalInferenceEngine<String>,
 ) {
     let mut cursor = node.walk();
@@ -326,11 +340,7 @@ fn scan_children(
     }
 }
 
-fn scan_selector(
-    node: Node<'_>,
-    ctx: &mut FileScan<'_, '_>,
-    locals: &LocalInferenceEngine<String>,
-) {
+fn scan_selector(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &LocalInferenceEngine<String>) {
     let Some((qualifier, qualifier_node, field_node)) = selector_parts(node, ctx.source) else {
         return;
     };
@@ -383,7 +393,7 @@ fn scan_selector(
     }
 }
 
-fn scan_direct(node: Node<'_>, ctx: &mut FileScan<'_, '_>, locals: &LocalInferenceEngine<String>) {
+fn scan_direct(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &LocalInferenceEngine<String>) {
     if is_definition_identifier(node, ctx.source) {
         return;
     }
@@ -403,11 +413,7 @@ fn scan_direct(node: Node<'_>, ctx: &mut FileScan<'_, '_>, locals: &LocalInferen
     }
 }
 
-fn seed_parameters(
-    node: Node<'_>,
-    ctx: &FileScan<'_, '_>,
-    locals: &mut LocalInferenceEngine<String>,
-) {
+fn seed_parameters(node: Node<'_>, ctx: &FileScan<'_>, locals: &mut LocalInferenceEngine<String>) {
     // Mark the method's own receiver variable as the same-owner receiver (Go has
     // no `self`/`this`; `func (s *T) f() { s.g() }` calls siblings through `s`).
     // Ported from the forward scan (extractor.rs) so `s.g()` routes to unproven
@@ -427,7 +433,7 @@ fn seed_parameters(
 
 fn seed_parameter_list(
     node: Node<'_>,
-    ctx: &FileScan<'_, '_>,
+    ctx: &FileScan<'_>,
     locals: &mut LocalInferenceEngine<String>,
     is_method_receiver: bool,
 ) {
@@ -441,7 +447,7 @@ fn seed_parameter_list(
 
 fn seed_parameter_declaration(
     node: Node<'_>,
-    ctx: &FileScan<'_, '_>,
+    ctx: &FileScan<'_>,
     locals: &mut LocalInferenceEngine<String>,
     is_method_receiver: bool,
 ) {
@@ -465,7 +471,7 @@ fn seed_parameter_declaration(
 
 fn seed_local_bindings(
     node: Node<'_>,
-    ctx: &FileScan<'_, '_>,
+    ctx: &FileScan<'_>,
     locals: &mut LocalInferenceEngine<String>,
 ) {
     match node.kind() {
@@ -479,11 +485,7 @@ fn seed_local_bindings(
     }
 }
 
-fn seed_var_spec(
-    node: Node<'_>,
-    ctx: &FileScan<'_, '_>,
-    locals: &mut LocalInferenceEngine<String>,
-) {
+fn seed_var_spec(node: Node<'_>, ctx: &FileScan<'_>, locals: &mut LocalInferenceEngine<String>) {
     let names = var_spec_names(node, ctx.source);
     if names.is_empty() {
         return;
@@ -511,7 +513,7 @@ fn seed_var_spec(
 
 fn seed_assignment_like(
     node: Node<'_>,
-    ctx: &FileScan<'_, '_>,
+    ctx: &FileScan<'_>,
     locals: &mut LocalInferenceEngine<String>,
     declare_lhs: bool,
 ) {
@@ -537,7 +539,7 @@ enum InferredBinding {
 fn infer_names_from_values(
     names: Vec<Option<String>>,
     values: Vec<Node<'_>>,
-    ctx: &FileScan<'_, '_>,
+    ctx: &FileScan<'_>,
     locals: &LocalInferenceEngine<String>,
 ) -> Vec<(String, InferredBinding)> {
     if names.is_empty() || values.is_empty() {
