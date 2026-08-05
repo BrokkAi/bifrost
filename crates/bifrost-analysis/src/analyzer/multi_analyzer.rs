@@ -952,7 +952,7 @@ impl IAnalyzer for MultiAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
-        // A Kotlin file's unresolved-type diagnostics must see the same
+        // JVM diagnostics must see the same
         // wider JVM source realm its import and hierarchy resolution do:
         // otherwise a type declared in a Java or Scala sibling file would be
         // misreported as unrecognized. Only `MultiAnalyzer` can construct
@@ -974,6 +974,12 @@ impl IAnalyzer for MultiAnalyzer {
             return crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(
                 file,
                 diagnostics,
+            );
+        }
+        if language_for_file(file) == Language::Java && self.delegates.contains_key(&Language::Java)
+        {
+            return crate::analyzer::java::diagnostics::collect_java_semantic_diagnostics(
+                self, file, source,
             );
         }
         self.delegate_for_file(file)

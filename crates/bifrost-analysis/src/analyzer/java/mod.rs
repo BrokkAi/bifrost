@@ -2,6 +2,7 @@ mod adapter;
 mod cache;
 mod clones;
 pub(crate) mod declarations;
+pub(crate) mod diagnostics;
 mod exceptions;
 mod hierarchy;
 pub(crate) mod imports;
@@ -203,6 +204,22 @@ impl JavaAnalyzer {
         self.resolve_forward_type_name_candidates(file, raw_name)
     }
 
+    pub(crate) fn resolve_type_name_candidates_in_realm(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Vec<CodeUnit> {
+        self.resolve_type_name_with(file, raw_name, |fqn| {
+            analyzer
+                .global_usage_definition_index()
+                .fqn(fqn)
+                .iter()
+                .find(|unit| unit.is_class() && unit.fq_name() == fqn && !unit.is_synthetic())
+                .cloned()
+        })
+    }
+
     pub fn is_known_type_name_in_file(&self, file: &ProjectFile, raw_name: &str) -> bool {
         self.resolve_type_name_with_external(file, raw_name)
             .is_some()
@@ -380,6 +397,14 @@ impl IAnalyzer for JavaAnalyzer {
 
     fn is_analyzed(&self, file: &ProjectFile) -> bool {
         self.inner.is_analyzed(file)
+    }
+
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        diagnostics::collect_java_semantic_diagnostics(self, file, source)
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {

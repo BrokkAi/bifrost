@@ -20,6 +20,7 @@ A user can verify this behavior with focused semantic and LSP tests. Missing loc
 - [x] (2026-08-05 16:45Z) Milestone 2, issue #1617: added the host-owned seven-ecosystem activation and evidence lifecycle, tested it, reviewed it, and landed commit `739708573`.
 - [x] (2026-08-05 16:45Z) Milestone 3, issue #1618: added the shared proof conformance harness and pinned offline Scala witnesses, tested it, reviewed it, and landed commit `be3c3d66a`.
 - [ ] Milestone 4, issue #1619: add the JVM pilot, exact positive and near-miss tests, review it, and commit it.
+- [x] (2026-08-05 17:10Z) Started #1619: added proof-gated Java collection, merged-realm workspace lookup, and three focused tests.
 - [ ] Run the final Bifrost policy gate and appropriate CI-equivalent checks.
 
 ## Surprises & Discoveries
@@ -38,6 +39,8 @@ A user can verify this behavior with focused semantic and LSP tests. Missing loc
   Evidence: The final harness now tests lexical scope, module, package, type, and member surface domains.
 - Observation: One broad JVM `search_symbols` call took 5.18 seconds and returned a large response.
   Evidence: Issue #1668 records the exact request, revision, RMCP state, and result.
+- Observation: Existing Kotlin and Scala collectors still construct complete workspace absences after resolver calls that can initialize JVM external indexes.
+  Evidence: Their implementations use `from_workspace_absences`; Kotlin type checks call `external_declaration_index()`.
 
 ## Decision Log
 
@@ -72,6 +75,8 @@ Validation passed: five core contract tests, three analysis mapping tests, seven
 Milestone 2 is complete. `DependencyPackEcosystem` selects JVM, .NET, npm, Python, Go, Cargo, or Ruby. `WorkspaceAnalyzer::activate_dependency_packs` runs explicit host work outside diagnostic requests. Complete work publishes overlay and discovery evidence atomically for one generation. Cancellation, incomplete preparation, unavailable runtime, or persistence failure retains the prior complete state. Explicit invalidation clears affected proof and requests a diagnostic refresh. LSP watched-file generation changes refresh all published diagnostic URIs.
 
 Milestone 3 is complete for the shared proof layer. The matrix contains all 11 required scenario classes, all five checked domains, exact multi-reason suppression, member-surface completeness, and the LSP diagnostic projection. Ten non-absence cases emit zero errors. One complete workspace absence emits one error. Two offline Scala witnesses are content-pinned. No checked-in pinned Java or Kotlin real-project corpus exists yet; milestone 4 must add JVM-specific executable cases. Other ecosystem real-project rows remain gated by their integration issues #1620 through #1627.
+
+Milestone 4 has started but is not complete. Java now has a structured collector. It uses the merged JVM workspace definition index in `MultiAnalyzer`, keeps multiple workspace candidates ambiguous, and does not create external `CodeUnit` values. Without retained dependency proof, a missing Java type produces `MissingDependencyDiscovery` and no error. Three Java tests cover workspace resolution, an unproved missing type, and a same-name value near miss. Active overlay lookup must next use Java import tiers. Kotlin and Scala must then stop eager external-index initialization during diagnostics.
 
 ## Context and Orientation
 
@@ -163,3 +168,5 @@ Revision note, 2026-08-05: Created the plan after live issue, worktree, RMCP, an
 Revision note, 2026-08-05 16:14Z: Completed issue #1616. Added exact API, test, review, policy, and latency evidence. Recorded the two review corrections that prevent unknown-boundary errors and expose empty-report completeness.
 
 Revision note, 2026-08-05 16:45Z: Landed #1617 and #1618 together after their parallel detached-worktree reviews. Recorded atomic lifecycle behavior, conformance results, pinned-corpus limits, and dogfood latency issue #1668.
+
+Revision note, 2026-08-05 17:10Z: Started #1619 with Java proof-gated collection and focused near-miss tests. Recorded remaining overlay-precedence and read-only migration work.
