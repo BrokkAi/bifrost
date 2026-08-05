@@ -16,11 +16,11 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - [x] (2026-08-05 21:33Z) Audited all 67 candidates against all 31 exact source revisions.
 - [x] (2026-08-05 21:20Z) Added a 67-row canonical audit and scorer in Brokkbench commit `3d1402548b0`.
 - [x] (2026-08-05 21:33Z) Added canonical scoring, output-contract repair, source validation, and 0.8 solve reporting.
-- [ ] Rescore reusable prior outputs and classify format failures separately from localization failures.
-- [ ] Run all 67 tasks without Bifrost at concurrency 10 and a 1,800-second task limit.
-- [ ] Select tasks that remain difficult without Bifrost and have prepared images, clones, and cache data.
-- [ ] Fix Bifrost MCP workspace arguments and prove symbol calls in one end-to-end task.
-- [ ] Run the selected tasks with symbol tools. Stop and fix any Bifrost error before continuing.
+- [x] (2026-08-05 21:45Z) Rescored reusable outputs and separated invalid output from localization scores.
+- [x] (2026-08-05 22:31Z) Ran all 64 valid tasks without Bifrost at concurrency 10 and a 1,800-second task limit.
+- [x] (2026-08-05 22:34Z) Selected 20 high-scoring baseline failures with ready sources and cache data.
+- [x] (2026-08-05 22:43Z) Fixed Bifrost MCP workspace arguments and proved symbol calls in one end-to-end task.
+- [ ] (2026-08-05 22:47Z) Run the selected tasks with symbol tools. The 20-task arm is active at concurrency 10.
 - [ ] Run the same tasks with symbol and NLP tools.
 - [ ] Add synthetic semantic step zero if natural semantic use is too low.
 - [ ] Produce a paired report and complete the requirement audit.
@@ -47,6 +47,10 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Evidence: One of 11 scorable outputs reaches the documented 0.8 threshold. Five outputs used the wrong contract, and three candidates are invalid.
 - Observation: The complete source audit leaves 64 runnable localization candidates.
   Evidence: All canonical files exist at their exact revisions. The audit excludes two non-localization tasks and `ccx-dep-trace-116`, whose required repository is absent.
+- Observation: The corrected baseline is hard for Luna with grep and workspace tools.
+  Evidence: Luna passed 2 of 64 tasks. The 58 scorable outputs had a 0.4132 mean and a 0.4676 median composite score. Six tasks produced no valid `answer.json`.
+- Observation: The symbol smoke test started Bifrost in seconds and improved the selected task.
+  Evidence: `ccx-dep-trace-273` improved from 0.7727 to 0.8081. Luna completed one `get_summaries` call and one `search_symbols` call.
 
 ## Decision Log
 
@@ -70,6 +74,9 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Date/Author: 2026-08-05 / Codex
 - Decision: Preserve the original 67 rows in the audit, but run only the 64 validated candidates.
   Rationale: This keeps defects visible while preventing invalid tasks from consuming model tokens.
+  Date/Author: 2026-08-05 / Codex
+- Decision: Use the 20 highest-scoring valid baseline failures below 0.8 for paired tool tests.
+  Rationale: These tasks are near enough to the solve limit to measure useful localization gains without selecting baseline passes.
   Date/Author: 2026-08-05 / Codex
 
 ## Outcomes & Retrospective
