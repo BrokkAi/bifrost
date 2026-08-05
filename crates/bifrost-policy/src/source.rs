@@ -11,6 +11,9 @@ use std::str::FromStr;
 
 use brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+use brokk_bifrost_analysis::analyzer::structural::materialization::{
+    DeclarationOrigin, GenerationKind,
+};
 use brokk_bifrost_analysis::analyzer::structural::query::schema::resolve_rql_schema_version;
 use brokk_bifrost_analysis::analyzer::structural::query::sexp::{
     code_query_from_expr, validate_policy_selector_expr,
@@ -4244,6 +4247,8 @@ fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> 
             PolicyRecord::AssertResolution,
             PolicyRecord::AssertReaching,
             PolicyRecord::AssertBoundary,
+            PolicyRecord::AssertGeneration,
+            PolicyRecord::AssertDeclarationState,
         ],
         "assert record",
     )?;
@@ -4254,8 +4259,102 @@ fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> 
         }
         PolicyRecord::AssertReaching => Ok(PolicyAssert::Reaching(decode_reaching_assert(expr)?)),
         PolicyRecord::AssertBoundary => Ok(PolicyAssert::Boundary(decode_boundary_assert(expr)?)),
+        PolicyRecord::AssertGeneration => {
+            Ok(PolicyAssert::Generation(decode_generation_assert(expr)?))
+        }
+        PolicyRecord::AssertDeclarationState => Ok(PolicyAssert::DeclarationState(
+            decode_declaration_state_assert(expr)?,
+        )),
         other => unreachable!("select_record returned {other:?}"),
     }
+}
+
+fn decode_generation_kind(expr: &Expr) -> Result<GenerationKind, PolicySourceError> {
+    let token = expect_token(expr, "generation kind")?;
+    expect_atom(expr, AtomDomain::GenerationKind, "generation kind")?;
+    Ok(GenerationKind::from_label(token)
+        .expect("the RQLP generation-kind atoms mirror the analyzer registry labels"))
+}
+
+fn decode_declaration_origin(expr: &Expr) -> Result<DeclarationOrigin, PolicySourceError> {
+    let token = expect_token(expr, "declaration origin")?;
+    expect_atom(expr, AtomDomain::DeclarationOrigin, "declaration origin")?;
+    Ok(DeclarationOrigin::from_label(token)
+        .expect("the RQLP declaration-origin atoms mirror the analyzer registry labels"))
+}
+
+fn decode_generation_assert(expr: &Expr) -> Result<GenerationAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertGeneration,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let kind = fields.get("kind").map(decode_generation_kind).transpose()?;
+    let cardinality = fields
+        .get("cardinality")
+        .map(decode_assert_cardinality)
+        .transpose()?;
+    let forbid_dynamic = fields
+        .get("forbid-dynamic")
+        .map(|value| decode_boolean(value, "assert forbid-dynamic flag"))
+        .transpose()?
+        .unwrap_or(false);
+    // An assert with neither a cardinality nor the dynamic prohibition can
+    // never fire; its verdict was fixed before any row was read.
+    if cardinality.is_none() && !forbid_dynamic {
+        return Err(source_error(
+            "assert-without-expectation",
+            expr.range.clone(),
+            "assert-generation requires :cardinality, :forbid-dynamic true, or both",
+        ));
+    }
+    Ok(GenerationAssert {
+        id,
+        at,
+        kind,
+        cardinality,
+        forbid_dynamic,
+    })
+}
+
+fn decode_declaration_state_assert(
+    expr: &Expr,
+) -> Result<DeclarationStateAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertDeclarationState,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let expect_origin = fields
+        .get("origin")
+        .map(decode_declaration_origin)
+        .transpose()?;
+    let declaration_only = fields
+        .get("declaration-only")
+        .map(|value| decode_boolean(value, "assert declaration-only flag"))
+        .transpose()?;
+    let config_gated = fields
+        .get("config-gated")
+        .map(|value| decode_boolean(value, "assert config-gated flag"))
+        .transpose()?;
+    if expect_origin.is_none() && declaration_only.is_none() && config_gated.is_none() {
+        return Err(source_error(
+            "assert-without-expectation",
+            expr.range.clone(),
+            "assert-declaration-state requires at least one of :origin, :declaration-only, or :config-gated",
+        ));
+    }
+    Ok(DeclarationStateAssert {
+        id,
+        at,
+        expect_origin,
+        declaration_only,
+        config_gated,
+    })
 }
 
 /// The capture name shared by every assert family, bounded once.

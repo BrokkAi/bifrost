@@ -21,7 +21,8 @@ use super::super::materialization_rows::{
 use super::super::query::{DeclarationStateFilter, ExportFilter, GenerationSiteFilter};
 use super::results::{
     CodeQueryDeclarationState, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
-    CodeQueryDiagnosticImpact, CodeQueryExport, CodeQueryGenerationSite, CodeQueryRange,
+    CodeQueryDiagnosticImpact, CodeQueryExport, CodeQueryGeneratedDeclaration,
+    CodeQueryGenerationSite, CodeQueryRange,
 };
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
@@ -326,6 +327,7 @@ pub(super) const IMPLEMENTATION_QUERY_AXES: &[MaterializationAxis] = &[
 pub(super) fn public_generation_site(
     value: &GenerationSiteValue,
     range: CodeQueryRange,
+    mut render_argument: impl FnMut(&crate::analyzer::Range) -> CodeQueryRange,
 ) -> CodeQueryGenerationSite {
     let row = value.row();
     CodeQueryGenerationSite {
@@ -342,7 +344,12 @@ pub(super) fn public_generation_site(
         generated: row
             .generated
             .iter()
-            .map(|(unit, _)| unit.fq_name().to_string())
+            .map(|(unit, argument)| CodeQueryGeneratedDeclaration {
+                fq_name: unit.fq_name().to_string(),
+                argument_start_byte: argument.start_byte,
+                argument_end_byte: argument.end_byte,
+                argument_range: render_argument(argument),
+            })
             .collect(),
     }
 }
@@ -372,6 +379,7 @@ pub(super) fn public_declaration_state(
     let row = value.row();
     CodeQueryDeclarationState {
         id: value.id(),
+        ast_id: row.ast_id(),
         path: super::rel_path_string(&row.file),
         language: crate::analyzer::common::language_for_file(&row.file).config_label(),
         fq_name: row.unit.fq_name().to_string(),

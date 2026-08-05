@@ -10318,7 +10318,10 @@ fn render_generation_site(
 ) -> CodeQueryGenerationSite {
     let row = value.row();
     let range = render_source_range(analyzer, &row.file, &row.site, cache);
-    materialization::public_generation_site(value, range)
+    let file = row.file.clone();
+    materialization::public_generation_site(value, range, |argument| {
+        render_source_range(analyzer, &file, argument, cache)
+    })
 }
 
 fn render_export(

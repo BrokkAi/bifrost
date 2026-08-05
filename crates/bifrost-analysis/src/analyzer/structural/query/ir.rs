@@ -571,6 +571,19 @@ pub struct GenerationSiteSeed {
     pub filter: GenerationSiteFilter,
 }
 
+impl GenerationSiteSeed {
+    /// Scan exactly the named workspace-relative files for every site.
+    pub fn for_exact_paths<'a>(
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, glob::PatternError> {
+        Ok(Self {
+            where_globs: exact_path_globs(paths)?,
+            languages: Vec::new(),
+            filter: GenerationSiteFilter::default(),
+        })
+    }
+}
+
 /// A non-structural seed producing export rows directly from recorded
 /// materialization provenance (issue #1476).
 #[derive(Debug, Clone, Default)]

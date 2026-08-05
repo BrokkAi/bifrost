@@ -2726,6 +2726,8 @@ const fn location_relationship(value: PolicyLocationRelationship) -> &'static st
         PolicyLocationRelationship::SelectedCandidate => "selected_candidate",
         PolicyLocationRelationship::ConsideredCandidate => "considered_candidate",
         PolicyLocationRelationship::ReachingBinding => "reaching_binding",
+        PolicyLocationRelationship::GenerationSite => "generation_site",
+        PolicyLocationRelationship::GeneratedDeclaration => "generated_declaration",
         PolicyLocationRelationship::DeclaringScope => "declaring_scope",
         PolicyLocationRelationship::ActualOccurrence => "actual_occurrence",
     }

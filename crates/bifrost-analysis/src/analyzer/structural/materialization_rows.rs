@@ -43,6 +43,12 @@ pub const MATERIALIZATION_PRODUCER_AXES: &[MaterializationAxis] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclarationStateRow {
     pub file: ProjectFile,
+    pub content_identity: ContentIdentity,
+    /// The arena fact whose range is exactly the unit's primary declaration
+    /// range, when one exists. A generated unit (whose range is its naming
+    /// argument) or a range-adjusted declaration has none; a row without an
+    /// anchor cannot be addressed by a captured node.
+    pub node: Option<u32>,
     pub unit: CodeUnit,
     pub origin: DeclarationOrigin,
     /// A signature that must not be treated as runnable behavior (a Python
@@ -54,6 +60,12 @@ pub struct DeclarationStateRow {
     pub config_gated: bool,
     /// The declaration's primary source range, when the analyzer states one.
     pub declaration: Option<Range>,
+}
+
+impl DeclarationStateRow {
+    pub fn ast_id(&self) -> Option<String> {
+        self.node.map(|node| ast_id(self.content_identity, node))
+    }
 }
 
 /// One construct that materializes declarations, with the exact set it
@@ -295,6 +307,8 @@ pub fn materialization_for_file(
         any_config_gated |= config_gated;
         states.push(DeclarationStateRow {
             file: file.clone(),
+            content_identity,
+            node: declaration.and_then(|range| fact_at_range(&facts, range)),
             unit: unit.clone(),
             origin: origins
                 .get(unit)

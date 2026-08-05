@@ -992,7 +992,18 @@ pub struct CodeQueryGenerationSite {
     /// explicitly not the whole answer.
     pub input: &'static str,
     pub generated_count: usize,
-    pub generated: Vec<String>,
+    pub generated: Vec<CodeQueryGeneratedDeclaration>,
+}
+
+/// One declaration a generation site materialized, with the literal naming
+/// argument that produced it — the multi-location half of generation
+/// evidence (#1476).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryGeneratedDeclaration {
+    pub fq_name: String,
+    pub argument_start_byte: usize,
+    pub argument_end_byte: usize,
+    pub argument_range: CodeQueryRange,
 }
 
 /// One export declaration (#1476).
@@ -1018,6 +1029,8 @@ pub struct CodeQueryExport {
 #[derive(Debug, Clone, Serialize)]
 pub struct CodeQueryDeclarationState {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
     pub path: String,
     pub language: &'static str,
     pub fq_name: String,
@@ -3243,7 +3256,10 @@ impl CodeQueryResult {
                             value.generated_count,
                         ));
                         for generated in &value.generated {
-                            out.push_str(&format!("  -> {generated}\n"));
+                            out.push_str(&format!(
+                                "  -> {} (named at line {})\n",
+                                generated.fq_name, generated.argument_range.start_line
+                            ));
                         }
                     }
                     CodeQueryResultValue::Export { value } => {

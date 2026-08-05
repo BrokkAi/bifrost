@@ -198,7 +198,11 @@ class SearchToolsClient:
     ) -> CodeQueryResponse:
         """Query normalized code structure across supported languages.
 
-        The compatible head is schema version 9, which adds the ``scopes``
+        The compatible head is schema version 10, which adds the
+        ``generation_sites`` and ``exports`` sources plus the ``generates``,
+        ``generated_by``, ``declaration_state_of``, ``implementation_of``, and
+        ``export_target`` steps over recorded declaration-materialization
+        provenance. The previous head, schema version 9, added the ``scopes``
         and ``bindings`` sources plus the ``scope_of``, ``scope_ancestors``,
         ``bindings_in``, ``reaching_binding``, ``binding_occurrence``,
         ``candidates_of``, and ``candidate_target`` steps, and puts the package

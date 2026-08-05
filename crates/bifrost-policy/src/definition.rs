@@ -11,6 +11,9 @@ use brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior;
 use brokk_bifrost_analysis::analyzer::identifier::define_identifier;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::structural::CodeQuery;
+use brokk_bifrost_analysis::analyzer::structural::materialization::{
+    DeclarationOrigin, GenerationKind,
+};
 use brokk_bifrost_analysis::analyzer::structural::occurrences::{
     Namespace, OccurrenceClass, OccurrenceRole,
 };
@@ -119,6 +122,8 @@ pub enum PolicyAssert {
     Resolution(ResolutionAssert),
     Reaching(ReachingAssert),
     Boundary(BoundaryAssert),
+    Generation(GenerationAssert),
+    DeclarationState(DeclarationStateAssert),
 }
 
 impl PolicyAssert {
@@ -128,6 +133,8 @@ impl PolicyAssert {
             Self::Resolution(assertion) => &assertion.id,
             Self::Reaching(assertion) => &assertion.id,
             Self::Boundary(assertion) => &assertion.id,
+            Self::Generation(assertion) => &assertion.id,
+            Self::DeclarationState(assertion) => &assertion.id,
         }
     }
 
@@ -138,18 +145,23 @@ impl PolicyAssert {
             Self::Resolution(assertion) => &assertion.at,
             Self::Reaching(assertion) => &assertion.at,
             Self::Boundary(assertion) => &assertion.at,
+            Self::Generation(assertion) => &assertion.at,
+            Self::DeclarationState(assertion) => &assertion.at,
         }
     }
 
-    /// The occurrence role the joined rows must carry. Capability reporting is
-    /// narrowed to exactly this role, so an adapter gap in an unrelated role
-    /// does not make the run unreliable.
-    pub const fn role(&self) -> OccurrenceRole {
+    /// The occurrence role the joined rows must carry, for the families whose
+    /// rows are occurrence-joined. Capability reporting is narrowed to exactly
+    /// this role, so an adapter gap in an unrelated role does not make the run
+    /// unreliable. The materialization families join declaration-backed rows
+    /// and have no occurrence role.
+    pub const fn role(&self) -> Option<OccurrenceRole> {
         match self {
-            Self::Occurrence(assertion) => assertion.role,
-            Self::Resolution(assertion) => assertion.role,
-            Self::Reaching(assertion) => assertion.role,
-            Self::Boundary(assertion) => assertion.role,
+            Self::Occurrence(assertion) => Some(assertion.role),
+            Self::Resolution(assertion) => Some(assertion.role),
+            Self::Reaching(assertion) => Some(assertion.role),
+            Self::Boundary(assertion) => Some(assertion.role),
+            Self::Generation(_) | Self::DeclarationState(_) => None,
         }
     }
 
@@ -159,6 +171,84 @@ impl PolicyAssert {
             Self::Resolution(_) => "resolution",
             Self::Reaching(_) => "reaching",
             Self::Boundary(_) => "boundary",
+            Self::Generation(_) => "generation",
+            Self::DeclarationState(_) => "declaration-state",
+        }
+    }
+}
+
+/// Require one captured generation site to materialize an exact set (#1476).
+///
+/// `at` captures the generating construct itself (a Ruby macro call is an
+/// arena fact, so the join is the same `ast_id` equality every family uses).
+/// A dynamic site's generated set is honestly unknown, so without
+/// `forbid_dynamic` the verdict there is inconclusive; with it, the dynamic
+/// site itself is the finding.
+#[derive(Debug, Clone)]
+pub struct GenerationAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    /// Restrict the joined site rows to one generation kind.
+    pub kind: Option<GenerationKind>,
+    /// The generated-set cardinality a literal site must satisfy.
+    pub cardinality: Option<AssertCardinality>,
+    /// Report a dynamic site as a finding instead of an inconclusive verdict.
+    pub forbid_dynamic: bool,
+}
+
+impl GenerationAssert {
+    /// A human-readable statement of the expectation, for finding evidence.
+    pub fn expectation(&self) -> String {
+        let mut text = String::from("generation site");
+        if let Some(kind) = self.kind {
+            text.push_str(&format!(" of kind {}", kind.label()));
+        }
+        if let Some(cardinality) = self.cardinality {
+            text.push_str(&format!(
+                " generating {} {} declaration(s)",
+                cardinality.label(),
+                cardinality.count()
+            ));
+        }
+        if self.forbid_dynamic {
+            text.push_str(", never with dynamic inputs");
+        }
+        text
+    }
+}
+
+/// Require one captured declaration's state row to carry an expected origin,
+/// declaration-only flag, or configuration gate (#1476).
+///
+/// `at` captures the declaration node; the join is the state row's `ast_id`
+/// anchor, so a row the materialization layer could not anchor is not
+/// addressable and the assert does not apply there.
+#[derive(Debug, Clone)]
+pub struct DeclarationStateAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub expect_origin: Option<DeclarationOrigin>,
+    pub declaration_only: Option<bool>,
+    pub config_gated: Option<bool>,
+}
+
+impl DeclarationStateAssert {
+    /// A human-readable statement of the expectation, for finding evidence.
+    pub fn expectation(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(origin) = self.expect_origin {
+            parts.push(format!("origin {}", origin.label()));
+        }
+        if let Some(expected) = self.declaration_only {
+            parts.push(format!("declaration-only {expected}"));
+        }
+        if let Some(expected) = self.config_gated {
+            parts.push(format!("config-gated {expected}"));
+        }
+        if parts.is_empty() {
+            "any declaration state".to_string()
+        } else {
+            format!("declaration state with {}", parts.join(", "))
         }
     }
 }

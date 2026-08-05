@@ -1330,8 +1330,11 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.generated_count,
                     ));
                     for generated in &value.generated {
-                        let generated = sanitize_terminal_text(generated);
-                        out.push_str(&format!("  -> {generated}\n"));
+                        let name = sanitize_terminal_text(&generated.fq_name);
+                        out.push_str(&format!(
+                            "  -> {name} (named at line {})\n",
+                            generated.argument_range.start_line
+                        ));
                     }
                 }
                 CodeQueryResultValue::Export { value } => {
