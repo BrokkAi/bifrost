@@ -3378,9 +3378,9 @@ where
     /// The retained source text of an analyzed file. Structural search
     /// re-parses from this instead of touching disk.
     pub(crate) fn file_source(&self, file: &ProjectFile) -> Option<String> {
-        self.source_snapshot_file_state(file)
+        self.fetch_file_state_from_current_source(file)
+            .or_else(|| self.source_snapshot_file_state(file))
             .or_else(|| self.fetch_file_state(file))
-            .or_else(|| self.fetch_file_state_from_current_source(file))
             .map(|state| state.source.clone())
             .or_else(|| self.project.read_source(file).ok())
     }
@@ -8004,8 +8004,8 @@ where
     }
 
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.fetch_file_state(file)
-            .or_else(|| self.fetch_file_state_from_current_source(file))
+        self.fetch_file_state_from_current_source(file)
+            .or_else(|| self.fetch_file_state(file))
             .map(|state| {
                 state
                     .declarations
@@ -8215,13 +8215,10 @@ where
     }
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
-        self.source_snapshot_file_state(code_unit.source())
+        self.fetch_file_state_from_current_source(code_unit.source())
+            .or_else(|| self.source_snapshot_file_state(code_unit.source()))
             .or_else(|| self.fetch_file_state(code_unit.source()))
             .and_then(|state| state.ranges.get(code_unit).cloned())
-            .or_else(|| {
-                self.fetch_file_state_from_current_source(code_unit.source())
-                    .and_then(|state| state.ranges.get(code_unit).cloned())
-            })
             .unwrap_or_default()
     }
 
