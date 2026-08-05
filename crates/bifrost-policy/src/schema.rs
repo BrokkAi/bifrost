@@ -222,6 +222,9 @@ policy_records! {
     AssertResolution { labels: ["assert-resolution"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-resolution :id ID :at CAPTURE :role ROLE :expect-tier TIER [:at-least true|false] [:forbid-tier TIER] [:require-unique true|false])", description: "Require the resolver's selected candidate for one captured reference to sit at, or above, one precedence tier." }
     AssertReaching { labels: ["assert-reaching"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-reaching :id ID :at CAPTURE :role ROLE :declared inside|outside :relative-to CAPTURE)", description: "Require the reaching binding of one captured reference to be declared inside or outside a second captured node." }
     AssertBoundary { labels: ["assert-boundary"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-boundary :id ID :at CAPTURE :role ROLE :forbid-fallback-past external_declared_unindexed|external_unknown)", description: "Forbid a name-only fallback selection once resolution reached or passed one authoritative boundary." }
+    AssertCanonical { labels: ["assert-canonical"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-canonical :id ID :at CAPTURE :role ROLE :equals CAPTURE :equals-role ROLE [:distinct true|false])", description: "Require two captured tokens' resolved declarations to share, or not share, one canonical identity." }
+    AssertRoute { labels: ["assert-route"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-route :id ID :at CAPTURE :role ROLE :to CAPTURE :to-role ROLE [:via HOP] [:forbid HOP])", description: "Require an identity route from the captured site to a second capture's declaration, optionally via or never via one hop kind." }
+    AssertRoundTrip { labels: ["assert-round-trip"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-round-trip :id ID :at CAPTURE :role ROLE)", description: "Require forward resolution and inverse enumeration to round-trip the captured site." }
     CardinalityExactly { labels: ["exactly"], layout: Positional, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(exactly N)", description: "Require exactly N joined occurrence rows." }
     CardinalityAtLeast { labels: ["at-least"], layout: Positional, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(at-least N)", description: "Require at least N joined occurrence rows." }
     CardinalityAtMost { labels: ["at-most"], layout: Positional, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(at-most N)", description: "Require at most N joined occurrence rows." }
@@ -462,6 +465,7 @@ macro_rules! value_shapes {
                     Self::PrecedenceTier => Some(AtomDomain::PrecedenceTier),
                     Self::DeclaredContainment => Some(AtomDomain::DeclaredContainment),
                     Self::BoundaryStrength => Some(AtomDomain::BoundaryStrength),
+                    Self::RouteHop => Some(AtomDomain::RouteHop),
                     Self::CaptureName
                     | Self::AssertCardinality
                     | Self::AssertEntries => None,
@@ -639,6 +643,9 @@ macro_rules! value_shapes {
                         PolicyRecord::AssertResolution,
                         PolicyRecord::AssertReaching,
                         PolicyRecord::AssertBoundary,
+                        PolicyRecord::AssertCanonical,
+                        PolicyRecord::AssertRoute,
+                        PolicyRecord::AssertRoundTrip,
                     ],
                     Self::AssertCardinality => &[
                         PolicyRecord::CardinalityExactly,
@@ -652,6 +659,7 @@ macro_rules! value_shapes {
                     | Self::PrecedenceTier
                     | Self::DeclaredContainment
                     | Self::BoundaryStrength
+                    | Self::RouteHop
                     | Self::Boolean => &[],
                     Self::SchemaVersion
                     | Self::PolicyId
@@ -733,6 +741,7 @@ value_shapes! {
     OccurrenceNamespace => "type, value, module, macro, or label",
     AssertCardinality => "an exactly, at-least, or at-most cardinality record",
     PrecedenceTier => "one precedence tier from the analyzer registry",
+    RouteHop => "one identity route hop kind from the analyzer registry",
     DeclaredContainment => "inside or outside",
     BoundaryStrength => "external_declared_unindexed or external_unknown",
     AssertEntries => "assert records",
@@ -1142,6 +1151,22 @@ policy_fields! {
     ResolutionAtLeast { record: AssertResolution, labels: ["at-least"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at-least true|false", description: "Accept any tier at least as strong as the expected one; omission requires the exact tier." }
     ResolutionForbidTier { record: AssertResolution, labels: ["forbid-tier"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: PrecedenceTier, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":forbid-tier TIER", description: "Forbid any selection at one named tier, which is how the anti-fallback contract is spelled." }
     ResolutionRequireUnique { record: AssertResolution, labels: ["require-unique"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":require-unique true|false", description: "Require exactly one selected candidate, making ambiguity a violation rather than a silent pick; omission is false." }
+    CanonicalAssertId { record: AssertCanonical, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
+    CanonicalAssertAt { record: AssertCanonical, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture whose resolved declarations carry the first canonical identity." }
+    CanonicalAssertRole { record: AssertCanonical, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the subject token's reference-class occurrence role; capability reporting narrows to exactly this role." }
+    CanonicalAssertEquals { record: AssertCanonical, labels: ["equals"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":equals CAPTURE", description: "Name the second capture whose resolved declarations carry the compared canonical identity." }
+    CanonicalAssertEqualsRole { record: AssertCanonical, labels: ["equals-role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":equals-role ROLE", description: "Name the second token's occurrence role." }
+    CanonicalAssertDistinct { record: AssertCanonical, labels: ["distinct"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Boolean, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":distinct true|false", description: "Invert the requirement: the two selections must share no canonical identity; omission requires a shared one." }
+    RouteAssertId { record: AssertRoute, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
+    RouteAssertAt { record: AssertRoute, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture whose site the route starts from." }
+    RouteAssertRole { record: AssertRoute, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the subject token's occurrence role; capability reporting narrows to exactly this role." }
+    RouteAssertTo { record: AssertRoute, labels: ["to"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":to CAPTURE", description: "Name the capture whose resolved declaration the route must terminate at." }
+    RouteAssertToRole { record: AssertRoute, labels: ["to-role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":to-role ROLE", description: "Name the target token's occurrence role." }
+    RouteAssertVia { record: AssertRoute, labels: ["via"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: RouteHop, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":via HOP", description: "Require at least one hop of this kind on the route." }
+    RouteAssertForbid { record: AssertRoute, labels: ["forbid"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: RouteHop, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":forbid HOP", description: "Never follow hops of this kind, so a route needing one does not exist for this assert." }
+    RoundTripAssertId { record: AssertRoundTrip, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
+    RoundTripAssertAt { record: AssertRoundTrip, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture whose site is round-tripped." }
+    RoundTripAssertRole { record: AssertRoundTrip, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the subject token's occurrence role; capability reporting narrows to exactly this role." }
     ReachingAssertId { record: AssertReaching, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
     ReachingAssertAt { record: AssertReaching, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture whose reaching binding is asserted about." }
     ReachingAssertRole { record: AssertReaching, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the reference-class occurrence role being reached from; capability reporting narrows to exactly this role." }
@@ -1238,6 +1263,7 @@ pub enum AtomDomain {
     PrecedenceTier,
     DeclaredContainment,
     BoundaryStrength,
+    RouteHop,
     Boolean,
 }
 
@@ -1392,6 +1418,15 @@ atom_values! {
     DeclaredOutside { domain: DeclaredContainment, spellings: ["outside"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The declaring scope is not contained in the named capture." }
     BoundaryDeclaredUnindexed { domain: BoundaryStrength, spellings: ["external_declared_unindexed"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The lookup reached an external root the build declares but nothing indexed." }
     BoundaryUnknown { domain: BoundaryStrength, spellings: ["external_unknown"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The lookup reached ground nothing is known about." }
+    HopAlias { domain: RouteHop, spellings: ["alias"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A local respelling of a declaration: an import alias or a type alias." }
+    HopImport { domain: RouteHop, spellings: ["import"], owner: OwnerApplicability::POLICY_ASSERTION, description: "An import binding that brings a declaration's name into a file or scope." }
+    HopExport { domain: RouteHop, spellings: ["export"], owner: OwnerApplicability::POLICY_ASSERTION, description: "An export site that makes a local declaration reachable from outside its file or module." }
+    HopReExport { domain: RouteHop, spellings: ["re_export"], owner: OwnerApplicability::POLICY_ASSERTION, description: "An export whose subject comes from elsewhere, forwarding identity onward." }
+    HopPartialPart { domain: RouteHop, spellings: ["partial_part"], owner: OwnerApplicability::POLICY_ASSERTION, description: "One physical part of a declaration source spells in several pieces." }
+    HopDeclarationDefinitionPeer { domain: RouteHop, spellings: ["declaration_definition_peer"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The peer link between a declaration head and its definition body." }
+    HopNestedOwner { domain: RouteHop, spellings: ["nested_owner"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The projection from a nested declaration onto its owner." }
+    HopImplementation { domain: RouteHop, spellings: ["implementation"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The link from an abstract member to a concrete member implementing it." }
+    HopGeneratedPeer { domain: RouteHop, spellings: ["generated_peer"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The link between a synthetic declaration and its source declaration." }
     BooleanTrue { domain: Boolean, spellings: ["true"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Enable the flag." }
     BooleanFalse { domain: Boolean, spellings: ["false"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Disable the flag." }
 }

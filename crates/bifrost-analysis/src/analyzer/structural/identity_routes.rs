@@ -789,6 +789,17 @@ pub fn round_trip_from_site(
     Ok(RoundTripOutcome::Holds { terminals })
 }
 
+/// Whether the file's language adapter supplies any route relation at all.
+/// An adapter that supplies none cannot state the absence of a route, so a
+/// consumer that finds no route there has a capability gap, not evidence.
+pub fn file_supplies_route_relations(file: &ProjectFile) -> bool {
+    structural_spec_for(language_for_file(file)).is_some_and(|spec| {
+        super::routes::ALL_ROUTE_HOP_KINDS
+            .iter()
+            .any(|kind| spec.identity_route_support().supports_relation(*kind))
+    })
+}
+
 /// The identity axes this module's physical grouping answers, mirrored by the
 /// completeness accounting of the query layer built on top (Milestone 4).
 pub const IDENTITY_ROUTE_PRODUCER_AXES: &[IdentityAxis] = &[

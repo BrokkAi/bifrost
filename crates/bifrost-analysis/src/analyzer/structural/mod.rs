@@ -86,11 +86,12 @@ pub use execution::{
 };
 pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
 pub use identity_routes::{
-    IDENTITY_ROUTE_PRODUCER_AXES, IdentityRoute, MAX_ROUTE_DEPTH, MAX_ROUTE_FAN_OUT,
-    PhysicalOccurrence, RoundTripOutcome, RouteEndpoint, RouteProvenance,
+    IDENTITY_PRESERVING_HOPS, IDENTITY_ROUTE_PRODUCER_AXES, IdentityRoute, MAX_ROUTE_DEPTH,
+    MAX_ROUTE_FAN_OUT, PhysicalOccurrence, RoundTripOutcome, RouteEndpoint, RouteProvenance,
     RouteRelationCompleteness, RouteRelationIncompleteReason, RouteRelationRow,
-    RouteRelationsFileResult, RoutesCancelled, canonical_identity_of, identity_routes_from,
-    physical_occurrences, round_trip_from_site, route_relations_for_file,
+    RouteRelationsFileResult, RoutesCancelled, canonical_identity_of,
+    file_supplies_route_relations, identity_routes_from, physical_occurrences,
+    round_trip_from_site, route_relations_for_file,
 };
 pub use kinds::{ALL_KINDS, NormalizedKind, Role};
 pub use lexical_environment::{
