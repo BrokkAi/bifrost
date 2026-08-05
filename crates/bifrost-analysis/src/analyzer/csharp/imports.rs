@@ -1,13 +1,11 @@
 use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::{
-    CodeUnit, CodeUnitType, ImportAnalysisProvider, ImportInfo, ProjectFile,
-    build_reverse_file_index,
-};
+use crate::analyzer::{CodeUnit, CodeUnitType, ImportAnalysisProvider, ImportInfo, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
 use tree_sitter::Node;
 
 use super::CSharpAnalyzer;
+use super::graph_support::{compute_implicit_reference_index, visible_type_candidates};
 
 impl ImportAnalysisProvider for CSharpAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
@@ -29,7 +27,7 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
             );
         }
         for target in aliases.values() {
-            imported.extend(self.visible_type_candidates(file, target));
+            imported.extend(visible_type_candidates(self, file, target));
         }
         self.memo_caches
             .imported_code_units
@@ -128,7 +126,7 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
                         .is_some_and(|suffix| suffix.starts_with("::"))
                 });
                 if uses_namespace_alias {
-                    let candidates = self.visible_type_candidates(source_file, &identifier);
+                    let candidates = visible_type_candidates(self, source_file, &identifier);
                     if target_classes
                         .iter()
                         .any(|target| candidates.contains(target))
@@ -145,7 +143,7 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
             .chain(source_imports)
             .any(|namespace| target_namespaces.contains(&namespace))
             || source_aliases.values().any(|alias_target| {
-                let candidates = self.visible_type_candidates(source_file, alias_target);
+                let candidates = visible_type_candidates(self, source_file, alias_target);
                 self.declarations(target)
                     .into_iter()
                     .filter(|unit| unit.kind() == CodeUnitType::Class)
@@ -157,90 +155,8 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
 impl CSharpAnalyzer {
     fn implicit_reference_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
         self.memo_caches.implicit_reference_index.get_or_build(
-            || self.compute_implicit_reference_index(true),
-            || self.compute_implicit_reference_index(false),
-        )
-    }
-
-    fn compute_implicit_reference_index(
-        &self,
-        parallel: bool,
-    ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
-        let mut by_namespace_and_name: HashMap<String, HashMap<String, Vec<ProjectFile>>> =
-            HashMap::default();
-        let mut by_fq_name: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-        let mut namespaces_by_file: HashMap<ProjectFile, Vec<String>> = HashMap::default();
-        let files: Vec<_> = self.inner.all_files();
-        for target in &files {
-            let top_level = self.inner.top_level_declarations(target);
-            let mut namespaces = HashSet::default();
-            for unit in &top_level {
-                namespaces.insert(unit.package_name().to_string());
-            }
-            if namespaces.is_empty() {
-                namespaces.insert(String::new());
-            }
-            namespaces_by_file.insert(target.clone(), namespaces.into_iter().collect());
-
-            for unit in top_level
-                .into_iter()
-                .filter(|unit| unit.kind() == CodeUnitType::Class)
-            {
-                by_namespace_and_name
-                    .entry(unit.package_name().to_string())
-                    .or_default()
-                    .entry(unit.identifier().to_string())
-                    .or_default()
-                    .push(target.clone());
-                by_fq_name
-                    .entry(unit.fq_name())
-                    .or_default()
-                    .push(target.clone());
-                by_fq_name
-                    .entry(unit.fq_name().replace('$', "."))
-                    .or_default()
-                    .push(target.clone());
-            }
-        }
-
-        build_reverse_file_index(
-            &files,
-            |candidate| {
-                let Some(identifiers) = self.inner.type_identifiers_of(candidate) else {
-                    return Vec::new();
-                };
-                let candidate_namespaces = namespaces_by_file
-                    .get(candidate)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                let mut resolved_targets = Vec::new();
-                for identifier in identifiers {
-                    for candidate_namespace in candidate_namespaces {
-                        if let Some(namespace_targets) = by_namespace_and_name
-                            .get(candidate_namespace)
-                            .and_then(|by_name| by_name.get(&identifier))
-                        {
-                            resolved_targets.extend(namespace_targets.iter().cloned());
-                        }
-                    }
-                    if let Some(fq_targets) = by_fq_name.get(&identifier) {
-                        resolved_targets.extend(fq_targets.iter().cloned());
-                    }
-                    // Attribute names can be structurally alias-qualified or
-                    // `global::` qualified. Resolve only those uncommon persisted
-                    // identities through the normal C# visible-type resolver so
-                    // default candidate routing agrees with authoritative scanning.
-                    if identifier.contains("::") {
-                        resolved_targets.extend(
-                            self.visible_type_candidates(candidate, &identifier)
-                                .into_iter()
-                                .map(|unit| unit.source().clone()),
-                        );
-                    }
-                }
-                resolved_targets
-            },
-            parallel,
+            || compute_implicit_reference_index(self, true),
+            || compute_implicit_reference_index(self, false),
         )
     }
 }

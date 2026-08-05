@@ -1,6 +1,7 @@
 use super::{
     TypeLookupDiagnostic, TypeLookupOutcome, TypeLookupStatus, TypeLookupType, no_type, sort_units,
 };
+use crate::analyzer::csharp::graph_support;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, CSharpTypeLookupResolution, ResolutionSession,
     csharp_type_lookup_resolution, csharp_type_lookup_resolution_in_session,
@@ -109,7 +110,7 @@ fn csharp_candidates_outcome(
     sort_units(&mut candidates);
     candidates.dedup();
     let logical_type_count = session
-        .query(|| csharp.logical_type_count(&candidates))
+        .query(|| graph_support::logical_type_count(&candidates))
         .unwrap_or_default();
     let status = if !ambiguous && logical_type_count <= 1 {
         TypeLookupStatus::Resolved
@@ -118,7 +119,7 @@ fn csharp_candidates_outcome(
     };
     let fqn = if status == TypeLookupStatus::Resolved {
         session
-            .query(|| csharp.first_logical_type_fqn(&candidates))
+            .query(|| graph_support::first_logical_type_fqn(&candidates))
             .flatten()
             .unwrap_or(fqn)
     } else {
@@ -154,7 +155,9 @@ fn csharp_expand_logical_type_parts(
             return Vec::new();
         }
         let parts = session.query_limited_rows(|limit| {
-            csharp.partial_type_parts_limited(&candidate, limit, || session.observe_cancellation())
+            graph_support::partial_type_parts_limited(csharp, &candidate, limit, || {
+                session.observe_cancellation()
+            })
         });
         if !session.observe_cancellation() {
             return Vec::new();

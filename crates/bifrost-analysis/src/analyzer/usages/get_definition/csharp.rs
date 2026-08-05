@@ -1,5 +1,6 @@
 use super::*;
 use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::csharp::{graph_support, hierarchy};
 use crate::analyzer::declaration_range::node_for_exact_range;
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::csharp_graph::{
@@ -74,14 +75,15 @@ impl<'a> CSharpDefinitionProvider<'a> {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
         let exact = match self.session {
             Some(session) => session.query_limited_rows(|limit| {
-                self.csharp
-                    .declaration_candidates_by_fqn_limited(fqn, false, limit, || {
-                        session.observe_cancellation()
-                    })
+                graph_support::declaration_candidates_by_fqn_limited(
+                    self.csharp,
+                    fqn,
+                    false,
+                    limit,
+                    || session.observe_cancellation(),
+                )
             }),
-            None => self
-                .csharp
-                .declaration_candidates_by_fqn(fqn, false)
+            None => graph_support::declaration_candidates_by_fqn(self.csharp, fqn, false)
                 .into_iter()
                 .collect(),
         };
@@ -90,14 +92,15 @@ impl<'a> CSharpDefinitionProvider<'a> {
         }
         match self.session {
             Some(session) => session.query_limited_rows(|limit| {
-                self.csharp
-                    .declaration_candidates_by_fqn_limited(fqn, true, limit, || {
-                        session.observe_cancellation()
-                    })
+                graph_support::declaration_candidates_by_fqn_limited(
+                    self.csharp,
+                    fqn,
+                    true,
+                    limit,
+                    || session.observe_cancellation(),
+                )
             }),
-            None => self
-                .csharp
-                .declaration_candidates_by_fqn(fqn, true)
+            None => graph_support::declaration_candidates_by_fqn(self.csharp, fqn, true)
                 .into_iter()
                 .collect(),
         }
@@ -130,7 +133,7 @@ impl<'a> CSharpDefinitionProvider<'a> {
 
     fn visible_type_candidates(&self, file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
         if self.session.is_none() {
-            return self.csharp.visible_type_candidates(file, name);
+            return graph_support::visible_type_candidates(self.csharp, file, name);
         }
         let mut using_aliases = || {
             let aliases = self.using_aliases(file);
@@ -149,7 +152,7 @@ impl<'a> CSharpDefinitionProvider<'a> {
                 .collect();
             self.observe_cancellation().then_some(candidates)
         };
-        self.csharp.visible_type_candidates_with_lookups(
+        graph_support::visible_type_candidates_with_lookups(
             name,
             true,
             &mut using_aliases,
@@ -162,10 +165,11 @@ impl<'a> CSharpDefinitionProvider<'a> {
     fn partial_type_parts(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
         match self.session {
             Some(session) => session.query_limited_rows(|limit| {
-                self.csharp
-                    .partial_type_parts_limited(owner, limit, || session.observe_cancellation())
+                graph_support::partial_type_parts_limited(self.csharp, owner, limit, || {
+                    session.observe_cancellation()
+                })
             }),
-            None => self.csharp.partial_type_parts(owner),
+            None => graph_support::partial_type_parts(self.csharp, owner),
         }
     }
 
@@ -192,8 +196,9 @@ impl<'a> CSharpDefinitionProvider<'a> {
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
         match self.session {
-            Some(session) => session
-                .query_limited_rows(|limit| self.csharp.import_statements_limited(file, limit)),
+            Some(session) => session.query_limited_rows(|limit| {
+                graph_support::import_statements_limited(self.csharp, file, limit)
+            }),
             None => self.csharp.import_statements(file),
         }
     }
@@ -214,9 +219,7 @@ impl<'a> CSharpDefinitionProvider<'a> {
         names: &[String],
     ) -> (Vec<CodeUnit>, bool) {
         if self.session.is_none() {
-            return self
-                .csharp
-                .attribute_type_candidates_with_ambiguity(file, names);
+            return hierarchy::attribute_type_candidates_with_ambiguity(self.csharp, file, names);
         }
         let mut visible_type_candidates = |name: &str| {
             let candidates = self.visible_type_candidates(file, name);
@@ -224,13 +227,12 @@ impl<'a> CSharpDefinitionProvider<'a> {
         };
         let mut attribute_class_is_applicable =
             |candidate: &CodeUnit| self.attribute_class_is_applicable(candidate);
-        self.csharp
-            .attribute_type_candidates_with_lookups(
-                names,
-                &mut visible_type_candidates,
-                &mut attribute_class_is_applicable,
-            )
-            .unwrap_or((Vec::new(), false))
+        hierarchy::attribute_type_candidates_with_lookups(
+            names,
+            &mut visible_type_candidates,
+            &mut attribute_class_is_applicable,
+        )
+        .unwrap_or((Vec::new(), false))
     }
 
     fn attribute_class_is_applicable(&self, candidate: &CodeUnit) -> Option<bool> {
@@ -280,7 +282,7 @@ impl<'a> CSharpDefinitionProvider<'a> {
                     if !self.observe_cancellation() {
                         return None;
                     }
-                    if ancestors.is_empty() || self.csharp.logical_type_count(&ancestors) > 1 {
+                    if ancestors.is_empty() || graph_support::logical_type_count(&ancestors) > 1 {
                         unresolved_ancestry = true;
                     } else {
                         stack.extend(ancestors);
@@ -331,15 +333,15 @@ impl<'a> CSharpDefinitionProvider<'a> {
                 if !self.observe_cancellation() {
                     return Vec::new();
                 }
-                if self.csharp.logical_type_count(&candidates) == 1 {
-                    self.csharp.sort_type_candidates(&mut candidates);
+                if graph_support::logical_type_count(&candidates) == 1 {
+                    graph_support::sort_type_candidates(&mut candidates);
                     if let Some(ancestor) = candidates.into_iter().next() {
                         ancestors.push(ancestor);
                     }
                 }
             }
         }
-        self.csharp.sort_dedup_type_candidates(&mut ancestors);
+        graph_support::sort_dedup_type_candidates(&mut ancestors);
         ancestors
     }
 
@@ -3023,7 +3025,7 @@ fn csharp_visible_type_output_candidates(
     name: &str,
 ) -> Vec<CodeUnit> {
     let mut candidates = csharp_visible_type_candidates(csharp, definitions, file, name);
-    csharp.sort_type_candidates(&mut candidates);
+    graph_support::sort_type_candidates(&mut candidates);
     candidates.dedup();
     candidates
 }
@@ -3035,7 +3037,7 @@ fn csharp_logical_visible_type_candidates(
     name: &str,
 ) -> Vec<CodeUnit> {
     let mut candidates = csharp_visible_type_candidates(csharp, definitions, file, name);
-    csharp.sort_dedup_type_candidates(&mut candidates);
+    graph_support::sort_dedup_type_candidates(&mut candidates);
     candidates
 }
 
@@ -3651,16 +3653,16 @@ namespace Demo
         );
         let csharp =
             resolve_analyzer::<CSharpAnalyzer>(fixture.analyzer.analyzer()).expect("C# analyzer");
-        let proven = csharp
-            .declaration_candidates_by_fqn("Demo.ProvenAttribute", false)
-            .into_iter()
-            .find(CodeUnit::is_class)
-            .expect("proven attribute");
-        let unknown = csharp
-            .declaration_candidates_by_fqn("Demo.UnknownAttribute", false)
-            .into_iter()
-            .find(CodeUnit::is_class)
-            .expect("unknown attribute");
+        let proven =
+            graph_support::declaration_candidates_by_fqn(csharp, "Demo.ProvenAttribute", false)
+                .into_iter()
+                .find(CodeUnit::is_class)
+                .expect("proven attribute");
+        let unknown =
+            graph_support::declaration_candidates_by_fqn(csharp, "Demo.UnknownAttribute", false)
+                .into_iter()
+                .find(CodeUnit::is_class)
+                .expect("unknown attribute");
 
         let proven_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
         let proven_definitions = CSharpDefinitionProvider::bounded(csharp, &proven_session);

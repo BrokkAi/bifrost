@@ -32,6 +32,7 @@ use super::resolver::{
     usage_method_return_type_fq_name_for_arity, usage_unqualified_value_member_shadows_type,
     usage_visible_extension_method_candidates,
 };
+use crate::analyzer::csharp::hierarchy;
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
     classify_reference_node, first_precise, parse_and_collect,
@@ -317,9 +318,8 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
                 return;
             };
             let names = csharp_attribute_type_names(name, ctx.source);
-            for candidate in ctx
-                .csharp
-                .usage_unambiguous_attribute_type_candidates(ctx.file, &names)
+            for candidate in
+                hierarchy::usage_unambiguous_attribute_type_candidates(ctx.csharp, ctx.file, &names)
             {
                 ctx.record(candidate.fq_name(), name);
             }

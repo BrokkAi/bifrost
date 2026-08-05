@@ -6915,6 +6915,14 @@ where
         Arc::clone(self.global_usage_definition_index_handle())
     }
 
+    /// The same index [`Self::global_usage_definition_index`] wraps in a
+    /// single-shard handle, borrowed rather than wrapped, so a language
+    /// implementation can hand out a `&dyn BoundedDefinitionLookup` without
+    /// allocating a handle per question.
+    pub(crate) fn global_usage_definition_index_ref(&self) -> &GlobalUsageDefinitionIndex {
+        self.global_usage_definition_index_handle().as_ref()
+    }
+
     /// Owned handle to the derived callable-facts index; see
     /// [`Self::global_usage_definition_index_shared`].
     pub(crate) fn usage_facts_index_shared(&self) -> Arc<UsageFactsIndex> {

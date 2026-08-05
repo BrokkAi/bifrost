@@ -4,7 +4,8 @@ mod clones;
 mod declarations;
 mod dependency_discovery;
 pub mod external;
-mod hierarchy;
+pub(crate) mod graph_support;
+pub(crate) mod hierarchy;
 mod imports;
 mod semantic;
 pub(crate) mod structural;
@@ -51,9 +52,7 @@ use adapter::CSharpAdapter;
 use cache::CSharpMemoCaches;
 use clones::build_csharp_clone_candidate_data;
 use external::{CSharpExternalDeclarationIndex, CSharpExternalMember, CSharpExternalType};
-use imports::{
-    csharp_static_using_from_import, csharp_using_alias_from_import, csharp_using_namespace,
-};
+use graph_support::CSharpAnalysisSource;
 use tests::detect_csharp_test_assertion_smells;
 
 fn limited_known_values<T>(
@@ -327,57 +326,6 @@ impl CSharpAnalyzer {
             .lookup_declarations_by_identifier_limited(identifier, limit, continue_query)
     }
 
-    pub(crate) fn usage_declaration_candidates_by_identifier(
-        &self,
-        identifier: &str,
-    ) -> Vec<CodeUnit> {
-        let index = self.inner.global_usage_definition_index();
-        let lookup: &dyn BoundedDefinitionLookup = &index;
-        lookup.identifier(identifier)
-    }
-
-    pub(crate) fn declaration_candidates_by_fqn(
-        &self,
-        fqn: &str,
-        normalized: bool,
-    ) -> BTreeSet<CodeUnit> {
-        let candidates = self
-            .inner
-            .lookup_declarations_by_persisted_fqn(fqn, normalized);
-        if !normalized {
-            return candidates;
-        }
-        let arity_key = csharp_arity_preserving_full_name(fqn);
-        candidates
-            .into_iter()
-            .filter(|candidate| {
-                csharp_arity_preserving_full_name(&candidate.fq_name()) == arity_key
-            })
-            .collect()
-    }
-
-    pub(crate) fn declaration_candidates_by_fqn_limited(
-        &self,
-        fqn: &str,
-        normalized: bool,
-        limit: usize,
-        continue_query: impl FnMut() -> bool,
-    ) -> LimitedQueryRows<CodeUnit> {
-        let mut batch = self.inner.lookup_declarations_by_persisted_fqn_limited(
-            fqn,
-            normalized,
-            limit,
-            continue_query,
-        );
-        if normalized {
-            let arity_key = csharp_arity_preserving_full_name(fqn);
-            batch.rows.retain(|candidate| {
-                csharp_arity_preserving_full_name(&candidate.fq_name()) == arity_key
-            });
-        }
-        batch
-    }
-
     pub(crate) fn member_candidates_for_owner(
         &self,
         owner_fqn: &str,
@@ -397,41 +345,15 @@ impl CSharpAnalyzer {
             .lookup_members_for_owner_name_limited(owner_fqn, name, limit, continue_query)
     }
 
-    pub(crate) fn usage_member_candidates_for_owner(
-        &self,
-        owner_fqn: &str,
-        name: &str,
-    ) -> Vec<CodeUnit> {
-        let normalized = csharp_normalize_full_name(owner_fqn);
-        let index = self.inner.global_usage_definition_index();
-        let lookup: &dyn BoundedDefinitionLookup = &index;
-        lookup.members_for_owner_name(owner_fqn, &normalized, name)
-    }
-
     pub(crate) fn workspace_namespace_exists(&self, namespace: &str) -> bool {
         self.inner.persisted_package_exists(namespace)
-    }
-
-    pub(crate) fn usage_workspace_namespace_exists(&self, namespace: &str) -> bool {
-        let index = self.inner.global_usage_definition_index();
-        let lookup: &dyn BoundedDefinitionLookup = &index;
-        lookup.package_exists(namespace)
     }
 
     pub fn namespace_of_file(&self, file: &ProjectFile) -> String {
         if let Some(cached) = self.memo_caches.namespace_by_file.get(file) {
             return (*cached).clone();
         }
-        let package = self.inner.package_name_of(file).unwrap_or_default();
-        let namespace = if package.is_empty() {
-            self.declarations(file)
-                .into_iter()
-                .map(|unit| unit.package_name().to_string())
-                .find(|package| !package.is_empty())
-                .unwrap_or_default()
-        } else {
-            package
-        };
+        let namespace = graph_support::compute_namespace_of_file(self, file);
         self.memo_caches
             .namespace_by_file
             .insert(file.clone(), Arc::new(namespace.clone()));
@@ -446,15 +368,14 @@ impl CSharpAnalyzer {
         if let Some(cached) = self.memo_caches.namespace_by_file.get(file) {
             return limited_known_values(1, std::iter::once((*cached).clone()), limit);
         }
-        let package = self.inner.file_namespace_hint_limited(file, limit);
-        if !package.complete {
-            return package;
+        let batch = graph_support::compute_namespace_of_file_limited(self, file, limit);
+        if batch.complete {
+            let namespace = batch.rows.first().cloned().unwrap_or_default();
+            self.memo_caches
+                .namespace_by_file
+                .insert(file.clone(), Arc::new(namespace));
         }
-        let namespace = package.rows.into_iter().next().unwrap_or_default();
-        self.memo_caches
-            .namespace_by_file
-            .insert(file.clone(), Arc::new(namespace.clone()));
-        LimitedQueryRows::complete(vec![namespace], package.inspected)
+        batch
     }
 
     pub fn external_declaration_index(&self) -> &CSharpExternalDeclarationIndex {
@@ -491,40 +412,11 @@ impl CSharpAnalyzer {
         if let Some(cached) = self.memo_caches.using_namespaces.get(file) {
             return (*cached).clone();
         }
-
-        let mut namespaces: Vec<String> = self
-            .inner
-            .import_info_of(file)
-            .iter()
-            .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
-            .collect();
-        for namespace in self.global_using_namespaces() {
-            if !namespaces.contains(namespace) {
-                namespaces.push(namespace.clone());
-            }
-        }
+        let namespaces = graph_support::compute_using_namespaces_of(self, file);
         self.memo_caches
             .using_namespaces
             .insert(file.clone(), Arc::new(namespaces.clone()));
         namespaces
-    }
-
-    pub(crate) fn import_statements_limited(
-        &self,
-        file: &ProjectFile,
-        limit: usize,
-    ) -> LimitedQueryRows<String> {
-        let imports = self.inner.import_info_of_limited(file, limit);
-        let statements = imports
-            .rows
-            .into_iter()
-            .map(|import| import.raw_snippet)
-            .collect();
-        if imports.complete {
-            LimitedQueryRows::complete(statements, imports.inspected)
-        } else {
-            LimitedQueryRows::incomplete(statements, imports.inspected)
-        }
     }
 
     pub(crate) fn using_namespaces_of_limited(
@@ -536,55 +428,25 @@ impl CSharpAnalyzer {
         if let Some(cached) = self.memo_caches.using_namespaces.get(file) {
             return limited_known_values(cached.len(), cached.iter().cloned(), limit);
         }
-        if limit == 0 || !continue_query() {
-            return LimitedQueryRows::incomplete(Vec::new(), 0);
-        }
-
-        let imports = self.inner.import_info_of_limited(file, limit);
-        let mut namespaces: Vec<_> = imports
-            .rows
-            .into_iter()
-            .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
-            .collect();
-        if !imports.complete {
-            return LimitedQueryRows::incomplete(namespaces, imports.inspected);
-        }
-
-        let globals = self.global_using_namespaces_limited(
-            limit.saturating_sub(imports.inspected),
+        let batch = graph_support::compute_using_namespaces_of_limited(
+            self,
+            file,
+            limit,
             &mut continue_query,
         );
-        for namespace in globals.rows {
-            if !namespaces.contains(&namespace) {
-                namespaces.push(namespace);
-            }
+        if batch.complete {
+            self.memo_caches
+                .using_namespaces
+                .insert(file.clone(), Arc::new(batch.rows.clone()));
         }
-        let inspected = imports.inspected.saturating_add(globals.inspected);
-        if !globals.complete {
-            return LimitedQueryRows::incomplete(namespaces, inspected);
-        }
-        self.memo_caches
-            .using_namespaces
-            .insert(file.clone(), Arc::new(namespaces.clone()));
-        LimitedQueryRows::complete(namespaces, inspected)
+        batch
     }
 
     pub fn using_aliases_of(&self, file: &ProjectFile) -> HashMap<String, String> {
         if let Some(cached) = self.memo_caches.using_aliases.get(file) {
             return (*cached).clone();
         }
-
-        let mut aliases: HashMap<String, String> = self
-            .inner
-            .import_info_of(file)
-            .iter()
-            .filter_map(csharp_using_alias_from_import)
-            .collect();
-        for (alias, target) in self.global_using_aliases() {
-            aliases
-                .entry(alias.clone())
-                .or_insert_with(|| target.clone());
-        }
+        let aliases = graph_support::compute_using_aliases_of(self, file);
         self.memo_caches
             .using_aliases
             .insert(file.clone(), Arc::new(aliases.clone()));
@@ -606,53 +468,21 @@ impl CSharpAnalyzer {
                 limit,
             );
         }
-        if limit == 0 || !continue_query() {
-            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        let batch =
+            graph_support::compute_using_aliases_of_limited(self, file, limit, &mut continue_query);
+        if batch.complete {
+            self.memo_caches.using_aliases.insert(
+                file.clone(),
+                Arc::new(batch.rows.iter().cloned().collect::<HashMap<_, _>>()),
+            );
         }
-
-        let imports = self.inner.import_info_of_limited(file, limit);
-        let mut aliases: HashMap<String, String> = imports
-            .rows
-            .iter()
-            .filter_map(csharp_using_alias_from_import)
-            .collect();
-        if !imports.complete {
-            return LimitedQueryRows::incomplete(aliases.into_iter().collect(), imports.inspected);
-        }
-
-        let globals = self.global_using_aliases_limited(
-            limit.saturating_sub(imports.inspected),
-            &mut continue_query,
-        );
-        for (alias, target) in globals.rows {
-            aliases.entry(alias).or_insert(target);
-        }
-        let inspected = imports.inspected.saturating_add(globals.inspected);
-        if !globals.complete {
-            return LimitedQueryRows::incomplete(aliases.into_iter().collect(), inspected);
-        }
-        self.memo_caches
-            .using_aliases
-            .insert(file.clone(), Arc::new(aliases.clone()));
-        LimitedQueryRows::complete(aliases.into_iter().collect(), inspected)
+        batch
     }
 
     pub(crate) fn global_using_namespaces(&self) -> &HashSet<String> {
-        self.memo_caches.global_using_namespaces.get_or_init(|| {
-            self.inner
-                .all_files()
-                .into_iter()
-                .flat_map(|file| self.inner.import_info_of(&file).into_iter())
-                .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
-                .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
-                .map(|namespace| {
-                    normalize_csharp_type_fragment(
-                        namespace.strip_prefix("global::").unwrap_or(&namespace),
-                    )
-                })
-                .filter(|namespace| !namespace.is_empty())
-                .collect()
-        })
+        self.memo_caches
+            .global_using_namespaces
+            .get_or_init(|| graph_support::compute_global_using_namespaces(self))
     }
 
     pub(crate) fn global_using_namespaces_limited(
@@ -663,44 +493,24 @@ impl CSharpAnalyzer {
         if let Some(cached) = self.memo_caches.global_using_namespaces.get() {
             return limited_known_values(cached.len(), cached.iter().cloned(), limit);
         }
-        let imports = self
-            .inner
-            .workspace_import_info_limited(limit, &mut continue_query);
-        let namespaces: HashSet<_> = imports
-            .rows
-            .into_iter()
-            .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
-            .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
-            .map(|namespace| {
-                normalize_csharp_type_fragment(
-                    namespace.strip_prefix("global::").unwrap_or(&namespace),
-                )
-            })
-            .filter(|namespace| !namespace.is_empty())
-            .collect();
-        if !imports.complete {
-            return LimitedQueryRows::incomplete(
-                namespaces.into_iter().collect(),
-                imports.inspected,
-            );
+        let batch = graph_support::compute_global_using_namespaces_limited(
+            self,
+            limit,
+            &mut continue_query,
+        );
+        if batch.complete {
+            let _ = self
+                .memo_caches
+                .global_using_namespaces
+                .set(batch.rows.iter().cloned().collect());
         }
-        let _ = self
-            .memo_caches
-            .global_using_namespaces
-            .set(namespaces.clone());
-        LimitedQueryRows::complete(namespaces.into_iter().collect(), imports.inspected)
+        batch
     }
 
     fn global_using_aliases(&self) -> &HashMap<String, String> {
-        self.memo_caches.global_using_aliases.get_or_init(|| {
-            self.inner
-                .all_files()
-                .into_iter()
-                .flat_map(|file| self.inner.import_info_of(&file).into_iter())
-                .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
-                .filter_map(|import| csharp_using_alias_from_import(&import))
-                .collect()
-        })
+        self.memo_caches
+            .global_using_aliases
+            .get_or_init(|| graph_support::compute_global_using_aliases(self))
     }
 
     pub(crate) fn global_using_aliases_limited(
@@ -717,20 +527,15 @@ impl CSharpAnalyzer {
                 limit,
             );
         }
-        let imports = self
-            .inner
-            .workspace_import_info_limited(limit, &mut continue_query);
-        let aliases: HashMap<_, _> = imports
-            .rows
-            .iter()
-            .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
-            .filter_map(csharp_using_alias_from_import)
-            .collect();
-        if !imports.complete {
-            return LimitedQueryRows::incomplete(aliases.into_iter().collect(), imports.inspected);
+        let batch =
+            graph_support::compute_global_using_aliases_limited(self, limit, &mut continue_query);
+        if batch.complete {
+            let _ = self
+                .memo_caches
+                .global_using_aliases
+                .set(batch.rows.iter().cloned().collect());
         }
-        let _ = self.memo_caches.global_using_aliases.set(aliases.clone());
-        LimitedQueryRows::complete(aliases.into_iter().collect(), imports.inspected)
+        batch
     }
 
     pub(crate) fn global_static_using_type_names_limited(
@@ -741,390 +546,141 @@ impl CSharpAnalyzer {
         if let Some(cached) = self.memo_caches.global_static_using_type_names.get() {
             return limited_known_values(cached.len(), cached.iter().cloned(), limit);
         }
-        let imports = self
-            .inner
-            .workspace_import_info_limited(limit, &mut continue_query);
-        let mut type_names: Vec<_> = imports
-            .rows
-            .iter()
-            .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
-            .filter_map(csharp_static_using_from_import)
-            .map(|target| {
-                normalize_csharp_type_fragment(target.strip_prefix("global::").unwrap_or(target))
-            })
-            .filter(|target| !target.is_empty())
-            .collect();
-        type_names.sort();
-        type_names.dedup();
-        if !imports.complete {
-            return LimitedQueryRows::incomplete(type_names, imports.inspected);
+        let batch = graph_support::compute_global_static_using_type_names_limited(
+            self,
+            limit,
+            &mut continue_query,
+        );
+        if batch.complete {
+            let _ = self
+                .memo_caches
+                .global_static_using_type_names
+                .set(batch.rows.clone());
         }
-        let _ = self
-            .memo_caches
-            .global_static_using_type_names
-            .set(type_names.clone());
-        LimitedQueryRows::complete(type_names, imports.inspected)
+        batch
     }
 
     pub(crate) fn global_static_using_types(&self) -> &[CodeUnit] {
-        self.memo_caches.global_static_using_types.get_or_init(|| {
-            let mut types = Vec::new();
-            for file in self.inner.all_files() {
-                for target in self
-                    .inner
-                    .import_info_of(&file)
-                    .iter()
-                    .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
-                    .filter_map(csharp_static_using_from_import)
-                {
-                    let target = normalize_csharp_type_fragment(
-                        target.strip_prefix("global::").unwrap_or(target),
-                    );
-                    types.extend(self.type_candidates_by_fqn(&target, false));
-                }
-            }
-            types.sort();
-            types.dedup();
-            types
-        })
+        self.memo_caches
+            .global_static_using_types
+            .get_or_init(|| graph_support::compute_global_static_using_types(self))
     }
 
     pub(crate) fn usage_global_static_using_types(&self) -> &[CodeUnit] {
         self.memo_caches
             .usage_global_static_using_types
-            .get_or_init(|| {
-                let mut types = Vec::new();
-                for file in self.inner.all_files() {
-                    for target in self
-                        .inner
-                        .import_info_of(&file)
-                        .iter()
-                        .filter(|import| {
-                            import.raw_snippet.trim_start().starts_with("global using ")
-                        })
-                        .filter_map(csharp_static_using_from_import)
-                    {
-                        let target = normalize_csharp_type_fragment(
-                            target.strip_prefix("global::").unwrap_or(target),
-                        );
-                        types.extend(self.type_candidates_by_fqn(&target, true));
-                    }
-                }
-                types.sort();
-                types.dedup();
-                types
-            })
+            .get_or_init(|| graph_support::compute_usage_global_static_using_types(self))
     }
+}
 
-    pub fn visible_type_candidates(&self, file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
-        self.visible_type_candidates_inner(file, name, true, false)
-    }
-
-    pub(crate) fn usage_visible_type_candidates(
+impl CSharpAnalysisSource for CSharpAnalyzer {
+    fn persisted_declaration_candidates_by_fqn(
         &self,
-        file: &ProjectFile,
-        name: &str,
-    ) -> Vec<CodeUnit> {
-        self.visible_type_candidates_inner(file, name, true, true)
+        fqn: &str,
+        normalized: bool,
+    ) -> BTreeSet<CodeUnit> {
+        self.inner
+            .lookup_declarations_by_persisted_fqn(fqn, normalized)
     }
 
-    pub(crate) fn partial_type_parts(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
-        if !owner.is_class() {
-            return Vec::new();
-        }
-        let owner_key = self.type_declaration_key(owner);
-        let mut parts: Vec<_> = self
-            .inner
-            .get_definitions(&owner.fq_name())
-            .into_iter()
-            .filter(|unit| unit.is_class() && self.type_declaration_key(unit) == owner_key)
-            .collect();
-        self.sort_type_candidates(&mut parts);
-        parts.dedup();
-        parts
-    }
-
-    pub(crate) fn partial_type_parts_limited(
+    fn persisted_declaration_candidates_by_fqn_limited(
         &self,
-        owner: &CodeUnit,
+        fqn: &str,
+        normalized: bool,
         limit: usize,
-        continue_query: impl FnMut() -> bool,
+        continue_query: &mut dyn FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
-        if !owner.is_class() {
-            return LimitedQueryRows::complete(Vec::new(), 0);
-        }
-        let batch = self.declaration_candidates_by_fqn_limited(
-            &owner.fq_name(),
-            false,
+        self.inner.lookup_declarations_by_persisted_fqn_limited(
+            fqn,
+            normalized,
             limit,
             continue_query,
-        );
-        if !batch.complete {
-            return LimitedQueryRows::incomplete(Vec::new(), batch.inspected);
-        }
-        let owner_key = self.type_declaration_key(owner);
-        let mut parts: Vec<_> = batch
-            .rows
-            .into_iter()
-            .filter(|unit| unit.is_class() && self.type_declaration_key(unit) == owner_key)
-            .collect();
-        self.sort_type_candidates(&mut parts);
-        parts.dedup();
-        LimitedQueryRows::complete(parts, batch.inspected)
-    }
-
-    pub(crate) fn usage_partial_type_parts(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
-        if !owner.is_class() {
-            return Vec::new();
-        }
-        let owner_key = self.type_declaration_key(owner);
-        let mut parts: Vec<_> = self
-            .usage_definition_candidates_by_fqn(&owner.fq_name())
-            .into_iter()
-            .filter(|unit| unit.is_class() && self.type_declaration_key(unit) == owner_key)
-            .collect();
-        self.sort_type_candidates(&mut parts);
-        parts.dedup();
-        parts
-    }
-
-    pub(crate) fn sort_dedup_type_candidates(&self, candidates: &mut Vec<CodeUnit>) {
-        let mut keyed: Vec<_> = candidates
-            .drain(..)
-            .map(|unit| {
-                let key = self.type_declaration_key(&unit);
-                let source = crate::path_utils::rel_path_string(unit.source());
-                (unit, key, source)
-            })
-            .collect();
-        keyed.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.2.cmp(&right.2)));
-        keyed.dedup_by(|left, right| left.1 == right.1);
-        candidates.extend(keyed.into_iter().map(|(unit, _, _)| unit));
-    }
-
-    pub(crate) fn sort_type_candidates(&self, candidates: &mut [CodeUnit]) {
-        candidates.sort_by_cached_key(|unit| {
-            (
-                self.type_declaration_key(unit),
-                crate::path_utils::rel_path_string(unit.source()),
-            )
-        });
-    }
-
-    pub(crate) fn logical_type_count(&self, candidates: &[CodeUnit]) -> usize {
-        candidates
-            .iter()
-            .map(|unit| self.type_declaration_key(unit))
-            .collect::<HashSet<_>>()
-            .len()
-    }
-
-    pub(crate) fn first_logical_type_fqn(&self, candidates: &[CodeUnit]) -> Option<String> {
-        let mut sorted = candidates.to_vec();
-        self.sort_type_candidates(&mut sorted);
-        sorted.first().map(CodeUnit::fq_name)
-    }
-
-    fn type_declaration_key(&self, unit: &CodeUnit) -> String {
-        unit.fq_name()
-    }
-
-    pub fn resolve_visible_type(&self, file: &ProjectFile, name: &str) -> Option<CodeUnit> {
-        let candidates = self.visible_type_candidates(file, name);
-        (self.logical_type_count(&candidates) == 1)
-            .then(|| {
-                let mut candidates = candidates;
-                self.sort_type_candidates(&mut candidates);
-                candidates.into_iter().next()
-            })
-            .flatten()
-    }
-
-    pub(crate) fn resolve_usage_visible_type(
-        &self,
-        file: &ProjectFile,
-        name: &str,
-    ) -> Option<CodeUnit> {
-        let candidates = self.usage_visible_type_candidates(file, name);
-        (self.logical_type_count(&candidates) == 1)
-            .then(|| {
-                let mut candidates = candidates;
-                self.sort_type_candidates(&mut candidates);
-                candidates.into_iter().next()
-            })
-            .flatten()
-    }
-
-    fn visible_type_candidates_inner(
-        &self,
-        file: &ProjectFile,
-        name: &str,
-        resolve_aliases: bool,
-        usage: bool,
-    ) -> Vec<CodeUnit> {
-        let mut using_aliases = || Some(self.using_aliases_of(file));
-        let mut namespace_of_file = || Some(self.namespace_of_file(file));
-        let mut using_namespaces = || Some(self.using_namespaces_of(file));
-        let mut type_candidates = |fqn: &str| Some(self.type_candidates_by_fqn(fqn, usage));
-        self.visible_type_candidates_with_lookups(
-            name,
-            resolve_aliases,
-            &mut using_aliases,
-            &mut namespace_of_file,
-            &mut using_namespaces,
-            &mut type_candidates,
         )
     }
 
-    pub(crate) fn visible_type_candidates_with_lookups<Aliases, Namespace, Usings, Candidates>(
+    fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.inner.forward_definition_fqn(fqn)
+    }
+
+    fn usage_definitions(&self) -> &dyn BoundedDefinitionLookup {
+        self.inner.global_usage_definition_index_ref()
+    }
+
+    fn all_files(&self) -> Vec<ProjectFile> {
+        self.inner.all_files()
+    }
+
+    fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
+        self.inner.package_name_of(file)
+    }
+
+    fn file_namespace_hint_limited(
         &self,
-        name: &str,
-        resolve_aliases: bool,
-        using_aliases: &mut Aliases,
-        namespace_of_file: &mut Namespace,
-        using_namespaces: &mut Usings,
-        type_candidates_by_fqn: &mut Candidates,
-    ) -> Vec<CodeUnit>
-    where
-        Aliases: FnMut() -> Option<HashMap<String, String>>,
-        Namespace: FnMut() -> Option<String>,
-        Usings: FnMut() -> Option<Vec<String>>,
-        Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
-    {
-        let mut normalized = normalize_csharp_type_fragment(name);
-        if normalized.is_empty() {
-            return Vec::new();
-        }
-        let mut global_qualified = false;
-        if let Some((alias, suffix)) = normalized.split_once("::") {
-            normalized = if alias == "global" {
-                global_qualified = true;
-                suffix.to_string()
-            } else if let Some(target) =
-                using_aliases().and_then(|mut aliases| aliases.remove(alias))
-            {
-                if suffix.is_empty() {
-                    target
-                } else {
-                    format!("{target}.{suffix}")
-                }
-            } else {
-                return Vec::new();
-            };
-        }
-        if global_qualified {
-            return type_candidates_by_fqn(&normalized).unwrap_or_default();
-        }
-        if resolve_aliases
-            && let Some(target) =
-                using_aliases().and_then(|aliases| aliases.get(&normalized).cloned())
-            && target != normalized
-        {
-            return self.visible_type_candidates_with_lookups(
-                &target,
-                false,
-                using_aliases,
-                namespace_of_file,
-                using_namespaces,
-                type_candidates_by_fqn,
-            );
-        }
-
-        let Some(mut namespace) = namespace_of_file() else {
-            return Vec::new();
-        };
-        if !namespace.is_empty() {
-            let Some(candidates) = type_candidates_by_fqn(&format!("{namespace}.{normalized}"))
-            else {
-                return Vec::new();
-            };
-            if !candidates.is_empty() {
-                return candidates;
-            }
-        }
-
-        let mut visible = Vec::new();
-        let Some(namespaces) = using_namespaces() else {
-            return Vec::new();
-        };
-        for using_namespace in namespaces {
-            let Some(candidates) =
-                type_candidates_by_fqn(&format!("{using_namespace}.{normalized}"))
-            else {
-                return Vec::new();
-            };
-            visible.extend(
-                candidates
-                    .into_iter()
-                    .filter(|candidate| candidate.package_name() == using_namespace),
-            );
-        }
-        if !visible.is_empty() {
-            return visible;
-        }
-
-        while let Some(separator) = namespace.rfind('.') {
-            namespace.truncate(separator);
-            let Some(candidates) = type_candidates_by_fqn(&format!("{namespace}.{normalized}"))
-            else {
-                return Vec::new();
-            };
-            if !candidates.is_empty() {
-                return candidates;
-            }
-        }
-
-        type_candidates_by_fqn(&normalized).unwrap_or_default()
+        file: &ProjectFile,
+        limit: usize,
+    ) -> LimitedQueryRows<String> {
+        self.inner.file_namespace_hint_limited(file, limit)
     }
 
-    fn type_candidates_by_fqn(&self, fqn: &str, usage: bool) -> Vec<CodeUnit> {
-        if usage {
-            return self.usage_type_candidates_by_fqn(fqn);
-        }
+    fn import_info_of_limited(
+        &self,
+        file: &ProjectFile,
+        limit: usize,
+    ) -> LimitedQueryRows<crate::analyzer::ImportInfo> {
+        self.inner.import_info_of_limited(file, limit)
+    }
+
+    fn workspace_import_info_limited(
+        &self,
+        limit: usize,
+        continue_query: &mut dyn FnMut() -> bool,
+    ) -> LimitedQueryRows<crate::analyzer::ImportInfo> {
         self.inner
-            .forward_definition_fqn(fqn)
-            .into_iter()
-            .filter(|unit| unit.is_class())
-            .collect()
+            .workspace_import_info_limited(limit, continue_query)
     }
 
-    pub(crate) fn usage_type_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        let index = self.inner.global_usage_definition_index();
-        let lookup: &dyn BoundedDefinitionLookup = &index;
-        let exact = lookup
-            .fqn(fqn)
-            .iter()
-            .filter(|unit| unit.is_class())
-            .cloned()
-            .collect::<Vec<_>>();
-        if !exact.is_empty() {
-            return exact;
-        }
-        let arity_key = csharp_arity_preserving_full_name(fqn);
-        lookup
-            .by_normalized_fqn(&csharp_normalize_full_name(fqn))
-            .iter()
-            .filter(|unit| {
-                unit.is_class() && csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key
-            })
-            .cloned()
-            .collect()
+    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.inner.raw_supertypes_of(code_unit)
     }
 
-    pub(crate) fn usage_definition_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        let index = self.inner.global_usage_definition_index();
-        let lookup: &dyn BoundedDefinitionLookup = &index;
-        let exact = lookup.fqn(fqn);
-        if !exact.is_empty() {
-            return exact.to_vec();
-        }
-        let arity_key = csharp_arity_preserving_full_name(fqn);
-        lookup
-            .by_normalized_fqn(&csharp_normalize_full_name(fqn))
-            .iter()
-            .filter(|unit| csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key)
-            .cloned()
-            .collect()
+    fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>> {
+        self.inner.type_identifiers_of(file)
+    }
+
+    fn namespace_of_file(&self, file: &ProjectFile) -> String {
+        CSharpAnalyzer::namespace_of_file(self, file)
+    }
+
+    fn using_namespaces_of(&self, file: &ProjectFile) -> Vec<String> {
+        CSharpAnalyzer::using_namespaces_of(self, file)
+    }
+
+    fn using_aliases_of(&self, file: &ProjectFile) -> HashMap<String, String> {
+        CSharpAnalyzer::using_aliases_of(self, file)
+    }
+
+    fn global_using_namespaces(&self) -> &HashSet<String> {
+        CSharpAnalyzer::global_using_namespaces(self)
+    }
+
+    fn global_using_namespaces_limited(
+        &self,
+        limit: usize,
+        continue_query: &mut dyn FnMut() -> bool,
+    ) -> LimitedQueryRows<String> {
+        CSharpAnalyzer::global_using_namespaces_limited(self, limit, continue_query)
+    }
+
+    fn global_using_aliases(&self) -> &HashMap<String, String> {
+        CSharpAnalyzer::global_using_aliases(self)
+    }
+
+    fn global_using_aliases_limited(
+        &self,
+        limit: usize,
+        continue_query: &mut dyn FnMut() -> bool,
+    ) -> LimitedQueryRows<(String, String)> {
+        CSharpAnalyzer::global_using_aliases_limited(self, limit, continue_query)
     }
 }
 

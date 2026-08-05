@@ -1,3 +1,4 @@
+use crate::analyzer::csharp::{graph_support, hierarchy};
 use crate::analyzer::usages::csharp_graph::hits::{
     push_hit, push_self_receiver_hit, push_unproven_hit,
 };
@@ -279,7 +280,8 @@ fn csharp_receiver_member_selects_visible_target(
     resolved_fqn: &str,
     ctx: &mut ScanCtx<'_>,
 ) -> bool {
-    let Some(visible) = ctx.csharp.resolve_usage_visible_type(ctx.file, reference) else {
+    let Some(visible) = graph_support::resolve_usage_visible_type(ctx.csharp, ctx.file, reference)
+    else {
         return false;
     };
     if !type_identity_matches(&visible.fq_name(), &ctx.spec.target.fq_name()) {
@@ -323,9 +325,7 @@ fn scan_attribute_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let names = csharp_attribute_type_names(name, ctx.source);
-    if ctx
-        .csharp
-        .usage_unambiguous_attribute_type_candidates(ctx.file, &names)
+    if hierarchy::usage_unambiguous_attribute_type_candidates(ctx.csharp, ctx.file, &names)
         .into_iter()
         .any(|candidate| type_identity_matches(&candidate.fq_name(), &ctx.spec.target.fq_name()))
     {
