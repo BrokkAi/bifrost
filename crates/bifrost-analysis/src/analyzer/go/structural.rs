@@ -5,6 +5,7 @@ use crate::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
     first_named_child,
 };
+use crate::analyzer::structural::{DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT};
 use crate::analyzer::structural::{LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT};
 use crate::analyzer::structural::{NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport};
 use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, Span, StructuralSpec};
@@ -197,6 +198,10 @@ impl StructuralSpec for GoStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &NO_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn materialization_support(&self) -> &DeclarationMaterializationSupport {
+        &NO_MATERIALIZATION_SUPPORT
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {

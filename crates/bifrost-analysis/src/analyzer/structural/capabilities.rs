@@ -6,6 +6,7 @@
 //! into stable diagnostics.
 
 use super::kinds::{NormalizedKind, Role};
+use super::materialization::MaterializationAxis;
 use super::occurrences::OccurrenceRole;
 use super::query::{CodeQuerySeed, OccurrenceFilter};
 use super::resolution::EnvironmentAxis;
@@ -29,6 +30,18 @@ pub(crate) enum QueryFeature {
     /// `OccurrenceRole` was parked between its registry and its query surface.
     #[allow(dead_code)]
     EnvironmentAxis(EnvironmentAxis),
+    /// The declaration-materialization axes a generation, export, state, or
+    /// linkage query depends on an adapter answering (issue #1476).
+    ///
+    /// The query surface that produces these arrives with the
+    /// `generation-sites`, `exports`, `generates` and `implementation-of`
+    /// steps; the variant exists now so the materialization support tables
+    /// the adapters already declare have exactly one route to a diagnostic,
+    /// and so the derivation layer built next has the message to report
+    /// against. This mirrors how `OccurrenceRole` and `EnvironmentAxis` were
+    /// parked between their registries and their query surfaces.
+    #[allow(dead_code)]
+    MaterializationAxis(MaterializationAxis),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -81,6 +94,9 @@ impl QueryFeatures {
                 QueryFeature::Role(role) => unsupported.roles.push(role),
                 QueryFeature::OccurrenceRole(role) => unsupported.occurrence_roles.push(role),
                 QueryFeature::EnvironmentAxis(axis) => unsupported.environment_axes.push(axis),
+                QueryFeature::MaterializationAxis(axis) => {
+                    unsupported.materialization_axes.push(axis)
+                }
             }
         }
         unsupported
@@ -93,6 +109,7 @@ pub(crate) struct UnsupportedQueryFeatures {
     roles: Vec<Role>,
     occurrence_roles: Vec<OccurrenceRole>,
     environment_axes: Vec<EnvironmentAxis>,
+    materialization_axes: Vec<MaterializationAxis>,
 }
 
 impl UnsupportedQueryFeatures {
@@ -120,6 +137,14 @@ impl UnsupportedQueryFeatures {
             diagnostics.push(QueryCapabilityDiagnostic {
                 language,
                 unsupported: UnsupportedFeatureGroup::EnvironmentAxes(self.environment_axes),
+            });
+        }
+        if !self.materialization_axes.is_empty() {
+            diagnostics.push(QueryCapabilityDiagnostic {
+                language,
+                unsupported: UnsupportedFeatureGroup::MaterializationAxes(
+                    self.materialization_axes,
+                ),
             });
         }
         diagnostics
@@ -159,6 +184,11 @@ impl QueryCapabilityDiagnostic {
                 self.language.config_label(),
                 labels(axes.iter().copied().map(EnvironmentAxis::label))
             ),
+            UnsupportedFeatureGroup::MaterializationAxes(axes) => format!(
+                "structural adapter for {} does not support declaration materialization axis(es): {}",
+                self.language.config_label(),
+                labels(axes.iter().copied().map(MaterializationAxis::label))
+            ),
         }
     }
 }
@@ -169,6 +199,7 @@ enum UnsupportedFeatureGroup {
     Roles(Vec<Role>),
     OccurrenceRoles(Vec<OccurrenceRole>),
     EnvironmentAxes(Vec<EnvironmentAxis>),
+    MaterializationAxes(Vec<MaterializationAxis>),
 }
 
 fn labels(labels: impl Iterator<Item = &'static str>) -> String {
@@ -258,6 +289,32 @@ mod tests {
         assert_eq!(
             diagnostics[1].message(),
             "structural adapter for scala does not support lexical environment axis(es): scopes, candidate_rejection"
+        );
+    }
+
+    /// An adapter that records no materialization provenance must reach the
+    /// same `Incomplete` diagnostic spine (#1476), and the family stays its
+    /// own group so a caller can tell "cannot state this file's scopes" from
+    /// "cannot state where this file's declarations come from".
+    #[test]
+    fn unsupported_materialization_axes_become_their_own_diagnostic_group() {
+        let features = QueryFeatures::new([
+            QueryFeature::MaterializationAxis(MaterializationAxis::GenerationSites),
+            QueryFeature::MaterializationAxis(MaterializationAxis::ImplementationLinkage),
+            QueryFeature::EnvironmentAxis(EnvironmentAxis::Scopes),
+        ]);
+        let diagnostics = features
+            .unsupported_by(|_| false)
+            .into_diagnostics(Language::Go);
+
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            diagnostics[0].message(),
+            "structural adapter for go does not support lexical environment axis(es): scopes"
+        );
+        assert_eq!(
+            diagnostics[1].message(),
+            "structural adapter for go does not support declaration materialization axis(es): generation_sites, implementation_linkage"
         );
     }
 }

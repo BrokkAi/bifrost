@@ -22,7 +22,7 @@ Observability: after the final milestone, `cargo nextest run` shows materializat
 - [x] (2026-08-05) Branch `dave/github-issue-1476-c500c1` merged with `origin/master` at `8986c0b99` so the #1473/#1474 foundation (schema v9, occurrence and environment rows, assertion kind, capability spine) is present.
 - [x] (2026-08-05) Codebase survey completed (producers for Ruby generation, Python overload, JS/TS exports, C++ macros/recovery; foundation surfaces). Findings recorded in Context and Orientation below.
 - [x] (2026-08-05) ExecPlan drafted.
-- [ ] Milestone 1 — core vocabulary, materialization axes, capability tables.
+- [x] (2026-08-05) Milestone 1 — core vocabulary, materialization axes, capability tables. Landed as one code commit plus this plan update: `crates/bifrost-core/src/analyzer/structural/materialization.rs` (four vocabularies, six axes, the total support table, four per-language statics), the required `StructuralSpec::materialization_support` with all eleven adapter implementations, the `StructuralSearchProvider::structural_supports_materialization_axis` passthrough, and `QueryFeature::MaterializationAxis` parked through the capability spine with its own diagnostic group. Validation: `cargo nextest run -p brokk-bifrost-core -p brokk-bifrost-analysis` 1878 passed; workspace all-features clippy clean.
 - [ ] Milestone 2 — producer-side provenance recording (Ruby, JS/TS, C++) with persistence.
 - [ ] Milestone 3 — materialization derivation layer (state, generation, export, linkage rows).
 - [ ] Milestone 4 — RQL/JSON typed domain exposure, schema version 10.
@@ -43,7 +43,13 @@ Findings from the pre-plan survey (2026-08-05). Update this section as implement
 - Observation: the sibling substrate this plan reuses is exactly three files' pattern. Per-file derived rows with per-axis completeness: `structural/lexical_environment.rs` (1427 lines); vocabulary + declared support in core: `structural/resolution.rs` (489 lines, `labelled_enum!` shared from `occurrences.rs`); capability plumbing: `QueryFeature` in `structural/capabilities.rs` with per-adapter support hooks on `StructuralSpec`/`StructuralSearchProvider`. Current RQL `SCHEMA_VERSION` is 9 (`query/ir.rs:39`); the versions ladder in `query/schema.rs:28-38` ends at `RQL_RESOLUTION_SCHEMA_VERSION: u32 = 9`.
 - Observation: Ruby's structural adapter maps `call` to `NormalizedKind::Call` (`ruby/structural.rs:20`), so a Ruby generation site (an `attr_accessor`/`alias_method` call) *is* already an arena fact and can anchor a row by AST identity without new fact kinds.
 
+- Observation (M1): `labelled_enum!` derives serde with `rename_all = "snake_case"`, and the vocabulary test asserts serde output equals `label()`, so a label must be the exact serde snake_case of its variant name. `CommonJsRoot` is therefore labelled `common_js_root`, not the plan's sketched `commonjs_root`; anyone adding a variant must derive the label from the variant name, not from taste.
+
 ## Decision Log
+
+- Decision (M1): `materialization_support` is a required `StructuralSpec` method with no default, not the defaulted hook the first plan draft sketched, matching `occurrence_role_support` and `lexical_environment_support` verbatim ("deliberately has no default: the table is total, so a default would let a new adapter advertise support nobody implemented"). All eleven adapters state a table; seven state `NO_MATERIALIZATION_SUPPORT`.
+  Rationale: convention consistency beats the marginal convenience of a default; the two sibling tables set the pattern and a third table that behaves differently would be a trap.
+  Date/Author: 2026-08-05, Fable 5.
 
 - Decision: the claimed language/axis matrix is deliberately non-uniform, unlike #1473/#1474's four-deep-adapter uniformity. Ruby claims generation sites and generated sets; Python claims declaration state (declaration-only) and implementation linkage; JS/TS claims export rows; C++ claims macro-definition rows, recovery provenance, and configuration gating. Nothing claims all axes. The mined commits are per-language by nature (attr_* is Ruby; @overload is Python; module.exports is JS; #define/recovery is C++), and forcing a uniform matrix would mean either inventing capabilities no producer computes or shrinking the slice to the empty intersection. The support table makes non-uniformity honest: every unclaimed (language, axis) pair reports unsupported, and queries over it report incomplete.
   Rationale: the capability spine exists precisely so partial rollout is sound; each axis ships where its producer already lives.

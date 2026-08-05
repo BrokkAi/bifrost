@@ -43,7 +43,9 @@ pub mod search;
 // The normalized kind/role registry and the spec trait a language implements
 // live in `brokk-bifrost-core`, below every grammar; only the engine that
 // consumes them stays here.
-pub use brokk_bifrost_core::analyzer::structural::{kinds, occurrences, resolution, spec};
+pub use brokk_bifrost_core::analyzer::structural::{
+    kinds, materialization, occurrences, resolution, spec,
+};
 
 pub use analysis_context::{
     MAX_PROTOCOL_NAME_BYTES, MAX_PROTOCOL_NAMESPACE_BYTES, MAX_PROTOCOL_REF_BYTES,
@@ -84,6 +86,13 @@ pub use lexical_environment::{
     BindingRow, ENVIRONMENT_PRODUCER_AXES, EnvironmentCompleteness, EnvironmentFileResult,
     EnvironmentIncompleteReason, ImportBinderDetail, PackageClauseRow, ReachingBindingOutcome,
     ScopeAnchor, ScopeRow, WILDCARD_IMPORT_NAME, environment_for_file, reaching_binding,
+};
+pub use materialization::{
+    ALL_DECLARATION_ORIGINS, ALL_EXPORT_FORMS, ALL_GENERATION_INPUT_CLASSES, ALL_GENERATION_KINDS,
+    ALL_MATERIALIZATION_AXES, CPP_MATERIALIZATION_SUPPORT, DeclarationMaterializationSupport,
+    DeclarationOrigin, ExportForm, GenerationInputClass, GenerationKind,
+    JS_TS_MATERIALIZATION_SUPPORT, MaterializationAxis, MaterializationSupport,
+    NO_MATERIALIZATION_SUPPORT, PYTHON_MATERIALIZATION_SUPPORT, RUBY_MATERIALIZATION_SUPPORT,
 };
 pub use occurrence_rows::{
     OccurrenceCompleteness, OccurrenceDerivationOptions, OccurrenceFileResult,

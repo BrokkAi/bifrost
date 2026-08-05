@@ -1496,6 +1496,13 @@ mod tests {
         ) -> bool {
             true
         }
+
+        fn structural_supports_materialization_axis(
+            &self,
+            _axis: crate::analyzer::structural::materialization::MaterializationAxis,
+        ) -> bool {
+            true
+        }
     }
 
     fn provider() -> FakeProvider {
