@@ -22,6 +22,8 @@ use crate::hash::{HashMap, map_with_capacity};
 
 pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 1;
 
+type DependencyEvidencePublication = (Box<[Language]>, super::DependencyDiscoveryEvidence);
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SemanticModelActivationEvidence {
     pub language: String,
@@ -973,7 +975,7 @@ impl SemanticModelRuntimeCache {
         &self,
         analyzer: &dyn IAnalyzer,
         active: &Arc<ResolvedActiveSemanticModels>,
-        dependency_evidence: Option<&[(Box<[Language]>, super::DependencyDiscoveryEvidence)]>,
+        dependency_evidence: Option<&[DependencyEvidencePublication]>,
         cancellation: &CancellationToken,
         max_combined_retained_bytes: u64,
     ) -> Result<Arc<SemanticModelOverlay>, SemanticModelOverlayBuildError> {
@@ -1379,7 +1381,7 @@ pub fn acquire_active_semantic_models_with_evidence(
     catalog: &SemanticPackCatalog,
     persistence: Option<SemanticModelActivationPersistence<'_>>,
     request: &SemanticModelActivationRequest,
-    dependency_evidence: Option<&[(Box<[Language]>, super::DependencyDiscoveryEvidence)]>,
+    dependency_evidence: Option<&[DependencyEvidencePublication]>,
     cancellation: &CancellationToken,
 ) -> SemanticModelRuntimeOutcome {
     let request_key = match runtime_request_key(request) {
