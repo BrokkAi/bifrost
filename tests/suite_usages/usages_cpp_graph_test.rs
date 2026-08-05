@@ -227,6 +227,74 @@ void consume(const Values& values) {
 }
 
 #[test]
+fn authoritative_cpp_range_for_type_reference_resolves_global_value_type() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "symboldatabase.h",
+            r#"#pragma once
+class ValueType {
+public:
+    enum Type { LONGLONG };
+};
+"#,
+        )
+        .file(
+            "vfvalue.h",
+            r#"#pragma once
+namespace ValueFlow {
+class Value {
+public:
+    enum class ValueType { INT };
+};
+}
+"#,
+        )
+        .file(
+            "valueflow.cpp",
+            r###"#include "symboldatabase.h"
+#include "vfvalue.h"
+namespace std {
+template<class T> class vector {
+public:
+    T* begin() const;
+    T* end() const;
+};
+}
+std::vector<ValueType> getParentValueTypes();
+bool ValueFlow::isLifetimeBorrowed() {
+    std::vector<ValueType> vtParents = getParentValueTypes();
+    for (const ValueType& vtParent : vtParents) {
+        (void)vtParent;
+    }
+    return true;
+}
+"###,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "ValueType"
+    });
+    let file = project.file("valueflow.cpp");
+    let source = file.read_to_string().expect("valueflow source");
+    let range_type = fixture_token_range(
+        &source,
+        "    for (const ValueType& vtParent : vtParents) {",
+        "ValueType",
+    );
+    let hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &file);
+    assert!(
+        hits.contains(&range_type),
+        "range-for type reference must resolve to global ValueType: {hits:#?}"
+    );
+    assert!(!hits.contains(&fixture_token_range(
+        &source,
+        "    for (const ValueType& vtParent : vtParents) {",
+        "vtParent",
+    )));
+}
+
+#[test]
 fn authoritative_cpp_template_forwarding_overload_selects_by_call_arity() {
     let header = r#"
 #pragma once

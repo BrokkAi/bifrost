@@ -1354,6 +1354,7 @@ fn run_rql_query_result(
                     CodeQueryResultValue::LexicalScope { value } => &value.path,
                     CodeQueryResultValue::Binding { value } => &value.path,
                     CodeQueryResultValue::ResolutionCandidate { value } => &value.path,
+                    CodeQueryResultValue::ReferenceEdge { value } => &value.path,
                     CodeQueryResultValue::QualifiedPath { value } => &value.path,
                     CodeQueryResultValue::PathSegment { value } => &value.path,
                 };

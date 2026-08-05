@@ -589,6 +589,42 @@ export interface RqlResolutionCandidateResult extends RqlQueryResultBase {
   external_target?: string;
 }
 
+/**
+ * One canonical reference edge, in the same row shape whichever producer
+ * derived it.
+ *
+ * The producer label is serialized as `edge_provenance` so the branch trace
+ * every result item carries keeps the `provenance` key to itself.
+ */
+export interface RqlReferenceEdgeResult extends RqlQueryResultBase {
+  result_type: "reference_edge";
+  id: string;
+  /**
+   * The site token's AST identity, absent when the producer cannot address
+   * the site as a facts-arena node. Where present it is the join with a
+   * capture's or an occurrence's `ast_id`.
+   */
+  ast_id?: string;
+  language: string;
+  range: RqlResultRange;
+  start_byte: number;
+  end_byte: number;
+  target: RqlDeclarationValue;
+  enclosing_declaration?: RqlDeclarationValue;
+  /** Absent when the producer classified no structured reference kind. */
+  reference_kind?: string;
+  proof: string;
+  usage_kind: string;
+  /** A declaration site is editor-visible navigation, not a runtime usage. */
+  site_class: string;
+  /** `unknown` is inconclusive; it is never silently equal to `external`. */
+  owner_relation: string;
+  /** Which producer derived the row: `forward` (resolver) or `inverse` (usage index). */
+  edge_provenance: string;
+  /** A comparison must refuse to relate rows from two generations. */
+  generation: number;
+}
+
 export type RqlQueryResultItem =
   | RqlStructuralMatchResult
   | RqlDeclarationResult
@@ -608,7 +644,8 @@ export type RqlQueryResultItem =
   | RqlOccurrenceResult
   | RqlLexicalScopeResult
   | RqlBindingResult
-  | RqlResolutionCandidateResult;
+  | RqlResolutionCandidateResult
+  | RqlReferenceEdgeResult;
 
 export interface RqlQueryResponse {
   text: string;
@@ -733,6 +770,8 @@ export function queryResultLabel(result: RqlQueryResultItem): string {
       return result.name;
     case "resolution_candidate":
       return candidateName(result.candidate);
+    case "reference_edge":
+      return result.target.fq_name;
   }
 }
 
@@ -777,6 +816,8 @@ export function queryResultDescription(result: RqlQueryResultItem): string {
       return `${result.kind} · ${result.hoisting} · scope #${result.declaring_scope_index}${result.shadowed ? " · shadowed" : ""}`;
     case "resolution_candidate":
       return `${result.tier ?? "unattributed"} · ${result.outcome}${result.rejection_reason ? ` (${result.rejection_reason})` : ""} · ${result.boundary}`;
+    case "reference_edge":
+      return `${result.edge_provenance} · ${result.reference_kind ?? "unclassified"} · ${result.usage_kind} · ${result.site_class}`;
     case "structural_match":
     case "declaration":
       return `${result.kind} · ${result.start_line}-${result.end_line}`;
@@ -929,6 +970,23 @@ export function queryResultTooltip(result: RqlQueryResultItem): string {
           ? "\n\nThis resolver reports only its selections, so an absent rejection row says nothing."
           : "")
       );
+    case "reference_edge":
+      return (
+        `**${result.reference_kind ?? "unclassified"} edge** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\n→ \`${result.target.fq_name}\` (${result.target.kind})` +
+        (result.enclosing_declaration
+          ? `\n\nFrom \`${result.enclosing_declaration.fq_name}\``
+          : "") +
+        `\n\n${result.edge_provenance} · ${result.proof} · ${result.usage_kind} · ${result.site_class}` +
+        `\n\nOwner relation ${result.owner_relation}` +
+        (result.owner_relation === "unknown"
+          ? " -- the classifier could not relate the owners, which is inconclusive rather than external."
+          : "") +
+        `\n\nGeneration ${result.generation}` +
+        (result.site_class === "declaration_site"
+          ? "\n\nA declaration site is editor-visible navigation, not a runtime usage."
+          : "")
+      );
   }
 }
 
@@ -972,6 +1030,8 @@ export function queryResultIcon(result: RqlQueryResultItem): string {
       return "symbol-variable";
     case "resolution_candidate":
       return "list-selection";
+    case "reference_edge":
+      return "arrow-both";
   }
 }
 
@@ -987,6 +1047,7 @@ export function queryResultRange(result: RqlQueryResultItem): RqlResultRange | u
     case "lexical_scope":
     case "binding":
     case "resolution_candidate":
+    case "reference_edge":
     case "procedure":
     case "program_point":
     case "control_edge":

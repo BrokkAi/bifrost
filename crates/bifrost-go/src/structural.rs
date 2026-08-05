@@ -5,6 +5,9 @@ use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
     first_named_child,
 };
+use brokk_bifrost_core::analyzer::structural::edges::{
+    INVERSE_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
+};
 use brokk_bifrost_core::analyzer::structural::facts::Span;
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::occurrences::{
@@ -206,6 +209,10 @@ impl StructuralSpec for GoStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &NO_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn reference_edge_support(&self) -> &ReferenceEdgeSupport {
+        &INVERSE_REFERENCE_EDGE_SUPPORT
     }
 
     fn identity_route_support(&self) -> &IdentityRouteSupport {

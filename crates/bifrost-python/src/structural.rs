@@ -7,6 +7,9 @@ use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
     field_name_in_parent, first_named_child, nearest_ancestor, node_range,
 };
+use brokk_bifrost_core::analyzer::structural::edges::{
+    DEEP_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
+};
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::occurrences::{
     Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
@@ -264,6 +267,10 @@ fn python_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingAc
 impl StructuralSpec for PythonStructuralSpec {
     fn language(&self) -> Language {
         Language::Python
+    }
+
+    fn reference_edge_support(&self) -> &ReferenceEdgeSupport {
+        &DEEP_REFERENCE_EDGE_SUPPORT
     }
 
     fn identity_route_support(&self) -> &IdentityRouteSupport {

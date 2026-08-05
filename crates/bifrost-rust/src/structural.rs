@@ -7,6 +7,9 @@ use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     linear_chain_tokens, qualified_chain_root, spelled_generic_arity,
 };
+use brokk_bifrost_core::analyzer::structural::edges::{
+    DEEP_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
+};
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::occurrences::{
     OccurrenceRole, OccurrenceRoleSupport,
@@ -442,6 +445,10 @@ impl StructuralSpec for RustStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS
+    }
+
+    fn reference_edge_support(&self) -> &ReferenceEdgeSupport {
+        &DEEP_REFERENCE_EDGE_SUPPORT
     }
 
     fn identity_route_support(&self) -> &IdentityRouteSupport {

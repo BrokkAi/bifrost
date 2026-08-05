@@ -490,6 +490,13 @@ pub(super) fn selected_site_quality(
                 proof_from_label(value.proof),
                 EvidenceCompleteness::Complete,
             ),
+            // An edge row carries its own proof attribution, exactly as a
+            // reference site does; set-level completeness is the query's
+            // diagnostics' business (#1479).
+            CodeQueryResultValue::ReferenceEdge { value } => (
+                proof_from_label(value.proof),
+                EvidenceCompleteness::Complete,
+            ),
             CodeQueryResultValue::ReceiverAnalysis { .. }
             | CodeQueryResultValue::FlowEndpoint { .. }
             | CodeQueryResultValue::FlowWitness { .. } => (
