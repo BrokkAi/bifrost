@@ -31,9 +31,7 @@ use brokk_bifrost_go::graph::resolver::{
 use std::collections::BTreeSet;
 
 pub(crate) use brokk_bifrost_go::graph::go_implicit_entry_point;
-pub(crate) use brokk_bifrost_go::graph::resolver::{
-    go_simple_type_name, go_type_name_parts, resolve_go_import_namespaces,
-};
+pub(crate) use brokk_bifrost_go::graph::resolver::{go_simple_type_name, go_type_name_parts};
 
 /// Build the whole Go `caller -> callee` edge set in a single inverted pass over
 /// the workspace (see [`inverted`]). Returns `None` when the analyzer exposes no
