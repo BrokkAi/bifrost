@@ -290,6 +290,32 @@ void test("highlights schema-v9 lexical environment forms and filter options", a
   }
 });
 
+void test("highlights schema-v10 materialization forms and filter options", async () => {
+  const tokens = tokenizeGrammar(
+    await grammar(),
+    "(generation-sites :kind accessor_macro :input literal) " +
+      '(exports :form default_anonymous :name "default") ' +
+      "(generates (generation-sites)) (generated-by (declaration-state-of " +
+      ":origin generated :declaration-only true :config-gated false (class))) " +
+      "(implementation-of (declaration-state-of :declaration-only true (function))) " +
+      "(export-target (exports))"
+  );
+  for (const form of [
+    "generation-sites",
+    "exports",
+    "generates",
+    "generated-by",
+    "declaration-state-of",
+    "implementation-of",
+    "export-target"
+  ]) {
+    assertScoped(tokens, form, "support.function.wrapper.bifrost-rql");
+  }
+  for (const option of [":input", ":form", ":origin", ":declaration-only", ":config-gated"]) {
+    assertScoped(tokens, option, "variable.parameter.role.bifrost-rql");
+  }
+});
+
 void test("highlights schema-v6 value-flow forms and plan references", async () => {
   const tokens = tokenizeGrammar(
     await grammar(),

@@ -37,6 +37,9 @@ pub enum MatchResultDomain {
     LexicalScope,
     Binding,
     ResolutionCandidate,
+    GenerationSite,
+    Export,
+    DeclarationState,
     File,
 }
 
@@ -52,6 +55,9 @@ impl MatchResultDomain {
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
             Self::ResolutionCandidate => "resolution_candidate",
+            Self::GenerationSite => "generation_site",
+            Self::Export => "export",
+            Self::DeclarationState => "declaration_state",
             Self::File => "file",
         }
     }

@@ -3417,6 +3417,13 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::LexicalScope
             | QueryValueKind::Binding
             | QueryValueKind::ResolutionCandidate
+            // Materialization rows are exact per-position (or, for a
+            // declaration state without a stated range, per-file) records of
+            // what one producer derived (#1476), so the same reasoning
+            // admits them.
+            | QueryValueKind::GenerationSite
+            | QueryValueKind::Export
+            | QueryValueKind::DeclarationState
             | QueryValueKind::File,
         ) => {}
         Err(_) => {
@@ -3935,11 +3942,41 @@ fn terminal_presentation(
             ProofState::Proven,
             ProofReason::DirectStructuralMatch,
         ),
+        CodeQueryResultValue::GenerationSite { value } => (
+            DetailedCodeQueryDomain::GenerationSite,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::Export { value } => (
+            DetailedCodeQueryDomain::Export,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::DeclarationState { value } => (
+            DetailedCodeQueryDomain::DeclarationState,
+            value.path.as_str(),
+            // A state row about a declaration whose range the analyzer does
+            // not state locates at the artifact, like a file row.
+            value.range,
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
     };
     if actual_domain != expected_domain || path != expected_path.as_str() {
         return Err(());
     }
-    let location = if actual_domain == DetailedCodeQueryDomain::File {
+    let location = if actual_domain == DetailedCodeQueryDomain::File
+        || (actual_domain == DetailedCodeQueryDomain::DeclarationState
+            && byte_span.is_none()
+            && range.is_none())
+    {
         if byte_span.is_some() || range.is_some() {
             return Err(());
         }
@@ -4491,6 +4528,9 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::LexicalScope { .. } => "lexical_scope",
         CodeQueryResultRef::Binding { .. } => "binding",
         CodeQueryResultRef::ResolutionCandidate { .. } => "resolution_candidate",
+        CodeQueryResultRef::GenerationSite { .. } => "generation_site",
+        CodeQueryResultRef::Export { .. } => "export",
+        CodeQueryResultRef::DeclarationState { .. } => "declaration_state",
     }
 }
 
@@ -4514,7 +4554,10 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::Occurrence { path, .. }
         | CodeQueryResultRef::LexicalScope { path, .. }
         | CodeQueryResultRef::Binding { path, .. }
-        | CodeQueryResultRef::ResolutionCandidate { path, .. } => path,
+        | CodeQueryResultRef::ResolutionCandidate { path, .. }
+        | CodeQueryResultRef::GenerationSite { path, .. }
+        | CodeQueryResultRef::Export { path, .. }
+        | CodeQueryResultRef::DeclarationState { path, .. } => path,
     }
 }
 
@@ -4547,6 +4590,9 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::ResolutionCandidate => {
             Some(MatchResultDomain::ResolutionCandidate)
         }
+        DetailedCodeQueryDomain::GenerationSite => Some(MatchResultDomain::GenerationSite),
+        DetailedCodeQueryDomain::Export => Some(MatchResultDomain::Export),
+        DetailedCodeQueryDomain::DeclarationState => Some(MatchResultDomain::DeclarationState),
         DetailedCodeQueryDomain::Procedure
         | DetailedCodeQueryDomain::ProgramPoint
         | DetailedCodeQueryDomain::ControlEdge
@@ -4634,6 +4680,25 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, ast_id.as_bytes());
             update_hash(&mut hasher, &ordinal.to_be_bytes());
+        }
+        DetailedCodeQueryKey::GenerationSite { id, ast_id, kind } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_optional_hash(&mut hasher, ast_id.as_deref());
+            update_hash(&mut hasher, kind.as_bytes());
+        }
+        DetailedCodeQueryKey::Export {
+            id,
+            form,
+            exported_name,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, form.as_bytes());
+            update_hash(&mut hasher, exported_name.as_bytes());
+        }
+        DetailedCodeQueryKey::DeclarationState { id, fq_name, origin } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, fq_name.as_bytes());
+            update_hash(&mut hasher, origin.as_bytes());
         }
         DetailedCodeQueryKey::ReferenceSite {
             target_id,
@@ -4723,6 +4788,9 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::LexicalScope => "lexical_scope",
         DetailedCodeQueryDomain::Binding => "binding",
         DetailedCodeQueryDomain::ResolutionCandidate => "resolution_candidate",
+        DetailedCodeQueryDomain::GenerationSite => "generation_site",
+        DetailedCodeQueryDomain::Export => "export",
+        DetailedCodeQueryDomain::DeclarationState => "declaration_state",
         DetailedCodeQueryDomain::File => "file",
     }
 }
@@ -4804,11 +4872,14 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
         | CodeQueryDiagnosticCode::EnvironmentAxisUnsupported
         | CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
+        | CodeQueryDiagnosticCode::MaterializationAxisUnsupported
+        | CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
         | CodeQueryDiagnosticCode::ResolutionTraceIncomplete => {
             PolicyIncompleteReason::CapabilityIncomplete
         }
         CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted
-        | CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted => {
+        | CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted
+        | CodeQueryDiagnosticCode::MaterializationRowBudgetExhausted => {
             PolicyIncompleteReason::PipelineRowBudget
         }
         CodeQueryDiagnosticCode::ReferenceSourceBytesTruncated => {

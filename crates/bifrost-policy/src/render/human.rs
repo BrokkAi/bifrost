@@ -2706,6 +2706,9 @@ const fn match_result_domain(value: MatchResultDomain) -> &'static str {
         MatchResultDomain::LexicalScope => "lexical_scope",
         MatchResultDomain::Binding => "binding",
         MatchResultDomain::ResolutionCandidate => "resolution_candidate",
+        MatchResultDomain::GenerationSite => "generation_site",
+        MatchResultDomain::Export => "export",
+        MatchResultDomain::DeclarationState => "declaration_state",
     }
 }
 

@@ -510,7 +510,13 @@ pub(super) fn selected_site_quality(
             // diagnostics, exactly as for an occurrence.
             | CodeQueryResultValue::LexicalScope { .. }
             | CodeQueryResultValue::Binding { .. }
-            | CodeQueryResultValue::ResolutionCandidate { .. } => {
+            | CodeQueryResultValue::ResolutionCandidate { .. }
+            // The materialization rows follow the same reasoning (#1476):
+            // each is an exact record of recorded provenance, and per-axis
+            // completeness arrives through the query's diagnostics.
+            | CodeQueryResultValue::GenerationSite { .. }
+            | CodeQueryResultValue::Export { .. }
+            | CodeQueryResultValue::DeclarationState { .. } => {
                 (ProofStatus::Proven, EvidenceCompleteness::Complete)
             }
             CodeQueryResultValue::Procedure { .. }
