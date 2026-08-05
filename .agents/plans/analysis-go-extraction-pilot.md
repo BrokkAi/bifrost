@@ -178,17 +178,19 @@ else the language's unit pins are the evidence (Ruby/Kotlin precedent).
       shim, so the plan's ~1.05k per-language shim estimate is low by ~500 LOC
       independently of the blocks -- the floor is the SPI block plus the memo
       shell.
-- [x] R2 (Rust extraction): `brokk-bifrost-rust` created and wired. 15,549 LOC in
-      the crate; the `analyzer/rust/` band (declarations, imports, structural,
-      test detection, field roles, adapter bodies, cargo routes, graph support,
-      usage index, hierarchy, lexical scope) plus the usage-graph resolver moved,
-      and the `.scm` assets ship from the crate with the Rust epoch salt bumped.
-      Analysis Rust residue 24,371, of which 17,494 is parked by design
+- [x] R2 (Rust extraction, 27153340 5039cfa7 b3feef88 c28e56ff 508912cb):
+      `brokk-bifrost-rust` created and wired. 16,375 LOC in the crate -- the
+      `analyzer/rust/` band (declarations, imports, structural, test detection,
+      field roles, adapter bodies, cargo routes, graph support, usage index,
+      hierarchy, lexical scope, diagnostics) plus the usage-graph resolver -- and
+      the `.scm` assets ship from the crate with the Rust epoch salt bumped.
+      Analysis Rust residue 23,582, of which 17,494 is parked by design
       (semantic 3,235; semantic_model adapters 4,233; definition/type routes
-      7,619; and the two scan bodies plus their hit recorder, 5,642, newly found
-      to route receiver types through `get_definition/rust.rs`) and ~2,630 is
-      production shim plus retained tests. Three census-missed lowerings were
-      needed and are recorded in the decision log below.
+      7,619; and the two scan bodies plus their hit recorder, 5,642 -- newly
+      found to route receiver types through `get_definition/rust.rs`, so they
+      follow it) and ~2,540 is production shim plus retained analyzer-bound
+      tests. Move rate 41% of the 39.9k seam, 68% of the seam outside the parks.
+      Three census-missed lowerings were needed; see the decision log.
 
 ## Decision log
 
