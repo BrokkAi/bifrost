@@ -202,8 +202,8 @@ fn declaration_name_node_for_line_range<'tree>(
     let mut best: Option<(usize, Node<'tree>)> = None;
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        let node_start_line = node.start_position().row + 1;
-        let node_end_line = node.end_position().row + 1;
+        let node_start_line = node.start_position().row;
+        let node_end_line = node.end_position().row;
         if node_start_line > range.start_line || node_end_line < range.end_line {
             continue;
         }
@@ -215,8 +215,8 @@ fn declaration_name_node_for_line_range<'tree>(
         }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            if child.start_position().row < range.start_line
-                && child.end_position().row + 1 >= range.end_line
+            if child.start_position().row <= range.start_line
+                && child.end_position().row >= range.end_line
             {
                 stack.push(child);
             }
@@ -359,8 +359,8 @@ mod tests {
                 // the current source representation.
                 start_byte: source.len() + start_byte,
                 end_byte: source.len() + end_byte,
-                start_line: 2,
-                end_line: 4,
+                start_line: 1,
+                end_line: 3,
             },
         )
         .expect("declaration name");
