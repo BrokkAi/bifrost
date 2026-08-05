@@ -1,10 +1,10 @@
-use crate::analyzer::Range;
 use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
 use crate::analyzer::usages::cpp_graph::extractor::{EnclosingContext, ScanCtx};
 use crate::analyzer::usages::cpp_graph::resolver::{
     TargetKind, precise_parent_of, same_logical_symbol, visible_owner_from_member_name,
 };
 use crate::analyzer::usages::model::{UsageHitKind, UsageHitSurface};
+use crate::analyzer::{CodeUnit, Range};
 use crate::text_utils::{find_line_index_for_offset, snippet_around_line};
 use tree_sitter::Node;
 
@@ -18,6 +18,30 @@ pub(super) fn push_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 pub(super) fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit_with_options(node, ctx, false, UsageHitKind::SelfReceiver, false);
+}
+
+/// Record a recursive free-function reference for the editor surface.
+///
+/// Usage-graph consumers exclude `SelfReceiver` hits, so allowing the
+/// enclosing definition here does not create a self edge in external usage
+/// results. The structured same-symbol check below prevents unrelated
+/// enclosing units from being classified as recursive references.
+pub(super) fn push_recursive_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if *ctx.limit_exceeded {
+        return;
+    }
+    let start = node.start_byte();
+    if is_inside_target_declaration(node, ctx) || is_member_field_own_declarator(node, ctx) {
+        return;
+    }
+    let line_idx = find_line_index_for_offset(ctx.line_starts, start);
+    let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
+        return;
+    };
+    if !same_logical_symbol(&enclosing, &ctx.spec.target) {
+        return;
+    }
+    insert_hit(node, ctx, enclosing, line_idx, UsageHitKind::SelfReceiver);
 }
 
 pub(super) fn push_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -80,7 +104,6 @@ fn push_hit_with_options(
         return;
     }
     let start = node.start_byte();
-    let end = node.end_byte();
     if (!allow_inside_target_declaration && is_inside_target_declaration(node, ctx))
         || is_member_field_own_declarator(node, ctx)
     {
@@ -98,11 +121,21 @@ fn push_hit_with_options(
     {
         return;
     }
+    insert_hit(node, ctx, enclosing, line_idx, kind);
+}
+
+fn insert_hit(
+    node: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+    enclosing: CodeUnit,
+    line_idx: usize,
+    kind: UsageHitKind,
+) {
     let hit = usage_hit(
         ctx.file,
         line_idx,
-        start,
-        end,
+        node.start_byte(),
+        node.end_byte(),
         enclosing,
         snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
     );
