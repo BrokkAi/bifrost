@@ -2831,6 +2831,7 @@ impl DetailedCodeQueryDomain {
             QueryValueKind::ResolutionCandidate => Self::ResolutionCandidate,
             QueryValueKind::QualifiedPath => Self::QualifiedPath,
             QueryValueKind::PathSegment => Self::PathSegment,
+            QueryValueKind::ReferenceEdge => Self::ReferenceEdge,
             QueryValueKind::File => Self::File,
         }
     }
@@ -2860,6 +2861,7 @@ impl DetailedCodeQueryDomain {
             Self::ResolutionCandidate => "resolution_candidate",
             Self::QualifiedPath => "qualified_path",
             Self::PathSegment => "path_segment",
+            Self::ReferenceEdge => "reference_edge",
         }
     }
 
@@ -3041,6 +3043,19 @@ impl DetailedCodeQueryDomain {
                 CodeQueryRowField::optional("resolution_status", Scalar::ConstrainedEnum),
                 CodeQueryRowField::optional("target_count", Scalar::Integer),
             ],
+            Self::ReferenceEdge => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("target_id", Scalar::DeclarationIdentity),
+                CodeQueryRowField::optional("reference_kind", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("proof", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("usage_kind", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("site_class", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("owner_relation", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("edge_provenance", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("generation", Scalar::Integer),
+            ],
         }
     }
 }
@@ -3075,6 +3090,7 @@ impl CodeQueryResultValue {
             Self::ResolutionCandidate { .. } => DetailedCodeQueryDomain::ResolutionCandidate,
             Self::QualifiedPath { .. } => DetailedCodeQueryDomain::QualifiedPath,
             Self::PathSegment { .. } => DetailedCodeQueryDomain::PathSegment,
+            Self::ReferenceEdge { .. } => DetailedCodeQueryDomain::ReferenceEdge,
         }
     }
 }
@@ -3491,6 +3507,37 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::PathSegment { value }, "target_count") => value
             .target_count
             .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::ReferenceEdge { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::ReferenceEdge { value }, "ast_id") => {
+            value.ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ReferenceEdge { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::ReferenceEdge { value }, "target_id") => {
+            value.target.id.as_deref().map(Scalar::DeclarationIdentity)
+        }
+        (CodeQueryResultValue::ReferenceEdge { value }, "reference_kind") => {
+            value.reference_kind.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::ReferenceEdge { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::ReferenceEdge { value }, "usage_kind") => {
+            Some(Scalar::ConstrainedEnum(value.usage_kind))
+        }
+        (CodeQueryResultValue::ReferenceEdge { value }, "site_class") => {
+            Some(Scalar::ConstrainedEnum(value.site_class))
+        }
+        (CodeQueryResultValue::ReferenceEdge { value }, "owner_relation") => {
+            Some(Scalar::ConstrainedEnum(value.owner_relation))
+        }
+        (CodeQueryResultValue::ReferenceEdge { value }, "edge_provenance") => {
+            Some(Scalar::ConstrainedEnum(value.provenance))
+        }
+        (CodeQueryResultValue::ReferenceEdge { value }, "generation") => {
+            Some(Scalar::Integer(value.generation))
+        }
         _ => None,
     }
 }
