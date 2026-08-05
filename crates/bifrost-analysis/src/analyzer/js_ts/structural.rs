@@ -8,9 +8,10 @@ use crate::analyzer::structural::adapter_helpers::{
     linear_chain_tokens, qualified_chain_root, spelled_generic_arity,
 };
 use crate::analyzer::structural::{
-    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, HoistingClass,
-    LexicalEnvironmentSupport, Namespace, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport,
-    Role, RoleSink, Span, StructuralSpec, default_occurrence_namespace,
+    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, DEEP_REFERENCE_EDGE_SUPPORT,
+    HoistingClass, LexicalEnvironmentSupport, Namespace, NormalizedKind, OccurrenceRole,
+    OccurrenceRoleSupport, ReferenceEdgeSupport, Role, RoleSink, Span, StructuralSpec,
+    default_occurrence_namespace,
 };
 use crate::analyzer::structural::{DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::{Language, Range};
@@ -475,6 +476,10 @@ impl StructuralSpec for JsTsStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &DEEP_LEXICAL_ENVIRONMENT_SUPPORT
+    }
+
+    fn reference_edge_support(&self) -> &ReferenceEdgeSupport {
+        &DEEP_REFERENCE_EDGE_SUPPORT
     }
 
     fn identity_route_support(&self) -> &IdentityRouteSupport {

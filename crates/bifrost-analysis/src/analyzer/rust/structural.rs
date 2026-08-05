@@ -9,8 +9,8 @@ use crate::analyzer::structural::adapter_helpers::{
 };
 use crate::analyzer::structural::{
     BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS,
-    HoistingClass, LexicalEnvironmentSupport, NormalizedKind, OccurrenceRole,
-    OccurrenceRoleSupport, Role, RoleSink, StructuralSpec,
+    DEEP_REFERENCE_EDGE_SUPPORT, HoistingClass, LexicalEnvironmentSupport, NormalizedKind,
+    OccurrenceRole, OccurrenceRoleSupport, ReferenceEdgeSupport, Role, RoleSink, StructuralSpec,
 };
 use crate::analyzer::structural::{DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::{Language, Range};
@@ -436,6 +436,10 @@ impl StructuralSpec for RustStructuralSpec {
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
         &DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS
+    }
+
+    fn reference_edge_support(&self) -> &ReferenceEdgeSupport {
+        &DEEP_REFERENCE_EDGE_SUPPORT
     }
 
     fn identity_route_support(&self) -> &IdentityRouteSupport {

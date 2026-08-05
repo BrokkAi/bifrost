@@ -14,7 +14,10 @@ use brokk_bifrost_analysis::analyzer::structural::CodeQuery;
 use brokk_bifrost_analysis::analyzer::structural::occurrences::{
     Namespace, OccurrenceClass, OccurrenceRole,
 };
-use brokk_bifrost_analysis::analyzer::structural::{BoundaryStatus, PrecedenceTier, RouteHopKind};
+use brokk_bifrost_analysis::analyzer::structural::{
+    BoundaryStatus, OwnerRelation, PrecedenceTier, RouteHopKind, SiteClass,
+};
+use brokk_bifrost_analysis::analyzer::usages::{ReferenceKind, UsageHitKind, UsageHitSurface};
 use brokk_bifrost_analysis::schema_version::SchemaVersionResolution;
 
 pub const POLICY_DOCUMENT_SCHEMA_VERSION: u32 = 1;
@@ -119,6 +122,8 @@ pub enum PolicyAssert {
     Resolution(ResolutionAssert),
     Reaching(ReachingAssert),
     Boundary(BoundaryAssert),
+    EdgeParity(EdgeParityAssert),
+    EdgeClass(EdgeClassAssert),
     Canonical(CanonicalAssert),
     Route(RouteAssert),
     RoundTrip(RoundTripAssert),
@@ -131,6 +136,8 @@ impl PolicyAssert {
             Self::Resolution(assertion) => &assertion.id,
             Self::Reaching(assertion) => &assertion.id,
             Self::Boundary(assertion) => &assertion.id,
+            Self::EdgeParity(assertion) => &assertion.id,
+            Self::EdgeClass(assertion) => &assertion.id,
             Self::Canonical(assertion) => &assertion.id,
             Self::Route(assertion) => &assertion.id,
             Self::RoundTrip(assertion) => &assertion.id,
@@ -144,6 +151,8 @@ impl PolicyAssert {
             Self::Resolution(assertion) => &assertion.at,
             Self::Reaching(assertion) => &assertion.at,
             Self::Boundary(assertion) => &assertion.at,
+            Self::EdgeParity(assertion) => &assertion.at,
+            Self::EdgeClass(assertion) => &assertion.at,
             Self::Canonical(assertion) => &assertion.at,
             Self::Route(assertion) => &assertion.at,
             Self::RoundTrip(assertion) => &assertion.at,
@@ -159,6 +168,8 @@ impl PolicyAssert {
             Self::Resolution(assertion) => assertion.role,
             Self::Reaching(assertion) => assertion.role,
             Self::Boundary(assertion) => assertion.role,
+            Self::EdgeParity(assertion) => assertion.role,
+            Self::EdgeClass(assertion) => assertion.role,
             Self::Canonical(assertion) => assertion.role,
             Self::Route(assertion) => assertion.role,
             Self::RoundTrip(assertion) => assertion.role,
@@ -171,6 +182,8 @@ impl PolicyAssert {
             Self::Resolution(_) => "resolution",
             Self::Reaching(_) => "reaching",
             Self::Boundary(_) => "boundary",
+            Self::EdgeParity(_) => "edge_parity",
+            Self::EdgeClass(_) => "edge_class",
             Self::Canonical(_) => "canonical",
             Self::Route(_) => "route",
             Self::RoundTrip(_) => "round_trip",
@@ -485,6 +498,159 @@ impl ExpectedOccurrence {
             Self::Binding => Some(OccurrenceClass::Binding),
             Self::None => None,
         }
+    }
+}
+
+/// Require field-for-field agreement between the forward and inverse edge
+/// projections at the subject token, within one workspace generation.
+///
+/// The direction follows the asserted role. A reference-class role checks the
+/// forward direction: every forward edge the resolver states at the token must
+/// have an inverse counterpart in its target's usage listing, with the same
+/// site identity, reference kind, proof, usage kind, site class, and owner
+/// relation. The `declaration_name` role checks the inverse direction: every
+/// inverse edge of the declaration this token names must have a forward
+/// counterpart derived from the file that spelled the site. Both provenance
+/// chains are retained on every finding.
+///
+/// There is deliberately no field-projection narrowing and no count
+/// comparison: the acceptance contract compares classifications explicitly,
+/// and a narrower projection would silently weaken it.
+#[derive(Debug, Clone)]
+pub struct EdgeParityAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub role: OccurrenceRole,
+    /// Compare only edges belonging to this usage surface. `None` compares
+    /// the complete row set, editor-only rows included.
+    pub surface: Option<UsageHitSurface>,
+}
+
+impl EdgeParityAssert {
+    pub fn expectation(&self) -> String {
+        let direction = if self.role == OccurrenceRole::DeclarationName {
+            "every inverse edge has a field-identical forward counterpart"
+        } else {
+            "every forward edge has a field-identical inverse counterpart"
+        };
+        match self.surface {
+            Some(surface) => format!(
+                "{direction} on the {} surface",
+                brokk_bifrost_analysis::analyzer::structural::query::schema::usage_surface_label(
+                    surface
+                )
+            ),
+            None => direction.to_string(),
+        }
+    }
+}
+
+/// Require or forbid classifications on the subject token's edge rows.
+///
+/// The rows follow the asserted role exactly as for the parity assert: a
+/// reference-class role reads the token's forward edges, the
+/// `declaration_name` role reads the inverse edges of the declaration the
+/// token names.
+#[derive(Debug, Clone)]
+pub struct EdgeClassAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub role: OccurrenceRole,
+    pub constraint: EdgeClassConstraint,
+    pub surface: Option<UsageHitSurface>,
+}
+
+impl EdgeClassAssert {
+    pub fn expectation(&self) -> String {
+        let base = self.constraint.expectation();
+        match self.surface {
+            Some(surface) => format!(
+                "{base} on the {} surface",
+                brokk_bifrost_analysis::analyzer::structural::query::schema::usage_surface_label(
+                    surface
+                )
+            ),
+            None => base,
+        }
+    }
+}
+
+/// One typed classification constraint. Require and forbid are per axis so a
+/// value can never be compared against the wrong vocabulary, and an empty
+/// require list means "no requirement", never "require nothing".
+#[derive(Debug, Clone)]
+pub enum EdgeClassConstraint {
+    Relation {
+        require: Vec<OwnerRelation>,
+        forbid: Vec<OwnerRelation>,
+    },
+    Usage {
+        require: Vec<UsageHitKind>,
+        forbid: Vec<UsageHitKind>,
+    },
+    SiteClass {
+        require: Vec<SiteClass>,
+        forbid: Vec<SiteClass>,
+    },
+    Kind {
+        require: Vec<ReferenceKind>,
+        forbid: Vec<ReferenceKind>,
+    },
+}
+
+impl EdgeClassConstraint {
+    pub const fn axis_label(&self) -> &'static str {
+        match self {
+            Self::Relation { .. } => "relation",
+            Self::Usage { .. } => "usage",
+            Self::SiteClass { .. } => "site_class",
+            Self::Kind { .. } => "kind",
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Relation { require, forbid } => require.is_empty() && forbid.is_empty(),
+            Self::Usage { require, forbid } => require.is_empty() && forbid.is_empty(),
+            Self::SiteClass { require, forbid } => require.is_empty() && forbid.is_empty(),
+            Self::Kind { require, forbid } => require.is_empty() && forbid.is_empty(),
+        }
+    }
+
+    pub fn expectation(&self) -> String {
+        fn joined<T>(values: &[T], label: impl Fn(&T) -> &'static str) -> String {
+            values.iter().map(label).collect::<Vec<_>>().join(", ")
+        }
+        let (require, forbid) = match self {
+            Self::Relation { require, forbid } => (
+                joined(require, |value| value.label()),
+                joined(forbid, |value| value.label()),
+            ),
+            Self::Usage { require, forbid } => (
+                joined(require, |value| value.wire_label()),
+                joined(forbid, |value| value.wire_label()),
+            ),
+            Self::SiteClass { require, forbid } => (
+                joined(require, |value| value.label()),
+                joined(forbid, |value| value.label()),
+            ),
+            Self::Kind { require, forbid } => (
+                joined(require, |value| {
+                    brokk_bifrost_analysis::analyzer::structural::query::schema::reference_kind_label(*value)
+                }),
+                joined(forbid, |value| {
+                    brokk_bifrost_analysis::analyzer::structural::query::schema::reference_kind_label(*value)
+                }),
+            ),
+        };
+        let mut parts = Vec::new();
+        if !require.is_empty() {
+            parts.push(format!("every edge {} in [{require}]", self.axis_label()));
+        }
+        if !forbid.is_empty() {
+            parts.push(format!("no edge {} in [{forbid}]", self.axis_label()));
+        }
+        parts.join("; ")
     }
 }
 

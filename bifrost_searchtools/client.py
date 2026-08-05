@@ -198,13 +198,16 @@ class SearchToolsClient:
     ) -> CodeQueryResponse:
         """Query normalized code structure across supported languages.
 
-        The compatible head is schema version 9, which adds the ``scopes``
+        The compatible head is schema version 11, which adds the canonical
+        reference-edge domain: ``edges_of`` from a declaration, ``edges_from``
+        from an occurrence, and ``edge_target`` back to a declaration. Schema
+        version 9 added the ``scopes``
         and ``bindings`` sources plus the ``scope_of``, ``scope_ancestors``,
         ``bindings_in``, ``reaching_binding``, ``binding_occurrence``,
         ``candidates_of``, and ``candidate_target`` steps, and puts the package
         clause on the file row. Schema version 8 added the ``occurrences``
         source plus the ``occurrences_in``, ``occurrences_of``, and
-        ``occurrence_target`` steps; both it and version 7 remain available as
+        ``occurrence_target`` steps; those and version 7 remain available as
         exact pins. Pass ``schema_version=2`` to
         pin the pre-CFG vocabulary or ``schema_version=3`` for CFG without
         typestate. A query starts with normalized syntactic
@@ -227,6 +230,16 @@ class SearchToolsClient:
         Version 7 adds ``taint`` with a host-registered ``taint_ref``. It only
         projects retained production taint findings and never compiles or
         solves taint, reconstructs witnesses, or performs policy classification.
+        Version 10 adds ``edges_of``, ``edges_from``, and ``edge_target`` over
+        canonical ``CodeQueryReferenceEdge`` rows. ``edges_of`` is the inverse
+        projection (every usage site the usage index enumerates for a
+        declaration) and ``edges_from`` is the forward one (the resolver's own
+        resolved targets for one exact token); both accept ``reference_kinds``,
+        ``proof``, ``surface``, ``usage``, ``relation``, and ``site_class``.
+        ``surface`` is optional with no default, because the complete edge
+        answer includes editor-only rows. A forward query in a language whose
+        adapter has no forward projection reports ``edge_axis_unsupported``
+        rather than an empty answer.
         Hierarchy steps are direct by default and accept a positive ``depth`` or
         ``transitive=True``. Declaration results are limited to declarations
         indexed by the workspace analyzer. Pass exactly one of ``pattern``,

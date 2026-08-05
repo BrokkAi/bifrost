@@ -296,6 +296,34 @@ A segment row states its namespace only when the adapter's classification or the
 
 Three absences here are answers rather than gaps, and each reports an `incomplete` diagnostic where it matters. A candidate with no tier is *unattributed*, never weakest -- `:tier unattributed` selects exactly those rows, and a policy comparing tiers over one must be inconclusive. A trace whose completeness is `selection_only` says nothing by omitting a rejection. And `(candidate-target ...)` answers only for unit-backed candidates, because a lexical binding and an external route carry no workspace declaration at all.
 
+## Canonical Reference Edges
+
+Schema v11 states "X uses Y" once, whichever derivation produced it. `(edges-of ...)` is the inverse projection -- every usage site the usage index enumerates for a declaration. `(edges-from ...)` is the forward one -- the resolver's own resolved targets for one exact token. `(edge-target ...)` walks an edge back to its indexed target declaration. Both edge wrappers accept `:reference-kinds`, `:proof`, `:surface`, `:usage`, `:relation` and `:site-class`.
+
+<!-- code-query-test:rql:edges-of -->
+```lisp
+(edges-of :usage [reference] :site-class [use_site]
+  (enclosing-decl
+    (language "java"
+      (callable :name "register"))))
+```
+
+<!-- code-query-test:rql:edges-from -->
+```lisp
+(edge-target
+  (edges-from :reference-kinds [method-call]
+    (language "java"
+      (occurrences :class reference))))
+```
+
+The direction is a field on every row, not something read off which wrapper produced the set: `edge_provenance` is `forward` or `inverse` (renamed on the wire so the result item's branch-trace `provenance` cannot shadow it), and a parity claim is therefore a comparison across a field. `generation` names the workspace generation the derivation ran in, and rows from two generations describe two workspaces.
+
+`:surface` is optional and, unlike `references-of`, has **no default**. The complete edge answer includes editor-only rows, so silently defaulting to `external-usages` would narrow the compared ground set without the author having said so.
+
+Four absences are answers rather than gaps. An absent `ast_id` means the producer could not address the site token as an AST node, not that the edge is weaker. An absent `reference_kind` means no structured kind was classified, and is not a kind to compare against. An `owner_relation` of `unknown` is inconclusive and never silently equal to `external`. A `site_class` of `declaration_site` is editor-visible navigation rather than a runtime usage, which is why it is classified instead of dropped.
+
+Only Java, Rust, Python, JavaScript and TypeScript answer the forward projection today. `(edges-from ...)` in any other language reports `edge_axis_unsupported` with `incomplete` impact -- never a clean empty answer -- and a derivation that was truncated, cancelled or failed reports `edge_derivation_incomplete`.
+
 ## Registered Typestate Findings and Witnesses
 
 Schema version 4 adds `typestate`, which consumes an exact `procedure` and a namespaced `:protocol-ref`, plus `witness`, which consumes each resulting finding. The connected host must already have registered an in-memory compiled protocol and pre-resolved binding plan for that reference and current workspace generation.
