@@ -1,34 +1,94 @@
-mod extractor;
-mod hits;
-mod inverted;
-mod resolver;
+//! The analysis-side wrappers over [`brokk_bifrost_python::graph`].
+//!
+//! The scans themselves moved with the language knowledge. What stays here is
+//! the downcast that produces their arguments, the `GraphUsageAnalyzer` /
+//! `UsageQueryResolver` / `UsageAnalyzer` strategy shells (all analysis-owned
+//! traits), and the inverted pass's fan-out -- `build_edge_output` and
+//! `parse_and_collect` are the shared, language-agnostic driver.
+
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::language_for_target;
-use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
+use crate::analyzer::usages::inverted_edges::{
+    UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output, parse_and_collect,
+};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::python_graph::extractor::{build_python_graph, scan_files_for_seeds};
-use crate::analyzer::usages::python_graph::resolver::{infer_export_names, infer_usage_seeds};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer, resolve_analyzer,
-    usage_importer_files,
+    BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer,
+    resolve_analyzer,
 };
 use crate::hash::HashSet;
+use brokk_bifrost_python::graph::PythonGraphSource;
+use brokk_bifrost_python::graph::extractor::{build_python_graph, scan_files_for_seeds};
+use brokk_bifrost_python::graph::inverted::PythonEdgeScan;
+use brokk_bifrost_python::graph::resolver::{infer_export_names, infer_usage_seeds};
+use brokk_bifrost_python::usage_index::usage_importer_files;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-pub(in crate::analyzer::usages) use extractor::{
+pub(in crate::analyzer::usages) use brokk_bifrost_python::graph::extractor::{
     collect_assigned_identifiers, collect_module_binding_timeline,
     collect_scope_facts_from_parsed_source, enclosing_scope_facts, is_declaration_identifier,
     slice as python_slice,
 };
-pub(in crate::analyzer::usages) use resolver::resolve_receiver_type;
+pub(in crate::analyzer::usages) use brokk_bifrost_python::graph::resolver::resolve_receiver_type;
+
+/// Run `visit` with the [`PythonGraphSource`] built from the *dispatching*
+/// analyzer.
+///
+/// A callback rather than a constructor because the definition-index accessor is
+/// itself a borrowed closure: `analyzer.global_usage_definition_index()` returns
+/// a handle that borrows the analyzer, and the Python side takes it lazily so a
+/// scan that never reaches the receiver-type fallback never pays for the build.
+pub(in crate::analyzer::usages) fn with_python_graph_source<R>(
+    analyzer: &dyn IAnalyzer,
+    visit: impl FnOnce(PythonGraphSource<'_>) -> R,
+) -> R {
+    let definitions = |consume: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| {
+        consume(&analyzer.global_usage_definition_index());
+    };
+    visit(PythonGraphSource {
+        index: analyzer,
+        hierarchy: analyzer.type_hierarchy_provider(),
+        imports: analyzer.import_analysis_provider(),
+        definitions: &definitions,
+    })
+}
+
+/// The whole-workspace inverted pass: the shared driver's parallel fan-out plus
+/// on-demand parsing, with [`PythonEdgeScan::scan_file`] resolving each file.
+///
+/// Trees are parsed on demand inside the per-file walk and dropped when the
+/// closure returns, so live trees are bounded by the worker count rather than
+/// the workspace size (#200).
+fn build_python_edges<Output, F>(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    nodes: &HashSet<String>,
+    targets: &HashSet<String>,
+    keep_file: F,
+) -> Output
+where
+    Output: UsageEdgeBuildOutput<String>,
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let files: Vec<ProjectFile> = py.get_analyzed_files().into_iter().collect();
+    let language = tree_sitter_python::LANGUAGE.into();
+    let scan = PythonEdgeScan::new(nodes, targets);
+    with_python_graph_source(analyzer, |graph| {
+        build_edge_output(&files, keep_file, |file| {
+            parse_and_collect(analyzer, file, nodes, &language, |input| {
+                scan.scan_file(&graph, py, file, input)
+            })
+        })
+    })
+}
 
 /// Build the whole Python `caller -> callee` edge set in a single inverted pass
-/// over the workspace (see [`inverted`]). Returns `None` when there are no Python
+/// (see [`build_python_edges`]). Returns `None` when there are no Python
 /// files. `nodes`/`keep_file` mirror the Go builder.
 pub(crate) fn build_python_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
@@ -39,7 +99,7 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = PythonEdgeResolver::try_new(analyzer)?;
-    Some(inverted::build_python_edges(
+    Some(build_python_edges(
         analyzer,
         resolver.py,
         nodes,
@@ -63,7 +123,7 @@ pub(crate) fn build_cached_python_usage_edges_for_targets(
     let edges = py.usage_edges_for_targets(nodes, targets, || {
         let resolver = PythonEdgeResolver::try_new(analyzer)
             .expect("resolved Python analyzer must construct a Python edge resolver");
-        inverted::build_python_edges(analyzer, resolver.py, nodes, targets, |_| true)
+        build_python_edges(analyzer, resolver.py, nodes, targets, |_| true)
     });
     Some(edges)
 }
@@ -146,15 +206,17 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
             scan_files.retain(|file| scan_scope.allows(file));
         }
 
-        let scan_result = scan_files_for_seeds(
-            analyzer,
-            py,
-            &graph,
-            &scan_files,
-            target,
-            &seeds,
-            scan_scope.cancellation(),
-        );
+        let scan_result = with_python_graph_source(analyzer, |source| {
+            scan_files_for_seeds(
+                &source,
+                py,
+                &graph,
+                &scan_files,
+                target,
+                &seeds,
+                scan_scope.cancellation(),
+            )
+        });
         let hits: BTreeSet<UsageHit> = scan_result
             .hits
             .into_iter()
@@ -211,7 +273,7 @@ impl<'a> PythonEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_python_edges(analyzer, self.py, nodes, nodes, keep_file)
+        build_python_edges(analyzer, self.py, nodes, nodes, keep_file)
     }
 }
 

@@ -76,9 +76,7 @@ use brokk_bifrost_python::imports::resolve_imports_batched;
 use brokk_bifrost_python::test_detection::detect_python_test_assertion_smells;
 use brokk_bifrost_python::usage_index::PythonUsageIndex;
 pub(crate) use brokk_bifrost_python::usage_index::{
-    ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
-    usage_importer_files, usage_matching_edges, usage_module_binding_timeline,
-    usage_resolve_module_files, usage_scope_facts, usage_seeds,
+    ModuleBindingEventKind, ModuleBindingTimeline, usage_resolve_module_files,
 };
 use cache::{
     PythonUsageEdgesKey, weight_code_unit_vec, weight_export_index, weight_python_usage_edges,

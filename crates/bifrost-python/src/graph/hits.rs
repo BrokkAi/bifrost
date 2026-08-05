@@ -1,18 +1,18 @@
-use crate::analyzer::Range;
-use crate::analyzer::usages::common::{
+use crate::graph::extractor::ScanCtx;
+use brokk_bifrost_core::analyzer::Range;
+use brokk_bifrost_core::analyzer::usages::common::{
     SNIPPET_CONTEXT_LINES, reclassify_self_receiver_hit_at, usage_hit,
 };
-use crate::analyzer::usages::python_graph::extractor::ScanCtx;
-use crate::text_utils::{find_line_index_for_offset, trimmed_snippet_around_line};
+use brokk_bifrost_core::text_utils::{find_line_index_for_offset, trimmed_snippet_around_line};
 use tree_sitter::Node;
 
-pub(super) fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if let Some(hit) = build_hit(node, ctx) {
         ctx.hits.insert(hit);
     }
 }
 
-pub(super) fn record_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn record_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if let Some(hit) = build_hit(node, ctx) {
         ctx.unproven_hits.insert(hit.into_unproven());
     }
@@ -23,7 +23,7 @@ pub(super) fn record_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// own class. Excluded from the external usage surface, counted as a same-owner
 /// site. Records the ordinary hit, then reclassifies it — the shared scan
 /// consumer, so the record ceremony lives in exactly one place.
-pub(super) fn record_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn record_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     record_hit(node, ctx);
     reclassify_self_receiver_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
 }
@@ -31,13 +31,16 @@ pub(super) fn record_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// Record `node` as an `Import`-binding hit (the token that brings the symbol
 /// into this file), which the IDE find-references surface includes but the
 /// call-graph surfaces ignore.
-pub(super) fn record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if let Some(hit) = build_hit(node, ctx) {
         ctx.hits.insert(hit.into_import());
     }
 }
 
-fn build_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Option<crate::analyzer::usages::UsageHit> {
+fn build_hit(
+    node: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+) -> Option<brokk_bifrost_core::analyzer::usages::model::UsageHit> {
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();
     if start_byte >= end_byte {
@@ -54,7 +57,7 @@ fn build_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Option<crate::analyzer::u
         end_line: line_idx,
     };
 
-    let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range)?;
+    let enclosing = ctx.graph.index.enclosing_code_unit(ctx.file, &range)?;
 
     Some(usage_hit(
         ctx.file, line_idx, start_byte, end_byte, enclosing, snippet,

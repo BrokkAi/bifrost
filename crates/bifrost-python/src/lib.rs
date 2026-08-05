@@ -26,6 +26,7 @@ pub mod bindings;
 pub mod clones;
 pub mod declarations;
 pub mod diagnostics;
+pub mod graph;
 pub mod graph_support;
 pub mod imports;
 pub mod queries;

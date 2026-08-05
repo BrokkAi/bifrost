@@ -1763,7 +1763,9 @@ impl PythonDefinitionContext {
         self.build_counters
             .generic_receiver_type_fallbacks
             .fetch_add(1, Ordering::Relaxed);
-        resolve_python_receiver_type(analyzer, py, file, raw_type, target_self_file)
+        with_python_graph_source(analyzer, |graph| {
+            resolve_python_receiver_type(&graph, py, file, raw_type, target_self_file)
+        })
     }
 
     #[cfg(test)]
@@ -1800,9 +1802,9 @@ impl PythonDefinitionContext {
                 self.build_counters
                     .scope_fact_builds
                     .fetch_add(1, Ordering::Relaxed);
-                Arc::new(collect_scope_facts_from_parsed_source(
-                    analyzer, py, file, source, root,
-                ))
+                Arc::new(with_python_graph_source(analyzer, |graph| {
+                    collect_scope_facts_from_parsed_source(&graph, py, file, source, root)
+                }))
             })
             .clone()
     }

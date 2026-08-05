@@ -48,7 +48,7 @@ use crate::analyzer::usages::python_graph::{
     collect_assigned_identifiers, collect_module_binding_timeline,
     collect_scope_facts_from_parsed_source, enclosing_scope_facts,
     is_declaration_identifier as python_is_declaration_identifier, python_slice,
-    resolve_receiver_type as resolve_python_receiver_type,
+    resolve_receiver_type as resolve_python_receiver_type, with_python_graph_source,
 };
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 pub(crate) use crate::analyzer::usages::reference_site::byte_offset_for_character_column;

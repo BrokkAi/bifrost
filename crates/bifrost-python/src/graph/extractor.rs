@@ -1,41 +1,48 @@
-use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
-use crate::analyzer::usages::local_inference::{
-    LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
-};
-use crate::analyzer::usages::model::{ImportKind, UsageHit};
-use crate::analyzer::usages::python_graph::hits::{
+//! Python's forward, per-target usage scan: the scoped import closure, the
+//! per-file walk that proves a reference, and the receiver-type facts both this
+//! and the inverted walk resolve through.
+
+use crate::graph::PythonGraphSource;
+use crate::graph::hits::{
     record_hit, record_import_hit, record_self_receiver_hit, record_unproven_hit,
 };
-use crate::analyzer::usages::python_graph::resolver::{
+use crate::graph::resolver::{
     annotation_reference_candidates, member_name, normalized_receiver_type,
     receiver_annotation_matches_target, resolve_constructor_types, resolve_receiver_type,
     target_owner_code_unit, top_level_identifier,
 };
-use crate::analyzer::{
-    CodeUnit, IAnalyzer, ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline,
-    ProjectFile, PythonAnalyzer, PythonScopeFacts, Range, resolve_fqn_candidates,
+use crate::graph_support::PythonUsageSource;
+use crate::imports::resolve_fqn_candidates;
+use crate::usage_index::{
+    ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
     usage_matching_edges, usage_module_binding_timeline, usage_resolve_module_files,
     usage_scope_facts,
 };
-use crate::cancellation::CancellationToken;
-use crate::hash::{HashMap, HashSet};
-use crate::text_utils::compute_line_starts;
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
+};
+use brokk_bifrost_core::analyzer::usages::model::{ImportKind, UsageHit};
+use brokk_bifrost_core::analyzer::usages::{ImportEdge, ImportEdgeKind};
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile, Range};
+use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
+use brokk_bifrost_core::text_utils::compute_line_starts;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
-pub(super) struct ParsedFile {
-    pub(super) source: Arc<String>,
-    pub(super) tree: Tree,
+pub struct ParsedFile {
+    pub source: Arc<String>,
+    pub tree: Tree,
 }
 
-pub(crate) struct PythonProjectGraph {
+pub struct PythonProjectGraph {
     parsed: HashMap<ProjectFile, ParsedFile>,
 }
 
 impl PythonProjectGraph {
-    pub(super) fn scan_files(
+    pub fn scan_files(
         &self,
         candidate_files: &HashSet<ProjectFile>,
         target_file: &ProjectFile,
@@ -48,7 +55,7 @@ impl PythonProjectGraph {
     }
 }
 
-pub(super) fn build_python_graph(
+pub fn build_python_graph(
     candidate_files: &HashSet<ProjectFile>,
     target_file: &ProjectFile,
     cancellation: Option<&CancellationToken>,
@@ -96,10 +103,10 @@ pub(super) fn build_python_graph(
     PythonProjectGraph { parsed }
 }
 
-pub(super) fn scan_files_for_seeds(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
-    graph: &PythonProjectGraph,
+pub fn scan_files_for_seeds(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
+    project_graph: &PythonProjectGraph,
     files: &HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
@@ -107,20 +114,21 @@ pub(super) fn scan_files_for_seeds(
 ) -> ScanResult {
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let unproven_collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
-    let target_short = top_level_identifier(analyzer, target);
-    let target_member = member_name(analyzer, target);
-    let target_owner = target_owner_code_unit(analyzer, target);
+    let target_short = top_level_identifier(graph.index, target);
+    let target_member = member_name(graph.index, target);
+    let target_owner = target_owner_code_unit(graph.index, target);
     // A same-file best-effort for unresolvable receivers is only safe when the
     // member name is unambiguous in the target's file (exactly one class there
     // declares it), so `recv.member` can only mean the target.
     let member_unique_in_target_file = target_member.as_deref().is_some_and(|member| {
-        let owners: HashSet<CodeUnit> = analyzer
+        let owners: HashSet<CodeUnit> = graph
+            .index
             .declarations(target.source())
             .into_iter()
             .filter(|decl| {
-                decl.identifier() == member && target_owner_code_unit(analyzer, decl).is_some()
+                decl.identifier() == member && target_owner_code_unit(graph.index, decl).is_some()
             })
-            .filter_map(|decl| target_owner_code_unit(analyzer, &decl))
+            .filter_map(|decl| target_owner_code_unit(graph.index, &decl))
             .collect();
         owners.len() == 1
     });
@@ -133,7 +141,7 @@ pub(super) fn scan_files_for_seeds(
         }
         let owned_source: Option<Arc<String>>;
         let owned_tree: Option<Tree>;
-        let (source_str, tree_ref) = if let Some(parsed) = graph.parsed.get(*file) {
+        let (source_str, tree_ref) = if let Some(parsed) = project_graph.parsed.get(*file) {
             (parsed.source.as_str(), &parsed.tree)
         } else {
             let Ok(source) = file.read_to_string() else {
@@ -161,41 +169,48 @@ pub(super) fn scan_files_for_seeds(
         }
 
         let edges = {
-            let _scope = crate::profiling::scope("python_graph::matching_edges");
-            usage_matching_edges(py, file, seeds)
+            let _scope = brokk_bifrost_core::profiling::scope("python_graph::matching_edges");
+            usage_matching_edges(python, file, seeds)
         };
         let module_bindings = {
-            let _scope = crate::profiling::scope("python_graph::module_binding_timeline");
-            let raw_module_bindings = usage_module_binding_timeline(py, file, || {
+            let _scope =
+                brokk_bifrost_core::profiling::scope("python_graph::module_binding_timeline");
+            let raw_module_bindings = usage_module_binding_timeline(python, file, || {
                 collect_module_binding_timeline(tree_ref.root_node(), source_str)
             });
-            classify_module_binding_timeline(py, file, raw_module_bindings.as_ref(), seeds, &edges)
+            classify_module_binding_timeline(
+                python,
+                file,
+                raw_module_bindings.as_ref(),
+                seeds,
+                &edges,
+            )
         };
         let target_self_file = *file == target.source();
         let scope_facts = {
-            let _scope = crate::profiling::scope("python_graph::scope_facts");
-            usage_scope_facts(py, file, || {
+            let _scope = brokk_bifrost_core::profiling::scope("python_graph::scope_facts");
+            usage_scope_facts(python, file, || {
                 collect_scope_facts_from_parsed_source(
-                    analyzer,
-                    py,
+                    graph,
+                    python,
                     file,
                     source_str,
                     tree_ref.root_node(),
                 )
             })
         };
-        let scope_range_index = build_scope_range_index(analyzer, scope_facts.as_ref());
+        let scope_range_index = build_scope_range_index(graph, scope_facts.as_ref());
 
         let mut local_hits = BTreeSet::new();
         let mut local_unproven_hits = BTreeSet::new();
         let line_starts = compute_line_starts(source_str);
 
         let mut scan_ctx = ScanCtx {
-            py,
+            python,
             file,
             source: source_str,
             line_starts: &line_starts,
-            analyzer,
+            graph,
             target,
             target_short: &target_short,
             target_member: target_member.as_deref(),
@@ -214,7 +229,7 @@ pub(super) fn scan_files_for_seeds(
         };
 
         {
-            let _scope = crate::profiling::scope("python_graph::scan_tree");
+            let _scope = brokk_bifrost_core::profiling::scope("python_graph::scan_tree");
             scan_node(tree_ref.root_node(), &mut scan_ctx);
         }
 
@@ -242,17 +257,17 @@ pub(super) fn scan_files_for_seeds(
     }
 }
 
-pub(super) struct ScanResult {
-    pub(super) hits: BTreeSet<UsageHit>,
-    pub(super) unproven_hits: BTreeSet<UsageHit>,
+pub struct ScanResult {
+    pub hits: BTreeSet<UsageHit>,
+    pub unproven_hits: BTreeSet<UsageHit>,
 }
 
-pub(super) struct ScanCtx<'a> {
-    py: &'a PythonAnalyzer,
-    pub(super) file: &'a ProjectFile,
-    pub(super) source: &'a str,
-    pub(super) line_starts: &'a [usize],
-    pub(super) analyzer: &'a dyn IAnalyzer,
+pub struct ScanCtx<'a> {
+    python: &'a dyn PythonUsageSource,
+    pub file: &'a ProjectFile,
+    pub source: &'a str,
+    pub line_starts: &'a [usize],
+    pub graph: &'a PythonGraphSource<'a>,
     target: &'a CodeUnit,
     target_short: &'a str,
     target_member: Option<&'a str>,
@@ -271,8 +286,8 @@ pub(super) struct ScanCtx<'a> {
     module_bindings: &'a HashMap<String, Vec<ClassifiedModuleBindingEvent>>,
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     scope_range_index: &'a [ScopeRangeEntry],
-    pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
+    pub hits: &'a mut BTreeSet<UsageHit>,
+    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
 
 struct ScopeRangeEntry {
@@ -282,13 +297,14 @@ struct ScopeRangeEntry {
 }
 
 fn build_scope_range_index(
-    analyzer: &dyn IAnalyzer,
+    graph: &PythonGraphSource<'_>,
     scope_facts: &HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
 ) -> Vec<ScopeRangeEntry> {
     let mut entries = scope_facts
         .keys()
         .flat_map(|scope| {
-            analyzer
+            graph
+                .index
                 .ranges(scope)
                 .into_iter()
                 .map(|range| ScopeRangeEntry {
@@ -338,8 +354,8 @@ fn indexed_scope_entry<'entry, 'facts>(
 /// The per-function receiver-type facts enclosing `node`, if any. Shared by the
 /// forward scan ([`ScanCtx`]) and the inverted builder (`PyScan`) so the two
 /// paths resolve a receiver's scope through one place.
-pub(in crate::analyzer::usages) fn enclosing_scope_facts<'a>(
-    analyzer: &dyn IAnalyzer,
+pub fn enclosing_scope_facts<'a>(
+    index: &dyn CodeUnitIndex,
     file: &ProjectFile,
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     node: Node<'_>,
@@ -350,7 +366,7 @@ pub(in crate::analyzer::usages) fn enclosing_scope_facts<'a>(
         start_line: 0,
         end_line: 0,
     };
-    let enclosing = analyzer.enclosing_code_unit(file, &range)?;
+    let enclosing = index.enclosing_code_unit(file, &range)?;
     scope_facts.get(&enclosing)
 }
 
@@ -434,18 +450,18 @@ impl ScanCtx<'_> {
             start_line: 0,
             end_line: 0,
         };
-        let Some(enclosing) = self.analyzer.enclosing_code_unit(self.file, &range) else {
+        let Some(enclosing) = self.graph.index.enclosing_code_unit(self.file, &range) else {
             return false;
         };
         if &enclosing == target_owner {
             return true;
         }
         if enclosing.is_function() {
-            return target_owner_code_unit(self.analyzer, &enclosing).as_ref()
+            return target_owner_code_unit(self.graph.index, &enclosing).as_ref()
                 == Some(target_owner)
                 && function_declaration_expression_is_class_scoped(node);
         }
-        target_owner_code_unit(self.analyzer, &enclosing).as_ref() == Some(target_owner)
+        target_owner_code_unit(self.graph.index, &enclosing).as_ref() == Some(target_owner)
     }
 
     /// Whether `expr`'s type is genuinely un-inferrable in `node`'s scope (an
@@ -529,13 +545,13 @@ impl ScanCtx<'_> {
             start_line: 0,
             end_line: 0,
         };
-        let Some(enclosing) = self.analyzer.enclosing_code_unit(self.file, &range) else {
+        let Some(enclosing) = self.graph.index.enclosing_code_unit(self.file, &range) else {
             return false;
         };
         let enclosing_class = if enclosing.is_class() {
             enclosing
         } else {
-            match target_owner_code_unit(self.analyzer, &enclosing) {
+            match target_owner_code_unit(self.graph.index, &enclosing) {
                 Some(class) => class,
                 None => return false,
             }
@@ -543,8 +559,8 @@ impl ScanCtx<'_> {
         if &enclosing_class == target_owner {
             return true;
         }
-        self.analyzer
-            .type_hierarchy_provider()
+        self.graph
+            .hierarchy
             .map(|provider| provider.get_ancestors(&enclosing_class))
             .unwrap_or_default()
             .into_iter()
@@ -565,8 +581,8 @@ impl ScanCtx<'_> {
             return false;
         };
         let Some(receiver_type) = resolve_receiver_type(
-            self.analyzer,
-            self.py,
+            self.graph,
+            self.python,
             self.file,
             raw_type,
             self.target_self_file,
@@ -576,8 +592,8 @@ impl ScanCtx<'_> {
         if &receiver_type == target_owner {
             return true;
         }
-        self.analyzer
-            .type_hierarchy_provider()
+        self.graph
+            .hierarchy
             .map(|provider| provider.get_ancestors(&receiver_type))
             .unwrap_or_default()
             .into_iter()
@@ -648,8 +664,8 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 fn handle_annotation_reference_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
     let Some(candidates) = annotation_reference_candidates(
-        ctx.analyzer,
-        ctx.py,
+        ctx.graph,
+        ctx.python,
         ctx.file,
         ctx.source,
         node,
@@ -713,13 +729,13 @@ fn handle_keyword_argument_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
-    let matches = resolve_constructor_types(ctx.analyzer, ctx.py, ctx.file, ctx.source, function)
+    let matches = resolve_constructor_types(ctx.graph, ctx.python, ctx.file, ctx.source, function)
         .into_iter()
         .any(|class| {
             &class == target_owner
                 || ctx
-                    .analyzer
-                    .type_hierarchy_provider()
+                    .graph
+                    .hierarchy
                     .map(|provider| provider.get_ancestors(&class))
                     .unwrap_or_default()
                     .into_iter()
@@ -916,7 +932,7 @@ fn namespace_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Opti
     if root_name.is_empty() || import_root_shadowed(ctx, root_name, root, node) {
         return None;
     }
-    let binder = ctx.py.import_binder_of(ctx.file);
+    let binder = ctx.python.import_binder_of(ctx.file);
     let binding = binder.bindings.get(root_name)?;
     if binding.kind != ImportKind::Namespace {
         return None;
@@ -930,7 +946,7 @@ fn namespace_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Opti
         written_module.push('.');
         written_module.push_str(segment);
     }
-    if usage_resolve_module_files(ctx.py, ctx.file, &written_module)
+    if usage_resolve_module_files(ctx.python, ctx.file, &written_module)
         .iter()
         .any(|resolved| {
             ctx.seeds
@@ -949,8 +965,8 @@ fn namespace_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Opti
         written_fqn.push('.');
         written_fqn.push_str(segment);
     }
-    resolve_fqn_candidates(ctx.py, &written_fqn, |name| {
-        ctx.analyzer.definitions(name).collect()
+    resolve_fqn_candidates(ctx.python, &written_fqn, |name| {
+        ctx.graph.index.definitions(name).collect()
     })
     .into_iter()
     .any(|candidate| &candidate == ctx.target)
@@ -961,7 +977,7 @@ fn imported_root_targets_module(ctx: &ScanCtx<'_>, root: Node<'_>, reference: No
     let Some(module_fqn) = imported_module_binding_fqn(ctx, root, reference) else {
         return false;
     };
-    usage_resolve_module_files(ctx.py, ctx.file, &module_fqn)
+    usage_resolve_module_files(ctx.python, ctx.file, &module_fqn)
         .into_iter()
         .any(|resolved_file| &resolved_file == ctx.target_source)
 }
@@ -983,7 +999,7 @@ fn module_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Option<
             module_fqn.push('.');
             module_fqn.push_str(segment);
         }
-        let resolved = usage_resolve_module_files(ctx.py, ctx.file, &module_fqn);
+        let resolved = usage_resolve_module_files(ctx.python, ctx.file, &module_fqn);
         if resolved.is_empty() {
             return None;
         }
@@ -1003,8 +1019,8 @@ fn call_result_matches_target(call: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     };
     let scope_facts = ctx.scope_facts_for_node(call);
     call_result_types(
-        ctx.analyzer,
-        ctx.py,
+        ctx.graph,
+        ctx.python,
         ctx.file,
         ctx.source,
         call,
@@ -1014,8 +1030,8 @@ fn call_result_matches_target(call: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     .any(|class| {
         &class == target_owner
             || ctx
-                .analyzer
-                .type_hierarchy_provider()
+                .graph
+                .hierarchy
                 .map(|provider| provider.get_ancestors(&class))
                 .unwrap_or_default()
                 .into_iter()
@@ -1023,9 +1039,9 @@ fn call_result_matches_target(call: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     })
 }
 
-pub(in crate::analyzer::usages) fn call_result_types(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
+pub fn call_result_types(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
     file: &ProjectFile,
     source: &str,
     call: Node<'_>,
@@ -1034,28 +1050,29 @@ pub(in crate::analyzer::usages) fn call_result_types(
     let Some(function) = call.child_by_field_name("function") else {
         return Vec::new();
     };
-    let constructed = resolve_constructor_types(analyzer, py, file, source, function);
+    let constructed = resolve_constructor_types(graph, python, file, source, function);
     if !constructed.is_empty() {
         return constructed;
     }
-    let callable_fqns = resolve_callable_fqns(analyzer, py, file, source, function, scope_facts);
+    let callable_fqns = resolve_callable_fqns(graph, python, file, source, function, scope_facts);
     if callable_fqns.is_empty() {
         return Vec::new();
     }
     let callables = callable_fqns
         .into_iter()
         .flat_map(|callable_fqn| {
-            resolve_fqn_candidates(py, &callable_fqn, |name| {
-                analyzer.definitions(name).collect()
+            resolve_fqn_candidates(python, &callable_fqn, |name| {
+                graph.index.definitions(name).collect()
             })
         })
         .collect::<Vec<_>>();
     let mut classes = Vec::new();
     for callable in callables.into_iter().filter(CodeUnit::is_function) {
-        let Some(raw_type) = callable_return_type_name(analyzer, &callable) else {
+        let Some(raw_type) = callable_return_type_name(graph, &callable) else {
             continue;
         };
-        if let Some(class) = resolve_receiver_type(analyzer, py, callable.source(), &raw_type, true)
+        if let Some(class) =
+            resolve_receiver_type(graph, python, callable.source(), &raw_type, true)
         {
             classes.push(class);
         }
@@ -1066,8 +1083,8 @@ pub(in crate::analyzer::usages) fn call_result_types(
 }
 
 fn resolve_callable_fqns(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
     file: &ProjectFile,
     source: &str,
     function: Node<'_>,
@@ -1075,18 +1092,18 @@ fn resolve_callable_fqns(
 ) -> Vec<String> {
     match function.kind() {
         "identifier" => {
-            resolve_identifier_callable_fqns(analyzer, py, file, source, function, scope_facts)
+            resolve_identifier_callable_fqns(graph, python, file, source, function, scope_facts)
         }
         "attribute" => {
-            resolve_attribute_callable_fqns(analyzer, py, file, source, function, scope_facts)
+            resolve_attribute_callable_fqns(graph, python, file, source, function, scope_facts)
         }
         _ => Vec::new(),
     }
 }
 
 fn resolve_identifier_callable_fqns(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
     file: &ProjectFile,
     source: &str,
     function: Node<'_>,
@@ -1096,16 +1113,15 @@ fn resolve_identifier_callable_fqns(
     if local.is_empty() || scope_facts.is_some_and(|facts| facts.is_shadowed(local)) {
         return Vec::new();
     }
-    let binder = py.import_binder_of(file);
+    let binder = python.import_binder_of(file);
     match binder.bindings.get(local) {
-        Some(binding) if binding.kind == crate::analyzer::usages::model::ImportKind::Named => {
-            binding
-                .imported_name
-                .as_ref()
-                .map(|imported| vec![format!("{}.{}", binding.module_specifier, imported)])
-                .unwrap_or_default()
-        }
-        _ => analyzer
+        Some(binding) if binding.kind == ImportKind::Named => binding
+            .imported_name
+            .as_ref()
+            .map(|imported| vec![format!("{}.{}", binding.module_specifier, imported)])
+            .unwrap_or_default(),
+        _ => graph
+            .index
             .declarations(file)
             .into_iter()
             .find(|unit| unit.is_function() && unit.identifier() == local)
@@ -1115,8 +1131,8 @@ fn resolve_identifier_callable_fqns(
 }
 
 fn resolve_attribute_callable_fqns(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
     file: &ProjectFile,
     source: &str,
     function: Node<'_>,
@@ -1132,7 +1148,7 @@ fn resolve_attribute_callable_fqns(
     if method.is_empty() {
         return Vec::new();
     }
-    let mut fqns = attribute_receiver_classes(analyzer, py, file, source, receiver, scope_facts)
+    let mut fqns = attribute_receiver_classes(graph, python, file, source, receiver, scope_facts)
         .into_iter()
         .map(|class| format!("{}.{}", class.fq_name(), method))
         .collect::<Vec<_>>();
@@ -1142,8 +1158,8 @@ fn resolve_attribute_callable_fqns(
 }
 
 fn attribute_receiver_classes(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
     file: &ProjectFile,
     source: &str,
     receiver: Node<'_>,
@@ -1151,7 +1167,7 @@ fn attribute_receiver_classes(
 ) -> Vec<CodeUnit> {
     let mut classes = match receiver.kind() {
         "identifier" => {
-            identifier_receiver_classes(analyzer, py, file, source, receiver, scope_facts)
+            identifier_receiver_classes(graph, python, file, source, receiver, scope_facts)
         }
         "attribute" => {
             if let Some(root) = leftmost_identifier(receiver)
@@ -1159,7 +1175,7 @@ fn attribute_receiver_classes(
             {
                 Vec::new()
             } else {
-                resolve_constructor_types(analyzer, py, file, source, receiver)
+                resolve_constructor_types(graph, python, file, source, receiver)
             }
         }
         _ => Vec::new(),
@@ -1170,8 +1186,8 @@ fn attribute_receiver_classes(
 }
 
 fn identifier_receiver_classes(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
     file: &ProjectFile,
     source: &str,
     receiver: Node<'_>,
@@ -1182,7 +1198,7 @@ fn identifier_receiver_classes(
         return Vec::new();
     }
     if matches!(ident, "self" | "cls")
-        && let Some(class) = enclosing_class_for_node(analyzer, file, receiver)
+        && let Some(class) = enclosing_class_for_node(graph, file, receiver)
     {
         return vec![class];
     }
@@ -1191,7 +1207,7 @@ fn identifier_receiver_classes(
             .resolution_for(ident)
             .as_precise()
             .and_then(|targets| targets.iter().next())
-            && let Some(class) = resolve_receiver_type(analyzer, py, file, raw_type, false)
+            && let Some(class) = resolve_receiver_type(graph, python, file, raw_type, false)
         {
             return vec![class];
         }
@@ -1199,13 +1215,13 @@ fn identifier_receiver_classes(
             return Vec::new();
         }
     }
-    resolve_receiver_type(analyzer, py, file, ident, false)
+    resolve_receiver_type(graph, python, file, ident, false)
         .into_iter()
         .collect()
 }
 
 fn enclosing_class_for_node(
-    analyzer: &dyn IAnalyzer,
+    graph: &PythonGraphSource<'_>,
     file: &ProjectFile,
     node: Node<'_>,
 ) -> Option<CodeUnit> {
@@ -1215,14 +1231,14 @@ fn enclosing_class_for_node(
         start_line: 0,
         end_line: 0,
     };
-    let enclosing = analyzer.enclosing_code_unit(file, &range)?;
+    let enclosing = graph.index.enclosing_code_unit(file, &range)?;
     // Python's structural model never separately indexes nested
     // function/lambda scopes as their own CodeUnit, so `self`/`cls` can only
     // ever need the enclosing unit itself or (a method's owner) exactly one
     // `parent_of` hop up — `.take(2)` keeps that bound explicit rather than
     // an unbounded walk that could climb past the same-file owner class.
-    crate::analyzer::usages::common::enclosing_owner_chain(enclosing, |unit| {
-        analyzer.parent_of(unit)
+    brokk_bifrost_core::analyzer::usages::common::enclosing_owner_chain(enclosing, |unit| {
+        graph.index.parent_of(unit)
     })
     .take(2)
     .find(|unit| unit.is_class() && unit.source() == file)
@@ -1256,7 +1272,7 @@ fn imported_module_binding_fqn(
     if import_root_shadowed(ctx, root_text, root, reference) {
         return None;
     }
-    let binder = ctx.py.import_binder_of(ctx.file);
+    let binder = ctx.python.import_binder_of(ctx.file);
     let binding = binder.bindings.get(root_text)?;
     match binding.kind {
         ImportKind::Namespace => Some(binding.module_specifier.clone()),
@@ -1267,7 +1283,7 @@ fn imported_module_binding_fqn(
             } else {
                 format!("{}.{}", binding.module_specifier, imported)
             };
-            (!usage_resolve_module_files(ctx.py, ctx.file, &candidate).is_empty())
+            (!usage_resolve_module_files(ctx.python, ctx.file, &candidate).is_empty())
                 .then_some(candidate)
         }
         _ => None,
@@ -1360,8 +1376,8 @@ fn member_receiver_match_is_unproven(
     }
 }
 
-pub(in crate::analyzer::usages) fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text(node, source)
+pub fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
 /// Whether `node` is the `function` callee of a call expression (`node(...)`).
@@ -1374,7 +1390,7 @@ fn is_call_callee(node: Node<'_>) -> bool {
     })
 }
 
-pub(in crate::analyzer::usages) fn is_declaration_identifier(node: Node<'_>) -> bool {
+pub fn is_declaration_identifier(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -1420,10 +1436,7 @@ struct ClassifiedModuleBindingEvent {
     kind: ModuleBindingKind,
 }
 
-pub(in crate::analyzer::usages) fn collect_module_binding_timeline(
-    root: Node<'_>,
-    source: &str,
-) -> ModuleBindingTimeline {
+pub fn collect_module_binding_timeline(root: Node<'_>, source: &str) -> ModuleBindingTimeline {
     let mut timeline = ModuleBindingTimeline::default();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -1542,7 +1555,7 @@ fn collect_import_binding_events(
 }
 
 fn classify_module_binding_timeline(
-    py: &PythonAnalyzer,
+    python: &dyn PythonUsageSource,
     file: &ProjectFile,
     timeline: &ModuleBindingTimeline,
     seeds: &BTreeSet<(ProjectFile, String)>,
@@ -1563,7 +1576,7 @@ fn classify_module_binding_timeline(
                     ModuleBindingEventKind::ImportModule(module) => {
                         if *module_targets
                             .entry(module.clone())
-                            .or_insert_with(|| module_contains_seed(py, file, module, seeds))
+                            .or_insert_with(|| module_contains_seed(python, file, module, seeds))
                         {
                             ModuleBindingKind::TargetModuleImport
                         } else {
@@ -1574,20 +1587,18 @@ fn classify_module_binding_timeline(
                         module,
                         imported_name,
                     } => {
-                        let direct =
-                            usage_resolve_module_files(py, file, module)
-                                .iter()
-                                .any(|resolved| {
-                                    seeds.contains(&(resolved.clone(), imported_name.clone()))
-                                });
+                        let direct = usage_resolve_module_files(python, file, module).iter().any(
+                            |resolved| seeds.contains(&(resolved.clone(), imported_name.clone())),
+                        );
                         let submodule = if module.ends_with('.') {
                             format!("{module}{imported_name}")
                         } else {
                             format!("{module}.{imported_name}")
                         };
-                        let imports_target_module = *module_targets
-                            .entry(submodule.clone())
-                            .or_insert_with(|| module_contains_seed(py, file, &submodule, seeds));
+                        let imports_target_module =
+                            *module_targets.entry(submodule.clone()).or_insert_with(|| {
+                                module_contains_seed(python, file, &submodule, seeds)
+                            });
                         if direct {
                             ModuleBindingKind::TargetSymbolImport
                         } else if imports_target_module {
@@ -1611,12 +1622,12 @@ fn classify_module_binding_timeline(
 }
 
 fn module_contains_seed(
-    py: &PythonAnalyzer,
+    python: &dyn PythonUsageSource,
     file: &ProjectFile,
     module: &str,
     seeds: &BTreeSet<(ProjectFile, String)>,
 ) -> bool {
-    usage_resolve_module_files(py, file, module)
+    usage_resolve_module_files(python, file, module)
         .iter()
         .any(|resolved| seeds.iter().any(|(seed_file, _)| seed_file == resolved))
 }
@@ -1743,11 +1754,7 @@ fn reference_is_deferred_function_body(node: Node<'_>) -> bool {
     false
 }
 
-pub(in crate::analyzer::usages) fn collect_assigned_identifiers(
-    node: Node<'_>,
-    source: &str,
-    out: &mut HashSet<String>,
-) {
+pub fn collect_assigned_identifiers(node: Node<'_>, source: &str, out: &mut HashSet<String>) {
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
         if node.kind() == "identifier" {
@@ -1765,40 +1772,38 @@ pub(in crate::analyzer::usages) fn collect_assigned_identifiers(
     }
 }
 
-pub(in crate::analyzer::usages) fn collect_scope_facts_from_parsed_source(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
+pub fn collect_scope_facts_from_parsed_source(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
 ) -> PythonScopeFacts {
     let mut factory_return_types = collect_factory_return_types_from_root(root, source);
-    collect_imported_factory_return_types(analyzer, py, file, &mut factory_return_types);
-    collect_scope_facts_with_factory_returns(analyzer, file, source, &factory_return_types)
+    collect_imported_factory_return_types(graph, python, file, &mut factory_return_types);
+    collect_scope_facts_with_factory_returns(graph, file, source, &factory_return_types)
 }
 
 fn collect_imported_factory_return_types(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
     file: &ProjectFile,
     factory_return_types: &mut HashMap<String, String>,
 ) {
-    let binder = py.import_binder_of(file);
+    let binder = python.import_binder_of(file);
     for (local, binding) in &binder.bindings {
-        if !matches!(
-            binding.kind,
-            crate::analyzer::usages::model::ImportKind::Named
-        ) {
+        if !matches!(binding.kind, ImportKind::Named) {
             continue;
         }
         let Some(imported) = binding.imported_name.as_deref() else {
             continue;
         };
         let fqn = format!("{}.{}", binding.module_specifier, imported);
-        let units = resolve_fqn_candidates(py, &fqn, |name| analyzer.definitions(name).collect());
+        let units =
+            resolve_fqn_candidates(python, &fqn, |name| graph.index.definitions(name).collect());
         for unit in units {
             if unit.is_function() {
-                if let Some(return_type) = callable_return_type_name(analyzer, &unit) {
+                if let Some(return_type) = callable_return_type_name(graph, &unit) {
                     factory_return_types
                         .entry(local.clone())
                         .or_insert(return_type);
@@ -1811,27 +1816,22 @@ fn collect_imported_factory_return_types(
             factory_return_types
                 .entry(local.clone())
                 .or_insert_with(|| unit.identifier().to_string());
-            collect_imported_class_method_return_types(
-                analyzer,
-                local,
-                &unit,
-                factory_return_types,
-            );
+            collect_imported_class_method_return_types(graph, local, &unit, factory_return_types);
         }
     }
 }
 
 fn collect_imported_class_method_return_types(
-    analyzer: &dyn IAnalyzer,
+    graph: &PythonGraphSource<'_>,
     local_class_name: &str,
     class_unit: &CodeUnit,
     factory_return_types: &mut HashMap<String, String>,
 ) {
-    for member in analyzer.direct_children(class_unit) {
+    for member in graph.index.direct_children(class_unit) {
         if !member.is_function() {
             continue;
         }
-        let Some(return_type) = callable_return_type_name(analyzer, &member) else {
+        let Some(return_type) = callable_return_type_name(graph, &member) else {
             continue;
         };
         factory_return_types
@@ -1840,9 +1840,9 @@ fn collect_imported_class_method_return_types(
     }
 }
 
-fn callable_return_type_name(analyzer: &dyn IAnalyzer, callable: &CodeUnit) -> Option<String> {
-    let source = analyzer.indexed_source(callable.source())?;
-    declaration_source_slices(analyzer, callable, &source)
+fn callable_return_type_name(graph: &PythonGraphSource<'_>, callable: &CodeUnit) -> Option<String> {
+    let source = graph.index.indexed_source(callable.source())?;
+    declaration_source_slices(graph, callable, &source)
         .into_iter()
         .find_map(|declaration_source| {
             let mut parser = Parser::new();
@@ -1870,19 +1870,19 @@ fn first_function_definition(root: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn collect_scope_facts_with_factory_returns(
-    analyzer: &dyn IAnalyzer,
+    graph: &PythonGraphSource<'_>,
     file: &ProjectFile,
     source: &str,
     factory_return_types: &HashMap<String, String>,
 ) -> PythonScopeFacts {
-    let declarations = analyzer.declarations(file);
+    let declarations = graph.index.declarations(file);
     let mut class_facts_by_name: HashMap<String, LocalBindingsSnapshot<String>> =
         HashMap::default();
     for declaration in declarations
         .iter()
         .filter(|declaration| declaration.is_class())
     {
-        let Some(declaration_source) = declaration_source(analyzer, declaration, source) else {
+        let Some(declaration_source) = declaration_source(graph, declaration, source) else {
             continue;
         };
         let facts = collect_scope_facts_from_source(
@@ -1903,7 +1903,7 @@ fn collect_scope_facts_with_factory_returns(
         .iter()
         .filter(|declaration| declaration.is_function())
     {
-        let Some(declaration_source) = declaration_source(analyzer, declaration, source) else {
+        let Some(declaration_source) = declaration_source(graph, declaration, source) else {
             continue;
         };
         // fqname-M4: package-less short_name owner, matched below against
@@ -1934,7 +1934,7 @@ fn collect_scope_facts_with_factory_returns(
     // its bindings must be recorded too, otherwise constructed-local receivers
     // used at module scope resolve to no type.
     for declaration in declarations.iter().filter(|d| d.is_module()) {
-        let Some(declaration_source) = declaration_source(analyzer, declaration, source) else {
+        let Some(declaration_source) = declaration_source(graph, declaration, source) else {
             continue;
         };
         let facts = collect_scope_facts_from_source(
@@ -1950,20 +1950,20 @@ fn collect_scope_facts_with_factory_returns(
 }
 
 fn declaration_source(
-    analyzer: &dyn IAnalyzer,
+    graph: &PythonGraphSource<'_>,
     declaration: &CodeUnit,
     file_source: &str,
 ) -> Option<String> {
-    let slices = declaration_source_slices(analyzer, declaration, file_source);
+    let slices = declaration_source_slices(graph, declaration, file_source);
     (!slices.is_empty()).then(|| slices.join("\n\n"))
 }
 
 fn declaration_source_slices<'a>(
-    analyzer: &dyn IAnalyzer,
+    graph: &PythonGraphSource<'_>,
     declaration: &CodeUnit,
     file_source: &'a str,
 ) -> Vec<&'a str> {
-    let mut ranges = analyzer.ranges(declaration);
+    let mut ranges = graph.index.ranges(declaration);
     ranges.sort_by_key(|range| range.start_byte);
     ranges
         .into_iter()
@@ -1987,7 +1987,7 @@ fn collect_scope_facts_from_source(
     )
 }
 
-pub(in crate::analyzer::usages) fn collect_function_scope_facts_from_node(
+pub fn collect_function_scope_facts_from_node(
     function: Node<'_>,
     source: &str,
 ) -> LocalBindingsSnapshot<String> {
