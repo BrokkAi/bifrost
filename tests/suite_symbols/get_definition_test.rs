@@ -290,6 +290,71 @@ void call(Token *tok) {
 }
 
 #[test]
+fn cpp_out_of_line_namespace_type_reference_prefers_global_value_type() {
+    let value_type_header = r#"#pragma once
+class ValueType {
+public:
+    enum Type { LONGLONG };
+};
+"#;
+    let value_header = r#"#pragma once
+namespace ValueFlow {
+class Value {
+public:
+    enum class ValueType { INT };
+};
+}
+"#;
+    let source = r###"#include "symboldatabase.h"
+#include "vfvalue.h"
+namespace std {
+template<class T> class vector {
+public:
+    T* begin() const;
+    T* end() const;
+};
+}
+std::vector<ValueType> getParentValueTypes();
+bool ValueFlow::isLifetimeBorrowed() {
+    std::vector<ValueType> vtParents = getParentValueTypes();
+    for (const ValueType& vtParent : vtParents) {
+        (void)vtParent;
+    }
+    auto check = []() {
+        ValueType lambdaValue{};
+        (void)lambdaValue;
+    };
+    check();
+    return true;
+}
+"###;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("symboldatabase.h", value_type_header)
+        .file("vfvalue.h", value_header)
+        .file("valueflow.cpp", source)
+        .build();
+    for reference in [
+        source
+            .find("for (const ValueType& vtParent")
+            .map(|offset| offset + "for (const ".len())
+            .expect("range-for type reference"),
+        source
+            .find("ValueType lambdaValue")
+            .expect("lambda type reference"),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("valueflow.cpp", source, reference),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        let definitions = result["definitions"].as_array().expect("definitions");
+        assert_eq!(definitions.len(), 1, "{value}");
+        assert_eq!(definitions[0]["fqn"], "ValueType", "{value}");
+    }
+}
+
+#[test]
 fn cpp_fragmented_export_class_member_resolves_to_real_field() {
     let header = r#"
 #pragma once

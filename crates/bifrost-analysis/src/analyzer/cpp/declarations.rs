@@ -473,15 +473,16 @@ fn fragmented_export_function_body_region(
     source: &str,
 ) -> Option<FragmentedExportBody> {
     let reparse_start = body.start_byte().checked_add(1)?;
-    let mut sibling = node.next_named_sibling();
+    let siblings = cpp_following_named_siblings(node, source);
+    let mut sibling_index = 0;
     // A complete recovered class's synthetic wrapper is immediately followed
     // by its displaced semicolon (comments may sit between the body and that
     // semicolon). Only scan for a later stray close when real member siblings
     // intervene; otherwise every earlier complete class would borrow the next
     // malformed class's close and claim its members.
-    while let Some(current) = sibling {
+    while let Some(current) = siblings.get(sibling_index).copied() {
         if current.kind() == "comment" {
-            sibling = current.next_named_sibling();
+            sibling_index += 1;
             continue;
         }
         if cpp_is_stray_semicolon(current, source) {
@@ -489,10 +490,10 @@ fn fragmented_export_function_body_region(
         }
         break;
     }
-    while let Some(current) = sibling {
-        let next = current.next_named_sibling();
+    while let Some(current) = siblings.get(sibling_index).copied() {
+        let next = siblings.get(sibling_index + 1).copied();
         if cpp_is_stray_close_brace(current, source)
-            && next.is_some_and(|candidate| cpp_is_stray_semicolon(candidate, source))
+            && next.is_some_and(|next| cpp_is_stray_semicolon(next, source))
         {
             let semicolon = next.expect("checked above");
             return Some(FragmentedExportBody {
@@ -526,7 +527,7 @@ fn fragmented_export_function_body_region(
                 },
             });
         }
-        sibling = next;
+        sibling_index += 1;
     }
     None
 }
@@ -546,6 +547,47 @@ fn cpp_nested_stray_close_brace<'tree>(node: Node<'tree>, source: &str) -> Optio
         stack.extend(current.named_children(&mut cursor));
     }
     None
+}
+
+/// Return named siblings that follow `node`, including siblings that tree-sitter
+/// attached to an enclosing container after malformed recovery split the local
+/// declaration list. Stop at the first structurally visible class close so a
+/// later namespace or exported class cannot supply the recovery boundary.
+fn cpp_following_named_siblings<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>> {
+    let mut siblings = Vec::new();
+    let mut anchor = node;
+    while let Some(parent) = anchor.parent() {
+        let at_translation_unit = parent.kind() == "translation_unit";
+        let mut sibling = anchor.next_named_sibling();
+        while let Some(current) = sibling {
+            if at_translation_unit
+                && (current.kind() == "namespace_definition"
+                    || (current.kind() == "function_definition"
+                        && first_class_like_child(current).is_some()))
+            {
+                return siblings;
+            }
+            siblings.push(current);
+            if cpp_is_stray_close_brace(current, source) {
+                if let Some(semicolon) = current
+                    .next_named_sibling()
+                    .filter(|candidate| cpp_is_stray_semicolon(*candidate, source))
+                {
+                    siblings.push(semicolon);
+                }
+                return siblings;
+            }
+            if current.start_byte() >= node.end_byte()
+                && matches!(current.kind(), "ERROR" | "labeled_statement")
+                && cpp_nested_stray_close_brace(current, source).is_some()
+            {
+                return siblings;
+            }
+            sibling = current.next_named_sibling();
+        }
+        anchor = parent;
+    }
+    siblings
 }
 
 fn cpp_fragment_sibling_is_class_member(node: Node<'_>, class_end: usize, source: &str) -> bool {
@@ -2278,8 +2320,7 @@ impl<'a> CppVisitor<'a> {
                         recovered_specialization_member_scope: false,
                         visible_using_namespaces: scope.visible_using_namespaces.clone(),
                     };
-                    let mut sibling = node.next_named_sibling();
-                    while let Some(candidate) = sibling {
+                    for candidate in cpp_following_named_siblings(node, self.source) {
                         if candidate.start_byte() >= fragmented.reparse_end {
                             break;
                         }
@@ -2291,7 +2332,6 @@ impl<'a> CppVisitor<'a> {
                             self.recovered_class_sibling_scopes
                                 .insert(candidate.id(), member_scope.clone());
                         }
-                        sibling = candidate.next_named_sibling();
                     }
                     if let Some(range) = recovered_constructor
                         && let (Some(prefix_tree), Some(body)) = (recovered_prefix_tree, body)
@@ -9039,6 +9079,139 @@ class SIMPLECPP_LIB Token {
                 .is_some_and(|ranges| ranges.iter().any(|range| range.end_byte == class_end)),
             "class navigation must include the terminating semicolon: {:#?}",
             parsed.navigation_ranges
+        );
+    }
+
+    #[test]
+    fn simplecpp_token_fragmented_export_keeps_location_and_string_fields() {
+        let source = r#"
+#define SIMPLECPP_LIB
+namespace simplecpp {
+using TokenString = std::string;
+class Macro;
+struct Location {
+  unsigned int fileIndex{};
+  unsigned int line{};
+  unsigned int col{};
+};
+struct Output {
+  int type;
+};
+class SIMPLECPP_LIB Token {
+ public:
+  Token(const TokenString &s, const Location &loc, bool wsahead = false) :
+      whitespaceahead(wsahead), location(loc), string(s) {
+      flags();
+  }
+  Token(const Token &tok) :
+      macro(tok.macro), op(tok.op), comment(tok.comment), name(tok.name),
+      number(tok.number), whitespaceahead(tok.whitespaceahead), location(tok.location),
+      string(tok.string), mExpandedFrom(tok.mExpandedFrom) {}
+  Token &operator=(const Token &tok) = delete;
+  const TokenString& str() const { return string; }
+  void setstr(const std::string &s) { string = s; flags(); }
+  bool isOneOf(const char ops[]) const;
+  TokenString macro;
+  char op;
+  bool comment;
+  bool name;
+  bool number;
+  bool whitespaceahead;
+  Location location;
+  Token *previous{};
+  Token *next{};
+ private:
+  void flags() {
+      name = !string.empty();
+      comment = false;
+      number = false;
+      op = 0;
+  }
+  TokenString string;
+};
+}
+struct Following {
+  int type;
+};
+class SIMPLECPP_LIB Later {
+ public:
+  Later(int value) : value(value) {}
+  int value;
+};
+"#;
+        let parsed = parse_cpp_declarations(source, "simplecpp-token.hpp");
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .any(|unit| { unit.is_field() && unit.fq_name() == "simplecpp.Token.location" })
+        );
+        assert!(
+            !parsed
+                .declarations()
+                .iter()
+                .any(|unit| { unit.is_function() && unit.fq_name() == "simplecpp.Token.location" })
+        );
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.is_field() && unit.fq_name() == "simplecpp.Token.string")
+        );
+        assert!(
+            !parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.is_function() && unit.fq_name() == "simplecpp.Token.string")
+        );
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.is_class() && unit.fq_name() == "simplecpp.Output")
+        );
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.is_field() && unit.fq_name() == "simplecpp.Output.type")
+        );
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.is_class() && unit.fq_name() == "Following")
+        );
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.is_field() && unit.fq_name() == "Following.type")
+        );
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.is_class() && unit.fq_name() == "Later")
+        );
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.is_field() && unit.fq_name() == "Later.value")
+        );
+        assert!(parsed.declarations().iter().all(|unit| {
+            !matches!(
+                unit.fq_name().as_str(),
+                "simplecpp.Token.Following" | "simplecpp.Token.Later"
+            )
+        }));
+        assert!(
+            !parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.fq_name() == "simplecpp.Token.Output"),
+            "the following struct must remain outside the recovered Token class"
         );
     }
 
