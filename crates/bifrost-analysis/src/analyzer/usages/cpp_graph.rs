@@ -1,29 +1,47 @@
-mod extractor;
-mod hits;
-mod inverted;
-mod resolver;
+//! The analysis-side wrappers over [`brokk_bifrost_cpp::graph`].
+//!
+//! The scans themselves moved with the language knowledge -- the forward
+//! extractor, the visibility/macro/include resolver, the hit builder and the
+//! per-file inverted walk are one body of code and crossed together. What stays
+//! here is the downcast that produces their arguments, the dispatching
+//! analyzer's side of a scan ([`CppDispatch`]), the `GraphUsageAnalyzer` /
+//! `UsageQueryResolver` / `UsageAnalyzer` strategy shells (all analysis-owned
+//! traits), the inverted pass's fan-out -- `build_edge_output` and
+//! `parse_and_collect` are the shared, language-agnostic driver -- the
+//! dead-code bulk eligibility split at the downcast, and
+//! [`CppAuthoritativeUsageBatch`], whose public path the root crate's
+//! reference differential depends on.
+
+#[cfg(test)]
+mod extractor_tests;
+#[cfg(test)]
+mod inverted_tests;
+#[cfg(test)]
+mod resolver_tests;
 mod shared;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::language_for_target;
-use crate::analyzer::usages::cpp_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::cpp_graph::shared::{CppEdgeResolver, CppQueryResolver};
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{CodeUnit, CppAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 pub(in crate::analyzer::usages) use brokk_bifrost_cpp::call_match::cpp_split_top_level_commas;
+use brokk_bifrost_cpp::graph::resolver::{TargetKind, TargetSpec};
+use brokk_bifrost_cpp::graph::{CppGraphSource, CppWorkspaceSource};
+use brokk_bifrost_cpp::graph_support::CppAnalysisSource;
 
-pub(in crate::analyzer::usages) use extractor::{
+pub(in crate::analyzer::usages) use brokk_bifrost_cpp::graph::extractor::{
     BareCallTargetResolution as CppBareCallTargetResolution,
     LexicalScopeResolution as CppLexicalScopeResolution,
     enclosing_lexical_scope_components as cpp_enclosing_lexical_scope_components,
     initialized_ordinary_type_imports as cpp_initialized_effective_using_imports,
     resolve_bare_call_target as cpp_resolve_bare_call_target,
 };
-pub(in crate::analyzer::usages) use resolver::{
+pub(in crate::analyzer::usages) use brokk_bifrost_cpp::graph::resolver::{
     CallArityEvidence, DesignatedInitializerOwner as CppDesignatedInitializerOwner,
     LexicalTypeResolution as CppLexicalTypeResolution, TargetKind as CppTargetKind,
     VisibilityIndex as CppVisibilityIndex, argument_children as cpp_argument_children,
@@ -38,9 +56,84 @@ pub(in crate::analyzer::usages) use resolver::{
 };
 pub use shared::CppAuthoritativeUsageBatch;
 
+/// The *dispatching* analyzer, in the shape [`brokk_bifrost_cpp::graph`] asks
+/// for.
+///
+/// Not the C++ analyzer: in a mixed workspace the query is issued against a
+/// `MultiAnalyzer`, whose `definitions` merges every language's shards and
+/// whose `import_statements` and provider accessors cross language boundaries,
+/// and the C++ walks depend on that reach. The C++ analyzer that answers the
+/// C++-only questions is resolved once here rather than at each of the nine
+/// `resolve_analyzer::<CppAnalyzer>` sites the scans used to carry.
+///
+/// A borrowed newtype rather than a bare `&dyn IAnalyzer` because two of the
+/// questions have no core capability to sit on and `dyn IAnalyzer` cannot be
+/// unsized to another trait object: `import_statements` is `IAnalyzer`'s own,
+/// and `DefinitionIndexHandle` is built per call, so it can never be lent out
+/// as a `&dyn` for the crate to hold.
+pub(in crate::analyzer::usages) struct CppDispatch<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    cpp: Option<&'a CppAnalyzer>,
+}
+
+impl<'a> CppDispatch<'a> {
+    pub(in crate::analyzer::usages) fn new(analyzer: &'a dyn IAnalyzer) -> Self {
+        Self {
+            analyzer,
+            cpp: resolve_analyzer::<CppAnalyzer>(analyzer),
+        }
+    }
+
+    pub(in crate::analyzer::usages) fn source(&self) -> CppGraphSource<'_> {
+        CppGraphSource {
+            index: self.analyzer,
+            cpp: self.cpp.map(|cpp| cpp as &dyn CppAnalysisSource),
+            aliases: self.analyzer.type_alias_provider(),
+            hierarchy: self.analyzer.type_hierarchy_provider(),
+            workspace: self,
+        }
+    }
+}
+
+impl CppWorkspaceSource for CppDispatch<'_> {
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
+        self.analyzer.import_statements(file)
+    }
+
+    fn definitions_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.analyzer.global_usage_definition_index().fqn(fqn)
+    }
+
+    fn definition_peers_by_fqn(&self, fqn: &str) -> Vec<&CodeUnit> {
+        // `into_shards` rather than a query on the handle: the peers are
+        // returned to a caller that outlives this lookup, so they must borrow
+        // the analyzer rather than a handle that dies with this call.
+        self.analyzer
+            .global_usage_definition_index()
+            .into_shards()
+            .into_iter()
+            .flat_map(|shard| shard.by_fqn(fqn).iter())
+            .collect()
+    }
+}
+
+/// The dispatching source for a call that has no [`CppDispatch`] to hand.
+///
+/// Every entry point below builds one per call, exactly where the moved code
+/// used to run its own `resolve_analyzer` downcast.
+pub(in crate::analyzer::usages) fn with_cpp_graph_source<T>(
+    analyzer: &dyn IAnalyzer,
+    body: impl FnOnce(CppGraphSource<'_>) -> T,
+) -> T {
+    let dispatch = CppDispatch::new(analyzer);
+    body(dispatch.source())
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub fn cpp_type_owner_for_test(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<CodeUnit> {
-    resolver::type_owner_of(analyzer, unit)
+    with_cpp_graph_source(analyzer, |source| {
+        brokk_bifrost_cpp::graph::resolver::type_owner_of(source, unit)
+    })
 }
 
 pub(crate) fn build_cpp_usage_edges<F>(
@@ -78,7 +171,9 @@ pub(crate) fn dead_code_bulk_eligibility(
     target: &CodeUnit,
     overloaded_fqns: &HashSet<String>,
 ) -> CppDeadCodeBulkEligibility {
-    let Some(spec) = TargetSpec::from_target(analyzer, target) else {
+    let Some(spec) =
+        with_cpp_graph_source(analyzer, |source| TargetSpec::from_target(source, target))
+    else {
         return CppDeadCodeBulkEligibility::NeedsPrecise;
     };
     match spec.kind {
@@ -99,7 +194,8 @@ pub(crate) fn dead_code_bulk_eligibility(
 }
 
 pub(crate) fn is_cpp_global_main(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> bool {
-    TargetSpec::from_target(analyzer, target).is_some_and(|spec| cpp_global_main(&spec))
+    with_cpp_graph_source(analyzer, |source| TargetSpec::from_target(source, target))
+        .is_some_and(|spec| cpp_global_main(&spec))
 }
 
 fn cpp_effectively_free_function(spec: &TargetSpec) -> bool {

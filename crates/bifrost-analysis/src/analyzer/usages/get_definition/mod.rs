@@ -6,7 +6,7 @@ use crate::analyzer::lexical_definitions::{
 use crate::analyzer::structural::resolution::{BoundaryStatus, PrecedenceTier, RejectionReason};
 use crate::analyzer::usages::common::namespace_prefixes;
 use crate::analyzer::usages::cpp_graph::{
-    CallArityEvidence, CppBareCallTargetResolution, CppDesignatedInitializerOwner,
+    CallArityEvidence, CppBareCallTargetResolution, CppDesignatedInitializerOwner, CppDispatch,
     CppLexicalScopeResolution, CppLexicalTypeResolution, CppTargetKind, CppVisibilityIndex,
     cpp_argument_children, cpp_constructor_type_node, cpp_designated_initializer_owner,
     cpp_enclosing_lexical_scope_components, cpp_field_declared_type_binding, cpp_first_type_child,
@@ -968,12 +968,13 @@ impl<'a> DefinitionBatchContext<'a> {
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
     ) -> Arc<CppVisibilityIndex<'a>> {
+        let dispatch = CppDispatch::new(analyzer);
         self.cpp_visibility
             .entry(file.clone())
             .or_insert_with(|| {
                 let mut roots = HashSet::default();
                 roots.insert(file.clone());
-                Arc::new(CppVisibilityIndex::build(cpp, analyzer, &roots))
+                Arc::new(CppVisibilityIndex::build(cpp, dispatch.source(), &roots))
             })
             .clone()
     }

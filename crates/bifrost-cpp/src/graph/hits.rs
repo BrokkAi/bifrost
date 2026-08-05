@@ -1,22 +1,22 @@
-use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
-use crate::analyzer::usages::cpp_graph::extractor::{EnclosingContext, ScanCtx};
-use crate::analyzer::usages::cpp_graph::resolver::{
+use crate::graph::extractor::{EnclosingContext, ScanCtx};
+use crate::graph::resolver::{
     TargetKind, precise_parent_of, same_logical_symbol, visible_owner_from_member_name,
 };
-use crate::analyzer::usages::model::{UsageHitKind, UsageHitSurface};
-use crate::analyzer::{CodeUnit, Range};
-use crate::text_utils::{find_line_index_for_offset, snippet_around_line};
+use brokk_bifrost_core::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
+use brokk_bifrost_core::analyzer::usages::model::{UsageHitKind, UsageHitSurface};
+use brokk_bifrost_core::analyzer::{CodeUnit, Range};
+use brokk_bifrost_core::text_utils::{find_line_index_for_offset, snippet_around_line};
 use tree_sitter::Node;
 
-pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit_with_options(node, ctx, false, UsageHitKind::Reference, false);
 }
 
-pub(super) fn push_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn push_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit_with_options(node, ctx, false, UsageHitKind::Reference, true);
 }
 
-pub(super) fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit_with_options(node, ctx, false, UsageHitKind::SelfReceiver, false);
 }
 
@@ -26,7 +26,7 @@ pub(super) fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// enclosing definition here does not create a self edge in external usage
 /// results. The structured same-symbol check below prevents unrelated
 /// enclosing units from being classified as recursive references.
-pub(super) fn push_recursive_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn push_recursive_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if *ctx.limit_exceeded {
         return;
     }
@@ -44,15 +44,15 @@ pub(super) fn push_recursive_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>
     insert_hit(node, ctx, enclosing, line_idx, UsageHitKind::SelfReceiver);
 }
 
-pub(super) fn push_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn push_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit_with_options(node, ctx, true, UsageHitKind::Definition, false);
 }
 
-pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_unproven_hit_with_kind(node, ctx, UsageHitKind::Reference);
 }
 
-pub(super) fn push_unproven_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn push_unproven_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_unproven_hit_with_kind(node, ctx, UsageHitKind::Definition);
 }
 
@@ -160,7 +160,7 @@ fn insert_hit(
     }
 }
 
-pub(super) fn enclosing_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> EnclosingContext {
+pub fn enclosing_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> EnclosingContext {
     let key = (node.start_byte(), node.end_byte());
     if let Some(cached) = ctx.enclosing_cache.borrow().get(&key).cloned() {
         return cached;
@@ -202,7 +202,7 @@ fn is_inside_target_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 /// A `field_declaration` also owns default member initializers and, for method
 /// declarations, parameter default values. Those subtrees contain genuine
 /// references and must not be discarded with the declaration's own name.
-pub(super) fn is_member_field_own_declarator(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+pub fn is_member_field_own_declarator(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     if !matches!(ctx.spec.kind, TargetKind::MemberField) {
         return false;
     }

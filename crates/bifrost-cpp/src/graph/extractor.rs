@@ -1,72 +1,74 @@
-use crate::analyzer::cpp::{
-    CppSentinelRecoveredClass, cpp_export_macro_token, cpp_sentinel_recovered_scope_for_node,
-    recovered_macro_return_type_node,
+use crate::call_match::{
+    CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_signature_param_types,
+    cpp_type_text_pointer_depth, normalize_cpp_type_name,
 };
-use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
-use crate::analyzer::usages::common::same_node;
-use crate::analyzer::usages::cpp_graph::hits::{
+use crate::declarations::{
+    CppSentinelRecoveredClass, cpp_export_macro_token, cpp_sentinel_recovered_scope_for_node,
+    node_text, recovered_macro_return_type_node,
+};
+use crate::graph::CppGraphSource;
+use crate::graph::callable_definitions_share_identity_evidence as cpp_callable_definitions_share_identity_evidence;
+use crate::graph::hits::{
     enclosing_context, is_member_field_own_declarator, push_definition_hit, push_hit,
     push_recursive_reference_hit, push_self_receiver_hit, push_type_hit,
     push_unproven_definition_hit, push_unproven_hit,
 };
-use crate::analyzer::usages::cpp_graph::resolver::*;
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::{
-    CodeUnit, CppAnalyzer, IAnalyzer, ProjectFile, Range,
-    cpp_callable_definitions_share_identity_evidence, cpp_node_text as node_text,
+use crate::graph::resolver::*;
+use crate::graph::syntax::explicit_qualified_callable_value;
+use crate::graph_support::CppAnalysisSource;
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::usages::common::same_node;
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
 };
-use crate::hash::{HashMap, HashSet};
-use brokk_bifrost_cpp::call_match::{
-    CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_signature_param_types,
-    cpp_type_text_pointer_depth, normalize_cpp_type_name,
-};
-use brokk_bifrost_cpp::graph::syntax::explicit_qualified_callable_value;
-#[cfg(test)]
+use brokk_bifrost_core::analyzer::usages::model::UsageHit;
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
+#[cfg(any(test, feature = "test-support"))]
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tree_sitter::Node;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static LEXICAL_SCOPE_RECONSTRUCTIONS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
+    pub static LEXICAL_SCOPE_RECONSTRUCTIONS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
 }
 
-pub(super) struct ScanState<'a> {
-    pub(super) max_usages: usize,
-    pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) raw_match_count: &'a mut usize,
-    pub(super) limit_exceeded: &'a mut bool,
+pub struct ScanState<'a> {
+    pub max_usages: usize,
+    pub hits: &'a mut BTreeSet<UsageHit>,
+    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
+    pub raw_match_count: &'a mut usize,
+    pub limit_exceeded: &'a mut bool,
 }
 
-pub(super) struct ScanCtx<'a> {
-    pub(super) analyzer: &'a dyn IAnalyzer,
-    pub(super) visibility: &'a VisibilityIndex<'a>,
-    pub(super) file: &'a ProjectFile,
-    pub(super) source: &'a str,
+pub struct ScanCtx<'a> {
+    pub analyzer: CppGraphSource<'a>,
+    pub visibility: &'a VisibilityIndex<'a>,
+    pub file: &'a ProjectFile,
+    pub source: &'a str,
     ordinary_type_imports: OrdinaryTypeImportCell,
     recovered_sentinel_classes: &'a [CppSentinelRecoveredClass],
-    pub(super) line_starts: &'a [usize],
-    pub(super) spec: &'a TargetSpec,
-    pub(super) target_group: &'a HashSet<CodeUnit>,
+    pub line_starts: &'a [usize],
+    pub spec: &'a TargetSpec,
+    pub target_group: &'a HashSet<CodeUnit>,
     type_reference_component_names: HashSet<String>,
-    pub(super) target_declaration_ranges: Vec<Range>,
+    pub target_declaration_ranges: Vec<Range>,
     orphaned_namespaces: Vec<OrphanedNamespaceEnvelope>,
-    pub(super) bindings: LocalInferenceEngine<CppScanBinding>,
+    pub bindings: LocalInferenceEngine<CppScanBinding>,
     local_shadows: LocalInferenceEngine<()>,
     using_enum_owners: ScopedUsingEnumOwners,
     semantic_using_enum_owners: SemanticUsingEnumOwners,
     needs_using_enum_member_resolution: bool,
-    pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) raw_match_count: &'a mut usize,
-    pub(super) max_usages: usize,
-    pub(super) limit_exceeded: &'a mut bool,
-    pub(super) enclosing_cache: RefCell<HashMap<(usize, usize), EnclosingContext>>,
-    pub(super) enclosing_owner_cache: RefCell<HashMap<CodeUnit, Option<CodeUnit>>>,
+    pub hits: &'a mut BTreeSet<UsageHit>,
+    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
+    pub raw_match_count: &'a mut usize,
+    pub max_usages: usize,
+    pub limit_exceeded: &'a mut bool,
+    pub enclosing_cache: RefCell<HashMap<(usize, usize), EnclosingContext>>,
+    pub enclosing_owner_cache: RefCell<HashMap<CodeUnit, Option<CodeUnit>>>,
     lexical_scope_cache: LexicalScopeCache,
     lexical_free_function_cache: RefCell<HashMap<(String, String), bool>>,
     member_owner_cache: RefCell<HashMap<CodeUnit, EnclosingMemberOwnerResolution>>,
@@ -81,21 +83,21 @@ impl ScanCtx<'_> {
 }
 
 #[derive(Clone, Default)]
-pub(super) struct EnclosingContext {
-    pub(super) enclosing: Option<CodeUnit>,
-    pub(super) owner: Option<CodeUnit>,
+pub struct EnclosingContext {
+    pub enclosing: Option<CodeUnit>,
+    pub owner: Option<CodeUnit>,
 }
 
-pub(super) fn prepare_file(
-    cpp: &CppAnalyzer,
+pub fn prepare_file(
+    cpp: &dyn CppAnalysisSource,
     file: &ProjectFile,
 ) -> Option<Arc<PreparedSyntaxTree>> {
     cpp.prepared_syntax(file)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn scan_prepared_file(
-    analyzer: &dyn IAnalyzer,
+pub fn scan_prepared_file(
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
@@ -312,7 +314,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn seed_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if crate::analyzer::cpp::is_direct_recovered_exported_class_field_declaration(node, ctx.source)
+    if crate::declarations::is_direct_recovered_exported_class_field_declaration(node, ctx.source)
         || (ctx.spec.kind != TargetKind::Type
             && indexed_recovered_class_field_declaration(node, ctx))
     {
@@ -1684,7 +1686,7 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
     }
 }
 
-pub(in crate::analyzer::usages) enum BareCallTargetResolution {
+pub enum BareCallTargetResolution {
     Type(CodeUnit),
     FreeFunctions(Vec<CodeUnit>),
     UnprovenFreeFunctions(Vec<CodeUnit>),
@@ -1697,7 +1699,7 @@ pub(in crate::analyzer::usages) enum BareCallTargetResolution {
 fn resolve_qualified_call_target(
     call: Node<'_>,
     function: Node<'_>,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
@@ -1778,7 +1780,7 @@ fn resolve_qualified_call_target(
 fn binding_free_function_candidates(
     binding: &OrdinaryTypeImport,
     active_bindings: &[&OrdinaryTypeImport],
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     name: &str,
@@ -1848,7 +1850,7 @@ fn resolve_callable_candidates(
     candidates: Vec<CodeUnit>,
     call_arity: Option<usize>,
     reference_byte: usize,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
 ) -> BareCallTargetResolution {
@@ -1877,7 +1879,7 @@ fn resolve_callable_candidates(
 
 fn resolve_direct_type_candidates(
     candidates: Vec<(CodeUnit, Vec<String>)>,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
 ) -> BareCallTargetResolution {
@@ -1907,10 +1909,10 @@ fn resolve_direct_type_candidates(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::analyzer::usages) fn resolve_bare_call_target(
+pub fn resolve_bare_call_target(
     call: Node<'_>,
     function: Node<'_>,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
@@ -2335,7 +2337,7 @@ fn template_type_component_preserves_target(
 fn template_reference_candidates_select_target(
     node: Node<'_>,
     candidates: &[CodeUnit],
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -2532,8 +2534,8 @@ fn target_guided_qualifier_type_scopes<'tree>(
             .visible_identifier_candidates(ctx.file, name)
             .filter(|candidate| candidate.is_class())
         {
-            let candidate_components = crate::analyzer::symbol_lookup::parse_symbol_path(
-                crate::analyzer::Language::Cpp,
+            let candidate_components = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+                brokk_bifrost_core::analyzer::Language::Cpp,
                 &cpp_name_for(candidate),
             );
             if !candidate_components.ends_with(components)
@@ -2561,8 +2563,8 @@ fn target_guided_qualifier_type_scopes<'tree>(
         let canonical_alias_target = matches!(
             candidates.as_slice(),
             [candidate]
-                if crate::analyzer::symbol_lookup::parse_symbol_path(
-                    crate::analyzer::Language::Cpp,
+                if brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+                    brokk_bifrost_core::analyzer::Language::Cpp,
                     &cpp_name_for(candidate),
                 ) == components
                     && ctx
@@ -2949,8 +2951,8 @@ fn member_alias_owner_matches_reference(node: Node<'_>, ctx: &ScanCtx<'_>) -> bo
     else {
         return false;
     };
-    let owner_components = crate::analyzer::symbol_lookup::parse_symbol_path(
-        crate::analyzer::Language::Cpp,
+    let owner_components = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+        brokk_bifrost_core::analyzer::Language::Cpp,
         &cpp_name_for(&owner),
     );
     !owner_components.is_empty() && reference_scope.ends_with(&owner_components)
@@ -3423,8 +3425,8 @@ fn target_guided_scope_lost_namespace(indexed_scope: &[String], target: &CodeUni
     if indexed_scope.len() <= 1 {
         return true;
     }
-    let mut target_scope = crate::analyzer::symbol_lookup::parse_symbol_path(
-        crate::analyzer::Language::Cpp,
+    let mut target_scope = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+        brokk_bifrost_core::analyzer::Language::Cpp,
         &cpp_name_for(target),
     );
     target_scope.pop();
@@ -3434,7 +3436,7 @@ fn target_guided_scope_lost_namespace(indexed_scope: &[String], target: &CodeUni
 }
 
 fn indexed_enclosing_lexical_scope(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     file: &ProjectFile,
     node: Node<'_>,
 ) -> Option<Vec<String>> {
@@ -3445,8 +3447,8 @@ fn indexed_enclosing_lexical_scope(
         end_line: node.end_position().row,
     };
     let enclosing = analyzer.enclosing_code_unit(file, &range)?;
-    let mut components = crate::analyzer::symbol_lookup::parse_symbol_path(
-        crate::analyzer::Language::Cpp,
+    let mut components = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+        brokk_bifrost_core::analyzer::Language::Cpp,
         &cpp_name_for(&enclosing),
     );
     if !enclosing.is_class() && !enclosing.is_module() {
@@ -4545,8 +4547,8 @@ fn global_field_resolves_to_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     }
     if let Some(indexed_scope) = indexed_enclosing_lexical_scope(ctx.analyzer, ctx.file, node)
         && cpp_namespace_for(&ctx.spec.target).is_some_and(|namespace| {
-            crate::analyzer::symbol_lookup::parse_symbol_path(
-                crate::analyzer::Language::Cpp,
+            brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+                brokk_bifrost_core::analyzer::Language::Cpp,
                 &namespace,
             ) == indexed_scope
         })
@@ -5216,8 +5218,8 @@ fn resolve_receiver_type_name_lexically(
     normalized: &str,
     ctx: &ScanCtx<'_>,
 ) -> LexicalTypeResolution {
-    let components = crate::analyzer::symbol_lookup::parse_symbol_path(
-        crate::analyzer::Language::Cpp,
+    let components = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+        brokk_bifrost_core::analyzer::Language::Cpp,
         normalized,
     );
     if components.is_empty() {
@@ -5720,7 +5722,7 @@ enum QualifiedOwnerResolution {
 }
 
 #[derive(Clone)]
-pub(in crate::analyzer::usages) enum LexicalScopeResolution {
+pub enum LexicalScopeResolution {
     Resolved(Vec<String>),
     Ambiguous,
     Missing,
@@ -5824,7 +5826,7 @@ fn type_reference_components(node: Node<'_>, source: &str) -> Option<(Vec<String
     (!components.is_empty()).then_some((components, is_globally_qualified_cpp_name(node)))
 }
 
-pub(super) fn enclosing_namespace_components(node: Node<'_>, source: &str) -> Vec<String> {
+pub fn enclosing_namespace_components(node: Node<'_>, source: &str) -> Vec<String> {
     let mut namespaces = Vec::new();
     let mut current = node.parent();
     while let Some(parent) = current {
@@ -5842,9 +5844,9 @@ pub(super) fn enclosing_namespace_components(node: Node<'_>, source: &str) -> Ve
     namespaces.into_iter().flatten().collect()
 }
 
-pub(in crate::analyzer::usages) fn enclosing_lexical_scope_components(
+pub fn enclosing_lexical_scope_components(
     node: Node<'_>,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -5857,7 +5859,7 @@ pub(in crate::analyzer::usages) fn enclosing_lexical_scope_components(
 #[allow(clippy::too_many_arguments)]
 fn cached_enclosing_lexical_scope_components_with_unresolved_owner(
     node: Node<'_>,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -5922,14 +5924,14 @@ fn lexical_scope_cache_anchor(node: Node<'_>) -> (usize, usize) {
 
 fn enclosing_lexical_scope_components_with_unresolved_owner(
     node: Node<'_>,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
     allow_structured_unresolved_owner: bool,
     ignore_function_owner: bool,
 ) -> LexicalScopeResolution {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     LEXICAL_SCOPE_RECONSTRUCTIONS_FOR_TEST.with(|count| count.set(count.get() + 1));
     let namespace = enclosing_namespace_components(node, source);
     let mut scope = namespace.clone();
@@ -6192,7 +6194,7 @@ fn qualified_owner_scope_is_recoverable(
 
 /// Whether `unit` is a real (non-alias) class owner. A `using` alias never
 /// counts as the true lexical owner recovered from the indexed graph.
-fn is_indexed_class_owner(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+fn is_indexed_class_owner(analyzer: CppGraphSource<'_>, unit: &CodeUnit) -> bool {
     unit.is_class()
         && !analyzer
             .type_alias_provider()
@@ -6213,7 +6215,7 @@ fn is_indexed_class_owner(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
 /// class's fully-qualified scope components (e.g. `["log4cxx", "HTMLLayout"]`)
 /// -- exactly the scope chain C++ unqualified lookup traverses.
 fn indexed_enclosing_owner_scope(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     node: Node<'_>,
@@ -6223,15 +6225,15 @@ fn indexed_enclosing_owner_scope(
 
 fn cached_indexed_enclosing_class_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
     let start = enclosing_context(node, ctx).enclosing?;
-    crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
+    brokk_bifrost_core::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
         ctx.analyzer.parent_of(unit)
     })
     .find(|unit| is_indexed_class_owner(ctx.analyzer, unit))
 }
 
-pub(in crate::analyzer::usages) fn resolve_type_node_lexically(
+pub fn resolve_type_node_lexically(
     node: Node<'_>,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
@@ -6308,9 +6310,9 @@ fn is_template_argument_type_leaf(node: Node<'_>) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_type_node_lexically_for_target(
+pub fn resolve_type_node_lexically_for_target(
     node: Node<'_>,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
@@ -6553,10 +6555,10 @@ fn resolve_type_node_lexically_for_target(
 #[allow(clippy::too_many_arguments)]
 fn target_guided_malformed_template_alias_resolution(
     node: Node<'_>,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
-    arguments: &[crate::analyzer::CppTemplateExpression],
+    arguments: &[brokk_bifrost_core::analyzer::model::CppTemplateExpression],
     components: &[String],
     target: &CodeUnit,
 ) -> Option<LexicalTypeResolution> {
@@ -6605,7 +6607,7 @@ fn target_guided_malformed_template_alias_resolution(
 
 fn resolve_type_node_lexically_for_target_without_visibility(
     node: Node<'_>,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -6640,7 +6642,7 @@ fn resolve_type_node_lexically_for_target_without_visibility(
 
 fn type_node_has_exact_target_identity_without_visibility(
     node: Node<'_>,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -6668,9 +6670,9 @@ fn type_node_has_exact_target_identity_without_visibility(
         .any(|qualified| qualified.join("::") == target_name)
 }
 
-pub(super) fn resolve_using_enum_declaration_owner(
+pub fn resolve_using_enum_declaration_owner(
     node: Node<'_>,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
@@ -6697,9 +6699,9 @@ pub(super) fn resolve_using_enum_declaration_owner(
     )
 }
 
-pub(super) fn resolve_ordinary_using_declaration_owner(
+pub fn resolve_ordinary_using_declaration_owner(
     node: Node<'_>,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -6728,7 +6730,7 @@ pub(super) fn resolve_ordinary_using_declaration_owner(
     )
 }
 
-pub(super) fn using_enum_declaration_type_node(node: Node<'_>) -> Option<Node<'_>> {
+pub fn using_enum_declaration_type_node(node: Node<'_>) -> Option<Node<'_>> {
     (node.kind() == "using_declaration"
         && (0..node.child_count()).any(|index| {
             node.child(index)
@@ -6738,7 +6740,7 @@ pub(super) fn using_enum_declaration_type_node(node: Node<'_>) -> Option<Node<'_
     .flatten()
 }
 
-pub(super) fn ordinary_using_declaration_type_node(node: Node<'_>) -> Option<Node<'_>> {
+pub fn ordinary_using_declaration_type_node(node: Node<'_>) -> Option<Node<'_>> {
     (node.kind() == "using_declaration"
         && using_enum_declaration_type_node(node).is_none()
         && using_namespace_directive_name_node(node).is_none())
@@ -7164,7 +7166,9 @@ fn using_binding_target_components_for_name(
         .filter(|candidate| {
             candidate.is_class()
                 || is_type_alias(candidate)
-                || (candidate.is_function() && type_owner_of(visibility.cpp(), candidate).is_none())
+                || (candidate.is_function()
+                    && type_owner_of(CppGraphSource::from_source(visibility.cpp()), candidate)
+                        .is_none())
         })
         .collect::<Vec<_>>();
     if visible_candidates.is_empty() {
@@ -7314,7 +7318,7 @@ fn project_using_binding_at_activation(
     }
 }
 
-fn effective_using_bindings_for_name(
+pub fn effective_using_bindings_for_name(
     visibility: &VisibilityIndex<'_>,
     imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
@@ -7353,9 +7357,9 @@ fn effective_using_bindings_for_name(
         .clone()
 }
 
-pub(in crate::analyzer::usages) fn initialized_ordinary_type_imports(
+pub fn initialized_ordinary_type_imports(
     root: Node<'_>,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -7495,8 +7499,8 @@ fn macro_expanded_cpp_name_components(
     unit: &CodeUnit,
     reference_byte: usize,
 ) -> Vec<String> {
-    crate::analyzer::symbol_lookup::parse_symbol_path(
-        crate::analyzer::Language::Cpp,
+    brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+        brokk_bifrost_core::analyzer::Language::Cpp,
         &cpp_name_for(unit),
     )
     .into_iter()
@@ -7506,8 +7510,8 @@ fn macro_expanded_cpp_name_components(
         else {
             return vec![component];
         };
-        let expanded = crate::analyzer::symbol_lookup::parse_symbol_path(
-            crate::analyzer::Language::Cpp,
+        let expanded = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+            brokk_bifrost_core::analyzer::Language::Cpp,
             &replacement,
         );
         if expanded.is_empty() {
@@ -7550,7 +7554,7 @@ fn ordinary_type_import_resolution(
     node: Node<'_>,
     components: &[String],
     global: bool,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
@@ -7684,11 +7688,11 @@ fn ordinary_type_import_resolution(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn resolve_type_components_lexically_at(
+pub fn resolve_type_components_lexically_at(
     node: Node<'_>,
     components: &[String],
     global: bool,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
@@ -7715,7 +7719,7 @@ fn resolve_type_components_lexically_at_preserving_alias_with_scope_cache(
     node: Node<'_>,
     components: &[String],
     global: bool,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
@@ -7743,7 +7747,7 @@ fn resolve_type_components_lexically_at_for_target_with_scope_cache(
     node: Node<'_>,
     components: &[String],
     global: bool,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
@@ -7773,7 +7777,7 @@ fn resolve_type_components_lexically_at_preserving_alias_with_recovered_scope(
     node: Node<'_>,
     components: &[String],
     global: bool,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
@@ -7801,7 +7805,7 @@ fn resolve_type_components_lexically_at_for_target_with_recovered_scope(
     node: Node<'_>,
     components: &[String],
     global: bool,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
@@ -7831,7 +7835,7 @@ fn resolve_type_components_lexically_at_inner(
     node: Node<'_>,
     components: &[String],
     global: bool,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
@@ -7881,7 +7885,7 @@ fn resolve_type_components_lexically_at_scoped(
     node: Node<'_>,
     components: &[String],
     global: bool,
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
@@ -8088,305 +8092,6 @@ fn out_of_line_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     false
 }
 
-#[cfg(test)]
-mod effective_using_scale_tests {
-    use super::*;
-    use crate::analyzer::CodeUnitIndex;
-    use crate::analyzer::{
-        AnalyzerConfig, AnalyzerQueryScope, CodeUnitType, Language, TestProject, WorkspaceAnalyzer,
-        resolve_analyzer,
-    };
-    use std::sync::Arc;
-
-    fn reset_lexical_scope_reconstructions_for_test() {
-        LEXICAL_SCOPE_RECONSTRUCTIONS_FOR_TEST.with(|count| count.set(0));
-    }
-
-    fn lexical_scope_reconstructions_for_test() -> usize {
-        LEXICAL_SCOPE_RECONSTRUCTIONS_FOR_TEST.with(Cell::get)
-    }
-
-    #[test]
-    fn effective_using_projection_and_callable_metadata_are_cached_at_scale() {
-        const HEADER_COUNT: usize = 24;
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let mut includes = String::new();
-        for index in 0..HEADER_COUNT {
-            let header = ProjectFile::new(root.clone(), format!("api_{index}.h"));
-            let mut header_source = format!(
-                "#pragma once\nnamespace api_{index} {{\nint Call_{index}(int value = 0);\n"
-            );
-            for unrelated in 0..64 {
-                header_source.push_str(&format!("struct Noise_{index}_{unrelated} {{}};\n"));
-            }
-            header_source.push_str(&format!("}}\nusing namespace api_{index};\n"));
-            header.write(header_source).expect("write scale header");
-            includes.push_str(&format!("#include \"api_{index}.h\"\n"));
-        }
-        let left = ProjectFile::new(root.clone(), "left.cc");
-        let right = ProjectFile::new(root.clone(), "right.cc");
-        left.write(format!("{includes}int left() {{ return Call_0(); }}\n"))
-            .expect("write left consumer");
-        right
-            .write(format!("{includes}int right() {{ return Call_0(); }}\n"))
-            .expect("write right consumer");
-
-        let project = Arc::new(TestProject::new(&root, Language::Cpp));
-        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
-        let analyzer = workspace.analyzer();
-        let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
-        let _scope = AnalyzerQueryScope::new(analyzer);
-        let roots = HashSet::from_iter([left.clone(), right]);
-        let visibility = VisibilityIndex::build(cpp, analyzer, &roots);
-        let prepared = cpp.prepared_syntax(&left).expect("prepared left consumer");
-        let root_node = prepared.tree().root_node();
-        let imports = initialized_ordinary_type_imports(
-            root_node,
-            analyzer,
-            &visibility,
-            &left,
-            prepared.source(),
-        );
-
-        for _ in 0..1_000 {
-            assert!(
-                effective_using_bindings_for_name(
-                    &visibility,
-                    &imports,
-                    &left,
-                    root_node,
-                    prepared.source(),
-                    "Absent",
-                )
-                .is_empty()
-            );
-        }
-        let after_absent = visibility.using_work_counts_for_test();
-        assert_eq!(
-            after_absent.0,
-            visibility.all_visible_source_files().len(),
-            "the union source index must walk each physical source once"
-        );
-        assert_eq!(
-            (
-                after_absent.1,
-                after_absent.2,
-                after_absent.3,
-                after_absent.4
-            ),
-            (0, 0, 0, 0),
-            "an absent name must not activate donors, expand namespaces, hydrate callables, or inspect unrelated declarations"
-        );
-        std::thread::scope(|scope| {
-            for _ in 0..16 {
-                let imports = Arc::clone(&imports);
-                let left = left.clone();
-                let visibility = &visibility;
-                scope.spawn(move || {
-                    let prepared = visibility
-                        .cpp()
-                        .prepared_syntax(&left)
-                        .expect("prepared concurrent consumer");
-                    for _ in 0..100 {
-                        let _ = effective_using_bindings_for_name(
-                            visibility,
-                            &imports,
-                            &left,
-                            prepared.tree().root_node(),
-                            prepared.source(),
-                            "Call_0",
-                        );
-                    }
-                });
-            }
-        });
-        let after_projection = visibility.using_work_counts_for_test();
-        assert!(
-            after_projection.4 <= HEADER_COUNT,
-            "namespace validation must inspect only requested-name candidates, not the unrelated declaration population: {after_projection:?}"
-        );
-        let _ = effective_using_bindings_for_name(
-            &visibility,
-            &imports,
-            &left,
-            root_node,
-            prepared.source(),
-            "Call_0",
-        );
-        assert_eq!(
-            visibility.using_work_counts_for_test(),
-            after_projection,
-            "repeated name lookup must reuse donor projection and namespace expansion"
-        );
-
-        let callable = cpp
-            .get_all_declarations()
-            .into_iter()
-            .find(|candidate| candidate.fq_name() == "api_0.Call_0" && candidate.is_function())
-            .expect("scale callable");
-        std::thread::scope(|scope| {
-            for _ in 0..16 {
-                let callable = callable.clone();
-                let left = left.clone();
-                let visibility = &visibility;
-                scope.spawn(move || {
-                    for _ in 0..100 {
-                        assert!(visibility
-                            .callable_arity_at_reference(
-                                analyzer,
-                                &left,
-                                &callable,
-                                usize::MAX,
-                            )
-                            .is_some());
-                    }
-                });
-            }
-        });
-        assert_eq!(
-            visibility.using_work_counts_for_test().3,
-            1,
-            "repeated logical callable lookup must hydrate default metadata once"
-        );
-    }
-
-    #[test]
-    fn structured_prefilter_skips_unrelated_unqualified_type_before_scope_or_alias_work() {
-        const NOISE_COUNT: usize = 96;
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let header = ProjectFile::new(root.clone(), "types.h");
-        let alias_header = ProjectFile::new(root.clone(), "aliases.h");
-        alias_header
-            .write("namespace aliasing { using SeenAlias = int; }\n")
-            .expect("write alias header");
-        let mut header_source =
-            String::from("#include \"aliases.h\"\nnamespace target { struct Wanted {}; }\n");
-        for index in 0..NOISE_COUNT {
-            header_source.push_str(&format!(
-                "namespace noise_{index} {{ struct Value {{}}; }}\n"
-            ));
-        }
-        header.write(header_source).expect("write header");
-        let consumer = ProjectFile::new(root.clone(), "consumer.cc");
-        consumer
-            .write(
-                "#include \"types.h\"\nvoid consume() { Missing value; Missing<int> templated; }\n",
-            )
-            .expect("write consumer");
-
-        let project = Arc::new(TestProject::new(&root, Language::Cpp));
-        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
-        let analyzer = workspace.analyzer();
-        let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
-        let _scope = AnalyzerQueryScope::new(analyzer);
-        let roots = HashSet::from_iter([consumer.clone()]);
-        let visibility = VisibilityIndex::build(cpp, analyzer, &roots);
-        let prepared = cpp.prepared_syntax(&consumer).expect("prepared consumer");
-        let source = prepared.source();
-        let start = source.find("Missing").expect("unqualified type reference");
-        let end = start + "Missing".len();
-        let mut stack = vec![prepared.tree().root_node()];
-        let mut type_node = None;
-        while let Some(node) = stack.pop() {
-            if node.start_byte() == start
-                && node.end_byte() == end
-                && matches!(node.kind(), "type_identifier" | "identifier")
-            {
-                type_node = Some(node);
-                break;
-            }
-            let mut cursor = node.walk();
-            stack.extend(node.named_children(&mut cursor));
-        }
-        let type_node = type_node.expect("qualified type node");
-        let template_start = source.rfind("Missing<int>").expect("template reference");
-        let template_end = template_start + "Missing<int>".len();
-        let mut stack = vec![prepared.tree().root_node()];
-        let mut template_node = None;
-        while let Some(node) = stack.pop() {
-            if node.start_byte() == template_start
-                && node.end_byte() == template_end
-                && node.kind() == "template_type"
-            {
-                template_node = Some(node);
-                break;
-            }
-            let mut cursor = node.walk();
-            stack.extend(node.named_children(&mut cursor));
-        }
-        let template_node = template_node.expect("template type node");
-        let imports = initialized_ordinary_type_imports(
-            prepared.tree().root_node(),
-            analyzer,
-            &visibility,
-            &consumer,
-            source,
-        );
-        let target = cpp
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| unit.kind() == CodeUnitType::Class && unit.fq_name() == "target.Wanted")
-            .expect("target declaration");
-        let first_alias_names = visibility
-            .visible_type_reference_component_names_for_target(analyzer, &consumer, &target);
-        let second_alias_names = visibility
-            .visible_type_reference_component_names_for_target(analyzer, &consumer, &target);
-        assert_eq!(
-            first_alias_names, second_alias_names,
-            "repeated target component-name lookups must reuse the root alias index"
-        );
-
-        reset_lexical_scope_reconstructions_for_test();
-        visibility.reset_target_preserving_type_resolution_count();
-        for node in [type_node, template_node] {
-            for _ in 0..2 {
-                let resolution = resolve_type_node_lexically_for_target(
-                    node,
-                    analyzer,
-                    &visibility,
-                    &imports,
-                    &consumer,
-                    source,
-                    &target,
-                    None,
-                    None,
-                );
-                assert!(
-                    matches!(resolution, LexicalTypeResolution::Missing),
-                    "an unrelated bare or template type must fail closed before scope reconstruction"
-                );
-            }
-        }
-        assert_eq!(
-            lexical_scope_reconstructions_for_test(),
-            0,
-            "the coarse unqualified prefilter must bypass lexical-scope reconstruction"
-        );
-        assert_eq!(
-            visibility.target_preserving_type_resolution_count(),
-            0,
-            "the coarse unqualified prefilter must bypass target-preserving lexical resolution"
-        );
-        assert_eq!(
-            visibility.visible_parser_alias_name_set_build_count(),
-            1,
-            "the visible parser-alias-name set must build lazily once and then be reused"
-        );
-        assert_eq!(
-            visibility.visible_parser_alias_target_names_build_count(),
-            1,
-            "the visible parser-alias target index must build once per root and serve repeated target scans"
-        );
-        assert_eq!(
-            visibility.alias_source_parse_count_for_test(&alias_header),
-            1,
-            "the shared visible parser-alias-name set must parse each visible alias source at most once"
-        );
-    }
-}
-
 #[derive(Clone, Copy)]
 enum StructuredOwnerContextResolution {
     /// The enclosing class is itself the target owner: a bare/`this->` call here is a
@@ -8510,8 +8215,8 @@ fn target_guided_out_of_line_owner(function: Node<'_>, ctx: &ScanCtx<'_>) -> Opt
         .visible_identifier_candidates(ctx.file, owner_name)
         .filter(|candidate| candidate.is_class())
     {
-        let components = crate::analyzer::symbol_lookup::parse_symbol_path(
-            crate::analyzer::Language::Cpp,
+        let components = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+            brokk_bifrost_core::analyzer::Language::Cpp,
             &cpp_name_for(candidate),
         );
         if !components.ends_with(&owner_components)

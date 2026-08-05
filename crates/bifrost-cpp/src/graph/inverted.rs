@@ -1,10 +1,11 @@
 //! Whole-workspace inverted edge builder for C++.
 //!
 //! Walks each file once and resolves every reference to the callee fqn it names,
-//! via the shared [`build_edges`] driver. C++ node fqns are dotted: a namespace +
+//! via the shared `build_edges` driver in `brokk-bifrost-analysis`. C++ node fqns
+//! are dotted: a namespace +
 //! class + member reads `example.Service.run`, a free function `example.freeHelper`,
 //! and a class `example.Service`. References resolve through the forward scanner's
-//! visibility primitives ([`VisibilityIndex::resolve_type`] / [`resolve_named`],
+//! visibility primitives ([`VisibilityIndex::resolve_type`] / `resolve_named`,
 //! which honor the include closure and namespaces) plus a [`LocalInferenceEngine`]
 //! (typed by [`CodeUnit`], like the forward scan) seeded with every local's and
 //! parameter's declared type so a method call's receiver can be typed:
@@ -22,14 +23,19 @@
 //! own fqns), so `this->`/unqualified calls attribute to the right class without
 //! re-deriving the namespace. Ambiguous receiver or return identities fail closed.
 
-use super::extractor::{
+use crate::declarations::{
+    CppSentinelRecoveredClass, cpp_sentinel_recovered_classes,
+    cpp_sentinel_recovered_scope_for_node, node_text, recovered_macro_return_type_node,
+};
+use crate::graph::CppGraphSource;
+use crate::graph::extractor::{
     BareCallTargetResolution, LexicalScopeResolution, enclosing_lexical_scope_components,
     initialized_ordinary_type_imports, ordinary_using_declaration_type_node,
     resolve_bare_call_target, resolve_ordinary_using_declaration_owner,
     resolve_type_components_lexically_at, resolve_type_node_lexically,
     resolve_using_enum_declaration_owner, using_enum_declaration_type_node,
 };
-use super::resolver::{
+use crate::graph::resolver::{
     DesignatedInitializerOwner, EnclosingMemberOwnerResolution, LexicalCallableValueResolution,
     LexicalTypeResolution, OrdinaryTypeImportCell, TargetKind, VisibilityIndex,
     VisibleMemberResolution, canonical_cpp_scope_components, constructor_style_local_declaration,
@@ -42,68 +48,54 @@ use super::resolver::{
     recovered_macro_decorated_type_node, resolve_declaring_member_owner, same_visible_symbol,
     type_reference_hit_node,
 };
-use crate::analyzer::cpp::{
-    CppSentinelRecoveredClass, cpp_sentinel_recovered_classes,
-    cpp_sentinel_recovered_scope_for_node, recovered_macro_return_type_node,
+use crate::graph::syntax::explicit_qualified_callable_value;
+use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
+use brokk_bifrost_core::analyzer::usages::common::same_node;
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node, first_precise,
 };
-use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
-use crate::analyzer::usages::common::same_node;
-use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
-    classify_reference_node, first_precise, parse_and_collect,
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
 };
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, cpp_node_text as node_text};
-use crate::hash::{HashMap, HashSet};
-use brokk_bifrost_cpp::graph::syntax::explicit_qualified_callable_value;
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
-/// Build the whole C++ `caller -> callee` edge set in a single inverted pass over
-/// the resolver-owned file set. `nodes`/`keep_file` mirror the Go builder.
-pub(super) fn build_cpp_edges<Output, F>(
-    analyzer: &dyn IAnalyzer,
-    files: &[ProjectFile],
+/// The C++ half of one file's inverted pass: seed the scan context from the
+/// already-parsed tree and walk it, recording every `caller -> callee` edge the
+/// file names.
+///
+/// The pass's fan-out -- `build_edge_output` plus `parse_and_collect`, the
+/// shared language-agnostic driver -- stays in `brokk-bifrost-analysis` and
+/// calls this once per kept file.
+pub fn scan_file(
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
-    nodes: &HashSet<String>,
-    keep_file: F,
-) -> Output
-where
-    Output: UsageEdgeBuildOutput<String>,
-    F: Fn(&ProjectFile) -> bool + Sync,
-{
-    let language = tree_sitter_cpp::LANGUAGE.into();
-    build_edge_output(files, keep_file, |file| {
-        parse_and_collect(analyzer, file, nodes, &language, |input| {
-            let ordinary_type_imports = initialized_ordinary_type_imports(
-                input.root(),
-                analyzer,
-                visibility,
-                file,
-                input.source,
-            );
-            let recovered_sentinel_classes =
-                cpp_sentinel_recovered_classes(input.root(), input.source);
-            let mut ctx = CppScan {
-                analyzer,
-                visibility,
-                file,
-                source: input.source,
-                ordinary_type_imports,
-                recovered_sentinel_classes,
-                class_ranges: ClassRangeIndex::build(analyzer, file),
-                declaring_member_cache: HashMap::default(),
-                input,
-                edges: PerFileEdges::default(),
-            };
-            let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            walk(input.root(), &mut ctx, &mut bindings);
-            ctx.edges
-        })
-    })
+    file: &ProjectFile,
+    input: &FileEdgeScanInput<'_>,
+) -> PerFileEdges {
+    let ordinary_type_imports =
+        initialized_ordinary_type_imports(input.root(), analyzer, visibility, file, input.source);
+    let recovered_sentinel_classes = cpp_sentinel_recovered_classes(input.root(), input.source);
+    let mut ctx = CppScan {
+        analyzer,
+        visibility,
+        file,
+        source: input.source,
+        ordinary_type_imports,
+        recovered_sentinel_classes,
+        class_ranges: ClassRangeIndex::build(analyzer.index, file),
+        declaring_member_cache: HashMap::default(),
+        input,
+        edges: PerFileEdges::default(),
+    };
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    walk(input.root(), &mut ctx, &mut bindings);
+    ctx.edges
 }
 
 struct CppScan<'a> {
-    analyzer: &'a dyn IAnalyzer,
+    analyzer: CppGraphSource<'a>,
     visibility: &'a VisibilityIndex<'a>,
     file: &'a ProjectFile,
     source: &'a str,
@@ -1010,7 +1002,7 @@ fn seed_declaration(
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
     if recovered_macro_return_type_node(node, ctx.source).is_some()
-        || crate::analyzer::cpp::is_direct_recovered_exported_class_field_declaration(
+        || crate::declarations::is_direct_recovered_exported_class_field_declaration(
             node, ctx.source,
         )
     {
@@ -1171,65 +1163,4 @@ fn resolve_type_node_with_recovered_scope(node: Node<'_>, ctx: &CppScan<'_>) -> 
 /// Infer a class type from an initializer expression for `auto`/untyped locals.
 fn infer_type_from_value(node: Node<'_>, ctx: &CppScan<'_>) -> Option<CodeUnit> {
     infer_cpp_initializer_type(ctx.analyzer, ctx.visibility, ctx.file, ctx.source, node)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::analyzer::{CodeUnitIndex, CppAnalyzer, Language, ProjectFile, TestProject};
-    use std::fs;
-
-    #[test]
-    fn inverted_edges_keep_macro_return_alias_reference() {
-        let source = r#"
-namespace absl {
-ABSL_NAMESPACE_BEGIN
-template <typename T>
-class beta_distribution {
- public:
-  using result_type = T;
-  class param_type {
-   private:
-    static RETURN_MACRO result_type Threshold() {
-      return result_type(1);
-    }
-  };
-};
-ABSL_NAMESPACE_END
-}
-"#;
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp root");
-        fs::write(root.join("beta.h"), source).expect("write fixture");
-        let file = ProjectFile::new(&root, "beta.h");
-        let analyzer = CppAnalyzer::from_project(TestProject::new(&root, Language::Cpp));
-        let declarations = analyzer.get_all_declarations();
-        let alias = declarations
-            .iter()
-            .find(|unit| unit.fq_name() == "absl.beta_distribution$result_type")
-            .expect("result_type alias");
-        let owner = declarations
-            .iter()
-            .find(|unit| unit.fq_name() == "absl.beta_distribution$param_type")
-            .expect("param_type owner");
-        let roots = std::iter::once(file.clone()).collect();
-        let visibility = VisibilityIndex::build(&analyzer, &analyzer, &roots);
-        let nodes = [alias.fq_name(), owner.fq_name()].into_iter().collect();
-
-        let edges: crate::analyzer::usages::inverted_edges::UsageEdges = build_cpp_edges(
-            &analyzer,
-            std::slice::from_ref(&file),
-            &visibility,
-            &nodes,
-            |_| true,
-        );
-
-        assert!(
-            edges
-                .edges
-                .contains_key(&(owner.fq_name(), alias.fq_name())),
-            "macro return type must produce an inverted owner-to-alias edge: {:?}",
-            edges.edges.keys().collect::<Vec<_>>()
-        );
-    }
 }
