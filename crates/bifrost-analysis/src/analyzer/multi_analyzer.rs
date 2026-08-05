@@ -1297,6 +1297,18 @@ impl IAnalyzer for MultiAnalyzer {
             .unwrap_or_default()
     }
 
+    fn partial_declaration_parts(&self, code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
+        self.delegate_for_code_unit(code_unit)?
+            .analyzer()
+            .partial_declaration_parts(code_unit)
+    }
+
+    fn abstract_member_implementations(&self, code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
+        self.delegate_for_code_unit(code_unit)?
+            .analyzer()
+            .abstract_member_implementations(code_unit)
+    }
+
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
         self.delegates
             .values()

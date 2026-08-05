@@ -4,16 +4,29 @@ use crate::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
     field_name_in_parent, first_named_child, nearest_ancestor, node_range,
 };
+use crate::analyzer::structural::adapter_helpers::{
+    linear_chain_tokens, qualified_chain_root, spelled_generic_arity,
+};
 use crate::analyzer::structural::{
     BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT, HoistingClass,
     LexicalEnvironmentSupport, Namespace, NormalizedKind, OccurrenceRole, OccurrenceRoleSupport,
     Role, RoleSink, Span, StructuralSpec, default_occurrence_namespace,
 };
+use crate::analyzer::structural::{DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::structural::{
     DeclarationMaterializationSupport, JS_TS_MATERIALIZATION_SUPPORT,
 };
 use crate::analyzer::{Language, Range};
 use tree_sitter::Node;
+
+/// The left-nested qualified chains of both grammars: expression namespace
+/// qualifiers (`nested_identifier`, naming its segment through `property`)
+/// and TypeScript qualified type names (`nested_type_identifier`, through
+/// `name`).
+const JS_TS_PATH_CHAIN: &[(&str, Option<&str>)] = &[
+    ("nested_identifier", Some("property")),
+    ("nested_type_identifier", Some("name")),
+];
 
 #[derive(Debug)]
 pub(crate) struct JsTsStructuralSpec {
@@ -471,8 +484,51 @@ impl StructuralSpec for JsTsStructuralSpec {
         &JS_TS_MATERIALIZATION_SUPPORT
     }
 
+    fn identity_route_support(&self) -> &IdentityRouteSupport {
+        // `export { x }` resolves through the local binding (including an
+        // imported one) to the origin declaration, so the export relation has
+        // a producer. Import specifiers and `export ... from` specifiers
+        // resolve to NoDefinition today -- a resolver gap, not a modeling
+        // choice -- so the import, alias and re-export relations stay
+        // unclaimed until the resolver answers them (see the #1475 ExecPlan
+        // Decision Log, M3, and its follow-up issue).
+        static SUPPORT: IdentityRouteSupport = DEEP_IDENTITY_AXES
+            .supported_relation(RouteHopKind::Export)
+            .supported_relation(RouteHopKind::NestedOwner);
+        &SUPPORT
+    }
+
     fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
         js_ts_binding_activation(binder, scope)
+    }
+
+    fn qualified_path_root<'tree>(&self, token: Node<'tree>) -> Option<Node<'tree>> {
+        if !matches!(
+            token.kind(),
+            "identifier" | "property_identifier" | "type_identifier"
+        ) {
+            return None;
+        }
+        qualified_chain_root(token, JS_TS_PATH_CHAIN)
+    }
+
+    fn path_segment_tokens<'tree>(&self, root: Node<'tree>) -> Vec<Node<'tree>> {
+        linear_chain_tokens(root, JS_TS_PATH_CHAIN, &[])
+    }
+
+    fn segment_generic_arity(&self, token: Node<'_>) -> Option<u32> {
+        spelled_generic_arity(token, JS_TS_PATH_CHAIN, &["generic_type"])
+    }
+
+    fn indirection_relation(&self, token: Node<'_>) -> Option<RouteHopKind> {
+        if let Some(export) = nearest_ancestor(token, |kind| kind == "export_statement") {
+            return Some(if export.child_by_field_name("source").is_some() {
+                RouteHopKind::ReExport
+            } else {
+                RouteHopKind::Export
+            });
+        }
+        nearest_ancestor(token, |kind| kind == "import_statement").map(|_| RouteHopKind::Import)
     }
 
     /// The only scope segments this adapter classifies come from

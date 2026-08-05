@@ -516,7 +516,11 @@ pub(super) fn selected_site_quality(
             // completeness arrives through the query's diagnostics.
             | CodeQueryResultValue::GenerationSite { .. }
             | CodeQueryResultValue::Export { .. }
-            | CodeQueryResultValue::DeclarationState { .. } => {
+            | CodeQueryResultValue::DeclarationState { .. }
+            // The identity-route rows are parser facts with the same per-axis
+            // completeness story (#1475).
+            | CodeQueryResultValue::QualifiedPath { .. }
+            | CodeQueryResultValue::PathSegment { .. } => {
                 (ProofStatus::Proven, EvidenceCompleteness::Complete)
             }
             CodeQueryResultValue::Procedure { .. }

@@ -46,6 +46,7 @@ use crate::analyzer::structural::adapter_helpers::{
     attach_role_with_derived_name, attach_terminal_callee, first_named_child,
 };
 use crate::analyzer::structural::{DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT};
+use crate::analyzer::structural::{IdentityRouteSupport, NO_IDENTITY_ROUTE_SUPPORT};
 use crate::analyzer::structural::{LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT};
 use crate::analyzer::structural::{NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport};
 use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, Span, StructuralSpec};
@@ -467,6 +468,10 @@ impl StructuralSpec for KotlinStructuralSpec {
 
     fn materialization_support(&self) -> &DeclarationMaterializationSupport {
         &NO_MATERIALIZATION_SUPPORT
+    }
+
+    fn identity_route_support(&self) -> &IdentityRouteSupport {
+        &NO_IDENTITY_ROUTE_SUPPORT
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {

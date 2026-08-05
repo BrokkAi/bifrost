@@ -1357,6 +1357,8 @@ fn run_rql_query_result(
                     CodeQueryResultValue::GenerationSite { value } => &value.path,
                     CodeQueryResultValue::Export { value } => &value.path,
                     CodeQueryResultValue::DeclarationState { value } => &value.path,
+                    CodeQueryResultValue::QualifiedPath { value } => &value.path,
+                    CodeQueryResultValue::PathSegment { value } => &value.path,
                 };
                 RunRqlQueryResultItem {
                     uri: path_to_uri_string(&workspace_root.join(path)),

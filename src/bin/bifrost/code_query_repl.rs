@@ -818,6 +818,17 @@ fn plan_summary_text(plan: &CodeQueryPlan) -> String {
             }
             parts
         }
+        CodeQueryPlanSource::Paths(seed) => {
+            let mut parts = vec!["qualified path query".to_string()];
+            parts.extend(environment_seed_scope_summary(
+                &seed.where_globs,
+                &seed.languages,
+            ));
+            if let Some(minimum) = seed.filter.min_segments {
+                parts.push(format!("min-segments {minimum}"));
+            }
+            parts
+        }
         CodeQueryPlanSource::Bindings(seed) => {
             let mut parts = vec!["binding query".to_string()];
             parts.extend(environment_seed_scope_summary(
@@ -1374,6 +1385,33 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                     }
                     if value.config_gated {
                         out.push_str("  config-gated\n");
+                    }
+                }
+                CodeQueryResultValue::QualifiedPath { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} segments\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "qualified path:", use_color),
+                        value.segment_count,
+                    ));
+                }
+                CodeQueryResultValue::PathSegment { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let text = sanitize_terminal_text(&value.text);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} #{} `{}`\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "path segment:", use_color),
+                        value.ordinal,
+                        paint(Style::new().bold(), &text, use_color),
+                    ));
+                    if let Some(status) = value.resolution_status {
+                        out.push_str(&format!("  resolves: {status}\n"));
                     }
                 }
             }

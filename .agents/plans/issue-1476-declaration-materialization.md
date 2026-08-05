@@ -54,6 +54,8 @@ Findings from the pre-plan survey (2026-08-05). Update this section as implement
   Evidence: `cargo clippy ... | tail -3` reported exit 0; the same command redirected to a file reported exit 101 with E0046.
 - Observation (M2): `FileState` literals exist in three places that the compiler only checks under `cfg(test)` for two of them (`parse_state` and `empty_file_state` in test modules). A plain `cargo build` after adding the field reported success while the test helpers were still stale; the first `cargo nextest` compile caught them.
 
+- Observation (merge, 2026-08-05): sibling #1475 (identity routes) landed on master claiming RQL schema version 10 on a divergent branch — the exact collision the #1473 retrospective predicted. The merge renumbered materialization to version 11 (`IDENTITY_SCHEMA_VERSION = 10`, `MATERIALIZATION_SCHEMA_VERSION = 11`, ladder chained identity -> materialization, all `since:` entries, golds, CLI banner, docs lineage, and the Python client docstring moved together). The two slices also collided across every registry seam (PolicyAssert families, pipeline values, detailed domains/keys, adapter spec hooks); a scripted union resolution left ~20 truncated blocks where hunks shared closing braces, each rebuilt from the pre-merge commit or master verbatim rather than re-typed.
+
 ## Decision Log
 
 - Decision (M1): `materialization_support` is a required `StructuralSpec` method with no default, not the defaulted hook the first plan draft sketched, matching `occurrence_role_support` and `lexical_environment_support` verbatim ("deliberately has no default: the table is total, so a default would let a new adapter advertise support nobody implemented"). All eleven adapters state a table; seven state `NO_MATERIALIZATION_SUPPORT`.

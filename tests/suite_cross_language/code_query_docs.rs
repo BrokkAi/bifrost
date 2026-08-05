@@ -189,7 +189,7 @@ fn query_documentation_tracks_public_contracts() {
     let python_client = fs::read_to_string(root.join("docs/src/content/docs/python-client.md"))
         .expect("read Python client documentation");
     for required in [
-        "compatible-head version-10",
+        "compatible-head version-11",
         "schema_version=2",
         "schema_version=3",
         "schema_version=4",
@@ -222,6 +222,7 @@ fn query_documentation_tracks_public_contracts() {
     let python_client_source = fs::read_to_string(root.join("bifrost_searchtools/client.py"))
         .expect("read Python client source");
     for required in [
+        "schema version 11",
         "schema version 10",
         "schema version 9",
         "occurrence_target",

@@ -18,7 +18,7 @@ use super::super::materialization_rows::{
     DeclarationStateRow, ExportRow, GenerationSiteRow, MaterializationCompleteness,
     MaterializationFileResult, MaterializationIncompleteReason, materialization_for_file,
 };
-use super::super::query::{DeclarationStateFilter, ExportFilter, GenerationSiteFilter};
+use super::super::query::{ExportFilter, GenerationSiteFilter};
 use super::results::{
     CodeQueryDeclarationState, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
     CodeQueryDiagnosticImpact, CodeQueryExport, CodeQueryGeneratedDeclaration,
@@ -291,19 +291,6 @@ pub(super) fn select_exports<'rows>(
         .iter()
         .enumerate()
         .filter(|(_, row)| filter.matches(row.form, &row.exported_name))
-        .map(|(index, _)| index)
-}
-
-/// Declaration-state indices of one file result that satisfy a filter.
-pub(super) fn select_states<'rows>(
-    result: &'rows MaterializationFileResult,
-    filter: &'rows DeclarationStateFilter,
-) -> impl Iterator<Item = usize> + 'rows {
-    result
-        .states
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| filter.matches(row.origin, row.declaration_only, row.config_gated))
         .map(|(index, _)| index)
 }
 

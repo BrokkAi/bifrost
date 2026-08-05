@@ -2,7 +2,7 @@ use super::ir::{
     BindingFilter, BindingSeed, CallInputSelector, CandidateFilter, CodeQuery, CodeQueryPlan,
     CodeQueryPlanSource, CodeQuerySeed, DeclarationStateFilter, ExportFilter, ExportSeed,
     GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal, OccurrenceFilter, OccurrenceSeed,
-    Pattern, QueryStep, ScopeFilter, ScopeSeed, StringPredicate, UNATTRIBUTED_TIER_LABEL,
+    PathSeed, Pattern, QueryStep, ScopeFilter, ScopeSeed, StringPredicate, UNATTRIBUTED_TIER_LABEL,
 };
 use super::schema::{
     CallTraversalCompleteness, reference_kind_label, usage_proof_label, usage_surface_label,
@@ -49,6 +49,7 @@ fn plan_to_json(plan: &CodeQueryPlan) -> Map<String, Value> {
         CodeQueryPlanSource::Bindings(seed) => binding_seed_to_json(seed),
         CodeQueryPlanSource::GenerationSites(seed) => generation_site_seed_to_json(seed),
         CodeQueryPlanSource::Exports(seed) => export_seed_to_json(seed),
+        CodeQueryPlanSource::Paths(seed) => path_seed_to_json(seed),
         CodeQueryPlanSource::Set { op, branches } => {
             let mut object = Map::new();
             object.insert(
@@ -402,6 +403,16 @@ pub(super) fn declaration_state_filter_to_json(
     object
 }
 
+fn path_seed_to_json(seed: &PathSeed) -> Map<String, Value> {
+    let mut object = environment_seed_scope_json(&seed.where_globs, &seed.languages);
+    let mut filter = Map::new();
+    if let Some(min_segments) = seed.filter.min_segments {
+        filter.insert("min_segments".to_string(), json!(min_segments));
+    }
+    object.insert("paths".to_string(), Value::Object(filter));
+    object
+}
+
 /// The `where`/`languages` prefix every non-structural seed renders identically.
 fn environment_seed_scope_json(
     where_globs: &[glob::Pattern],
@@ -458,6 +469,17 @@ impl BindingSeed {
 impl GenerationSiteSeed {
     pub(crate) fn to_canonical_json(&self) -> Value {
         Value::Object(generation_site_seed_to_json(self))
+    }
+
+    pub(crate) fn canonical_cache_key(&self) -> String {
+        serde_json::to_string(&self.to_canonical_json())
+            .expect("canonical generation-site seed is serializable")
+    }
+}
+
+impl PathSeed {
+    pub(crate) fn to_canonical_json(&self) -> Value {
+        Value::Object(path_seed_to_json(self))
     }
 
     pub(crate) fn canonical_cache_key(&self) -> String {
@@ -527,6 +549,7 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         QueryStep::DeclarationStateOf(filter) => {
             object.extend(declaration_state_filter_to_json(filter));
         }
+        QueryStep::SegmentTarget => {}
         QueryStep::OccurrencesOf(filter) | QueryStep::OccurrencesIn(filter) => {
             object.extend(occurrence_filter_to_json(filter));
         }
@@ -539,6 +562,11 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         QueryStep::ReachingBinding(options) => {
             if options.include_shadowed {
                 object.insert("include_shadowed".to_string(), Value::Bool(true));
+            }
+        }
+        QueryStep::SegmentsOf(options) => {
+            if options.resolved {
+                object.insert("resolved".to_string(), Value::Bool(true));
             }
         }
         QueryStep::Typestate(traversal) => {

@@ -884,6 +884,71 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             query.insert("bindings".to_string(), Value::Object(filter));
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::Paths => {
+            let options = &items[1..];
+            if !options.len().is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    "(paths ...) filter options must be name/value pairs",
+                ));
+            }
+            let mut filter = Map::new();
+            for pair in options.chunks_exact(2) {
+                let key = pair[0].as_symbol().ok_or_else(|| {
+                    lower_error(&pair[0], "(paths ...) option names must be symbols")
+                })?;
+                if key != ":min-segments" && key != ":min_segments" {
+                    return Err(lower_error(
+                        &pair[0],
+                        "(paths ...) accepts only :min-segments",
+                    ));
+                }
+                let ExprKind::Number(count) = pair[1].kind else {
+                    return Err(lower_error(&pair[1], ":min-segments takes an integer"));
+                };
+                insert_unique(&mut filter, "min_segments", Value::Number(count.into()))
+                    .at(&pair[0])?;
+            }
+            let mut query = Map::new();
+            query.insert("paths".to_string(), Value::Object(filter));
+            Ok(Some(Value::Object(query)))
+        }
+        RqlForm::SegmentsOf => {
+            if items.len() < 2 {
+                return Err(lower_error(
+                    expr,
+                    "(segments-of ...) expects optional :resolved true followed by a query",
+                ));
+            }
+            let options = &items[1..items.len() - 1];
+            if !options.len().is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    "(segments-of ...) options must be name/value pairs",
+                ));
+            }
+            let mut step = Map::new();
+            for pair in options.chunks_exact(2) {
+                let key = pair[0].as_symbol().ok_or_else(|| {
+                    lower_error(&pair[0], "(segments-of ...) option names must be symbols")
+                })?;
+                if key != ":resolved" {
+                    return Err(lower_error(
+                        &pair[0],
+                        "(segments-of ...) accepts only :resolved",
+                    ));
+                }
+                if !matches!(pair[1].kind, ExprKind::Symbol(ref text) if text == "true") {
+                    return Err(lower_error(&pair[1], ":resolved must be true when present"));
+                }
+                insert_unique(&mut step, "resolved", Value::Bool(true)).at(&pair[0])?;
+            }
+            step.insert(
+                "op".to_string(),
+                Value::String(QueryStepOp::SegmentsOf.label().to_string()),
+            );
+            append_step(expr, &items[items.len() - 1], step)
+        }
         RqlForm::BindingsIn | RqlForm::CandidatesOf | RqlForm::ReachingBinding => {
             if items.len() < 2 {
                 return Err(lower_error(
@@ -916,7 +981,8 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::Generates
         | RqlForm::GeneratedBy
         | RqlForm::ImplementationOf
-        | RqlForm::ExportTarget => {
+        | RqlForm::ExportTarget
+        | RqlForm::SegmentTarget => {
             expect_len(expr, items, 2, head)?;
             let op = form
                 .query_step_op()
@@ -1346,6 +1412,9 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::DeclarationStateOf
         | RqlForm::ImplementationOf
         | RqlForm::ExportTarget => unreachable!("wrapper filtered above"),
+        RqlForm::Paths | RqlForm::SegmentsOf | RqlForm::SegmentTarget => {
+            unreachable!("wrapper filtered above")
+        }
     }
     Ok(Value::Object(object))
 }

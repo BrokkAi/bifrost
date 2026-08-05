@@ -473,6 +473,37 @@ These steps use normalized tree-sitter call shapes and the selected adapter's ex
 }
 ```
 
+### Qualified paths and their segments (schema v10)
+
+A **qualified path** is one linear chain of segments (`java.util.Map`, `crate::util::Widget`), anchored at its terminal segment token's AST identity. `paths` is a source of its own:
+
+<!-- code-query-test:json:path-seed -->
+```json
+{
+  "languages": ["rust"],
+  "paths": {"min_segments": 3}
+}
+```
+
+Each path row carries `id`, `ast_id` (the terminal segment's identity, the equijoin key with captures and occurrence rows over that token), `path`, `language`, `range`, `start_byte`, `end_byte`, and `segment_count`. A path always has at least two segments; one segment is a bare identifier, not a path.
+
+`segments_of` returns each path's ordered **segment** rows; with `"resolved": true`, one resolver batch per file also answers every segment's own position:
+
+<!-- code-query-test:json:segments-of -->
+```json
+{
+  "languages": ["rust"],
+  "paths": {},
+  "steps": [
+    {"op": "segments_of", "resolved": true}
+  ]
+}
+```
+
+Each segment row carries `path_ast_id` (the group key back to its path), `ordinal`, decoded `text` (a quoted or raw identifier stays one segment and is never re-split), an optional `namespace`, an optional `generic_arity` (the argument count the source spells at that segment: `Map<String, Integer>` spells 2 at `Map`), and -- when resolution was derived -- `resolution_status` (`resolved`, `ambiguous`, `unresolved`, `incomplete`) with `target_count`. `ast_id` is absent for a segment whose token is not a fact (Rust's `crate`/`self`/`super` path keywords): its position in the path is real, its structural identity is genuinely absent. `namespace` is stated only by the adapter's own classification or by what the segment's resolution decides -- a mixed target set decides nothing -- and is otherwise absent, never guessed.
+
+`segment_target` projects each segment's own resolution onto workspace declarations, so "what is `util` in `crate::util::Widget`" is answerable at the segment rather than only at the terminal. A language whose adapter does not answer the path axes reports `identity_axis_unsupported` rather than returning an empty complete answer.
+
 ## Containment And Descendants
 
 `inside` and `not_inside` inspect lexical ancestors of the root match. `has` and `not_has` inspect descendants of the pattern on which they appear.

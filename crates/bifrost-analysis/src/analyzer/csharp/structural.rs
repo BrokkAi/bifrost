@@ -6,6 +6,7 @@ use crate::analyzer::structural::adapter_helpers::{
     attach_role_with_derived_name, attach_terminal_callee, first_named_child,
 };
 use crate::analyzer::structural::{DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT};
+use crate::analyzer::structural::{IdentityAxis, IdentityRouteSupport, RouteHopKind};
 use crate::analyzer::structural::{LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT};
 use crate::analyzer::structural::{NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport};
 use crate::analyzer::structural::{NormalizedKind, Role, RoleSink, Span, StructuralSpec};
@@ -283,6 +284,18 @@ impl StructuralSpec for CSharpStructuralSpec {
 
     fn materialization_support(&self) -> &DeclarationMaterializationSupport {
         &NO_MATERIALIZATION_SUPPORT
+    }
+
+    fn identity_route_support(&self) -> &IdentityRouteSupport {
+        // C#'s occurrence adapter is shallow, so it claims no path axes; its
+        // declaration layer does enumerate the parts of a partial type, which
+        // is exactly the partial-part relation.
+        static SUPPORT: IdentityRouteSupport = IdentityRouteSupport::NONE
+            .supported_axis(IdentityAxis::CanonicalIdentity)
+            .supported_axis(IdentityAxis::PhysicalGrouping)
+            .supported_relation(RouteHopKind::PartialPart)
+            .supported_relation(RouteHopKind::NestedOwner);
+        &SUPPORT
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {

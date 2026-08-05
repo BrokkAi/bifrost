@@ -1242,6 +1242,7 @@ impl QueryCodeTraits {
                 | CodeQueryPlanSource::Bindings(_)
                 | CodeQueryPlanSource::GenerationSites(_)
                 | CodeQueryPlanSource::Exports(_) => {}
+                CodeQueryPlanSource::Paths(_) => {}
                 CodeQueryPlanSource::Set { branches, .. } => plans.extend(branches),
             }
         }

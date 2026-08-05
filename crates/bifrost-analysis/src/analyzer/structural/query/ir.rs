@@ -39,15 +39,20 @@ pub const MAX_OCCURRENCE_FILTER_ENTRIES: usize = 32;
 pub const MAX_ENVIRONMENT_FILTER_ENTRIES: usize = 32;
 /// Upper bound on the length of one `:name` entry of a binding filter.
 pub const MAX_BINDING_NAME_LENGTH: usize = 256;
-pub const SCHEMA_VERSION: u64 = 10;
+pub const SCHEMA_VERSION: u64 = 11;
 pub const DECLARATION_CONTAINMENT_SCHEMA_VERSION: u64 = 5;
 pub const OCCURRENCE_SCHEMA_VERSION: u64 = 8;
 /// Lexical scope, binding and resolution-candidate rows with their seeds and
 /// seven steps (#1474).
 pub const RESOLUTION_SCHEMA_VERSION: u64 = 9;
+/// Qualified-path and path-segment rows with the `paths` seed and the
+/// `segments-of`/`segment-target` steps (#1475).
+pub const IDENTITY_SCHEMA_VERSION: u64 = 10;
 /// Declaration materialization: generation sites, exports, declaration state,
-/// implementation linkage (issue #1476).
-pub const MATERIALIZATION_SCHEMA_VERSION: u64 = 10;
+/// implementation linkage (issue #1476). Version 10 was claimed by both #1475
+/// and this slice on divergent branches; the merge renumbered materialization
+/// to 11, exactly as the #1473 retrospective's precedent prescribes.
+pub const MATERIALIZATION_SCHEMA_VERSION: u64 = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryValueKind {
@@ -69,6 +74,8 @@ pub enum QueryValueKind {
     LexicalScope,
     Binding,
     ResolutionCandidate,
+    QualifiedPath,
+    PathSegment,
     GenerationSite,
     Export,
     DeclarationState,
@@ -96,6 +103,8 @@ impl QueryValueKind {
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
             Self::ResolutionCandidate => "resolution_candidate",
+            Self::QualifiedPath => "qualified_path",
+            Self::PathSegment => "path_segment",
             Self::GenerationSite => "generation_site",
             Self::Export => "export",
             Self::DeclarationState => "declaration_state",
@@ -215,6 +224,8 @@ pub enum QueryStep {
     BindingOccurrence,
     CandidatesOf(CandidateFilter),
     CandidateTarget,
+    SegmentsOf(SegmentsOfOptions),
+    SegmentTarget,
     Generates,
     GeneratedBy,
     DeclarationStateOf(DeclarationStateFilter),
@@ -554,6 +565,52 @@ impl ScopeSeed {
     }
 }
 
+/// Constrained-value filter over qualified-path rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PathFilter {
+    /// Keep only paths with at least this many segments. A path always has at
+    /// least two (one segment is a bare identifier, not a path), so values
+    /// below three never filter anything.
+    pub min_segments: Option<u32>,
+}
+
+impl PathFilter {
+    pub fn is_empty(&self) -> bool {
+        self.min_segments.is_none()
+    }
+}
+
+/// Options of the `segments-of` step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SegmentsOfOptions {
+    /// Derive each segment's prefix resolution (one resolver batch per file)
+    /// so rows carry a status, targets, and a resolution-decided namespace.
+    /// Off by default: a query that never asks never pays.
+    pub resolved: bool,
+}
+
+/// A non-structural seed producing qualified-path rows directly from
+/// workspace facts (#1475).
+#[derive(Debug, Clone, Default)]
+pub struct PathSeed {
+    pub where_globs: Vec<glob::Pattern>,
+    pub languages: Vec<Language>,
+    pub filter: PathFilter,
+}
+
+impl PathSeed {
+    /// Scan exactly the named workspace-relative files for every path.
+    pub fn for_exact_paths<'a>(
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, glob::PatternError> {
+        Ok(Self {
+            where_globs: exact_path_globs(paths)?,
+            languages: Vec::new(),
+            filter: PathFilter::default(),
+        })
+    }
+}
+
 /// A non-structural seed producing binding rows directly from workspace facts.
 #[derive(Debug, Clone, Default)]
 pub struct BindingSeed {
@@ -645,6 +702,8 @@ impl QueryStep {
             Self::ImplementationOf => QueryStepOp::ImplementationOf,
             Self::ExportTarget => QueryStepOp::ExportTarget,
             Self::CandidateTarget => QueryStepOp::CandidateTarget,
+            Self::SegmentsOf(_) => QueryStepOp::SegmentsOf,
+            Self::SegmentTarget => QueryStepOp::SegmentTarget,
         }
     }
 
@@ -700,6 +759,8 @@ impl QueryStep {
             QueryStepOp::BindingOccurrence => Some(Self::BindingOccurrence),
             QueryStepOp::CandidatesOf => Some(Self::CandidatesOf(CandidateFilter::default())),
             QueryStepOp::CandidateTarget => Some(Self::CandidateTarget),
+            QueryStepOp::SegmentsOf => Some(Self::SegmentsOf(SegmentsOfOptions::default())),
+            QueryStepOp::SegmentTarget => Some(Self::SegmentTarget),
             QueryStepOp::Generates => Some(Self::Generates),
             QueryStepOp::GeneratedBy => Some(Self::GeneratedBy),
             QueryStepOp::DeclarationStateOf => {
@@ -754,7 +815,9 @@ impl QueryStep {
                 | QueryValueKind::ReceiverAnalysis
                 | QueryValueKind::Occurrence
                 | QueryValueKind::LexicalScope
-                | QueryValueKind::Binding,
+                | QueryValueKind::Binding
+                | QueryValueKind::QualifiedPath
+                | QueryValueKind::PathSegment,
             ) => Some(QueryValueKind::File),
             (Self::ImportsOf | Self::ImportersOf, QueryValueKind::File) => {
                 Some(QueryValueKind::File)
@@ -820,6 +883,10 @@ impl QueryStep {
             (Self::CandidatesOf(_), QueryValueKind::Occurrence) => {
                 Some(QueryValueKind::ResolutionCandidate)
             }
+            (Self::SegmentsOf(_), QueryValueKind::QualifiedPath) => {
+                Some(QueryValueKind::PathSegment)
+            }
+            (Self::SegmentTarget, QueryValueKind::PathSegment) => Some(QueryValueKind::Declaration),
             (Self::CandidateTarget, QueryValueKind::ResolutionCandidate) => {
                 Some(QueryValueKind::Declaration)
             }
@@ -923,6 +990,8 @@ pub(super) fn validate_query_steps(
             QueryStep::BindingOccurrence => "binding",
             QueryStep::CandidatesOf(_) => "occurrence",
             QueryStep::CandidateTarget => "resolution_candidate",
+            QueryStep::SegmentsOf(_) => "qualified_path",
+            QueryStep::SegmentTarget => "path_segment",
             QueryStep::Generates => "generation_site",
             QueryStep::GeneratedBy => "declaration or declaration_state",
             QueryStep::DeclarationStateOf(_) => "declaration",
@@ -1024,6 +1093,7 @@ pub enum CodeQueryPlanSource {
     Occurrences(Box<OccurrenceSeed>),
     Scopes(Box<ScopeSeed>),
     Bindings(Box<BindingSeed>),
+    Paths(Box<PathSeed>),
     GenerationSites(Box<GenerationSiteSeed>),
     Exports(Box<ExportSeed>),
     Set {
@@ -1056,6 +1126,7 @@ impl CodeQuery {
             CodeQueryPlanSource::Occurrences(_)
             | CodeQueryPlanSource::Scopes(_)
             | CodeQueryPlanSource::Bindings(_)
+            | CodeQueryPlanSource::Paths(_)
             | CodeQueryPlanSource::GenerationSites(_)
             | CodeQueryPlanSource::Exports(_)
             | CodeQueryPlanSource::Set { .. } => None,
@@ -1125,6 +1196,20 @@ fn validate_plan(
             }
             ValidatedDomain {
                 kind: QueryValueKind::Occurrence,
+                captures: None,
+            }
+        }
+        CodeQueryPlanSource::Paths(_) => {
+            if schema_version < IDENTITY_SCHEMA_VERSION {
+                return Err(QueryError::new(
+                    child_query_path(path, "paths"),
+                    format!(
+                        "the paths source requires schema version {IDENTITY_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
+                    ),
+                ));
+            }
+            ValidatedDomain {
+                kind: QueryValueKind::QualifiedPath,
                 captures: None,
             }
         }

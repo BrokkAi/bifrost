@@ -40,6 +40,8 @@ pub enum MatchResultDomain {
     GenerationSite,
     Export,
     DeclarationState,
+    QualifiedPath,
+    PathSegment,
     File,
 }
 
@@ -58,6 +60,8 @@ impl MatchResultDomain {
             Self::GenerationSite => "generation_site",
             Self::Export => "export",
             Self::DeclarationState => "declaration_state",
+            Self::QualifiedPath => "qualified_path",
+            Self::PathSegment => "path_segment",
             Self::File => "file",
         }
     }
