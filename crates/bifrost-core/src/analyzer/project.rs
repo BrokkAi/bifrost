@@ -1342,7 +1342,7 @@ fn detect_languages(root: &Path) -> io::Result<BTreeSet<Language>> {
 fn detect_languages_in_files(files: &BTreeSet<ProjectFile>) -> BTreeSet<Language> {
     let mut languages = BTreeSet::new();
     for file in files {
-        let language = language_for_file(&file);
+        let language = language_for_file(file);
         if language != Language::None {
             languages.insert(language);
         }

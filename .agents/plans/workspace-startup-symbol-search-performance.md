@@ -21,9 +21,9 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 - [x] (2026-08-05) Measured semantic-pack activation and skipped analyzer traversal for an empty active model set.
 - [x] (2026-08-05) Added exact connection-local SQLite active membership for concurrent workspaces without changing the persistent schema.
 - [x] (2026-08-05) Restricted symbol candidate reads to active blobs and added safe literal filtering.
-- [ ] Validate correctness, concurrency, cache reuse, and measured performance.
-- [ ] Run required formatting, tests, clippy, and repository policies when available.
-- [ ] Commit and push the completed change to the current branch when the user requests a push.
+- [x] (2026-08-05) Validated concurrent reader isolation, strict corruption repair, cache reuse, and release performance.
+- [x] (2026-08-05) Ran formatting, focused tests, the workspace suites, the comprehensive feature suite, and all-features clippy.
+- [x] (2026-08-05) Committed the completed change to the current branch. A push still requires a user request.
 
 ## Surprises & Discoveries
 
@@ -54,6 +54,12 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 - Observation: An empty semantic-model selection still traversed the analyzer to build an empty overlay.
   Evidence: Empty overlay acquisition fell from 725.5 milliseconds to about 40-84 milliseconds after the empty-set fast path.
 
+- Observation: The service can trust Bifrost's transactional publication marker, but diagnostic builds must detect cache corruption.
+  Evidence: The strict corruption test deleted one `code_units` row. Marker-only validation missed it. Full validation repaired it.
+
+- Observation: The repository test gate has one resolver failure outside the changed warm-start and symbol-search paths.
+  Evidence: Both normal and `nlp,python` suites fail only `an_unindexed_declared_dependency_is_a_boundary_row_rather_than_an_empty_answer`. The test uses an in-memory analyzer and does not call `search_symbols`.
+
 ## Decision Log
 
 - Decision: Correct the identity design instead of adding eager router startup.
@@ -72,11 +78,21 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
   Rationale: Storage filtering can use a mandatory literal when one exists. A pattern without one must still scan the active workspace, not the global cache.
   Date/Author: 2026-08-05 / Codex
 
+- Decision: Use atomic publication validation only for service startup. Keep full side-table integrity validation for strict persisted builds.
+  Rationale: Bifrost publishes one blob transactionally, so the service marker is sufficient during normal operation. Strict builds and tests must still find external database corruption.
+  Date/Author: 2026-08-05 / Codex
+
 ## Outcomes & Retrospective
 
 The implementation now resolves clean tracked paths from the Git index, shares one repository identity map across language analyzers, reuses one workspace listing, and limits symbol SQL to active blobs. The active set uses a connection-local `STRICT` temporary table. Literal queries filter names and qualified names in SQLite before Rust hydration.
 
-On fully warm Apache Camel in a debug build, analyzer construction fell from 9.73 seconds to about 4.0 seconds. The no-match literal `search_symbols.resolve` stage fell from 24.03 seconds to about 1.03 seconds. Release timing and the comprehensive gate remain.
+On Apache Camel, debug analyzer construction fell from 9.73 seconds to about 4.0 seconds. The debug no-match literal `search_symbols.resolve` stage fell from 24.03 seconds to about 1.03 seconds.
+
+The final release run constructed the analyzer in 2.86 seconds. A warm no-match symbol call took 576 milliseconds. Its resolve stage took 573.7 milliseconds. No clean tracked file was hashed; Git supplied all 37,451 identities.
+
+The shared cache had a cold operating-system page-cache effect during one earlier run. Its first Java symbol query took 9.63 seconds. The next Java query took 276.3 milliseconds. This is storage warmth, not repeated Bifrost indexing.
+
+Formatting, focused tests, and all-features clippy pass. The normal and comprehensive suites each reach the same unrelated cross-language resolver failure described above. The required policy tool is not installed.
 
 ## Context and Orientation
 
@@ -163,3 +179,5 @@ Revision note: 2026-08-05. Created this plan after profiling showed that lazy mu
 Revision note: 2026-08-05. Recorded the completed bulk Git identity milestone and its focused validation.
 
 Revision note: 2026-08-05. Recorded the temporary-table design, reconciliation fix, semantic-overlay fast path, and warm debug measurements.
+
+Revision note: 2026-08-05. Recorded final release measurements, validation results, and the strict-versus-service cache-validation boundary.

@@ -332,7 +332,9 @@ impl WorkspaceAnalyzer {
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
     ) -> Result<Self, StoreError> {
-        let store_context = crate::analyzer::persistent_store_context(project.as_ref())?;
+        let mut store_context = crate::analyzer::persistent_store_context(project.as_ref())?;
+        store_context.startup_cache_validation =
+            crate::analyzer::tree_sitter_analyzer::StartupCacheValidation::AtomicPublication;
         Self::build_filtered(project, config, None, store_context, None, false)
     }
 

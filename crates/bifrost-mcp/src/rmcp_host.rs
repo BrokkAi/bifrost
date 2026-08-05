@@ -594,6 +594,7 @@ pub struct BifrostMcpHandler {
 }
 
 impl BifrostMcpHandler {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         service: Arc<SearchToolsService>,
         named_workspaces: Option<Arc<NamedWorkspaceRouter>>,

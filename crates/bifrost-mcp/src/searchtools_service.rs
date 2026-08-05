@@ -2416,7 +2416,7 @@ impl SearchToolsService {
                 move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
                     let _scope = profiling::scope("mcp_cold.analyzer_construction");
                     let project = build_project(canonical.clone(), file_listing)?;
-                    let workspace = WorkspaceAnalyzer::build_persisted(
+                    let workspace = WorkspaceAnalyzer::build_persisted_for_service(
                         Arc::clone(&project),
                         AnalyzerConfig::default(),
                     )

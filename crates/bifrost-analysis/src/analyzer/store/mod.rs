@@ -1317,13 +1317,33 @@ impl AnalyzerStore {
         entries: &[(Oid, String)],
         generations: &HashMap<String, GenerationId>,
     ) -> Result<Vec<(Oid, String)>> {
-        let mut conn = self.active_read_conn()?;
+        let present = self.parsed_blob_keys_at_generations(entries, generations)?;
+        let mut seen = HashSet::default();
+        Ok(entries
+            .iter()
+            .filter(|entry| seen.insert((*entry).clone()) && !present.contains(*entry))
+            .cloned()
+            .collect())
+    }
+
+    pub(crate) fn missing_published_parsed_blob_keys_at_generations(
+        &self,
+        entries: &[(Oid, String)],
+        generations: &HashMap<String, GenerationId>,
+    ) -> Result<Vec<(Oid, String)>> {
+        let mut conn = {
+            let _scope = crate::profiling::scope("store.missing_blobs.open_reader");
+            self.active_read_conn()?
+        };
         let tx = conn.transaction()?;
-        require_generation_map(
-            &tx,
-            generations,
-            entries.iter().map(|(_, lang)| lang.as_str()),
-        )?;
+        {
+            let _scope = crate::profiling::scope("store.missing_blobs.check_generations");
+            require_generation_map(
+                &tx,
+                generations,
+                entries.iter().map(|(_, lang)| lang.as_str()),
+            )?;
+        }
         let missing = missing_published_parsed_blob_keys_conn(&tx, entries)?;
         tx.commit()?;
         Ok(missing)
@@ -1344,18 +1364,14 @@ impl AnalyzerStore {
         entries: &[(Oid, String)],
         generations: &HashMap<String, GenerationId>,
     ) -> Result<HashSet<(Oid, String)>> {
-        let mut conn = self.active_read_conn()?;
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(
             &tx,
             generations,
             entries.iter().map(|(_, lang)| lang.as_str()),
         )?;
-        // Analyzer startup only needs the atomic publication marker. Full
-        // side-table count validation belongs to hydration and explicit
-        // integrity checks. Repeating those correlated counts for every file
-        // made warm startup take seconds in large Java repositories.
-        let present = published_parsed_blob_keys_conn(&tx, entries)?;
+        let present = parsed_blob_keys_conn(&tx, entries)?;
         tx.commit()?;
         Ok(present)
     }
@@ -2835,10 +2851,19 @@ impl AnalyzerStore {
         // One request may carry several patterns, so the storage projection
         // intentionally supplies one complete declaration candidate set for
         // the batch while avoiding per-candidate file-state hydration.
-        let mut conn = self.active_read_conn()?;
+        let mut conn = {
+            let _scope = crate::profiling::scope("store.symbol_names.open_reader");
+            self.active_read_conn()?
+        };
         let tx = conn.transaction()?;
-        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        sync_active_blob_oids(&tx, active_oids)?;
+        {
+            let _scope = crate::profiling::scope("store.symbol_names.check_generations");
+            require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        }
+        {
+            let _scope = crate::profiling::scope("store.symbol_names.sync_active_oids");
+            sync_active_blob_oids(&tx, active_oids)?;
+        }
         let mut out = Vec::new();
         let mut inspected = 0usize;
         let mut complete = true;
@@ -2847,13 +2872,16 @@ impl AnalyzerStore {
                 complete = false;
                 break;
             }
-            let rows = search_candidate_name_rows_by_lang_conn_cancellable(
-                &tx,
-                lang_index,
-                lang,
-                literal_substrings,
-                cancellation,
-            )?;
+            let rows = {
+                let _scope = crate::profiling::scope(format!("store.symbol_names.query[{lang}]"));
+                search_candidate_name_rows_by_lang_conn_cancellable(
+                    &tx,
+                    lang_index,
+                    lang,
+                    literal_substrings,
+                    cancellation,
+                )?
+            };
             inspected = inspected.saturating_add(rows.inspected);
             out.extend(rows.rows);
             if !rows.complete {
@@ -7504,40 +7532,15 @@ fn parsed_blob_keys_conn(
     parsed_blob_keys_conn_with_condition(conn, entries, "", PARSED_BLOB_INTEGRITY_CONDITION)
 }
 
-fn published_parsed_blob_keys_conn(
-    conn: &Connection,
-    entries: &[(Oid, String)],
-) -> Result<HashSet<(Oid, String)>> {
-    sync_requested_parsed_blobs(conn, entries)?;
-    let mut statement = conn.prepare_cached(
-        "SELECT requested.blob_oid, requested.lang
-         FROM temp.requested_parsed_blobs AS requested
-         CROSS JOIN blob_meta AS meta
-           ON meta.blob_oid = requested.blob_oid AND meta.lang = requested.lang
-         CROSS JOIN blobs AS active_blob
-           ON active_blob.blob_oid = meta.blob_oid AND active_blob.lang = meta.lang
-         LEFT JOIN analysis_epochs AS active_epoch ON active_epoch.lang = active_blob.lang
-         WHERE meta.is_complete = 1
-           AND active_blob.generation = COALESCE(active_epoch.generation, 0)",
-    )?;
-    let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut present = set_with_capacity(entries.len());
-    for row in rows {
-        let (oid, lang) = row?;
-        if let Ok(oid) = Oid::from_str(&oid) {
-            present.insert((oid, lang));
-        }
-    }
-    Ok(present)
-}
-
 fn missing_published_parsed_blob_keys_conn(
     conn: &Connection,
     entries: &[(Oid, String)],
 ) -> Result<Vec<(Oid, String)>> {
-    sync_requested_parsed_blobs(conn, entries)?;
+    {
+        let _scope = crate::profiling::scope("store.missing_blobs.sync_requested");
+        sync_requested_parsed_blobs(conn, entries)?;
+    }
+    let _query_scope = crate::profiling::scope("store.missing_blobs.query");
     let mut statement = conn.prepare_cached(
         "SELECT requested.blob_oid, requested.lang
          FROM temp.requested_parsed_blobs AS requested

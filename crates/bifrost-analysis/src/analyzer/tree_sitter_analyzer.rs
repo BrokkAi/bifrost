@@ -165,6 +165,13 @@ pub(crate) struct AnalyzerStoreContext {
     pub(crate) liveness: Option<Arc<Liveness>>,
     pub(crate) live_paths: Arc<LivePathMap>,
     pub(crate) generations: Arc<HashMap<String, GenerationId>>,
+    pub(crate) startup_cache_validation: StartupCacheValidation,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum StartupCacheValidation {
+    FullIntegrity,
+    AtomicPublication,
 }
 
 pub(crate) struct StructuralSnapshotKey {
@@ -207,6 +214,7 @@ fn store_context_from_store(project: &dyn Project, store: AnalyzerStore) -> Anal
         liveness,
         live_paths: Arc::new(LivePathMap::default()),
         generations: Arc::new(HashMap::default()),
+        startup_cache_validation: StartupCacheValidation::FullIntegrity,
     }
 }
 
@@ -3097,10 +3105,21 @@ where
                     })
                     .collect();
                 let _missing_scope = profiling::scope("reconcile.find_missing_blobs");
-                let missing = match store_context.store.missing_parsed_blob_keys_at_generations(
-                    &all_blob_keys,
-                    store_context.generations.as_ref(),
-                ) {
+                let missing_result = match store_context.startup_cache_validation {
+                    StartupCacheValidation::FullIntegrity => {
+                        store_context.store.missing_parsed_blob_keys_at_generations(
+                            &all_blob_keys,
+                            store_context.generations.as_ref(),
+                        )
+                    }
+                    StartupCacheValidation::AtomicPublication => store_context
+                        .store
+                        .missing_published_parsed_blob_keys_at_generations(
+                            &all_blob_keys,
+                            store_context.generations.as_ref(),
+                        ),
+                };
+                let missing = match missing_result {
                     Ok(missing) => missing,
                     Err(_) => {
                         let mut seen = HashSet::default();
@@ -8923,6 +8942,7 @@ mod tests {
             liveness: None,
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
 
         let error = match TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
@@ -9415,6 +9435,7 @@ mod tests {
                 "python".to_string(),
                 GenerationId::BOOTSTRAP,
             )])),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -9569,6 +9590,7 @@ mod tests {
                 "python".to_string(),
                 GenerationId::BOOTSTRAP,
             )])),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -9647,6 +9669,7 @@ mod tests {
                 "python".to_string(),
                 GenerationId::BOOTSTRAP,
             )])),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -10728,6 +10751,7 @@ mod tests {
                 "python".to_string(),
                 GenerationId::BOOTSTRAP,
             )])),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -11098,6 +11122,7 @@ mod tests {
             liveness: None,
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
         };
         let config = AnalyzerConfig::default();
 
