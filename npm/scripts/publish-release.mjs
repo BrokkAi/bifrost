@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,13 +22,19 @@ function parseArgs(argv) {
   return options;
 }
 
-function packageExists(packageName, version) {
-  const result = spawnSync(
+export function packageExists(packageName, version, spawnProcess = spawnSync) {
+  const result = spawnProcess(
     "npm",
     ["view", `${packageName}@${version}`, "version", "--registry=https://registry.npmjs.org"],
     { encoding: "utf8" },
   );
-  return result.status === 0 && result.stdout.trim() === version;
+  if (result.error) throw result.error;
+  if (result.status === 0) {
+    if (result.stdout.trim() === version) return true;
+    throw new Error(`npm view ${packageName}@${version} returned: ${result.stdout.trim()}`);
+  }
+  if (/\bE404\b/.test(result.stderr)) return false;
+  throw new Error(`npm view ${packageName}@${version} failed:\n${result.stderr}`);
 }
 
 function validateTarball(tarball, packageName, version) {
@@ -41,10 +47,34 @@ function validateTarball(tarball, packageName, version) {
   }
 }
 
-function publishTarball(tarball) {
-  const result = spawnSync("npm", ["publish", tarball, "--access", "public"], { stdio: "inherit" });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`npm publish failed for ${tarball}`);
+export async function publishTarball(
+  tarball,
+  spawnProcess = spawn,
+  writeOutput = (message) => process.stdout.write(message),
+  writeError = (message) => process.stderr.write(message),
+) {
+  const child = spawnProcess("npm", ["publish", tarball, "--access", "public"], {
+    stdio: ["inherit", "pipe", "pipe"],
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => {
+    output += chunk;
+    writeOutput(chunk);
+  });
+  child.stderr.on("data", (chunk) => {
+    output += chunk;
+    writeError(chunk);
+  });
+  const status = await new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", resolve);
+  });
+  if (status === 0) return;
+  if (/\bE403\b/.test(output) && /cannot publish over the previously published versions/i.test(output)) {
+    writeError(`npm already accepted ${path.basename(tarball)}; waiting for registry visibility\n`);
+    return;
+  }
+  throw new Error(`npm publish failed for ${tarball}`);
 }
 
 function delay(milliseconds) {
@@ -81,11 +111,11 @@ async function main() {
   }
 
   for (const entry of platformEntries) {
-    if (!packageExists(entry.packageName, version)) publishTarball(entry.tarball);
+    if (!packageExists(entry.packageName, version)) await publishTarball(entry.tarball);
   }
   await Promise.all(platformEntries.map((entry) => waitForVersion(entry.packageName, version)));
 
-  if (!packageExists(rootEntry.packageName, version)) publishTarball(rootEntry.tarball);
+  if (!packageExists(rootEntry.packageName, version)) await publishTarball(rootEntry.tarball);
   await waitForVersion(rootEntry.packageName, version);
 }
 
