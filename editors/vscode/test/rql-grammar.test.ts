@@ -266,7 +266,7 @@ void test("highlights schema-v8 occurrence forms and filter options", async () =
 void test("highlights schema-v9 lexical environment forms and filter options", async () => {
   const tokens = tokenizeGrammar(
     await grammar(),
-    "(scopes :kind block) (bindings :kind local :name \"rows\" :hoisting scope_wide) " +
+    '(scopes :kind block) (bindings :kind local :name "rows" :hoisting scope_wide) ' +
       "(scope-ancestors (scope-of (bindings-in :kind parameter (function)))) " +
       "(binding-occurrence (reaching-binding :include-shadowed true (occurrences))) " +
       "(candidate-target (candidates-of :tier lexical_binding :outcome selected " +
@@ -285,13 +285,7 @@ void test("highlights schema-v9 lexical environment forms and filter options", a
   ]) {
     assertScoped(tokens, form, "support.function.wrapper.bifrost-rql");
   }
-  for (const option of [
-    ":hoisting",
-    ":include-shadowed",
-    ":tier",
-    ":outcome",
-    ":boundary"
-  ]) {
+  for (const option of [":hoisting", ":include-shadowed", ":tier", ":outcome", ":boundary"]) {
     assertScoped(tokens, option, "variable.parameter.role.bifrost-rql");
   }
 });
