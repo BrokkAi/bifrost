@@ -391,6 +391,18 @@ fn pinned_real_project_witnesses_are_available_offline_and_immutable() {
             }
             path => panic!("unregistered pinned fixture {path}"),
         };
-        assert_eq!(format!("{:x}", Sha256::digest(source)), fixture.sha256);
+        let canonical_source = String::from_utf8_lossy(source).replace("\r\n", "\n");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(canonical_source.as_bytes())),
+            fixture.sha256
+        );
+
+        let windows_source = canonical_source.replace('\n', "\r\n");
+        assert_eq!(
+            Sha256::digest(windows_source.replace("\r\n", "\n").as_bytes()),
+            Sha256::digest(canonical_source.as_bytes()),
+            "{} must have the same witness hash after Windows checkout",
+            fixture.path
+        );
     }
 }
