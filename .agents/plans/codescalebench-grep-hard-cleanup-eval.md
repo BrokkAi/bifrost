@@ -13,9 +13,9 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - [x] (2026-08-05 20:10Z) Confirmed that `grep_hard/suite_final.jsonl` contains 67 unique tasks.
 - [x] (2026-08-05 20:10Z) Confirmed that prior `SUCCESS` counts measured completion, not task solves.
 - [x] (2026-08-05 20:10Z) Confirmed that all 40 prior Bifrost sessions disabled Bifrost because of a literal workspace placeholder.
-- [ ] Audit all 67 task instructions, answer schemas, repository identities, and scorers.
+- [x] (2026-08-05 21:33Z) Audited all 67 candidates against all 31 exact source revisions.
 - [x] (2026-08-05 21:20Z) Added a 67-row canonical audit and scorer in Brokkbench commit `3d1402548b0`.
-- [ ] Implement dataset and scorer corrections with behavior tests.
+- [x] (2026-08-05 21:33Z) Added canonical scoring, output-contract repair, source validation, and 0.8 solve reporting.
 - [ ] Rescore reusable prior outputs and classify format failures separately from localization failures.
 - [ ] Run all 67 tasks without Bifrost at concurrency 10 and a 1,800-second task limit.
 - [ ] Select tasks that remain difficult without Bifrost and have prepared images, clones, and cache data.
@@ -45,6 +45,8 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Evidence: `ccx-dep-trace-116` requires `kubernetes/apimachinery`, but its Dockerfile provides Kubernetes, client-go, api, and etcd only.
 - Observation: The corrected old bare outputs do not show 15 solves.
   Evidence: One of 11 scorable outputs reaches the documented 0.8 threshold. Five outputs used the wrong contract, and three candidates are invalid.
+- Observation: The complete source audit leaves 64 runnable localization candidates.
+  Evidence: All canonical files exist at their exact revisions. The audit excludes two non-localization tasks and `ccx-dep-trace-116`, whose required repository is absent.
 
 ## Decision Log
 
@@ -65,6 +67,9 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Date/Author: 2026-08-05 / Codex
 - Decision: Call a task solved only at canonical composite score 0.8 or more.
   Rationale: A single oracle hit is useful partial credit, not a complete solution.
+  Date/Author: 2026-08-05 / Codex
+- Decision: Preserve the original 67 rows in the audit, but run only the 64 validated candidates.
+  Rationale: This keeps defects visible while preventing invalid tasks from consuming model tokens.
   Date/Author: 2026-08-05 / Codex
 
 ## Outcomes & Retrospective
@@ -108,9 +113,9 @@ Use campaign directories below `/mnt/containers/code_isnt_memory/`. Keep stopped
 
 ## Validation and Acceptance
 
-The dataset audit must contain 67 rows. Every row must identify its answer contract, repository mapping, verifier, and current defect category. All corrected scorer tests must pass.
+The dataset audit must contain 67 rows. The runnable manifest must contain 64 validated localization tasks. Every row must identify its answer contract, repository mapping, verifier, and current defect category. All corrected scorer tests must pass.
 
-The fresh bare run must contain 67 result records. The hard-set manifest must exclude format failures and scorer failures. It must record the corrected score used for selection.
+The fresh bare run must contain 64 result records. The hard-set manifest must exclude format failures and scorer failures. It must record the corrected score used for selection.
 
 The symbol smoke test must prove Bifrost startup and one completed symbol call. The full symbol arm must have no MCP-start error. The NLP arm must use the identical task manifest and runtime, except for NLP enablement. Its report must include symbol calls, semantic calls, main and utility tokens, request time, cost, and paired composite scores.
 
@@ -131,3 +136,5 @@ The invalid prior campaign is `/mnt/containers/code_isnt_memory/codescale-three-
 The dataset audit will use the CodeScaleBench task loaders and verifier modules. It must not duplicate oracle scoring logic. The Brokkbench harness will keep `bare`, `symbols`, and `symbols-nlp` modes. It will add a real Bifrost startup gate and preserve separate main and utility LLM metrics.
 
 Revision note: Created after the invalid Bifrost run. It expands the work to the complete 67-task cleanup and staged reevaluation.
+
+Revision note: The complete audit found three invalid candidates. The execution count is now 64, while the audit still covers all 67 rows.
