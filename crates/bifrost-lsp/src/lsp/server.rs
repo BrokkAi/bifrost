@@ -1350,6 +1350,8 @@ fn run_rql_query_result(
                     CodeQueryResultValue::CallSite { value } => &value.path,
                     CodeQueryResultValue::ExpressionSite { value } => &value.path,
                     CodeQueryResultValue::ReceiverAnalysis { value } => &value.path,
+                    CodeQueryResultValue::ReceiverOutcome { value } => &value.path,
+                    CodeQueryResultValue::ReceiverEvidence { value } => &value.path,
                     CodeQueryResultValue::Occurrence { value } => &value.path,
                     CodeQueryResultValue::LexicalScope { value } => &value.path,
                     CodeQueryResultValue::Binding { value } => &value.path,

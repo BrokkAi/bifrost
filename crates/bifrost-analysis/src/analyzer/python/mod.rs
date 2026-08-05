@@ -773,6 +773,10 @@ fn import_order_requires_source(binder: &ImportBinder, local_names: &HashSet<Str
 }
 
 impl IAnalyzer for PythonAnalyzer {
+    fn invalidate_cached_file_identities(&self) {
+        self.inner.invalidate_cached_file_identities();
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.begin_query(context);
     }

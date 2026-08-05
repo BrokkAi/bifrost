@@ -217,7 +217,12 @@ macro_rules! policy_records {
 policy_records! {
     Policy { labels: ["policy"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(policy [:schema-version N] :id ID :name NAME :message MESSAGE :severity SEVERITY :analysis ANALYSIS ...)", description: "Define one executable static-analysis policy." }
     Endpoint { labels: ["endpoint"], layout: KeywordPairs, owner: OwnerApplicability::ENDPOINT, signature: "(endpoint [:schema-version N] :id ID :name NAME :display-name TEXT :role source|sink ...)", description: "Define one diagnostic-neutral reusable source or sink endpoint." }
-    Analysis { labels: ["analysis"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(analysis :type match|taint|typestate|assertion ...)", description: "Select and configure exactly one policy analysis kind." }
+    Analysis { labels: ["analysis"], layout: Mixed, owner: OwnerApplicability::POLICY_ALL, signature: "(analysis :type match|taint|typestate|assertion ...)", description: "Select and configure exactly one policy analysis kind." }
+    Bind { labels: ["bind"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(bind :name NAME (:query SELECTOR | :from NAME :step STEP))", description: "Bind one named typed row relation from a CodeQuery or an earlier binding expansion." }
+    Join { labels: ["join"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(join :left NAME :right NAME [:kind inner|anti] :on ((LEFT RIGHT)...))", description: "Join two named row relations by registered equal-typed fields." }
+    Group { labels: ["group"], layout: Mixed, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(group :name NAME :by (BINDING.FIELD...) (aggregate ...) ...)", description: "Group joined rows by registered fields and compute named aggregates." }
+    Aggregate { labels: ["aggregate"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(aggregate :name NAME :op min|count|count-distinct [:value BINDING.FIELD] [:where ((BINDING.FIELD eq VALUE)...)] )", description: "Compute one bounded typed aggregate within a row group." }
+    RowAssert { labels: ["assert"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert [:id ID] :group NAME :value NAME :cardinality (exactly|at-least|at-most N))", description: "Assert a cardinality over one named aggregate in every row group." }
     Assert { labels: ["assert"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert :id ID :at CAPTURE :role ROLE :expect declaration|reference|binding|none [:cardinality (exactly N)] [:namespace NAMESPACE] [:require-target true|false])", description: "Require or forbid occurrences at one captured AST node with exact cardinality." }
     AssertResolution { labels: ["assert-resolution"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-resolution :id ID :at CAPTURE :role ROLE :expect-tier TIER [:at-least true|false] [:forbid-tier TIER] [:require-unique true|false])", description: "Require the resolver's selected candidate for one captured reference to sit at, or above, one precedence tier." }
     AssertReaching { labels: ["assert-reaching"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-reaching :id ID :at CAPTURE :role ROLE :declared inside|outside :relative-to CAPTURE)", description: "Require the reaching binding of one captured reference to be declared inside or outside a second captured node." }
@@ -314,7 +319,12 @@ pub fn applicable_records_from_label(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldPlacement {
     Keyword,
-    Positional { index: u8 },
+    Positional {
+        index: u8,
+    },
+    /// A bounded source-ordered tail of positional child values. At most one
+    /// descriptor of this kind may exist for a record.
+    VariadicPositional,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -474,10 +484,14 @@ macro_rules! value_shapes {
                     Self::UsageSurface => Some(AtomDomain::UsageSurface),
                     Self::EdgeClassAxis => Some(AtomDomain::EdgeClassAxis),
                     Self::RouteHop => Some(AtomDomain::RouteHop),
+                    Self::RowExpansionStep => Some(AtomDomain::RowExpansionStep),
+                    Self::RowJoinKind => Some(AtomDomain::RowJoinKind),
+                    Self::RowAggregateOp => Some(AtomDomain::RowAggregateOp),
                     Self::CaptureName
                     | Self::AssertCardinality
                     | Self::AssertEntries
-                    | Self::EdgeClassValues => None,
+                    | Self::EdgeClassValues
+                    | Self::AssertionPlanEntries => None,
                     Self::SchemaVersion
                     | Self::PolicyId
                     | Self::EndpointId
@@ -551,7 +565,13 @@ macro_rules! value_shapes {
                     | Self::ClassificationRefinements
                     | Self::Predicates
                     | Self::CvssPredicates
-                    | Self::CvssMetrics => None,
+                    | Self::CvssMetrics
+                    | Self::RowAggregates
+                    | Self::RowName
+                    | Self::RowFieldRef
+                    | Self::RowFieldRefs
+                    | Self::RowJoinConditions
+                    | Self::RowPredicates => None,
                 }
             }
 
@@ -660,6 +680,13 @@ macro_rules! value_shapes {
                         PolicyRecord::AssertRoute,
                         PolicyRecord::AssertRoundTrip,
                     ],
+                    Self::AssertionPlanEntries => &[
+                        PolicyRecord::Bind,
+                        PolicyRecord::Join,
+                        PolicyRecord::Group,
+                        PolicyRecord::RowAssert,
+                    ],
+                    Self::RowAggregates => &[PolicyRecord::Aggregate],
                     Self::AssertCardinality => &[
                         PolicyRecord::CardinalityExactly,
                         PolicyRecord::CardinalityAtLeast,
@@ -678,7 +705,10 @@ macro_rules! value_shapes {
                     | Self::EdgeClassAxis
                     | Self::EdgeClassValues
                     | Self::RouteHop
-                    | Self::Boolean => &[],
+                    | Self::Boolean
+                    | Self::RowExpansionStep
+                    | Self::RowJoinKind
+                    | Self::RowAggregateOp => &[],
                     Self::SchemaVersion
                     | Self::PolicyId
                     | Self::EndpointId
@@ -725,7 +755,12 @@ macro_rules! value_shapes {
                     | Self::TaintLabels
                     | Self::TaintTags
                     | Self::TaintImpacts
-                    | Self::Strings => &[],
+                    | Self::Strings
+                    | Self::RowName
+                    | Self::RowFieldRef
+                    | Self::RowFieldRefs
+                    | Self::RowJoinConditions
+                    | Self::RowPredicates => &[],
                 }
             }
         }
@@ -768,6 +803,16 @@ value_shapes! {
     EdgeClassAxis => "relation, usage, site-class, or kind",
     EdgeClassValues => "one or more classification labels of the constrained axis",
     AssertEntries => "assert records",
+    AssertionPlanEntries => "bind, join, group, and relational assert records",
+    RowAggregates => "aggregate records",
+    RowName => "a bounded row binding, group, or aggregate name",
+    RowFieldRef => "a binding.field row reference",
+    RowFieldRefs => "one or more binding.field row references",
+    RowJoinConditions => "one or more equality field pairs",
+    RowPredicates => "zero or more typed equality predicates",
+    RowExpansionStep => "a registered typed row expansion",
+    RowJoinKind => "inner or anti",
+    RowAggregateOp => "min, count, or count-distinct",
     Boolean => "true or false",
     AnalysisRecord => "an analysis record whose fields agree with its explicit type",
     ReportOptions => "a report record",
@@ -975,8 +1020,9 @@ policy_fields! {
     EndpointSupersedes { record: Endpoint, labels: ["supersedes"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_64, shape: EndpointIds, owner: OwnerApplicability::ENDPOINT, signature: ":supersedes [ENDPOINT-ID...]", description: "Declare explicit same-event dominance edges." }
 
     AnalysisType { record: Analysis, labels: ["type"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: AnalysisType, owner: OwnerApplicability::POLICY_ALL, signature: ":type match|taint|typestate|assertion", description: "Select the analysis variant; fields are never inferred from their presence." }
-    AnalysisSubject { record: Analysis, labels: ["subject"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":subject (rql ...)|(rql-file ...)", description: "Select the subject nodes each assertion is evaluated at; the selector must bind the captures named by :at." }
-    AnalysisAsserts { record: Analysis, labels: ["asserts"], placement: FieldPlacement::Keyword, required: Required, multiplicity: ValueMultiplicity::sequence(1, 64), shape: AssertEntries, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":asserts [(assert ...)...]", description: "Declare the independent occurrence invariants evaluated at every subject row." }
+    AnalysisSubject { record: Analysis, labels: ["subject"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":subject (rql ...)|(rql-file ...)", description: "Select the subject nodes each specialized assertion is evaluated at; required with :asserts." }
+    AnalysisAsserts { record: Analysis, labels: ["asserts"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::sequence(1, 64), shape: AssertEntries, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":asserts [(assert ...)...]", description: "Declare specialized occurrence, resolution, route, or identity invariants; required with :subject." }
+    AnalysisPlanEntries { record: Analysis, labels: [], placement: FieldPlacement::VariadicPositional, required: Optional, multiplicity: ValueMultiplicity::sequence(1, 64), shape: AssertionPlanEntries, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(bind|join|group|assert ...)...", description: "Declare a bounded source-ordered relational assertion plan." }
     AnalysisSelector { record: Analysis, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_MATCH, signature: ":selector (rql ...)|(rql-file ...)", description: "Select positive location-bearing match results." }
     AnalysisMode { record: Analysis, labels: ["mode"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintMode, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: ":mode may", description: "Select the schema-version-1 may analysis mode." }
     AnalysisCallModeling { record: Analysis, labels: ["call-modeling"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: CallModelingSpec, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: ":call-modeling (call-modeling :unmodeled paranoid|optimistic|require-model)", description: "Choose fallback behavior for unmodeled calls; omission defaults to paranoid." }
@@ -989,6 +1035,26 @@ policy_fields! {
     AnalysisSubjects { record: Analysis, labels: ["subjects"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: SubjectSet, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":subjects (subject-set ...)", description: "Compose values newly tracked by typestate." }
     AnalysisUncertainty { record: Analysis, labels: ["uncertainty"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: UncertaintySpec, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":uncertainty (uncertainty ...)", description: "Declare explicit handling for subjects that escape the analysis root." }
     AnalysisAutomaton { record: Analysis, labels: ["automaton"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: AutomatonSpec, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":automaton (automaton ...)", description: "Declare the author-facing typestate automaton and terminal obligations." }
+
+    BindName { record: Bind, labels: ["name"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":name NAME", description: "Set the unique row binding name." }
+    BindQuery { record: Bind, labels: ["query"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":query (rql ...)|(rql-file ...)", description: "Execute one typed CodeQuery as the binding source." }
+    BindFrom { record: Bind, labels: ["from"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":from NAME", description: "Name an earlier binding to expand." }
+    BindStep { record: Bind, labels: ["step"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: RowExpansionStep, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":step STEP", description: "Select one typed expansion relation." }
+    JoinLeft { record: Join, labels: ["left"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":left NAME", description: "Name the left row binding." }
+    JoinRight { record: Join, labels: ["right"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":right NAME", description: "Name the right row binding." }
+    JoinKind { record: Join, labels: ["kind"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: RowJoinKind, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":kind inner|anti", description: "Choose inner join or anti-join; omission means inner." }
+    JoinOn { record: Join, labels: ["on"], placement: FieldPlacement::Keyword, required: Required, multiplicity: ValueMultiplicity::sequence(1, 16), shape: RowJoinConditions, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":on ((LEFT-FIELD RIGHT-FIELD)...)", description: "Declare equal-typed field pairs relative to the left and right bindings." }
+    GroupName { record: Group, labels: ["name"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":name NAME", description: "Set the unique row group name." }
+    GroupBy { record: Group, labels: ["by"], placement: FieldPlacement::Keyword, required: Required, multiplicity: ValueMultiplicity::sequence(1, 16), shape: RowFieldRefs, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":by (BINDING.FIELD...)", description: "Choose the typed row fields that identify each group." }
+    GroupAggregates { record: Group, labels: [], placement: FieldPlacement::VariadicPositional, required: Required, multiplicity: ValueMultiplicity::sequence(1, 32), shape: RowAggregates, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(aggregate ...)...", description: "Declare the source-ordered aggregates computed for the group." }
+    AggregateName { record: Aggregate, labels: ["name"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":name NAME", description: "Set the unique aggregate name within its group." }
+    AggregateOp { record: Aggregate, labels: ["op"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowAggregateOp, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":op min|count|count-distinct", description: "Choose the bounded aggregate operation." }
+    AggregateValue { record: Aggregate, labels: ["value"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: RowFieldRef, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":value BINDING.FIELD", description: "Select the typed input field for min or count-distinct." }
+    AggregateWhere { record: Aggregate, labels: ["where"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::sequence(0, 16), shape: RowPredicates, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":where ((BINDING.FIELD eq VALUE)...)", description: "Conjoin bounded typed equality predicates before aggregation." }
+    RowAssertId { record: RowAssert, labels: ["id"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id ID", description: "Optionally override the stable assertion identity derived from group and aggregate names." }
+    RowAssertGroup { record: RowAssert, labels: ["group"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":group NAME", description: "Name the row group being asserted." }
+    RowAssertValue { record: RowAssert, labels: ["value"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":value NAME", description: "Name the aggregate being asserted." }
+    RowAssertCardinality { record: RowAssert, labels: ["cardinality"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: AssertCardinality, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":cardinality (exactly|at-least|at-most N)", description: "Set the expected aggregate cardinality." }
 
     RqlSchemaVersion { record: Rql, labels: ["schema-version"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SchemaVersion, owner: OwnerApplicability::BOTH, signature: ":schema-version N", description: "Pin the nested RQL version exactly; omission uses the RQL compatible head." }
     RqlQuery { record: Rql, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: RqlQuery, owner: OwnerApplicability::BOTH, signature: "QUERY", description: "Embed exactly one spanned RQL query subtree." }
@@ -1279,6 +1345,11 @@ pub fn positional_field(record: PolicyRecord, index: u8) -> Option<&'static Poli
         .find(|descriptor| descriptor.placement == FieldPlacement::Positional { index })
 }
 
+pub fn variadic_positional_field(record: PolicyRecord) -> Option<&'static PolicyFieldDescriptor> {
+    fields_for_record(record)
+        .find(|descriptor| descriptor.placement == FieldPlacement::VariadicPositional)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AtomDomain {
     AnalysisType,
@@ -1313,6 +1384,9 @@ pub enum AtomDomain {
     EdgeClassAxis,
     RouteHop,
     Boolean,
+    RowExpansionStep,
+    RowJoinKind,
+    RowAggregateOp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1489,6 +1563,20 @@ atom_values! {
     HopGeneratedPeer { domain: RouteHop, spellings: ["generated_peer"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The link between a synthetic declaration and its source declaration." }
     BooleanTrue { domain: Boolean, spellings: ["true"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Enable the flag." }
     BooleanFalse { domain: Boolean, spellings: ["false"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Disable the flag." }
+    RowReceiverOutcome { domain: RowExpansionStep, spellings: ["receiver-outcome"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Expand a site into its mandatory receiver outcome row." }
+    RowReceiverEvidence { domain: RowExpansionStep, spellings: ["receiver-evidence"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Expand a site into receiver evidence rows." }
+    RowMemberSelection { domain: RowExpansionStep, spellings: ["member-selection"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Expand a site into its mandatory member selection outcome row." }
+    RowMemberCandidates { domain: RowExpansionStep, spellings: ["member-candidates"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Expand a site into member candidate rows." }
+    RowCandidateHierarchy { domain: RowExpansionStep, spellings: ["candidate-hierarchy"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Expand a member candidate into hierarchy hop rows." }
+    RowMemberFamily { domain: RowExpansionStep, spellings: ["member-family"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Expand a member into its canonical family outcome." }
+    RowFamilyEdges { domain: RowExpansionStep, spellings: ["family-edges"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Expand a member family into exact relation edges." }
+    RowDispatchOutcome { domain: RowExpansionStep, spellings: ["dispatch-outcome"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Expand a call site into its mandatory dispatch outcome row." }
+    RowDispatchTargets { domain: RowExpansionStep, spellings: ["dispatch-targets"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Expand a call site into bounded dispatch target rows." }
+    RowJoinInner { domain: RowJoinKind, spellings: ["inner"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Retain rows with matching right-side rows." }
+    RowJoinAnti { domain: RowJoinKind, spellings: ["anti"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Retain left rows with no matching right-side row." }
+    RowAggregateMin { domain: RowAggregateOp, spellings: ["min"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Compute the minimum integer value." }
+    RowAggregateCount { domain: RowAggregateOp, spellings: ["count"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Count retained rows." }
+    RowAggregateCountDistinct { domain: RowAggregateOp, spellings: ["count-distinct"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Count distinct non-null typed values." }
 }
 
 pub fn atom_values(domain: AtomDomain) -> impl Iterator<Item = &'static AtomValueDescriptor> {
@@ -1621,6 +1709,7 @@ mod tests {
             ] {
                 let mut labels = HashSet::new();
                 let mut positions = HashSet::new();
+                let mut has_variadic = false;
                 for field in fields_for_record(*record)
                     .filter(|descriptor| descriptor.context.allows(context))
                 {
@@ -1638,6 +1727,13 @@ mod tests {
                                 positions.insert(index),
                                 "duplicate position {index} in {record:?}/{context:?}"
                             );
+                        }
+                        FieldPlacement::VariadicPositional => {
+                            assert!(
+                                !has_variadic,
+                                "duplicate variadic field in {record:?}/{context:?}"
+                            );
+                            has_variadic = true;
                         }
                     }
                 }

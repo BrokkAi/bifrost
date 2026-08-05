@@ -2412,11 +2412,25 @@ fn validate_authored_policy_selectors(
         PolicyAnalysis::Match { spec } => {
             validate_authored_selector_at("/analysis/selector", &spec.selector, selectors)?
         }
-        PolicyAnalysis::Assertion { spec } => validate_authored_selector_at(
-            ASSERTION_SUBJECT_SELECTOR_PATH,
-            &spec.subject,
-            selectors,
-        )?,
+        PolicyAnalysis::Assertion { spec } => {
+            if let Some(plan) = &spec.relational {
+                for binding in &plan.bindings {
+                    if let RowBindingSource::Query(query) = &binding.source {
+                        validate_authored_selector_at(
+                            &relational_binding_selector_path(&binding.name),
+                            query,
+                            selectors,
+                        )?;
+                    }
+                }
+            } else {
+                validate_authored_selector_at(
+                    ASSERTION_SUBJECT_SELECTOR_PATH,
+                    &spec.subject,
+                    selectors,
+                )?;
+            }
+        }
         PolicyAnalysis::Taint { spec } => {
             for source in &spec.sources.entries {
                 validate_authored_selector_at(
@@ -2806,8 +2820,18 @@ fn expected_selector_paths(
     let mut paths = Vec::new();
     match &definition.analysis {
         PolicyAnalysis::Match { .. } => paths.push(selector_path("/analysis/selector")?),
-        PolicyAnalysis::Assertion { .. } => {
-            paths.push(selector_path(ASSERTION_SUBJECT_SELECTOR_PATH)?)
+        PolicyAnalysis::Assertion { spec } => {
+            if let Some(plan) = &spec.relational {
+                for binding in &plan.bindings {
+                    if matches!(binding.source, RowBindingSource::Query(_)) {
+                        paths.push(selector_path(&relational_binding_selector_path(
+                            &binding.name,
+                        ))?);
+                    }
+                }
+            } else {
+                paths.push(selector_path(ASSERTION_SUBJECT_SELECTOR_PATH)?)
+            }
         }
         PolicyAnalysis::Taint { spec } => {
             extend_taint_paths(&mut paths, "sources", &spec.sources.entries)?;

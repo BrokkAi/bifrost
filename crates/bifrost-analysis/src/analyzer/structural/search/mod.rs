@@ -138,12 +138,13 @@ use expansions::{
 // existing consumer path unchanged.
 use super::lexical_environment::ReachingBindingOutcome;
 use super::occurrence_rows::{OccurrenceRow, OccurrenceTarget};
-use super::occurrences::OccurrenceClass;
+use super::occurrences::{OccurrenceClass, OccurrenceRole};
 use super::query::{
     BindingFilter, CandidateFilter, EdgeFilter, OccurrenceFilter, OccurrenceSeed, ScopeFilter,
 };
-use crate::analyzer::semantic::ContentIdentity;
+use crate::analyzer::semantic::{ContentIdentity, LengthDelimitedDigest};
 use crate::analyzer::usages::get_definition::TraceCandidateRef;
+pub use results::ALL_DETAILED_CODE_QUERY_DOMAINS;
 pub use results::CodeQueryBinding;
 pub use results::CodeQueryCallArgument;
 pub use results::CodeQueryCallSite;
@@ -193,6 +194,8 @@ pub use results::CodeQueryProvenanceStep;
 pub use results::CodeQueryQualifiedPath;
 pub use results::CodeQueryRange;
 pub use results::CodeQueryReceiverAnalysis;
+pub use results::CodeQueryReceiverEvidence;
+pub use results::CodeQueryReceiverOutcome;
 pub use results::CodeQueryReceiverValue;
 pub use results::CodeQueryReferenceEdge;
 pub use results::CodeQueryReferenceSite;
@@ -202,6 +205,11 @@ pub use results::CodeQueryResult;
 pub use results::CodeQueryResultItem;
 pub use results::CodeQueryResultRef;
 pub use results::CodeQueryResultValue;
+pub use results::CodeQueryRowField;
+pub use results::CodeQueryRowFieldError;
+pub use results::CodeQueryRowRef;
+pub use results::CodeQueryRowScalarRef;
+pub use results::CodeQueryRowScalarType;
 pub use results::CodeQuerySemanticCompleteness;
 pub use results::CodeQuerySemanticEvidence;
 pub use results::CodeQuerySemanticLimits;
@@ -359,6 +367,19 @@ struct ExpressionSiteValue {
 struct ReceiverAnalysisValue {
     report: ReceiverQueryReport,
     capture: Option<String>,
+    site_id: String,
+    site_ast_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReceiverEvidenceValue {
+    receiver: ReceiverAnalysisValue,
+    id: String,
+    parent_evidence_id: Option<String>,
+    ordinal: usize,
+    chain_hop: usize,
+    value: ReceiverValue,
+    factory: Option<CodeUnit>,
 }
 
 #[derive(Default)]
@@ -477,6 +498,8 @@ enum PipelineValue {
     CallSite(CallSiteValue),
     ExpressionSite(ExpressionSiteValue),
     ReceiverAnalysis(ReceiverAnalysisValue),
+    ReceiverOutcome(ReceiverAnalysisValue),
+    ReceiverEvidence(ReceiverEvidenceValue),
     Occurrence(OccurrenceValue),
     LexicalScope(ScopeValue),
     Binding(BindingValue),
@@ -521,6 +544,8 @@ enum PipelineKey {
     CallSite(CallSiteValue),
     ExpressionSite(ExpressionSiteValue),
     ReceiverAnalysis(ReceiverQueryOperation, ProjectFile, Range),
+    ReceiverOutcome(String),
+    ReceiverEvidence(String),
     Occurrence(OccurrenceKey),
     LexicalScope(ScopeKey),
     Binding(BindingKey),
@@ -562,6 +587,8 @@ impl PipelineValue {
                 value.report.site.file.clone(),
                 value.report.site.range,
             ),
+            Self::ReceiverOutcome(value) => PipelineKey::ReceiverOutcome(value.site_id.clone()),
+            Self::ReceiverEvidence(value) => PipelineKey::ReceiverEvidence(value.id.clone()),
             Self::Occurrence(value) => PipelineKey::Occurrence(value.key()),
             Self::LexicalScope(value) => PipelineKey::LexicalScope(value.key()),
             Self::GenerationSite(value) => PipelineKey::GenerationSite(value.key()),
@@ -785,6 +812,8 @@ enum PipelineTraceValue {
     CallSite(CallSiteValue),
     ExpressionSite(ExpressionSiteValue),
     ReceiverAnalysis(ReceiverAnalysisValue),
+    ReceiverOutcome(ReceiverAnalysisValue),
+    ReceiverEvidence(ReceiverEvidenceValue),
     Occurrence(OccurrenceValue),
     LexicalScope(ScopeValue),
     Binding(BindingValue),
@@ -2687,6 +2716,40 @@ fn detailed_evidence_for_pipeline_value(
                 provenance: Vec::new(),
             }
         }
+        PipelineValue::ReceiverOutcome(value) => {
+            let site = &value.report.site;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::ReceiverOutcome,
+                key: DetailedCodeQueryKey::ReceiverOutcome {
+                    id: value.site_id.clone(),
+                    site_id: value.site_id.clone(),
+                },
+                file: site.file.clone(),
+                source_slice_sha256: None,
+                byte_span: Some(range_byte_span(site.range)),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::ReceiverEvidence(value) => {
+            let site = &value.receiver.report.site;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::ReceiverEvidence,
+                key: DetailedCodeQueryKey::ReceiverEvidence {
+                    id: value.id.clone(),
+                    site_id: value.receiver.site_id.clone(),
+                },
+                file: site.file.clone(),
+                source_slice_sha256: None,
+                byte_span: Some(range_byte_span(site.range)),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
         PipelineValue::Occurrence(value) => {
             let row = &value.row;
             let byte_span = row.range.start_byte..row.range.end_byte;
@@ -2967,6 +3030,8 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::Export(value) => Some(value.file()),
         PipelineValue::DeclarationState(value) => Some(value.file()),
         PipelineValue::ReferenceEdge(value) => Some(value.file()),
+        PipelineValue::ReceiverOutcome(value) => Some(&value.report.site.file),
+        PipelineValue::ReceiverEvidence(value) => Some(&value.receiver.report.site.file),
         PipelineValue::File(_) | PipelineValue::ReceiverAnalysis(_) => None,
     }
 }
@@ -3061,6 +3126,10 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::CallSite(site) => collect_call_source_files(site, files),
         PipelineValue::ExpressionSite(site) => collect_call_source_files(&site.call_site, files),
         PipelineValue::ReceiverAnalysis(value) => collect_receiver_source_files(value, files),
+        PipelineValue::ReceiverOutcome(value) => collect_receiver_source_files(value, files),
+        PipelineValue::ReceiverEvidence(value) => {
+            collect_receiver_source_files(&value.receiver, files)
+        }
         PipelineValue::Occurrence(value) => {
             files.insert(value.file().clone());
         }
@@ -3107,6 +3176,10 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
             collect_call_source_files(&site.call_site, files);
         }
         PipelineTraceValue::ReceiverAnalysis(value) => collect_receiver_source_files(value, files),
+        PipelineTraceValue::ReceiverOutcome(value) => collect_receiver_source_files(value, files),
+        PipelineTraceValue::ReceiverEvidence(value) => {
+            collect_receiver_source_files(&value.receiver, files)
+        }
         PipelineTraceValue::Occurrence(value) => {
             files.insert(value.file().clone());
         }
@@ -3324,6 +3397,12 @@ fn detailed_trace_provenance_ref(
         }
         PipelineTraceValue::ReceiverAnalysis(value) => {
             detailed_receiver_provenance_ref(value, cache)
+        }
+        PipelineTraceValue::ReceiverOutcome(value) => {
+            detailed_receiver_outcome_provenance_ref(value, cache)
+        }
+        PipelineTraceValue::ReceiverEvidence(value) => {
+            detailed_receiver_evidence_provenance_ref(value, cache)
         }
         PipelineTraceValue::Occurrence(value) => detailed_occurrence_provenance_ref(value, cache),
         PipelineTraceValue::GenerationSite(value) => {
@@ -3615,6 +3694,46 @@ fn detailed_receiver_provenance_ref(
             analysis_kind: value.report.operation.as_str().to_string(),
             outcome: receiver_query_outcome_label(&value.report.analysis).to_string(),
             capture: value.capture.clone(),
+        },
+        file: site.file.clone(),
+        source_slice_sha256: cached_source_slice_sha256(cache, &site.file, &byte_span),
+        byte_span: Some(byte_span),
+        display_range: cached_display_range(cache, &site.file, site.range),
+        identities: DetailedCodeQueryProvenanceIdentities::None,
+    }
+}
+
+fn detailed_receiver_outcome_provenance_ref(
+    value: &ReceiverAnalysisValue,
+    cache: &PipelineRenderCache,
+) -> DetailedCodeQueryProvenanceRefEvidence {
+    let site = &value.report.site;
+    let byte_span = range_byte_span(site.range);
+    DetailedCodeQueryProvenanceRefEvidence {
+        domain: DetailedCodeQueryDomain::ReceiverOutcome,
+        key: DetailedCodeQueryKey::ReceiverOutcome {
+            id: value.site_id.clone(),
+            site_id: value.site_id.clone(),
+        },
+        file: site.file.clone(),
+        source_slice_sha256: cached_source_slice_sha256(cache, &site.file, &byte_span),
+        byte_span: Some(byte_span),
+        display_range: cached_display_range(cache, &site.file, site.range),
+        identities: DetailedCodeQueryProvenanceIdentities::None,
+    }
+}
+
+fn detailed_receiver_evidence_provenance_ref(
+    value: &ReceiverEvidenceValue,
+    cache: &PipelineRenderCache,
+) -> DetailedCodeQueryProvenanceRefEvidence {
+    let site = &value.receiver.report.site;
+    let byte_span = range_byte_span(site.range);
+    DetailedCodeQueryProvenanceRefEvidence {
+        domain: DetailedCodeQueryDomain::ReceiverEvidence,
+        key: DetailedCodeQueryKey::ReceiverEvidence {
+            id: value.id.clone(),
+            site_id: value.receiver.site_id.clone(),
         },
         file: site.file.clone(),
         source_slice_sha256: cached_source_slice_sha256(cache, &site.file, &byte_span),
@@ -6628,6 +6747,8 @@ fn apply_plan_step(
                     | PipelineValue::CallSite(_)
                     | PipelineValue::ExpressionSite(_)
                     | PipelineValue::ReceiverAnalysis(_)
+                    | PipelineValue::ReceiverOutcome(_)
+                    | PipelineValue::ReceiverEvidence(_)
                     | PipelineValue::Occurrence(_)
                     | PipelineValue::LexicalScope(_)
                     | PipelineValue::Binding(_)
@@ -6670,29 +6791,31 @@ fn apply_plan_step(
                     (&mut state.cache_profile, cache_observation)
                 {
                     if cache_hit {
-                        let replayed_edges =
-                            rows.iter()
-                                .filter_map(|row| match &row.value {
-                                    PipelineValue::File(file) => Some(graph.importer_count(file)),
-                                    PipelineValue::StructuralMatch(_)
-                                    | PipelineValue::Declaration(_)
-                                    | PipelineValue::Semantic(_)
-                                    | PipelineValue::ReferenceSite(_)
-                                    | PipelineValue::CallSite(_)
-                                    | PipelineValue::ExpressionSite(_)
-                                    | PipelineValue::ReceiverAnalysis(_)
-                                    | PipelineValue::Occurrence(_)
-                                    | PipelineValue::LexicalScope(_)
-                                    | PipelineValue::Binding(_)
-                                    | PipelineValue::ResolutionCandidate(_)
-                                    | PipelineValue::GenerationSite(_)
-                                    | PipelineValue::Export(_)
-                                    | PipelineValue::DeclarationState(_)
-                                    | PipelineValue::ReferenceEdge(_) => None,
-                                    PipelineValue::QualifiedPath(_)
-                                    | PipelineValue::PathSegment(_) => None,
-                                })
-                                .sum();
+                        let replayed_edges = rows
+                            .iter()
+                            .filter_map(|row| match &row.value {
+                                PipelineValue::File(file) => Some(graph.importer_count(file)),
+                                PipelineValue::StructuralMatch(_)
+                                | PipelineValue::Declaration(_)
+                                | PipelineValue::Semantic(_)
+                                | PipelineValue::ReferenceSite(_)
+                                | PipelineValue::CallSite(_)
+                                | PipelineValue::ExpressionSite(_)
+                                | PipelineValue::ReceiverAnalysis(_)
+                                | PipelineValue::ReceiverOutcome(_)
+                                | PipelineValue::ReceiverEvidence(_)
+                                | PipelineValue::Occurrence(_)
+                                | PipelineValue::LexicalScope(_)
+                                | PipelineValue::Binding(_)
+                                | PipelineValue::ResolutionCandidate(_)
+                                | PipelineValue::GenerationSite(_)
+                                | PipelineValue::Export(_)
+                                | PipelineValue::DeclarationState(_)
+                                | PipelineValue::ReferenceEdge(_)
+                                | PipelineValue::QualifiedPath(_)
+                                | PipelineValue::PathSegment(_) => None,
+                            })
+                            .sum();
                         profile
                             .import_reverse
                             .record_hit(Some(cache_complete), replayed_edges);
@@ -6742,6 +6865,8 @@ fn apply_plan_step(
                         | PipelineValue::CallSite(_)
                         | PipelineValue::ExpressionSite(_)
                         | PipelineValue::ReceiverAnalysis(_)
+                        | PipelineValue::ReceiverOutcome(_)
+                        | PipelineValue::ReceiverEvidence(_)
                         | PipelineValue::Occurrence(_)
                         | PipelineValue::LexicalScope(_)
                         | PipelineValue::Binding(_)
@@ -7445,6 +7570,7 @@ fn apply_pipeline_step(
                     receiver_service
                         .as_ref()
                         .expect("receiver query service exists for receiver steps"),
+                    analyzer,
                     operation,
                     &trace.seed.file,
                     Some(&trace.seed.facts),
@@ -7763,6 +7889,16 @@ fn apply_pipeline_step(
                     value.report.site.file.clone(),
                 ))]
             }
+            (PipelineValue::ReceiverOutcome(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.report.site.file.clone(),
+                ))]
+            }
+            (PipelineValue::ReceiverEvidence(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.receiver.report.site.file.clone(),
+                ))]
+            }
             (PipelineValue::File(file), QueryStep::ImportsOf) => {
                 let graph = import_graph.expect("import graph exists for import steps");
                 match graph.imports_of(file) {
@@ -7967,6 +8103,7 @@ fn apply_pipeline_step(
                     receiver_service
                         .as_ref()
                         .expect("receiver query service exists for receiver steps"),
+                    analyzer,
                     operation,
                     &seed.file,
                     Some(&seed.facts),
@@ -8063,6 +8200,55 @@ fn apply_pipeline_step(
                 &mut row_exhausted,
                 &mut receiver_truncated,
             ),
+            (
+                PipelineValue::Occurrence(value),
+                QueryStep::ReceiverTargets(_)
+                | QueryStep::PointsTo(_)
+                | QueryStep::MemberTargets(_),
+            ) => {
+                let operation = receiver_operation(step);
+                let input = if value.row.role == OccurrenceRole::ReceiverPosition
+                    && operation != ReceiverQueryOperation::MemberTargets
+                {
+                    ReceiverQueryInput::Expression
+                } else {
+                    ReceiverQueryInput::ContainingSite
+                };
+                let mut expansions = receiver_analysis_expansions_for_pipeline_row(
+                    analyzer,
+                    receiver_service
+                        .as_ref()
+                        .expect("receiver query service exists for receiver steps"),
+                    operation,
+                    value.file(),
+                    &row.traces,
+                    vec![value.row.range],
+                    input,
+                    receiver_facts,
+                    budget,
+                    limits,
+                    receiver_budget_override,
+                    max_step_outputs.saturating_sub(output.len()),
+                    cancellation,
+                    diagnostics,
+                    cache_profile,
+                    &mut receiver_diagnostics,
+                    &mut row_exhausted,
+                    &mut receiver_truncated,
+                );
+                correlate_receiver_expansions(&mut expansions, value.row.ast_id());
+                expansions
+            }
+            (PipelineValue::ReceiverAnalysis(value), QueryStep::ReceiverOutcome) => {
+                vec![PipelineExpansion {
+                    value: PipelineValue::ReceiverOutcome(value.clone()),
+                    trace: vec![(PipelineTraceValue::ReceiverOutcome(value.clone()), None)],
+                    budgeted: false,
+                }]
+            }
+            (PipelineValue::ReceiverAnalysis(value), QueryStep::ReceiverEvidence) => {
+                receiver_evidence_expansions(value)
+            }
             (PipelineValue::File(file), QueryStep::OccurrencesIn(filter)) => {
                 occurrence_expansions_for_file(
                     analyzer,
@@ -8703,6 +8889,86 @@ fn receiver_operation(step: &QueryStep) -> ReceiverQueryOperation {
     }
 }
 
+const RECEIVER_EVIDENCE_ID_DOMAIN: &[u8] = b"bifrost.code_query.receiver_evidence.v1";
+
+fn receiver_evidence_expansions(value: &ReceiverAnalysisValue) -> Vec<PipelineExpansion> {
+    let ReceiverQueryAnalysis::Values(outcome) = &value.report.analysis else {
+        return Vec::new();
+    };
+    let Some(values) = outcome.values() else {
+        return Vec::new();
+    };
+
+    let mut expansions = Vec::new();
+    for (ordinal, root) in values.iter().enumerate() {
+        let mut current = root.clone();
+        let mut parent_evidence_id = None;
+        let mut chain_hop = 0usize;
+        loop {
+            let evidence_kind = receiver_evidence_kind(&current);
+            let mut digest = LengthDelimitedDigest::new(RECEIVER_EVIDENCE_ID_DOMAIN);
+            digest.push(value.site_id.as_bytes());
+            digest.push(&ordinal.to_le_bytes());
+            digest.push(&chain_hop.to_le_bytes());
+            digest.push(evidence_kind.as_bytes());
+            let id = digest.finish().to_string();
+            let (factory, returned) = match &current {
+                ReceiverValue::FactoryReturn { factory, value } => {
+                    (Some(factory.clone()), Some(value.as_ref().clone()))
+                }
+                _ => (None, None),
+            };
+            let evidence = ReceiverEvidenceValue {
+                receiver: value.clone(),
+                id: id.clone(),
+                parent_evidence_id,
+                ordinal,
+                chain_hop,
+                value: current,
+                factory,
+            };
+            expansions.push(PipelineExpansion {
+                value: PipelineValue::ReceiverEvidence(evidence.clone()),
+                trace: vec![(PipelineTraceValue::ReceiverEvidence(evidence), None)],
+                budgeted: false,
+            });
+            let Some(returned) = returned else {
+                break;
+            };
+            current = returned;
+            parent_evidence_id = Some(id);
+            chain_hop += 1;
+        }
+    }
+    expansions
+}
+
+fn correlate_receiver_expansions(expansions: &mut [PipelineExpansion], ast_id: String) {
+    for expansion in expansions {
+        let PipelineValue::ReceiverAnalysis(value) = &mut expansion.value else {
+            unreachable!("receiver analysis expansion has its declared terminal domain")
+        };
+        value.site_ast_id = Some(ast_id.clone());
+        for (trace, _) in &mut expansion.trace {
+            let PipelineTraceValue::ReceiverAnalysis(value) = trace else {
+                unreachable!("receiver analysis expansion trace has its declared terminal domain")
+            };
+            value.site_ast_id = Some(ast_id.clone());
+        }
+    }
+}
+
+fn receiver_evidence_kind(value: &ReceiverValue) -> &'static str {
+    match value {
+        ReceiverValue::AllocationSite { .. } => "allocation_site",
+        ReceiverValue::InstanceType(_) => "instance_type",
+        ReceiverValue::ClassOrStaticObject(_) => "class_or_static_object",
+        ReceiverValue::ModuleOrExportObject(_) => "module_or_export_object",
+        ReceiverValue::CurrentReceiver(_) => "current_receiver",
+        ReceiverValue::FactoryReturn { .. } => "factory_return",
+    }
+}
+
 type ReceiverDiagnostics =
     BTreeMap<(CodeQueryDiagnosticCode, Language, &'static str, String), usize>;
 const RECEIVER_PIPELINE_OUTPUT_CAP_REASON: &str = "pipeline output cap omitted receiver inputs";
@@ -8979,6 +9245,7 @@ fn receiver_analysis_expansions_for_pipeline_row(
     };
     receiver_analysis_expansions(
         service,
+        analyzer,
         operation,
         file,
         structural_facts.as_ref(),
@@ -8999,6 +9266,7 @@ fn receiver_analysis_expansions_for_pipeline_row(
 #[allow(clippy::too_many_arguments)]
 fn receiver_analysis_expansions(
     service: &ReceiverQueryService<'_>,
+    analyzer: &dyn IAnalyzer,
     operation: ReceiverQueryOperation,
     file: &ProjectFile,
     structural_facts: Option<&Arc<FileFacts>>,
@@ -9166,9 +9434,12 @@ fn receiver_analysis_expansions(
                 ))
                 .or_default() += 1;
         }
+        let (site_id, site_ast_id) = receiver_site_identity(analyzer, &report, structural_facts);
         let value = ReceiverAnalysisValue {
             report,
             capture: capture.clone(),
+            site_id,
+            site_ast_id,
         };
         expansions.push(PipelineExpansion {
             value: PipelineValue::ReceiverAnalysis(value.clone()),
@@ -9177,6 +9448,46 @@ fn receiver_analysis_expansions(
         });
     }
     expansions
+}
+
+const RECEIVER_SITE_ID_DOMAIN: &[u8] = b"bifrost.code_query.receiver_site.v1";
+
+fn receiver_site_identity(
+    analyzer: &dyn IAnalyzer,
+    report: &ReceiverQueryReport,
+    facts: Option<&Arc<FileFacts>>,
+) -> (String, Option<String>) {
+    let content_identity = facts.map_or_else(
+        || {
+            analyzer.indexed_source(&report.site.file).map_or_else(
+                || ContentIdentity::hash_bytes(report.site.text.as_bytes()),
+                |source| ContentIdentity::hash_bytes(source.as_bytes()),
+            )
+        },
+        |facts| facts.source_identity(),
+    );
+    let mut digest = LengthDelimitedDigest::new(RECEIVER_SITE_ID_DOMAIN);
+    digest.push(content_identity.as_bytes());
+    digest.push(report.operation.as_str().as_bytes());
+    digest.push(&report.site.range.start_byte.to_le_bytes());
+    digest.push(&report.site.range.end_byte.to_le_bytes());
+    let site_id = digest.finish().to_string();
+
+    let site_ast_id = facts.and_then(|facts| {
+        let mut exact = facts.nodes().iter().enumerate().filter(|(_, node)| {
+            node.range.start_byte == report.site.range.start_byte
+                && node.range.end_byte == report.site.range.end_byte
+        });
+        let (node, _) = exact.next()?;
+        if exact.next().is_some() {
+            return None;
+        }
+        Some(super::occurrence_rows::ast_id(
+            content_identity,
+            u32::try_from(node).expect("facts arena node IDs fit u32"),
+        ))
+    });
+    (site_id, site_ast_id)
 }
 
 fn record_receiver_pipeline_output_omission(
@@ -10108,6 +10419,12 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::ReceiverAnalysis(value) => {
             Some(PipelineTraceValue::ReceiverAnalysis(value.clone()))
         }
+        PipelineValue::ReceiverOutcome(value) => {
+            Some(PipelineTraceValue::ReceiverOutcome(value.clone()))
+        }
+        PipelineValue::ReceiverEvidence(value) => {
+            Some(PipelineTraceValue::ReceiverEvidence(value.clone()))
+        }
         PipelineValue::Occurrence(value) => Some(PipelineTraceValue::Occurrence(value.clone())),
         PipelineValue::LexicalScope(value) => Some(PipelineTraceValue::LexicalScope(value.clone())),
         PipelineValue::Binding(value) => Some(PipelineTraceValue::Binding(value.clone())),
@@ -10202,6 +10519,12 @@ fn render_pipeline_item(
         PipelineValue::ReceiverAnalysis(value) => CodeQueryResultValue::ReceiverAnalysis {
             value: Box::new(render_receiver_analysis(analyzer, &value, detail, cache)),
         },
+        PipelineValue::ReceiverOutcome(value) => CodeQueryResultValue::ReceiverOutcome {
+            value: Box::new(render_receiver_outcome(analyzer, &value, cache)),
+        },
+        PipelineValue::ReceiverEvidence(value) => CodeQueryResultValue::ReceiverEvidence {
+            value: Box::new(render_receiver_evidence(analyzer, &value, cache)),
+        },
         PipelineValue::Occurrence(value) => CodeQueryResultValue::Occurrence {
             value: Box::new(render_occurrence(analyzer, &value, detail, cache)),
         },
@@ -10271,6 +10594,12 @@ fn render_provenance(
                     }
                     PipelineTraceValue::ReceiverAnalysis(value) => {
                         render_receiver_analysis_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::ReceiverOutcome(value) => {
+                        render_receiver_outcome_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::ReceiverEvidence(value) => {
+                        render_receiver_evidence_ref(analyzer, value, cache)
                     }
                     PipelineTraceValue::Occurrence(value) => {
                         render_occurrence_ref(analyzer, value, cache)
@@ -10428,6 +10757,41 @@ fn render_receiver_analysis_ref(
         analysis_kind: value.report.operation.as_str(),
         outcome: receiver_query_outcome_label(&value.report.analysis),
         capture: value.capture.clone(),
+    }
+}
+
+fn render_receiver_outcome_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &ReceiverAnalysisValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let rendered = render_receiver_outcome(analyzer, value, cache);
+    CodeQueryResultRef::ReceiverOutcome {
+        id: rendered.id,
+        site_id: rendered.site_id,
+        path: rendered.path,
+        range: rendered.range,
+        outcome: rendered.outcome,
+        coverage: rendered.coverage,
+    }
+}
+
+fn render_receiver_evidence_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &ReceiverEvidenceValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    CodeQueryResultRef::ReceiverEvidence {
+        id: value.id.clone(),
+        site_id: value.receiver.site_id.clone(),
+        path: rel_path_string(&value.receiver.report.site.file),
+        range: render_source_range(
+            analyzer,
+            &value.receiver.report.site.file,
+            &value.receiver.report.site.range,
+            cache,
+        ),
+        evidence_kind: receiver_evidence_kind(&value.value),
     }
 }
 
@@ -11661,6 +12025,8 @@ fn render_receiver_analysis(
         }
     };
     CodeQueryReceiverAnalysis {
+        site_id: value.site_id.clone(),
+        site_ast_id: value.site_ast_id.clone(),
         analysis_kind: value.report.operation.as_str(),
         path: rel_path_string(&value.report.site.file),
         language: value.report.site.language.config_label(),
@@ -11678,6 +12044,110 @@ fn render_receiver_analysis(
         member_targets,
         reason,
         limit,
+    }
+}
+
+fn render_receiver_outcome(
+    analyzer: &dyn IAnalyzer,
+    value: &ReceiverAnalysisValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryReceiverOutcome {
+    let (outcome, reason, limit) = match &value.report.analysis {
+        ReceiverQueryAnalysis::Values(outcome) => receiver_outcome_metadata(outcome),
+        ReceiverQueryAnalysis::MemberTargets(outcome) => receiver_outcome_metadata(outcome),
+    };
+    let coverage = if outcome == "unsupported" {
+        "unsupported"
+    } else if outcome == "exceeded_budget" || value.report.candidates_truncated {
+        "truncated"
+    } else if value.report.semantic_unsupported.is_some() || outcome == "ambiguous" {
+        "open"
+    } else if outcome == "unknown" {
+        "unknown"
+    } else {
+        "exhaustive"
+    };
+    CodeQueryReceiverOutcome {
+        id: value.site_id.clone(),
+        site_id: value.site_id.clone(),
+        site_ast_id: value.site_ast_id.clone(),
+        path: rel_path_string(&value.report.site.file),
+        language: value.report.site.language.config_label(),
+        range: render_source_range(
+            analyzer,
+            &value.report.site.file,
+            &value.report.site.range,
+            cache,
+        ),
+        analysis_kind: value.report.operation.as_str(),
+        outcome,
+        coverage,
+        candidate_count: receiver_candidate_count(&value.report),
+        candidates_truncated: value.report.candidates_truncated,
+        reason,
+        limit,
+        semantic_unsupported: value.report.semantic_unsupported.map(|value| value.label()),
+        setup_nodes: value.report.work.setup_nodes,
+        summary_expansions: value.report.work.summary_expansions,
+        scope_nodes: value.report.work.scope_nodes,
+    }
+}
+
+fn render_receiver_evidence(
+    analyzer: &dyn IAnalyzer,
+    value: &ReceiverEvidenceValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryReceiverEvidence {
+    let fallback = value.receiver.report.site.range;
+    let declaration_unit = match &value.value {
+        ReceiverValue::AllocationSite { ty, .. } => Some(ty),
+        ReceiverValue::InstanceType(unit)
+        | ReceiverValue::ClassOrStaticObject(unit)
+        | ReceiverValue::ModuleOrExportObject(unit)
+        | ReceiverValue::CurrentReceiver(unit) => Some(unit),
+        ReceiverValue::FactoryReturn { .. } => None,
+    };
+    let declaration =
+        declaration_unit.map(|unit| declaration_value_for_unit(analyzer, unit, fallback));
+    let rendered_declaration_id = declaration.as_ref().map(|declaration| {
+        declaration_id(
+            &rel_path_string(declaration.unit.source()),
+            declaration.unit.kind().display_lowercase(),
+            &declaration.unit.fq_name(),
+            declaration.range,
+        )
+    });
+    let factory_id = value.factory.as_ref().map(|factory| {
+        let declaration = declaration_value_for_unit(analyzer, factory, fallback);
+        declaration_id(
+            &rel_path_string(declaration.unit.source()),
+            declaration.unit.kind().display_lowercase(),
+            &declaration.unit.fq_name(),
+            declaration.range,
+        )
+    });
+    let proof = match &value.receiver.report.analysis {
+        ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(_)) => "precise",
+        _ => "ambiguous",
+    };
+    let completeness = render_receiver_outcome(analyzer, &value.receiver, cache).coverage;
+    CodeQueryReceiverEvidence {
+        id: value.id.clone(),
+        site_id: value.receiver.site_id.clone(),
+        site_ast_id: value.receiver.site_ast_id.clone(),
+        path: rel_path_string(&value.receiver.report.site.file),
+        parent_evidence_id: value.parent_evidence_id.clone(),
+        ordinal: value.ordinal,
+        chain_hop: value.chain_hop,
+        evidence_kind: receiver_evidence_kind(&value.value),
+        declaration_id: rendered_declaration_id,
+        declaration_fq_name: declaration.as_ref().map(|value| value.unit.fq_name()),
+        declaration_kind: declaration
+            .as_ref()
+            .map(|value| value.unit.kind().display_lowercase()),
+        factory_id,
+        proof,
+        completeness,
     }
 }
 

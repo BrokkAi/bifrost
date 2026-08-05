@@ -374,6 +374,10 @@ fn push_ordered_mixin(index: &mut HashMap<String, Vec<String>>, from: String, to
 }
 
 impl IAnalyzer for RubyAnalyzer {
+    fn invalidate_cached_file_identities(&self) {
+        self.inner.invalidate_cached_file_identities();
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.begin_query(context);
     }

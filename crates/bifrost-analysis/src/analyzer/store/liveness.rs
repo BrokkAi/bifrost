@@ -75,14 +75,7 @@ impl Liveness {
         let planned = files
             .par_iter()
             .map(|file| {
-                let abs_path = file.abs_path();
-                let rel_path = abs_path.strip_prefix(&self.workdir).map_err(|_| {
-                    format!(
-                        "project file {} is not under git workdir {}",
-                        abs_path.display(),
-                        self.workdir.display()
-                    )
-                })?;
+                let rel_path = self.rel_path_from_workdir(file)?;
                 // Git paths use forward slashes on every host. This conversion
                 // stays at the Git API boundary.
                 let rel = rel_path.to_string_lossy().replace('\\', "/");
@@ -96,6 +89,13 @@ impl Liveness {
             }
         }
         Ok(resolved)
+    }
+
+    pub fn invalidate_startup_oids(&self) {
+        *self
+            .startup_oids
+            .lock()
+            .expect("liveness startup OID mutex poisoned") = None;
     }
 
     /// Full live view; rebuilt when the Git index bytes or overlay generation change.
@@ -1011,6 +1011,34 @@ mod tests {
         assert_eq!(
             snapshot.oid_for_path(&file),
             Some(Oid::hash_object(ObjectType::Blob, b"fn dirty() {}\n").unwrap())
+        );
+    }
+
+    #[test]
+    fn invalidating_startup_oids_refreshes_bulk_working_tree_identities() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("a.rs"), "fn old() {}\n").unwrap();
+        commit_all(&repo, "init");
+
+        let file = project_file(temp.path(), "a.rs");
+        let liveness = Liveness::new(repo).unwrap();
+        let initial = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            initial.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn old() {}\n").unwrap())
+        );
+
+        std::fs::write(temp.path().join("a.rs"), "fn refreshed() {}\n").unwrap();
+        liveness.invalidate_startup_oids();
+        let refreshed = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            refreshed.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn refreshed() {}\n").unwrap())
         );
     }
 }

@@ -2805,16 +2805,42 @@ where
     ) -> Result<HashMap<ProjectFile, Oid>, String> {
         let _scope = profiling::scope("TreeSitterAnalyzer::resolve_live_oids");
         let mut planned = Vec::with_capacity(files.len());
+        let mut overlay_files = Vec::new();
         let mut disk_files = Vec::with_capacity(files.len());
         for file in files {
             if project.has_overlay(file) {
-                let source = project.read_source(file).map_err(|err| err.to_string())?;
-                let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
-                    .map_err(|err| err.to_string())?;
-                planned.push((file.clone(), oid, LivePathEntry::overlay(file.clone(), oid)));
+                overlay_files.push(file);
             } else {
                 disk_files.push(file.clone());
             }
+        }
+
+        let plan_overlay = |file: &&ProjectFile| -> Result<_, String> {
+            let source = project.read_source(file).map_err(|err| err.to_string())?;
+            let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
+                .map_err(|err| err.to_string())?;
+            Ok((
+                (*file).clone(),
+                oid,
+                LivePathEntry::overlay((*file).clone(), oid),
+            ))
+        };
+        let resolved_overlays = if overlay_files.len() <= 1 {
+            overlay_files.iter().map(&plan_overlay).collect::<Vec<_>>()
+        } else {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(config.parallelism().clamp(1, overlay_files.len()))
+                .build()
+                .map_err(|err| format!("failed to build live OID thread pool: {err}"))?;
+            pool.install(|| {
+                overlay_files
+                    .par_iter()
+                    .map(&plan_overlay)
+                    .collect::<Vec<_>>()
+            })
+        };
+        for result in resolved_overlays {
+            planned.push(result?);
         }
 
         if let Some(liveness) = store_context.liveness.as_ref() {
@@ -7695,6 +7721,12 @@ impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
+    fn invalidate_cached_file_identities(&self) {
+        if let Some(liveness) = self.store_context.liveness.as_ref() {
+            liveness.invalidate_startup_oids();
+        }
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         let mut cache = self.query_read_cache_write();
         let was_active = cache.is_active();
