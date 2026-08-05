@@ -1,14 +1,14 @@
 use super::resolver::node_text;
-use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
-use crate::analyzer::{
-    CodeUnit, IAnalyzer, PhpAnalyzer, PhpFileContext, TypeHierarchyProvider,
-    php_signature_return_type_text, resolve_php_type,
+use crate::adapter::php_signature_return_type_text;
+use crate::aliases::{PhpFileContext, resolve_php_type};
+use crate::graph::PhpGraphSource;
+use crate::graph_support::PhpAnalysisSource;
+use crate::graph_support::{php_direct_declared_class_parent, php_file_context_from_source};
+use brokk_bifrost_core::analyzer::CodeUnit;
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceEngine, SymbolResolution,
 };
-use crate::hash::{HashMap, HashSet};
-use brokk_bifrost_php::graph_support::{
-    php_direct_declared_class_parent, php_file_context_from_source,
-};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
 const LOCAL_SCOPE_NODES: &[&str] = &[
@@ -19,11 +19,11 @@ const LOCAL_SCOPE_NODES: &[&str] = &[
     "arrow_function",
 ];
 
-pub(in crate::analyzer::usages) fn is_local_scope(node: Node<'_>) -> bool {
+pub fn is_local_scope(node: Node<'_>) -> bool {
     LOCAL_SCOPE_NODES.contains(&node.kind())
 }
 
-pub(in crate::analyzer::usages) fn seed_parameter_types<F>(
+pub fn seed_parameter_types<F>(
     node: Node<'_>,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -59,9 +59,7 @@ pub(in crate::analyzer::usages) fn seed_parameter_types<F>(
     }
 }
 
-pub(in crate::analyzer::usages) fn assignment_parts(
-    node: Node<'_>,
-) -> Option<(Node<'_>, Node<'_>)> {
+pub fn assignment_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     (node.kind() == "assignment_expression")
         .then(|| {
             node.child_by_field_name("left")
@@ -70,15 +68,13 @@ pub(in crate::analyzer::usages) fn assignment_parts(
         .flatten()
 }
 
-pub(in crate::analyzer::usages) fn object_creation_type(node: Node<'_>) -> Option<Node<'_>> {
+pub fn object_creation_type(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| matches!(child.kind(), "name" | "qualified_name" | "relative_scope"))
 }
 
-pub(in crate::analyzer::usages) fn static_member_parts(
-    node: Node<'_>,
-) -> Option<(Node<'_>, Node<'_>)> {
+pub fn static_member_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     let scope = node
         .child_by_field_name("scope")
         .or_else(|| node.child_by_field_name("class"))
@@ -95,11 +91,11 @@ pub(in crate::analyzer::usages) fn static_member_parts(
 /// Keep that interpretation shared by the targeted and inverted usage walkers
 /// so return-type inference for assignments follows the same owner semantics as
 /// the static call edge itself.
-pub(in crate::analyzer::usages) fn static_scope_type_fq_name(
-    php: &PhpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn static_scope_type_fq_name(
+    php: &dyn PhpAnalysisSource,
+    analyzer: PhpGraphSource<'_>,
     raw: &str,
-    ctx: &crate::analyzer::PhpFileContext,
+    ctx: &PhpFileContext,
     enclosing_owner: Option<&str>,
 ) -> Option<String> {
     match raw {
@@ -107,6 +103,7 @@ pub(in crate::analyzer::usages) fn static_scope_type_fq_name(
         "parent" => {
             let enclosing_owner = enclosing_owner?;
             let mut definitions = analyzer
+                .index
                 .definitions(enclosing_owner)
                 .filter(CodeUnit::is_class);
             let enclosing_class = definitions.next()?;
@@ -119,30 +116,21 @@ pub(in crate::analyzer::usages) fn static_scope_type_fq_name(
     }
 }
 
-pub(in crate::analyzer::usages) fn variable_identifier<'a>(
-    node: Node<'_>,
-    source: &'a str,
-) -> &'a str {
+pub fn variable_identifier<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     node_text(node, source).trim_start_matches('$')
 }
 
-pub(in crate::analyzer::usages) fn literal_member_identifier<'a>(
-    node: Node<'_>,
-    source: &'a str,
-) -> Option<&'a str> {
+pub fn literal_member_identifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
     (node.kind() == "name").then(|| node_text(node, source))
 }
 
-pub(in crate::analyzer::usages) fn static_property_identifier<'a>(
-    node: Node<'_>,
-    source: &'a str,
-) -> Option<&'a str> {
+pub fn static_property_identifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
     (node.kind() == "variable_name").then(|| variable_identifier(node, source))
 }
 
-pub(in crate::analyzer::usages) fn declared_field_type_fq_name(
-    php: &PhpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn declared_field_type_fq_name(
+    php: &dyn PhpAnalysisSource,
+    analyzer: PhpGraphSource<'_>,
     field: &CodeUnit,
 ) -> Option<String> {
     if !field.is_field() {
@@ -152,9 +140,9 @@ pub(in crate::analyzer::usages) fn declared_field_type_fq_name(
         .or_else(|| signature_declared_type_fq_name(php, analyzer, field))
 }
 
-pub(in crate::analyzer::usages) fn declared_callable_return_type_fq_name(
-    php: &PhpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn declared_callable_return_type_fq_name(
+    php: &dyn PhpAnalysisSource,
+    analyzer: PhpGraphSource<'_>,
     callable: &CodeUnit,
 ) -> Option<String> {
     if !callable.is_function() {
@@ -168,9 +156,9 @@ pub(in crate::analyzer::usages) fn declared_callable_return_type_fq_name(
 /// the source tree recursively. Method-call and field-access chains are reduced
 /// from their innermost receiver outward, and every step fails closed unless it
 /// has one structured declaration with a class return/type fact.
-pub(in crate::analyzer::usages) fn instance_receiver_type_fq_name<F>(
-    php: &PhpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn instance_receiver_type_fq_name<F>(
+    php: &dyn PhpAnalysisSource,
+    analyzer: PhpGraphSource<'_>,
     root: Node<'_>,
     source: &str,
     ctx: &PhpFileContext,
@@ -282,18 +270,18 @@ where
     resolved.remove(&root.id())
 }
 
-pub(in crate::analyzer::usages) fn declared_instance_callable(
-    php: &PhpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn declared_instance_callable(
+    php: &dyn PhpAnalysisSource,
+    analyzer: PhpGraphSource<'_>,
     owner_fq_name: &str,
     member: &str,
 ) -> Option<CodeUnit> {
     declared_member(php, analyzer, owner_fq_name, member, CodeUnit::is_function)
 }
 
-pub(in crate::analyzer::usages) fn declared_instance_field(
-    php: &PhpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn declared_instance_field(
+    php: &dyn PhpAnalysisSource,
+    analyzer: PhpGraphSource<'_>,
     owner_fq_name: &str,
     member: &str,
 ) -> Option<CodeUnit> {
@@ -301,8 +289,8 @@ pub(in crate::analyzer::usages) fn declared_instance_field(
 }
 
 fn declared_member(
-    php: &PhpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+    php: &dyn PhpAnalysisSource,
+    analyzer: PhpGraphSource<'_>,
     owner_fq_name: &str,
     member: &str,
     wanted: fn(&CodeUnit) -> bool,
@@ -312,6 +300,7 @@ fn declared_member(
     }
 
     let mut owners = analyzer
+        .index
         .definitions(owner_fq_name)
         .filter(CodeUnit::is_class);
     let owner = owners.next()?;
@@ -347,12 +336,13 @@ fn declared_member(
 }
 
 fn unique_member(
-    analyzer: &dyn IAnalyzer,
+    analyzer: PhpGraphSource<'_>,
     owner_fq_name: &str,
     member: &str,
     wanted: fn(&CodeUnit) -> bool,
 ) -> Result<Option<CodeUnit>, ()> {
     let mut definitions = analyzer
+        .index
         .definitions(&format!("{owner_fq_name}.{member}"))
         .filter(wanted);
     let Some(definition) = definitions.next() else {
@@ -364,20 +354,16 @@ fn unique_member(
     Ok(Some(definition))
 }
 
-fn indexed_declared_type_fq_name(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<String> {
-    analyzer
-        .usage_facts_index()
-        .fact_for_declaration(unit)
-        .and_then(|facts| facts.return_type_fqn.as_deref())
-        .map(str::to_string)
+fn indexed_declared_type_fq_name(analyzer: PhpGraphSource<'_>, unit: &CodeUnit) -> Option<String> {
+    analyzer.facts.declaration_return_type_fqn(unit)
 }
 
 fn signature_declared_type_fq_name(
-    php: &PhpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+    php: &dyn PhpAnalysisSource,
+    analyzer: PhpGraphSource<'_>,
     unit: &CodeUnit,
 ) -> Option<String> {
-    let signatures = analyzer.signatures(unit);
+    let signatures = analyzer.index.signatures(unit);
     let raw = signatures
         .iter()
         .find_map(|signature| php_signature_return_type_text(signature))?;

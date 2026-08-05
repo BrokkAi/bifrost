@@ -35,57 +35,52 @@ use super::syntax::{
     declared_instance_field, instance_receiver_type_fq_name, is_local_scope, object_creation_type,
     seed_parameter_types, static_member_parts, static_scope_type_fq_name, variable_identifier,
 };
-use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
-    classify_reference_node, parse_and_collect,
+use crate::aliases::{
+    PhpFileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
 };
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::same_owner::route_same_owner;
-use crate::analyzer::{
-    IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, resolve_php_constant,
-    resolve_php_function, resolve_php_type,
+use crate::graph::PhpGraphSource;
+use crate::graph_support::PhpAnalysisSource;
+use crate::graph_support::php_file_context_from_source;
+use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node,
 };
-use crate::hash::HashSet;
-use brokk_bifrost_php::graph_support::php_file_context_from_source;
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
+};
+use brokk_bifrost_core::analyzer::usages::same_owner::route_same_owner;
 use tree_sitter::Node;
 
-/// Build the whole PHP `caller -> callee` edge set in a single inverted pass over
-/// the resolver-owned file set. `nodes`/`keep_file` mirror the Go builder.
-pub(super) fn build_php_edges<Output, F>(
-    analyzer: &dyn IAnalyzer,
-    php: &PhpAnalyzer,
-    files: &[ProjectFile],
-    nodes: &HashSet<String>,
-    keep_file: F,
-) -> Output
-where
-    Output: UsageEdgeBuildOutput<String>,
-    F: Fn(&ProjectFile) -> bool + Sync,
-{
-    let language = tree_sitter_php::LANGUAGE_PHP.into();
-    build_edge_output(files, keep_file, |file| {
-        parse_and_collect(analyzer, file, nodes, &language, |input| {
-            let ctx = php_file_context_from_source(php, file, input.source);
-            let mut scan = PhpScan {
-                analyzer,
-                php,
-                ctx,
-                source: input.source,
-                class_ranges: ClassRangeIndex::build(analyzer, file),
-                input,
-                edges: PerFileEdges::default(),
-            };
-            let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            walk(input.root(), &mut scan, &mut bindings);
-            scan.edges
-        })
-    })
+/// Resolve every reference in one already-parsed PHP file.
+///
+/// `brokk-bifrost-analysis` owns the fan-out over files (`build_edge_output`)
+/// and the on-demand parse (`parse_and_collect`), so a whole pass is that driver
+/// calling this once per file. Trees are therefore bounded by the worker count
+/// rather than the workspace size (#200).
+pub fn scan_php_file(
+    analyzer: PhpGraphSource<'_>,
+    php: &dyn PhpAnalysisSource,
+    file: &ProjectFile,
+    input: &FileEdgeScanInput<'_>,
+) -> PerFileEdges {
+    let ctx = php_file_context_from_source(php, file, input.source);
+    let mut scan = PhpScan {
+        analyzer,
+        php,
+        ctx,
+        source: input.source,
+        class_ranges: ClassRangeIndex::build(analyzer.index, file),
+        input,
+        edges: PerFileEdges::default(),
+    };
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    walk(input.root(), &mut scan, &mut bindings);
+    scan.edges
 }
 
 struct PhpScan<'a> {
-    analyzer: &'a dyn IAnalyzer,
-    php: &'a PhpAnalyzer,
+    analyzer: PhpGraphSource<'a>,
+    php: &'a dyn PhpAnalysisSource,
     ctx: PhpFileContext,
     source: &'a str,
     class_ranges: ClassRangeIndex,
@@ -447,12 +442,8 @@ fn assignment_receiver_type_fqn(right: Node<'_>, scan: &mut PhpScan<'_>) -> Opti
 }
 
 fn declared_callable_return_type_fqn(scan: &PhpScan<'_>, callable_fqn: &str) -> Option<String> {
-    if let Some(return_type) = scan
-        .analyzer
-        .usage_facts_index()
-        .callable_return_type(callable_fqn)
-    {
-        return Some(return_type.to_string());
+    if let Some(return_type) = scan.analyzer.facts.callable_return_type_fqn(callable_fqn) {
+        return Some(return_type);
     }
     let mut definitions = scan
         .php

@@ -52,10 +52,12 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::PhpAdapter;
-pub(crate) use brokk_bifrost_php::adapter::php_signature_return_type_text;
+// The parked bounded-definition route (`usages/get_definition/php.rs`) resolves
+// these through the module, so the chain now runs crate -> shim -> parked file
+// rather than the other way around.
 pub(crate) use brokk_bifrost_php::aliases::{
-    PhpFileContext, php_file_context_from_tree_at, resolve_php_constant, resolve_php_constant_node,
-    resolve_php_function, resolve_php_function_node, resolve_php_type, resolve_php_type_node,
+    php_file_context_from_tree_at, resolve_php_constant_node, resolve_php_function_node,
+    resolve_php_type_node,
 };
 // PHP's four public alias names keep their historical `crate::analyzer::` paths
 // even though they now live in `brokk-bifrost-php` -- the `brokk_bifrost_go::packages`

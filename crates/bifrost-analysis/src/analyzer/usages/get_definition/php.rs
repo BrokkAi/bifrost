@@ -12,6 +12,7 @@ use crate::analyzer::usages::php_graph::syntax::{
     seed_parameter_types, static_member_parts as php_static_member_parts,
     variable_identifier as php_variable_identifier,
 };
+use crate::analyzer::usages::php_graph::{PhpAnalyzerFacts, php_graph_source};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use brokk_bifrost_php::graph_support::{
     php_direct_declared_class_parent, php_file_context_from_source, php_is_interface,
@@ -1988,7 +1989,8 @@ fn php_declared_callable_return_type_fqn(
     if definitions.next().is_some() {
         return None;
     }
-    declared_callable_return_type_fq_name(php, php, &callable)
+    let facts = PhpAnalyzerFacts(php);
+    declared_callable_return_type_fq_name(php, php_graph_source(php, &facts), &callable)
 }
 
 fn php_callable_return_type_fqn(
@@ -2010,7 +2012,10 @@ fn php_callable_return_type_fqn(
     }
     session
         .is_none()
-        .then(|| declared_callable_return_type_fq_name(php, analyzer, callable))
+        .then(|| {
+            let facts = PhpAnalyzerFacts(analyzer);
+            declared_callable_return_type_fq_name(php, php_graph_source(analyzer, &facts), callable)
+        })
         .flatten()
 }
 
@@ -2033,7 +2038,10 @@ fn php_field_type_fqn(
     }
     session
         .is_none()
-        .then(|| declared_field_type_fq_name(php, analyzer, field))
+        .then(|| {
+            let facts = PhpAnalyzerFacts(analyzer);
+            declared_field_type_fq_name(php, php_graph_source(analyzer, &facts), field)
+        })
         .flatten()
 }
 

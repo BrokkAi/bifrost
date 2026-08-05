@@ -26,6 +26,8 @@ pub mod aliases;
 pub mod clones;
 pub mod composer;
 pub mod declarations;
+pub mod diagnostics;
+pub mod graph;
 pub mod graph_support;
 pub mod structural;
 pub mod test_detection;

@@ -170,10 +170,6 @@ pub use php::{
     PhpAnalyzer, PhpUseAliases, parse_php_use_aliases, parse_php_use_aliases_by_kind,
     parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
-pub(crate) use php::{
-    PhpFileContext, php_signature_return_type_text, resolve_php_constant, resolve_php_function,
-    resolve_php_type,
-};
 pub(crate) use pool_memo::PoolSafeMemo;
 pub use project::{
     BIFROST_IGNORE_FILE_NAME, DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject,

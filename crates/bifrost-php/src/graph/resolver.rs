@@ -1,17 +1,17 @@
-use crate::analyzer::CodeUnitIndex;
-pub(in crate::analyzer::usages) use crate::analyzer::usages::common::node_text;
-use crate::analyzer::{
-    CodeUnit, IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, Range, TypeHierarchyProvider,
-    resolve_php_type,
-};
-use crate::cancellation::CancellationToken;
-use crate::hash::{HashMap, HashSet};
-use crate::text_utils::find_line_index_for_offset;
-use brokk_bifrost_php::graph_support::php_is_interface;
+use crate::aliases::{PhpFileContext, resolve_php_type};
+use crate::graph::PhpGraphSource;
+use crate::graph_support::PhpAnalysisSource;
+use crate::graph_support::php_is_interface;
+use brokk_bifrost_core::analyzer::model::Range;
+pub use brokk_bifrost_core::analyzer::usages::common::node_text;
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
+use brokk_bifrost_core::text_utils::find_line_index_for_offset;
 use std::cell::RefCell;
 use tree_sitter::Node;
 
-pub(super) enum TargetKind {
+pub enum TargetKind {
     Type,
     Constructor,
     Method,
@@ -20,17 +20,17 @@ pub(super) enum TargetKind {
     Function,
 }
 
-pub(super) struct TargetSpec {
-    pub(super) target: CodeUnit,
-    pub(super) kind: TargetKind,
-    pub(super) owner: Option<CodeUnit>,
-    pub(super) owner_fq_name: Option<String>,
-    pub(super) target_fq_name: String,
-    pub(super) member_name: String,
+pub struct TargetSpec {
+    pub target: CodeUnit,
+    pub kind: TargetKind,
+    pub owner: Option<CodeUnit>,
+    pub owner_fq_name: Option<String>,
+    pub target_fq_name: String,
+    pub member_name: String,
 }
 
 impl TargetSpec {
-    pub(super) fn from_target(php: &PhpAnalyzer, target: &CodeUnit) -> Option<Self> {
+    pub fn from_target(php: &dyn PhpAnalysisSource, target: &CodeUnit) -> Option<Self> {
         if target.is_class() {
             return Some(Self {
                 target: target.clone(),
@@ -74,14 +74,14 @@ impl TargetSpec {
 }
 
 #[derive(Default)]
-pub(super) struct PhpHierarchyIndex {
+pub struct PhpHierarchyIndex {
     owner_fq_name: Option<String>,
     owner_is_interface: bool,
     subtype_matches: RefCell<HashMap<String, bool>>,
 }
 
 impl PhpHierarchyIndex {
-    pub(super) fn for_target_owner(php: &PhpAnalyzer, spec: &TargetSpec) -> Self {
+    pub fn for_target_owner(php: &dyn PhpAnalysisSource, spec: &TargetSpec) -> Self {
         let Some(owner) = spec.owner.as_ref() else {
             return Self::default();
         };
@@ -93,7 +93,7 @@ impl PhpHierarchyIndex {
         }
     }
 
-    fn is_subtype(&self, php: &PhpAnalyzer, receiver_fq_name: &str, owner: &str) -> bool {
+    fn is_subtype(&self, php: &dyn PhpAnalysisSource, receiver_fq_name: &str, owner: &str) -> bool {
         if self.owner_fq_name.as_deref() != Some(owner) {
             return false;
         }
@@ -113,9 +113,9 @@ impl PhpHierarchyIndex {
         result
     }
 
-    pub(super) fn overriding_methods(
+    pub fn overriding_methods(
         &self,
-        php: &PhpAnalyzer,
+        php: &dyn PhpAnalysisSource,
         spec: &TargetSpec,
         files: &HashSet<ProjectFile>,
         cancellation: Option<&CancellationToken>,
@@ -140,7 +140,7 @@ impl PhpHierarchyIndex {
 }
 
 fn class_is_subtype_of_owner(
-    php: &PhpAnalyzer,
+    php: &dyn PhpAnalysisSource,
     class_unit: &CodeUnit,
     owner_fq_name: &str,
 ) -> bool {
@@ -158,8 +158,8 @@ fn class_is_subtype_of_owner(
     false
 }
 
-pub(super) fn receiver_type_matches(
-    php: &PhpAnalyzer,
+pub fn receiver_type_matches(
+    php: &dyn PhpAnalysisSource,
     receiver_fq_name: &str,
     owner: &str,
     hierarchy: &PhpHierarchyIndex,
@@ -171,9 +171,9 @@ pub(super) fn receiver_type_matches(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn static_receiver_matches(
-    php: &PhpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn static_receiver_matches(
+    php: &dyn PhpAnalysisSource,
+    analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
     start: usize,
     end: usize,
@@ -202,9 +202,9 @@ pub(super) fn static_receiver_matches(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn receiver_is_enclosing_subtype(
-    php: &PhpAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn receiver_is_enclosing_subtype(
+    php: &dyn PhpAnalysisSource,
+    analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
     start: usize,
     end: usize,
@@ -216,8 +216,8 @@ pub(super) fn receiver_is_enclosing_subtype(
         .is_some_and(|receiver| receiver_type_matches(php, &receiver, owner, hierarchy))
 }
 
-pub(super) fn enclosing_owner_fq_name_at(
-    analyzer: &dyn IAnalyzer,
+pub fn enclosing_owner_fq_name_at(
+    analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
     start: usize,
     end: usize,
@@ -230,15 +230,13 @@ pub(super) fn enclosing_owner_fq_name_at(
         end_line: find_line_index_for_offset(line_starts, end),
     };
     analyzer
+        .index
         .enclosing_code_unit(file, &range)
-        .and_then(|enclosing| analyzer.parent_of(&enclosing).or(Some(enclosing)))
+        .and_then(|enclosing| analyzer.index.parent_of(&enclosing).or(Some(enclosing)))
         .map(|enclosing_owner| enclosing_owner.fq_name())
 }
 
-pub(in crate::analyzer::usages) fn qualified_candidate_text(
-    node: Node<'_>,
-    source: &str,
-) -> String {
+pub fn qualified_candidate_text(node: Node<'_>, source: &str) -> String {
     let mut candidate = node;
     let mut parent = node.parent();
     while let Some(ancestor) = parent {
@@ -252,15 +250,15 @@ pub(in crate::analyzer::usages) fn qualified_candidate_text(
     node_text(candidate, source).trim().to_string()
 }
 
-pub(super) fn is_object_creation_type_name(node: Node<'_>) -> bool {
+pub fn is_object_creation_type_name(node: Node<'_>) -> bool {
     semantic_parent(node).is_some_and(|parent| parent.kind() == "object_creation_expression")
 }
 
-pub(super) fn is_function_call_name(node: Node<'_>) -> bool {
+pub fn is_function_call_name(node: Node<'_>) -> bool {
     semantic_parent(node).is_some_and(|parent| parent.kind() == "function_call_expression")
 }
 
-pub(super) fn is_member_or_scoped_access_name(node: Node<'_>) -> bool {
+pub fn is_member_or_scoped_access_name(node: Node<'_>) -> bool {
     semantic_parent(node).is_some_and(|parent| {
         matches!(
             parent.kind(),
@@ -274,12 +272,12 @@ pub(super) fn is_member_or_scoped_access_name(node: Node<'_>) -> bool {
     })
 }
 
-pub(super) fn is_const_declaration_name(node: Node<'_>) -> bool {
+pub fn is_const_declaration_name(node: Node<'_>) -> bool {
     node.parent()
         .is_some_and(|parent| parent.kind() == "const_element")
 }
 
-pub(super) fn is_function_declaration_name(node: Node<'_>) -> bool {
+pub fn is_function_declaration_name(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         matches!(
             parent.kind(),
