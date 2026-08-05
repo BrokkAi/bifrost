@@ -82,16 +82,37 @@ pub(crate) fn parse_source_region_with_cancellation(
     let bytes = source.as_bytes();
     let start_point = advance_ts_point(bytes, tree_sitter::Point { row: 0, column: 0 }, 0, start);
     let end_point = advance_ts_point(bytes, start_point, start, end);
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(language).ok()?;
-    parser
-        .set_included_ranges(&[tree_sitter::Range {
+    parse_source_range_with_cancellation(
+        language,
+        source,
+        tree_sitter::Range {
             start_byte: start,
             end_byte: end,
             start_point,
             end_point,
-        }])
-        .ok()?;
+        },
+        cancellation,
+    )
+}
+
+/// Parse one parser-provided source range without recomputing its points.
+pub(crate) fn parse_source_range_with_cancellation(
+    language: &tree_sitter::Language,
+    source: &str,
+    range: tree_sitter::Range,
+    cancellation: Option<&CancellationToken>,
+) -> Option<tree_sitter::Tree> {
+    if range.start_byte >= range.end_byte
+        || range.end_byte > source.len()
+        || !source.is_char_boundary(range.start_byte)
+        || !source.is_char_boundary(range.end_byte)
+        || cancellation.is_some_and(CancellationToken::is_cancelled)
+    {
+        return None;
+    }
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(language).ok()?;
+    parser.set_included_ranges(&[range]).ok()?;
     if let Some(cancellation) = cancellation {
         let mut read = |offset: usize, _| &source.as_bytes()[offset..];
         let mut progress = |_: &tree_sitter::ParseState| cancellation.is_cancelled();

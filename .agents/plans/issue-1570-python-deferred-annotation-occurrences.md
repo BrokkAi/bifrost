@@ -17,8 +17,8 @@ The change must preserve Bifrost's structural identity contract. Each occurrence
 - [x] (2026-08-05 08:29Z) Shared Python annotation-context detection between structural extraction and definition resolution.
 - [x] (2026-08-05 08:29Z) Emitted deferred-annotation identifier facts from the Python adapter with cancellable region parsing.
 - [x] (2026-08-05 08:29Z) Added extractor, adapter, resolver-path, and end-to-end behavior tests.
-- [ ] Run focused featureless validation and the required policy selection.
-- [ ] Run the guided specialist review and correct confirmed findings.
+- [x] (2026-08-05 08:53Z) Ran formatting, dependency, featureless test, Clippy, diff, and policy validation.
+- [x] (2026-08-05 08:53Z) Ran all five guided specialist reviews and corrected each confirmed issue.
 
 ## Surprises & Discoveries
 
@@ -43,6 +43,15 @@ The change must preserve Bifrost's structural identity contract. Each occurrence
 - Observation: The core library remains affected by the known temporary-database environment failure.
   Evidence: 158 tests passed. `cache_db::tests::streaming_reader_has_a_small_non_mmap_page_cache` failed while opening its temporary SQLite file. The same failure is recorded in the parent #1473 plan.
 
+- Observation: The default Rust compiler and Homebrew Clippy have the same release hash but different LLVM builds.
+  Evidence: The default compiler reports LLVM 22.1.2. Homebrew Clippy reports LLVM 22.1.6. The isolated Homebrew toolchain passed.
+
+- Observation: Specialist review found that the first resolver change used the complete outer string for each compound operand.
+  Evidence: The new `"Widget | Gadget"` end-to-end case failed by inspection before the focused-reference helper. It now resolves both inner ranges.
+
+- Observation: The final policy run completed in 2.790 seconds with 295 existing findings.
+  Evidence: The only warning in a changed file is the unchanged sort and dedup at `python_graph/resolver.rs`.
+
 ## Decision Log
 
 - Decision: Add source-backed facts before occurrence-row derivation. Do not add ad hoc occurrence rows.
@@ -61,9 +70,25 @@ The change must preserve Bifrost's structural identity contract. Each occurrence
   Rationale: A guessed range would violate the source-backed fact contract.
   Date/Author: 2026-08-05 / Codex
 
+- Decision: Share one deferred-annotation range parser between extraction and resolution.
+  Rationale: Both layers must accept the same inner identifiers and exact source ranges.
+  Date/Author: 2026-08-05 / Codex
+
+- Decision: Reject implicitly concatenated and escaped annotation strings.
+  Rationale: Their decoded contents do not map to one contiguous parser-provided source region.
+  Date/Author: 2026-08-05 / Codex
+
+- Decision: Do not add an incomplete-extraction result to `StructuralSpec` in this change.
+  Rationale: The accepted design intentionally fails closed for malformed or unmappable strings. The occurrence result makes no claim about all valid Python annotation forms.
+  Date/Author: 2026-08-05 / Codex
+
 ## Outcomes & Retrospective
 
-The parser, facts-arena, Python adapter, and end-to-end behavior milestones are complete. Full validation and review remain.
+The implementation and review are complete. Deferred bare and compound annotation operands now use source-backed facts. They resolve by their exact inner ranges. Ordinary, malformed, escaped, and implicitly concatenated strings remain absent.
+
+The featureless analysis library passed 1,714 tests, with 7 ignored. The cross-language suite passed all 362 tests. Focused adapter, extractor, resolver, and conformance tests passed. Formatting, dependency boundaries, diff checks, and focused all-target Clippy passed.
+
+The required policy pack returned `finding` because the repository has existing warnings. It returned no new warning in changed code. The guided security, duplication, senior, DevOps, and architecture reviews found four confirmed defects. This plan corrected all four. The architecture review also proposed a wider completeness API. This plan did not accept that proposal because it conflicts with the explicit fail-closed boundary.
 
 ## Context and Orientation
 
@@ -171,3 +196,5 @@ Plan revision note (2026-08-05): Created the initial self-contained implementati
 Plan revision note (2026-08-05): Recorded the successful included-range parser prototype and exact source-position evidence.
 
 Plan revision note (2026-08-05): Recorded the embedded-fact implementation, resolver seam, focused tests, known core environment failure, and corrected root-package integration commands.
+
+Plan revision note (2026-08-05): Recorded broad validation, five-reviewer findings, compound-resolution corrections, fail-closed edge cases, and final outcomes.

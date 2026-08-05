@@ -17,7 +17,10 @@ use crate::cancellation::CancellationToken;
 use brokk_bifrost_core::analyzer::structural::spec::EmbeddedLeafFact;
 use tree_sitter::Node;
 
-use super::syntax::{expression_name_node, python_node_is_in_annotation};
+use super::syntax::{
+    expression_name_node, python_deferred_annotation_identifier_ranges,
+    python_node_is_in_annotation,
+};
 
 #[derive(Debug, Default)]
 pub(crate) struct PythonStructuralSpec;
@@ -326,54 +329,15 @@ impl StructuralSpec for PythonStructuralSpec {
             return Vec::new();
         }
 
-        let mut content = None;
-        for index in 0..node.named_child_count() {
-            let Some(child) = node.named_child(index) else {
-                continue;
-            };
-            match child.kind() {
-                "string_start" | "string_end" => {}
-                "string_content" if content.is_none() => content = Some(child),
-                _ => return Vec::new(),
-            }
-        }
-        let Some(content) = content else {
-            return Vec::new();
-        };
-        let language = tree_sitter_python::LANGUAGE.into();
-        let Some(tree) = crate::analyzer::common::parse_source_region_with_cancellation(
-            &language,
-            source,
-            content.start_byte(),
-            content.end_byte(),
-            cancellation,
-        ) else {
-            return Vec::new();
-        };
-        if tree.root_node().has_error() {
-            return Vec::new();
-        }
-
-        let mut facts = Vec::new();
-        let mut stack = vec![tree.root_node()];
-        while let Some(current) = stack.pop() {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return Vec::new();
-            }
-            if current.kind() == "identifier" {
-                facts.push(EmbeddedLeafFact {
-                    kind: NormalizedKind::Identifier,
-                    range: node_range(current),
-                    occurrence_role: OccurrenceRole::TypeOperand,
-                });
-            }
-            for index in (0..current.named_child_count()).rev() {
-                if let Some(child) = current.named_child(index) {
-                    stack.push(child);
-                }
-            }
-        }
-        facts
+        python_deferred_annotation_identifier_ranges(node, source, cancellation)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|range| EmbeddedLeafFact {
+                kind: NormalizedKind::Identifier,
+                range,
+                occurrence_role: OccurrenceRole::TypeOperand,
+            })
+            .collect()
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
@@ -574,6 +538,8 @@ mod structural_spec_tests {
             "    pass\n",
             "def escaped(widget: \"Wid\\x67et\") -> None:\n",
             "    pass\n",
+            "def concatenated(widget: \"Wid\" \"get\") -> None:\n",
+            "    pass\n",
         );
         let found = occurrence_roles_of(
             &PYTHON_STRUCTURAL_SPEC,
@@ -590,6 +556,8 @@ mod structural_spec_tests {
             source.rfind("Widget\"").expect("ordinary string content"),
             at("Widget["),
             at("Wid\\x67et"),
+            source.rfind("Wid\"").expect("concatenated first content"),
+            source.rfind("get\"").expect("concatenated second content"),
         ] {
             assert!(
                 found.iter().all(|(start, _, _)| *start != absent),

@@ -773,12 +773,17 @@ fn conformance_deferred_annotations_are_type_operands_but_strings_are_not() {
     let source = concat!(
         "class Widget:\n",
         "    pass\n",
+        "class Gadget:\n",
+        "    pass\n",
         "\n",
         "def direct(widget: Widget) -> int:\n",
         "    return 1\n",
         "\n",
         "def deferred(widget: \"Widget\") -> int:\n",
         "    return 2\n",
+        "\n",
+        "def compound(widget: \"Widget | Gadget\") -> int:\n",
+        "    return 3\n",
         "\n",
         "name = \"Widget\"\n",
     );
@@ -790,6 +795,7 @@ fn conformance_deferred_annotations_are_type_operands_but_strings_are_not() {
             ("declaration_name".into(), "type".into(), "none".into()),
             ("type_operand".into(), "type".into(), "resolved".into()),
             ("type_operand".into(), "type".into(), "resolved".into()),
+            ("type_operand".into(), "type".into(), "resolved".into()),
         ],
         "direct and deferred annotations must classify alike: {:?}",
         rows(&value)
@@ -799,7 +805,19 @@ fn conformance_deferred_annotations_are_type_operands_but_strings_are_not() {
         vec![
             "src.deferred.Widget".to_string(),
             "src.deferred.Widget".to_string(),
+            "src.deferred.Widget".to_string(),
         ]
+    );
+    assert_eq!(
+        classified(&value, "Gadget"),
+        vec![
+            ("declaration_name".into(), "type".into(), "none".into()),
+            ("type_operand".into(), "type".into(), "resolved".into()),
+        ]
+    );
+    assert_eq!(
+        resolved_targets(&value, "Gadget"),
+        vec!["src.deferred.Gadget".to_string()]
     );
 
     let quoted_starts: Vec<_> = source.match_indices("\"Widget\"").collect();

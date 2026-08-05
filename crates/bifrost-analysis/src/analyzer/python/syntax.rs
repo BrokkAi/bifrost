@@ -1,3 +1,5 @@
+use crate::analyzer::Range;
+use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use tree_sitter::Node;
 
@@ -181,4 +183,63 @@ pub(crate) fn python_node_is_in_annotation(node: Node<'_>) -> bool {
         current = parent;
     }
     false
+}
+
+/// Parse one exactly mapped deferred annotation and return its identifier ranges.
+pub(crate) fn python_deferred_annotation_identifier_ranges(
+    string: Node<'_>,
+    source: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Option<Vec<Range>> {
+    if string.kind() != "string"
+        || string
+            .parent()
+            .is_some_and(|parent| parent.kind() == "concatenated_string")
+        || !python_node_is_in_annotation(string)
+    {
+        return None;
+    }
+
+    let mut content = None;
+    for index in 0..string.named_child_count() {
+        let child = string.named_child(index)?;
+        match child.kind() {
+            "string_start" | "string_end" => {}
+            "string_content" if content.is_none() => content = Some(child),
+            _ => return None,
+        }
+    }
+    let content = content?;
+    let language = tree_sitter_python::LANGUAGE.into();
+    let tree = crate::analyzer::common::parse_source_range_with_cancellation(
+        &language,
+        source,
+        content.range(),
+        cancellation,
+    )?;
+    if tree.root_node().has_error() {
+        return None;
+    }
+
+    let mut ranges = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(current) = stack.pop() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
+        if current.kind() == "identifier" {
+            ranges.push(Range {
+                start_byte: current.start_byte(),
+                end_byte: current.end_byte(),
+                start_line: current.start_position().row + 1,
+                end_line: current.end_position().row + 1,
+            });
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    Some(ranges)
 }
