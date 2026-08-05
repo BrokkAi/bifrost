@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+const RETAINED_TRANSPORT_TIMING_PREFIX: &str = "retained_transport_timing=";
+
 #[derive(Debug)]
 pub(super) struct Timed<T> {
     pub duration_ms: f64,
@@ -152,8 +154,9 @@ fn write_profile_trace(
         .case_id
         .map(|case_id| format!("case_id={case_id}\n"))
         .unwrap_or_default();
+    let retained_transport_timings = render_retained_transport_timings(&captured.transport_timings);
     let contents = format!(
-        "repository={}\nscenario={}\n{case_line}phase={}\niteration={}\nsuccess={success}\nduration_ms={duration_ms}\ntruncated={}\n{failure}{}",
+        "repository={}\nscenario={}\n{case_line}phase={}\niteration={}\nsuccess={success}\nduration_ms={duration_ms}\ntruncated={}\n{retained_transport_timings}{failure}{}",
         trace.target.name,
         trace.scenario.label(),
         trace.phase,
@@ -168,6 +171,17 @@ fn write_profile_trace(
         )
     })?;
     Ok(report_path)
+}
+
+fn render_retained_transport_timings(lines: &[String]) -> String {
+    let mut rendered = String::new();
+    for line in lines {
+        debug_assert!(!line.contains('\r') && !line.contains('\n'));
+        rendered.push_str(RETAINED_TRANSPORT_TIMING_PREFIX);
+        rendered.push_str(line);
+        rendered.push('\n');
+    }
+    rendered
 }
 
 pub(super) fn error_with_stderr_tail(error: String, tail: CapturedStderr) -> String {
@@ -213,7 +227,7 @@ pub(super) fn transport_phase_report(
                 path.display()
             )
         })?;
-        for (phase, tool, duration_ms) in parse_transport_phase_timings(&contents) {
+        for (phase, tool, duration_ms) in parse_profile_transport_phase_timings(&contents) {
             phases.insert(phase.clone());
             timings.entry((phase, tool)).or_default().push(duration_ms);
         }
@@ -241,28 +255,44 @@ pub(super) fn transport_phase_report(
 fn parse_transport_phase_timings(contents: &str) -> Vec<(String, String, f64)> {
     contents
         .lines()
-        .filter_map(|line| {
-            let marker = line.find("mcp_request.")?;
-            let timing = &line[marker + "mcp_request.".len()..];
-            let phase_end = timing.find('[')?;
-            let tool_end = timing[phase_end + 1..].find(']')? + phase_end + 1;
-            let phase = &timing[..phase_end];
-            if !matches!(
-                phase,
-                "queue_wait" | "execution" | "response_queue_wait" | "writer_delivery"
-            ) {
-                return None;
-            }
-            let duration_start = timing[tool_end + 1..].rfind('(')? + tool_end + 2;
-            let duration_end = timing[duration_start..].find(" ms)")? + duration_start;
-            let duration_ms = timing[duration_start..duration_end].parse().ok()?;
-            Some((
-                phase.to_string(),
-                timing[phase_end + 1..tool_end].to_string(),
-                duration_ms,
-            ))
-        })
+        .filter_map(parse_transport_phase_timing_line)
         .collect()
+}
+
+fn parse_profile_transport_phase_timings(contents: &str) -> Vec<(String, String, f64)> {
+    let mut retained = contents
+        .lines()
+        .filter_map(|line| line.strip_prefix(RETAINED_TRANSPORT_TIMING_PREFIX))
+        .peekable();
+    if retained.peek().is_some() {
+        retained
+            .filter_map(parse_transport_phase_timing_line)
+            .collect()
+    } else {
+        parse_transport_phase_timings(contents)
+    }
+}
+
+fn parse_transport_phase_timing_line(line: &str) -> Option<(String, String, f64)> {
+    let marker = line.find("mcp_request.")?;
+    let timing = &line[marker + "mcp_request.".len()..];
+    let phase_end = timing.find('[')?;
+    let tool_end = timing[phase_end + 1..].find(']')? + phase_end + 1;
+    let phase = &timing[..phase_end];
+    if !matches!(
+        phase,
+        "queue_wait" | "execution" | "response_queue_wait" | "writer_delivery"
+    ) {
+        return None;
+    }
+    let duration_start = timing[tool_end + 1..].rfind('(')? + tool_end + 2;
+    let duration_end = timing[duration_start..].find(" ms)")? + duration_start;
+    let duration_ms = timing[duration_start..duration_end].parse().ok()?;
+    Some((
+        phase.to_string(),
+        timing[phase_end + 1..tool_end].to_string(),
+        duration_ms,
+    ))
 }
 
 #[cfg(test)]
@@ -308,6 +338,35 @@ mod tests {
         );
         assert_eq!(timings[1].0, "execution");
         assert_eq!(timings[1].2, 3456.7);
+    }
+
+    #[test]
+    fn issue_1631_retained_timings_replace_truncated_raw_samples() {
+        let output = tempfile::tempdir().unwrap();
+        let profile = test_profile(&output);
+        let filename = "case-measured-1.log";
+        let retained = render_retained_transport_timings(&[
+            "[bifrost-timing] DURATION mcp_request.queue_wait[search_symbols] (0.2 ms)".to_string(),
+            "[bifrost-timing] END mcp_request.execution[search_symbols] (1.0 ms)".to_string(),
+            "[bifrost-timing] DURATION mcp_request.response_queue_wait[search_symbols] (0.1 ms)"
+                .to_string(),
+            "[bifrost-timing] END mcp_request.writer_delivery[search_symbols] (0.1 ms)".to_string(),
+        ]);
+        write_measured_artifact(
+            &profile,
+            filename,
+            &format!(
+                "truncated=true\n{retained}\
+                 [bifrost-timing] END mcp_request.execution[search_symbols] (1.0 ms)\n\
+                 [bifrost-timing] DURATION mcp_request.response_queue_wait[search_symbols] (0.1 ms)\n\
+                 [bifrost-timing] END mcp_request.writer_delivery[search_symbols] (0.1 ms)\n"
+            ),
+        );
+
+        let phases = transport_phase_report(Some(&profile), &[PathBuf::from(filename)]).unwrap();
+
+        assert_eq!(phases.len(), 4);
+        assert!(phases.iter().all(|phase| phase.durations_ms.len() == 1));
     }
 
     #[test]

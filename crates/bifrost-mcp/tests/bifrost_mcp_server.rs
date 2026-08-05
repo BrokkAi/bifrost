@@ -1,6 +1,7 @@
 mod common;
 
 use brokk_bifrost_analysis::Language;
+use brokk_bifrost_mcp::mcp_common::MCP_RMCP_HOST_ENV;
 use brokk_bifrost_policy::{PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files};
 use common::{FixtureCorpus, InlineTestProject};
 use serde_json::{Value, json};
@@ -1023,9 +1024,8 @@ fn bifrost_mcp_query_code_transports_explain_and_profile_reports() {
 #[test]
 fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     // Both hosts: the upstream sync that added request correlation ids
-    // landed them on the fallback host alone, and only a wire assertion
-    // that runs against both would have caught the default host missing
-    // them.
+    // landed them on the hand-written host alone. Only a wire assertion
+    // against both hosts would have caught the rmcp omission.
     for host in McpHost::ALL {
         bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions_on(host);
     }
@@ -3603,11 +3603,15 @@ fn call_tool_answering_roots(
 /// *instead of* `initialize`, carrying the negotiation keys in `_meta`, and
 /// rmcp answers it before any session exists. It is not a mid-session call.
 #[test]
-fn mcp_2026_07_28_discovery_answers_before_any_handshake() {
+fn default_mcp_host_answers_2026_07_28_discovery_before_any_handshake() {
     let workspace = InlineTestProject::new()
         .file("DiscoverMe.java", "class DiscoverMe {}\n")
         .build();
-    let mut child = spawn_server_on(McpHost::Rmcp, workspace.root(), "searchtools");
+    // The legacy CI lane sets the rollback selector for its parent process.
+    // Remove it from this child because this test proves the process default.
+    let mut command = mcp_server_command(workspace.root(), "searchtools", &[]);
+    command.env_remove(MCP_RMCP_HOST_ENV);
+    let mut child = command.spawn().expect("spawn default-host bifrost");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
@@ -4068,6 +4072,12 @@ fn codex_sandbox_metadata(root: &std::path::Path, thread_id: &str) -> Value {
 }
 
 fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std::process::Child {
+    mcp_server_command(root, mode, extra_args)
+        .spawn()
+        .expect("spawn bifrost")
+}
+
+fn mcp_server_command(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> Command {
     let mut command = Command::new(mcp_server_binary());
     command.env("BIFROST_SEMANTIC_INDEX", "off");
     command.arg("--force-semantic-cpu");
@@ -4078,9 +4088,8 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn bifrost")
+        .stderr(Stdio::piped());
+    command
 }
 
 /// Issue #1491: the benchmark's transport-phase profile contract in
@@ -4105,7 +4114,7 @@ fn profiled_tool_calls_emit_all_transport_phases_on(host: McpHost) {
         )
         .build();
     let mut child = Command::new(mcp_server_binary())
-        .env("BIFROST_MCP_RMCP", host.switch())
+        .env(MCP_RMCP_HOST_ENV, host.switch())
         .env("BIFROST_SEMANTIC_INDEX", "off")
         .env("BIFROST_TIMING", "1")
         .arg("--force-semantic-cpu")
@@ -4168,17 +4177,16 @@ fn profiled_tool_calls_emit_all_transport_phases_on(host: McpHost) {
 
 /// Which MCP host serves a session.
 ///
-/// The hand-written stack is the default. The rmcp stack is selected with
-/// `BIFROST_MCP_RMCP=on`. Rootless behaviour -- where all
-/// client-supplied workspace authorization lives -- is asserted against both,
-/// because whichever one an operator falls back to has to be correct, and
-/// because testing only one host is what let a pre-handshake bypass reach a
-/// green suite once already.
+/// The rmcp stack is the default. `BIFROST_MCP_RMCP=off` selects the
+/// hand-written rollback stack. Rootless behaviour -- where all client-supplied
+/// workspace authorization lives -- is asserted against both. The rollback
+/// host must stay correct, and testing one host once let a pre-handshake bypass
+/// reach a green suite.
 #[derive(Clone, Copy, Debug)]
 enum McpHost {
-    /// The hand-written stack in `mcp_common.rs`. Still the default.
+    /// The hand-written rollback stack in `mcp_common.rs`.
     HandWritten,
-    /// The `rmcp`-backed host in `rmcp_host.rs`.
+    /// The default `rmcp`-backed host in `rmcp_host.rs`.
     Rmcp,
 }
 
@@ -4201,7 +4209,7 @@ impl McpHost {
 /// so they keep covering the default host.
 fn spawn_server_on(host: McpHost, root: &std::path::Path, mode: &str) -> std::process::Child {
     Command::new(mcp_server_binary())
-        .env("BIFROST_MCP_RMCP", host.switch())
+        .env(MCP_RMCP_HOST_ENV, host.switch())
         .env("BIFROST_SEMANTIC_INDEX", "off")
         .arg("--force-semantic-cpu")
         .arg("--root")
@@ -4221,7 +4229,7 @@ fn spawn_rootless_server_on(
     mode: &str,
 ) -> std::process::Child {
     Command::new(mcp_server_binary())
-        .env("BIFROST_MCP_RMCP", host.switch())
+        .env(MCP_RMCP_HOST_ENV, host.switch())
         .env("BIFROST_SEMANTIC_INDEX", "off")
         .arg("--force-semantic-cpu")
         .arg("--mcp")
