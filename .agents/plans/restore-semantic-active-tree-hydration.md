@@ -15,7 +15,8 @@ Bifrost currently hashes every tracked source file before semantic search become
 - [x] (2026-08-05) Moved active membership, vectors, and BM25 to a read-only-main, temporary-writable SQLite session.
 - [x] (2026-08-05) Added exact-membership, independent-session, watcher, connection-mode, and query-plan tests.
 - [x] (2026-08-05) Profiled warm Kafka. Active construction now takes 2.19 seconds and materializes zero files.
-- [ ] Run the full pre-push gate. Its first featureless test link filled `/mnt/optane`; rerun all gate parts in one managed target on the larger home disk.
+- [x] (2026-08-05) Ran workspace all-target, all-feature Clippy with warnings denied. It passes.
+- [x] (2026-08-05) Ran the featureless gate on the larger disk. 11,756 test executions passed across two runs. Two unrelated tests failed and reproduced outside this change.
 - [ ] Commit, push, and rerun the 20-task CodeScale semantic arm.
 
 ## Surprises & Discoveries
@@ -41,6 +42,9 @@ Bifrost currently hashes every tracked source file before semantic search become
 - Observation: The standard pre-push gate cannot use the nearly full worktree disk for its featureless test links.
   Evidence: The gate failed with `No space left on device` at 2.7 GB free. Its isolated Clippy target was correctly placed on the larger home disk.
 
+- Observation: The featureless gate has two failures outside semantic indexing.
+  Evidence: The piped REPL prints its complete result and `bye`, then fails to exit before 30 seconds. It reproduces alone with `BIFROST_SEMANTIC_INDEX=off`. A later run failed `source_and_class_jars_share_declaration_ids_and_keep_distinct_origins`. The two gate runs passed 5,371 and 6,385 tests before fail-fast stopped them.
+
 ## Decision Log
 
 - Decision: Keep the persistent schema at version 14.
@@ -65,7 +69,7 @@ Bifrost currently hashes every tracked source file before semantic search become
 
 ## Outcomes & Retrospective
 
-The implementation now keeps all active worktree state in one temporary SQLite schema. The persistent schema remains at version 14. The NLP library passes 58 tests. The semantic-search module passes 10 integration tests. The persistence suite passes 109 tests. Warm Kafka resolves 6,051 semantic paths to 141,319 exact occurrences and 70,234 vectors. Identity resolution takes 0.77 seconds. Active SQLite and Rust construction takes 2.19 seconds. CodeScale evaluation remains in progress.
+The implementation now keeps all active worktree state in one temporary SQLite schema. The persistent schema remains at version 14. The NLP library passes 58 tests. The semantic-search module passes 10 integration tests. The persistence suite passes 109 tests. Workspace all-feature Clippy passes with warnings denied. Warm Kafka resolves 6,051 semantic paths to 141,319 exact occurrences and 70,234 vectors. Identity resolution takes 0.77 seconds. Active SQLite and Rust construction takes 2.19 seconds. CodeScale evaluation remains in progress.
 
 ## Context and Orientation
 
@@ -133,3 +137,5 @@ Plan revision note (2026-08-05): Created from the measured CodeScale regression 
 Plan revision note (2026-08-05): Recorded the completed implementation and focused validation. Added the stale libgit2 index finding.
 
 Plan revision note (2026-08-05): Recorded the warm Kafka profile, the costly sort, and the low-disk gate recovery.
+
+Plan revision note (2026-08-05): Recorded final Clippy success and the two reproduced featureless gate failures outside semantic indexing.

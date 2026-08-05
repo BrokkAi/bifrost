@@ -49,7 +49,7 @@ pub fn working_tree_oids(
     let mut hashed = 0usize;
     for rel in rel_paths {
         let use_worktree = dirty.contains(rel)
-            || index_oids.get(rel).is_none()
+            || !index_oids.contains_key(rel)
             || has_content_transform(repo, Path::new(rel))?;
         let oid = if use_worktree {
             hashed += 1;
