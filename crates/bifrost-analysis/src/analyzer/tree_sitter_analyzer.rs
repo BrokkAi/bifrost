@@ -3650,6 +3650,11 @@ where
     /// The declaration-materialization provenance recorded for `file` by its
     /// language walk (issue #1476). Empty when the file has none or is not
     /// analyzed here.
+    ///
+    /// Parked until the milestone-3 derivation layer consumes it, exactly as
+    /// the sibling query-feature variants were parked between registry and
+    /// query surface.
+    #[allow(dead_code)]
     pub(crate) fn materialization_records_of(
         &self,
         file: &ProjectFile,

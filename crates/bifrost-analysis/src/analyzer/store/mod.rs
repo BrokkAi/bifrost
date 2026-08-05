@@ -4778,6 +4778,7 @@ type SignatureMetadataRow = (i64, Vec<u8>);
 type SignatureMetadataRows = HashMap<String, Vec<SignatureMetadataRow>>;
 type CppTemplateMetadataRows = HashMap<String, Vec<SignatureMetadataRow>>;
 type ScalaExportRows = HashMap<String, Vec<(i64, Vec<u8>)>>;
+type MaterializationRecordRows = HashMap<String, Vec<(Option<i64>, Vec<u8>)>>;
 type RangeRow = (i64, i64, i64, i64, i64);
 type RangeRows = HashMap<String, Vec<RangeRow>>;
 type RubyDispatchRows = HashMap<String, Vec<(i64, i64)>>;
@@ -5554,8 +5555,8 @@ fn read_materialization_records_bulk(
     conn: &Connection,
     lang: &str,
     oids: &[String],
-) -> Result<HashMap<String, Vec<(Option<i64>, Vec<u8>)>>> {
-    let mut out: HashMap<String, Vec<(Option<i64>, Vec<u8>)>> = HashMap::default();
+) -> Result<MaterializationRecordRows> {
+    let mut out: MaterializationRecordRows = HashMap::default();
     for chunk in oids.chunks(900) {
         if chunk.is_empty() {
             continue;
@@ -11753,6 +11754,96 @@ mod tests {
             bulk.get(&file)
                 .expect("bulk hydration")
                 .materialization_records,
+            state.materialization_records
+        );
+    }
+
+    /// C++ materialization provenance (issue #1476): a `#define` is a
+    /// generation site producing its macro unit, a preprocessor conditional
+    /// is a recorded configuration gate, and an export-macro class the parser
+    /// broke is recorded as a recovered declaration.
+    #[test]
+    fn cpp_macro_config_and_recovery_records() {
+        use crate::analyzer::structural::materialization::{GenerationKind, MaterializationRecord};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "config.h",
+            concat!(
+                "#define WIDGET_MAX 8\n",
+                "#ifdef USE_FAST\n",
+                "int fast_path();\n",
+                "#else\n",
+                "int slow_path();\n",
+                "#endif\n",
+            ),
+        );
+        let state = parse_state(&CppAdapter, &file);
+        let records = &state.materialization_records;
+        let generated: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                MaterializationRecord::GeneratedDeclaration { kind, unit, .. } => {
+                    Some((*kind, unit.fq_name().to_string()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            generated,
+            vec![(
+                GenerationKind::PreprocessorDefinition,
+                "WIDGET_MAX".to_string()
+            )],
+            "records: {records:?}"
+        );
+        let gates: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record {
+                MaterializationRecord::ConfigurationConditional { range } => Some(*range),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gates.len(), 1, "records: {records:?}");
+        let source = file.read_to_string().unwrap();
+        let ifdef_start = source.find("#ifdef").unwrap();
+        assert_eq!(gates[0].start_byte, ifdef_start);
+        assert!(
+            gates[0].end_byte >= source.find("slow_path").unwrap(),
+            "the gate interval must cover the else branch: {:?}",
+            gates[0]
+        );
+
+        // The f7a2bb5 shape: an export-annotation macro on a single-base class
+        // makes tree-sitter parse the class as a bogus function definition;
+        // recovery re-derives the class and must say it did so.
+        let recovered_file = write_file(
+            temp.path(),
+            "exported.h",
+            concat!(
+                "class CORE_EXPORT QgsPoint : public QgsAbstractGeometry\n",
+                "{\n",
+                "  public:\n",
+                "    QgsPoint( double x, double y );\n",
+                "};\n",
+            ),
+        );
+        let state = parse_state(&CppAdapter, &recovered_file);
+        let recovered: Vec<_> = state
+            .materialization_records
+            .iter()
+            .filter_map(|record| match record {
+                MaterializationRecord::RecoveredDeclaration { unit, .. } => {
+                    Some(unit.fq_name().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            recovered,
+            vec!["QgsPoint".to_string()],
+            "records: {:?}",
             state.materialization_records
         );
     }
