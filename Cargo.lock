@@ -264,6 +264,7 @@ dependencies = [
  "bincode",
  "brokk-bifrost-core",
  "brokk-bifrost-go",
+ "brokk-bifrost-python",
  "brokk-bifrost-rust",
  "cap-fs-ext",
  "cap-std",
@@ -441,6 +442,18 @@ dependencies = [
  "tempfile",
  "tree-sitter",
  "url",
+]
+
+[[package]]
+name = "brokk-bifrost-python"
+version = "0.8.22"
+dependencies = [
+ "brokk-bifrost-core",
+ "rayon",
+ "regex",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-python",
 ]
 
 [[package]]

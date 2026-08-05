@@ -1,41 +1,49 @@
-use crate::analyzer::python::{
-    python_deferred_annotation_identifier_ranges, python_node_is_in_annotation,
-};
-use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
-use crate::analyzer::usages::model::{ImportBinder, ImportKind};
-use crate::analyzer::{BoundedDefinitionLookup, CodeUnitIndex};
-use crate::analyzer::{
-    CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer, resolve_fqn_candidates, usage_seeds,
-};
+//! Python's reference resolution: export-name and seed inference, receiver-type
+//! resolution, and annotation candidates.
+//!
+//! `index` arguments below are the *dispatching* analyzer's
+//! [`CodeUnitIndex`] (see [`PythonGraphSource`]); `python` is the Python
+//! analyzer's memoized products.
+
+use crate::graph::PythonGraphSource;
+use crate::graph_support::PythonUsageSource;
+use crate::imports::resolve_fqn_candidates;
+use crate::syntax::{python_deferred_annotation_identifier_ranges, python_node_is_in_annotation};
+use crate::usage_index::usage_seeds;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
+use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ImportBinder, ImportKind};
+use brokk_bifrost_core::analyzer::usages::{ImportEdge, ImportEdgeKind};
+use brokk_bifrost_core::analyzer::{
+    BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, Language, ProjectFile, Range,
+};
 use std::collections::BTreeSet;
 use tree_sitter::Node;
 
-pub(super) fn infer_export_names(analyzer: &PythonAnalyzer, target: &CodeUnit) -> BTreeSet<String> {
-    if target_owner_code_unit(analyzer, target).is_some() {
-        let owner_name = top_level_identifier(analyzer, target);
+pub fn infer_export_names(python: &dyn PythonUsageSource, target: &CodeUnit) -> BTreeSet<String> {
+    if target_owner_code_unit(python, target).is_some() {
+        let owner_name = top_level_identifier(python, target);
         let owner_exports =
-            infer_export_names_for_local(analyzer, target, target.source(), &owner_name);
+            infer_export_names_for_local(python, target, target.source(), &owner_name);
         if !owner_exports.is_empty() {
             return owner_exports;
         }
     }
 
-    infer_export_names_for_local(analyzer, target, target.source(), target.identifier())
+    infer_export_names_for_local(python, target, target.source(), target.identifier())
 }
 
-pub(super) fn infer_usage_seeds(
-    analyzer: &PythonAnalyzer,
+pub fn infer_usage_seeds(
+    python: &dyn PythonUsageSource,
     target: &CodeUnit,
     seed_names: BTreeSet<String>,
 ) -> BTreeSet<(ProjectFile, String)> {
     let mut seeds = BTreeSet::new();
     for seed_name in &seed_names {
-        seeds.extend(usage_seeds(analyzer, target.source(), seed_name));
+        seeds.extend(usage_seeds(python, target.source(), seed_name));
     }
     if seeds.is_empty()
         && seed_names.contains(target.identifier())
-        && is_module_level_target_identifier(analyzer, target, target.source(), target.identifier())
+        && is_module_level_target_identifier(python, target, target.source(), target.identifier())
     {
         seeds.insert((target.source().clone(), target.identifier().to_string()));
     }
@@ -43,24 +51,23 @@ pub(super) fn infer_usage_seeds(
 }
 
 fn infer_export_names_for_local(
-    analyzer: &PythonAnalyzer,
+    python: &dyn PythonUsageSource,
     target: &CodeUnit,
     file: &ProjectFile,
     local_name: &str,
 ) -> BTreeSet<String> {
-    let index = analyzer.export_index_of(file);
+    let index = python.export_index_of(file);
     let mut export_names = BTreeSet::new();
     if index.exports_by_name.contains_key(local_name) {
         export_names.insert(local_name.to_string());
     }
     for (export_name, entry) in index.exports_by_name {
-        if matches!(entry, crate::analyzer::usages::ExportEntry::Local { local_name: ref name } if name == local_name)
-        {
+        if matches!(entry, ExportEntry::Local { local_name: ref name } if name == local_name) {
             export_names.insert(export_name);
         }
     }
     if export_names.is_empty()
-        && is_module_level_target_identifier(analyzer, target, file, local_name)
+        && is_module_level_target_identifier(python, target, file, local_name)
     {
         export_names.insert(local_name.to_string());
     }
@@ -68,21 +75,21 @@ fn infer_export_names_for_local(
 }
 
 fn is_module_level_target_identifier(
-    analyzer: &PythonAnalyzer,
+    python: &dyn PythonUsageSource,
     target: &CodeUnit,
     file: &ProjectFile,
     local_name: &str,
 ) -> bool {
     target.source() == file
         && target.identifier() == local_name
-        && analyzer
+        && python
             .parent_of(target)
             .is_some_and(|parent| parent.is_module() && parent.source() == file)
 }
 
-pub(super) fn top_level_identifier(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> String {
+pub fn top_level_identifier(index: &dyn CodeUnitIndex, target: &CodeUnit) -> String {
     let mut current = target.clone();
-    while let Some(parent) = analyzer.parent_of(&current) {
+    while let Some(parent) = index.parent_of(&current) {
         if parent.is_module() {
             break;
         }
@@ -91,22 +98,19 @@ pub(super) fn top_level_identifier(analyzer: &dyn IAnalyzer, target: &CodeUnit) 
     current.identifier().to_string()
 }
 
-pub(super) fn member_name(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> Option<String> {
-    target_owner_code_unit(analyzer, target).map(|_| target.identifier().to_string())
+pub fn member_name(index: &dyn CodeUnitIndex, target: &CodeUnit) -> Option<String> {
+    target_owner_code_unit(index, target).map(|_| target.identifier().to_string())
 }
 
-pub(super) fn target_owner_code_unit(
-    analyzer: &dyn IAnalyzer,
-    target: &CodeUnit,
-) -> Option<CodeUnit> {
-    analyzer
+pub fn target_owner_code_unit(index: &dyn CodeUnitIndex, target: &CodeUnit) -> Option<CodeUnit> {
+    index
         .parent_of(target)
         .filter(|parent| parent.source() == target.source() && parent.is_class())
 }
 
-pub(in crate::analyzer::usages) fn resolve_receiver_type(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
+pub fn resolve_receiver_type(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
     file: &ProjectFile,
     raw_type: &str,
     target_self_file: bool,
@@ -116,13 +120,13 @@ pub(in crate::analyzer::usages) fn resolve_receiver_type(
         return None;
     }
 
-    if let Some(binding) = py.import_binder_of(file).bindings.get(raw_type)
+    if let Some(binding) = python.import_binder_of(file).bindings.get(raw_type)
         && binding.kind == ImportKind::Named
         && let Some(imported) = binding.imported_name.as_ref()
     {
         let fqn = format!("{}.{}", binding.module_specifier, imported);
         if let Some(class) =
-            resolve_fqn_candidates(py, &fqn, |name| analyzer.definitions(name).collect())
+            resolve_fqn_candidates(python, &fqn, |name| graph.index.definitions(name).collect())
                 .into_iter()
                 .find(CodeUnit::is_class)
         {
@@ -130,7 +134,7 @@ pub(in crate::analyzer::usages) fn resolve_receiver_type(
         }
     }
 
-    if let Some(provider) = analyzer.import_analysis_provider()
+    if let Some(provider) = graph.imports
         && let Some(imported) = provider
             .imported_code_units_of(file)
             .into_iter()
@@ -139,7 +143,8 @@ pub(in crate::analyzer::usages) fn resolve_receiver_type(
         return Some(imported);
     }
 
-    analyzer
+    graph
+        .index
         .declarations(file)
         .into_iter()
         .find(|code_unit| code_unit.identifier() == raw_type && code_unit.is_class())
@@ -147,18 +152,21 @@ pub(in crate::analyzer::usages) fn resolve_receiver_type(
             if !target_self_file {
                 return None;
             }
-            resolve_indexed_receiver_type(
-                analyzer,
-                &analyzer.global_usage_definition_index(),
-                file,
-                raw_type,
-            )
+            // The only reader of the analyzer's global definition index in this
+            // crate, and the reason `PythonGraphSource::definitions` is a
+            // callback: the index builds on first access, so resolving it
+            // eagerly per scan would pay for a build this branch usually skips.
+            let mut resolved = None;
+            (graph.definitions)(&mut |support| {
+                resolved = resolve_indexed_receiver_type(graph.index, support, file, raw_type);
+            });
+            resolved
         })
 }
 
 fn resolve_bare_annotation_symbol(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -169,26 +177,27 @@ fn resolve_bare_annotation_symbol(
         return Vec::new();
     }
 
-    if let Some(owner) = annotation_scope_owner_class(analyzer, file, source, node) {
-        let owner_candidates = exact_owner_annotation_members(analyzer, &owner, raw_symbol);
+    if let Some(owner) = annotation_scope_owner_class(graph, file, source, node) {
+        let owner_candidates = exact_owner_annotation_members(graph, &owner, raw_symbol);
         if !owner_candidates.is_empty() {
             return owner_candidates;
         }
     }
 
     let mut candidates = Vec::new();
-    if let Some(binding) = py.import_binder_of(file).bindings.get(raw_symbol)
+    if let Some(binding) = python.import_binder_of(file).bindings.get(raw_symbol)
         && binding.kind == ImportKind::Named
         && let Some(imported) = binding.imported_name.as_ref()
     {
         let fqn = format!("{}.{}", binding.module_specifier, imported);
-        candidates.extend(resolve_fqn_candidates(py, &fqn, |name| {
-            analyzer.definitions(name).collect()
+        candidates.extend(resolve_fqn_candidates(python, &fqn, |name| {
+            graph.index.definitions(name).collect()
         }));
     }
 
     candidates.extend(
-        analyzer
+        graph
+            .index
             .top_level_declarations(file)
             .into_iter()
             .filter(|code_unit| !code_unit.is_module() && code_unit.identifier() == raw_symbol),
@@ -205,9 +214,9 @@ fn resolve_bare_annotation_symbol(
 /// annotated-assignment type are considered. In particular, string contents are
 /// accepted only in those annotation positions; arbitrary string literals are
 /// never interpreted as type expressions.
-pub(in crate::analyzer::usages) fn annotation_reference_candidates(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
+pub fn annotation_reference_candidates(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -220,8 +229,8 @@ pub(in crate::analyzer::usages) fn annotation_reference_candidates(
     let mut candidates = match node.kind() {
         "identifier" => {
             let mut candidates = resolve_bare_annotation_symbol(
-                analyzer,
-                py,
+                graph,
+                python,
                 file,
                 source,
                 node,
@@ -229,8 +238,8 @@ pub(in crate::analyzer::usages) fn annotation_reference_candidates(
             );
             if candidates.is_empty() {
                 candidates.extend(resolve_receiver_type(
-                    analyzer,
-                    py,
+                    graph,
+                    python,
                     file,
                     node_text(node, source),
                     target_self_file,
@@ -252,11 +261,11 @@ pub(in crate::analyzer::usages) fn annotation_reference_candidates(
                     continue;
                 };
                 let mut symbol_candidates =
-                    resolve_bare_annotation_symbol(analyzer, py, file, source, node, symbol);
+                    resolve_bare_annotation_symbol(graph, python, file, source, node, symbol);
                 if symbol_candidates.is_empty() {
                     symbol_candidates.extend(resolve_receiver_type(
-                        analyzer,
-                        py,
+                        graph,
+                        python,
                         file,
                         symbol,
                         target_self_file,
@@ -266,7 +275,7 @@ pub(in crate::analyzer::usages) fn annotation_reference_candidates(
             }
             candidates
         }
-        "attribute" => resolve_annotation_attribute_types(analyzer, py, file, source, node),
+        "attribute" => resolve_annotation_attribute_types(graph, python, file, source, node),
         _ => Vec::new(),
     };
     candidates.sort();
@@ -275,8 +284,8 @@ pub(in crate::analyzer::usages) fn annotation_reference_candidates(
 }
 
 fn resolve_annotation_attribute_types(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -285,13 +294,13 @@ fn resolve_annotation_attribute_types(
     // adding owner-qualified nested classes (`Outer.Inner`). The constructor
     // resolver already understands module/re-export bindings; it simply cannot
     // interpret a class as the namespace for another class.
-    let mut candidates = resolve_constructor_types(analyzer, py, file, source, node);
+    let mut candidates = resolve_constructor_types(graph, python, file, source, node);
     let Some((root, attributes)) = annotation_attribute_chain(node) else {
         return candidates;
     };
     let root_text = node_text(root, source);
     let owners: Vec<_> =
-        resolve_bare_annotation_symbol(analyzer, py, file, source, root, root_text)
+        resolve_bare_annotation_symbol(graph, python, file, source, root, root_text)
             .into_iter()
             .filter(CodeUnit::is_class)
             .collect();
@@ -302,7 +311,7 @@ fn resolve_annotation_attribute_types(
 
     for attribute in attributes {
         let segment = node_text(attribute, source);
-        let next_candidates = exact_nested_annotation_class(analyzer, &owner, segment);
+        let next_candidates = exact_nested_annotation_class(graph, &owner, segment);
         let [next] = next_candidates.as_slice() else {
             return candidates;
         };
@@ -328,11 +337,11 @@ fn annotation_attribute_chain(node: Node<'_>) -> Option<(Node<'_>, Vec<Node<'_>>
 }
 
 fn exact_nested_annotation_class(
-    analyzer: &dyn IAnalyzer,
+    graph: &PythonGraphSource<'_>,
     owner: &CodeUnit,
     segment: &str,
 ) -> Vec<CodeUnit> {
-    let mut candidates: Vec<_> = exact_owner_annotation_members(analyzer, owner, segment)
+    let mut candidates: Vec<_> = exact_owner_annotation_members(graph, owner, segment)
         .into_iter()
         .filter(CodeUnit::is_class)
         .collect();
@@ -342,16 +351,18 @@ fn exact_nested_annotation_class(
 }
 
 fn exact_owner_annotation_members(
-    analyzer: &dyn IAnalyzer,
+    graph: &PythonGraphSource<'_>,
     owner: &CodeUnit,
     segment: &str,
 ) -> Vec<CodeUnit> {
-    let mut candidates: Vec<_> = analyzer
+    let mut candidates: Vec<_> = graph
+        .index
         .declarations(owner.source())
         .into_iter()
         .filter(|unit| {
             unit.identifier() == segment
-                && analyzer
+                && graph
+                    .index
                     .parent_of(unit)
                     .is_some_and(|parent| parent.fq_name() == owner.fq_name())
         })
@@ -362,7 +373,7 @@ fn exact_owner_annotation_members(
 }
 
 fn annotation_scope_owner_class(
-    analyzer: &dyn IAnalyzer,
+    graph: &PythonGraphSource<'_>,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -370,21 +381,21 @@ fn annotation_scope_owner_class(
     if !annotation_expression_is_class_scoped(node) {
         return None;
     }
-    let range = crate::analyzer::Range {
+    let range = Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
         start_line: 0,
         end_line: 0,
     };
-    if let Some(enclosing) = analyzer.enclosing_code_unit(file, &range) {
+    if let Some(enclosing) = graph.index.enclosing_code_unit(file, &range) {
         if enclosing.is_class() {
             return Some(enclosing);
         }
-        if let Some(owner) = target_owner_code_unit(analyzer, &enclosing) {
+        if let Some(owner) = target_owner_code_unit(graph.index, &enclosing) {
             return Some(owner);
         }
     }
-    structural_annotation_owner_class(analyzer, file, source, node)
+    structural_annotation_owner_class(graph, file, source, node)
 }
 
 fn annotation_expression_is_class_scoped(node: Node<'_>) -> bool {
@@ -408,7 +419,7 @@ fn annotation_expression_is_class_scoped(node: Node<'_>) -> bool {
 }
 
 fn structural_annotation_owner_class(
-    analyzer: &dyn IAnalyzer,
+    graph: &PythonGraphSource<'_>,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -420,18 +431,20 @@ fn structural_annotation_owner_class(
             if name.is_empty() {
                 return None;
             }
-            let class_range = crate::analyzer::Range {
+            let class_range = Range {
                 start_byte: parent.start_byte(),
                 end_byte: parent.end_byte(),
                 start_line: 0,
                 end_line: 0,
             };
-            let mut matches: Vec<_> = analyzer
+            let mut matches: Vec<_> = graph
+                .index
                 .declarations(file)
                 .into_iter()
                 .filter(|unit| unit.is_class() && unit.identifier() == name)
                 .filter(|unit| {
-                    analyzer
+                    graph
+                        .index
                         .ranges(unit)
                         .into_iter()
                         .any(|range| range.contains(&class_range))
@@ -460,14 +473,14 @@ fn is_annotation_reference_node(node: Node<'_>) -> bool {
 /// source text. Bare callees use the import binder or same-file declarations;
 /// qualified callees walk tree-sitter's `attribute` fields back to a namespace
 /// import and append each attribute component structurally.
-pub(in crate::analyzer::usages) fn resolve_constructor_types(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
+pub fn resolve_constructor_types(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
     file: &ProjectFile,
     source: &str,
     function: Node<'_>,
 ) -> Vec<CodeUnit> {
-    let binder = py.import_binder_of(file);
+    let binder = python.import_binder_of(file);
     let fqn = match function.kind() {
         "identifier" => {
             let local = node_text(function, source);
@@ -479,7 +492,8 @@ pub(in crate::analyzer::usages) fn resolve_constructor_types(
                     .imported_name
                     .as_ref()
                     .map(|imported| format!("{}.{}", binding.module_specifier, imported)),
-                _ => analyzer
+                _ => graph
+                    .index
                     .declarations(file)
                     .into_iter()
                     .find(|unit| unit.is_class() && unit.identifier() == local)
@@ -493,7 +507,7 @@ pub(in crate::analyzer::usages) fn resolve_constructor_types(
         return Vec::new();
     };
     let mut classes: Vec<CodeUnit> =
-        resolve_fqn_candidates(py, &fqn, |name| analyzer.definitions(name).collect())
+        resolve_fqn_candidates(python, &fqn, |name| graph.index.definitions(name).collect())
             .into_iter()
             .filter(CodeUnit::is_class)
             .collect();
@@ -535,7 +549,7 @@ fn namespace_constructor_fqn(
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text(node, source)
+    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
 fn resolve_indexed_receiver_type(
@@ -567,7 +581,7 @@ fn module_fqn_for_file(index: &dyn CodeUnitIndex, file: &ProjectFile) -> Option<
         })
 }
 
-pub(super) fn normalized_receiver_type(annotation: &str) -> Option<String> {
+pub fn normalized_receiver_type(annotation: &str) -> Option<String> {
     let annotation = unwrap_python_string_annotation(annotation.trim());
     let annotation = unwrap_supported_receiver_wrapper(annotation);
     if annotation.is_empty()
@@ -613,7 +627,7 @@ fn unwrap_supported_receiver_wrapper(annotation: &str) -> &str {
     }
 }
 
-pub(super) fn receiver_annotation_matches_target(
+pub fn receiver_annotation_matches_target(
     annotation: &str,
     edges: &[ImportEdge],
     target_short: &str,

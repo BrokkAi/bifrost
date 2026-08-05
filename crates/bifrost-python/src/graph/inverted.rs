@@ -24,159 +24,166 @@ use super::extractor::{
 use super::resolver::{
     annotation_reference_candidates, resolve_constructor_types, resolve_receiver_type,
 };
-use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::PythonAnalyzer;
-use crate::analyzer::usages::inverted_edges::{
-    FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
-    classify_reference_node, parse_and_collect,
-};
-use crate::analyzer::usages::local_inference::LocalBindingsSnapshot;
-use crate::analyzer::usages::model::ImportKind;
-use crate::analyzer::{
-    CodeUnit, IAnalyzer, Language, ProjectFile, resolve_fqn_candidates, usage_resolve_module_files,
-    usage_scope_facts,
-};
-use crate::hash::{HashMap, HashSet};
+use crate::graph::PythonGraphSource;
+use crate::graph_support::PythonUsageSource;
+use crate::imports::resolve_fqn_candidates;
+use crate::usage_index::{usage_resolve_module_files, usage_scope_facts};
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    FileEdgeScanInput, PerFileEdges, classify_reference_node,
+};
+use brokk_bifrost_core::analyzer::usages::local_inference::LocalBindingsSnapshot;
+use brokk_bifrost_core::analyzer::usages::model::ImportKind;
+use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile, Range};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tree_sitter::Node;
 
-/// Build the whole Python `caller -> callee` edge set in a single inverted pass.
-pub(super) fn build_python_edges<Output, F>(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
-    nodes: &HashSet<String>,
-    targets: &HashSet<String>,
-    keep_file: F,
-) -> Output
-where
-    Output: UsageEdgeBuildOutput<String>,
-    F: Fn(&ProjectFile) -> bool + Sync,
-{
-    // `nodes` remains the complete caller/callee graph domain. `targets` is the
-    // subset whose inbound references this build must resolve and retain.
-    debug_assert!(targets.is_subset(nodes));
-    let files: Vec<ProjectFile> = py.get_analyzed_files().into_iter().collect();
-    let language = tree_sitter_python::LANGUAGE.into();
-    let mut targets_by_terminal: HashMap<String, Vec<String>> = HashMap::default();
-    for target in targets {
-        // Python fqns are dotted module paths with no other delimiter (per the
-        // module doc comment above), so re-tokenizing with the shared structured
-        // splitter and taking the terminal segment reproduces
-        // `rsplit('.').next()`'s terminal split exactly.
-        let terminal = parse_symbol_path(Language::Python, target)
-            .pop()
-            .unwrap_or_else(|| target.clone());
-        targets_by_terminal
-            .entry(terminal)
-            .or_default()
-            .push(target.clone());
+/// The whole-pass state the per-file walk shares: the terminal-segment index
+/// over `targets`, and the namespace-candidate memo the walk fills as it goes.
+///
+/// Built once per inverted pass and then borrowed by every worker, so
+/// `brokk-bifrost-analysis`'s fan-out (`build_edge_output` + `parse_and_collect`,
+/// both analysis-owned) can hold it across the parallel closure.
+pub struct PythonEdgeScan<'a> {
+    targets: &'a HashSet<String>,
+    targets_by_terminal: HashMap<String, Vec<String>>,
+    canonical_namespace_candidates: Mutex<HashMap<String, Arc<Vec<String>>>>,
+}
+
+impl<'a> PythonEdgeScan<'a> {
+    /// `nodes` remains the complete caller/callee graph domain. `targets` is the
+    /// subset whose inbound references this build must resolve and retain.
+    pub fn new(nodes: &HashSet<String>, targets: &'a HashSet<String>) -> Self {
+        debug_assert!(targets.is_subset(nodes));
+        let mut targets_by_terminal: HashMap<String, Vec<String>> = HashMap::default();
+        for target in targets {
+            // Python fqns are dotted module paths with no other delimiter (per the
+            // module doc comment above), so re-tokenizing with the shared structured
+            // splitter and taking the terminal segment reproduces
+            // `rsplit('.').next()`'s terminal split exactly.
+            let terminal = parse_symbol_path(Language::Python, target)
+                .pop()
+                .unwrap_or_else(|| target.clone());
+            targets_by_terminal
+                .entry(terminal)
+                .or_default()
+                .push(target.clone());
+        }
+        Self {
+            targets,
+            targets_by_terminal,
+            canonical_namespace_candidates: Mutex::new(HashMap::default()),
+        }
     }
-    let canonical_namespace_candidates: Mutex<HashMap<String, Arc<Vec<String>>>> =
-        Mutex::new(HashMap::default());
-    build_edge_output(&files, keep_file, |file| {
-        // Parse on demand and drop the tree when this closure returns, so live trees
-        // are bounded by the worker count rather than the workspace size (#200).
-        // Resolution reaches no other file's tree: the import binder, same-file
-        // declarations, and the receiver-type facts are all derived from this file
-        // plus the analyzer's own (tree-free) caches.
-        parse_and_collect(analyzer, file, nodes, &language, |input| {
-            let source = input.source;
 
-            // Per-file resolution context from the import binder. A namespace
-            // binding's module_specifier is either the full fqn (for
-            // `from m import f`) or the module prefix (for `import m as u`); the
-            // node-membership check downstream disambiguates which applies.
-            let binder = py.import_binder_of(file);
-            let mut named: HashMap<String, String> = HashMap::default();
-            let mut namespace: HashMap<String, NamespaceBinding> = HashMap::default();
-            for (local, binding) in &binder.bindings {
-                match binding.kind {
-                    ImportKind::Named => {
-                        if let Some(imported) = &binding.imported_name {
-                            let module = canonical_import_module_fqn(
-                                analyzer,
-                                py,
-                                file,
-                                &binding.module_specifier,
-                            )
-                            .unwrap_or_else(|| binding.module_specifier.clone());
-                            named.insert(local.clone(), format!("{module}.{imported}"));
-                        }
+    /// Resolve every reference in one already-parsed file.
+    ///
+    /// Reaches no other file's tree: the import binder, same-file declarations,
+    /// and the receiver-type facts are all derived from this file plus the
+    /// analyzer's own (tree-free) caches.
+    pub fn scan_file(
+        &self,
+        graph: &PythonGraphSource<'_>,
+        python: &dyn PythonUsageSource,
+        file: &ProjectFile,
+        input: &FileEdgeScanInput<'_>,
+    ) -> PerFileEdges {
+        let source = input.source;
+
+        // Per-file resolution context from the import binder. A namespace
+        // binding's module_specifier is either the full fqn (for
+        // `from m import f`) or the module prefix (for `import m as u`); the
+        // node-membership check downstream disambiguates which applies.
+        let binder = python.import_binder_of(file);
+        let mut named: HashMap<String, String> = HashMap::default();
+        let mut namespace: HashMap<String, NamespaceBinding> = HashMap::default();
+        for (local, binding) in &binder.bindings {
+            match binding.kind {
+                ImportKind::Named => {
+                    if let Some(imported) = &binding.imported_name {
+                        let module = canonical_import_module_fqn(
+                            graph,
+                            python,
+                            file,
+                            &binding.module_specifier,
+                        )
+                        .unwrap_or_else(|| binding.module_specifier.clone());
+                        named.insert(local.clone(), format!("{module}.{imported}"));
                     }
-                    ImportKind::Namespace => {
-                        let direct_module = binding.module_specifier.clone();
-                        let imported_module = binding
-                            .namespace_imported_module
-                            .as_deref()
-                            .unwrap_or(&direct_module);
-                        let module =
-                            canonical_import_module_fqn(analyzer, py, file, imported_module);
-                        let workspace_module = module.is_some();
-                        let consumed_attributes = module.as_ref().map_or(0, |_| {
-                            let imported_segments =
-                                parse_symbol_path(Language::Python, imported_module);
-                            let bound_segments =
-                                parse_symbol_path(Language::Python, &direct_module);
-                            imported_segments.len().saturating_sub(bound_segments.len())
-                        });
-                        namespace.insert(
-                            local.clone(),
-                            NamespaceBinding {
-                                module: module.unwrap_or(direct_module),
-                                workspace_module,
-                                consumed_attributes,
-                            },
-                        );
-                    }
-                    ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => {}
                 }
+                ImportKind::Namespace => {
+                    let direct_module = binding.module_specifier.clone();
+                    let imported_module = binding
+                        .namespace_imported_module
+                        .as_deref()
+                        .unwrap_or(&direct_module);
+                    let module = canonical_import_module_fqn(graph, python, file, imported_module);
+                    let workspace_module = module.is_some();
+                    let consumed_attributes = module.as_ref().map_or(0, |_| {
+                        let imported_segments =
+                            parse_symbol_path(Language::Python, imported_module);
+                        let bound_segments = parse_symbol_path(Language::Python, &direct_module);
+                        imported_segments.len().saturating_sub(bound_segments.len())
+                    });
+                    namespace.insert(
+                        local.clone(),
+                        NamespaceBinding {
+                            module: module.unwrap_or(direct_module),
+                            workspace_module,
+                            consumed_attributes,
+                        },
+                    );
+                }
+                ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => {}
             }
-            let same_file: HashMap<String, String> = analyzer
-                .declarations(file)
-                .into_iter()
-                .map(|unit| (unit.identifier().to_string(), unit.fq_name()))
-                .collect();
+        }
+        let same_file: HashMap<String, String> = graph
+            .index
+            .declarations(file)
+            .into_iter()
+            .map(|unit| (unit.identifier().to_string(), unit.fq_name()))
+            .collect();
 
-            // Per-function receiver-type facts (typed params + `x = Foo()`),
-            // computed by the same routine the forward scan uses, so a typed
-            // `recv.method` resolves to the receiver's class fqn.
-            let scope_facts = usage_scope_facts(py, file, || {
-                collect_scope_facts_from_parsed_source(analyzer, py, file, source, input.root())
-            });
+        // Per-function receiver-type facts (typed params + `x = Foo()`),
+        // computed by the same routine the forward scan uses, so a typed
+        // `recv.method` resolves to the receiver's class fqn.
+        let scope_facts = usage_scope_facts(python, file, || {
+            collect_scope_facts_from_parsed_source(graph, python, file, source, input.root())
+        });
 
-            let mut ctx = PyScan {
-                analyzer,
-                py,
-                targets,
-                targets_by_terminal: &targets_by_terminal,
-                file,
-                source,
-                named,
-                namespace,
-                same_file,
-                scope_facts: scope_facts.as_ref(),
-                canonical_namespace_candidates: &canonical_namespace_candidates,
-                input,
-                edges: PerFileEdges::default(),
-            };
-            scan_tree(input.root(), &mut ctx);
-            ctx.edges
-        })
-    })
+        let mut ctx = PyScan {
+            graph,
+            python,
+            targets: self.targets,
+            targets_by_terminal: &self.targets_by_terminal,
+            file,
+            source,
+            named,
+            namespace,
+            same_file,
+            scope_facts: scope_facts.as_ref(),
+            canonical_namespace_candidates: &self.canonical_namespace_candidates,
+            input,
+            edges: PerFileEdges::default(),
+        };
+        scan_tree(input.root(), &mut ctx);
+        ctx.edges
+    }
 }
 
 fn canonical_import_module_fqn(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
     importing_file: &ProjectFile,
     module_specifier: &str,
 ) -> Option<String> {
-    let resolved = usage_resolve_module_files(py, importing_file, module_specifier);
+    let resolved = usage_resolve_module_files(python, importing_file, module_specifier);
     let [module_file] = resolved.as_slice() else {
         return None;
     };
-    analyzer
+    graph
+        .index
         .declarations(module_file)
         .into_iter()
         .find(CodeUnit::is_module)
@@ -184,8 +191,8 @@ fn canonical_import_module_fqn(
 }
 
 struct PyScan<'a> {
-    analyzer: &'a dyn IAnalyzer,
-    py: &'a PythonAnalyzer,
+    graph: &'a PythonGraphSource<'a>,
+    python: &'a dyn PythonUsageSource,
     targets: &'a HashSet<String>,
     targets_by_terminal: &'a HashMap<String, Vec<String>>,
     file: &'a ProjectFile,
@@ -238,7 +245,7 @@ impl PyScan<'_> {
         // is gated on matching a known target owner; the inverted builder has no
         // target to validate against, so enabling it would let an unimported,
         // non-local type name bind to an unrelated same-named class elsewhere.
-        resolve_receiver_type(self.analyzer, self.py, self.file, type_name, false)
+        resolve_receiver_type(self.graph, self.python, self.file, type_name, false)
             .map(|unit| unit.fq_name())
     }
 
@@ -281,8 +288,8 @@ impl PyScan<'_> {
         }
 
         let resolved: Arc<Vec<String>> = Arc::new(
-            resolve_fqn_candidates(self.py, direct, |name| {
-                self.analyzer.definitions(name).collect()
+            resolve_fqn_candidates(self.python, direct, |name| {
+                self.graph.index.definitions(name).collect()
             })
             .into_iter()
             .map(|unit| unit.fq_name())
@@ -322,7 +329,7 @@ fn walk(
                 "function_definition" | "lambda" => {
                     scopes.push(collect_function_scope(node, ctx.source));
                     let scope_facts = merged_enclosing_scope_facts(
-                        ctx.analyzer,
+                        ctx.graph,
                         ctx.file,
                         ctx.scope_facts,
                         &mut merged_facts,
@@ -411,7 +418,7 @@ fn push_function_children<'tree>(
 }
 
 fn merged_enclosing_scope_facts(
-    analyzer: &dyn IAnalyzer,
+    graph: &PythonGraphSource<'_>,
     file: &ProjectFile,
     scope_facts: &HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     merged_facts: &mut Vec<LocalBindingsSnapshot<String>>,
@@ -425,7 +432,7 @@ fn merged_enclosing_scope_facts(
     // reconstruct. Nested functions and lambdas instead need their structural
     // declarations to shadow the inherited outer snapshot.
     let local = if inherited.is_none() && node.kind() == "function_definition" {
-        enclosing_scope_facts(analyzer, file, scope_facts, node)
+        enclosing_scope_facts(graph.index, file, scope_facts, node)
             .cloned()
             .unwrap_or(structural_local)
     } else {
@@ -486,7 +493,7 @@ fn handle_identifier(node: Node<'_>, ctx: &mut PyScan<'_>, scopes: &[FunctionSco
 
 fn handle_annotation_reference(node: Node<'_>, ctx: &mut PyScan<'_>) -> bool {
     let Some(candidates) =
-        annotation_reference_candidates(ctx.analyzer, ctx.py, ctx.file, ctx.source, node, false)
+        annotation_reference_candidates(ctx.graph, ctx.python, ctx.file, ctx.source, node, false)
     else {
         return false;
     };
@@ -521,13 +528,13 @@ fn handle_attribute(
         return;
     }
     if object.kind() == "call" && ctx.targets_by_terminal.contains_key(attribute_text) {
-        for class in call_result_types(ctx.analyzer, ctx.py, ctx.file, ctx.source, object, facts) {
+        for class in call_result_types(ctx.graph, ctx.python, ctx.file, ctx.source, object, facts) {
             let direct = format!("{}.{attribute_text}", class.fq_name());
             if ctx.targets.contains(&direct) {
                 ctx.record(direct, attribute);
                 continue;
             }
-            if let Some(provider) = ctx.analyzer.type_hierarchy_provider() {
+            if let Some(provider) = ctx.graph.hierarchy {
                 for ancestor in provider.get_ancestors(&class) {
                     let inherited = format!("{}.{attribute_text}", ancestor.fq_name());
                     if ctx.targets.contains(&inherited) {
@@ -631,7 +638,7 @@ fn handle_keyword_argument(node: Node<'_>, ctx: &mut PyScan<'_>, scopes: &[Funct
         {
             return;
         }
-        resolve_constructor_types(ctx.analyzer, ctx.py, ctx.file, ctx.source, function)
+        resolve_constructor_types(ctx.graph, ctx.python, ctx.file, ctx.source, function)
     };
     for class in classes {
         let direct = format!("{}.{member}", class.fq_name());
@@ -639,7 +646,7 @@ fn handle_keyword_argument(node: Node<'_>, ctx: &mut PyScan<'_>, scopes: &[Funct
             ctx.record(direct, name);
             continue;
         }
-        if let Some(provider) = ctx.analyzer.type_hierarchy_provider() {
+        if let Some(provider) = ctx.graph.hierarchy {
             for ancestor in provider.get_ancestors(&class) {
                 let inherited = format!("{}.{member}", ancestor.fq_name());
                 if ctx.targets.contains(&inherited) {
@@ -651,17 +658,18 @@ fn handle_keyword_argument(node: Node<'_>, ctx: &mut PyScan<'_>, scopes: &[Funct
 }
 
 fn lexical_class(ctx: &PyScan<'_>, node: Node<'_>) -> Option<CodeUnit> {
-    let range = crate::analyzer::Range {
+    let range = Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
         start_line: 0,
         end_line: 0,
     };
-    let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range)?;
+    let enclosing = ctx.graph.index.enclosing_code_unit(ctx.file, &range)?;
     if enclosing.is_class() {
         Some(enclosing)
     } else {
-        ctx.analyzer
+        ctx.graph
+            .index
             .parent_of(&enclosing)
             .filter(CodeUnit::is_class)
     }

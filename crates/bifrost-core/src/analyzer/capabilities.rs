@@ -194,7 +194,7 @@ pub trait TypeAliasProvider: CapabilityProvider {
 
 pub trait TestDetectionProvider: CapabilityProvider {}
 
-pub trait TypeHierarchyProvider: CapabilityProvider {
+pub trait TypeHierarchyProvider: CapabilityProvider + Send + Sync {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit>;
 

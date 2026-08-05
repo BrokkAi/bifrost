@@ -296,7 +296,7 @@ mod tests {
     /// aborts the whole provider slice on any unavailable file.
     #[test]
     fn empty_source_extracts_zero_facts() {
-        let spec = &crate::analyzer::python::structural::PYTHON_STRUCTURAL_SPEC;
+        let spec = &brokk_bifrost_python::structural::PYTHON_STRUCTURAL_SPEC;
         let grammar = tree_sitter_python::LANGUAGE.into();
         let facts = extract_file_facts(spec, &grammar, "").expect("empty source yields facts");
         assert_eq!(facts.work_item_count(), 0);
@@ -330,7 +330,7 @@ mod tests {
     /// later milestones depends on.
     #[test]
     fn extracted_occurrence_roles_round_trip_through_the_snapshot_codec() {
-        let spec = &crate::analyzer::python::structural::PYTHON_STRUCTURAL_SPEC;
+        let spec = &brokk_bifrost_python::structural::PYTHON_STRUCTURAL_SPEC;
         let grammar = tree_sitter_python::LANGUAGE.into();
         let source = "def render(label):\n    return label\n";
         let facts = extract_file_facts(spec, &grammar, source).expect("python fixture extracts");
@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn embedded_facts_preserve_identity_containment_limits_and_snapshots() {
-        let spec = &crate::analyzer::python::structural::PYTHON_STRUCTURAL_SPEC;
+        let spec = &brokk_bifrost_python::structural::PYTHON_STRUCTURAL_SPEC;
         let grammar = tree_sitter_python::LANGUAGE.into();
         let source = concat!(
             "class Widget:\n",

@@ -1,6 +1,7 @@
-use super::declarations::py_node_text;
-use super::*;
-use crate::analyzer::test_assertions::{
+use crate::declarations::py_node_text;
+use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
+use brokk_bifrost_core::analyzer::test_assertions::{
     TestAssertionSignal, append_test_assertion_findings, compact_assertion_excerpt,
 };
 use regex::Regex;
@@ -32,7 +33,7 @@ struct PythonTestCase {
     start_byte: usize,
 }
 
-pub(super) fn detect_python_test_assertion_smells(
+pub fn detect_python_test_assertion_smells(
     file: &ProjectFile,
     source: &str,
     weights: &TestAssertionWeights,
@@ -361,10 +362,8 @@ fn compact_python_excerpt(text: &str) -> String {
     compact_assertion_excerpt(text, 180)
 }
 
-pub(super) fn python_source_contains_tests(source: &str) -> bool {
+pub fn python_source_contains_tests(source: &str) -> bool {
     static TEST_DEF_RE: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"(?m)^\s*def\s+test_[A-Za-z0-9_]*\s*\(").unwrap());
     source.contains("@pytest.mark.") || TEST_DEF_RE.is_match(source)
 }
-
-impl TestDetectionProvider for PythonAnalyzer {}

@@ -258,7 +258,7 @@ impl PythonArtifactPackProducer {
                 );
             }
         };
-        let Some(tree) = super::declarations::parse_python_tree(source) else {
+        let Some(tree) = brokk_bifrost_python::declarations::parse_python_tree(source) else {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,

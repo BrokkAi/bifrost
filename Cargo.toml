@@ -7,6 +7,7 @@ members = [
     "crates/bifrost-mcp",
     "crates/bifrost-nlp",
     "crates/bifrost-policy",
+    "crates/bifrost-python",
     "crates/bifrost-runtime",
     "crates/bifrost-rust",
     "crates/bifrost-semantic-packs",

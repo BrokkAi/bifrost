@@ -38,7 +38,7 @@ pub mod store;
 pub mod structural;
 pub(crate) mod symbol_lookup;
 pub mod taint;
-pub(crate) mod test_assertions;
+pub use brokk_bifrost_core::analyzer::test_assertions;
 pub mod tree_sitter_analyzer;
 pub(crate) mod tree_walk;
 mod typescript;
@@ -181,9 +181,8 @@ pub use project::{
     ProjectSourceSnapshot, TestProject, WorkspaceFileListingCache, collect_workspace_files,
 };
 pub(crate) use python::{
-    ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
-    resolve_fqn_candidates, resolve_module_code_unit, usage_importer_files, usage_matching_edges,
-    usage_module_binding_timeline, usage_resolve_module_files, usage_scope_facts, usage_seeds,
+    ModuleBindingEventKind, ModuleBindingTimeline, resolve_fqn_candidates,
+    resolve_module_code_unit, usage_resolve_module_files,
 };
 pub use python::{
     PythonAnalyzer, PythonImportBinding,

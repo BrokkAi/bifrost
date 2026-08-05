@@ -7,6 +7,7 @@ const names = [
   "brokk-bifrost",
   "brokk-bifrost-core",
   "brokk-bifrost-go",
+  "brokk-bifrost-python",
   "brokk-bifrost-rust",
   "brokk-bifrost-analysis",
   "brokk-bifrost-nlp",
@@ -26,10 +27,12 @@ function metadata(overrides = {}) {
     "brokk-bifrost": [],
     "brokk-bifrost-core": [],
     "brokk-bifrost-go": [dependency("brokk-bifrost-core")],
+    "brokk-bifrost-python": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-rust": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-analysis": [
       dependency("brokk-bifrost-core"),
       dependency("brokk-bifrost-go"),
+      dependency("brokk-bifrost-python"),
       dependency("brokk-bifrost-rust"),
     ],
     "brokk-bifrost-nlp": [dependency("brokk-bifrost-analysis")],
@@ -94,6 +97,7 @@ test("rejects an analysis dependency on prebuilt semantic packs", () => {
           "brokk-bifrost-analysis": [
             dependency("brokk-bifrost-core"),
             dependency("brokk-bifrost-go"),
+            dependency("brokk-bifrost-python"),
             dependency("brokk-bifrost-rust"),
             dependency("brokk-bifrost-semantic-packs"),
           ],

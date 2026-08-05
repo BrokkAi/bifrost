@@ -1,0 +1,22 @@
+[package]
+name = "brokk-bifrost-python"
+version.workspace = true
+edition.workspace = true
+description = "Python language knowledge for brokk-bifrost: module identity, declarations, imports, and usage-graph resolution"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[lib]
+name = "brokk_bifrost_python"
+
+[dependencies]
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22" }
+rayon = "1.10.0"
+regex = "1.12.2"
+tree-sitter = "0.25.10"
+tree-sitter-python = "0.25.0"
+
+[dev-dependencies]
+tempfile = "3.23.0"

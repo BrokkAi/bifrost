@@ -1,6 +1,6 @@
-use super::graph_support::resolve_base_class;
 use super::*;
 use crate::analyzer::build_direct_descendant_index;
+use brokk_bifrost_python::graph_support::resolve_base_class;
 use std::sync::Arc;
 
 impl TypeHierarchyProvider for PythonAnalyzer {

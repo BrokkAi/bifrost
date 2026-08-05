@@ -11,25 +11,26 @@
 //! here. Module resolution reuses the analyzer's existing [`python_module_name`]
 //! + [`resolve_python_relative_module`].
 
-use crate::analyzer::usages::{
-    ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportEdge, ImportEdgeKind, ImportKind,
-    LocalBindingsSnapshot,
+use brokk_bifrost_core::analyzer::usages::local_inference::LocalBindingsSnapshot;
+use brokk_bifrost_core::analyzer::usages::model::{
+    ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,
 };
-use crate::analyzer::{CodeUnit, Language, ProjectFile};
-use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::usages::{ImportEdge, ImportEdgeKind};
+use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use super::declarations::python_module_name;
-use super::graph_support::{
+use crate::declarations::python_module_name;
+use crate::graph_support::{
     PythonAnalysisSource, PythonUsageSource, export_index_from_file_facts,
     import_binder_from_imports,
 };
-use super::imports::{module_replacement_of, resolve_python_relative_module};
+use crate::imports::{module_replacement_of, resolve_python_relative_module};
 
 /// Re-export and reverse-import indices over the Python workspace.
 #[derive(Debug, Default)]
-pub(crate) struct PythonUsageIndex {
+pub struct PythonUsageIndex {
     module_index: HashMap<String, Vec<ProjectFile>>,
     exports_by_file: HashMap<ProjectFile, ExportIndex>,
     reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
@@ -39,18 +40,18 @@ pub(crate) struct PythonUsageIndex {
     scope_facts_by_file: Mutex<HashMap<ProjectFile, Arc<PythonScopeFacts>>>,
 }
 
-pub(crate) type ModuleBindingTimeline = HashMap<String, Vec<ModuleBindingEvent>>;
-pub(crate) type PythonScopeFacts = HashMap<CodeUnit, LocalBindingsSnapshot<String>>;
+pub type ModuleBindingTimeline = HashMap<String, Vec<ModuleBindingEvent>>;
+pub type PythonScopeFacts = HashMap<CodeUnit, LocalBindingsSnapshot<String>>;
 
 #[derive(Clone, Debug)]
-pub(crate) struct ModuleBindingEvent {
-    pub(crate) visible_from: usize,
-    pub(crate) conditional: bool,
-    pub(crate) kind: ModuleBindingEventKind,
+pub struct ModuleBindingEvent {
+    pub visible_from: usize,
+    pub conditional: bool,
+    pub kind: ModuleBindingEventKind,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum ModuleBindingEventKind {
+pub enum ModuleBindingEventKind {
     ImportModule(String),
     FromImport {
         module: String,
@@ -94,8 +95,8 @@ impl PythonUsageIndex {
     /// Takes [`PythonAnalysisSource`], not [`PythonUsageSource`]: the cell this
     /// build fills is only reachable through the latter, so the narrower
     /// parameter is what stops the build from re-entering it.
-    pub(super) fn build(python: &dyn PythonAnalysisSource) -> Self {
-        let _scope = crate::profiling::scope("PythonUsageIndex::build");
+    pub fn build(python: &dyn PythonAnalysisSource) -> Self {
+        let _scope = brokk_bifrost_core::profiling::scope("PythonUsageIndex::build");
         let mut files: Vec<ProjectFile> = python
             .project()
             .analyzable_files(Language::Python)
@@ -242,7 +243,7 @@ impl PythonUsageIndex {
         }
     }
 
-    pub(super) fn seeds_for_target(
+    pub fn seeds_for_target(
         &self,
         target_file: &ProjectFile,
         target_short: &str,
@@ -288,7 +289,7 @@ impl PythonUsageIndex {
         seeds
     }
 
-    pub(super) fn matching_edges_for_importer(
+    pub fn matching_edges_for_importer(
         &self,
         importer: &ProjectFile,
         seeds: &BTreeSet<(ProjectFile, String)>,
@@ -308,11 +309,11 @@ impl PythonUsageIndex {
         matches
     }
 
-    pub(super) fn importer_files_for_seeds(
+    pub fn importer_files_for_seeds(
         &self,
         seeds: &BTreeSet<(ProjectFile, String)>,
-    ) -> crate::hash::HashSet<ProjectFile> {
-        let mut importers = crate::hash::HashSet::default();
+    ) -> HashSet<ProjectFile> {
+        let mut importers = HashSet::default();
         for (target_file, _) in seeds {
             let Some(edges) = self.importer_reverse.get(target_file) else {
                 continue;
@@ -327,7 +328,7 @@ impl PythonUsageIndex {
         importers
     }
 
-    pub(super) fn resolve_module_files(
+    pub fn resolve_module_files(
         &self,
         importing_file: &ProjectFile,
         module_specifier: &str,
@@ -335,7 +336,7 @@ impl PythonUsageIndex {
         resolve_module(&self.module_index, importing_file, module_specifier)
     }
 
-    pub(super) fn module_binding_timeline(
+    pub fn module_binding_timeline(
         &self,
         file: &ProjectFile,
         build: impl FnOnce() -> ModuleBindingTimeline,
@@ -359,7 +360,7 @@ impl PythonUsageIndex {
             .clone()
     }
 
-    pub(super) fn scope_facts(
+    pub fn scope_facts(
         &self,
         file: &ProjectFile,
         build: impl FnOnce() -> PythonScopeFacts,
@@ -475,7 +476,7 @@ fn build_importer_reverse(
 }
 
 /// Export seeds for the target, following re-export chains.
-pub(crate) fn usage_seeds(
+pub fn usage_seeds(
     python: &dyn PythonUsageSource,
     target_file: &ProjectFile,
     target_short: &str,
@@ -486,7 +487,7 @@ pub(crate) fn usage_seeds(
 }
 
 /// The import edges in `importer` that bind one of the `seeds`.
-pub(crate) fn usage_matching_edges(
+pub fn usage_matching_edges(
     python: &dyn PythonUsageSource,
     importer: &ProjectFile,
     seeds: &BTreeSet<(ProjectFile, String)>,
@@ -496,14 +497,14 @@ pub(crate) fn usage_matching_edges(
         .matching_edges_for_importer(importer, seeds)
 }
 
-pub(crate) fn usage_importer_files(
+pub fn usage_importer_files(
     python: &dyn PythonUsageSource,
     seeds: &BTreeSet<(ProjectFile, String)>,
-) -> crate::hash::HashSet<ProjectFile> {
+) -> HashSet<ProjectFile> {
     python.usage_index().importer_files_for_seeds(seeds)
 }
 
-pub(crate) fn usage_resolve_module_files(
+pub fn usage_resolve_module_files(
     python: &dyn PythonUsageSource,
     importing_file: &ProjectFile,
     module_specifier: &str,
@@ -513,7 +514,7 @@ pub(crate) fn usage_resolve_module_files(
         .resolve_module_files(importing_file, module_specifier)
 }
 
-pub(crate) fn usage_module_binding_timeline(
+pub fn usage_module_binding_timeline(
     python: &dyn PythonUsageSource,
     file: &ProjectFile,
     build: impl FnOnce() -> ModuleBindingTimeline,
@@ -521,7 +522,7 @@ pub(crate) fn usage_module_binding_timeline(
     python.usage_index().module_binding_timeline(file, build)
 }
 
-pub(crate) fn usage_scope_facts(
+pub fn usage_scope_facts(
     python: &dyn PythonUsageSource,
     file: &ProjectFile,
     build: impl FnOnce() -> PythonScopeFacts,
@@ -531,12 +532,7 @@ pub(crate) fn usage_scope_facts(
 
 #[cfg(test)]
 mod tests {
-    use super::super::PythonAnalyzer;
     use super::*;
-    use crate::analyzer::usages::inverted_edges::UsageEdges;
-    use crate::analyzer::{IAnalyzer, TestProject};
-    use crate::hash::HashSet;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn module_replacement_chains_canonicalize_and_cycles_are_rejected() {
@@ -584,50 +580,5 @@ mod tests {
             panic!("cached scope facts should avoid rebuilding the file")
         });
         assert!(Arc::ptr_eq(&first_facts, &second_facts));
-    }
-
-    #[test]
-    fn usage_edges_are_reused_per_target_set_and_reset_on_update() {
-        let root = tempfile::tempdir().expect("temporary project root");
-        let file = ProjectFile::new(root.path(), "module.py");
-        file.write("def target(): pass\n")
-            .expect("write Python fixture");
-        let analyzer = PythonAnalyzer::new(Arc::new(TestProject::new(
-            root.path().to_path_buf(),
-            Language::Python,
-        )));
-        let nodes = HashSet::from_iter(["module.target".to_string(), "module.other".to_string()]);
-        let first_targets = HashSet::from_iter(["module.target".to_string()]);
-        let second_targets = HashSet::from_iter(["module.target".to_string()]);
-        let builds = AtomicUsize::new(0);
-
-        let first = analyzer.usage_edges_for_targets(&nodes, &first_targets, || {
-            builds.fetch_add(1, Ordering::Relaxed);
-            UsageEdges::default()
-        });
-        let second = analyzer.usage_edges_for_targets(&nodes, &second_targets, || {
-            panic!("warm Python usage graph must reuse the cached edges")
-        });
-
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(1, builds.load(Ordering::Relaxed));
-
-        let different_targets = HashSet::from_iter(["module.other".to_string()]);
-        analyzer.usage_edges_for_targets(&nodes, &different_targets, || {
-            builds.fetch_add(1, Ordering::Relaxed);
-            UsageEdges::default()
-        });
-        assert_eq!(
-            2,
-            builds.load(Ordering::Relaxed),
-            "different callee targets need a separately resolved graph"
-        );
-
-        let updated = analyzer.update(&std::collections::BTreeSet::from([file]));
-        updated.usage_edges_for_targets(&nodes, &first_targets, || {
-            builds.fetch_add(1, Ordering::Relaxed);
-            UsageEdges::default()
-        });
-        assert_eq!(3, builds.load(Ordering::Relaxed));
     }
 }

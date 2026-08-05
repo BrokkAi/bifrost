@@ -1,33 +1,31 @@
 //! The language half of Python's resolution logic: module lookup, the export
 //! index, the import binder, base-class resolution and the skeleton renderer,
 //! written as free functions over a source trait instead of as methods on
-//! [`PythonAnalyzer`].
+//! `PythonAnalyzer`.
 //!
-//! [`PythonAnalyzer`] owns the lazy cells (six moka caches, two `OnceLock`s and
-//! a `PoolSafeMemo`) and implements [`PythonAnalysisSource`] out of its own
-//! accessors, so the functions below reach back for the memoized products they
-//! need without naming the analyzer type.
-//!
-//! [`PythonAnalyzer`]: super::PythonAnalyzer
+//! `PythonAnalyzer` (in `brokk-bifrost-analysis`) owns the lazy cells (six moka
+//! caches, two `OnceLock`s and a `PoolSafeMemo`) and implements
+//! [`PythonAnalysisSource`] out of its own accessors, so the functions below
+//! reach back for the memoized products they need without naming the analyzer
+//! type.
 
+use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
+use brokk_bifrost_core::analyzer::model::{CodeUnitType, ImportInfo};
 use brokk_bifrost_core::analyzer::prepared_syntax::IndexedFileFacts;
-
-use crate::analyzer::usages::{
+use brokk_bifrost_core::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
-use crate::analyzer::{
-    CodeUnit, CodeUnitIndex, CodeUnitType, ImportAnalysisProvider, ImportInfo, ProjectFile,
-};
-use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
+use brokk_bifrost_core::hash::HashSet;
 use std::collections::BTreeSet;
 
-use super::declarations::{collect_python_identifiers, parse_python_tree};
-use super::imports::{
+use crate::declarations::{collect_python_identifiers, parse_python_tree};
+use crate::imports::{
     PythonImportDetails, python_import_details, python_import_infos_from_node,
     python_namespace_binding_module, python_namespace_binding_name, resolve_exported_fqn,
     resolve_import_bindings, resolve_python_relative_module,
 };
-use super::usage_index::PythonUsageIndex;
+use crate::usage_index::PythonUsageIndex;
 
 /// The analyzer-resident products Python's language logic resolves through, on
 /// top of the two core capability traits it reads declarations and imports
@@ -39,7 +37,7 @@ use super::usage_index::PythonUsageIndex;
 /// everything it calls take this trait, so the build cannot re-enter the
 /// `OnceLock` it is filling. Code that runs once the index exists takes
 /// [`PythonUsageSource`].
-pub(crate) trait PythonAnalysisSource: CodeUnitIndex + ImportAnalysisProvider {
+pub trait PythonAnalysisSource: CodeUnitIndex + ImportAnalysisProvider {
     /// Path-derived module units for `module_fq`; `None` when the store could
     /// not answer the path-symbol query at all.
     fn path_module_fqn(&self, module_fq: &str) -> Option<Vec<CodeUnit>>;
@@ -65,11 +63,11 @@ pub(crate) trait PythonAnalysisSource: CodeUnitIndex + ImportAnalysisProvider {
 
 /// [`PythonAnalysisSource`] plus the built usage index. Everything reached from
 /// the export/importer walks needs it; the index build itself must not.
-pub(crate) trait PythonUsageSource: PythonAnalysisSource {
+pub trait PythonUsageSource: PythonAnalysisSource {
     fn usage_index(&self) -> &PythonUsageIndex;
 }
 
-pub(super) fn extract_type_identifiers(source: &str) -> BTreeSet<String> {
+pub fn extract_type_identifiers(source: &str) -> BTreeSet<String> {
     let Some(tree) = parse_python_tree(source) else {
         return BTreeSet::new();
     };
@@ -78,7 +76,7 @@ pub(super) fn extract_type_identifiers(source: &str) -> BTreeSet<String> {
     identifiers.into_iter().collect()
 }
 
-pub(crate) fn resolve_module_code_unit(
+pub fn resolve_module_code_unit(
     python: &dyn PythonAnalysisSource,
     module_fq: &str,
 ) -> Option<CodeUnit> {
@@ -96,7 +94,7 @@ pub(crate) fn resolve_module_code_unit(
 /// definition-lookup path per FQN exactly as the single-FQN version does. Preserves its per-item
 /// semantics precisely, including that a path lookup which succeeds but finds no module unit does
 /// *not* fall through to the definition lookup.
-pub(crate) fn resolve_module_code_units_batch(
+pub fn resolve_module_code_units_batch(
     python: &dyn PythonAnalysisSource,
     module_fqs: &[String],
 ) -> Vec<Option<CodeUnit>> {
@@ -118,7 +116,7 @@ pub(crate) fn resolve_module_code_units_batch(
     results
 }
 
-pub(super) fn compute_export_index_of(
+pub fn compute_export_index_of(
     python: &dyn PythonAnalysisSource,
     file: &ProjectFile,
 ) -> ExportIndex {
@@ -157,7 +155,7 @@ pub(super) fn compute_export_index_of(
     finish_export_index(events, index)
 }
 
-pub(crate) fn export_index_from_file_facts(
+pub fn export_index_from_file_facts(
     python: &dyn PythonAnalysisSource,
     file: &ProjectFile,
     facts: &dyn IndexedFileFacts,
@@ -347,7 +345,7 @@ fn record_single_reexport_event(
     ));
 }
 
-pub(crate) fn import_binder_from_imports(
+pub fn import_binder_from_imports(
     python: &dyn PythonAnalysisSource,
     file: &ProjectFile,
     imports: &[ImportInfo],
@@ -427,7 +425,7 @@ pub(crate) fn import_binder_from_imports(
     binder
 }
 
-pub(super) fn public_declarations_in_module(
+pub fn public_declarations_in_module(
     python: &dyn PythonAnalysisSource,
     module_fq: &str,
 ) -> Vec<CodeUnit> {
@@ -441,7 +439,7 @@ pub(super) fn public_declarations_in_module(
         .collect()
 }
 
-pub(super) fn resolve_base_class(
+pub fn resolve_base_class(
     python: &dyn PythonAnalysisSource,
     code_unit: &CodeUnit,
     raw: &str,
@@ -495,7 +493,7 @@ pub(super) fn resolve_base_class(
         .or_else(|| python.definitions(trimmed).next())
 }
 
-pub(super) fn render_skeleton_recursive(
+pub fn render_skeleton_recursive(
     index: &dyn CodeUnitIndex,
     code_unit: &CodeUnit,
     indent: &str,
