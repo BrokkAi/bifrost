@@ -61,14 +61,21 @@ test("uses the platform executable name", () => {
   assert.equal(nativeBinaryPath("C:\\bundle", "win32"), "C:\\bundle/bin/bifrost.exe");
 });
 
-test("forwards arguments and process status", () => {
+test("forwards all CLI arguments unchanged and returns process status", () => {
   const child = new EventEmitter();
   child.kill = () => true;
+  const forwardedArgs = [
+    "--future-native-flag",
+    "value with spaces",
+    "--option=value",
+    "--",
+    "--literal-after-separator",
+  ];
   let invocation;
   let exitCode;
   launch(
     "/tmp/bundle",
-    ["--version"],
+    forwardedArgs,
     "linux",
     (binary, args, options) => {
       invocation = { binary, args, options };
@@ -79,7 +86,7 @@ test("forwards arguments and process status", () => {
     },
   );
   assert.equal(invocation.binary, "/tmp/bundle/bin/bifrost");
-  assert.deepEqual(invocation.args, ["--version"]);
+  assert.deepEqual(invocation.args, forwardedArgs);
   assert.equal(invocation.options.stdio, "inherit");
   child.emit("exit", 17, null);
   assert.equal(exitCode, 17);
