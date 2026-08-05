@@ -46,7 +46,7 @@ Current Codex does not advertise standard roots. For any rootless connection who
 
 ## Protocol Revisions
 
-With `BIFROST_MCP_RMCP=on` (see below), Bifrost speaks MCP through [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the official Rust SDK, and accepts every revision that SDK knows, including `2025-11-25` and `2026-07-28`. The negotiated revision is whatever the client asks for. Without that variable, Bifrost serves `2025-11-25` from its hand-written implementation and none of the rest of this section applies.
+Bifrost speaks MCP through [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the official Rust SDK, by default. It accepts every revision that SDK knows, including `2025-11-25` and `2026-07-28`. The negotiated revision is whatever the client asks for. Set `BIFROST_MCP_RMCP=off` to use the hand-written rollback host, which serves only `2025-11-25`.
 
 ## Request budget
 
@@ -60,11 +60,11 @@ A `2026-07-28` client gets three things a `2025-11-25` client does not. `server/
 
 Rootless activation differs by revision because `2026-07-28` removed the post-initialization roots lifecycle. A client on that revision receives an `input_required` result carrying an embedded `roots/list` request, answers it with `inputResponses`, and retries the same tool call; Bifrost validates those roots exactly as it validates a `roots/list` reply, so the echoed `requestState` grants nothing on its own. Only one such round is offered per call.
 
-### Opting into the rmcp host
+### MCP host selection
 
-Bifrost currently serves MCP from its long-standing hand-written protocol implementation. `BIFROST_MCP_RMCP=on` switches that process to the `rmcp`-backed host instead, which is what everything in this section describes: `2026-07-28`, `server/discover`, `resultType`, cache hints, and MRTR activation are available only there. The hand-written host speaks `2025-11-25` and no newer revision.
+Bifrost serves MCP from the `rmcp`-backed host by default. This host provides `2026-07-28`, `server/discover`, `resultType`, cache hints, and MRTR activation. `BIFROST_MCP_RMCP=on` also selects this host explicitly.
 
-The switch is opt-in because `rmcp` 3.0 was days old when Bifrost adopted it. Making it the default is a deliberate later step, and removing the hand-written host is the step after that.
+Set `BIFROST_MCP_RMCP=off` to select the long-standing hand-written rollback host. It speaks `2025-11-25` and no newer revision. Bifrost retains and tests this host for rollback; this promotion does not remove it.
 
 Explicit `--root` integrations remain authoritative and do not require roots negotiation. The packaged launcher also translates `BIFROST_WORKSPACE_ROOT` into an explicit `--root`. Prefer an explicit root for manual fixed-project configurations. Packaged plugins use client-provided roots or Codex sandbox-state metadata so package-local command resolution stays independent from analyzer scope.
 

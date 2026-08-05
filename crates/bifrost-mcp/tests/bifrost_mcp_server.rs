@@ -1023,9 +1023,8 @@ fn bifrost_mcp_query_code_transports_explain_and_profile_reports() {
 #[test]
 fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     // Both hosts: the upstream sync that added request correlation ids
-    // landed them on the fallback host alone, and only a wire assertion
-    // that runs against both would have caught the default host missing
-    // them.
+    // landed them on the hand-written host alone. Only a wire assertion
+    // against both hosts would have caught the rmcp omission.
     for host in McpHost::ALL {
         bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions_on(host);
     }
@@ -3603,11 +3602,11 @@ fn call_tool_answering_roots(
 /// *instead of* `initialize`, carrying the negotiation keys in `_meta`, and
 /// rmcp answers it before any session exists. It is not a mid-session call.
 #[test]
-fn mcp_2026_07_28_discovery_answers_before_any_handshake() {
+fn default_mcp_host_answers_2026_07_28_discovery_before_any_handshake() {
     let workspace = InlineTestProject::new()
         .file("DiscoverMe.java", "class DiscoverMe {}\n")
         .build();
-    let mut child = spawn_server_on(McpHost::Rmcp, workspace.root(), "searchtools");
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
@@ -4168,17 +4167,16 @@ fn profiled_tool_calls_emit_all_transport_phases_on(host: McpHost) {
 
 /// Which MCP host serves a session.
 ///
-/// The hand-written stack is the default. The rmcp stack is selected with
-/// `BIFROST_MCP_RMCP=on`. Rootless behaviour -- where all
-/// client-supplied workspace authorization lives -- is asserted against both,
-/// because whichever one an operator falls back to has to be correct, and
-/// because testing only one host is what let a pre-handshake bypass reach a
-/// green suite once already.
+/// The rmcp stack is the default. `BIFROST_MCP_RMCP=off` selects the
+/// hand-written rollback stack. Rootless behaviour -- where all client-supplied
+/// workspace authorization lives -- is asserted against both. The rollback
+/// host must stay correct, and testing one host once let a pre-handshake bypass
+/// reach a green suite.
 #[derive(Clone, Copy, Debug)]
 enum McpHost {
-    /// The hand-written stack in `mcp_common.rs`. Still the default.
+    /// The hand-written rollback stack in `mcp_common.rs`.
     HandWritten,
-    /// The `rmcp`-backed host in `rmcp_host.rs`.
+    /// The default `rmcp`-backed host in `rmcp_host.rs`.
     Rmcp,
 }
 

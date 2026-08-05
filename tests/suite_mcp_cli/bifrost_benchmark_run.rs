@@ -450,13 +450,16 @@ fn interactive_session_prewarm_keeps_workspace_build_out_of_timed_profile_sample
     drop(session);
 
     // Two runs, one per side of the #1491 benchmark-validity fix. An ambient
-    // dogfooding `BIFROST_MCP_RMCP=on` must be stripped by the harness, so the
-    // first run still measures the default stack. Selecting the rmcp stack
-    // requires the explicit benchmark-facing variable, and that run must also
-    // satisfy the transport-phase profile contract.
+    // `BIFROST_MCP_RMCP=off` must be stripped by the harness, so the first run
+    // measures the default rmcp stack. Selecting the legacy rollback requires
+    // the explicit benchmark-facing variable. Both runs must satisfy the
+    // transport-phase profile contract.
     for (run_label, benchmark_env) in [
-        ("ambient-stripped", ("BIFROST_MCP_RMCP", "on")),
-        ("explicit-rmcp", ("BIFROST_BENCHMARK_MCP_RMCP", "on")),
+        ("ambient-stripped-default-rmcp", ("BIFROST_MCP_RMCP", "off")),
+        (
+            "explicit-legacy-rollback",
+            ("BIFROST_BENCHMARK_MCP_RMCP", "off"),
+        ),
     ] {
         let manifest_dir = temp.path().join(format!("manifest-{run_label}"));
         fs::create_dir_all(&manifest_dir).expect("manifest dir");

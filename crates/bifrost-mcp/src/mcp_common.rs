@@ -382,11 +382,9 @@ pub fn run_stdio_server(
 
 /// Selects the `rmcp`-backed MCP host instead of the hand-written stack below.
 ///
-/// Off by default while the migration lands. The `rmcp` host is complete and
-/// the contract suite exercises both, but `rmcp` 3.0 was days old when Bifrost
-/// adopted it (issue #1328), so the switch stays opt-in until the new host has
-/// run against real clients. Flipping the default to `on` is a deliberate,
-/// separate step; deleting the stack below is the step after that.
+/// The `rmcp` host is the default after the promotion validation in issue
+/// #1581. `on` keeps an explicit rmcp selector for controlled launches. `off`
+/// keeps the hand-written stack available as the tested rollback host.
 ///
 /// While both hosts exist, anything that changes MCP behaviour has to be
 /// applied to both. That is not hypothetical -- the first upstream sync after
@@ -397,7 +395,7 @@ pub const MCP_RMCP_HOST_ENV: &str = "BIFROST_MCP_RMCP";
 
 fn rmcp_host_enabled(value: Option<&OsStr>) -> Result<bool, String> {
     match value {
-        None => Ok(false),
+        None => Ok(true),
         Some(value) if value == "on" => Ok(true),
         Some(value) if value == "off" => Ok(false),
         Some(value) => Err(format!(
@@ -1905,11 +1903,10 @@ mod tests {
     }
 
     #[test]
-    fn the_rmcp_host_is_opt_in_and_the_switch_is_strict() {
-        // Unset means the hand-written host for now. Getting this backwards
-        // would ship an untried protocol stack while every test claimed
-        // otherwise, so it is asserted rather than assumed.
-        assert!(!rmcp_host_enabled(None).unwrap());
+    fn the_rmcp_host_is_default_and_the_switch_is_strict() {
+        // Unset selects rmcp. The explicit off value keeps the tested legacy
+        // rollback path available while both implementations remain.
+        assert!(rmcp_host_enabled(None).unwrap());
         assert!(rmcp_host_enabled(Some(OsStr::new("on"))).unwrap());
         assert!(!rmcp_host_enabled(Some(OsStr::new("off"))).unwrap());
 

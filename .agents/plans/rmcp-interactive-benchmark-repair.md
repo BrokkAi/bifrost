@@ -6,9 +6,9 @@ This document follows `.agents/PLANS.md`. A contributor must update this plan af
 
 ## Purpose / Big Picture
 
-Bifrost must use the RMCP host by default to receive current MCP protocol support, including asynchronous protocol work. The default change remains blocked because two usage-scan cases fail the interactive benchmark. The host already returns truthful bounded results and supports cancellation. This work restores enough response time for delivery and makes the benchmark retain required transport timings when a large trace removes early stderr data.
+Bifrost must use the RMCP host by default to receive current MCP protocol support, including asynchronous protocol work. Two usage-scan cases first blocked that promotion. This work restored enough response time for delivery and made the benchmark retain required transport timings when a large trace removes early stderr data.
 
-After this change, `scripts/run-interactive-latency.sh --profile` must pass with `BIFROST_BENCHMARK_MCP_RMCP=on`. The two usage scans must finish inside five seconds. Each measured profile must report `queue_wait`, `execution`, `response_queue_wait`, and `writer_delivery`, even when its raw stderr tail is truncated. This plan does not change the default host selector. A later promotion change will use the successful benchmark evidence.
+The local and Ubuntu benchmarks now pass with `BIFROST_BENCHMARK_MCP_RMCP=on`. After that evidence passed, the user authorized the promotion on this branch. An unset `BIFROST_MCP_RMCP` must now select RMCP. Explicit `off` must keep the tested hand-written rollback host. This promotion does not remove either host.
 
 ## Progress
 
@@ -23,6 +23,10 @@ After this change, `scripts/run-interactive-latency.sh --profile` must pass with
 - [x] (2026-08-05 15:32Z) Passed the local release interactive benchmark with RMCP enabled. All 10 cases passed.
 - [x] (2026-08-05 15:34Z) Pushed the branch and dispatched GitHub Actions run `31020949528` with profile capture and Slack disabled.
 - [x] (2026-08-05 15:48Z) Passed the Ubuntu `interactive-latency` job, downloaded its artifact, and recorded the remote evidence.
+- [x] (2026-08-05 16:10Z) Verified that issue #1581 remains open and that blocker issues #1503 and #1309 are closed.
+- [x] (2026-08-05 16:18Z) Changed the unset selector to RMCP. Kept explicit `off` as the legacy rollback. Updated behavior tests, comments, benchmark coverage, and MCP documentation.
+- [x] (2026-08-05 16:35Z) Passed 122 MCP unit tests, 31 MCP integration tests, 11 benchmark CLI tests, isolated doctests, formatting, full workspace all-feature Clippy, and final policy review.
+- [ ] Commit and push the promotion change, then open one ready pull request.
 
 ## Surprises & Discoveries
 
@@ -71,6 +75,18 @@ After this change, `scripts/run-interactive-latency.sh --profile` must pass with
 - Observation: The separate broad benchmark job did not run a corpus case.
   Evidence: The dispatch supplied `repo=bifrost-self`, but `benchmark/targets.toml` has no repo with that name. The broad harness stopped before analysis. The targeted interactive job uses `benchmark/interactive-latency.toml`, where `bifrost-self` is valid, and passed.
 
+- Observation: The full MCP code suite passes with RMCP as the unset default.
+  Evidence: `cargo test -p brokk-bifrost-mcp --lib --tests` passed 122 unit tests and 31 integration tests. The default 2026-07-28 discovery test and the explicit two-host tests passed.
+
+- Observation: The normal doctest command can reuse mixed Rust 1.96 metadata.
+  Evidence: The code tests passed, but the doctest compile failed with E0514 because the normal target contained rustup and Homebrew artifacts. The managed isolated target with Homebrew Cargo and rustc passed and removed itself.
+
+- Observation: The final policy result matches the branch baseline.
+  Evidence: All 12 `bifrost.code-smells` rules completed with 280 findings and zero diagnostics. Seven findings touch changed source or test files. They are existing operations outside changed lines or reviewed test-loop prompts. No promotion edit adds a finding.
+
+- Observation: `run_policy` remains slower than the repository threshold.
+  Evidence: Identical calls took 4,896 ms with an unreliable result and 11,342 ms with a complete finding result. New evidence was added to issue #1452. A later final call took 5,025 ms before warm repeats fell below the threshold.
+
 ## Decision Log
 
 - Decision: Keep RMCP and its current protocol behavior unchanged.
@@ -93,8 +109,12 @@ After this change, `scripts/run-interactive-latency.sh --profile` must pass with
   Rationale: A value of zero would create false performance evidence. A phase that the host did not emit must still fail validation.
   Date/Author: 2026-08-05 / Codex
 
-- Decision: Keep the RMCP default selector change outside this branch.
-  Rationale: GitHub issue #1581 requires successful promotion evidence before the unset selector changes. This branch produces that evidence.
+- Decision: Keep the RMCP default selector change outside this branch. Superseded on 2026-08-05.
+  Rationale: GitHub issue #1581 required successful promotion evidence before the unset selector changed. The branch first produced that evidence.
+  Date/Author: 2026-08-05 / Codex
+
+- Decision: Promote RMCP on this branch after the successful branch benchmark.
+  Rationale: The user explicitly extended this branch after the local and Ubuntu gates passed. Issues #1503 and #1309 are closed. Explicit `off` keeps the tested rollback.
   Date/Author: 2026-08-05 / Codex
 
 - Decision: Pin the Homebrew Cargo and Rust compiler for the all-feature gate.
@@ -107,7 +127,7 @@ The repair is complete. Bifrost now keeps transport evidence outside the raw tra
 
 GitHub Actions run `31020949528` passed its targeted `interactive-latency` job on revision `7594bf75f2a871cc4573761a7fa472b1f42f41c1`. All ten cases passed. The artifact proves that all four transport phases remain present in all 220 profiles, including 49 truncated raw traces. The separate broad job failed only because the supplied `bifrost-self` selector does not exist in its different manifest. It did not test code.
 
-This branch now supplies the required RMCP promotion evidence. The RMCP default selector remains unchanged by design. A later promotion change can use this result.
+This branch supplies the required RMCP promotion evidence. The user then authorized the selector change on this branch. The validated implementation now makes RMCP the unset default and retains explicit `off` for rollback. The hand-written host remains present and tested. The commit, push, and pull request remain in progress.
 
 ## Context and Orientation
 
@@ -154,6 +174,10 @@ Run the local release benchmark with RMCP enabled and profile capture. It must r
 Milestone 5 records remote branch evidence. Commit the completed implementation and validation notes. Push the branch. Dispatch `.github/workflows/benchmark.yml` with profile capture enabled, strict comparison disabled for this exploratory branch, and Slack disabled. The broad benchmark job can report unrelated corpus regressions. This plan accepts only the `interactive-latency` job as RMCP promotion evidence.
 
 Download the `interactive-latency-<run-id>` artifact. Record the branch revision, runner system, selector, exact command, p50, p95, bounded count, fairness values, artifact name, and run URL. If the interactive job fails, inspect the measured profile before changing any limit. Update this plan and continue with the smallest supported correction.
+
+Milestone 6 promotes the validated host. Change `rmcp_host_enabled(None)` to select RMCP. Keep explicit `on` and `off` strict. Update the selector unit test. Make one 2026-07-28 discovery test start the server without a selector, so it proves the process default from end to end. Keep the two-host contract suite and explicit legacy rollback lane.
+
+Update host-default comments and public MCP documentation. Change the benchmark environment-isolation test to prove that an ambient legacy selector cannot override the new default. Use the benchmark-facing selector to prove explicit legacy rollback. Do not remove the hand-written host.
 
 ## Concrete Steps
 
@@ -206,6 +230,15 @@ Push and dispatch the branch benchmark:
 
 Find the dispatched run, wait for `interactive-latency`, and download its artifact. Do not post to Slack. Record all evidence in this plan.
 
+After the user authorizes promotion, run:
+
+    cargo fmt --all -- --check
+    cargo test -p brokk-bifrost-mcp mcp_common::tests::the_rmcp_host_is_default_and_the_switch_is_strict
+    cargo test -p brokk-bifrost-mcp --test bifrost_mcp_server default_mcp_host_answers_2026_07_28_discovery_before_any_handshake -- --nocapture
+    cargo test -p brokk-bifrost --test suite_mcp_cli bifrost_benchmark_run -- --nocapture
+
+Run the same final policy selection. Then commit and push only the promotion files. Open one ready pull request against `master` and link issue #1581.
+
 ## Validation and Acceptance
 
 The transport unit test must prove that raw trace truncation can remove `queue_wait` without removing the retained timing line. The test must also prove that the report has no duplicate timing sample when raw and retained text both contain the same phase.
@@ -218,7 +251,7 @@ The local release benchmark must show ten successful cases. `scan-semantic-proce
 
 The GitHub `interactive-latency` job must pass on the branch revision and publish its artifact. A failure in the separate broad corpus job does not reject this targeted repair unless it identifies a regression caused by changed code.
 
-Do not change the default selector, remove the legacy host, raise the latency limit, or broaden this work into analyzer optimization. If the repair cannot meet the gate, record the dominant phase and return to the user for the later timing-policy decision described in the Decision Log.
+Do not remove the legacy host, raise the latency limit, or broaden this work into analyzer optimization. The promotion must keep `BIFROST_MCP_RMCP=off` as the rollback selector.
 
 ## Idempotence and Recovery
 
@@ -289,4 +322,4 @@ The exact private type names for retained entries can change during implementati
 
 `crates/bifrost-analysis/src/searchtools/scan_usages.rs` must keep `ScanUsagesExecutionContext::with_cancellation_and_max_duration` and both public request fields unchanged. Only the default constant and its explanation change.
 
-Revision note, 2026-08-05: Created the initial plan from the failed RMCP promotion run. The plan separates real response-budget work from bounded profile capture and keeps the selector promotion outside this branch. Recorded the first checkpoint commit before source implementation. Corrected the benchmark unit-test target. Recorded the completed transport-capture, scan-budget, local validation, and local benchmark milestones. Added the successful Ubuntu interactive result and artifact evidence. Removed the invalid broad-manifest repo selector from the replay command.
+Revision note, 2026-08-05: Created the initial plan from the failed RMCP promotion run. The plan separates real response-budget work from bounded profile capture. Recorded the first checkpoint commit before source implementation. Corrected the benchmark unit-test target. Recorded the completed transport-capture, scan-budget, local validation, and local benchmark milestones. Added the successful Ubuntu interactive result and artifact evidence. Removed the invalid broad-manifest repo selector from the replay command. Added Milestone 6 after the user authorized promotion on this branch. Recorded the completed selector, rollback, behavior-test, Clippy, package-test, doctest, and policy gates.
