@@ -1108,7 +1108,7 @@ fn execute_probes(
     let worker_count = probe_parallelism.min(work.len()).max(1);
     let next = AtomicUsize::new(0);
     let (sender, receiver) = mpsc::channel::<(usize, ProbeOutcome, bool, u64)>();
-    let results: Vec<(usize, ProbeOutcome, bool, u64)> = thread::scope(|scope| {
+    thread::scope(|scope| -> Result<(), String> {
         for _ in 0..worker_count {
             let next = &next;
             let sender = sender.clone();
@@ -1149,25 +1149,26 @@ fn execute_probes(
             });
         }
         drop(sender);
-        receiver.iter().collect()
-    });
-    for (index, outcome, compared_modes, elapsed_ms) in results {
-        if compared_modes {
-            summary.render_mode_comparisons += 1;
+        // Apply outcomes as they arrive, not after the wave: the dump write
+        // for a finished probe must reach disk even when a sibling probe runs
+        // for days (#1689 -- the collect-then-apply shape still withheld every
+        // record until the slowest probe in the wave returned).
+        for (index, outcome, compared_modes, elapsed_ms) in receiver.iter() {
+            if compared_modes {
+                summary.render_mode_comparisons += 1;
+            }
+            if matches!(outcome, ProbeOutcome::Error(_)) {
+                summary.calls_errored += 1;
+            }
+            summary.calls_executed += 1;
+            probes[index].elapsed_ms = Some(elapsed_ms);
+            probes[index].outcome = Some(outcome);
+            if let Some(writer) = dump.as_deref_mut() {
+                write_probe_record_line(writer, &probes[index])?;
+            }
         }
-        if matches!(outcome, ProbeOutcome::Error(_)) {
-            summary.calls_errored += 1;
-        }
-        summary.calls_executed += 1;
-        probes[index].elapsed_ms = Some(elapsed_ms);
-        probes[index].outcome = Some(outcome);
-        // Stream the record as soon as its outcome lands: an OOM or panic
-        // mid-run must still leave the completed probes on disk (#1689).
-        if let Some(writer) = dump.as_deref_mut() {
-            write_probe_record_line(writer, &probes[index])?;
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn call_tool(
