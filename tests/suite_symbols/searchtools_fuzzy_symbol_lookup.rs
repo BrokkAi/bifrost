@@ -1841,6 +1841,32 @@ doc! {macro_rules! join {
 }
 
 #[test]
+fn rust_crate_qualified_suffix_lookup_returns_indexed_location() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"serde-json\"\nversion = \"1.0.0\"\n",
+        )
+        .file("src/lib.rs", "pub mod value;\n")
+        .file("src/value.rs", "pub fn to_value() {}\n")
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+
+    let locations = get_symbol_locations(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["value.to_value".to_string()],
+        },
+    );
+
+    assert!(locations.not_found.is_empty(), "{locations:#?}");
+    assert!(locations.ambiguous.is_empty(), "{locations:#?}");
+    assert_eq!(1, locations.locations.len(), "{locations:#?}");
+    assert_eq!("serde_json.value.to_value", locations.locations[0].symbol);
+    assert_eq!("src/value.rs", locations.locations[0].path);
+}
+
+#[test]
 fn search_symbols_ranks_cpp_implementations_ahead_of_headers_and_noise() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

@@ -211,7 +211,7 @@ the focus.
     `fd816b03037760fde6fa5f2b0df1bd776859f18b9da63816467ad163d3169e72`.
     Final live GitHub audit confirms #1433, #1465, and #1467 are closed and
     assigned only to `jbellis`.
-- [ ] Complete C++ ranks eleven through twenty and publish its evidence and
+- [x] Complete C++ ranks eleven through twenty and publish its evidence and
   user summary.
   - [x] (2026-08-02 17:04Z) Completed C++ rank eleven
     `libarchive__libarchive` at pinned head `40a71c83`. The live selector
@@ -420,7 +420,7 @@ the focus.
     workspace all-target/all-feature Clippy pass. The broad featureless run
     reached one unrelated C# wall-clock failure after 1,529 sibling tests;
     that exact test passed alone.
-  - [ ] (2026-08-06) Complete the fresh-epoch language certification and
+  - [x] (2026-08-06) Complete the fresh-epoch language certification and
     reclose earlier ranks in repository order. The first ten-repository replay
     at clean pushed head `1f0bd3ac` queried every configured target with no
     file errors, skips, or truncation, but it correctly rejected the language
@@ -633,6 +633,39 @@ the focus.
       and
       `133f08a76c7db61e02603f1570624f5a15da980c13578301985fcbab1c307493`.
       The next active repository is rank nineteen `pyro-ppl__pyro`.
+    - [x] (2026-08-05) Rank nineteen `pyro-ppl__pyro` completed at pinned
+      head `6cc3ecdc`. Its complete C++ surface is one source file. The final
+      clean certification audited all 589 candidates and all 581 sites. It
+      queried all four inverse targets and reported six consistent and 575
+      inconclusive rows. It had zero missing rows, errors, skips, truncation,
+      or candidate exclusions. No issue was necessary.
+    - [x] (2026-08-05) Rank twenty `cppcheck-opensource__cppcheck` completed
+      at pinned head `4517bc76`. The uncapped replay exposed one valid missing
+      type reference after the earlier 1,000-target boundary. Jonathan-assigned
+      issue #1734 grouped the forward-route and inverse-parity symptom because
+      both came from one visible same-FQN declaration defect. Commit `9c45dacc`
+      retains physically visible same-FQN type declarations while it preserves
+      alias identity. The public symbols API resolves the witness to the real
+      `XMLDocument` body. The final-head exact report has an exact inverse hit
+      and zero missing rows. Issue #1734 is closed and assigned only to
+      `jbellis`. The final clean repository replay audited 290 files, 296,420
+      candidates, and 10,000 sites. It queried all 1,225 inverse targets and
+      reported 3,136 consistent, 110 editor-only, 34 honestly unproven, 6,720
+      inconclusive, and zero missing rows. It had no file errors, skips,
+      truncation, or candidate exclusions.
+    - [x] (2026-08-05) Rebuilt at clean published head `1ed3c614` and
+      certified all ten selected C++ repositories with a 2,000-target cap.
+      The accepted envelope contains 1,425 files, 667,798 candidates, 73,885
+      sites, and 5,214/5,214 inverse targets. It has zero missing rows, file
+      errors, candidate exclusions, skipped targets, or truncation. The raw
+      JSONL SHA-256 is
+      `4dd1200ac582e9954dd2b2d786d3225055c12f54f9f708f311a78d4db31c270e`.
+      The durable manifest and summary are
+      `.agents/docs/reference-differential/cpp-task-ranks11-20-1ed3c614.jsonl`
+      and its `-summary.md` companion. A later fast-forward to `8c107ce1`
+      changed repository cloning, dependency checks, and license generation.
+      It did not change C++ or shared symbol behavior. The focused #1734
+      regression passed again after that fast-forward.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user

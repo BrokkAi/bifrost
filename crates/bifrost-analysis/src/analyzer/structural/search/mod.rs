@@ -954,6 +954,7 @@ struct PipelineRenderCache {
     conflicting_sources: HashSet<ProjectFile>,
     declaration_ranges: HashMap<DeclarationValue, Option<CodeQueryRange>>,
     enclosing_units: HashMap<(ProjectFile, usize, usize), Option<CodeUnit>>,
+    file_declarations: HashMap<ProjectFile, Vec<(CodeUnit, Vec<Range>)>>,
     source_loads_sealed: bool,
 }
 
@@ -1065,10 +1066,40 @@ impl PipelineRenderCache {
         start_line: usize,
         end_line: usize,
     ) -> Option<CodeUnit> {
-        self.enclosing_units
-            .entry((file.clone(), start_line, end_line))
-            .or_insert_with(|| analyzer.enclosing_code_unit_for_lines(file, start_line, end_line))
-            .clone()
+        let cache_key = (file.clone(), start_line, end_line);
+        if let Some(enclosing) = self.enclosing_units.get(&cache_key) {
+            return enclosing.clone();
+        }
+
+        // A structural query commonly renders many matches from one source
+        // file. Calling `enclosing_code_unit_for_lines` for every match
+        // repeatedly clones and scans the full declaration set. Retain the
+        // declaration ranges once for this render pass instead.
+        let declarations = self
+            .file_declarations
+            .entry(file.clone())
+            .or_insert_with(|| {
+                analyzer
+                    .declarations(file)
+                    .into_iter()
+                    .map(|code_unit| {
+                        let ranges = analyzer.ranges(&code_unit);
+                        (code_unit, ranges)
+                    })
+                    .collect()
+            });
+        let enclosing = declarations
+            .iter()
+            .filter_map(|(code_unit, ranges)| {
+                let range = ranges
+                    .iter()
+                    .find(|range| range.start_line <= start_line && range.end_line >= end_line)?;
+                Some((range.end_line - range.start_line, code_unit))
+            })
+            .min_by_key(|(span, _)| *span)
+            .map(|(_, code_unit)| code_unit.clone());
+        self.enclosing_units.insert(cache_key, enclosing.clone());
+        enclosing
     }
 }
 

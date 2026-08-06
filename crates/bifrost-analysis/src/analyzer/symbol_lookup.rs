@@ -342,6 +342,11 @@ fn suffix_resolution_from_index(
     {
         return Some(CodeUnitResolution::Resolved(matches));
     }
+    if let Some(CodeUnitResolution::Resolved(matches)) =
+        unique_resolution_from_matches(analyzer, exact_suffix_matches, include)
+    {
+        return Some(CodeUnitResolution::Resolved(matches));
+    }
 
     drop(stage1_scope);
 

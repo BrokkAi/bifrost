@@ -212,6 +212,7 @@ pub(super) struct RankedSearchCandidate {
     score: SymbolCandidateScore,
     line: usize,
     primary_range: Range,
+    is_type_alias: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -377,7 +378,7 @@ pub fn search_symbols_with_cancellation(
                     language_for_file(candidate.code_unit.source()),
                 );
             if params.include_tests || !is_test {
-                filtered.push((candidate.code_unit, range, is_test));
+                filtered.push((candidate.code_unit, range, is_test, candidate.is_type_alias));
             }
         }
         filtered
@@ -407,8 +408,9 @@ pub fn search_symbols_with_cancellation(
         .flatten()
         .map(|candidate| candidate.code_unit.fq_name())
         .collect();
-    let (model_symbols, total_model_symbols) = analyzer
-        .semantic_model_overlay()
+    let semantic_model_overlay = analyzer.semantic_model_overlay();
+    let (model_symbols, total_model_symbols) = semantic_model_overlay
+        .as_deref()
         .map(|overlay| {
             let (matched, total, model_complete) = overlay.search_with_limit_filter(
                 &pattern_batch,
@@ -483,25 +485,34 @@ pub fn search_symbols_with_cancellation(
                     &code_units,
                     CodeUnitType::Class,
                     render_context,
+                    semantic_model_overlay.as_deref(),
                 ),
-                functions: collect_callable_kind_names(analyzer, &code_units, render_context),
+                functions: collect_callable_kind_names(
+                    analyzer,
+                    &code_units,
+                    render_context,
+                    semantic_model_overlay.as_deref(),
+                ),
                 fields: collect_ranked_kind_names(
                     analyzer,
                     &code_units,
                     CodeUnitType::Field,
                     render_context,
+                    semantic_model_overlay.as_deref(),
                 ),
                 modules: collect_ranked_kind_names(
                     analyzer,
                     &code_units,
                     CodeUnitType::Module,
                     render_context,
+                    semantic_model_overlay.as_deref(),
                 ),
                 macros: collect_ranked_kind_names(
                     analyzer,
                     &code_units,
                     CodeUnitType::Macro,
                     render_context,
+                    semantic_model_overlay.as_deref(),
                 ),
             });
         }
@@ -2038,12 +2049,12 @@ fn is_model_ancestor_target(symbol: &crate::analyzer::semantic_model::SemanticMo
 pub(super) fn rank_search_symbol_candidates(
     analyzer: &dyn IAnalyzer,
     patterns: &[String],
-    code_units: Vec<(CodeUnit, Range, bool)>,
+    code_units: Vec<(CodeUnit, Range, bool, bool)>,
     cancellation: Option<&crate::CancellationToken>,
 ) -> (Vec<RankedSearchCandidate>, bool) {
     let mut ranked = Vec::new();
     let mut complete = true;
-    for (code_unit, primary_range, is_test) in code_units {
+    for (code_unit, primary_range, is_test, is_type_alias) in code_units {
         if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
             complete = false;
             break;
@@ -2053,6 +2064,7 @@ pub(super) fn rank_search_symbol_candidates(
             score: score_search_symbol_candidate(analyzer, patterns, &code_unit, is_test),
             code_unit,
             primary_range,
+            is_type_alias,
         });
     }
     ranked.sort_by(compare_ranked_search_candidates);
@@ -2453,39 +2465,50 @@ pub(super) fn collect_ranked_kind_names(
     code_units: &[RankedSearchCandidate],
     kind: CodeUnitType,
     render_context: Option<&DeclarationNameRangeContext>,
+    semantic_model_overlay: Option<&crate::analyzer::semantic_model::SemanticModelOverlay>,
 ) -> Vec<SearchSymbolHit> {
-    collect_ranked_names_by(analyzer, code_units, render_context, |unit| {
-        unit.kind() == kind
-    })
+    collect_ranked_names_by(
+        analyzer,
+        code_units,
+        render_context,
+        semantic_model_overlay,
+        |unit| unit.kind() == kind,
+    )
 }
 
 pub(super) fn collect_callable_kind_names(
     analyzer: &dyn IAnalyzer,
     code_units: &[RankedSearchCandidate],
     render_context: Option<&DeclarationNameRangeContext>,
+    semantic_model_overlay: Option<&crate::analyzer::semantic_model::SemanticModelOverlay>,
 ) -> Vec<SearchSymbolHit> {
-    collect_ranked_names_by(analyzer, code_units, render_context, CodeUnit::is_callable)
+    collect_ranked_names_by(
+        analyzer,
+        code_units,
+        render_context,
+        semantic_model_overlay,
+        CodeUnit::is_callable,
+    )
 }
 
 pub(super) fn collect_ranked_names_by(
     analyzer: &dyn IAnalyzer,
     code_units: &[RankedSearchCandidate],
     render_context: Option<&DeclarationNameRangeContext>,
+    semantic_model_overlay: Option<&crate::analyzer::semantic_model::SemanticModelOverlay>,
     matches_kind: impl Fn(&CodeUnit) -> bool,
 ) -> Vec<SearchSymbolHit> {
     let mut hits: Vec<_> = code_units
         .iter()
         .filter(|candidate| matches_kind(&candidate.code_unit))
         .flat_map(|candidate| {
-            let semantic_model = analyzer.semantic_model_overlay().and_then(|overlay| {
+            let semantic_model = semantic_model_overlay.and_then(|overlay| {
                 let matched = overlay.symbols_named(&candidate.code_unit.fq_name());
                 (matched.disposition
                     == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
                     .then(|| matched.records[0].provenance.clone())
             });
-            let is_type_alias = analyzer
-                .type_alias_provider()
-                .is_some_and(|provider| provider.is_type_alias(&candidate.code_unit));
+            let is_type_alias = candidate.is_type_alias;
             display_signatures(analyzer, &candidate.code_unit)
                 .into_iter()
                 .map(move |signature| SearchSymbolHit {
