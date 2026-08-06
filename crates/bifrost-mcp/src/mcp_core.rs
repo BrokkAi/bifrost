@@ -52,7 +52,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
         "scan_usages_by_reference"
     };
     let search_symbols_description = format!(
-        "Find classes, functions, methods, fields, modules, and other indexed declarations by name. Use this first for broad or partial symbol discovery, then pass fully qualified results to get_symbol_sources or {scan_tool_name}."
+        "Find classes, functions, methods, fields, modules, and other indexed declarations by name. Use this first for broad or partial symbol discovery, then pass fully qualified results to get_symbol_sources or {scan_tool_name}. Patterns that match too many symbols to rank return a too_many_matches count instead of results; re-run with more specific patterns."
     );
 
     let mut descriptors = vec![
@@ -88,12 +88,12 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
         ),
         tool_descriptor(
             "get_symbol_sources",
-            "Read exact source blocks for known symbols after search_symbols. File paths/globs return flat top-level symbol outlines as a secondary file-backed view; use get_summaries for broader structure.",
+            "Read exact source blocks for known symbols after search_symbols. File paths/globs return flat top-level symbol outlines as a secondary file-backed view; use get_summaries for broader structure. A glob that matches more files than the per-target limit is skipped and reported under too_broad with a sample of the match; narrow it or list explicit files.",
             symbol_names_schema(),
         ),
         tool_descriptor(
             "get_summaries",
-            "Summarize code or navigate containers. Use a narrow directory target like an `ls` to list its immediate child directories and git-visible files (tracked or unignored), including non-source files; gitignored files are excluded. Do not pass `/`, the repository root, or a broad source tree in a large repository; narrow the target to the package or source directory that matters. Use an OO namespace or language package/import target like a semantic `ls` to list direct child packages and top-level types declared in that exact package. Real filesystem directories win name collisions, and mixed target kinds are accepted in one call. Literal files, globs, classes, and modules return ranged summaries. Oversized ordinary summaries degrade to compact_symbols; oversized listings retain a total count and set truncated. Examples: [\"src/auth\"], [\"com.example.auth\"], [\"github.com/cli/cli/v2/internal/skills/discovery\"], [\"src/auth/**/*.rs\", \"MyClass\"].",
+            "Summarize code or navigate containers. Use a narrow directory target like an `ls` to list its immediate child directories and git-visible files (tracked or unignored), including non-source files; gitignored files are excluded. Do not pass `/`, the repository root, or a broad source tree in a large repository; narrow the target to the package or source directory that matters. Use an OO namespace or language package/import target like a semantic `ls` to list direct child packages and top-level types declared in that exact package. Real filesystem directories win name collisions, and mixed target kinds are accepted in one call. Literal files, globs, classes, and modules return ranged summaries. Oversized ordinary summaries degrade to compact_symbols; oversized listings retain a total count and set truncated. A glob target that matches more files than the per-target limit is skipped and reported under too_broad with a sample of the match; narrow it or use list_symbols. Examples: [\"src/auth\"], [\"com.example.auth\"], [\"github.com/cli/cli/v2/internal/skills/discovery\"], [\"src/auth/**/*.rs\", \"MyClass\"].",
             summaries_schema(),
         ),
         scan_descriptor,
