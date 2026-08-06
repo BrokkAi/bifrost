@@ -958,6 +958,28 @@ fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
 /// workspace. The walk is ignore-aware, skips `.git/`, and keeps other dotted
 /// directories in scope.
 pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
+    if let Some(repo) = crate::gitblob::discover(root) {
+        let workdir = repo
+            .workdir()
+            .ok_or_else(|| io::Error::other("repository has no working directory"))?;
+        let canonical_root = root.canonicalize()?.normalize();
+        let canonical_workdir = workdir.canonicalize()?.normalize();
+        let active_paths =
+            crate::gitblob::all_working_tree_paths(&repo).map_err(io::Error::other)?;
+        let mut files = BTreeSet::new();
+        for rel in active_paths {
+            let absolute = canonical_workdir.join(rel);
+            let Ok(project_rel) = absolute.strip_prefix(&canonical_root) else {
+                continue;
+            };
+            files.insert(ProjectFile::new(
+                root.to_path_buf(),
+                project_rel.to_path_buf(),
+            ));
+        }
+        return Ok(files);
+    }
+
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .ignore(false)
@@ -1025,36 +1047,10 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
     // walker thread's clone has also been dropped.
     drop(tx);
 
-    let mut files = collector.join().expect("file-collector thread panicked");
+    let files = collector.join().expect("file-collector thread panicked");
 
     if let Some(err) = first_error.lock().expect("walk error lock poisoned").take() {
         return Err(err);
-    }
-    // Ignore walkers apply `.gitignore` patterns even to files already tracked
-    // by Git. Git itself does not: a broad pattern such as `db/` must not hide
-    // a tracked `src/db/mod.rs` from the analyzer. Union the repository index
-    // after the walk while retaining ignore behavior for untracked generated
-    // files.
-    if let Some(repo) = crate::gitblob::discover(root) {
-        let workdir = repo
-            .workdir()
-            .ok_or_else(|| io::Error::other("repository has no working directory"))?;
-        let canonical_root = root.canonicalize()?.normalize();
-        let canonical_workdir = workdir.canonicalize()?.normalize();
-        let index = repo.index().map_err(io::Error::other)?;
-        for entry in index.iter() {
-            let rel = crate::gitblob::index_path_to_string(&entry).map_err(io::Error::other)?;
-            let abs = canonical_workdir.join(rel);
-            let Ok(project_rel) = abs.strip_prefix(&canonical_root) else {
-                continue;
-            };
-            if abs.is_file() {
-                files.insert(ProjectFile::new(
-                    root.to_path_buf(),
-                    project_rel.to_path_buf(),
-                ));
-            }
-        }
     }
     Ok(files)
 }
@@ -1470,6 +1466,28 @@ mod tests {
                 .unwrap()
                 .contains(&ProjectFile::new(&root, "src/db/mod.rs"))
         );
+    }
+
+    #[test]
+    fn collect_project_files_includes_nonignored_untracked_files() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = crate::gitblob::test_repo::init_repo(&root);
+        write_file(&root, "tracked.rs", "fn tracked() {}\n");
+        crate::gitblob::test_repo::commit_all(&repo, "tracked source");
+        write_file(&root, "generated.rs", "fn generated() {}\n");
+        write_file(&root, ".gitignore", "ignored/\n");
+        write_file(&root, "ignored/ignored.rs", "fn ignored() {}\n");
+
+        let rels: BTreeSet<String> = collect_workspace_files(&root)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.rel_path().to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        assert!(rels.contains("tracked.rs"), "{rels:?}");
+        assert!(rels.contains("generated.rs"), "{rels:?}");
+        assert!(!rels.contains("ignored/ignored.rs"), "{rels:?}");
     }
 
     #[test]

@@ -137,6 +137,34 @@ pub fn all_working_tree_oid_values(repo: &Repository) -> Result<HashMap<String, 
     resolve_working_tree_oid_values(workdir, &rel_paths, &dirty, &index_oids, started)
 }
 
+/// Resolve every existing tracked and untracked path in one repository snapshot.
+///
+/// The Git index supplies clean tracked paths without reading their bytes. The
+/// worktree diff supplies only changed, deleted, and untracked paths that need
+/// filesystem checks. Callers that need the blob identity should use
+/// [`all_working_tree_oid_values`]; this path-only form avoids hashing dirty
+/// files when a caller only needs the active file set.
+pub fn all_working_tree_paths(repo: &Repository) -> Result<HashSet<String>> {
+    let workdir = workdir(repo)?;
+    let mut index = repo.index().map_err(|e| e.to_string())?;
+    index.read(true).map_err(|e| e.to_string())?;
+    let dirty = dirty_worktree_paths(repo)?;
+    let mut paths = HashSet::with_capacity(index.len() + dirty.len());
+
+    for entry in index.iter() {
+        let rel = index_path_to_string(&entry)?;
+        if !dirty.contains(&rel) || workdir.join(&rel).is_file() {
+            paths.insert(rel);
+        }
+    }
+    for rel in dirty {
+        if index.get_path(Path::new(&rel), 0).is_none() && workdir.join(&rel).is_file() {
+            paths.insert(rel);
+        }
+    }
+    Ok(paths)
+}
+
 fn resolve_working_tree_oid_values(
     workdir: &Path,
     rel_paths: &[String],
@@ -565,6 +593,24 @@ mod tests {
             0,
             "clean tracked content must use its index OID"
         );
+    }
+
+    #[test]
+    fn all_working_tree_paths_use_index_and_dirty_overlay() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("tracked.rs"), "fn tracked() {}\n").unwrap();
+        commit_all(&repo, "init");
+        std::fs::write(temp.path().join("dirty.rs"), "fn dirty() {}\n").unwrap();
+
+        let paths = all_working_tree_paths(&repo).unwrap();
+        assert!(paths.contains("tracked.rs"), "{paths:?}");
+        assert!(paths.contains("dirty.rs"), "{paths:?}");
+
+        std::fs::remove_file(temp.path().join("tracked.rs")).unwrap();
+        let paths = all_working_tree_paths(&repo).unwrap();
+        assert!(!paths.contains("tracked.rs"), "{paths:?}");
+        assert!(paths.contains("dirty.rs"), "{paths:?}");
     }
 
     #[test]
