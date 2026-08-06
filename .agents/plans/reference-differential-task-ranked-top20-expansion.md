@@ -619,6 +619,20 @@ the focus.
       and
       `5508ea3494449e8c8d8b44e0c3e53c37a12a11e2cfae8899d2b60d577ac4c611`.
       The next active repository is rank eighteen `Mbed-TLS__mbedtls`.
+    - [x] (2026-08-06 15:39Z) Rank eighteen `Mbed-TLS__mbedtls`
+      completed at pinned head `9e9eb069`. The live `tasks.py` selector assigns
+      it 16 qualifying C++ tasks after the `large-repos.csv` exclusion. The
+      fresh clean replay at Bifrost `939c64e9` audited all 57 eligible files,
+      743,297 source bytes, all 6,716 candidates, and all 4,521 sites. It
+      resolved 2,283 forward sites and queried all 91 inverse targets. It
+      reported 407 consistent, 148 honestly unproven, 3,966 inconclusive, and
+      zero editor-only or missing rows. It had no invalid locations, file
+      errors, skipped targets, truncation, or configured-limit failures. No
+      issue was necessary. The report and exact-head runner SHA-256 values are
+      `cc757db21e7e9e065700aa5899aa1d71a5d263d5c0a0a506f45cb28e3ba2aafb`
+      and
+      `133f08a76c7db61e02603f1570624f5a15da980c13578301985fcbab1c307493`.
+      The next active repository is rank nineteen `pyro-ppl__pyro`.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
