@@ -974,7 +974,7 @@ impl<'a> DefinitionBatchContext<'a> {
             .or_insert_with(|| {
                 let mut roots = HashSet::default();
                 roots.insert(file.clone());
-                Arc::new(CppVisibilityIndex::build(cpp, dispatch.source(), &roots))
+                Arc::new(CppVisibilityIndex::build(cpp, &dispatch.source(), &roots))
             })
             .clone()
     }

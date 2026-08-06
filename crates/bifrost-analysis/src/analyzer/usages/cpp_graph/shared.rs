@@ -108,7 +108,7 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
             .cpp
             .record_authoritative_visibility_build_for_test();
         let dispatch = CppDispatch::new(analyzer);
-        let visibility = VisibilityIndex::build(resolver.cpp, dispatch.source(), roots);
+        let visibility = VisibilityIndex::build(resolver.cpp, &dispatch.source(), roots);
         Some(Self {
             analyzer,
             resolver,
@@ -164,7 +164,7 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
         let dispatch = CppDispatch::new(analyzer);
         let visibility = VisibilityIndex::build_with_cancellation(
             self.cpp,
-            dispatch.source(),
+            &dispatch.source(),
             &files,
             scan_scope.cancellation(),
         );
@@ -189,7 +189,7 @@ impl CppQueryResolver<'_> {
         let mut specs = Vec::with_capacity(overloads.len());
         let mut seen_type_specs = HashSet::default();
         for overload in overloads {
-            let Some(spec) = TargetSpec::from_target(source, overload) else {
+            let Some(spec) = TargetSpec::from_target(&source, overload) else {
                 return GraphUsageOutcome::fallback_safe(
                     overload.fq_name(),
                     GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
@@ -243,7 +243,7 @@ impl CppQueryResolver<'_> {
                 #[cfg(any(test, feature = "test-support"))]
                 self.cpp.record_target_spec_scan_for_test();
                 let spec = spec.with_visible_callable_arities(
-                    source,
+                    &source,
                     self.cpp,
                     visibility,
                     file,
@@ -267,7 +267,7 @@ impl CppQueryResolver<'_> {
                     )
                 });
                 scan_prepared_file(
-                    source,
+                    &source,
                     visibility,
                     file,
                     prepared_file.prepared.as_ref(),
@@ -343,7 +343,7 @@ where
     build_edge_output(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |input| {
             brokk_bifrost_cpp::graph::inverted::scan_file(
-                dispatch.source(),
+                &dispatch.source(),
                 visibility,
                 file,
                 input,
@@ -388,7 +388,7 @@ impl<'a> CppEdgeResolver<'a> {
             .cloned()
             .collect();
         let dispatch = CppDispatch::new(analyzer);
-        let visibility = VisibilityIndex::build(self.cpp, dispatch.source(), &roots);
+        let visibility = VisibilityIndex::build(self.cpp, &dispatch.source(), &roots);
         build_cpp_edges(analyzer, &self.files, &visibility, nodes, keep_file)
     }
 
@@ -408,7 +408,7 @@ impl<'a> CppEdgeResolver<'a> {
             .cloned()
             .collect();
         let dispatch = CppDispatch::new(analyzer);
-        let visibility = VisibilityIndex::build(self.cpp, dispatch.source(), &roots);
+        let visibility = VisibilityIndex::build(self.cpp, &dispatch.source(), &roots);
         build_cpp_edges(analyzer, &self.files, &visibility, nodes, keep_file)
     }
 }

@@ -59,12 +59,12 @@ mod effective_using_scale_tests {
         let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
         let _scope = AnalyzerQueryScope::new(analyzer);
         let roots = HashSet::from_iter([left.clone(), right]);
-        let visibility = VisibilityIndex::build(cpp, CppDispatch::new(analyzer).source(), &roots);
+        let visibility = VisibilityIndex::build(cpp, &CppDispatch::new(analyzer).source(), &roots);
         let prepared = cpp.prepared_syntax(&left).expect("prepared left consumer");
         let root_node = prepared.tree().root_node();
         let imports = initialized_ordinary_type_imports(
             root_node,
-            CppDispatch::new(analyzer).source(),
+            &CppDispatch::new(analyzer).source(),
             &visibility,
             &left,
             prepared.source(),
@@ -156,7 +156,7 @@ mod effective_using_scale_tests {
                         assert!(
                             visibility
                                 .callable_arity_at_reference(
-                                    CppDispatch::new(analyzer).source(),
+                                    &CppDispatch::new(analyzer).source(),
                                     &left,
                                     &callable,
                                     usize::MAX,
@@ -205,7 +205,7 @@ mod effective_using_scale_tests {
         let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
         let _scope = AnalyzerQueryScope::new(analyzer);
         let roots = HashSet::from_iter([consumer.clone()]);
-        let visibility = VisibilityIndex::build(cpp, CppDispatch::new(analyzer).source(), &roots);
+        let visibility = VisibilityIndex::build(cpp, &CppDispatch::new(analyzer).source(), &roots);
         let prepared = cpp.prepared_syntax(&consumer).expect("prepared consumer");
         let source = prepared.source();
         let start = source.find("Missing").expect("unqualified type reference");
@@ -242,7 +242,7 @@ mod effective_using_scale_tests {
         let template_node = template_node.expect("template type node");
         let imports = initialized_ordinary_type_imports(
             prepared.tree().root_node(),
-            CppDispatch::new(analyzer).source(),
+            &CppDispatch::new(analyzer).source(),
             &visibility,
             &consumer,
             source,
@@ -253,12 +253,12 @@ mod effective_using_scale_tests {
             .find(|unit| unit.kind() == CodeUnitType::Class && unit.fq_name() == "target.Wanted")
             .expect("target declaration");
         let first_alias_names = visibility.visible_type_reference_component_names_for_target(
-            CppDispatch::new(analyzer).source(),
+            &CppDispatch::new(analyzer).source(),
             &consumer,
             &target,
         );
         let second_alias_names = visibility.visible_type_reference_component_names_for_target(
-            CppDispatch::new(analyzer).source(),
+            &CppDispatch::new(analyzer).source(),
             &consumer,
             &target,
         );
@@ -273,7 +273,7 @@ mod effective_using_scale_tests {
             for _ in 0..2 {
                 let resolution = resolve_type_node_lexically_for_target(
                     node,
-                    CppDispatch::new(analyzer).source(),
+                    &CppDispatch::new(analyzer).source(),
                     &visibility,
                     &imports,
                     &consumer,

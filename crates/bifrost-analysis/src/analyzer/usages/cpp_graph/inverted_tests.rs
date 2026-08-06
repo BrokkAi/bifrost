@@ -47,7 +47,7 @@ ABSL_NAMESPACE_END
             .expect("param_type owner");
         let roots = std::iter::once(file.clone()).collect();
         let visibility =
-            VisibilityIndex::build(&analyzer, CppGraphSource::from_source(&analyzer), &roots);
+            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
         let nodes = [alias.fq_name(), owner.fq_name()].into_iter().collect();
 
         let edges: crate::analyzer::usages::inverted_edges::UsageEdges = build_cpp_edges(

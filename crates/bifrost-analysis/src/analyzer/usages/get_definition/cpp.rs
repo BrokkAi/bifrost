@@ -2129,20 +2129,20 @@ fn cpp_type_node_resolves_lexically(
         return false;
     }
     let CppLexicalScopeResolution::Resolved(scope) =
-        cpp_enclosing_lexical_scope_components(node, dispatch.source(), visibility, file, source)
+        cpp_enclosing_lexical_scope_components(node, &dispatch.source(), visibility, file, source)
     else {
         return false;
     };
     matches!(
         visibility.resolve_type_components_lexically_for_forward(
-            dispatch.source(),
+            &dispatch.source(),
             file,
             &[name],
             false,
             &scope,
         ),
         CppLexicalTypeResolution::Resolved { unit, .. }
-            if visibility.external_type_candidate_visible_in_context(dispatch.source(), file, &unit, node)
+            if visibility.external_type_candidate_visible_in_context(&dispatch.source(), file, &unit, node)
     )
 }
 
@@ -2371,7 +2371,7 @@ fn resolve_cpp_type(
         if !qualified_template {
             match cpp_enclosing_lexical_scope_components(
                 node,
-                dispatch.source(),
+                &dispatch.source(),
                 visibility,
                 file,
                 source,
@@ -2380,7 +2380,7 @@ fn resolve_cpp_type(
                     let lexical =
                         cpp_type_name_components(template_node, source).map(|components| {
                             visibility.resolve_type_components_lexically_for_forward(
-                                dispatch.source(),
+                                &dispatch.source(),
                                 file,
                                 &components,
                                 false,
@@ -2730,11 +2730,11 @@ fn resolve_cpp_type_without_focused_qualifier(
             )
         };
         let owner = match cpp_enclosing_lexical_scope_components(
-            node, dispatch.source(), visibility, file, source,
+            node, &dispatch.source(), visibility, file, source,
         ) {
             CppLexicalScopeResolution::Resolved(lexical_scope) => {
                 match visibility.resolve_type_components_lexically_for_forward(
-                    dispatch.source(),
+                    &dispatch.source(),
                     file,
                     &components,
                     globally_qualified,
@@ -2957,14 +2957,14 @@ fn resolve_cpp_type_without_focused_qualifier(
     if node.kind() == "type_identifier" {
         match cpp_enclosing_lexical_scope_components(
             node,
-            dispatch.source(),
+            &dispatch.source(),
             visibility,
             file,
             source,
         ) {
             CppLexicalScopeResolution::Resolved(scope) => {
                 match visibility.resolve_type_components_lexically_for_forward(
-                    dispatch.source(),
+                    &dispatch.source(),
                     file,
                     &[text.to_string()],
                     false,
@@ -3005,7 +3005,7 @@ fn resolve_cpp_type_without_focused_qualifier(
                 // otherwise a nested same-named type can win by index order.
                 if let Some(scope) = cpp_out_of_line_namespace_scope(support, source, node) {
                     match visibility.resolve_type_components_lexically_for_forward(
-                        dispatch.source(),
+                        &dispatch.source(),
                         file,
                         &[text.to_string()],
                         false,
@@ -3821,7 +3821,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             );
             candidates.retain(|candidate| {
                 ctx.visibility.declaration_visible_at(
-                    ctx_dispatch.source(),
+                    &ctx_dispatch.source(),
                     ctx.file,
                     candidate,
                     call.start_byte(),
@@ -3977,7 +3977,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             }
             let imports = cpp_initialized_effective_using_imports(
                 ctx.root,
-                ctx_dispatch.source(),
+                &ctx_dispatch.source(),
                 ctx.visibility,
                 ctx.file,
                 ctx.source,
@@ -3985,7 +3985,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             match cpp_resolve_bare_call_target(
                 call,
                 function,
-                ctx_dispatch.source(),
+                &ctx_dispatch.source(),
                 ctx.visibility,
                 &imports,
                 ctx.file,
@@ -4106,7 +4106,7 @@ fn cpp_bare_free_function_definition_candidates(
         .collect();
     candidates.retain(|candidate| {
         ctx.visibility.declaration_visible_at(
-            ctx_dispatch.source(),
+            &ctx_dispatch.source(),
             ctx.file,
             candidate,
             reference_byte,
@@ -5426,7 +5426,7 @@ fn cpp_field_declared_type(
 ) -> Option<CppType> {
     let dispatch = CppDispatch::new(analyzer);
     let (name, unit, indirection) =
-        cpp_field_declared_type_binding(dispatch.source(), visibility, file, field)?;
+        cpp_field_declared_type_binding(&dispatch.source(), visibility, file, field)?;
     Some(CppType {
         alias_unit: cpp_resolve_type_alias_unit(analyzer, visibility, file, &name),
         name,
@@ -5612,7 +5612,7 @@ fn cpp_enclosing_class_member_candidates(
             .filter(|candidate| {
                 !cpp_type_alias_declaration_contains_node(analyzer, candidate, node)
                     && visibility.external_type_candidate_visible_in_context(
-                        dispatch.source(),
+                        &dispatch.source(),
                         file,
                         candidate,
                         node,
@@ -5833,7 +5833,7 @@ fn cpp_resolve_owner_type_in_lexical_namespace(
         })
         .unwrap_or_default();
     let resolved = match visibility.resolve_type_components_lexically_for_forward(
-        dispatch.source(),
+        &dispatch.source(),
         file,
         &owner_components,
         globally_qualified,
@@ -6894,7 +6894,7 @@ fn cpp_alias_arrow_target_unit(ctx: CppLookupCtx<'_, '_>, alias: &CodeUnit) -> O
         let arrow = cpp_member_candidates(ctx, vec![wrapper], "operator->", None, None)
             .into_iter()
             .next()?;
-        let return_text = cpp_function_return_type_text(ctx_dispatch.source(), &arrow)?;
+        let return_text = cpp_function_return_type_text(&ctx_dispatch.source(), &arrow)?;
         // `receiver->member` follows one level of pointer indirection from operator->'s result.
         if cpp_type_text_pointer_depth(&return_text) < 1 {
             return None;
@@ -7148,7 +7148,7 @@ fn cpp_function_return_type(
     function: &CodeUnit,
 ) -> Option<CppType> {
     let dispatch = CppDispatch::new(analyzer);
-    let type_text = cpp_function_return_type_text(dispatch.source(), function)?;
+    let type_text = cpp_function_return_type_text(&dispatch.source(), function)?;
     let indirection = cpp_type_text_pointer_depth(&type_text);
     let type_text = normalize_cpp_type_text(&type_text);
     Some(CppType::from_text(

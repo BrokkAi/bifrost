@@ -350,10 +350,10 @@ ABSL_NAMESPACE_END
             .expect("standard-library alias declaration");
         let roots = HashSet::from_iter([consumer.clone()]);
         let visibility =
-            VisibilityIndex::build(&analyzer, CppGraphSource::from_source(&analyzer), &roots);
+            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
         assert_eq!(
             visibility.unique_type_candidate_preserving_target(
-                CppGraphSource::from_source(&analyzer),
+                &CppGraphSource::from_source(&analyzer),
                 &consumer,
                 &[class_decl, alias_decl],
                 class_decl,
@@ -362,12 +362,12 @@ ABSL_NAMESPACE_END
             "same-file conditional declarations preserve the selected target identity"
         );
         assert!(visibility.alternate_same_fqn_type_declarations(
-            CppGraphSource::from_source(&analyzer),
+            &CppGraphSource::from_source(&analyzer),
             &[class_decl, alias_decl],
             class_decl,
         ));
         assert!(visibility.complementary_same_fqn_type_declarations(
-            CppGraphSource::from_source(&analyzer),
+            &CppGraphSource::from_source(&analyzer),
             &[class_decl, alias_decl],
             class_decl,
         ));
@@ -381,7 +381,7 @@ ABSL_NAMESPACE_END
         );
         assert!(
             !visibility.alternate_same_fqn_type_declarations(
-                CppGraphSource::from_source(&analyzer),
+                &CppGraphSource::from_source(&analyzer),
                 &[class_decl, alias_decl, &unguarded_duplicate],
                 class_decl,
             ),
@@ -397,7 +397,7 @@ ABSL_NAMESPACE_END
             false,
         );
         assert!(!visibility.alternate_same_fqn_type_declarations(
-            CppGraphSource::from_source(&analyzer),
+            &CppGraphSource::from_source(&analyzer),
             &[class_decl, &duplicate],
             class_decl,
         ));
@@ -410,7 +410,7 @@ ABSL_NAMESPACE_END
             false,
         );
         assert!(!visibility.alternate_same_fqn_type_declarations(
-            CppGraphSource::from_source(&analyzer),
+            &CppGraphSource::from_source(&analyzer),
             &[class_decl, &other_namespace_decl],
             class_decl,
         ));
@@ -457,7 +457,7 @@ ABSL_NAMESPACE_END
         let (internal, inspected_peers) =
             with_cpp_global_field_linkage_peer_inspection_counter_for_test(|| {
                 cpp_global_field_has_internal_linkage(
-                    CppGraphSource::from_source(&analyzer),
+                    &CppGraphSource::from_source(&analyzer),
                     &target,
                 )
             });
@@ -655,7 +655,7 @@ ABSL_NAMESPACE_END
             HashSet::from_iter([expected_hit(&right, right_source)]),
         );
 
-        let visibility = VisibilityIndex::build(&cpp, CppGraphSource::from_source(&cpp), &roots);
+        let visibility = VisibilityIndex::build(&cpp, &CppGraphSource::from_source(&cpp), &roots);
         assert!(visibility.is_visible(&left, &left_global));
         assert!(visibility.is_visible(&right, &right_global));
         assert!(
@@ -694,7 +694,7 @@ ABSL_NAMESPACE_END
         let (by_identifier, classification_count) =
             with_cpp_global_field_internal_linkage_classification_counter_for_test(|| {
                 build_visible_identifier_index(
-                    CppGraphSource::from_source(&cpp),
+                    &CppGraphSource::from_source(&cpp),
                     &visible_by_file,
                     &visible_source_files_by_root,
                     &mut HashMap::default(),
@@ -1136,7 +1136,7 @@ ABSL_NAMESPACE_END
             .iter()
             .map(|candidate| {
                 cpp_class_declaration_strength(
-                    CppDispatch::new(workspace.analyzer()).source(),
+                    &CppDispatch::new(workspace.analyzer()).source(),
                     candidate,
                 )
             })
@@ -1210,8 +1210,11 @@ ABSL_NAMESPACE_END
         let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
         let _query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
         let roots = [file.clone()].into_iter().collect();
-        let visibility =
-            VisibilityIndex::build(cpp, CppDispatch::new(workspace.analyzer()).source(), &roots);
+        let visibility = VisibilityIndex::build(
+            cpp,
+            &CppDispatch::new(workspace.analyzer()).source(),
+            &roots,
+        );
         let prepared = cpp.prepared_syntax(&file).expect("prepared macro fixture");
         let mut stack = vec![prepared.tree().root_node()];
         let mut calls = Vec::new();
@@ -1320,8 +1323,11 @@ ABSL_NAMESPACE_END
         let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
         let _query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
         let roots = HashSet::from_iter([file.clone()]);
-        let visibility =
-            VisibilityIndex::build(cpp, CppDispatch::new(workspace.analyzer()).source(), &roots);
+        let visibility = VisibilityIndex::build(
+            cpp,
+            &CppDispatch::new(workspace.analyzer()).source(),
+            &roots,
+        );
 
         // Hold this thread's cursor across the worker's complete macro/include replay. A
         // file-global cursor blocks the worker here; a worker-local cursor lets it finish while
@@ -1453,8 +1459,11 @@ ABSL_NAMESPACE_END
         ]
         .into_iter()
         .collect();
-        let visibility =
-            VisibilityIndex::build(cpp, CppDispatch::new(workspace.analyzer()).source(), &roots);
+        let visibility = VisibilityIndex::build(
+            cpp,
+            &CppDispatch::new(workspace.analyzer()).source(),
+            &roots,
+        );
 
         for _ in 0..100 {
             assert_eq!(
@@ -1516,7 +1525,7 @@ ABSL_NAMESPACE_END
         let analyzer = workspace.analyzer();
         let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
         let roots = HashSet::from_iter([consumer.clone()]);
-        let visibility = VisibilityIndex::build(cpp, CppDispatch::new(analyzer).source(), &roots);
+        let visibility = VisibilityIndex::build(cpp, &CppDispatch::new(analyzer).source(), &roots);
         let prepared = cpp.prepared_syntax(&consumer).expect("prepared consumer");
         let targets = cpp
             .get_all_declarations()
@@ -1529,11 +1538,11 @@ ABSL_NAMESPACE_END
             .collect::<Vec<_>>();
         assert_eq!(targets.len(), TARGET_COUNT, "scale fixture targets");
         for target in &targets {
-            let spec = TargetSpec::from_target(CppDispatch::new(analyzer).source(), target)
+            let spec = TargetSpec::from_target(&CppDispatch::new(analyzer).source(), target)
                 .expect("target spec");
             assert!(matches!(
                 spec.with_visible_callable_arities(
-                    CppDispatch::new(analyzer).source(),
+                    &CppDispatch::new(analyzer).source(),
                     cpp,
                     &visibility,
                     &consumer,
@@ -1663,14 +1672,14 @@ ABSL_NAMESPACE_END
         );
         let roots = HashSet::from_iter([consumer_file.clone()]);
         let visibility =
-            VisibilityIndex::build(&analyzer, CppGraphSource::from_source(&analyzer), &roots);
+            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
         let prepared = analyzer
             .prepared_syntax(&consumer_file)
             .expect("prepared consumer");
-        let spec = TargetSpec::from_target(CppGraphSource::from_source(&analyzer), &target)
+        let spec = TargetSpec::from_target(&CppGraphSource::from_source(&analyzer), &target)
             .expect("target spec")
             .with_visible_callable_arities(
-                CppGraphSource::from_source(&analyzer),
+                &CppGraphSource::from_source(&analyzer),
                 &analyzer,
                 &visibility,
                 &consumer_file,

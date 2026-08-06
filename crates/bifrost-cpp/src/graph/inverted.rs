@@ -69,7 +69,7 @@ use tree_sitter::Node;
 /// shared language-agnostic driver -- stays in `brokk-bifrost-analysis` and
 /// calls this once per kept file.
 pub fn scan_file(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     input: &FileEdgeScanInput<'_>,
@@ -78,7 +78,7 @@ pub fn scan_file(
         initialized_ordinary_type_imports(input.root(), analyzer, visibility, file, input.source);
     let recovered_sentinel_classes = cpp_sentinel_recovered_classes(input.root(), input.source);
     let mut ctx = CppScan {
-        analyzer,
+        analyzer: *analyzer,
         visibility,
         file,
         source: input.source,
@@ -208,7 +208,7 @@ fn record_reference(
                 (
                     resolve_using_enum_declaration_owner(
                         node,
-                        ctx.analyzer,
+                        &ctx.analyzer,
                         ctx.visibility,
                         &ctx.ordinary_type_imports,
                         ctx.file,
@@ -220,7 +220,7 @@ fn record_reference(
                 (
                     resolve_ordinary_using_declaration_owner(
                         node,
-                        ctx.analyzer,
+                        &ctx.analyzer,
                         ctx.visibility,
                         ctx.file,
                         ctx.source,
@@ -280,7 +280,7 @@ fn record_reference(
         "type_identifier" | "qualified_identifier" | "scoped_type_identifier" | "template_type" => {
             if is_declaration_name(node) {
                 if let Some(owners) = out_of_line_member_definition_owner(
-                    ctx.analyzer,
+                    &ctx.analyzer,
                     ctx.visibility,
                     ctx.file,
                     ctx.source,
@@ -311,7 +311,7 @@ fn record_reference(
                     && parent.child_by_field_name("function") == Some(node)
             }) && let LexicalTypeResolution::Resolved { unit, .. } = resolve_type_node_lexically(
                 node,
-                ctx.analyzer,
+                &ctx.analyzer,
                 ctx.visibility,
                 &ctx.ordinary_type_imports,
                 ctx.file,
@@ -329,7 +329,7 @@ fn record_reference(
                     .visibility
                     .visible_member_for_owner_name(ctx.file, &unit, unit.identifier())
                     && let Some(constructor) = constructors.iter().find(|constructor| {
-                        cpp_callable_arity(ctx.analyzer, constructor).accepts(call_arity)
+                        cpp_callable_arity(&ctx.analyzer, constructor).accepts(call_arity)
                     })
                 {
                     ctx.record(constructor.fq_name(), function_terminal_node(node));
@@ -361,7 +361,7 @@ fn record_recovered_macro_return_type_reference(return_type: Node<'_>, ctx: &mut
     let components = [name.to_string()];
     if let LexicalTypeResolution::Resolved { unit, .. } = ctx
         .visibility
-        .resolve_type_components_lexically(ctx.analyzer, ctx.file, &components, false, &scope)
+        .resolve_type_components_lexically(&ctx.analyzer, ctx.file, &components, false, &scope)
     {
         ctx.record(unit.fq_name(), return_type);
         return;
@@ -375,7 +375,7 @@ fn record_recovered_macro_return_type_reference(return_type: Node<'_>, ctx: &mut
                 .type_alias_provider()
                 .is_some_and(|provider| provider.is_type_alias(candidate))
                 && ctx.visibility.external_type_candidate_visible_in_context(
-                    ctx.analyzer,
+                    &ctx.analyzer,
                     ctx.file,
                     candidate,
                     return_type,
@@ -430,7 +430,7 @@ fn record_type_reference(
 ) {
     let ordinary_resolution = resolve_type_node_lexically(
         node,
-        ctx.analyzer,
+        &ctx.analyzer,
         ctx.visibility,
         &ctx.ordinary_type_imports,
         ctx.file,
@@ -460,7 +460,7 @@ fn recovered_sentinel_type_resolution(
     let components = cpp_type_name_components(node, ctx.source)?;
     let global = is_globally_qualified_cpp_name(node);
     Some(ctx.visibility.resolve_type_components_lexically(
-        ctx.analyzer,
+        &ctx.analyzer,
         ctx.file,
         &components,
         global,
@@ -477,7 +477,7 @@ fn recovered_or_indexed_lexical_scope(node: Node<'_>, ctx: &CppScan<'_>) -> Opti
     ctx.recovered_sentinel_scope(node).or_else(|| {
         match enclosing_lexical_scope_components(
             node,
-            ctx.analyzer,
+            &ctx.analyzer,
             ctx.visibility,
             ctx.file,
             ctx.source,
@@ -510,7 +510,7 @@ fn record_recovered_macro_decorated_type_reference(
         }
         if let LexicalTypeResolution::Resolved { unit, .. } = resolve_type_node_lexically(
             candidate,
-            ctx.analyzer,
+            &ctx.analyzer,
             ctx.visibility,
             &ctx.ordinary_type_imports,
             ctx.file,
@@ -599,7 +599,7 @@ fn record_qualified_callable_value(
     } else {
         match enclosing_lexical_scope_components(
             qualified,
-            ctx.analyzer,
+            &ctx.analyzer,
             ctx.visibility,
             ctx.file,
             ctx.source,
@@ -612,7 +612,7 @@ fn record_qualified_callable_value(
         }
     };
     let owner = match ctx.visibility.resolve_callable_value_components_lexically(
-        ctx.analyzer,
+        &ctx.analyzer,
         ctx.file,
         &owner_components,
         member_name,
@@ -632,7 +632,7 @@ fn record_qualified_callable_value(
             qualified,
             &owner_components,
             global,
-            ctx.analyzer,
+            &ctx.analyzer,
             ctx.visibility,
             &ctx.ordinary_type_imports,
             ctx.file,
@@ -717,7 +717,7 @@ fn record_call(node: Node<'_>, ctx: &mut CppScan<'_>, bindings: &LocalInferenceE
                         {
                             VisibleMemberResolution::Callable(callables) => {
                                 if let Some(callable) = callables.iter().find(|callable| {
-                                    cpp_callable_arity(ctx.analyzer, callable).accepts(call_arity)
+                                    cpp_callable_arity(&ctx.analyzer, callable).accepts(call_arity)
                                 }) {
                                     ctx.record(callable.fq_name(), field);
                                 }
@@ -794,7 +794,7 @@ fn record_call(node: Node<'_>, ctx: &mut CppScan<'_>, bindings: &LocalInferenceE
             let resolution = resolve_bare_call_target(
                 node,
                 function,
-                ctx.analyzer,
+                &ctx.analyzer,
                 ctx.visibility,
                 &ctx.ordinary_type_imports,
                 ctx.file,
@@ -815,7 +815,7 @@ fn record_call(node: Node<'_>, ctx: &mut CppScan<'_>, bindings: &LocalInferenceE
                         .visibility
                         .visible_member_for_owner_name(ctx.file, &unit, unit.identifier())
                         && let Some(constructor) = constructors.iter().find(|constructor| {
-                            cpp_callable_arity(ctx.analyzer, constructor).accepts(call_arity)
+                            cpp_callable_arity(&ctx.analyzer, constructor).accepts(call_arity)
                         })
                     {
                         ctx.record(constructor.fq_name(), terminal);
@@ -849,7 +849,7 @@ fn resolve_declaring_member_owner_cached(
         return cached;
     }
     let resolution = resolve_declaring_member_owner(
-        ctx.analyzer,
+        &ctx.analyzer,
         ctx.visibility,
         ctx.file,
         receiver_owner,
@@ -869,7 +869,7 @@ fn enclosing_callable_owner(node: Node<'_>, ctx: &CppScan<'_>) -> Option<CodeUni
             let declarator = parent.child_by_field_name("declarator")?;
             let function = declarator_name_node(declarator)?;
             if let Some(owners) = out_of_line_member_definition_owner(
-                ctx.analyzer,
+                &ctx.analyzer,
                 ctx.visibility,
                 ctx.file,
                 ctx.source,
@@ -928,7 +928,7 @@ fn scoped_call_owner(node: Node<'_>, ctx: &CppScan<'_>) -> Option<String> {
     let scope = node.child_by_field_name("scope")?;
     match resolve_type_node_lexically(
         scope,
-        ctx.analyzer,
+        &ctx.analyzer,
         ctx.visibility,
         &ctx.ordinary_type_imports,
         ctx.file,
@@ -980,7 +980,7 @@ fn receiver_type_unit(
             .or_else(|| receiver.named_child(0))
             .and_then(|inner| receiver_type_unit(inner, ctx, bindings, remaining_call_depth)),
         "call_expression" if remaining_call_depth > 0 => infer_cpp_initializer_binding(
-            ctx.analyzer,
+            &ctx.analyzer,
             ctx.visibility,
             ctx.file,
             ctx.source,
@@ -1149,7 +1149,7 @@ fn resolve_type_node_with_recovered_scope(node: Node<'_>, ctx: &CppScan<'_>) -> 
     let components = cpp_type_name_components(node, ctx.source)?;
     let global = is_globally_qualified_cpp_name(node);
     match ctx.visibility.resolve_type_components_lexically(
-        ctx.analyzer,
+        &ctx.analyzer,
         ctx.file,
         &components,
         global,
@@ -1162,5 +1162,5 @@ fn resolve_type_node_with_recovered_scope(node: Node<'_>, ctx: &CppScan<'_>) -> 
 
 /// Infer a class type from an initializer expression for `auto`/untyped locals.
 fn infer_type_from_value(node: Node<'_>, ctx: &CppScan<'_>) -> Option<CodeUnit> {
-    infer_cpp_initializer_type(ctx.analyzer, ctx.visibility, ctx.file, ctx.source, node)
+    infer_cpp_initializer_type(&ctx.analyzer, ctx.visibility, ctx.file, ctx.source, node)
 }

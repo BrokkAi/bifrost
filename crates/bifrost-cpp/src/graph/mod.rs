@@ -165,7 +165,7 @@ impl<'a> CppGraphSource<'a> {
 /// without a C++ analyzer answers `false`, exactly as the downcast's `else` arm
 /// did.
 pub fn callable_definitions_share_identity_evidence(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     left: &CodeUnit,
     right: &CodeUnit,
 ) -> bool {

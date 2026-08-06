@@ -80,7 +80,7 @@ pub enum NamespaceValueResolution {
 }
 
 pub fn resolve_namespace_value(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     namespace: &str,
@@ -332,7 +332,7 @@ impl TargetSpec {
         })
     }
 
-    pub fn from_target(analyzer: CppGraphSource<'_>, target: &CodeUnit) -> Option<Self> {
+    pub fn from_target(analyzer: &CppGraphSource<'_>, target: &CodeUnit) -> Option<Self> {
         if target.is_class() {
             return Some(Self::new(
                 target.clone(),
@@ -411,7 +411,7 @@ impl TargetSpec {
 
     pub fn with_visible_callable_arities<'a>(
         &'a self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         cpp: &dyn CppAnalysisSource,
         visibility: &VisibilityIndex<'_>,
         file: &ProjectFile,
@@ -474,7 +474,7 @@ fn logical_symbol_key(unit: &CodeUnit) -> LogicalSymbolKey {
     }
 }
 
-fn classify_enum_owner(analyzer: CppGraphSource<'_>, owner: &CodeUnit) -> EnumOwnerKind {
+fn classify_enum_owner(analyzer: &CppGraphSource<'_>, owner: &CodeUnit) -> EnumOwnerKind {
     let classify = |source: &str| {
         let source = source.trim_start();
         if source.starts_with("enum class ") || source.starts_with("enum struct ") {
@@ -971,7 +971,7 @@ impl<'a> VisibilityIndex<'a> {
         Self {
             cpp,
             visible_by_identifier: build_visible_identifier_index(
-                CppGraphSource::from_source(cpp),
+                &CppGraphSource::from_source(cpp),
                 &visible_by_file,
                 &visible_source_files_by_root,
                 &mut global_field_internal_linkage,
@@ -1028,7 +1028,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn build(
         cpp: &'a dyn CppAnalysisSource,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         roots: &HashSet<ProjectFile>,
     ) -> Self {
         Self::build_with_cancellation(cpp, analyzer, roots, None)
@@ -1036,7 +1036,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn build_with_cancellation(
         cpp: &'a dyn CppAnalysisSource,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         roots: &HashSet<ProjectFile>,
         cancellation: Option<&CancellationToken>,
     ) -> Self {
@@ -1161,7 +1161,7 @@ impl<'a> VisibilityIndex<'a> {
         self.global_field_internal_linkage
             .get(unit)
             .copied()
-            .unwrap_or_else(|| cpp_global_field_has_internal_linkage(self.cpp_source(), unit))
+            .unwrap_or_else(|| cpp_global_field_has_internal_linkage(&self.cpp_source(), unit))
     }
 
     pub fn call_arity_evidence(
@@ -1985,7 +1985,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn callable_arities_for_target(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         cpp: &dyn CppAnalysisSource,
         file: &ProjectFile,
         prepared: &PreparedSyntaxTree,
@@ -2080,7 +2080,7 @@ impl<'a> VisibilityIndex<'a> {
         }
         let mut visible_files = HashSet::default();
         collect_include_closure(
-            self.cpp_source(),
+            &self.cpp_source(),
             self.cpp.include_target_index(),
             target.source(),
             &mut visible_files,
@@ -2249,7 +2249,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn declaration_visible_at(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         declaration: &CodeUnit,
         reference_byte: usize,
@@ -2273,7 +2273,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn callable_arity_at_reference(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         candidate: &CodeUnit,
         reference_byte: usize,
@@ -2302,7 +2302,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn physical_declaration_visible_at(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         declaration: &CodeUnit,
         reference_byte: usize,
@@ -2381,7 +2381,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn external_type_candidate_visible_in_context(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         candidate: &CodeUnit,
         reference: Node<'_>,
@@ -2498,7 +2498,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn is_exhaustive_same_fqn_type_declaration_family(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         candidate: &CodeUnit,
     ) -> bool {
@@ -2529,7 +2529,7 @@ impl<'a> VisibilityIndex<'a> {
     /// nested terminal's active-branch check.
     pub fn dependent_member_pointer_alias_visible_in_context(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         candidate: &CodeUnit,
         owner_components: &[String],
@@ -2650,7 +2650,7 @@ impl<'a> VisibilityIndex<'a> {
     /// activation checks.
     pub fn external_type_candidate_guard_compatible_in_context(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         candidate: &CodeUnit,
         reference: Node<'_>,
@@ -2736,7 +2736,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn type_candidate_may_be_visible_before_reference(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         candidate: &CodeUnit,
         reference_byte: usize,
@@ -3003,7 +3003,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn resolve_type_components_lexically(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         components: &[String],
         global: bool,
@@ -3021,7 +3021,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn resolve_type_components_lexically_for_forward(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         components: &[String],
         global: bool,
@@ -3039,7 +3039,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn resolve_type_components_lexically_for_target(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         components: &[String],
         global: bool,
@@ -3075,7 +3075,7 @@ impl<'a> VisibilityIndex<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn structured_type_reference_may_resolve_to_target(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         components: &[String],
         global: bool,
@@ -3137,7 +3137,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn target_preserving_reference_namespace(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         identifier: &str,
         target: &CodeUnit,
@@ -3176,7 +3176,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn resolve_imported_type_candidate(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         target: &CodeUnit,
         target_components: &[String],
@@ -3205,7 +3205,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn resolve_type_components_lexically_inner(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         components: &[String],
         global: bool,
@@ -3281,7 +3281,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn resolve_injected_class_name(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         components: &[String],
         global: bool,
@@ -3351,7 +3351,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn resolve_inherited_type_for_lexical_scope(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         lexical_scope: &[String],
         name: &str,
@@ -3438,7 +3438,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn resolve_type_candidates(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         candidates: &[&CodeUnit],
         resolution: TypeCandidateResolution<'_>,
@@ -3458,7 +3458,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn resolve_callable_value_components_lexically(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         owner_components: &[String],
         member_name: &str,
@@ -3536,7 +3536,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn resolve_unique_canonical_type_for_declaration(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         visible_from: &ProjectFile,
         declaration: &CodeUnit,
         raw_name: &str,
@@ -3560,7 +3560,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn canonical_type_unit(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         visible_from: &ProjectFile,
         unit: &CodeUnit,
     ) -> Option<CodeUnit> {
@@ -3582,7 +3582,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn canonical_visible_full_type_unit(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         visible_from: &ProjectFile,
         unit: &CodeUnit,
     ) -> Option<CodeUnit> {
@@ -3653,7 +3653,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn structured_alias_primary_preserves_target(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         visible_from: &ProjectFile,
         candidate: &CodeUnit,
         target: &CodeUnit,
@@ -3692,7 +3692,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn structured_class_alias_resolves_to_target(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         visible_from: &ProjectFile,
         alias: &CodeUnit,
         target: &CodeUnit,
@@ -3747,7 +3747,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn flattened_macro_namespace_alias_target_matches(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         visible_from: &ProjectFile,
         alias: &CodeUnit,
         alias_target: &StructuredAliasTarget,
@@ -3813,7 +3813,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn template_alias_arguments_preserve_target(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         visible_from: &ProjectFile,
         alias: &CodeUnit,
         arguments: &[CppTemplateExpression],
@@ -3849,7 +3849,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn same_template_member_identity(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         left: &CodeUnit,
         right: &CodeUnit,
     ) -> bool {
@@ -3874,7 +3874,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn unique_canonical_type_candidate(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         visible_from: &ProjectFile,
         candidates: &[&CodeUnit],
     ) -> Option<CodeUnit> {
@@ -3897,7 +3897,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn unique_type_candidate_preserving_target(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         visible_from: &ProjectFile,
         candidates: &[&CodeUnit],
         target: &CodeUnit,
@@ -3935,7 +3935,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn alternate_same_fqn_type_declarations(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         candidates: &[&CodeUnit],
         target: &CodeUnit,
     ) -> bool {
@@ -4038,7 +4038,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn declarations_share_exhaustive_conditional_family(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         candidates: &[&CodeUnit],
     ) -> bool {
         // Guard terms alone cannot distinguish one #if family from separate
@@ -4079,7 +4079,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn complementary_same_fqn_type_declarations(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         candidates: &[&CodeUnit],
         target: &CodeUnit,
     ) -> bool {
@@ -4102,7 +4102,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn type_candidate_preserving_target(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         visible_from: &ProjectFile,
         candidate: &CodeUnit,
         target: &CodeUnit,
@@ -4189,7 +4189,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn alias_candidate_may_preserve_target(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         visible_from: &ProjectFile,
         candidate: &CodeUnit,
         target: &CodeUnit,
@@ -4253,7 +4253,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn resolves_to_type(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         raw_name: &str,
         target: &CodeUnit,
@@ -4294,7 +4294,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn parser_alias_resolves_to_type(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         raw_name: &str,
         target: &CodeUnit,
@@ -4433,7 +4433,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn resolve_call_return_binding(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         raw_name: &str,
         arity: usize,
@@ -4461,7 +4461,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn resolve_call_return_binding_without_arity(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         raw_name: &str,
         lexical_namespace: Option<&str>,
@@ -4511,7 +4511,7 @@ impl<'a> VisibilityIndex<'a> {
     /// index.
     pub fn visible_type_reference_component_names_for_target(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         target: &CodeUnit,
     ) -> HashSet<String> {
@@ -4589,12 +4589,15 @@ impl<'a> VisibilityIndex<'a> {
                     visible.push(candidate.clone());
                 }
             }
+            // Built once per call rather than per candidate; `cpp_source` rebuilds
+            // the five-field source from the same `self.cpp` on every call.
+            let cpp_source = self.cpp_source();
             let candidates = visible
                 .iter()
                 .filter(|candidate| {
                     candidate.source() == file
                         && candidate.is_class()
-                        && !declared_type_alias(self.cpp_source(), candidate)
+                        && !declared_type_alias(&cpp_source, candidate)
                         && self.cpp.ranges(candidate).iter().any(|range| {
                             range.start_byte <= class.start_byte()
                                 && class.end_byte() <= range.end_byte
@@ -4641,7 +4644,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn indexed_enclosing_owner_scope(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         node: Node<'_>,
     ) -> Option<Vec<String>> {
@@ -4695,7 +4698,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn cached_precise_parent_of(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         code_unit: &CodeUnit,
     ) -> Option<CodeUnit> {
         if let Some(cached) = self
@@ -4717,7 +4720,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn callable_is_constructor_declaration(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         candidate: &CodeUnit,
     ) -> bool {
         if !candidate.is_function() {
@@ -4822,7 +4825,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn field_declared_type_fact(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         field: &CodeUnit,
     ) -> Option<DeclaredFieldTypeFact> {
         if let Some(cached) = self
@@ -4844,7 +4847,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn structured_alias_target(
         &self,
-        analyzer: CppGraphSource<'_>,
+        analyzer: &CppGraphSource<'_>,
         unit: &CodeUnit,
     ) -> Option<StructuredAliasTarget> {
         if let Some(cached) = self
@@ -5076,7 +5079,7 @@ pub enum EnclosingMemberOwnerResolution {
 }
 
 pub fn resolve_declaring_member_owner(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     receiver_owner: &CodeUnit,
@@ -5176,7 +5179,7 @@ pub fn lexical_component_tiers<'a>(
 }
 
 pub fn build_visible_identifier_index(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     visible_by_file: &HashMap<ProjectFile, HashSet<CodeUnit>>,
     visible_source_files_by_root: &HashMap<ProjectFile, HashSet<ProjectFile>>,
     global_field_internal_linkage: &mut HashMap<CodeUnit, bool>,
@@ -5282,7 +5285,7 @@ fn push_cpp_fqn_candidate(out: &mut Vec<String>, package: &str, short: &str) {
 }
 
 pub fn infer_cpp_initializer_type(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -5293,7 +5296,7 @@ pub fn infer_cpp_initializer_type(
 }
 
 pub fn infer_cpp_initializer_binding(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -5387,7 +5390,7 @@ pub fn infer_cpp_initializer_binding(
 }
 
 fn resolve_static_method_call_return_binding(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -5432,7 +5435,7 @@ fn resolve_static_method_call_return_binding(
 }
 
 fn resolve_field_method_call_return_binding(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -5466,7 +5469,7 @@ fn resolve_field_method_call_return_binding(
 }
 
 fn unanimous_return_binding(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     candidates: &[CodeUnit],
@@ -5614,7 +5617,7 @@ fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 pub fn collect_include_closure(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     include_targets: &IncludeTargetIndex,
     file: &ProjectFile,
     out: &mut HashSet<ProjectFile>,
@@ -5720,7 +5723,7 @@ fn parse_macro_parameter_list_arity(replacement: &str) -> Option<CallableArity> 
     Some(CallableArity::new(required, total, repeated))
 }
 
-pub fn cpp_callable_arity(analyzer: CppGraphSource<'_>, unit: &CodeUnit) -> CallableArity {
+pub fn cpp_callable_arity(analyzer: &CppGraphSource<'_>, unit: &CodeUnit) -> CallableArity {
     analyzer
         .signature_metadata(unit)
         .into_iter()
@@ -5968,7 +5971,7 @@ fn unconditional_include_reaches(
 }
 
 fn declaration_guard_requirements(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     cpp: &dyn CppAnalysisSource,
     candidate: &CodeUnit,
 ) -> Vec<(usize, HashSet<PreprocessorGuard>)> {
@@ -6174,7 +6177,7 @@ fn unique_include_target(mut targets: Vec<ProjectFile>) -> Option<ProjectFile> {
 }
 
 fn callable_declaration_activation_in_file(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     prepared: &PreparedSyntaxTree,
     candidate: &CodeUnit,
     reference_file: &ProjectFile,
@@ -6279,7 +6282,7 @@ fn callable_preprocessor_context_is_visible_for_reference(
 }
 
 fn flattened_macro_namespace_declaration_matches(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     cpp: &dyn CppAnalysisSource,
     reference_file: &ProjectFile,
     visible_declaration: &CodeUnit,
@@ -6748,7 +6751,7 @@ fn qualified_base_initializer_constructs_target(
     let resolves_target = |components: &[String]| {
         matches!(
             ctx.visibility.resolve_type_components_lexically_for_target(
-                ctx.analyzer,
+                &ctx.analyzer,
                 ctx.file,
                 components,
                 is_globally_qualified_cpp_name(qualified),
@@ -6786,7 +6789,7 @@ fn field_declares_type(unit: &CodeUnit, ctx: &ScanCtx<'_>, owner: &CodeUnit) -> 
 }
 
 pub fn field_declared_binding(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     visible_from: &ProjectFile,
     field: &CodeUnit,
@@ -6837,7 +6840,7 @@ fn unique_logical_type_candidate(candidates: Vec<&CodeUnit>) -> Option<CodeUnit>
 }
 
 fn unique_type_candidate_preserving_alias(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     candidates: &[&CodeUnit],
 ) -> Option<CodeUnit> {
     let first = *candidates.first()?;
@@ -6859,7 +6862,7 @@ fn unique_type_candidate_preserving_alias(
         .then(|| first.clone())
 }
 
-fn declared_type_alias(analyzer: CppGraphSource<'_>, unit: &CodeUnit) -> bool {
+fn declared_type_alias(analyzer: &CppGraphSource<'_>, unit: &CodeUnit) -> bool {
     is_type_alias(unit)
         || analyzer
             .type_alias_provider()
@@ -6867,7 +6870,7 @@ fn declared_type_alias(analyzer: CppGraphSource<'_>, unit: &CodeUnit) -> bool {
 }
 
 pub fn field_declared_type_binding(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     visible_from: &ProjectFile,
     field: &CodeUnit,
@@ -6891,7 +6894,7 @@ pub fn field_declared_type_binding(
 }
 
 fn decode_field_declared_type_fact(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     field: &CodeUnit,
 ) -> Option<DeclaredFieldTypeFact> {
     let declaration = analyzer.get_source(field, false)?;
@@ -6922,7 +6925,7 @@ fn decode_field_declared_type_fact(
 }
 
 fn decode_structured_alias_target(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     unit: &CodeUnit,
 ) -> Option<StructuredAliasTarget> {
     analyzer
@@ -7085,13 +7088,13 @@ fn field_declaration_type_matches(
     owner: &CodeUnit,
 ) -> bool {
     ctx.visibility
-        .resolves_to_type(ctx.analyzer, ctx.file, declaration, owner)
+        .resolves_to_type(&ctx.analyzer, ctx.file, declaration, owner)
         || field_type_prefix(declaration, unit.identifier()).is_some_and(|type_text| {
             let normalized = normalize_field_type_text(type_text);
             ctx.visibility
-                .resolves_to_type(ctx.analyzer, ctx.file, type_text, owner)
+                .resolves_to_type(&ctx.analyzer, ctx.file, type_text, owner)
                 || ctx.visibility.resolves_to_type(
-                    ctx.analyzer,
+                    &ctx.analyzer,
                     ctx.file,
                     normalized.as_str(),
                     owner,
@@ -7149,7 +7152,7 @@ pub fn declaration_mentions_type(node: Node<'_>, ctx: &ScanCtx<'_>, owner: &Code
         return false;
     };
     ctx.visibility.resolves_to_type(
-        ctx.analyzer,
+        &ctx.analyzer,
         ctx.file,
         node_text(type_node, ctx.source),
         owner,
@@ -8070,7 +8073,7 @@ pub fn out_of_line_destructor_type_reference(node: Node<'_>) -> Option<Node<'_>>
 }
 
 pub fn out_of_line_member_definition_owner<'tree>(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -9097,7 +9100,7 @@ fn parser_alias_target_names(alias: &CppAlias) -> Vec<String> {
 /// The declared return type text of a C++ function unit, with leading declaration specifiers
 /// stripped, e.g. `T*` for `T* operator->()`.
 pub fn cpp_function_return_type_text(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     function: &CodeUnit,
 ) -> Option<String> {
     let metadata = analyzer.signature_metadata(function);
@@ -9113,7 +9116,7 @@ pub fn cpp_function_return_type_text(
 }
 
 fn cpp_function_signature_text(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     function: &CodeUnit,
 ) -> Option<String> {
     function
@@ -9301,12 +9304,12 @@ pub fn enclosing_namespace_context(node: Node<'_>, source: &str) -> Option<Strin
 /// Like [`precise_parent_of`], but drops module (namespace) parents. A namespace is a scope, not a
 /// type or receiver, so namespace-scoped functions and constants resolve as free functions and
 /// globals rather than members.
-pub fn type_owner_of(analyzer: CppGraphSource<'_>, code_unit: &CodeUnit) -> Option<CodeUnit> {
+pub fn type_owner_of(analyzer: &CppGraphSource<'_>, code_unit: &CodeUnit) -> Option<CodeUnit> {
     type_owner_resolution(analyzer, code_unit).map(|owner| owner.unit)
 }
 
 fn type_owner_resolution(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     code_unit: &CodeUnit,
 ) -> Option<ResolvedTypeOwner> {
     precise_parent_resolution(analyzer, code_unit).filter(|owner| !owner.unit.is_module())
@@ -9318,7 +9321,7 @@ fn type_owner_resolution(
 /// resolution must continue to prefer the callable definition rather than
 /// replacing it with the forward owner.
 fn target_forward_owner_resolution(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     code_unit: &CodeUnit,
 ) -> Option<ResolvedTypeOwner> {
     if !code_unit.is_function() {
@@ -9358,7 +9361,7 @@ fn target_forward_owner_resolution(
 }
 
 pub fn precise_parent_of(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     code_unit: &CodeUnit,
 ) -> Option<CodeUnit> {
@@ -9366,7 +9369,7 @@ pub fn precise_parent_of(
 }
 
 fn precise_parent_resolution(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     code_unit: &CodeUnit,
 ) -> Option<ResolvedTypeOwner> {
     #[cfg(any(test, feature = "test-support"))]
@@ -9457,7 +9460,7 @@ fn precise_parent_resolution(
 }
 
 fn exact_structural_type_parent(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     code_unit: &CodeUnit,
 ) -> Option<CodeUnit> {
     if !code_unit.is_function() && !code_unit.is_field() {
@@ -9474,7 +9477,7 @@ fn exact_structural_type_parent(
 }
 
 fn same_source_owner(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     code_unit: &CodeUnit,
     owner_fqn: &str,
     owner_name: &str,
@@ -9494,7 +9497,7 @@ fn same_source_owner(
 }
 
 fn visible_full_cpp_owner(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     code_unit: &CodeUnit,
     owner_fqn: &str,
     owner_name: &str,
@@ -9556,7 +9559,7 @@ pub enum CppClassDeclarationStrength {
 }
 
 fn directly_included_owner(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     code_unit: &CodeUnit,
     owner_fqn: &str,
     owner_name: &str,
@@ -9590,7 +9593,7 @@ fn directly_included_owner(
 }
 
 fn prefer_member_declaring_owners<'a>(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     member: &CodeUnit,
     candidates: Vec<&'a CodeUnit>,
 ) -> Vec<&'a CodeUnit> {
@@ -9607,7 +9610,7 @@ fn prefer_member_declaring_owners<'a>(
 }
 
 fn owner_declares_member(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     owner: &CodeUnit,
     member: &CodeUnit,
 ) -> bool {
@@ -9619,7 +9622,7 @@ fn owner_declares_member(
 }
 
 fn classify_direct_owner_candidates<'a>(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     candidates: impl Iterator<Item = &'a CodeUnit>,
 ) -> DirectOwnerResolution {
     collapse_owner_candidates(candidates.map(|candidate| {
@@ -9655,7 +9658,7 @@ pub fn collapse_owner_candidates(
 }
 
 pub fn cpp_class_declaration_strength(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     candidate: &CodeUnit,
 ) -> CppClassDeclarationStrength {
     if let Some(prepared) = analyzer
@@ -9690,7 +9693,7 @@ pub fn cpp_class_declaration_strength(
 }
 
 fn cpp_class_declaration_strength_in_tree(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     candidate: &CodeUnit,
     source: &str,
     root: Node<'_>,
@@ -9783,7 +9786,7 @@ pub fn same_visible_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
 }
 
 pub fn same_visible_global_field_symbol(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     internal_linkage_cache: &mut HashMap<CodeUnit, bool>,
     left: &CodeUnit,
     right: &CodeUnit,
@@ -9804,7 +9807,7 @@ pub fn same_visible_global_field_symbol(
 }
 
 fn cpp_global_field_has_internal_linkage_cached(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     cache: &mut HashMap<CodeUnit, bool>,
     candidate: &CodeUnit,
 ) -> bool {
@@ -9850,7 +9853,7 @@ pub fn same_logical_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
 }
 
 pub fn cpp_global_field_has_internal_linkage(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     candidate: &CodeUnit,
 ) -> bool {
     if !candidate.is_field() || candidate.short_name().contains('.') {
@@ -9871,7 +9874,7 @@ pub fn cpp_global_field_has_internal_linkage(
 }
 
 fn cpp_global_field_linkage_peers<'a>(
-    analyzer: CppGraphSource<'a>,
+    analyzer: &CppGraphSource<'a>,
     candidate: &'a CodeUnit,
 ) -> impl Iterator<Item = &'a CodeUnit> + 'a {
     // `peers` rather than `fqn` on the same index: the peers are returned to
@@ -9919,7 +9922,7 @@ pub fn with_cpp_global_field_linkage_peer_inspection_counter_for_test<T>(
 }
 
 fn cpp_global_field_declaration_linkage(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     candidate: &CodeUnit,
 ) -> Option<CppFieldLinkage> {
     let cpp = analyzer.cpp?;
@@ -9944,7 +9947,7 @@ fn cpp_global_field_declaration_linkage(
 }
 
 fn cpp_global_field_declaration_linkage_in_tree(
-    analyzer: CppGraphSource<'_>,
+    analyzer: &CppGraphSource<'_>,
     candidate: &CodeUnit,
     source: &str,
     root: Node<'_>,

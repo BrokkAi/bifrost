@@ -181,7 +181,7 @@ pub fn enclosing_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> EnclosingContext 
         if let Some(cached) = cached {
             return cached;
         }
-        let resolved = precise_parent_of(ctx.analyzer, ctx.visibility, enclosing)
+        let resolved = precise_parent_of(&ctx.analyzer, ctx.visibility, enclosing)
             .or_else(|| visible_owner_from_member_name(ctx, enclosing));
         ctx.enclosing_owner_cache
             .borrow_mut()

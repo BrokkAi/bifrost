@@ -133,7 +133,7 @@ pub(in crate::analyzer::usages) fn with_cpp_graph_source<T>(
 #[cfg(any(test, feature = "test-support"))]
 pub fn cpp_type_owner_for_test(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<CodeUnit> {
     with_cpp_graph_source(analyzer, |source| {
-        brokk_bifrost_cpp::graph::resolver::type_owner_of(source, unit)
+        brokk_bifrost_cpp::graph::resolver::type_owner_of(&source, unit)
     })
 }
 
@@ -173,7 +173,7 @@ pub(crate) fn dead_code_bulk_eligibility(
     overloaded_fqns: &HashSet<String>,
 ) -> CppDeadCodeBulkEligibility {
     let Some(spec) =
-        with_cpp_graph_source(analyzer, |source| TargetSpec::from_target(source, target))
+        with_cpp_graph_source(analyzer, |source| TargetSpec::from_target(&source, target))
     else {
         return CppDeadCodeBulkEligibility::NeedsPrecise;
     };
@@ -195,7 +195,7 @@ pub(crate) fn dead_code_bulk_eligibility(
 }
 
 pub(crate) fn is_cpp_global_main(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> bool {
-    with_cpp_graph_source(analyzer, |source| TargetSpec::from_target(source, target))
+    with_cpp_graph_source(analyzer, |source| TargetSpec::from_target(&source, target))
         .is_some_and(|spec| cpp_global_main(&spec))
 }
 
