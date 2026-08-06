@@ -2,7 +2,7 @@
 //!
 //! Attribute-class evidence and the direct-ancestor walk moved to
 //! [`brokk_bifrost_csharp::hierarchy`]; the `direct_ancestors` moka cache and
-//! the `direct_descendant_index` `OnceLock` stay on the analyzer, and
+//! the memoized `direct_descendant_index` stay on the analyzer, and
 //! `build_direct_descendant_index` is generic over `IAnalyzer`, so the impl
 //! stays here.
 
@@ -27,9 +27,14 @@ impl TypeHierarchyProvider for CSharpAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+        // The builder itself is serial, so the same closure serves both memo
+        // arms; the memo's value here is the non-blocking claim protocol.
         self.memo_caches
             .direct_descendant_index
-            .get_or_init(|| build_direct_descendant_index(self, self))
+            .get_or_build(
+                || build_direct_descendant_index(self, self),
+                || build_direct_descendant_index(self, self),
+            )
             .descendants(code_unit)
     }
 }

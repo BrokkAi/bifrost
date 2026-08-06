@@ -3,7 +3,7 @@
 //!
 //! The supertype-name resolution and the ancestor-to-descendant inversion moved
 //! to [`brokk_bifrost_jvm::kotlin::hierarchy`]. What stays is the two moka
-//! ancestor caches, the two `OnceLock` descendant indexes, and the persisted
+//! ancestor caches, the two memoized descendant indexes, and the persisted
 //! hierarchy row type the walk reads through [`KotlinHierarchyFact`]. Each pair
 //! is realm-keyed because the realm-aware and realm-less answers are different
 //! questions, and a Kotlin-only entry must never be served to a caller that can
@@ -75,8 +75,13 @@ impl KotlinAnalyzer {
             Some(_) => &self.realm_direct_descendant_index,
             None => &self.direct_descendant_index,
         };
+        // The builder itself is serial, so the same closure serves both memo
+        // arms; the memo's value here is the non-blocking claim protocol.
         index
-            .get_or_init(|| self.build_direct_descendant_index(realm))
+            .get_or_build(
+                || self.build_direct_descendant_index(realm),
+                || self.build_direct_descendant_index(realm),
+            )
             .descendants(code_unit)
     }
 

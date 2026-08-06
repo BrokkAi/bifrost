@@ -14,7 +14,11 @@ pub(super) struct CSharpMemoCaches {
     pub(super) imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     pub(super) referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     pub(super) direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    pub(super) direct_descendant_index: OnceLock<DirectDescendantIndex>,
+    /// `PoolSafeMemo`, not `OnceLock`, for the same reason as the two sibling
+    /// cells below: this whole-workspace build is reached from rayon workers
+    /// during cold scans, and a blocking `get_or_init` parks every one of them
+    /// behind the single initializer for its full duration.
+    pub(super) direct_descendant_index: PoolSafeMemo<DirectDescendantIndex>,
     pub(super) reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(super) implicit_reference_index:
         PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
@@ -38,7 +42,7 @@ impl CSharpMemoCaches {
             ),
             referencing_files: build_weighted_cache(budget_bytes / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(budget_bytes / 8, weight_code_unit_vec),
-            direct_descendant_index: OnceLock::new(),
+            direct_descendant_index: PoolSafeMemo::new(),
             reverse_import_index: PoolSafeMemo::new(),
             implicit_reference_index: PoolSafeMemo::new(),
             global_using_namespaces: OnceLock::new(),

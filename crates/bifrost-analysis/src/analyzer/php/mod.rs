@@ -4,7 +4,7 @@
 //! resolution, composer PSR-4 visibility, the structural spec, test detection,
 //! clone normalization and the R1 free functions -- lives in the crate. What
 //! stays here is the [`PhpAnalyzer`] struct with its one moka cache, one
-//! `OnceLock` and the `Arc<PhpComposerAutoload>` it rebuilds when
+//! `PoolSafeMemo` and the `Arc<PhpComposerAutoload>` it rebuilds when
 //! `composer.json` changes, the `PhpAdapter` forwarding shell, the core
 //! capability impls the crate resolves through, the `LanguageSupport` SPI block,
 //! and the executable-semantics lowerer.
@@ -40,15 +40,16 @@ use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::weighted_cache::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, DirectDescendantIndex,
-    ForwardQueryProvider, IAnalyzer, Language, Project, ProjectFile, Range, SignatureMetadata,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeHierarchyProvider, UsageFactsIndex, build_direct_descendant_index, resolve_analyzer,
+    ForwardQueryProvider, IAnalyzer, Language, PoolSafeMemo, Project, ProjectFile, Range,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex, build_direct_descendant_index,
+    resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub(crate) use adapter::PhpAdapter;
 // The parked bounded-definition route (`usages/get_definition/php.rs`) resolves
@@ -78,7 +79,10 @@ pub struct PhpAnalyzer {
     inner: TreeSitterAnalyzer<PhpAdapter>,
     memo_budget: u64,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
+    /// `PoolSafeMemo`, not `OnceLock`: this whole-workspace build is reached
+    /// from rayon workers during cold scans, and a blocking `get_or_init` parks
+    /// every one of them behind the single initializer for its full duration.
+    direct_descendant_index: Arc<PoolSafeMemo<DirectDescendantIndex>>,
     composer_autoload: Arc<PhpComposerAutoload>,
 }
 
@@ -132,7 +136,7 @@ impl PhpAnalyzer {
             inner,
             memo_budget,
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
-            direct_descendant_index: Arc::new(OnceLock::new()),
+            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
             composer_autoload,
         }
     }
@@ -254,8 +258,13 @@ impl TypeHierarchyProvider for PhpAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+        // The builder itself is serial, so the same closure serves both memo
+        // arms; the memo's value here is the non-blocking claim protocol.
         self.direct_descendant_index
-            .get_or_init(|| build_direct_descendant_index(self, self))
+            .get_or_build(
+                || build_direct_descendant_index(self, self),
+                || build_direct_descendant_index(self, self),
+            )
             .descendants(code_unit)
     }
 }
