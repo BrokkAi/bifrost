@@ -4,7 +4,7 @@ use crate::analyzer::usages::common::{
 };
 use crate::analyzer::usages::traits::CandidateFileProvider;
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile,
+    CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportReachability, Language, ProjectFile,
     cpp_callable_definitions_share_identity_evidence,
 };
 use crate::cancellation::CancellationToken;
@@ -228,17 +228,33 @@ fn find_direct_importers_with_cancellation(
             .and_then(|infos| infos.get(candidate))
             .cloned()
             .unwrap_or_else(|| import_provider.import_info_of(candidate));
-        let could_import_target = source_files
-            .iter()
-            .any(|target| import_provider.could_import_file(candidate, &imports, target));
+        // A single `DoesNotReach` only rules out one target, so the walk keeps
+        // asking until a target reaches or one answers `Unknown`. The backstop
+        // below is skipped only when EVERY target was proved unreachable
+        // (#1730): one undecided pair is enough to need it.
+        let mut verdict = ImportReachability::DoesNotReach;
+        for target in source_files {
+            match import_provider.import_reachability(candidate, &imports, target) {
+                ImportReachability::Reaches => {
+                    verdict = ImportReachability::Reaches;
+                    break;
+                }
+                ImportReachability::Unknown => verdict = ImportReachability::Unknown,
+                ImportReachability::DoesNotReach => {}
+            }
+        }
         if cancellation.is_cancelled() {
             return Err(());
         }
-        if could_import_target {
-            if let Ok(mut sink) = importers.lock() {
-                sink.insert(candidate.clone());
+        match verdict {
+            ImportReachability::Reaches => {
+                if let Ok(mut sink) = importers.lock() {
+                    sink.insert(candidate.clone());
+                }
+                return Ok(());
             }
-            return Ok(());
+            ImportReachability::DoesNotReach => return Ok(()),
+            ImportReachability::Unknown => {}
         }
         let imported = import_provider
             .imported_code_units_from_infos(candidate, &imports)

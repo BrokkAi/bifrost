@@ -5,12 +5,12 @@ use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CSharpAnalyzer, CloneSmell,
     CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer, DeclarationInfo,
     DefinitionIndexHandle, ExceptionHandlingAnalysis, ExceptionSmellWeights, GoAnalyzer, IAnalyzer,
-    ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer, KotlinAnalyzer, Language,
-    PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer,
-    ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch, SemanticDiagnostic,
-    SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
-    TypescriptAnalyzer,
+    ImportAnalysisProvider, ImportInfo, ImportReachability, JavaAnalyzer, JavascriptAnalyzer,
+    KotlinAnalyzer, Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range,
+    RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch,
+    SemanticDiagnostic, SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
+    TypeHierarchyProvider, TypescriptAnalyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
@@ -477,6 +477,20 @@ impl ImportAnalysisProvider for MultiAnalyzer {
             .and_then(AnalyzerDelegate::import_analysis_provider)
             .map(|provider| provider.could_import_file(source_file, imports, target))
             .unwrap_or(false)
+    }
+
+    /// A file whose language has no delegate is undecided, not unreachable:
+    /// `unwrap_or` must not manufacture a proof the workspace never made.
+    fn import_reachability(
+        &self,
+        source_file: &ProjectFile,
+        imports: &[ImportInfo],
+        target: &ProjectFile,
+    ) -> ImportReachability {
+        self.delegate_for_file(source_file)
+            .and_then(AnalyzerDelegate::import_analysis_provider)
+            .map(|provider| provider.import_reachability(source_file, imports, target))
+            .unwrap_or(ImportReachability::Unknown)
     }
 
     /// Without this override, `MultiAnalyzer` falls back to the trait default (always `None`) instead

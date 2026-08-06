@@ -71,8 +71,8 @@ pub(crate) use brokk_bifrost_cpp::imports::{
     include_paths as cpp_include_paths, resolve_include_targets, resolve_include_targets_with_index,
 };
 pub use capabilities::{
-    CapabilityProvider, ImportAnalysisProvider, TestDetectionProvider, TypeAliasProvider,
-    TypeHierarchyProvider,
+    CapabilityProvider, ImportAnalysisProvider, ImportReachability, TestDetectionProvider,
+    TypeAliasProvider, TypeHierarchyProvider,
 };
 pub(crate) use capabilities::{
     DirectDescendantIndex, build_direct_descendant_index, build_reverse_file_index,
