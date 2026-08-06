@@ -771,6 +771,12 @@ fn transparent_expression_parent(current: Node<'_>, parent: Node<'_>) -> bool {
         "parenthesized_expression" | "checked_expression"
     ) || (parent.kind() == "cast_expression"
         && parent.child_by_field_name("value") == Some(current))
+        || (parent.kind() == "binary_expression"
+            && parent
+                .child_by_field_name("operator")
+                .is_some_and(|operator| matches!(operator.kind(), "+" | "-" | "??"))
+            && (parent.child_by_field_name("left") == Some(current)
+                || parent.child_by_field_name("right") == Some(current)))
         || (parent.kind() == "postfix_unary_expression"
             && parent.named_child(0) == Some(current)
             && parent
