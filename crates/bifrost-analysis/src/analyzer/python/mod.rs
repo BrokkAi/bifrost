@@ -1,8 +1,8 @@
 //! The analyzer-owned shim over [`brokk_bifrost_python`].
 //!
 //! What lives here is everything the language crate cannot name: the
-//! [`PythonAnalyzer`] newtype and its six moka caches, two `OnceLock`s and
-//! `PoolSafeMemo`; the accessors that implement
+//! [`PythonAnalyzer`] newtype and its seven moka caches, one `OnceLock` and two
+//! `PoolSafeMemo`s; the accessors that implement
 //! [`brokk_bifrost_python::graph_support::PythonAnalysisSource`] and
 //! [`brokk_bifrost_python::graph_support::PythonUsageSource`] out of them; the
 //! `PythonAdapter` forwarding shell; the `IAnalyzer`/`CodeUnitIndex` impls; and
@@ -121,7 +121,12 @@ pub struct PythonAnalyzer {
         Cache<PythonUsageEdgesKey, Arc<crate::analyzer::usages::inverted_edges::UsageEdges>>,
     direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
-    usage_index: Arc<OnceLock<PythonUsageIndex>>,
+    // PoolSafeMemo, not OnceLock: this cell is reached from inside rayon workers -- the graph
+    // extractor's per-file fan-out resolves module bindings through it. The builder is serial, so
+    // the same closure serves both memo arms; what the memo buys is the non-blocking claim
+    // protocol, which stops a cold whole-workspace build from parking every worker that arrives
+    // behind the one thread running the initializer.
+    usage_index: Arc<PoolSafeMemo<PythonUsageIndex>>,
 }
 
 crate::analyzer::impl_forward_query_provider!(PythonAnalyzer);
@@ -243,7 +248,7 @@ impl PythonAnalyzer {
             usage_edges: build_weighted_cache(memo_budget / 8, weight_python_usage_edges),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            usage_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(PoolSafeMemo::new()),
         }
     }
 
@@ -270,9 +275,11 @@ impl PythonAnalyzer {
     }
 
     /// The cached re-export/importer index, built once per analyzer generation.
-    fn usage_index(&self) -> &PythonUsageIndex {
-        self.usage_index
-            .get_or_init(|| PythonUsageIndex::build(self))
+    fn usage_index(&self) -> Arc<PythonUsageIndex> {
+        self.usage_index.get_or_build(
+            || PythonUsageIndex::build(self),
+            || PythonUsageIndex::build(self),
+        )
     }
 
     /// `get_with` (not get-then-insert): callers include the parallelized candidate walker's
@@ -389,7 +396,7 @@ impl PythonAnalysisSource for PythonAnalyzer {
 }
 
 impl PythonUsageSource for PythonAnalyzer {
-    fn usage_index(&self) -> &PythonUsageIndex {
+    fn usage_index(&self) -> Arc<PythonUsageIndex> {
         self.usage_index()
     }
 }
@@ -653,7 +660,7 @@ impl IAnalyzer for PythonAnalyzer {
             usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            usage_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(PoolSafeMemo::new()),
         }
     }
 
@@ -674,7 +681,7 @@ impl IAnalyzer for PythonAnalyzer {
             usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
-            usage_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(PoolSafeMemo::new()),
         }
     }
 

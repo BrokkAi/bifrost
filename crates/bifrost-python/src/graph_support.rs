@@ -3,8 +3,8 @@
 //! written as free functions over a source trait instead of as methods on
 //! `PythonAnalyzer`.
 //!
-//! `PythonAnalyzer` (in `brokk-bifrost-analysis`) owns the lazy cells (six moka
-//! caches, two `OnceLock`s and a `PoolSafeMemo`) and implements
+//! `PythonAnalyzer` (in `brokk-bifrost-analysis`) owns the lazy cells (seven
+//! moka caches, one `OnceLock` and two `PoolSafeMemo`s) and implements
 //! [`PythonAnalysisSource`] out of its own accessors, so the functions below
 //! reach back for the memoized products they need without naming the analyzer
 //! type.
@@ -35,8 +35,8 @@ use crate::usage_index::PythonUsageIndex;
 /// can reach past this surface.
 ///
 /// The usage index is deliberately absent: [`PythonUsageIndex::build`] and
-/// everything it calls take this trait, so the build cannot re-enter the
-/// `OnceLock` it is filling. Code that runs once the index exists takes
+/// everything it calls take this trait, so the build cannot re-enter the memo
+/// it is filling. Code that runs once the index exists takes
 /// [`PythonUsageSource`].
 pub trait PythonAnalysisSource: CodeUnitIndex + ImportAnalysisProvider {
     /// Path-derived module units for `module_fq`; `None` when the store could
@@ -69,7 +69,7 @@ pub trait PythonAnalysisSource: CodeUnitIndex + ImportAnalysisProvider {
 /// [`PythonAnalysisSource`] plus the built usage index. Everything reached from
 /// the export/importer walks needs it; the index build itself must not.
 pub trait PythonUsageSource: PythonAnalysisSource {
-    fn usage_index(&self) -> &PythonUsageIndex;
+    fn usage_index(&self) -> Arc<PythonUsageIndex>;
 }
 
 pub fn extract_type_identifiers(source: &str) -> BTreeSet<String> {
