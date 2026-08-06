@@ -32,7 +32,7 @@ use crate::imports::{module_replacement_of, resolve_python_relative_module};
 #[derive(Debug, Default)]
 pub struct PythonUsageIndex {
     module_index: HashMap<String, Vec<ProjectFile>>,
-    exports_by_file: HashMap<ProjectFile, ExportIndex>,
+    exports_by_file: HashMap<ProjectFile, Arc<ExportIndex>>,
     reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
     importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
@@ -106,8 +106,8 @@ impl PythonUsageIndex {
         files.dedup();
 
         let mut module_index: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-        let mut exports_by_file: HashMap<ProjectFile, ExportIndex> = HashMap::default();
-        let mut binders_by_file: HashMap<ProjectFile, ImportBinder> = HashMap::default();
+        let mut exports_by_file: HashMap<ProjectFile, Arc<ExportIndex>> = HashMap::default();
+        let mut binders_by_file: HashMap<ProjectFile, Arc<ImportBinder>> = HashMap::default();
         let mut replacement_modules: HashMap<ProjectFile, String> = HashMap::default();
         python.visit_file_facts(&files, &mut |file, facts| {
             let module_name = facts
@@ -124,7 +124,7 @@ impl PythonUsageIndex {
                 .or_default()
                 .push(file.clone());
             if let Some(facts) = facts {
-                let binder = import_binder_from_imports(python, file, facts.imports());
+                let binder = Arc::new(import_binder_from_imports(python, file, facts.imports()));
                 if binder.bindings.values().any(is_sys_namespace_binding)
                     && let Some(replacement) = module_replacement_of(python, file, facts.source())
                 {
@@ -132,7 +132,13 @@ impl PythonUsageIndex {
                 }
                 exports_by_file.insert(
                     file.clone(),
-                    export_index_from_file_facts(python, file, facts, &module_name, &binder),
+                    Arc::new(export_index_from_file_facts(
+                        python,
+                        file,
+                        facts,
+                        &module_name,
+                        &binder,
+                    )),
                 );
                 binders_by_file.insert(file.clone(), binder);
             } else {
@@ -416,8 +422,8 @@ fn canonical_module_replacement(
 fn build_importer_reverse(
     module_index: &HashMap<String, Vec<ProjectFile>>,
     files: &[ProjectFile],
-    binders_by_file: &HashMap<ProjectFile, ImportBinder>,
-    exports_by_file: &HashMap<ProjectFile, ExportIndex>,
+    binders_by_file: &HashMap<ProjectFile, Arc<ImportBinder>>,
+    exports_by_file: &HashMap<ProjectFile, Arc<ExportIndex>>,
 ) -> HashMap<ProjectFile, Vec<ImportEdge>> {
     let mut reverse: HashMap<ProjectFile, Vec<ImportEdge>> = HashMap::default();
     for file in files {

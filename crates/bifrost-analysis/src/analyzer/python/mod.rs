@@ -79,7 +79,8 @@ pub(crate) use brokk_bifrost_python::usage_index::{
     ModuleBindingEventKind, ModuleBindingTimeline, usage_resolve_module_files,
 };
 use cache::{
-    PythonUsageEdgesKey, weight_code_unit_vec, weight_export_index, weight_python_usage_edges,
+    PythonUsageEdgesKey, weight_code_unit_vec, weight_export_index, weight_import_binder,
+    weight_python_usage_edges,
 };
 use clones::build_clone_candidate_data;
 
@@ -108,6 +109,10 @@ pub struct PythonAnalyzer {
     // while candidate discovery was single-threaded and dominated by slower costs, but the dominant
     // cost once that walk was fixed and parallelized (#1257).
     export_index: Cache<ProjectFile, Arc<ExportIndex>>,
+    // Uncached, this rebuilt the whole per-file binding map -- including a store lookup per
+    // from-import through `resolve_module_code_unit` -- for every single `.bindings.get(name)` the
+    // receiver-type and annotation resolvers do. One binder per file serves all of them.
+    import_binder: Cache<ProjectFile, Arc<ImportBinder>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     // Dead-code analysis scans the stable caller domain but resolves a bounded
     // callee target set. Cache that exact pair for warm requests so repeated
@@ -233,6 +238,7 @@ impl PythonAnalyzer {
             imported_target_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             export_index: build_weighted_cache(memo_budget / 8, weight_export_index),
+            import_binder: build_weighted_cache(memo_budget / 8, weight_import_binder),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
             usage_edges: build_weighted_cache(memo_budget / 8, weight_python_usage_edges),
             direct_descendant_index: Arc::new(OnceLock::new()),
@@ -272,17 +278,22 @@ impl PythonAnalyzer {
     /// `get_with` (not get-then-insert): callers include the parallelized candidate walker's
     /// re-export BFS, so two threads racing on the same file's first lookup must not both pay the
     /// full disk-read-and-reparse cost below.
-    pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
-        self.export_index
-            .get_with(file.clone(), || {
-                Arc::new(compute_export_index_of(self, file))
-            })
-            .as_ref()
-            .clone()
+    pub fn export_index_of(&self, file: &ProjectFile) -> Arc<ExportIndex> {
+        self.export_index.get_with(file.clone(), || {
+            Arc::new(compute_export_index_of(self, file))
+        })
     }
 
-    pub fn import_binder_of(&self, file: &ProjectFile) -> ImportBinder {
-        import_binder_from_imports(self, file, &self.inner.import_info_of(file))
+    /// `get_with` for the same reason as `export_index_of`: the receiver-type and annotation
+    /// resolvers ask for this from the parallelized candidate walk.
+    pub fn import_binder_of(&self, file: &ProjectFile) -> Arc<ImportBinder> {
+        self.import_binder.get_with(file.clone(), || {
+            Arc::new(import_binder_from_imports(
+                self,
+                file,
+                &self.inner.import_info_of(file),
+            ))
+        })
     }
 
     /// The set of files any of `file`'s imports resolve into, cached per file. Unlike
@@ -348,11 +359,11 @@ impl PythonAnalysisSource for PythonAnalyzer {
         self.inner.forward_definition_fqn(fqn)
     }
 
-    fn import_binder_of(&self, file: &ProjectFile) -> ImportBinder {
+    fn import_binder_of(&self, file: &ProjectFile) -> Arc<ImportBinder> {
         self.import_binder_of(file)
     }
 
-    fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
+    fn export_index_of(&self, file: &ProjectFile) -> Arc<ExportIndex> {
         self.export_index_of(file)
     }
 
@@ -637,6 +648,7 @@ impl IAnalyzer for PythonAnalyzer {
             ),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
             export_index: build_weighted_cache(self.memo_budget / 8, weight_export_index),
+            import_binder: build_weighted_cache(self.memo_budget / 8, weight_import_binder),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
             usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
             direct_descendant_index: Arc::new(OnceLock::new()),
@@ -657,6 +669,7 @@ impl IAnalyzer for PythonAnalyzer {
             ),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
             export_index: build_weighted_cache(self.memo_budget / 8, weight_export_index),
+            import_binder: build_weighted_cache(self.memo_budget / 8, weight_import_binder),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
             usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
             direct_descendant_index: Arc::new(OnceLock::new()),

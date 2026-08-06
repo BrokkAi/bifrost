@@ -1,5 +1,5 @@
 use super::*;
-use crate::analyzer::usages::{ExportEntry, ReexportStar};
+use crate::analyzer::usages::{ExportEntry, ImportBinder, ImportBinding, ReexportStar};
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -52,6 +52,24 @@ pub(super) fn weight_export_index(_key: &ProjectFile, value: &Arc<ExportIndex>) 
         .map(|star| star.module_specifier.len() + size_of::<ReexportStar>())
         .sum::<usize>();
     (exports_size + reexport_stars_size + size_of::<ExportIndex>()).min(u32::MAX as usize) as u32
+}
+
+pub(super) fn weight_import_binder(_key: &ProjectFile, value: &Arc<ImportBinder>) -> u32 {
+    let bindings_size = value
+        .bindings
+        .iter()
+        .map(|(local_name, binding)| {
+            local_name.len()
+                + binding.module_specifier.len()
+                + binding
+                    .namespace_imported_module
+                    .as_deref()
+                    .map_or(0, str::len)
+                + binding.imported_name.as_deref().map_or(0, str::len)
+                + size_of::<ImportBinding>()
+        })
+        .sum::<usize>();
+    (bindings_size + size_of::<ImportBinder>()).min(u32::MAX as usize) as u32
 }
 
 pub(super) fn weight_python_usage_edges(

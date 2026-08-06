@@ -18,6 +18,7 @@ use brokk_bifrost_core::analyzer::usages::model::{
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use crate::declarations::{collect_python_identifiers, parse_python_tree};
 use crate::imports::{
@@ -48,9 +49,13 @@ pub trait PythonAnalysisSource: CodeUnitIndex + ImportAnalysisProvider {
 
     fn definition_fqn(&self, fqn: &str) -> Vec<CodeUnit>;
 
-    fn import_binder_of(&self, file: &ProjectFile) -> ImportBinder;
+    /// Shared by handle: both products are immutable for the analyzer
+    /// generation that cached them, and callers ask for them once per receiver
+    /// type, annotation or export name, so deep-cloning the whole map out of
+    /// the cache on every hit was pure waste.
+    fn import_binder_of(&self, file: &ProjectFile) -> Arc<ImportBinder>;
 
-    fn export_index_of(&self, file: &ProjectFile) -> ExportIndex;
+    fn export_index_of(&self, file: &ProjectFile) -> Arc<ExportIndex>;
 
     /// Every file's indexed facts, visited in the analyzer's own bulk-read
     /// batches. `None` marks a file the index carries no record for.

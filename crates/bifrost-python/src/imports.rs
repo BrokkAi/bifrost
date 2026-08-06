@@ -614,7 +614,7 @@ fn resolve_exported_name(
         }
 
         if !export_name.starts_with('_') {
-            for star in index.reexport_stars {
+            for star in &index.reexport_stars {
                 for target_file in
                     resolve_module_files_for_export(python, &file, &star.module_specifier)
                 {

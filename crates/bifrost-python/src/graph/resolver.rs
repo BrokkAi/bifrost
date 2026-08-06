@@ -61,9 +61,9 @@ fn infer_export_names_for_local(
     if index.exports_by_name.contains_key(local_name) {
         export_names.insert(local_name.to_string());
     }
-    for (export_name, entry) in index.exports_by_name {
-        if matches!(entry, ExportEntry::Local { local_name: ref name } if name == local_name) {
-            export_names.insert(export_name);
+    for (export_name, entry) in &index.exports_by_name {
+        if matches!(entry, ExportEntry::Local { local_name: name } if name == local_name) {
+            export_names.insert(export_name.clone());
         }
     }
     if export_names.is_empty()
