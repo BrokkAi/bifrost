@@ -488,7 +488,7 @@ pub(crate) fn resolve_cpp_bounded(
             "C++ analyzer is unavailable",
         ));
     };
-    if !CppAnalyzer::receiver_query_supported(file) {
+    if !brokk_bifrost_cpp::imports::receiver_query_supported(file) {
         return session.finish(no_definition(
             "cpp_c_receiver_unsupported",
             "bounded receiver traversal is intentionally unsupported for plain C",
@@ -1095,7 +1095,7 @@ pub(crate) fn cpp_type_lookup_resolution_in_session(
     session: &ResolutionSession,
 ) -> Option<CppBoundedTypeResolution> {
     let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
-    if !CppAnalyzer::receiver_query_supported(file) {
+    if !brokk_bifrost_cpp::imports::receiver_query_supported(file) {
         return None;
     }
     let provider = CppBoundedProvider { cpp, session };

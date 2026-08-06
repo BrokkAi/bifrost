@@ -43,7 +43,6 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
-use regex::Regex;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
@@ -256,13 +255,6 @@ impl CppAnalyzer {
             .bulk_file_states_for_query(files, BulkFileStateSource::Include);
     }
 
-    pub(crate) fn receiver_query_supported(file: &ProjectFile) -> bool {
-        file.rel_path()
-            .extension()
-            .and_then(|extension| extension.to_str())
-            != Some("c")
-    }
-
     pub(crate) fn declaration_candidates_by_identifier_limited(
         &self,
         identifier: &str,
@@ -435,23 +427,6 @@ impl CppAnalyzer {
     #[doc(hidden)]
     pub fn sql_definitions_query_count_for_test(&self) -> usize {
         self.inner.sql_definitions_query_count_for_test()
-    }
-
-    pub fn extract_type_identifiers(&self, source: &str) -> BTreeSet<String> {
-        static IDENT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-        let regex =
-            IDENT_RE.get_or_init(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_:<>]*").expect("valid regex"));
-        regex
-            .find_iter(source)
-            .map(|m| m.as_str())
-            .filter(|token| {
-                token
-                    .chars()
-                    .next()
-                    .is_some_and(|ch| ch.is_ascii_uppercase())
-            })
-            .map(|token| token.trim_matches(':').to_string())
-            .collect()
     }
 
     #[cfg(test)]
