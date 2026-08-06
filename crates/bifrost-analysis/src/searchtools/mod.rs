@@ -306,6 +306,13 @@ fn code_unit_kind_name(kind: CodeUnitType) -> &'static str {
     kind.display_lowercase()
 }
 
+/// Memo entry: (source length, content hash, classifier build result).
+type CppClassifierMemo = (
+    usize,
+    u64,
+    Option<std::rc::Rc<crate::analyzer::CppOccurrenceClassifier>>,
+);
+
 thread_local! {
     /// Per-thread 1-entry memo for the C++ occurrence classifier. Building it
     /// reparses the whole file with tree-sitter, and the definitions/scan
@@ -313,9 +320,8 @@ thread_local! {
     /// files (phalcon's 9.5 MB phalcon.zep.c, #1698) that meant one full parse
     /// per candidate unit, hours per tool call. Keyed by (length, content
     /// hash) so an edit invalidates; one entry per thread keeps it bounded.
-    static CPP_OCCURRENCE_CLASSIFIER: std::cell::RefCell<
-        Option<(usize, u64, Option<std::rc::Rc<crate::analyzer::CppOccurrenceClassifier>>)>,
-    > = const { std::cell::RefCell::new(None) };
+    static CPP_OCCURRENCE_CLASSIFIER: std::cell::RefCell<Option<CppClassifierMemo>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn cpp_occurrence_classifier_for(
