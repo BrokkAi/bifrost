@@ -3286,6 +3286,22 @@ impl<'a> CppVisitor<'a> {
             self.visit_class_like(type_node, scope, stack);
         }
 
+        if let Some(recovered) = recovered_macro_typedef_alias(node, self.source) {
+            let range = Range {
+                start_byte: node.start_byte(),
+                end_byte: recovered.end_node.end_byte(),
+                start_line: node.start_position().row + 1,
+                end_line: recovered.end_node.end_position().row + 1,
+            };
+            let signature = self
+                .source
+                .get(range.start_byte..range.end_byte)
+                .map(normalize_cpp_whitespace)
+                .unwrap_or_default();
+            self.record_type_aliases(node, scope, vec![recovered.name], signature, range);
+            return;
+        }
+
         let alias_names = match node.kind() {
             "alias_declaration" => extract_alias_declaration_name(node, self.source)
                 .into_iter()
@@ -3298,6 +3314,23 @@ impl<'a> CppVisitor<'a> {
 
     fn add_type_aliases(&mut self, node: Node<'_>, scope: &ScopeInfo, alias_names: Vec<String>) {
         let signature = normalize_cpp_whitespace(node_text(node, self.source));
+        self.record_type_aliases(
+            node,
+            scope,
+            alias_names,
+            signature,
+            cpp_declaration_range(node),
+        );
+    }
+
+    fn record_type_aliases(
+        &mut self,
+        node: Node<'_>,
+        scope: &ScopeInfo,
+        alias_names: Vec<String>,
+        signature: String,
+        range: Range,
+    ) {
         if signature.is_empty() {
             return;
         }
@@ -3327,7 +3360,7 @@ impl<'a> CppVisitor<'a> {
             // Declaration identity does not include the alias signature. Keep
             // each physical range so conditional aliases retain their guards.
             self.parsed
-                .add_code_unit(code_unit.clone(), node, self.source, None, None);
+                .add_code_unit_with_range(code_unit.clone(), range, None, None);
             self.parsed
                 .add_signature(code_unit.clone(), signature.clone());
             if let Some(metadata) = &scope.template_metadata {
@@ -4249,20 +4282,89 @@ fn recovered_typedef_error_alias_name(
 }
 
 fn extract_typedef_alias_names(node: Node<'_>, source: &str) -> Vec<String> {
-    let type_node = node.child_by_field_name("type");
+    // A function-like token in the type position can make tree-sitter expose
+    // its argument as a parenthesized declarator. Do not publish that argument
+    // as an alias. The macro-specific recovery below handles the proven shape.
+    if fragmented_parenthesized_typedef_type(node).is_some() {
+        return Vec::new();
+    }
+    let has_function_like_macro_type = node
+        .child_by_field_name("type")
+        .filter(|type_node| type_node.kind() == "type_identifier")
+        .is_some_and(|type_node| {
+            cpp_export_macro_token(&normalize_cpp_whitespace(node_text(type_node, source)))
+        });
     let mut names = Vec::new();
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if type_node.is_some_and(|type_node| same_node(child, type_node)) {
+    for declarator in node.children_by_field_name("declarator", &mut cursor) {
+        if has_function_like_macro_type && declarator.kind() == "parenthesized_declarator" {
             continue;
         }
-        if let Some(name) = extract_typedef_declarator_name(child, source)
+        if let Some(name) = extract_typedef_declarator_name(declarator, source)
             && !names.contains(&name)
         {
             names.push(name);
         }
     }
     names
+}
+
+struct RecoveredMacroTypedefAlias<'tree> {
+    name: String,
+    end_node: Node<'tree>,
+}
+
+/// Recover `typedef MACRO(type) alias;` when tree-sitter splits the final alias
+/// into an identifier expression statement. The uppercase macro token, missing
+/// typedef terminator, and complete sibling terminator prove this exact shape.
+fn recovered_macro_typedef_alias<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<RecoveredMacroTypedefAlias<'tree>> {
+    let type_node = fragmented_parenthesized_typedef_type(node)?;
+    if type_node.kind() != "type_identifier"
+        || !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(type_node, source)))
+    {
+        return None;
+    }
+
+    let end_node = node.next_named_sibling()?;
+    if end_node.kind() != "expression_statement" || end_node.named_child_count() != 1 {
+        return None;
+    }
+    let name_node = end_node.named_child(0)?;
+    if name_node.kind() != "identifier" {
+        return None;
+    }
+    let has_terminator = (0..end_node.child_count()).any(|index| {
+        end_node
+            .child(index)
+            .is_some_and(|child| child.kind() == ";" && !child.is_missing())
+    });
+    if !has_terminator {
+        return None;
+    }
+    let name = normalize_cpp_whitespace(node_text(name_node, source));
+    (!name.is_empty()).then_some(RecoveredMacroTypedefAlias { name, end_node })
+}
+
+fn fragmented_parenthesized_typedef_type(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "type_definition" {
+        return None;
+    }
+    let mut declarator_cursor = node.walk();
+    let mut declarators = node.children_by_field_name("declarator", &mut declarator_cursor);
+    if declarators.next()?.kind() != "parenthesized_declarator" || declarators.next().is_some() {
+        return None;
+    }
+    let has_missing_terminator = (0..node.child_count()).any(|index| {
+        node.child(index)
+            .is_some_and(|child| child.kind() == ";" && child.is_missing())
+    });
+    if !has_missing_terminator {
+        return None;
+    }
+    node.child_by_field_name("type")
 }
 
 fn extract_typedef_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
