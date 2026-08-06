@@ -1878,7 +1878,9 @@ fn unresolved_and_external_calls_remain_typed_boundaries() {
                 .outgoing_kind(ControlEdgeKind::Exceptional),
             root(),
         );
-    external.assert_outcome(IcfgOutcomeKind::Unproven);
+    // No dependency discovery ran for "third-party", so the refined boundary
+    // is external_unknown and dispatch cannot claim a closed answer (#1599).
+    external.assert_outcome(IcfgOutcomeKind::Unknown);
     external.assert_boundary(
         "external_invoke",
         ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchExternal)
