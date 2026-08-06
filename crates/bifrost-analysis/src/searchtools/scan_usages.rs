@@ -1184,23 +1184,24 @@ pub(super) fn resolve_scan_usages_target(
         }
     };
 
-    // The byte offset computed below from `target.line`/`target.column` is
-    // matched against `analyzer.ranges_of(&unit)` further down, which is
-    // itself keyed to the analyzer's indexed snapshot — so the line/column
-    // must be interpreted against that same snapshot, not a fresh disk read,
-    // or the two coordinate systems could disagree on a just-edited file.
-    let source = match analyzer.indexed_source(&file) {
-        Some(source) => source,
-        None => {
-            return location_selector_failure(
-                &target,
-                "read_failed",
-                format!(
-                    "failed to read `{}`: not indexed by analyzer",
-                    rel_path_string(&file)
-                ),
-            );
-        }
+    // Location ranges use the current source projection. Read the same
+    // working-tree source for line and column conversion, then fall back to
+    // the indexed snapshot when the file is not readable.
+    let source = match analyzer.project().read_source(&file) {
+        Ok(source) => source,
+        Err(_) => match analyzer.indexed_source(&file) {
+            Some(source) => source,
+            None => {
+                return location_selector_failure(
+                    &target,
+                    "read_failed",
+                    format!(
+                        "failed to read `{}`: not indexed by analyzer",
+                        rel_path_string(&file)
+                    ),
+                );
+            }
+        },
     };
 
     if target.column == Some(0) {
@@ -2986,8 +2987,8 @@ pub(super) fn external_usage_definition_ranges(
     let Some(source) = analyzer.indexed_source(target.source()) else {
         return ranges;
     };
-    let exact_ranges = DeclarationNameRangeContext::new(target.source(), source)
-        .location_name_ranges(analyzer, target);
+    let exact_ranges =
+        DeclarationNameRangeContext::new(target.source(), source).name_ranges(analyzer, target);
     if exact_ranges.is_empty() {
         ranges
     } else {
