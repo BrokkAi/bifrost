@@ -293,7 +293,7 @@ impl ScalaAnalyzer {
             if !seen.insert(fqn.clone()) {
                 continue;
             }
-            if let crate::analyzer::usages::scala_graph::namespace::ScalaTypeNamespaceResolution::Resolved(definition) =
+            if let brokk_bifrost_jvm::scala::graph::namespace::ScalaTypeNamespaceResolution::Resolved(definition) =
                 types.exact_type_declaration_for_owner_context(&fqn, code_unit)
             {
                 ancestors.push(definition);

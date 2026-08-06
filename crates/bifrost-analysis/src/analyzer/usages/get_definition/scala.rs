@@ -10,17 +10,22 @@ use crate::analyzer::scala::{
     scala_package_prefixes_at, scala_package_prefixes_at_checked, scala_simple_type_name,
     scala_type_lookup_segments,
 };
-use crate::analyzer::usages::scala_graph::local::{
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use crate::analyzer::{ImportInfo, SignatureMetadata, StructuredImportPath, StructuredImportScope};
+use brokk_bifrost_jvm::scala::graph::local::{
     ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
     seed_scala_binding_with_receiver_declaration,
 };
-use crate::analyzer::usages::scala_graph::namespace::{
+use brokk_bifrost_jvm::scala::graph::namespace::{
     ScalaDirectAncestorResolution, ScalaTypeNamespaceResolution, ScalaUnindexedTypeBinding,
     resolve_exact_lexical_type_namespace, scala_anonymous_instance_for_template,
     scala_nearest_unindexed_type_binding, scala_qualified_type_root,
     scala_type_reference_is_singleton, scala_unindexed_type_binding_shadows,
 };
-use crate::analyzer::usages::scala_graph::syntax::{
+use brokk_bifrost_jvm::scala::graph::resolver::{
+    method_signature_arity, resolved_extension_receiver_type,
+};
+use brokk_bifrost_jvm::scala::graph::syntax::{
     ScalaCallArgumentListKind, ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole,
     ScalaCallableSiteRole, ScalaCallableSourceAlternative, ScalaFunctionParameterShape,
     ScalaParameterListKind, ScalaParameterTypeIdentity, ScalaQualifiedStableTypeRole,
@@ -30,11 +35,6 @@ use crate::analyzer::usages::scala_graph::syntax::{
     qualified_stable_type_reference, scala_callable_alternative_is_candidate,
     scala_callable_alternative_matches, scala_pattern_binder_names, scala_source_facts,
 };
-use crate::analyzer::usages::scala_graph::{
-    method_signature_arity, resolved_extension_receiver_type,
-};
-use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
-use crate::analyzer::{ImportInfo, SignatureMetadata, StructuredImportPath, StructuredImportScope};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 

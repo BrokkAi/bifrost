@@ -62,7 +62,6 @@ pub(crate) use crate::analyzer::usages::reference_site::{
 // crate. The direction is one-way, exactly as it is for rust and python:
 // `brokk_bifrost_ruby::graph` names `ResolutionSession`, `get_definition`,
 // `get_type` and `DefinitionBatchContext` zero times.
-use crate::analyzer::usages::scala_graph::syntax::ScalaPackageContextIndex;
 use crate::analyzer::usages::scala_graph::{
     import_candidate_fq_names, import_candidate_owner_fq_names,
     package_name_of as scala_package_name_of, scala_builtin_type_name,
@@ -83,6 +82,7 @@ use crate::navigation::NavigationOperation;
 use crate::path_utils::rel_path_string;
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use brokk_bifrost_jvm::scala::graph::syntax::ScalaPackageContextIndex;
 use brokk_bifrost_ruby::graph::RubyGraphSource;
 use brokk_bifrost_ruby::graph::extractor::{
     ruby_enclosing_receiver, ruby_field_reference_owner_and_scope, ruby_receiver_type,
