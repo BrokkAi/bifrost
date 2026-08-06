@@ -14,12 +14,18 @@
 //! [`brokk_bifrost_core::analyzer::tree_walk`] and are re-exported by
 //! [`crate::analyzer::tree_sitter_analyzer`], where their callers already reach
 //! them. The enter/exit iterative walker joined them there when the Ruby scans
-//! moved into `brokk-bifrost-ruby`; java and js_ts reach it at this path.
+//! moved into `brokk-bifrost-ruby`; java and js_ts reach it at this path. The
+//! three direct-child readers -- `named_children`, `first_named_child_of_kind`
+//! and `has_token_child` -- followed when Kotlin's declaration walk moved into
+//! `brokk-bifrost-jvm`, since a language crate reads its own grammar's child
+//! slots with them; the first two are re-exported here for the callers already
+//! at this path, and `has_token_child` has no analysis-side caller left.
 
 use tree_sitter::Node;
 
 pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{
-    TreeWalkAction, node_for_exact_range, subtree_contains, walk_tree_iterative,
+    TreeWalkAction, first_named_child_of_kind, named_children, node_for_exact_range,
+    subtree_contains, walk_tree_iterative,
 };
 
 /// All descendants of `node` (not including `node` itself) whose `kind()` equals
@@ -46,37 +52,6 @@ pub(crate) fn descendants_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<N
         }
     }
     out
-}
-
-/// The direct named children of `node`, in source order.
-pub(crate) fn named_children<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
-}
-
-/// The first direct named child of `node` whose kind is `kind`.
-///
-/// Distinct from a bare "first named child": this selects by kind, which is how
-/// declaration walks reach a specific grammar slot (a `class_body`, a
-/// `type_identifier`) without assuming child order.
-pub(crate) fn first_named_child_of_kind<'tree>(
-    node: Node<'tree>,
-    kind: &str,
-) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == kind)
-}
-
-/// Whether `node` has an anonymous (token) child spelled `token`.
-///
-/// Restricted to anonymous children on purpose: grammars can spell the same
-/// text as either a keyword token or a named node, and callers asking this
-/// question want the keyword.
-pub(crate) fn has_token_child(node: Node<'_>, token: &str) -> bool {
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .any(|child| !child.is_named() && child.kind() == token)
 }
 
 #[cfg(test)]

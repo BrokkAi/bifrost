@@ -52,19 +52,22 @@
 
 mod adapter;
 mod clones;
-pub(crate) mod declarations;
 pub(crate) mod diagnostics;
 mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
 mod semantic;
-pub(crate) mod structural;
-mod supertypes;
-pub(crate) mod syntax;
-mod tests;
+mod structural;
 pub(crate) mod types;
+
 use crate::analyzer::Range;
 use crate::analyzer::store::LimitedQueryRows;
+/// The Kotlin declaration walk, its positional syntax readers, structured
+/// import decoding, raw-supertype extraction and test detection now live in
+/// [`brokk_bifrost_jvm::kotlin`]. Re-exporting the modules under their
+/// historical names keeps every `crate::analyzer::kotlin::…` path in this crate
+/// pointing at the same items.
+pub(crate) use brokk_bifrost_jvm::kotlin::{declarations, syntax};
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
@@ -99,10 +102,10 @@ use crate::analyzer::{
     UsageFactsIndex, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_jvm::kotlin::test_detection::detect_kotlin_test_assertion_smells;
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
-use tests::detect_kotlin_test_assertion_smells;
 use tree_sitter::Node;
 
 pub(crate) use adapter::KotlinAdapter;
@@ -777,7 +780,7 @@ impl LanguageSupport for KotlinSupport {
     }
 
     fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
-        &structural::KOTLIN_STRUCTURAL_SPEC
+        &brokk_bifrost_jvm::kotlin::structural::KOTLIN_STRUCTURAL_SPEC
     }
 
     fn highlight_query(&self) -> Option<&'static str> {
