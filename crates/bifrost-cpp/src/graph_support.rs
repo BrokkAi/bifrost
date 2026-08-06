@@ -65,6 +65,27 @@ pub trait CppSource:
     /// it. A missing fact requires the resolver's syntax fallback.
     fn cpp_field_linkage(&self, code_unit: &CodeUnit) -> Option<CppFieldLinkage>;
 
+    /// The cached result of a preprocessor-visible include-reachability walk.
+    ///
+    /// The reference language affects only `__cplusplus` guards. Callers pass
+    /// that fact as a Boolean so cache keys do not retain the full reference
+    /// path.
+    fn cached_unconditional_include_reachability(
+        &self,
+        first: &ProjectFile,
+        donor_source: &ProjectFile,
+        reference_is_c: bool,
+    ) -> Option<bool>;
+
+    /// Store a completed preprocessor-visible include-reachability walk.
+    fn cache_unconditional_include_reachability(
+        &self,
+        first: &ProjectFile,
+        donor_source: &ProjectFile,
+        reference_is_c: bool,
+        reaches: bool,
+    );
+
     /// The declaration's syntactic owner, which unlike
     /// [`CodeUnitIndex::parent_of`] never falls back to a definition-row lookup.
     fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit>;

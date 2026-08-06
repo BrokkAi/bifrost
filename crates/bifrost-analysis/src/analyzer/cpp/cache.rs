@@ -39,3 +39,16 @@ pub(super) fn weight_project_file_set(
     });
     size.saturating_add(size_of::<HashSet<ProjectFile>>()) as u32
 }
+
+pub(super) fn weight_include_reachability(
+    key: &(ProjectFile, ProjectFile, bool),
+    _value: &bool,
+) -> u32 {
+    let (first, donor, _) = key;
+    let size = size_of::<(ProjectFile, ProjectFile, bool)>()
+        .saturating_add(first.root().as_os_str().len())
+        .saturating_add(first.rel_path().as_os_str().len())
+        .saturating_add(donor.root().as_os_str().len())
+        .saturating_add(donor.rel_path().as_os_str().len());
+    size.clamp(1, u32::MAX as usize) as u32
+}

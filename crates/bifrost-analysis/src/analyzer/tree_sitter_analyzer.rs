@@ -7322,6 +7322,12 @@ where
                 limit,
             );
         }
+        if let Some(state) = self.query_file_state_snapshot(&key) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.signature_metadata, code_unit),
+                limit,
+            );
+        }
         let storage_key = self.adapter.storage_language_key_for_file(file);
         self.store_query_or_record(
             self.store_context

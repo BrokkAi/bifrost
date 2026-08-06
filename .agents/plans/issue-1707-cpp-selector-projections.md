@@ -15,7 +15,9 @@ C++ navigation must render a canonical selector without loading every stored fac
 - [x] Run focused tests and the repeat Phalcon probe.
 - [x] Persist C++ global-field linkage and read it without preparing source syntax.
 - [x] Run a focused linkage regression and repeat the Phalcon probe.
-- [ ] Avoid repeated syntax preparation in unconditional C++ include-reachability checks.
+- [x] Reuse unconditional C++ include-reachability answers across visibility indexes.
+- [x] Reuse the request FileState snapshot for C++ signature metadata during visibility construction.
+- [ ] Stop source rendering when `get_symbol_sources` exceeds its MCP response budget.
 - [ ] Run the required policy check after MCP tool registration is repaired.
 
 ## Surprises & Discoveries
@@ -36,6 +38,12 @@ C++ navigation must render a canonical selector without loading every stored fac
   Evidence: It reached 40 records at 1:40, but stayed at 44 records through 5:40. The selector-only run also reached 44.
 - Observation: Include-reachability is now the dominant syntax cost.
   Evidence: The repeat sample attributes 1,237 `prepared_syntax` calls to `unconditional_include_reaches` during C++ reference resolution.
+- Observation: Retained include-reachability answers do not improve the first visibility build.
+  Evidence: The first Phalcon request still reached 44 records and then stopped. The cache helps only later visibility indexes in the same analyzer.
+- Observation: C++ visibility construction now completes before the slow source lookup.
+  Evidence: The post-change sample at 1:46 is in `get_symbol_sources`, not `get_definitions_by_reference`, and contains no `signature_metadata_for_unit_limited` frames.
+- Observation: A broad `PHP_METHOD` source lookup renders 18,280,879 bytes before MCP rejects it.
+  Evidence: Two raw-symbol probes each take about 41 seconds and exceed the 16 MiB response budget. File-anchored probes finish in less than one second.
 
 ## Decision Log
 
@@ -45,7 +53,7 @@ C++ navigation must render a canonical selector without loading every stored fac
 
 ## Outcomes & Retrospective
 
-The selector path no longer needs full FileState hydration when persisted rows are complete. The dedicated test proves this behavior. Persisted global-field linkage also prevents a visibility-build parse. The Phalcon probe still stops at 44 records because unconditional include-reachability reparses the large include graph. The next focused change must persist or directly project the guard facts that this check needs.
+The selector path no longer needs full FileState hydration when persisted rows are complete. The dedicated test proves this behavior. Persisted global-field linkage also prevents a visibility-build parse. C++ include reachability now retains bounded answers across visibility indexes. Request-local metadata reads reuse the FileState already hydrated by the visibility build. The Phalcon navigation part now completes before `get_symbol_sources`. The remaining slow path renders source that MCP later rejects for size.
 
 Focused validation passed: `cargo fmt --check`, the persisted selector test, the six issue-1092 C++ identity tests, the global-field linkage regression, and `cargo clippy -p brokk-bifrost-analysis --all-targets -- -D warnings`. The policy skill is installed, but `list_policies` and `run_policy` are not registered in this task. The required policy result is therefore unavailable.
 
@@ -63,6 +71,8 @@ Change C++ header and implementation evidence in `cpp/identity.rs` to use `Impor
 
 Add a persisted C++ selector behavior test. It will query header and implementation definitions, render their selectors, and assert the canonical result and zero full hydrations.
 
+Give source-block collection an explicit byte budget for MCP requests. It must stop before it allocates all source blocks for a response that MCP will reject. It must keep the existing error contract: an oversized request returns `InvalidParams`, not partial source text.
+
 ## Concrete Steps
 
 From the repository root, run:
@@ -74,7 +84,7 @@ From the repository root, run:
 
 ## Validation and Acceptance
 
-The new test must show that canonical C++ selector output remains stable while full hydration stays at zero. The Phalcon run must make progress beyond 40 records within five minutes.
+The new test must show that canonical C++ selector output remains stable while full hydration stays at zero. The Phalcon run must make progress beyond 40 records within five minutes. An oversized source lookup must stop collection before it renders all oversized blocks and must return the existing response-budget error.
 
 ## Idempotence and Recovery
 
@@ -86,6 +96,6 @@ The before samples are `/tmp/issue-1707-phfresh-sample.txt` and `/tmp/issue-1707
 
 ## Interfaces and Dependencies
 
-The change uses `LanguageSupport::signature_metadata_limited`, `LanguageSupport::declaration_ranges_limited`, and `ImportAnalysisProvider::import_info_of`. It does not add a crate, a database schema change, or a new cache.
+The change uses `LanguageSupport::signature_metadata_limited`, `LanguageSupport::declaration_ranges_limited`, and `ImportAnalysisProvider::import_info_of`. It does not add a crate or a database schema change. It adds one bounded in-memory include-reachability cache.
 
 Plan revision: 2026-08-06. Created after the reproducible one-worker result. The plan selects direct projections because they remove the observed hydration path with less retained state.

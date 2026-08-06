@@ -5928,10 +5928,21 @@ fn unconditional_include_reaches(
     if known_missing.contains(first) {
         return false;
     }
+    let reference_is_c = reference_file
+        .rel_path()
+        .extension()
+        .and_then(|extension| extension.to_str())
+        == Some("c");
+    if let Some(reaches) =
+        cpp.cached_unconditional_include_reachability(first, donor_source, reference_is_c)
+    {
+        return reaches;
+    }
     let mut visited = HashSet::default();
     let mut files = vec![first.clone()];
     while let Some(file) = files.pop() {
         if file == *donor_source {
+            cpp.cache_unconditional_include_reachability(first, donor_source, reference_is_c, true);
             return true;
         }
         if known_missing.contains(&file) || !visited.insert(file.clone()) {
@@ -5967,6 +5978,7 @@ fn unconditional_include_reaches(
         }
     }
     known_missing.extend(visited);
+    cpp.cache_unconditional_include_reachability(first, donor_source, reference_is_c, false);
     false
 }
 
