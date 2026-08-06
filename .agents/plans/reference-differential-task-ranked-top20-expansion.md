@@ -565,6 +565,20 @@ the focus.
       `81f90974a3c547077cef72e35ef4cb23b739964b8dd5c3059ec8561f11ced92a`.
       The next active repository is rank sixteen
       `GoogleCloudPlatform__esp-v2`.
+    - [x] (2026-08-06 13:13Z) Rank sixteen
+      `GoogleCloudPlatform__esp-v2` completed at pinned head `1c176f5a`.
+      The fresh clean replay at Bifrost `4f7218b7` audited all 81 files,
+      367,301 source bytes, 14,846 structured candidates, and 10,000 sites.
+      It queried all 540 inverse targets. It reported 4,014 resolved forward
+      sites, 1,661 consistent, 71 editor-only, 34 honestly unproven, 8,234
+      inconclusive, and zero missing rows. It had no invalid locations, file
+      errors, skipped targets, truncation, or configured-limit failures. The
+      report and exact runner SHA-256 values are
+      `9825ce8980dca0b82acc9099641f20c3cd373a8f128c909897171bcff4c44b49`
+      and
+      `ab8e8801562ec1a967107ded8ef6eff06fdb358aac52a330a88658a46e4a81e8`.
+      No new issue was necessary. The next active repository is rank seventeen
+      `abseil__abseil-cpp`.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
