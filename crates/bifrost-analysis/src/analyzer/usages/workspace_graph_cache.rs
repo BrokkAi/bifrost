@@ -10,20 +10,29 @@ use std::sync::Arc;
 const USAGE_GRAPH_REPRESENTATION_VERSION: u32 = 1;
 pub(crate) const DEFAULT_MAX_RETAINED_BYTES: u64 = 32 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum WorkspaceUsageGraphKind {
+    File,
+    Exact,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct WorkspaceUsageGraphCacheKey {
     representation_version: u32,
+    kind: WorkspaceUsageGraphKind,
     ecosystems: Box<[UsageEcosystem]>,
     source_generations: Box<[u64]>,
 }
 
 impl WorkspaceUsageGraphCacheKey {
     pub(crate) fn new(
+        kind: WorkspaceUsageGraphKind,
         ecosystems: impl IntoIterator<Item = UsageEcosystem>,
         source_generations: Box<[u64]>,
     ) -> Self {
         Self {
             representation_version: USAGE_GRAPH_REPRESENTATION_VERSION,
+            kind,
             ecosystems: ecosystems.into_iter().collect(),
             source_generations,
         }
@@ -163,25 +172,30 @@ impl Default for SnapshotWorkspaceUsageGraphCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::usages::workspace_graph::WorkspaceUsageGraph;
+    use crate::analyzer::usages::workspace_graph::WorkspaceUsageRankingNode;
     use crate::hash::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
+    fn key_with_kind(
+        generation: u64,
+        kind: WorkspaceUsageGraphKind,
+    ) -> WorkspaceUsageGraphCacheKey {
+        WorkspaceUsageGraphCacheKey::new(kind, [UsageEcosystem::Rust], Box::new([generation]))
+    }
+
     fn key(generation: u64) -> WorkspaceUsageGraphCacheKey {
-        WorkspaceUsageGraphCacheKey::new([UsageEcosystem::Rust], Box::new([generation]))
+        key_with_kind(generation, WorkspaceUsageGraphKind::Exact)
     }
 
     fn empty_graph() -> WorkspaceUsageRankingGraph {
         WorkspaceUsageRankingGraph {
-            graph: WorkspaceUsageGraph {
-                nodes: Vec::new(),
-                edges: Vec::new(),
-                resolved_ecosystems: Vec::new(),
-            },
+            nodes: Vec::<WorkspaceUsageRankingNode>::new(),
+            edges: Vec::new(),
             node_indices_by_file: HashMap::default(),
+            resolved_ecosystems: Vec::new(),
         }
     }
 
@@ -275,6 +289,27 @@ mod tests {
         }
 
         assert_eq!(2, builds.load(Ordering::SeqCst));
+        assert_eq!(2, cache.len_for_test());
+    }
+
+    #[test]
+    fn file_and_exact_graphs_have_separate_cache_entries() {
+        let cache = SnapshotWorkspaceUsageGraphCache::default();
+        let cancellation = CancellationToken::default();
+
+        for kind in [
+            WorkspaceUsageGraphKind::File,
+            WorkspaceUsageGraphKind::Exact,
+        ] {
+            let (_, lifecycle) = ready_graph(cache.acquire(
+                key_with_kind(1, kind),
+                &cancellation,
+                || WorkspaceUsageGraphCacheBuildOutcome::Complete(empty_graph()),
+                || true,
+            ));
+            assert_eq!(WorkspaceUsageGraphCacheLifecycle::Built, lifecycle);
+        }
+
         assert_eq!(2, cache.len_for_test());
     }
 

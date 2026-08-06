@@ -6,7 +6,9 @@ from typing import Any, ClassVar, Literal, cast, get_args
 
 
 CodeQueryExecutionMode = Literal["results", "explain", "profile"]
-MostRelevantFilesRankingModeValue = Literal["history_imports", "usage_graph"]
+MostRelevantFilesRankingModeValue = Literal[
+    "history_imports", "usage_graph", "usage_graph_exact"
+]
 MostRelevantFilesIncompleteReasonValue = Literal["cancelled", "time_budget"]
 TestFileKindValue = Literal["test", "test_support", "production", "ambiguous"]
 _CODE_QUERY_EXECUTION_MODES = get_args(CodeQueryExecutionMode)

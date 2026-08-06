@@ -2314,6 +2314,11 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIn("B.java", [file.path for file in result.files])
         self.assertEqual([], result.not_found)
         self.assertEqual([], result.duplicates)
+        self.assertEqual("usage_graph", result.ranking_mode_used)
+        self.assertEqual(
+            "usage_graph_exact",
+            MostRelevantFilesRankingMode.USAGE_GRAPH_EXACT.value,
+        )
         self.assertIn("B.java", text)
 
     def test_most_relevant_files_reports_duplicate_resolved_seeds(self) -> None:
