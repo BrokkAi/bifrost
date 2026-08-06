@@ -8480,7 +8480,13 @@ pub(crate) fn node_range(node: Node<'_>) -> Range {
 /// `text` start at the file header while `start_line`/`end_line` still pointed
 /// at the declaration body.
 pub(crate) fn expanded_comment_start(source: &str, start_byte: usize) -> usize {
-    assert!(start_byte <= source.len() && source.is_char_boundary(start_byte));
+    // Tree-sitter can report a byte offset inside a UTF-8 code point for a
+    // malformed or generated source file. The later `str::get` call already
+    // rejects that range, so do not panic while trying to add comments. This
+    // occurred while prewarming Envoy's generated C++ sources.
+    if start_byte > source.len() || !source.is_char_boundary(start_byte) {
+        return start_byte.min(source.len());
+    }
 
     // Walk backward from the declaration instead of building a line index for
     // the whole file. Semantic indexing asks for every function body in a
@@ -8626,6 +8632,18 @@ mod tests {
         assert_eq!(
             expanded_comment_start(source, declaration),
             source.find("// nearby").unwrap()
+        );
+    }
+
+    #[test]
+    fn expanded_comment_start_ignores_non_boundary_offsets() {
+        let source = "// docs\nfn café() {}";
+        let non_boundary = source.find('é').unwrap() + 1;
+
+        assert_eq!(expanded_comment_start(source, non_boundary), non_boundary);
+        assert_eq!(
+            expanded_comment_start(source, source.len() + 1),
+            source.len()
         );
     }
 
