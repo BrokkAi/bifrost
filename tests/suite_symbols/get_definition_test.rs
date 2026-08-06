@@ -32419,3 +32419,68 @@ fun use(value: Shared) {
         "{value}"
     );
 }
+
+/// #644: Rust forward definition lookup must honor the focused token and treat
+/// local binding/declaration names as declarations, not references, so a
+/// receiver, `self`, `Self`, a parameter, or a `let` binding never resolves to
+/// an unrelated same-named field/method/variant. Each case reproduces one of
+/// the failure modes the gritql forward/inverse differential reported.
+#[test]
+fn rust_focus_never_resolves_bindings_to_unrelated_members_issue_644() {
+    // (source, click marker at the focused token, wrong fqn that #644 reported)
+    let s1 = "pub struct ApplyPatternArgs { pub dry_run: bool }\npub fn run(arg: ApplyPatternArgs) -> bool {\n    arg.dry_run\n}\n";
+    let s2 = "pub struct Problem;\nimpl Problem {\n    pub fn execute_shared(&self) -> u8 { 0 }\n    pub fn run(&self) -> u8 {\n        self.execute_shared()\n    }\n}\n";
+    let s3 = "pub enum Node {\n    Pattern,\n}\nimpl Node {\n    pub fn make() -> Self {\n        Self::Pattern\n    }\n}\n";
+    let s4 = "pub struct CallbackPattern;\npub struct BuiltIns;\nimpl BuiltIns {\n    pub fn call(&self) {}\n}\npub fn run(call: &CallbackPattern) { let _ = call; }\n";
+    let s5 = "pub struct WrappedResult { pub actual_sample: u8 }\npub fn run() {\n    let mut actual_sample = 1u8;\n    actual_sample += 1;\n}\n";
+
+    let cases = [
+        (s1, "arg.dry_run", "dry_run"),
+        (s2, "self.execute_shared", "execute_shared"),
+        (s3, "Self::Pattern", "Node.Pattern"),
+        (s4, "call: &CallbackPattern", "BuiltIns.call"),
+        (s5, "actual_sample = 1", "actual_sample"),
+    ];
+    for (src, click, forbidden) in cases {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", src)
+            .build();
+        let at = src.find(click).unwrap();
+        let value = lookup(project.root(), &location_reference("src/lib.rs", src, at));
+        let result = &value["results"][0];
+        let defs: Vec<String> = result["definitions"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry["name"].as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            defs.iter().all(|name| !name.contains(forbidden)),
+            "issue #644: focused token {click:?} must not resolve to the unrelated `{forbidden}`, got {defs:?} ({value})"
+        );
+    }
+
+    // Positive control: `Self::Pattern`'s `Self` still resolves to the enclosing
+    // type, so rejecting the variant did not blind the enclosing-type lookup.
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", s3)
+        .build();
+    let at = s3.find("Self::Pattern").unwrap();
+    let value = lookup(project.root(), &location_reference("src/lib.rs", s3, at));
+    let defs: Vec<String> = value["results"][0]["definitions"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| entry["name"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        defs.iter().any(|name| name == "Node"),
+        "issue #644: `Self` must resolve to the enclosing type Node, got {defs:?} ({value})"
+    );
+}
