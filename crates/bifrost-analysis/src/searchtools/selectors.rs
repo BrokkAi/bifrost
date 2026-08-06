@@ -10,8 +10,8 @@ use super::*;
 // evidence the answers rest on. When a second implementer exists this is the seam to
 // generalize; until then the capability would be C++ wearing a generic name.
 use crate::analyzer::{
-    CallableLinkage, CppCallableUnitRole, cpp_callable_definitions_share_identity_evidence,
-    cpp_callable_unit_role, cpp_indexed_callable_linkage,
+    CallableLinkage, CppAnalyzer, CppCallableUnitRole, cpp_callable_unit_role,
+    cpp_header_body_files_are_related, cpp_indexed_callable_linkage, resolve_analyzer,
 };
 
 pub(super) type DefinitionCandidateKey = (
@@ -1013,22 +1013,182 @@ pub(super) fn file_anchored_definition_selector(unit: &CodeUnit) -> String {
     format!("{}#{}", rel_path_string(unit.source()), unit.fq_name())
 }
 
+#[derive(Default)]
+struct CppSelectorFacts {
+    signatures: HashMap<CodeUnit, Vec<String>>,
+    roles: HashMap<CodeUnit, CppCallableUnitRole>,
+    linkages: HashMap<CodeUnit, Option<CallableLinkage>>,
+    first_range_starts: HashMap<CodeUnit, usize>,
+}
+
+impl CppSelectorFacts {
+    fn load(analyzer: &dyn IAnalyzer, units: &[CodeUnit]) -> Self {
+        let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
+            return Self::load_through_analyzer(analyzer, units);
+        };
+        let mut facts = Self::default();
+        for unit in units
+            .iter()
+            .filter(|unit| language_for_target(unit) == Language::Cpp && unit.is_callable())
+        {
+            let signatures = cpp.signatures_limited(unit, usize::MAX);
+            facts.signatures.insert(
+                unit.clone(),
+                if signatures.complete {
+                    signatures.rows
+                } else {
+                    analyzer.signatures(unit)
+                },
+            );
+
+            let metadata = cpp.signature_metadata_limited(unit, usize::MAX);
+            let metadata = if metadata.complete {
+                metadata.rows
+            } else {
+                analyzer.signature_metadata(unit)
+            };
+            facts
+                .roles
+                .insert(unit.clone(), cpp_callable_role_from_metadata(&metadata));
+            facts
+                .linkages
+                .insert(unit.clone(), cpp_callable_linkage_from_metadata(&metadata));
+
+            let ranges = cpp.ranges_limited(unit, usize::MAX);
+            let first_range_start = if ranges.complete {
+                ranges.rows.into_iter().map(|range| range.start_byte).min()
+            } else {
+                analyzer
+                    .ranges(unit)
+                    .into_iter()
+                    .map(|range| range.start_byte)
+                    .min()
+            };
+            if let Some(first_range_start) = first_range_start {
+                facts
+                    .first_range_starts
+                    .insert(unit.clone(), first_range_start);
+            }
+        }
+        facts
+    }
+
+    fn load_through_analyzer(analyzer: &dyn IAnalyzer, units: &[CodeUnit]) -> Self {
+        let mut facts = Self::default();
+        for unit in units
+            .iter()
+            .filter(|unit| language_for_target(unit) == Language::Cpp && unit.is_callable())
+        {
+            facts
+                .signatures
+                .insert(unit.clone(), analyzer.signatures(unit));
+            facts
+                .roles
+                .insert(unit.clone(), cpp_callable_unit_role(analyzer, unit));
+            facts
+                .linkages
+                .insert(unit.clone(), cpp_indexed_callable_linkage(analyzer, unit));
+            if let Some(first_range_start) = analyzer
+                .ranges(unit)
+                .into_iter()
+                .map(|range| range.start_byte)
+                .min()
+            {
+                facts
+                    .first_range_starts
+                    .insert(unit.clone(), first_range_start);
+            }
+        }
+        facts
+    }
+
+    fn signature_key(&self, unit: &CodeUnit) -> Vec<String> {
+        let signatures = self.signatures.get(unit).cloned().unwrap_or_default();
+        if signatures.is_empty() {
+            unit.signature().map(str::to_string).into_iter().collect()
+        } else {
+            signatures
+        }
+    }
+
+    fn role(&self, unit: &CodeUnit) -> CppCallableUnitRole {
+        self.roles
+            .get(unit)
+            .copied()
+            .unwrap_or(CppCallableUnitRole::Unknown)
+    }
+
+    fn linkage(&self, unit: &CodeUnit) -> Option<CallableLinkage> {
+        self.linkages.get(unit).copied().flatten()
+    }
+
+    fn first_range_start(&self, unit: &CodeUnit) -> usize {
+        self.first_range_starts
+            .get(unit)
+            .copied()
+            .unwrap_or(usize::MAX)
+    }
+}
+
+fn cpp_callable_role_from_metadata(
+    metadata: &[crate::analyzer::SignatureMetadata],
+) -> CppCallableUnitRole {
+    let declaration = metadata
+        .iter()
+        .any(|metadata| metadata.is_declaration_only());
+    let definition = metadata
+        .iter()
+        .any(|metadata| !metadata.is_declaration_only());
+    match (declaration, definition) {
+        (true, false) => CppCallableUnitRole::DeclarationOnly,
+        (false, true) => CppCallableUnitRole::Definition,
+        (true, true) => CppCallableUnitRole::Both,
+        (false, false) => CppCallableUnitRole::Unknown,
+    }
+}
+
+fn cpp_callable_linkage_from_metadata(
+    metadata: &[crate::analyzer::SignatureMetadata],
+) -> Option<CallableLinkage> {
+    let mut external = false;
+    for metadata in metadata {
+        match metadata.callable_linkage() {
+            Some(CallableLinkage::Internal) => return Some(CallableLinkage::Internal),
+            Some(CallableLinkage::External) => external = true,
+            None => {}
+        }
+    }
+    external.then_some(CallableLinkage::External)
+}
+
+fn cpp_selector_definitions_share_identity_evidence(
+    analyzer: &dyn IAnalyzer,
+    facts: &CppSelectorFacts,
+    left: &CodeUnit,
+    right: &CodeUnit,
+) -> bool {
+    left.source() == right.source()
+        || (left.fq_name() == right.fq_name()
+            && left.signature() == right.signature()
+            && matches!(facts.linkage(left), Some(CallableLinkage::External))
+            && matches!(facts.linkage(right), Some(CallableLinkage::External))
+            && cpp_header_body_files_are_related(analyzer, left.source(), right.source()))
+}
+
 fn cpp_callable_family_selectors(
     analyzer: &dyn IAnalyzer,
+    facts: &CppSelectorFacts,
     same_signature: &[CodeUnit],
 ) -> HashMap<CodeUnit, String> {
     let roles: HashMap<_, _> = same_signature
         .iter()
-        .map(|unit| (unit.clone(), cpp_callable_unit_role(analyzer, unit)))
+        .map(|unit| (unit.clone(), facts.role(unit)))
         .collect();
     let declarations: Vec<_> = same_signature
         .iter()
         .filter(|unit| {
             matches!(roles.get(*unit), Some(CppCallableUnitRole::DeclarationOnly))
-                && matches!(
-                    cpp_indexed_callable_linkage(analyzer, unit),
-                    Some(CallableLinkage::External)
-                )
+                && matches!(facts.linkage(unit), Some(CallableLinkage::External))
         })
         .collect();
     let definitions: Vec<_> = same_signature
@@ -1037,10 +1197,7 @@ fn cpp_callable_family_selectors(
             matches!(
                 roles.get(*unit),
                 Some(CppCallableUnitRole::Definition | CppCallableUnitRole::Both)
-            ) && matches!(
-                cpp_indexed_callable_linkage(analyzer, unit),
-                Some(CallableLinkage::External)
-            )
+            ) && matches!(facts.linkage(unit), Some(CallableLinkage::External))
         })
         .collect();
 
@@ -1049,7 +1206,12 @@ fn cpp_callable_family_selectors(
         let related = definitions
             .iter()
             .filter(|definition| {
-                cpp_callable_definitions_share_identity_evidence(analyzer, declaration, definition)
+                cpp_selector_definitions_share_identity_evidence(
+                    analyzer,
+                    facts,
+                    declaration,
+                    definition,
+                )
             })
             .map(|definition| (*definition).clone())
             .collect();
@@ -1066,12 +1228,7 @@ fn cpp_callable_family_selectors(
         declarations.sort_by_key(|candidate| {
             (
                 rel_path_string(candidate.source()),
-                analyzer
-                    .ranges(candidate)
-                    .into_iter()
-                    .map(|range| range.start_byte)
-                    .min()
-                    .unwrap_or(usize::MAX),
+                facts.first_range_start(candidate),
             )
         });
         if let Some(declaration) = declarations.into_iter().next() {
@@ -1108,11 +1265,20 @@ fn cpp_canonical_selectors(
     analyzer: &dyn IAnalyzer,
     units: &[CodeUnit],
 ) -> HashMap<CodeUnit, String> {
+    let facts = CppSelectorFacts::load(analyzer, units);
+    cpp_canonical_selectors_with_facts(analyzer, units, &facts)
+}
+
+fn cpp_canonical_selectors_with_facts(
+    analyzer: &dyn IAnalyzer,
+    units: &[CodeUnit],
+    facts: &CppSelectorFacts,
+) -> HashMap<CodeUnit, String> {
     let mut by_fqn_signature: HashMap<(String, Vec<String>), Vec<CodeUnit>> = HashMap::default();
     for unit in units {
         if language_for_target(unit) == Language::Cpp && unit.is_callable() {
             by_fqn_signature
-                .entry((unit.fq_name(), cpp_callable_signature_key(analyzer, unit)))
+                .entry((unit.fq_name(), facts.signature_key(unit)))
                 .or_default()
                 .push(unit.clone());
         }
@@ -1122,7 +1288,7 @@ fn cpp_canonical_selectors(
     let mut families_by_fqn_signature: HashMap<(String, Vec<String>), HashSet<String>> =
         HashMap::default();
     for ((fqn, signature), members) in &by_fqn_signature {
-        for (member, family) in cpp_callable_family_selectors(analyzer, members) {
+        for (member, family) in cpp_callable_family_selectors(analyzer, facts, members) {
             family_by_unit.insert(member, family.clone());
             families_by_fqn_signature
                 .entry((fqn.clone(), signature.clone()))
@@ -1150,10 +1316,7 @@ fn cpp_canonical_selectors(
             .get(unit)
             .cloned()
             .unwrap_or_else(|| file_anchored_definition_selector(unit));
-        let prefer = matches!(
-            cpp_callable_unit_role(analyzer, unit),
-            CppCallableUnitRole::DeclarationOnly
-        );
+        let prefer = matches!(facts.role(unit), CppCallableUnitRole::DeclarationOnly);
         let entry = canonical_by_fqn
             .entry(unit.fq_name())
             .or_insert_with(|| (prefer, family.clone()));
@@ -1181,21 +1344,6 @@ fn cpp_canonical_selectors(
         out.insert(unit.clone(), canonical);
     }
     out
-}
-
-/// Use the persisted, parameter-bearing signature inventory to distinguish C++
-/// overloads. `CodeUnit::signature` is optional and is absent for declarations
-/// headed by project macros (for example fmt's `FMT_BEGIN_NAMESPACE` headers),
-/// even though the structured index has their signatures. Falling back to the
-/// unit field only preserves the older shapes whose metadata is genuinely
-/// unavailable.
-fn cpp_callable_signature_key(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<String> {
-    let signatures = analyzer.signatures(unit);
-    if signatures.is_empty() {
-        unit.signature().map(str::to_string).into_iter().collect()
-    } else {
-        signatures
-    }
 }
 
 /// Partition resolved overloads into distinct selectable definitions, preserving
@@ -1233,7 +1381,8 @@ pub(super) fn distinct_definitions(
     // languages still render file-anchored there).
     let mut domains_by_fqn: HashMap<String, HashSet<(Language, Option<String>)>> =
         HashMap::default();
-    let cpp_canonical = cpp_canonical_selectors(analyzer, &overloads);
+    let cpp_facts = CppSelectorFacts::load(analyzer, &overloads);
+    let cpp_canonical = cpp_canonical_selectors_with_facts(analyzer, &overloads, &cpp_facts);
     let mut files_by_fqn_signature: HashMap<(String, Vec<String>), HashSet<String>> =
         HashMap::default();
     for unit in &overloads {
@@ -1246,7 +1395,7 @@ pub(super) fn distinct_definitions(
             .or_default()
             .insert((language, module_path));
         let signature = if language == Language::Cpp && unit.is_callable() {
-            cpp_callable_signature_key(analyzer, unit)
+            cpp_facts.signature_key(unit)
         } else {
             analyzer.signatures(unit)
         };
@@ -1377,6 +1526,52 @@ pub(super) fn selector_ends_with_go_module_scope_segment(input: &str) -> bool {
 pub(super) struct LineRangeAnchorSelector<'a> {
     file_path: &'a str,
     anchor: &'a str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{AnalyzerConfig, CppAnalyzer, WorkspaceAnalyzer};
+    use crate::test_support::AnalyzerFixture;
+    use std::sync::Arc;
+
+    #[test]
+    fn cpp_canonical_selectors_use_persisted_facts_without_full_hydration() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Cpp,
+            &[
+                ("include/api.h", "int compute(int value);\n"),
+                (
+                    "src/api.cpp",
+                    "#include \"../include/api.h\"\nint compute(int value) { return value; }\n",
+                ),
+            ],
+        );
+        let initial = fixture.analyzer.analyzer();
+        assert_eq!(2, initial.definitions("compute").count());
+
+        let reopened = WorkspaceAnalyzer::build(
+            Arc::new(fixture.test_project().clone()),
+            AnalyzerConfig::default(),
+        );
+        let analyzer = reopened.analyzer();
+        let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
+        let definitions: Vec<_> = analyzer.definitions("compute").collect();
+        assert_eq!(2, definitions.len());
+
+        cpp.reset_full_hydration_count_for_test();
+        let selectors = cpp_canonical_selectors(analyzer, &definitions);
+        assert!(
+            selectors
+                .values()
+                .all(|selector| selector == "include/api.h#compute")
+        );
+        assert_eq!(
+            0,
+            cpp.full_hydration_count_for_test(),
+            "selector facts must not hydrate the persisted header or implementation"
+        );
+    }
 }
 
 pub(super) fn line_range_anchor_selector(input: &str) -> Option<LineRangeAnchorSelector<'_>> {

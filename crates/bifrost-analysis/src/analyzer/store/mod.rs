@@ -2061,6 +2061,24 @@ impl AnalyzerStore {
         Ok(result)
     }
 
+    /// Read at most `limit` signature labels for one persisted code unit
+    /// without hydrating the owning file state.
+    pub(crate) fn signatures_for_unit_limited(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Result<LimitedQueryRows<String>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result = signatures_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// Read at most `limit` Ruby dispatch-mode rows for one persisted code
     /// unit without hydrating the owning file state.
     pub(crate) fn ruby_method_dispatch_modes_for_unit_limited(
@@ -7172,6 +7190,59 @@ fn signature_metadata_for_unit_limited_conn(
     } else {
         Ok(LimitedQueryRows::complete(rows, inspected))
     }
+}
+
+fn signatures_for_unit_limited_conn(
+    conn: &Connection,
+    oid: Oid,
+    lang: &str,
+    unit: &CodeUnit,
+    limit: usize,
+) -> Result<LimitedQueryRows<String>> {
+    if limit == 0 {
+        return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+    }
+    let sql = format!(
+        "SELECT length(CAST(signatures.text AS BLOB)),
+                CASE
+                    WHEN length(CAST(signatures.text AS BLOB)) <= ?9 THEN signatures.text
+                    ELSE NULL
+                END
+         FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+         JOIN unit_signatures AS signatures
+           ON signatures.blob_oid = units.blob_oid
+          AND signatures.lang = units.lang
+          AND signatures.unit_key = units.unit_key
+         WHERE units.blob_oid = ?1
+           AND units.lang = ?2
+           AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
+           AND units.kind = ?4
+           AND units.short_name = ?5
+           AND units.signature IS ?6
+           AND units.synthetic = ?7
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+         ORDER BY signatures.ordinal
+         LIMIT ?8"
+    );
+    let oid = oid.to_string();
+    let kind = code_unit_kind_to_i64(unit.kind());
+    let synthetic = bool_to_i64(unit.is_synthetic());
+    let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = conn.prepare_cached(&sql)?;
+    let mut query = statement.query(params![
+        oid,
+        lang,
+        unit.fq_name(),
+        kind,
+        unit.short_name(),
+        unit.signature(),
+        synthetic,
+        sql_limit,
+        usize_to_i64(MAX_LIMITED_QUERY_ROW_BYTES)?,
+    ])?;
+    collect_limited_text_rows(&mut query, limit)
 }
 
 fn ruby_method_dispatch_modes_for_unit_limited_conn(

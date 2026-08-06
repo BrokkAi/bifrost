@@ -302,12 +302,30 @@ impl CppAnalyzer {
         self.inner.signature_metadata_limited(code_unit, limit)
     }
 
+    pub(crate) fn signatures_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<String> {
+        self.inner.signatures_limited(code_unit, limit)
+    }
+
     pub(crate) fn ranges_limited(
         &self,
         code_unit: &CodeUnit,
         limit: usize,
     ) -> LimitedQueryRows<Range> {
         self.inner.ranges_limited(code_unit, limit)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_full_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test()
     }
 
     pub fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {

@@ -7252,6 +7252,45 @@ where
             .unwrap_or_default()
     }
 
+    pub(crate) fn signatures_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<String> {
+        if limit == 0 {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        }
+        let file = code_unit.source();
+        let Some(oid) = self.resolve_live_oid_for_file(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.state.dirty_file_state(&key) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.signatures, code_unit),
+                limit,
+            );
+        }
+        if let Some(state) = self.source_snapshot_file_state(file) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.signatures, code_unit),
+                limit,
+            );
+        }
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        self.store_query_or_record(
+            self.store_context.store.signatures_for_unit_limited(
+                oid,
+                &storage_key,
+                self.store_context.generations[&storage_key],
+                code_unit,
+                limit,
+            ),
+            format!("querying signatures for `{}`", code_unit.fq_name()),
+        )
+        .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0))
+    }
+
     pub(crate) fn signature_metadata_vec_of(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
         self.fetch_file_state(code_unit.source())
             .and_then(|state| state.signature_metadata.get(code_unit).cloned())
