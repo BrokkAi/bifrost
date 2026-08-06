@@ -2038,6 +2038,24 @@ impl AnalyzerStore {
         Ok(result)
     }
 
+    /// Read only the type-alias units for one persisted file. This avoids
+    /// hydrating its source and unrelated analyzer facts for an alias check.
+    pub(crate) fn type_aliases_for_file<A: LanguageAdapter>(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        adapter: &A,
+        file: &ProjectFile,
+    ) -> Result<Option<Vec<CodeUnit>>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result = type_aliases_for_file_conn(&tx, oid, lang, adapter, file)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// Read at most `limit` signature-metadata rows for one persisted code
     /// unit without hydrating the owning file state.
     ///
@@ -5226,6 +5244,50 @@ fn summary_file_projection_conn<A: LanguageAdapter>(
         ranges,
         children,
     }))
+}
+
+fn type_aliases_for_file_conn<A: LanguageAdapter>(
+    conn: &Connection,
+    oid: Oid,
+    lang: &str,
+    adapter: &A,
+    file: &ProjectFile,
+) -> Result<Option<Vec<CodeUnit>>> {
+    if read_summary_projection_meta(conn, &oid.to_string(), lang)?.is_none() {
+        return Ok(None);
+    }
+    let sql = format!(
+        "SELECT units.kind, units.content_qualifier, units.signature, units.synthetic,
+                units.fq_segments
+         FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+         WHERE units.blob_oid = ?1 AND units.lang = ?2 AND units.is_type_alias = 1
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+         ORDER BY units.unit_key"
+    );
+    let oid = oid.to_string();
+    let mut statement = conn.prepare_cached(&sql)?;
+    let mut rows = statement.query(params![oid, lang])?;
+    let mut aliases = Vec::new();
+    while let Some(row) = rows.next()? {
+        let kind = code_unit_kind_from_i64(row.get(0)?)?;
+        let content_qualifier = row.get::<_, String>(1)?;
+        let signature = row.get::<_, Option<String>>(2)?;
+        let synthetic = row.get::<_, i64>(3)? != 0;
+        let fq_segments = row.get::<_, Option<Vec<u8>>>(4)?;
+        let (fq_name, package_segment_count) =
+            hydrate_unit_fq(adapter, fq_segments.as_deref(), &content_qualifier, file)?;
+        aliases.push(CodeUnit::from_fq(
+            file.clone(),
+            kind,
+            fq_name,
+            package_segment_count,
+            signature,
+            synthetic,
+        ));
+    }
+    Ok(Some(aliases))
 }
 
 fn hydrate_file_states_conn<A: LanguageAdapter>(

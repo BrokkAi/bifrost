@@ -19,6 +19,8 @@ C++ navigation must render a canonical selector without loading every stored fac
 - [x] Reuse the request FileState snapshot for C++ signature metadata during visibility construction.
 - [x] Stop source rendering when `get_symbol_sources` exceeds its MCP response budget.
 - [x] Reuse same-name function range groups while rendering broad source results.
+- [x] Skip C++ field-linkage checks for sources already in a root's include closure.
+- [x] Read C++ type-alias facts without hydrating a complete FileState.
 - [ ] Run the required policy check after MCP tool registration is repaired.
 
 ## Surprises & Discoveries
@@ -51,11 +53,22 @@ C++ navigation must render a canonical selector without loading every stored fac
   Evidence: `source_blocks_for_code_unit_with_cache` called `definitions(PHP_METHOD)` for each resolved generated file before it collected that file's ranges.
 - Observation: Caching each same-name range group cuts broad source lookup time by about 84 percent.
   Evidence: The two raw `PHP_METHOD` probes now take 6,534 ms and 6,409 ms. The prior budget-only probes took 40,338 ms and 40,257 ms.
+- Observation: Linkage classification ran before the visibility index checked whether the field source was already reachable.
+  Evidence: The counter test observed two needless classifications for fields from a shared included header. Reordering the checks makes this zero.
+- Observation: The linkage-order change reaches the first 44 Phalcon probes faster.
+  Evidence: The new run wrote probe 44 after about 83 seconds. The prior run reached 44 after about 89 seconds.
+- Observation: C++ alias checks hydrate complete FileState values during the next slow definition probe.
+  Evidence: The post-change sample attributes 522 samples to `TreeSitterAnalyzer::is_type_alias`, through `fetch_file_state` and `AnalyzerStore::hydrate_file_state_with_source`.
+- Observation: A persisted alias-unit projection removes that hydration path.
+  Evidence: The new test checks 1,025 C++ aliases, one above the source-snapshot capacity, with zero full hydrations.
 
 ## Decision Log
 
 - Decision: Use existing persisted, bounded projections before adding another general cache.
   Rationale: The selector needs a small subset of FileState. The store already supports direct metadata and range queries.
+  Date/Author: 2026-08-06 / Codex
+- Decision: Retain only persisted type-alias units, keyed by content OID and path.
+  Rationale: Alias checks need a small fact set. A byte-bounded projection avoids source and side-table retention while keeping warm requests fast.
   Date/Author: 2026-08-06 / Codex
 
 ## Outcomes & Retrospective

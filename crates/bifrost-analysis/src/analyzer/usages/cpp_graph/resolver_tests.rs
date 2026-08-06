@@ -675,7 +675,7 @@ ABSL_NAMESPACE_END
     }
 
     #[test]
-    fn visible_identifier_index_reuses_internal_linkage_classification_across_roots() {
+    fn visible_identifier_index_skips_linkage_for_reachable_field_sources() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let left = ProjectFile::new(root.clone(), "left.cpp");
@@ -708,8 +708,8 @@ ABSL_NAMESPACE_END
             });
 
         assert_eq!(
-            classification_count, 2,
-            "one batch should classify each repeated global field once even when several roots share it"
+            classification_count, 0,
+            "a field from a reachable source does not need linkage classification"
         );
         // issue_1184 exercises the authoritative internal-linkage/root-isolation behavior.
         // This fixture only guards that sharing the cache across roots preserves the buckets.

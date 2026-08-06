@@ -5189,14 +5189,14 @@ pub fn build_visible_identifier_index(
         let mut by_identifier: HashMap<String, Vec<CodeUnit>> = HashMap::default();
         for unit in visible {
             if unit.is_field()
+                && !visible_source_files_by_root
+                    .get(file)
+                    .is_some_and(|sources| sources.contains(unit.source()))
                 && cpp_global_field_has_internal_linkage_cached(
                     analyzer,
                     global_field_internal_linkage,
                     unit,
                 )
-                && !visible_source_files_by_root
-                    .get(file)
-                    .is_some_and(|sources| sources.contains(unit.source()))
             {
                 continue;
             }

@@ -140,6 +140,13 @@ const IMPORT_INFO_STORE_ENTRY_OVERHEAD_BYTES: usize = 512;
 // enormous headroom for a workspace of this shape while still capping a
 // Trino-class workspace by recency instead of letting it grow without bound.
 const IMPORT_INFO_STORE_MAX_BYTES: usize = 64 * 1024 * 1024;
+// Type-alias checks need only a small set of `CodeUnit` values per file. Keep
+// these persisted projections separate from complete FileState values so a
+// broad C++ visibility walk does not retain every source and side table.
+const TYPE_ALIAS_STORE_TEXT_BYTES_MULTIPLIER: usize = 2;
+const TYPE_ALIAS_STORE_UNIT_OVERHEAD_BYTES: usize = 256;
+const TYPE_ALIAS_STORE_ENTRY_OVERHEAD_BYTES: usize = 512;
+const TYPE_ALIAS_STORE_MAX_BYTES: usize = 32 * 1024 * 1024;
 // `SummaryFileProjection` is much lighter than `FileState`: no source text,
 // just the declaration/signature/range/children maps used to render
 // `get_summaries`. Call it a few KB per entry; 128 entries is a small,
@@ -940,6 +947,21 @@ impl ByteBounded for Arc<[ImportInfo]> {
     }
 }
 
+impl ByteBounded for Arc<[CodeUnit]> {
+    fn estimated_bytes(&self) -> usize {
+        self.iter()
+            .map(|unit| {
+                unit.fq_name()
+                    .len()
+                    .saturating_add(unit.short_name().len())
+                    .saturating_add(unit.signature().map_or(0, str::len))
+                    .saturating_mul(TYPE_ALIAS_STORE_TEXT_BYTES_MULTIPLIER)
+                    .saturating_add(TYPE_ALIAS_STORE_UNIT_OVERHEAD_BYTES)
+            })
+            .fold(TYPE_ALIAS_STORE_ENTRY_OVERHEAD_BYTES, usize::saturating_add)
+    }
+}
+
 /// A byte-bounded LRU of content-addressed derivations, retained across
 /// requests behind whatever per-request single-flight layer the caller already
 /// has.
@@ -980,6 +1002,7 @@ type PreparedSyntaxStore = ByteBoundedStore<PreparedSyntaxCacheKey, Arc<Prepared
 /// scan asked for the same file's imports tens of thousands of times per
 /// request, every one a SQLite hydration.
 type ImportInfoStore = ByteBoundedStore<FileStateCacheKey, Arc<[ImportInfo]>>;
+type TypeAliasStore = ByteBoundedStore<FileStateCacheKey, Arc<[CodeUnit]>>;
 
 impl<K: Eq + std::hash::Hash + Clone, V: Clone + ByteBounded> ByteBoundedStore<K, V> {
     fn new(max_bytes: usize) -> Self {
@@ -1712,6 +1735,9 @@ pub struct TreeSitterAnalyzer<A> {
     /// lexical imports by asking the store for the same file's imports over and
     /// over: 70k hydrations across 1100 distinct files in one request.
     import_info_store: Arc<Mutex<ImportInfoStore>>,
+    /// Cross-request type-alias projections. A type-alias check is common in
+    /// C++ resolution, but it needs only this small persisted fact.
+    type_alias_store: Arc<Mutex<TypeAliasStore>>,
     /// Import hydrations this analyzer issued to the store, for perf pins. The
     /// call count alone cannot see the #1451 shape -- callers legitimately ask
     /// per reference -- so what must stay bounded is the *store reads* those
@@ -1777,6 +1803,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             query_file_state_snapshot: Arc::new(ArcSwapOption::empty()),
             prepared_syntax_store: Arc::clone(&self.prepared_syntax_store),
             import_info_store: Arc::clone(&self.import_info_store),
+            type_alias_store: Arc::clone(&self.type_alias_store),
             import_info_hydration_count: Arc::clone(&self.import_info_hydration_count),
             #[cfg(test)]
             live_oid_validation_counts: Arc::clone(&self.live_oid_validation_counts),
@@ -1979,6 +2006,7 @@ where
             import_info_store: Arc::new(Mutex::new(ImportInfoStore::new(
                 IMPORT_INFO_STORE_MAX_BYTES,
             ))),
+            type_alias_store: Arc::new(Mutex::new(TypeAliasStore::new(TYPE_ALIAS_STORE_MAX_BYTES))),
             import_info_hydration_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
@@ -2186,6 +2214,7 @@ where
             import_info_store: Arc::new(Mutex::new(ImportInfoStore::new(
                 IMPORT_INFO_STORE_MAX_BYTES,
             ))),
+            type_alias_store: Arc::new(Mutex::new(TypeAliasStore::new(TYPE_ALIAS_STORE_MAX_BYTES))),
             import_info_hydration_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
@@ -7241,9 +7270,65 @@ where
     }
 
     pub(crate) fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
-        self.fetch_file_state(code_unit.source())
-            .map(|state| state.type_aliases.contains(code_unit))
-            .unwrap_or(false)
+        let file = code_unit.source();
+        let Some(oid) = self.resolve_live_oid_for_file(file) else {
+            return false;
+        };
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.state.dirty_file_state(&key) {
+            return state.type_aliases.contains(code_unit);
+        }
+        if let Some(state) = self.source_snapshot_file_state(file) {
+            return state.type_aliases.contains(code_unit);
+        }
+        if let Some(state) = self.query_file_state_snapshot(&key) {
+            return state.type_aliases.contains(code_unit);
+        }
+        if !self.adapter.should_persist_code_unit(code_unit) {
+            return self
+                .fetch_file_state(file)
+                .is_some_and(|state| state.type_aliases.contains(code_unit));
+        }
+        if let Some(aliases) = self.type_alias_store_get(&key) {
+            return aliases.contains(code_unit);
+        }
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        let aliases = self
+            .store_query_or_record(
+                self.store_context.store.type_aliases_for_file(
+                    oid,
+                    &storage_key,
+                    self.store_context.generations[&storage_key],
+                    self.adapter.as_ref(),
+                    file,
+                ),
+                format!("querying type aliases for `{file}`"),
+            )
+            .and_then(|aliases| aliases.map(Arc::<[CodeUnit]>::from))
+            .or_else(|| {
+                self.fetch_file_state(file)
+                    .map(|state| Arc::from(state.type_aliases.iter().cloned().collect::<Vec<_>>()))
+            });
+        let Some(aliases) = aliases else {
+            return false;
+        };
+        let is_alias = aliases.contains(code_unit);
+        self.type_alias_store_retain(key, aliases);
+        is_alias
+    }
+
+    fn type_alias_store_get(&self, key: &FileStateCacheKey) -> Option<Arc<[CodeUnit]>> {
+        self.type_alias_store
+            .lock()
+            .expect("type alias store mutex poisoned")
+            .get(key)
+    }
+
+    fn type_alias_store_retain(&self, key: FileStateCacheKey, aliases: Arc<[CodeUnit]>) {
+        self.type_alias_store
+            .lock()
+            .expect("type alias store mutex poisoned")
+            .retain(key, aliases);
     }
 
     pub(crate) fn signatures_vec_of(&self, code_unit: &CodeUnit) -> Vec<String> {
@@ -8450,6 +8535,7 @@ fn enclosing_code_unit_rank(code_unit: &CodeUnit) -> usize {
 mod tests {
     use super::*;
     use crate::analyzer::CodeUnitType;
+    use crate::analyzer::cpp::CppAdapter;
     use crate::analyzer::go::GoAdapter;
     use crate::analyzer::java::JavaAdapter;
     use crate::analyzer::javascript::JavascriptAdapter;
@@ -9831,6 +9917,37 @@ mod tests {
         );
         assert_eq!(analyzer.full_hydration_count_for_test(), 0);
         assert_eq!(analyzer.bulk_hydration_count_for_test(), 0);
+    }
+
+    #[test]
+    fn type_alias_projection_avoids_full_file_hydration() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        for index in 0..=SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY {
+            std::fs::write(
+                root.join(format!("src/Alias{index}.cpp")),
+                format!("using Alias{index} = int;\n"),
+            )
+            .expect("write alias source");
+        }
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let analyzer = TreeSitterAnalyzer::new(project, CppAdapter);
+        let aliases = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .filter(|unit| unit.identifier().starts_with("Alias"))
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY + 1);
+
+        analyzer.reset_full_hydration_count_for_test();
+        assert!(aliases.iter().all(|alias| analyzer.is_type_alias(alias)));
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            0,
+            "persisted type-alias checks must not hydrate a FileState"
+        );
     }
 
     #[test]
