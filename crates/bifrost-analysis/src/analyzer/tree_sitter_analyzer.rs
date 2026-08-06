@@ -7332,9 +7332,14 @@ where
     }
 
     pub(crate) fn signatures_vec_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.fetch_file_state(code_unit.source())
-            .and_then(|state| state.signatures.get(code_unit).cloned())
-            .unwrap_or_default()
+        let signatures = self.signatures_limited(code_unit, usize::MAX);
+        if signatures.complete {
+            signatures.rows
+        } else {
+            self.fetch_file_state(code_unit.source())
+                .and_then(|state| state.signatures.get(code_unit).cloned())
+                .unwrap_or_default()
+        }
     }
 
     pub(crate) fn signatures_limited(
@@ -7357,6 +7362,12 @@ where
             );
         }
         if let Some(state) = self.source_snapshot_file_state(file) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.signatures, code_unit),
+                limit,
+            );
+        }
+        if let Some(state) = self.query_file_state_snapshot(&key) {
             return limited_projection_rows(
                 projection_rows_for_unit(&state.signatures, code_unit),
                 limit,
@@ -9991,6 +10002,46 @@ mod tests {
             analyzer.full_hydration_count_for_test(),
             0,
             "persisted type-alias checks must not hydrate a FileState"
+        );
+    }
+
+    #[test]
+    fn signature_projection_avoids_full_file_hydration() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        for index in 0..=SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY {
+            std::fs::write(
+                root.join(format!("src/Alias{index}.cpp")),
+                format!("using Alias{index} = int;\n"),
+            )
+            .expect("write alias source");
+        }
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let analyzer = TreeSitterAnalyzer::new(project, CppAdapter);
+        let aliases = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .filter(|unit| unit.identifier().starts_with("Alias"))
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY + 1);
+
+        analyzer.reset_full_hydration_count_for_test();
+        for alias in &aliases {
+            assert!(
+                analyzer
+                    .signatures(alias)
+                    .iter()
+                    .any(|signature| signature.contains(alias.identifier())),
+                "persisted signature must include {}",
+                alias.identifier()
+            );
+        }
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            0,
+            "persisted signature reads must not hydrate a FileState"
         );
     }
 

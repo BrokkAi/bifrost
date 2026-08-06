@@ -22,6 +22,7 @@ C++ navigation must render a canonical selector without loading every stored fac
 - [x] Skip C++ field-linkage checks for sources already in a root's include closure.
 - [x] Read C++ type-alias facts without hydrating a complete FileState.
 - [x] Read enclosing declaration facts without hydrating a complete FileState.
+- [x] Read alias signatures without hydrating a complete FileState.
 - [ ] Run the required policy check after MCP tool registration is repaired.
 
 ## Surprises & Discoveries
@@ -66,6 +67,12 @@ C++ navigation must render a canonical selector without loading every stored fac
   Evidence: The post-alias sample attributes 719 `fetch_file_state_for_key_with_source` calls to `enclosing_code_unit` through `resolve_cpp_type_without_focused_qualifier`.
 - Observation: A direct declaration-range projection removes this owner lookup hydration.
   Evidence: The new test checks 1,025 C++ methods, one above the source-snapshot capacity, and returns each exact owner with zero full hydrations.
+- Observation: After the owner projection, alias-target signature lookup becomes the largest FileState hydration path.
+  Evidence: The 10-second sample attributes 6,745 samples to `signatures_vec_of`, called from `cpp_alias_target_texts`, through `hydrate_file_state_with_source`.
+- Observation: The first 44 navigation records still take 17 seconds after workspace setup.
+  Evidence: The owner-projection dump was created at 23:12:25Z and wrote record 44 at 23:12:42Z. The two preceding dumps have the same 17-second interval.
+- Observation: A stored signature projection removes alias signature hydration.
+  Evidence: The new test reads 1,025 C++ alias signatures, one above the source-snapshot capacity, with zero full hydrations.
 
 ## Decision Log
 
@@ -78,12 +85,15 @@ C++ navigation must render a canonical selector without loading every stored fac
 - Decision: Query stored declaration ranges before full state hydration for owner lookup.
   Rationale: Persisted declarations include the identity and ordered ranges needed for the existing smallest-enclosing selection. Empty or unavailable projections retain the full-state fallback for file scope and incomplete storage.
   Date/Author: 2026-08-06 / Codex
+- Decision: Use the complete stored signature projection before generic signature hydration.
+  Rationale: Alias resolution needs the same ordered signature strings that the store retains. An incomplete result keeps the complete FileState fallback. Source retrieval remains a lazy final fallback for aliases without usable signature text.
+  Date/Author: 2026-08-06 / Codex
 
 ## Outcomes & Retrospective
 
 The selector path no longer needs full FileState hydration when persisted rows are complete. The dedicated test proves this behavior. Persisted global-field linkage also prevents a visibility-build parse. C++ include reachability now retains bounded answers across visibility indexes. Request-local metadata reads reuse the FileState already hydrated by the visibility build. The Phalcon navigation part now completes before `get_symbol_sources`. Broad source lookup now stops at the response limit and reuses same-name range groups. This cuts the rejected `PHP_METHOD` source probes from about 40 seconds to about 6.5 seconds.
 
-Focused validation passed: `cargo fmt --check`, the persisted selector and alias tests, the enclosing-owner projection test, the six issue-1092 C++ identity tests, the global-field linkage regression, and `cargo clippy -p brokk-bifrost-analysis -p brokk-bifrost-cpp --all-targets -- -D warnings`. The policy skill is installed, but `list_policies` and `run_policy` are not registered in this task. The required policy result is therefore unavailable.
+Focused validation passed: `cargo fmt --check`, the persisted selector and alias tests, the enclosing-owner and signature projection tests, the six issue-1092 C++ identity tests, the global-field linkage regression, two BehaviorTree alias regression tests, and `cargo clippy -p brokk-bifrost-analysis -p brokk-bifrost-cpp --all-targets -- -D warnings`. The policy skill is installed, but `list_policies` and `run_policy` are not registered in this task. The required policy result is therefore unavailable.
 
 ## Context and Orientation
 
