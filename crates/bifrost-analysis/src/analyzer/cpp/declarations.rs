@@ -1066,11 +1066,15 @@ fn cpp_sentinel_reparsed_class<'tree>(
                 raw_supertypes,
             });
         }
+        // Only when the nested class item carries its own body. A bodyless
+        // `class ATTR` -- the type half of `class ATTR Span { ... }` reduced to
+        // a function definition -- is the export-macro shape recovered by the
+        // next arm, and must fall through to it rather than abort the search.
         if child.kind() == "function_definition"
             && let Some(class_node) = first_class_like_child(child)
+            && let Some(body) = cpp_body_node(class_node)
+            && let Some(name) = class_like_name(class_node, source)
         {
-            let name = class_like_name(class_node, source)?;
-            let body = cpp_body_node(class_node)?;
             let raw_supertypes =
                 matches!(class_node.kind(), "class_specifier" | "struct_specifier")
                     .then(|| extract_cpp_supertypes(class_node, source));
@@ -7486,7 +7490,8 @@ fn cpp_sentinel_macro_class_region(
         return None;
     };
     let body_open_start = cpp_sentinel_macro_class_body_open(node, class_start)
-        .or_else(|| cpp_body_node(node).map(|body| body.start_byte()))?;
+        .or_else(|| cpp_body_node(node).map(|body| body.start_byte()))
+        .or_else(|| cpp_sentinel_macro_displaced_class_body(node).map(|body| body.start_byte()))?;
     if class_start >= body_open_start {
         return None;
     }
@@ -7581,6 +7586,21 @@ fn cpp_sentinel_macro_class_body_open(node: Node<'_>, class_start: usize) -> Opt
         stack.extend(current.children(&mut cursor));
     }
     None
+}
+
+/// The class body that tree-sitter displaced out of a sentinel-prefixed
+/// declaration and left as the malformed node's next sibling.
+///
+/// When the sentinel envelope reduces to a bare `ERROR` -- `ABSL_NAMESPACE_BEGIN
+/// template <typename T> class ABSL_ATTRIBUTE_VIEW Span` -- the class token is
+/// the last child of that `ERROR` and its `{` opens a sibling
+/// `compound_statement` instead. The body is still the malformed tree's own
+/// structured token, which is what the caller's `body.start_byte() !=
+/// body_open_start` agreement check needs; it just is not reachable by walking
+/// forward from the class token inside the node.
+fn cpp_sentinel_macro_displaced_class_body(node: Node<'_>) -> Option<Node<'_>> {
+    node.next_named_sibling()
+        .filter(|sibling| sibling.kind() == "compound_statement")
 }
 
 fn cpp_sentinel_macro_region(node: Node<'_>, source: &str) -> Option<(usize, usize)> {
