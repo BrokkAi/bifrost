@@ -16,9 +16,11 @@ operations belong to the catalog and generation-scoped runtime described below.
 > install, strictly activate, and match semantic-model packs for one analyzer
 > generation. A successful runtime acquisition also publishes an immutable
 > declaration overlay for normal navigation and query result surfaces.
-> Procedure-summary payloads are
-> activation-neutral: compiling, installing, selecting, loading, or activating
-> one does not yet change value-flow results.
+> Procedure-summary payloads can contribute exact external-call transfers to
+> value-flow and taint when an embedding supplies the catalog and activation
+> request to the production policy runtime. Workspace source bodies take
+> precedence; missing, conflicting, incompatible, or incomplete summaries stay
+> visible in the analysis outcome.
 
 Together, the catalog and runtime can install, select, activate, account for, quarantine, and garbage-collect packs while keeping matching generation-local.
 

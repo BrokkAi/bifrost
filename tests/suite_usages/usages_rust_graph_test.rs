@@ -265,7 +265,7 @@ unrelated!();
     ]);
     let candidates: HashSet<ProjectFile> = analyzer.get_analyzed_files().into_iter().collect();
 
-    let unique_type = definition(&analyzer, "defs.UniqueType");
+    let unique_type = definition(&analyzer, "tokens.defs.UniqueType");
     let type_hits = authoritative_hits(&analyzer, &unique_type, candidates.clone());
     let body_type = consumer.find("Option<UniqueType>").expect("body type") + "Option<".len();
     let qualified_type = consumer
@@ -295,7 +295,7 @@ unrelated!();
     );
 
     let defs_module = analyzer
-        .get_definitions("defs")
+        .get_definitions("tokens.defs")
         .into_iter()
         .find(CodeUnit::is_module)
         .expect("defs module");
@@ -314,7 +314,7 @@ unrelated!();
         "qualified token-tree paths must preserve the exact module segment: {module_hits:#?}"
     );
 
-    let unique_value = definition(&analyzer, "defs.unique_value");
+    let unique_value = definition(&analyzer, "tokens.defs.unique_value");
     let value_hits = authoritative_hits(&analyzer, &unique_value, candidates.clone());
     let value_reference = consumer
         .find("unique_value(); // BARE_VALUE_BODY")
@@ -331,7 +331,7 @@ unrelated!();
         "the function declaration token must not be reported as its usage: {value_hits:#?}"
     );
 
-    let ambiguous = analyzer.get_definitions("defs.Ambiguous");
+    let ambiguous = analyzer.get_definitions("tokens.defs.Ambiguous");
     let ambiguous_type = ambiguous
         .iter()
         .find(|definition| definition.is_class())
@@ -397,7 +397,7 @@ binds_alias_name!(Metric);
         ("src/builder.rs", builder_source),
     ]);
     let target = analyzer
-        .get_definitions("base.TestOutput")
+        .get_definitions("macro_alias.base.TestOutput")
         .into_iter()
         .find(|candidate| analyzer.is_type_alias(candidate))
         .expect("type alias target");
@@ -518,7 +518,7 @@ criterion_group!(benches, bench); // SAME_FQN_OTHER_TARGET
     ]);
     let file = project.file("benches/baseline.rs");
     let target = analyzer
-        .get_definitions("benches.bench")
+        .get_definitions("macro_args.benches.baseline.bench")
         .into_iter()
         .find(|candidate| candidate.source() == &file)
         .expect("baseline bench definition");
@@ -727,17 +727,17 @@ pub fn qualified() {
         ),
     ]);
     let tuple = analyzer
-        .get_definitions("definitions.Tuple")
+        .get_definitions("constructors.definitions.Tuple")
         .into_iter()
         .find(CodeUnit::is_class)
         .expect("tuple struct definition");
     let unit = analyzer
-        .get_definitions("definitions.Unit")
+        .get_definitions("constructors.definitions.Unit")
         .into_iter()
         .find(CodeUnit::is_class)
         .expect("unit struct definition");
     let named = analyzer
-        .get_definitions("definitions.Named")
+        .get_definitions("constructors.definitions.Named")
         .into_iter()
         .find(CodeUnit::is_class)
         .expect("named-field struct definition");
@@ -1516,7 +1516,7 @@ fn run() {
         ("Cargo.toml", "[package]\nname = \"demo\"\n"),
     ]);
 
-    let target = definition(&analyzer, "service.Service");
+    let target = definition(&analyzer, "demo.service.Service");
     let broad_candidates = analyzer.get_analyzed_files().into_iter().collect();
     let non_rust_only = [ProjectFile::new(
         analyzer.project().root().to_path_buf(),
@@ -2645,7 +2645,7 @@ pub fn run() {
         ("src/parser/options.rs", "pub struct Extension;\n"),
         ("src/consumer.rs", consumer),
     ]);
-    let target = definition(&analyzer, "parser.options");
+    let target = definition(&analyzer, "owner_filter.parser.options");
     let hits = authoritative_hits(
         &analyzer,
         &target,
@@ -5271,7 +5271,7 @@ fn main() {
     ]);
     let model_file = project.file("src/model.rs");
     let consumer_file = project.file("src/consumer.rs");
-    let public_type = definition(&analyzer, "model.PublicType");
+    let public_type = definition(&analyzer, "identity_routes.model.PublicType");
     let completed = member(&analyzer, &model_file, "Lifecycle", "Completed");
     let candidates: HashSet<ProjectFile> = analyzer.get_analyzed_files().into_iter().collect();
 
@@ -6951,7 +6951,7 @@ mod shadowed {
         ("src/private_consumer.rs", private_consumer),
     ]);
     let target = analyzer
-        .get_definitions("definitions.target_macro")
+        .get_definitions("macro_demo.definitions.target_macro")
         .into_iter()
         .find(CodeUnit::is_macro)
         .expect("target macro definition");
@@ -7058,7 +7058,7 @@ mod shadowed {
         "macro imported after `mod early` must not be visible there: {hits:#?}"
     );
     let private_target = analyzer
-        .get_definitions("private_macros.private_macro")
+        .get_definitions("macro_demo.private_macros.private_macro")
         .into_iter()
         .find(CodeUnit::is_macro)
         .expect("private macro definition");
@@ -7140,7 +7140,7 @@ fn main() { target_macro!(); } // BIN_DECOY_USE
         ("src/main.rs", main),
     ]);
     let target = analyzer
-        .get_definitions("child.target_macro")
+        .get_definitions("macro_targets.child.target_macro")
         .into_iter()
         .find(|definition| {
             definition.is_macro() && definition.source() == &project.file("src/child.rs")
@@ -7815,9 +7815,9 @@ macro_rules! tracing_event {
         .collect();
 
     for (target_fqn, token) in [
-        ("tracing.src.__macro_support", "__macro_support"),
-        ("tracing.src.field", "field"),
-        ("tracing-core.src.metadata.Kind", "Kind"),
+        ("tracing.__macro_support", "__macro_support"),
+        ("tracing.field", "field"),
+        ("tracing_core.metadata.Kind", "Kind"),
     ] {
         let target = definition(&analyzer, target_fqn);
         let hits = authoritative_hits(&analyzer, &target, candidates.clone());
@@ -8024,7 +8024,7 @@ fn rust_graph_strategy_resolves_same_package_bin_imported_free_function_call() {
         ),
     ]);
 
-    let target = definition(&analyzer, "inference.infer");
+    let target = definition(&analyzer, "import_model_weights.inference.infer");
     let hits = authoritative_hits(
         &analyzer,
         &target,
@@ -8038,6 +8038,56 @@ fn rust_graph_strategy_resolves_same_package_bin_imported_free_function_call() {
             hit.file == project.file("src/bin/safetensors.rs") && hit.snippet.contains("infer();")
         }),
         "expected same-package bin->lib infer() call: {hits:#?}"
+    );
+}
+
+/// Each bench is its own crate, so `crate::` names that bench's own items and
+/// sibling benches stay invisible to each other -- but the helper module they
+/// share has one identity, which `crate::common::…` must still reach from
+/// either of them.
+#[test]
+fn rust_bench_targets_own_their_crate_root_and_still_share_helper_modules() {
+    let left = "#[path = \"common/mod.rs\"]\nmod common;\n\nconst LIMIT: usize = 1;\n\nfn main() {\n    let _ = crate::LIMIT;\n    crate::common::helper();\n}\n";
+    let right = "#[path = \"common/mod.rs\"]\nmod common;\n\nconst LIMIT: usize = 2;\n\nfn main() {\n    let _ = crate::LIMIT;\n    crate::common::helper();\n}\n";
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"bench-shared\"\nversion = \"0.1.0\"\n",
+        ),
+        ("src/lib.rs", "pub fn placeholder() {}\n"),
+        ("benches/common/mod.rs", "pub fn helper() {}\n"),
+        ("benches/left.rs", left),
+        ("benches/right.rs", right),
+    ]);
+    let candidates: HashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+
+    let helper = definition(&analyzer, "bench_shared.benches.common.helper");
+    let helper_hits = authoritative_hits(&analyzer, &helper, candidates.clone());
+    for (path, source) in [("benches/left.rs", left), ("benches/right.rs", right)] {
+        let call =
+            source.find("crate::common::helper").expect("shared call") + "crate::common::".len();
+        assert!(
+            helper_hits
+                .iter()
+                .any(|hit| { hit.file == project.file(path) && hit.start_offset == call }),
+            "every bench must reach the helper module they share: {helper_hits:#?}"
+        );
+    }
+
+    let limit = definition(&analyzer, "bench_shared.benches.left._module_.LIMIT");
+    let limit_hits = authoritative_hits(&analyzer, &limit, candidates);
+    let own = left.find("crate::LIMIT").expect("own const") + "crate::".len();
+    assert!(
+        limit_hits
+            .iter()
+            .any(|hit| { hit.file == project.file("benches/left.rs") && hit.start_offset == own }),
+        "a bench must resolve its own `crate::` item: {limit_hits:#?}"
+    );
+    assert!(
+        limit_hits
+            .iter()
+            .all(|hit| hit.file != project.file("benches/right.rs")),
+        "a sibling bench target must not see this bench's `crate::` item: {limit_hits:#?}"
     );
 }
 
@@ -8057,7 +8107,7 @@ fn rust_graph_strategy_resolves_path_attribute_module_qualified_function_call() 
         ("benches/binary_ops.rs", bench),
     ]);
 
-    let target = definition(&analyzer, "benches.common.report_failures");
+    let target = definition(&analyzer, "bench_path.benches.common.report_failures");
     let hits = authoritative_hits(
         &analyzer,
         &target,
@@ -9281,7 +9331,7 @@ fn invalid(_: Thing) {}
         ("src/orphan_target.rs", "pub struct Thing;\n"),
         ("src/orphan_consumer.rs", orphan),
     ]);
-    let hits = rust_graph_hits(&analyzer, "orphan_target.Thing");
+    let hits = rust_graph_hits(&analyzer, "demo.orphan_target.Thing");
     let invalid = orphan.find("invalid(_: Thing)").expect("orphan use") + "invalid(_: ".len();
 
     assert!(
@@ -9309,7 +9359,7 @@ fn valid() { let _ = VALUE; }
         ("src/main.rs", main),
         ("src/fixtures.rs", "pub const VALUE: usize = 1;\n"),
     ]);
-    let hits = rust_graph_hits(&analyzer, "fixtures._module_.VALUE");
+    let hits = rust_graph_hits(&analyzer, "demo.fixtures._module_.VALUE");
     let expected = main.find("let _ = VALUE").expect("binary use") + "let _ = ".len();
 
     assert!(
@@ -9337,7 +9387,7 @@ fn rust_nested_path_module_shares_its_cargo_target_without_escaping_workspace() 
         ("src/outer/mapped.rs", "pub const VALUE: usize = 1;\n"),
         ("src/outer/consumer.rs", consumer),
     ]);
-    let hits = rust_graph_hits(&analyzer, "outer.mapped._module_.VALUE");
+    let hits = rust_graph_hits(&analyzer, "demo.outer.mapped._module_.VALUE");
     let expected = consumer.find("let _ = VALUE").expect("nested path use") + "let _ = ".len();
 
     assert!(
@@ -9398,7 +9448,7 @@ fn consume_absolute(_: ::demo_app::Item) {}
         ("src/lib.rs", "pub struct Item;\n"),
         ("src/main.rs", main),
     ]);
-    let hits = rust_graph_hits(&analyzer, "Item");
+    let hits = rust_graph_hits(&analyzer, "demo_app.Item");
     let expected = main
         .find("consume(_: LibraryItem)")
         .expect("own-library use")
@@ -9447,7 +9497,7 @@ fn valid(_: chained_model::Item) {}
         ("dep/src/lib.rs", "pub mod model;\n"),
         ("dep/src/model.rs", "pub struct Item;\n"),
     ]);
-    let hits = rust_graph_hits(&analyzer, "dep.src.model.Item");
+    let hits = rust_graph_hits(&analyzer, "dep_package.model.Item");
     let expected = consumer
         .find("chained_model::Item")
         .expect("path-dependency use")
@@ -9492,7 +9542,7 @@ fn rust_dependency_module_qualifier_from_nested_module_is_exact() {
         ("crates/toml/src/de/parser/mod.rs", "pub mod document;\n"),
         ("crates/toml/src/de/parser/document.rs", consumer),
     ]);
-    let target = definition(&analyzer, "crates.toml_parser.src.parser");
+    let target = definition(&analyzer, "toml_parser.parser");
     let hits = UsageFinder::new()
         .find_usages_default(&analyzer, &[target])
         .all_hits_including_imports();
@@ -9533,7 +9583,7 @@ fn rust_rooted_module_qualifier_inside_use_path_is_exact() {
         ("src/de.rs", "pub struct DeString;\n"),
         ("src/detable.rs", consumer),
     ]);
-    let target = definition(&analyzer, "de");
+    let target = definition(&analyzer, "toml.de");
     let hits = UsageFinder::new()
         .find_usages_default(&analyzer, &[target])
         .all_hits_including_imports();
@@ -10203,7 +10253,7 @@ fn consume(_: DispatchConfig, _: OtherDispatchConfig, _: HostNameState) {}
             "pub struct HostNameState;\npub struct DispatchConfig;\n",
         ),
     ]);
-    let target = definition(&analyzer, "rust.src.lib.dispatch.DispatchConfig");
+    let target = definition(&analyzer, "nmstate.dispatch.DispatchConfig");
     let hits = authoritative_hits(
         &analyzer,
         &target,
@@ -10307,7 +10357,7 @@ fn rust_grouped_use_module_qualifier_reconstructs_outer_dependency_path() {
         ),
         ("crates/app/src/lib.rs", consumer),
     ]);
-    let target = definition(&analyzer, "crates.toml_parser.src.parser");
+    let target = definition(&analyzer, "toml_parser.parser");
     let hits = UsageFinder::new()
         .find_usages_default(&analyzer, &[target])
         .all_hits_including_imports();
@@ -10358,7 +10408,7 @@ fn rust_grouped_glob_module_qualifier_reconstructs_outer_dependency_path() {
         ),
         ("crates/app/src/lib.rs", consumer),
     ]);
-    let target = definition(&analyzer, "crates.toml_parser.src.parser");
+    let target = definition(&analyzer, "toml_parser.parser");
     let hits = UsageFinder::new()
         .find_usages_default(&analyzer, &[target])
         .all_hits_including_imports();
@@ -10419,7 +10469,7 @@ pub fn consume(_: Item) {}
     let files: HashSet<ProjectFile> = [candidate.clone()].into_iter().collect();
     let import_item = app.find("Item};").expect("absolute grouped import item");
 
-    let dependency_item = definition(&analyzer, "crates.upstream.src.nested.Item");
+    let dependency_item = definition(&analyzer, "upstream.nested.Item");
     let dependency_hits = authoritative_hits(&analyzer, &dependency_item, files.clone());
     assert!(
         dependency_hits.iter().any(|hit| {
@@ -10430,7 +10480,7 @@ pub fn consume(_: Item) {}
         "leading-absolute grouped use must resolve through the Cargo dependency: {dependency_hits:#?}"
     );
 
-    let local_item = definition(&analyzer, "crates.app.src.upstream.nested.Item");
+    let local_item = definition(&analyzer, "app.upstream.nested.Item");
     let local_hits = authoritative_hits(&analyzer, &local_item, files);
     assert!(
         local_hits
@@ -10470,7 +10520,7 @@ pub fn item_shadow() {
         ("crates/app/src/lib.rs", app),
     ]);
     let candidate = project.file("crates/app/src/lib.rs");
-    let target = definition(&analyzer, "crates.value.src.Type");
+    let target = definition(&analyzer, "value.Type");
     let hits = authoritative_hits(
         &analyzer,
         &target,
@@ -10561,7 +10611,7 @@ fn run(value: Semaphore) { task::spawn(task(value)); } // SAME_PACKAGE_BENCH
         ),
         ("crates/benches/sync_semaphore.rs", bench),
     ]);
-    let task = definition(&analyzer, "crates.tokio.src.task");
+    let task = definition(&analyzer, "tokio.task");
     let task_hits = UsageFinder::new()
         .find_usages_default(&analyzer, std::slice::from_ref(&task))
         .all_hits_including_imports();
@@ -10610,7 +10660,7 @@ fn run(value: Semaphore) { task::spawn(task(value)); } // SAME_PACKAGE_BENCH
         "same-named module from another dependency must remain unrelated: {task_hits:#?}"
     );
 
-    let maybe_done = definition(&analyzer, "crates.tokio.src.future.maybe_done");
+    let maybe_done = definition(&analyzer, "tokio.future.maybe_done");
     let maybe_done_hits = UsageFinder::new()
         .find_usages_default(&analyzer, &[maybe_done])
         .all_hits_including_imports();
@@ -10699,13 +10749,9 @@ fn exercise(_: ::parser_dep::decoder::Encoding) {}
     let candidates: HashSet<ProjectFile> = [candidate.clone()].into_iter().collect();
 
     for (target_fqn, marker, expected_len) in [
+        ("parser_dep.decoder", "decoder::Encoding", "decoder".len()),
         (
-            "crates.parser-dep.src.decoder",
-            "decoder::Encoding",
-            "decoder".len(),
-        ),
-        (
-            "crates.parser-dep.src.decoder.Encoding",
+            "parser_dep.decoder.Encoding",
             "Encoding) {}",
             "Encoding".len(),
         ),
@@ -10778,8 +10824,8 @@ mod tests {
     let candidates: HashSet<ProjectFile> = [candidate.clone()].into_iter().collect();
 
     for (fqn, marker) in [
-        ("tracing-core.src.span.Attributes", "Attributes"),
-        ("tracing-core.src.span.Id", "Id {"),
+        ("tracing_core.span.Attributes", "Attributes"),
+        ("tracing_core.span.Id", "Id {"),
     ] {
         let target = definition(&analyzer, fqn);
         let hits = authoritative_hits(&analyzer, &target, candidates.clone());
@@ -10791,7 +10837,7 @@ mod tests {
         );
     }
 
-    let id = definition(&analyzer, "tracing-core.src.span.Id");
+    let id = definition(&analyzer, "tracing_core.span.Id");
     let id_hits = authoritative_hits(&analyzer, &id, candidates.clone());
     for expected in dispatcher
         .match_indices("span::Id")
@@ -10805,7 +10851,7 @@ mod tests {
         );
     }
 
-    let span = definition(&analyzer, "tracing-core.src.span");
+    let span = definition(&analyzer, "tracing_core.span");
     let span_hits = authoritative_hits(&analyzer, &span, candidates);
     for expected in dispatcher.match_indices("span::").map(|(offset, _)| offset) {
         assert!(
@@ -10849,14 +10895,14 @@ fn rust_authoritative_examples_resolve_own_library_nested_types_and_aliases() {
 
     for (target_fqn, path, source, marker, expected_len) in [
         (
-            "toml-benchmarks.src.manifest.Manifest",
+            "toml_benchmarks.manifest.Manifest",
             "toml-benchmarks/examples/bench.rs",
             manifest_example,
             "Manifest>();",
             "Manifest".len(),
         ),
         (
-            "comrak.src.nodes.AstNode",
+            "comrak.nodes.AstNode",
             "comrak/examples/custom.rs",
             alias_example,
             "AstNode) {}",
@@ -10881,7 +10927,7 @@ fn rust_authoritative_examples_resolve_own_library_nested_types_and_aliases() {
         );
     }
 
-    let private = definition(&analyzer, "comrak.src.nodes.Private");
+    let private = definition(&analyzer, "comrak.nodes.Private");
     let alias_candidate = project.file("comrak/examples/custom.rs");
     let private_hits = authoritative_hits(
         &analyzer,
@@ -10916,7 +10962,7 @@ fn exercise(value: &str) { value::ValueSerializer::with_style(); }
             "pub struct ValueSerializer;\nimpl ValueSerializer { pub fn with_style() {} }\n",
         ),
     ]);
-    let target = definition(&analyzer, "ser.value.ValueSerializer");
+    let target = definition(&analyzer, "toml.ser.value.ValueSerializer");
     let candidate = project.file("src/ser/document.rs");
     let hits = authoritative_hits(
         &analyzer,
@@ -11205,7 +11251,7 @@ fn build(_: TestTsigAlgorithm, _: AltTsigAlgorithm, _: TsigKey, _: TsigSecretKey
         ("compatibility-tests/src/lib.rs", consumer),
     ]);
     let candidate = project.file("compatibility-tests/src/lib.rs");
-    let target = definition(&analyzer, "dns-test.src.tsig.TsigAlgorithm");
+    let target = definition(&analyzer, "dns_test.tsig.TsigAlgorithm");
     let hits = UsageFinder::new()
         .find_usages_default(&analyzer, &[target])
         .all_hits_including_imports();
@@ -11290,7 +11336,7 @@ fn execute() {
         ("wealthfolio-app/src/lib.rs", consumer),
     ]);
     let candidate = project.file("wealthfolio-app/src/lib.rs");
-    let target = definition(&analyzer, "wealthfolio-ai.src.live_evals.runner.run_case");
+    let target = definition(&analyzer, "wealthfolio_ai.live_evals.runner.run_case");
     let hits = UsageFinder::new()
         .find_usages_default(&analyzer, &[target])
         .all_hits();
@@ -11650,17 +11696,17 @@ mod tests {
     let candidate = project.file("crates/burn-nn/src/lib.rs");
     for (target_fqn, marker, owner_len) in [
         (
-            "crates.burn-std.src.distribution.Distribution",
+            "burn_std.distribution.Distribution",
             "Distribution::Default",
             "Distribution".len(),
         ),
         (
-            "crates.burn-std.src.tensor.TensorData",
+            "burn_std.tensor.TensorData",
             "TensorData::zeros",
             "TensorData".len(),
         ),
         (
-            "crates.burn-std.src.tensor.Tolerance",
+            "burn_std.tensor.Tolerance",
             "Tolerance::default",
             "Tolerance".len(),
         ),
@@ -11717,8 +11763,7 @@ mod tests {
         "a same-named trait member on a sibling implementer must stay unrelated: {f16_hits:#?}"
     );
 
-    let distribution_target =
-        definition(&analyzer, "crates.burn-std.src.distribution.Distribution");
+    let distribution_target = definition(&analyzer, "burn_std.distribution.Distribution");
     let distribution_hits = authoritative_hits(
         &analyzer,
         &distribution_target,
@@ -11734,7 +11779,7 @@ mod tests {
         "a same-named sibling reexport must not be attributed to the physical owner: {distribution_hits:#?}"
     );
 
-    let tensor_target = definition(&analyzer, "crates.burn-core.src.tensor");
+    let tensor_target = definition(&analyzer, "burn_core.tensor");
     let tensor_hits = authoritative_hits(
         &analyzer,
         &tensor_target,
@@ -11790,10 +11835,7 @@ use other::BencherExt as OtherBencherExt;
         ("crates/burn-backend-tests/benches/conv.rs", bench),
     ]);
     let candidate = project.file("crates/burn-backend-tests/benches/conv.rs");
-    let target = definition(
-        &analyzer,
-        "crates.burn-backend-tests.benches.common.BencherExt",
-    );
+    let target = definition(&analyzer, "burn_backend_tests.benches.common.BencherExt");
     let hits = authoritative_hits(
         &analyzer,
         &target,
@@ -12190,7 +12232,7 @@ fn invalid_build(_: build_dep::Shared) {}
         ("app/build.rs", build_script),
     ]);
 
-    let normal_hits = rust_graph_hits(&analyzer, "normal.src.Shared");
+    let normal_hits = rust_graph_hits(&analyzer, "normal_package.Shared");
     let normal = library.find("normal_dep::Shared").unwrap() + "normal_dep::".len();
     let invalid_normal = build_script.find("normal_dep::Shared").unwrap() + "normal_dep::".len();
     assert!(
@@ -12203,7 +12245,7 @@ fn invalid_build(_: build_dep::Shared) {}
         hit.file != project.file("app/build.rs") || hit.start_offset != invalid_normal
     }));
 
-    let development_hits = rust_graph_hits(&analyzer, "development.src.Shared");
+    let development_hits = rust_graph_hits(&analyzer, "development_package.Shared");
     let unit_test = library.find("dev_dep::Shared").unwrap() + "dev_dep::".len();
     let example_use = example.find("dev_dep::Shared").unwrap() + "dev_dep::".len();
     for (path, start) in [
@@ -12217,7 +12259,7 @@ fn invalid_build(_: build_dep::Shared) {}
         );
     }
 
-    let build_hits = rust_graph_hits(&analyzer, "build-dep.src.Shared");
+    let build_hits = rust_graph_hits(&analyzer, "build_package.Shared");
     let build_use = build_script.find("build_dep::Shared").unwrap() + "build_dep::".len();
     let invalid_build = library.find("build_dep::Shared").unwrap() + "build_dep::".len();
     assert!(

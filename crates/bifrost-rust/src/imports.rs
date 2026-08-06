@@ -642,6 +642,75 @@ pub fn resolve_rust_import_package_scoped(
     resolve_rust_module_segments_with_crate(&lexical_package, &crate_package, &segments)
 }
 
+/// Where a module specifier's resolved package is anchored, for persistence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustModuleAnchor {
+    /// `crate::...` -- anchored at the file's crate root.
+    Crate,
+    /// `self::...` / `super::...` / a bare local path -- anchored at the file's
+    /// own package, popped `pop` components.
+    OwnModule { pop: u8 },
+    /// A path rooted in another crate; its package is not placeable from this
+    /// file's path at all.
+    External,
+}
+
+/// Whether a module specifier is rooted at the crate rather than at a module.
+pub fn rust_module_specifier_is_crate_rooted(module_specifier: &str) -> bool {
+    module_specifier
+        .trim()
+        .split("::")
+        .find(|segment| !segment.is_empty())
+        == Some("crate")
+}
+
+/// Classify a package that [`resolve_rust_module_path_with_crate`] already
+/// produced, by comparing it against the package of the file it is persisted
+/// under.
+///
+/// The anchor is derived from the RESOLVED package rather than from the
+/// specifier's `super` count: a specifier resolves at the import's lexical
+/// scope, while the anchor has to describe the package that actually gets
+/// stored. Counting `super`s only agrees with that package while the two scopes
+/// coincide; comparing the resolved package is correct either way.
+///
+/// `crate_rooted` wins over the component relationships below. A crate root and
+/// an own-module ancestor can coincide in the extracting mount and diverge in
+/// another, so a `crate::` route has to keep its own anchor.
+pub fn rust_anchor_for_resolved_package(
+    resolved_package: &str,
+    file_package: &str,
+    crate_rooted: bool,
+) -> RustModuleAnchor {
+    fn components(package: &str) -> Vec<&str> {
+        package
+            .split('.')
+            .filter(|component| !component.is_empty())
+            .collect()
+    }
+    if crate_rooted {
+        return RustModuleAnchor::Crate;
+    }
+    // Compare components, not raw strings: `a.bc` must not read as living
+    // under `a.b`.
+    let resolved = components(resolved_package);
+    let file = components(file_package);
+    if file.starts_with(&resolved) {
+        // An ancestor of this file's own module -- pop back up to it. Equality
+        // lands here with a pop of zero, as does an empty resolved package.
+        match u8::try_from(file.len() - resolved.len()) {
+            Ok(pop) => RustModuleAnchor::OwnModule { pop },
+            Err(_) => RustModuleAnchor::External,
+        }
+    } else if resolved.starts_with(&file) {
+        // A module below this file's own: those extra components are written in
+        // the source, so they ride in the persisted tail past the anchor.
+        RustModuleAnchor::OwnModule { pop: 0 }
+    } else {
+        RustModuleAnchor::External
+    }
+}
+
 pub fn resolve_rust_module_segments_with_crate<S: AsRef<str>>(
     package: &str,
     crate_package: &str,
@@ -737,7 +806,30 @@ pub fn rust_external_module_segments(segments: &[String]) -> Option<(&str, Optio
     Some((root, (!nested.is_empty()).then_some(nested)))
 }
 
+/// Kind-level root (`C.tests`, `C.benches`, `C.examples`) for a file that sits
+/// at its own target root, i.e. the package prefix under which the modules
+/// shared between sibling targets live. `None` when the file has no separate
+/// kind root, so callers only pay for the target-directory case.
+///
+/// A target root file owns its `crate::` root (sibling benches must not see
+/// each other's items), so a name that misses under that root may still be one
+/// of the shared modules beside it -- `mod common;` in `benches/a.rs` and in
+/// `benches/b.rs` both name the single `benches/common/mod.rs` identity.
+pub fn rust_target_kind_root_package(file: &ProjectFile) -> Option<String> {
+    crate::crate_naming::rust_target_kind_root(file).map(|root| root.join("."))
+}
+
+/// Package that `crate::` resolves to from `file`: crate-anchored when a
+/// `Cargo.toml` governs the file, otherwise the legacy path-derived root.
 pub fn rust_crate_root_package(file: &ProjectFile) -> String {
+    if let Some(paths) = crate::crate_naming::rust_crate_paths(file) {
+        return paths.crate_root.join(".");
+    }
+    rust_path_derived_crate_root_package(file)
+}
+
+/// Directory-derived crate root, kept verbatim for manifest-less trees.
+fn rust_path_derived_crate_root_package(file: &ProjectFile) -> String {
     let rel = file.rel_path();
     let mut components: Vec<_> = rel
         .components()

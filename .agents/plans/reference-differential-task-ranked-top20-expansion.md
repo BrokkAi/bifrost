@@ -470,7 +470,7 @@ the focus.
       and
       `63efc0366803e9bdbe3680f646bcad991ad9d99ab4c1e923b9c963ecde9b090e`.
       The next active triage repository is rank fourteen `google__wuffs`.
-    - [ ] (2026-08-06 10:18Z) Rank fourteen `google__wuffs` is in
+    - [x] (2026-08-06 12:00Z) Rank fourteen `google__wuffs` completed
       depth-first repair at pinned head `46ac36bd`. A clean fresh-epoch
       baseline had seven missing rows. The repeated-tag visibility correction
       then changed 37 prior unproven source-fragment rows to missing because
@@ -492,9 +492,47 @@ the focus.
       `03a81d43dce5f3b9746767d8b0dd0dc511cc6b5d912ee108d2b576742340da67`,
       and
       `407306979b7168b49e71c0b61a070368496f48344729b3f427922896a2b8868b`.
-      The remaining seven rows are owned by assigned issues #1703, #1704,
-      and #1705. Wuffs remains the active repository until all three close and
-      a clean full replay reports zero missing rows.
+      Assigned issues #1703 and #1704 shared the guarded C++ type-resolution
+      path, so one grouped implementation retained both shapes as exact
+      unproven evidence. It requires a physically visible target and exact
+      structured owner or alias identity. It excludes template alias
+      applications and does not relax normal visibility. Commit `98dd40a3`
+      reached `origin/master` through merge head `d11ccdb0`; both issues are
+      closed and have clean evidence comments. All 239 C++ usage tests pass.
+      The four clean exact reports have SHA-256 values
+      `598ff6f419973d1c819fb911d86bd104e4ea5355d962f088e236b41ddbc1dbaa`,
+      `5c7e5766a24804f3e3695d6c09b65ed872bdf5a5d7ceb06991137eaf11e3d0b2`,
+      `72428b588efeac7d86088369c315deb09b461b6f10b0496b38e91ccfe90310e9`,
+      and
+      `f0a89f823f55b84cdc1d1778b58778dc7125b41bb353d21160c4b46325b7bcc0`.
+      The clean full replay now reports 2,142 consistent, 17 editor-only, 79
+      honestly unproven, 7,759 inconclusive, and three missing rows. Its
+      SHA-256 is
+      `abafd6611d0a02daf0638590a74cf0c9fbb51fb5da6942b2bac75860868265c7`.
+      Jonathan-assigned issue #1705 found that tree-sitter split a
+      function-like macro typedef into a partial `type_definition` and a
+      following identifier statement. Bifrost published the macro argument as
+      a false alias, which hid the real tagged typedef and three `repr` field
+      uses. Commit `507b0bab` now reads structured declarator fields, recovers
+      the real sibling alias with its complete signature and range, rejects a
+      non-macro near-miss, and invalidates stale C++ parsed blobs. It reached
+      `origin/master` through merge head `327a6217`; issue #1705 is closed and
+      assigned only to `jbellis`. All 240 C++ usage tests, the focused stale
+      generation test, formatting, and diff checks pass.
+      The three clean pushed-head exact witnesses are consistent. Their report
+      SHA-256 values are
+      `c241157503e852cfde7e7a5379a63e148d3bfe6b3814603ff13d0dc5144a1aed`,
+      `1c7e430a51eae972ab4ec47b11ac81b42a6e58fd3c687a076d1de2902e4b393d`,
+      and
+      `1fe79ce07f4f958d2e14f348fe393115b82a92c2726cbfb73a6ae8a9bd548510`.
+      The clean full replay audited 36 files and 10,000 sites, then queried all
+      622 targets. It reported 2,219 consistent, 17 editor-only, 70 honestly
+      unproven, 7,694 inconclusive, and zero missing rows, with no file errors,
+      skips, or truncation. The full report and runner SHA-256 values are
+      `112bd4443f86683b0ce66ec539103a5d97a405305c17d6c8d74ecbd4d56626cf`
+      and
+      `6bf35bd98b235d7460aac5cb3ee31cd97870cf8c14b38edbdc08447165df1ff0`.
+      The next active repository is rank fifteen.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user

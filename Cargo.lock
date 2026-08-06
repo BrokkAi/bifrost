@@ -551,6 +551,7 @@ name = "brokk-bifrost-rust"
 version = "0.8.22"
 dependencies = [
  "brokk-bifrost-core",
+ "filetime",
  "glob",
  "moka",
  "rayon",

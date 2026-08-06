@@ -1,5 +1,6 @@
 //! Shared SQLite schema and connection setup for bifrost's rebuildable cache DB.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
@@ -24,7 +25,12 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 pub const STORE_FILE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
-const CURRENT_MIGRATION_VERSION: i64 = 15;
+const CURRENT_MIGRATION_VERSION: i64 = 16;
+pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
+pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
+pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
+pub const OPTIONAL_FACT_KIND_SCALA_EXPORT: i64 = 4;
+pub const OPTIONAL_FACT_KIND_MATERIALIZATION_RECORD: i64 = 5;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
 const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
@@ -51,6 +57,8 @@ const SEMANTIC_FILE_DOCUMENTS_SQL: &str =
     include_str!("../migrations/cache/0014-semantic-file-documents.sql");
 const MATERIALIZATION_RECORDS_SQL: &str =
     include_str!("../migrations/cache/0015-materialization-records.sql");
+const OPTIONAL_FACT_MANIFEST_SQL: &str =
+    include_str!("../migrations/cache/0016-optional-fact-manifest.sql");
 const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CURRENT_BASELINE_SQL,
     PATH_SYMBOL_UNITS_SQL,
@@ -67,6 +75,7 @@ const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     SEMANTIC_MODEL_ACTIVE_SET_SQL,
     SEMANTIC_FILE_DOCUMENTS_SQL,
     MATERIALIZATION_RECORDS_SQL,
+    OPTIONAL_FACT_MANIFEST_SQL,
 ];
 // The store file is named for the schema version that wrote it, and that
 // version is the migration count. Tie the two at compile time so a migration
@@ -117,6 +126,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("apply semantic file documents migration");
     conn.execute_batch(MATERIALIZATION_RECORDS_SQL)
         .expect("apply materialization records migration");
+    conn.execute_batch(OPTIONAL_FACT_MANIFEST_SQL)
+        .expect("apply optional fact manifest migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -143,6 +154,12 @@ const GENERATED_LEGACY_PROJECT_GITIGNORE: &[u8] = b"/.gitignore\n/bifrost_cache.
 // openers for one canonical cache path. SQLite remains the cross-process lock.
 static PROCESS_LOCAL_OPEN_GUARDS: Lazy<Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static PROCESS_LOCAL_VERSION_SWEEP_ATTEMPTS: Lazy<Mutex<HashSet<PathBuf>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// How long a store from another schema version must go untouched before
+/// collection removes it.
+pub const VERSION_STORE_GRACE_SECS: i64 = 14 * 24 * 3600;
 /// The store file this build owns: `bifrost_cache.v{schema version}.db`.
 ///
 /// The schema version belongs in the name rather than only in the file's
@@ -192,6 +209,83 @@ pub fn store_file_with_suffix(store: &Path, suffix: &str) -> PathBuf {
         .to_os_string();
     name.push(suffix);
     store.with_file_name(name)
+}
+
+/// Remove versioned stores that have not been used during the grace period.
+///
+/// Only older stores are candidates. The current store and stores from a
+/// newer build remain available to older or newer checkouts. The newest mtime
+/// across the store and its sidecars represents use because WAL activity may
+/// not update the main database file.
+pub fn sweep_disused_version_stores(cache_dir: &Path) -> Result<Vec<PathBuf>> {
+    let stores = disused_version_store_paths(cache_dir)?;
+    remove_version_stores(&stores)?;
+    Ok(stores)
+}
+
+fn disused_version_store_paths(cache_dir: &Path) -> Result<Vec<PathBuf>> {
+    let now = now_unix_seconds();
+    let mut stores = Vec::new();
+    for entry in std::fs::read_dir(cache_dir).map_err(|err| format!("cache DB I/O error: {err}"))? {
+        let entry = entry.map_err(|err| format!("cache DB I/O error: {err}"))?;
+        let name = entry.file_name();
+        let Some(version) = name.to_str().and_then(store_file_version) else {
+            continue;
+        };
+        if version >= cache_db_schema_version() {
+            continue;
+        }
+        let store = entry.path();
+        if last_store_use_unix_seconds(&store)? + VERSION_STORE_GRACE_SECS > now {
+            continue;
+        }
+        stores.push(store);
+    }
+    Ok(stores)
+}
+
+fn remove_version_stores(stores: &[PathBuf]) -> Result<()> {
+    for store in stores {
+        for suffix in STORE_FILE_SUFFIXES {
+            let path = store_file_with_suffix(store, suffix);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(format!(
+                        "cache DB I/O error removing {}: {err}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn last_store_use_unix_seconds(store: &Path) -> Result<i64> {
+    let mut newest = 0;
+    for suffix in STORE_FILE_SUFFIXES {
+        let path = store_file_with_suffix(store, suffix);
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(format!(
+                    "cache DB I/O error reading {}: {err}",
+                    path.display()
+                ));
+            }
+        };
+        let modified = metadata
+            .modified()
+            .map_err(|err| format!("cache DB I/O error reading {}: {err}", path.display()))?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|delta| delta.as_secs() as i64)
+            .unwrap_or(0);
+        newest = newest.max(modified);
+    }
+    Ok(newest)
 }
 
 /// Open the workspace's shared cache database, creating it if necessary.
@@ -287,6 +381,7 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
             db_path.display()
         )
     })?;
+    let startup_cleanup = disused_version_stores_on_startup(&db_path);
     import_newest_older_store(&db_path)?;
     let mut conn = Connection::open_with_flags(
         &db_path,
@@ -302,7 +397,36 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
     if !initialized_before_open {
         delete_legacy_cache_files(&db_path);
     }
+    if let Some(stores) = startup_cleanup
+        && let Err(error) = remove_version_stores(&stores)
+    {
+        eprintln!("Bifrost cache startup cleanup skipped: {error}");
+    }
     Ok(conn)
+}
+
+fn disused_version_stores_on_startup(db_path: &Path) -> Option<Vec<PathBuf>> {
+    if db_path.file_name() != Some(std::ffi::OsStr::new(cache_db_file_name())) {
+        return None;
+    }
+    let cache_dir = db_path.parent()?;
+    let should_attempt = PROCESS_LOCAL_VERSION_SWEEP_ATTEMPTS
+        .lock()
+        .expect("cache version sweep mutex poisoned")
+        .insert(cache_dir.to_path_buf());
+    if !should_attempt {
+        return None;
+    }
+    match disused_version_store_paths(cache_dir) {
+        Ok(stores) => Some(stores),
+        Err(error) => {
+            // Old stores are optional cache data. An unreadable old store must
+            // not prevent the current store from opening. A later process can
+            // retry the sweep.
+            eprintln!("Bifrost cache startup cleanup skipped: {error}");
+            None
+        }
+    }
 }
 
 /// Open a read-only connection to an already-initialized cache DB.
@@ -2299,6 +2423,255 @@ mod tests {
             )
             .unwrap(),
             1
+        );
+        assert!(current_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn optional_fact_manifest_migration_preserves_populated_v15_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        let version_15 = &CACHE_MIGRATION_SQL[..15];
+        migrate_with_sql(&mut conn, version_15).unwrap();
+        assert_eq!(cache_migration_version(&conn).unwrap(), 15);
+
+        conn.execute_batch(
+            "INSERT INTO blobs(blob_oid, lang) VALUES
+               ('1111111111111111111111111111111111111111', 'cpp'),
+               ('2222222222222222222222222222222222222222', 'ruby'),
+               ('3333333333333333333333333333333333333333', 'scala'),
+               ('4444444444444444444444444444444444444444', 'rust');
+
+             INSERT INTO code_units(
+               blob_oid, lang, unit_key, kind, short_name, identifier,
+               content_qualifier, synthetic, is_type_alias, top_level_ordinal,
+               in_declarations, in_definition_lookup
+             ) VALUES
+               ('1111111111111111111111111111111111111111', 'cpp', 1, 0,
+                'TemplateOne', 'TemplateOne', '', 0, 0, 0, 1, 0),
+               ('1111111111111111111111111111111111111111', 'cpp', 2, 0,
+                'TemplateTwo', 'TemplateTwo', '', 0, 0, 1, 1, 0),
+               ('2222222222222222222222222222222222222222', 'ruby', 1, 2,
+                'dispatch', 'dispatch', '', 0, 0, 0, 1, 0),
+               ('3333333333333333333333333333333333333333', 'scala', 1, 0,
+                'ExportOwner', 'ExportOwner', '', 0, 0, 0, 1, 0);
+
+             INSERT INTO blob_meta(
+               blob_oid, lang, contains_tests, content_package,
+               stored_unit_count, range_count, signature_count,
+               signature_metadata_count, supertype_count, child_count,
+               import_statement_count, import_count, type_identifier_count,
+               ruby_dispatch_count, scala_trait_count, is_complete,
+               cpp_template_metadata_count
+             ) VALUES
+               ('1111111111111111111111111111111111111111', 'cpp', 0, 'cpp.pkg',
+                2, 11, 12, 13, 14, 15, 16, 17, 18, 0, 0, 1, 3),
+               ('2222222222222222222222222222222222222222', 'ruby', 0, 'ruby.pkg',
+                1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0),
+               ('3333333333333333333333333333333333333333', 'scala', 0, 'scala.pkg',
+                1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0),
+               ('4444444444444444444444444444444444444444', 'rust', 0, 'rust.pkg',
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0);
+
+             INSERT INTO unit_cpp_template_metadata(blob_oid, lang, unit_key, metadata) VALUES
+               ('1111111111111111111111111111111111111111', 'cpp', 1, X'01'),
+               ('1111111111111111111111111111111111111111', 'cpp', 2, X'02');
+             INSERT INTO ruby_method_dispatch_modes(blob_oid, lang, unit_key, mode) VALUES
+               ('2222222222222222222222222222222222222222', 'ruby', 1, 2);
+             INSERT INTO scala_traits(blob_oid, lang, unit_key) VALUES
+               ('3333333333333333333333333333333333333333', 'scala', 1);
+             INSERT INTO scala_exports(blob_oid, lang, owner_key, ordinal, info) VALUES
+               ('3333333333333333333333333333333333333333', 'scala', 1, 0, X'03'),
+               ('3333333333333333333333333333333333333333', 'scala', 1, 1, X'04');
+             INSERT INTO materialization_records(blob_oid, lang, ordinal, unit_key, payload) VALUES
+               ('4444444444444444444444444444444444444444', 'rust', 0, NULL, X'05'),
+               ('4444444444444444444444444444444444444444', 'rust', 1, NULL, X'06');
+
+             INSERT INTO blob_payload_costs(blob_oid, lang, payload_bytes) VALUES
+               ('1111111111111111111111111111111111111111', 'cpp', 73);
+             INSERT INTO structural_facts_snapshots(
+               blob_oid, lang, snapshot_version, payload
+             ) VALUES
+               ('1111111111111111111111111111111111111111', 'cpp', 4, X'0708');",
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        let manifest_rows = conn
+            .prepare(
+                "SELECT fact_kind, lang, row_count
+                 FROM blob_optional_fact_manifest
+                 ORDER BY fact_kind",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            manifest_rows,
+            vec![
+                (
+                    OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA,
+                    "cpp".to_string(),
+                    3
+                ),
+                (
+                    OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE,
+                    "ruby".to_string(),
+                    1,
+                ),
+                (OPTIONAL_FACT_KIND_SCALA_TRAIT, "scala".to_string(), 1),
+                (OPTIONAL_FACT_KIND_SCALA_EXPORT, "scala".to_string(), 2),
+                (
+                    OPTIONAL_FACT_KIND_MATERIALIZATION_RECORD,
+                    "rust".to_string(),
+                    2,
+                ),
+            ]
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO blob_optional_fact_manifest(
+                   blob_oid, lang, fact_kind, row_count
+                 ) VALUES(
+                   '1111111111111111111111111111111111111111', 'cpp', 5, 0
+                 )",
+                [],
+            )
+            .is_err(),
+            "the sparse manifest must not store zero counts"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('blob_meta')
+                 WHERE name IN (
+                   'cpp_template_metadata_count',
+                   'ruby_dispatch_count',
+                   'scala_trait_count'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM blob_meta", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT GROUP_CONCAT(content_package, ',')
+                 FROM (SELECT content_package FROM blob_meta ORDER BY lang)",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "cpp.pkg,ruby.pkg,rust.pkg,scala.pkg"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT stored_unit_count, range_count, signature_count,
+                        signature_metadata_count, supertype_count, child_count,
+                        import_statement_count, import_count, type_identifier_count
+                 FROM blob_meta
+                 WHERE blob_oid = '1111111111111111111111111111111111111111'
+                   AND lang = 'cpp'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .unwrap(),
+            (2, 11, 12, 13, 14, 15, 16, 17, 18)
+        );
+        assert_eq!(
+            conn.query_row("SELECT payload_bytes FROM blob_payload_costs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            73
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT snapshot_version, hex(payload) FROM structural_facts_snapshots",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+            (4, "0708".to_string())
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM unit_cpp_template_metadata) +
+                   (SELECT COUNT(*) FROM ruby_method_dispatch_modes) +
+                   (SELECT COUNT(*) FROM scala_traits) +
+                   (SELECT COUNT(*) FROM scala_exports) +
+                   (SELECT COUNT(*) FROM materialization_records)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            8
+        );
+        conn.execute(
+            "INSERT INTO blob_optional_fact_manifest(
+               blob_oid, lang, fact_kind, row_count
+             ) VALUES(
+               '4444444444444444444444444444444444444444', 'rust', 99, 1
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM blob_meta
+             WHERE blob_oid = '4444444444444444444444444444444444444444'
+               AND lang = 'rust'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM blob_optional_fact_manifest WHERE lang = 'rust'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "manifest rows must follow their parsed metadata lifetime"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
         );
         assert!(current_schema_is_valid(&conn).unwrap());
     }

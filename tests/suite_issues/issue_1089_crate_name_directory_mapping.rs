@@ -119,7 +119,7 @@ fn sway_self_as_alias_references_resolve_to_workspace_crate() {
     );
     assert_resolved(
         &bare,
-        "forc-pkg.src.TestPassCondition",
+        "forc_pkg.TestPassCondition",
         "bare alias-imported item",
     );
     // `pkg::BuiltPackage` terminal in a return type and a body expression
@@ -133,7 +133,7 @@ fn sway_self_as_alias_references_resolve_to_workspace_crate() {
     );
     assert_resolved(
         &ret,
-        "forc-pkg.src.BuiltPackage",
+        "forc_pkg.BuiltPackage",
         "pkg::BuiltPackage return terminal",
     );
     let body = loc(
@@ -146,7 +146,7 @@ fn sway_self_as_alias_references_resolve_to_workspace_crate() {
     );
     assert_resolved(
         &body,
-        "forc-pkg.src.BuiltPackage",
+        "forc_pkg.BuiltPackage",
         "pkg::BuiltPackage body terminal",
     );
     // the import terminal in `use pkg::TestPassCondition;`
@@ -160,7 +160,7 @@ fn sway_self_as_alias_references_resolve_to_workspace_crate() {
     );
     assert_resolved(
         &import_terminal,
-        "forc-pkg.src.TestPassCondition",
+        "forc_pkg.TestPassCondition",
         "alias import terminal",
     );
     // sanity: the direct (non-aliased) crate path still resolves
@@ -172,11 +172,7 @@ fn sway_self_as_alias_references_resolve_to_workspace_crate() {
         0,
         "BuildOpts",
     );
-    assert_resolved(
-        &direct,
-        "forc-pkg.src.BuildOpts",
-        "direct forc_pkg::BuildOpts",
-    );
+    assert_resolved(&direct, "forc_pkg.BuildOpts", "direct forc_pkg::BuildOpts");
 }
 
 #[test]

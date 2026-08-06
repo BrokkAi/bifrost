@@ -22,6 +22,7 @@
 
 pub mod adapter;
 pub mod cargo_routes;
+pub mod crate_naming;
 pub mod declarations;
 pub mod diagnostics;
 pub mod field_roles;

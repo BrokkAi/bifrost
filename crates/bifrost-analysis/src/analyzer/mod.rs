@@ -149,14 +149,14 @@ pub use model::{
     CallableArity, CallableFacts, CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit,
     CodeUnitType, CommentDensityStats, DeclarationInfo, DeclarationKind, DispatchExtensibility,
     ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo, Language,
-    LanguageDialect, MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights, ParameterMetadata,
-    ParseError, ParseErrorKind, ProjectFile, Range, RubyMethodDispatchMode, ScalaExportInfo,
-    ScalaExportSelector, SearchSymbolCandidate, SemanticAbsenceProof, SemanticDiagnostic,
-    SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason, SemanticDiagnosticOutcome,
-    SemanticDiagnosticReport, SemanticDiagnosticReportStatus, SignatureMetadata,
-    StructuredImportPath, StructuredImportPathKind, StructuredImportScope, StructuredTypeIdentity,
-    StructuredTypeName, SummaryFileProjection, TestAssertionAnalysis, TestAssertionSmell,
-    TestAssertionWeights, metrics_from_declarations,
+    LanguageDialect, MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights, PackageAnchor,
+    ParameterMetadata, ParseError, ParseErrorKind, ProjectFile, Range, RubyMethodDispatchMode,
+    ScalaExportInfo, ScalaExportSelector, SearchSymbolCandidate, SemanticAbsenceProof,
+    SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
+    SemanticDiagnosticOutcome, SemanticDiagnosticReport, SemanticDiagnosticReportStatus,
+    SignatureMetadata, StructuredImportPath, StructuredImportPathKind, StructuredImportScope,
+    StructuredTypeIdentity, StructuredTypeName, SummaryFileProjection, TestAssertionAnalysis,
+    TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
 };
 pub(crate) use model::{CallableLinkage, CppTemplateMetadata};
 pub use multi_analyzer::resolve_analyzer;

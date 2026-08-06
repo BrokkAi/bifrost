@@ -306,11 +306,11 @@ fn code_unit_kind_name(kind: CodeUnitType) -> &'static str {
     kind.display_lowercase()
 }
 
-type CppOccurrenceClassifierMemo = Option<(
-    usize,
-    u64,
-    Option<std::rc::Rc<crate::analyzer::CppOccurrenceClassifier>>,
-)>;
+struct CachedCppOccurrenceClassifier {
+    source_len: usize,
+    content_hash: u64,
+    classifier: Option<std::rc::Rc<crate::analyzer::CppOccurrenceClassifier>>,
+}
 
 thread_local! {
     /// Per-thread 1-entry memo for the C++ occurrence classifier. Building it
@@ -319,7 +319,7 @@ thread_local! {
     /// files (phalcon's 9.5 MB phalcon.zep.c, #1698) that meant one full parse
     /// per candidate unit, hours per tool call. Keyed by (length, content
     /// hash) so an edit invalidates; one entry per thread keeps it bounded.
-    static CPP_OCCURRENCE_CLASSIFIER: std::cell::RefCell<CppOccurrenceClassifierMemo> =
+    static CPP_OCCURRENCE_CLASSIFIER: std::cell::RefCell<Option<CachedCppOccurrenceClassifier>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -333,15 +333,19 @@ fn cpp_occurrence_classifier_for(
     CPP_OCCURRENCE_CLASSIFIER.with(|cell| {
         let mut guard = cell.borrow_mut();
         match &*guard {
-            Some((cached_len, cached_hash, cached))
-                if *cached_len == source.len() && *cached_hash == content_hash =>
+            Some(cached)
+                if cached.source_len == source.len() && cached.content_hash == content_hash =>
             {
-                cached.clone()
+                cached.classifier.clone()
             }
             _ => {
                 let built =
                     crate::analyzer::CppOccurrenceClassifier::new(source).map(std::rc::Rc::new);
-                *guard = Some((source.len(), content_hash, built.clone()));
+                *guard = Some(CachedCppOccurrenceClassifier {
+                    source_len: source.len(),
+                    content_hash,
+                    classifier: built.clone(),
+                });
                 built
             }
         }

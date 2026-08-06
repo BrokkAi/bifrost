@@ -36,6 +36,7 @@ use crate::imports::{
     RustImportOwner, RustProjectedImport, RustVisibility, resolve_rust_import_package_scoped,
     resolve_rust_module_path_with_crate, resolve_rust_module_segments_with_crate,
     rust_crate_root_package, rust_import_projection, rust_module_extents,
+    rust_target_kind_root_package,
 };
 
 /// How a local binding in an importer refers to its target: a named import
@@ -688,35 +689,69 @@ impl RustModuleFiles {
         files.extend(rust_module_files_from_segments(importing_file, segments));
         files.sort();
         files.dedup();
-        files.retain(|file| {
-            self.cargo_routes.target_relation(importing_file, file)
-                != RustCargoTargetRelation::Disjoint
-        });
-        files
+        let mut routes = files
             .into_iter()
             .map(|file| RustResolvedModuleRoute {
                 target_module: ModuleKey::new(&file, &resolved_module),
                 target_file: file,
                 provenance: RustRouteProvenance::Local,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        // Second candidate for a target root file: the same name spelled under
+        // the kind root, where the modules shared with sibling targets live.
+        // Appended, so the target's own route still comes first.
+        if let Some(alternative) = self.kind_root_alternative(importing_file, &resolved_module) {
+            for file in self.files_for_package(&alternative) {
+                if routes.iter().all(|route| route.target_file != file) {
+                    routes.push(RustResolvedModuleRoute {
+                        target_module: ModuleKey::new(&file, &alternative),
+                        target_file: file,
+                        provenance: RustRouteProvenance::Local,
+                    });
+                }
+            }
+        }
+        routes.retain(|route| {
+            self.cargo_routes
+                .target_relation(importing_file, &route.target_file)
+                != RustCargoTargetRelation::Disjoint
+        });
+        routes
     }
 
     fn files_for_module(&self, module: &ModuleKey) -> Vec<ProjectFile> {
-        let package = module.package();
+        self.files_for_package(&module.package())
+    }
+
+    fn files_for_package(&self, package: &str) -> Vec<ProjectFile> {
         let mut files = self
             .by_package
-            .get(&package)
+            .get(package)
             .into_iter()
             .flatten()
             .map(|file_id| self.files[*file_id].clone())
             .collect::<Vec<_>>();
-        if let Some(inline) = self.inline_by_name.get(&package) {
+        if let Some(inline) = self.inline_by_name.get(package) {
             files.extend(inline.iter().map(|file_id| self.files[*file_id].clone()));
         }
         files.sort();
         files.dedup();
         files
+    }
+
+    /// Re-spell `package` -- a name resolved against `importing_file`'s own
+    /// `crate::` root -- under the kind root shared with its sibling targets,
+    /// when that names files and the own-root spelling did not.
+    ///
+    /// This is the second half of the target-root chain: `crate::common::x` and
+    /// `common::x` in `benches/b.rs` first mean this bench's own `common`, and
+    /// only then the `benches/common/mod.rs` every bench shares.
+    fn kind_root_alternative(&self, importing_file: &ProjectFile, package: &str) -> Option<String> {
+        let kind_root = rust_target_kind_root_package(importing_file)?;
+        let own_root = rust_crate_root_package(importing_file);
+        let suffix = package.strip_prefix(&own_root)?;
+        let alternative = format!("{kind_root}{suffix}");
+        (!self.files_for_package(&alternative).is_empty()).then_some(alternative)
     }
 }
 

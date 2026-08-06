@@ -7,6 +7,7 @@ use crate::analyzer::lexical_definitions::{
     FormalParameterLayout, PythonMethodBinding, formal_parameter_slots,
 };
 use crate::analyzer::structural::FileFacts;
+use crate::analyzer::structural::resolution::BoundaryStatus;
 use crate::analyzer::usages::get_definition::{
     CallSiteSyntax, CallSyntaxKind, CallTargetLookupOutcome, DefinitionLookupOutcome,
     DefinitionLookupRequest, DefinitionLookupStatus, ExactCallReference, ExactCallReferenceGap,
@@ -98,6 +99,10 @@ pub(crate) enum CallDispatchBoundaryKind {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CallDispatchLookup {
     pub(crate) status: Option<DefinitionLookupStatus>,
+    /// The refined external-root evidence for a
+    /// [`DefinitionLookupStatus::UnresolvableImportBoundary`] status, shared
+    /// with the resolution trace (#1474). `None` for every other status.
+    pub(crate) boundary: Option<BoundaryStatus>,
     pub(crate) targets: Vec<CallDispatchTarget>,
     pub(crate) boundaries: Vec<CallDispatchBoundaryKind>,
     pub(crate) truncated: bool,
@@ -466,6 +471,15 @@ impl CallRelationService {
             }
             return lookup;
         };
+        if outcome.outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary {
+            let name = outcome
+                .outcome
+                .resolved_reference_target()
+                .unwrap_or_default();
+            let (boundary, _) =
+                super::get_definition::trace::boundary_evidence(analyzer, &location.file, name);
+            lookup.boundary = Some(boundary);
+        }
         apply_call_target_outcome(&mut lookup, outcome, limits.max_candidates);
         lookup.cancelled |= cancellation.is_some_and(CancellationToken::is_cancelled);
         lookup
@@ -1469,6 +1483,42 @@ mod tests {
         assert_eq!(lookup.targets[0].definition.fq_name(), "Example.helper");
         assert_eq!(lookup.targets[0].proof, UsageProof::Proven);
         assert!(lookup.boundaries.is_empty(), "{lookup:#?}");
+    }
+
+    /// #1599: a boundary status carries its refined external evidence so the
+    /// dispatch oracle can classify quality from it. Nothing declares or
+    /// indexes `third-party` here, so the refinement is `external_unknown`.
+    #[test]
+    fn exact_dispatch_refines_an_external_boundary_status() {
+        let source = "import { work } from \"third-party\";\nexport function caller(): number { return work(); }\n";
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::TypeScript, &[("external.ts", source)]);
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.project_root(), "external.ts"),
+                call_span: call_span(source, "work()"),
+            },
+            Arc::from(source),
+            generous_limits(),
+            None,
+        );
+
+        assert_eq!(
+            lookup.status,
+            Some(DefinitionLookupStatus::UnresolvableImportBoundary),
+            "{lookup:#?}"
+        );
+        assert_eq!(
+            lookup.boundary,
+            Some(BoundaryStatus::ExternalUnknown),
+            "{lookup:#?}"
+        );
+        assert_eq!(
+            lookup.boundaries,
+            vec![CallDispatchBoundaryKind::External],
+            "{lookup:#?}"
+        );
     }
 
     #[test]

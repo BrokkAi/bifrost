@@ -1989,7 +1989,20 @@ impl fmt::Display for ProjectFile {
     }
 }
 
-#[derive(Debug)]
+/// Where a persisted unit's package prefix is anchored when it is re-resolved
+/// at hydration time. `None` on the unit means "use the language adapter's
+/// default anchor". This is process-local provenance recorded by the extractor;
+/// it is never itself persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PackageAnchor {
+    /// Anchored at the file's own module package, popped up `pop` levels
+    /// (`pop` is relative to the file-package boundary, floor 0).
+    OwnModule { pop: u8 },
+    /// Anchored at the crate root of the file's crate.
+    CrateRoot,
+}
+
+#[derive(Debug, Clone)]
 struct CodeUnitInner {
     source: ProjectFile,
     kind: CodeUnitType,
@@ -1997,10 +2010,11 @@ struct CodeUnitInner {
     synthetic: bool,
     fq: FqName,
     package_segment_count: usize,
+    package_anchor: Option<PackageAnchor>,
     rendered_name: RenderedCodeUnitName,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RenderedCodeUnitName {
     display: String,
     package_end: usize,
@@ -2170,6 +2184,7 @@ impl CodeUnit {
             synthetic,
             fq,
             package_segment_count,
+            package_anchor: None,
             rendered_name,
         }))
     }
@@ -2279,26 +2294,32 @@ impl CodeUnit {
             .map(|(start, end)| &self.0.rendered_name.display[start..end])
     }
 
+    /// Record where this unit's package prefix is anchored, so persistence can
+    /// store a content-stable tail instead of a path-derived absolute prefix.
+    pub fn with_package_anchor(mut self, anchor: PackageAnchor) -> Self {
+        Arc::make_mut(&mut self.0).package_anchor = Some(anchor);
+        self
+    }
+
+    /// The extractor-recorded anchor, or `None` to mean "use the language
+    /// adapter's default anchor".
+    pub fn package_anchor(&self) -> Option<PackageAnchor> {
+        self.0.package_anchor
+    }
+
+    // Rebuilders clone the inner and mutate one field: reconstructing via
+    // `from_fq` would silently drop `package_anchor` and re-persist a
+    // path-derived absolute prefix.
     pub fn without_signature(&self) -> Self {
-        Self::from_fq(
-            self.0.source.clone(),
-            self.0.kind,
-            self.0.fq.clone(),
-            self.0.package_segment_count,
-            None,
-            self.0.synthetic,
-        )
+        let mut inner = (*self.0).clone();
+        inner.signature = None;
+        Self(Arc::new(inner))
     }
 
     pub fn with_synthetic(&self, synthetic: bool) -> Self {
-        Self::from_fq(
-            self.0.source.clone(),
-            self.0.kind,
-            self.0.fq.clone(),
-            self.0.package_segment_count,
-            self.0.signature.clone(),
-            synthetic,
-        )
+        let mut inner = (*self.0).clone();
+        inner.synthetic = synthetic;
+        Self(Arc::new(inner))
     }
 
     pub fn is_class(&self) -> bool {
@@ -3215,6 +3236,59 @@ pub fn metrics_from_declarations(
         .collect::<BTreeSet<_>>()
         .len();
     CodeBaseMetrics::new(file_count, declarations.len())
+}
+
+#[cfg(test)]
+mod package_anchor_tests {
+    use super::*;
+
+    fn anchored_unit() -> CodeUnit {
+        let source = ProjectFile::new(PathBuf::from("/repo"), PathBuf::from("src/describe.rs"));
+        CodeUnit::with_signature(
+            source,
+            CodeUnitType::Function,
+            "demo",
+            "JsError.describe",
+            Some("fn describe()".to_string()),
+            false,
+        )
+        .with_package_anchor(PackageAnchor::CrateRoot)
+    }
+
+    #[test]
+    fn rebuilders_preserve_the_package_anchor() {
+        let unit = anchored_unit();
+        assert_eq!(unit.package_anchor(), Some(PackageAnchor::CrateRoot));
+
+        let stripped = unit.without_signature();
+        assert_eq!(stripped.signature(), None);
+        assert_eq!(stripped.package_anchor(), Some(PackageAnchor::CrateRoot));
+
+        let synthetic = unit.with_synthetic(true);
+        assert!(synthetic.is_synthetic());
+        assert_eq!(synthetic.package_anchor(), Some(PackageAnchor::CrateRoot));
+
+        // Chained rebuilds keep it too, including a non-unit-variant anchor.
+        let popped = unit
+            .clone()
+            .with_package_anchor(PackageAnchor::OwnModule { pop: 2 })
+            .with_synthetic(true)
+            .without_signature();
+        assert_eq!(
+            popped.package_anchor(),
+            Some(PackageAnchor::OwnModule { pop: 2 })
+        );
+        assert_eq!(popped.fq(), unit.fq());
+        assert_eq!(popped.package_name(), unit.package_name());
+    }
+
+    #[test]
+    fn units_default_to_the_adapter_anchor() {
+        let source = ProjectFile::new(PathBuf::from("/repo"), PathBuf::from("src/lib.rs"));
+        let unit = CodeUnit::new(source, CodeUnitType::Class, "demo", "JsError");
+        assert_eq!(unit.package_anchor(), None);
+        assert_eq!(unit.without_signature().package_anchor(), None);
+    }
 }
 
 #[cfg(test)]

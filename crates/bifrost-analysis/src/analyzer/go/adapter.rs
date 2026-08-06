@@ -51,15 +51,27 @@ impl LanguageAdapter for GoAdapter {
         canonical_go_package_name(file, content_qualifier)
     }
 
-    fn path_derived_package_fq(
+    fn default_package_anchor(&self) -> Option<crate::analyzer::PackageAnchor> {
+        Some(crate::analyzer::PackageAnchor::OwnModule { pop: 0 })
+    }
+
+    /// A Go declaration always sits in its file's own package, so the file's
+    /// own module is the only anchor this adapter can place. The declared
+    /// `package` clause travels in the content qualifier because the live
+    /// import path alone cannot recover a `_test` suffix or the module-less
+    /// fallback name.
+    fn resolve_package_anchor(
         &self,
+        anchor: crate::analyzer::PackageAnchor,
         content_qualifier: &str,
         file: &ProjectFile,
     ) -> Option<crate::analyzer::FqName> {
-        Some(go_package_fq(&canonical_go_package_name(
-            file,
-            content_qualifier,
-        )))
+        match anchor {
+            crate::analyzer::PackageAnchor::OwnModule { pop: 0 } => Some(go_package_fq(
+                &canonical_go_package_name(file, content_qualifier),
+            )),
+            _ => None,
+        }
     }
 
     fn contains_tests(

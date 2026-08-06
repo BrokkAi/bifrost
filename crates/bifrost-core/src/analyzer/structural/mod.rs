@@ -10,6 +10,7 @@
 //! query layer that consume them stay in `brokk-bifrost-analysis`.
 
 pub mod adapter_helpers;
+pub mod callable;
 pub mod edges;
 pub mod facts;
 pub mod kinds;

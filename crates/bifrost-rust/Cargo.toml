@@ -24,4 +24,6 @@ tree-sitter-rust = "0.24.0"
 
 [dev-dependencies]
 brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22", features = ["test-support"] }
+# crate_naming's mtime-invalidation test stamps manifest timestamps directly.
+filetime = "0.2"
 tempfile = "3.23.0"

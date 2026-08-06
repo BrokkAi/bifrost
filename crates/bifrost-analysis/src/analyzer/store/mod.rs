@@ -5,10 +5,11 @@ pub mod query;
 
 use std::cell::RefCell;
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use bincode::Options;
@@ -21,6 +22,12 @@ use rusqlite::{
 use sha2::{Digest, Sha256};
 use tree_sitter::Language as TsLanguage;
 
+use brokk_bifrost_core::cache_db::{
+    OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA, OPTIONAL_FACT_KIND_MATERIALIZATION_RECORD,
+    OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE, OPTIONAL_FACT_KIND_SCALA_EXPORT,
+    OPTIONAL_FACT_KIND_SCALA_TRAIT,
+};
+
 use crate::CancellationToken;
 use crate::analyzer::fq_name::{FqName, segment_interner};
 use crate::analyzer::model::MAX_SIGNATURE_METADATA_BLOB_BYTES;
@@ -29,8 +36,8 @@ use crate::analyzer::structural::materialization::{
 };
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, CppTemplateMetadata, ImportInfo, Language, ProjectFile, Range,
-    RubyMethodDispatchMode, SignatureMetadata, SummaryFileProjection,
+    CodeUnit, CodeUnitType, CppTemplateMetadata, ImportInfo, Language, PackageAnchor, ProjectFile,
+    Range, RubyMethodDispatchMode, SignatureMetadata, SummaryFileProjection,
 };
 use crate::gitblob;
 use crate::hash::{HashMap, HashSet, set_with_capacity};
@@ -195,7 +202,8 @@ const EXACT_PATH_SYMBOL_FQN_SQL: &str =
       )
     ORDER BY rel_path, exact_fqn";
 
-const PARSED_BLOB_INTEGRITY_CONDITION: &str = "
+static PARSED_BLOB_INTEGRITY_CONDITION: LazyLock<String> = LazyLock::new(|| {
+    let mut condition = "
 meta.is_complete = 1
 AND EXISTS (
   SELECT 1
@@ -222,10 +230,30 @@ AND meta.signature_metadata_count = (
   SELECT COUNT(*) FROM unit_signature_metadata AS metadata
   WHERE metadata.blob_oid = meta.blob_oid AND metadata.lang = meta.lang
 )
-AND meta.cpp_template_metadata_count = (
-  SELECT COUNT(*) FROM unit_cpp_template_metadata AS metadata
-  WHERE metadata.blob_oid = meta.blob_oid AND metadata.lang = meta.lang
-)
+AND (SELECT
+"
+    .to_string();
+    for (index, descriptor) in OPTIONAL_FACT_DESCRIPTORS.iter().enumerate() {
+        if index > 0 {
+            condition.push_str("  AND ");
+        } else {
+            condition.push_str("  ");
+        }
+        writeln!(
+            condition,
+            "COALESCE(MAX(CASE WHEN manifest.fact_kind = {} THEN manifest.row_count END), 0) = (\n    SELECT COUNT(*) FROM {} AS facts\n    WHERE facts.blob_oid = meta.blob_oid AND facts.lang = meta.lang\n  )",
+            descriptor.kind as i64, descriptor.table
+        )
+        .expect("write optional fact integrity SQL");
+    }
+    let known_kinds = optional_fact_kind_list();
+    write!(
+        condition,
+        "  AND COUNT(manifest.fact_kind) =\n      COUNT(CASE WHEN manifest.fact_kind IN ({known_kinds}) THEN 1 END)\n  FROM blob_optional_fact_manifest AS manifest\n  WHERE manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang\n)\n"
+    )
+    .expect("write optional fact integrity guard");
+    condition.push_str(
+        "
 AND meta.supertype_count = (
   SELECT COUNT(*) FROM unit_supertypes AS supertypes
   WHERE supertypes.blob_oid = meta.blob_oid AND supertypes.lang = meta.lang
@@ -246,14 +274,30 @@ AND meta.type_identifier_count = (
   SELECT COUNT(*) FROM type_identifiers AS identifiers
   WHERE identifiers.blob_oid = meta.blob_oid AND identifiers.lang = meta.lang
 )
-AND meta.ruby_dispatch_count = (
-  SELECT COUNT(*) FROM ruby_method_dispatch_modes AS modes
-  WHERE modes.blob_oid = meta.blob_oid AND modes.lang = meta.lang
-)
-AND meta.scala_trait_count = (
-  SELECT COUNT(*) FROM scala_traits AS traits
-  WHERE traits.blob_oid = meta.blob_oid AND traits.lang = meta.lang
-)";
+",
+    );
+    condition
+});
+
+static OPTIONAL_FACT_COUNT_PROJECTION: LazyLock<String> = LazyLock::new(|| {
+    let mut projection = OPTIONAL_FACT_DESCRIPTORS
+        .iter()
+        .map(|descriptor| {
+            format!(
+                "COALESCE(MAX(CASE WHEN manifest.fact_kind = {} THEN manifest.row_count END), 0)",
+                descriptor.kind as i64
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let known_kinds = optional_fact_kind_list();
+    write!(
+        projection,
+        ",\nCOUNT(manifest.fact_kind) -\nCOUNT(CASE WHEN manifest.fact_kind IN ({known_kinds}) THEN 1 END)"
+    )
+    .expect("write optional fact projection guard");
+    projection
+});
 
 pub struct AnalyzerStore {
     // Field order is load-bearing for `Drop`: Rust drops struct fields in
@@ -3754,14 +3798,130 @@ struct PersistedSideTableCounts {
     range_count: usize,
     signature_count: usize,
     signature_metadata_count: usize,
-    cpp_template_metadata_count: usize,
     supertype_count: usize,
     child_count: usize,
     import_statement_count: usize,
     import_count: usize,
     type_identifier_count: usize,
-    ruby_dispatch_count: usize,
-    scala_trait_count: usize,
+    optional: OptionalFactCounts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i64)]
+enum OptionalFactKind {
+    CppTemplateMetadata = OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA,
+    RubyMethodDispatchMode = OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE,
+    ScalaTrait = OPTIONAL_FACT_KIND_SCALA_TRAIT,
+    ScalaExport = OPTIONAL_FACT_KIND_SCALA_EXPORT,
+    MaterializationRecord = OPTIONAL_FACT_KIND_MATERIALIZATION_RECORD,
+}
+
+impl OptionalFactKind {
+    const fn slot(self) -> usize {
+        match self {
+            Self::CppTemplateMetadata => 0,
+            Self::RubyMethodDispatchMode => 1,
+            Self::ScalaTrait => 2,
+            Self::ScalaExport => 3,
+            Self::MaterializationRecord => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OptionalFactDescriptor {
+    kind: OptionalFactKind,
+    table: &'static str,
+}
+
+const OPTIONAL_FACT_DESCRIPTORS: [OptionalFactDescriptor; 5] = [
+    OptionalFactDescriptor {
+        kind: OptionalFactKind::CppTemplateMetadata,
+        table: "unit_cpp_template_metadata",
+    },
+    OptionalFactDescriptor {
+        kind: OptionalFactKind::RubyMethodDispatchMode,
+        table: "ruby_method_dispatch_modes",
+    },
+    OptionalFactDescriptor {
+        kind: OptionalFactKind::ScalaTrait,
+        table: "scala_traits",
+    },
+    OptionalFactDescriptor {
+        kind: OptionalFactKind::ScalaExport,
+        table: "scala_exports",
+    },
+    OptionalFactDescriptor {
+        kind: OptionalFactKind::MaterializationRecord,
+        table: "materialization_records",
+    },
+];
+
+fn optional_fact_kind_list() -> String {
+    OPTIONAL_FACT_DESCRIPTORS
+        .iter()
+        .map(|descriptor| (descriptor.kind as i64).to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OptionalFactCounts([usize; OPTIONAL_FACT_DESCRIPTORS.len()]);
+
+impl OptionalFactCounts {
+    fn get(self, kind: OptionalFactKind) -> usize {
+        self.0[kind.slot()]
+    }
+
+    fn set(&mut self, kind: OptionalFactKind, count: usize) {
+        self.0[kind.slot()] = count;
+    }
+
+    fn nonzero_len(self) -> usize {
+        self.0.into_iter().filter(|count| *count > 0).count()
+    }
+}
+
+fn optional_fact_counts(
+    cpp_template_metadata: usize,
+    ruby_dispatch_modes: usize,
+    scala_traits: usize,
+    scala_exports: usize,
+    materialization_records: usize,
+) -> OptionalFactCounts {
+    let mut counts = OptionalFactCounts::default();
+    counts.set(OptionalFactKind::CppTemplateMetadata, cpp_template_metadata);
+    counts.set(
+        OptionalFactKind::RubyMethodDispatchMode,
+        ruby_dispatch_modes,
+    );
+    counts.set(OptionalFactKind::ScalaTrait, scala_traits);
+    counts.set(OptionalFactKind::ScalaExport, scala_exports);
+    counts.set(
+        OptionalFactKind::MaterializationRecord,
+        materialization_records,
+    );
+    counts
+}
+
+fn insert_optional_fact_manifest(
+    tx: &Transaction<'_>,
+    oid: &str,
+    lang: &str,
+    counts: OptionalFactCounts,
+) -> Result<()> {
+    let mut stmt = tx.prepare_cached(
+        "INSERT INTO blob_optional_fact_manifest(blob_oid, lang, fact_kind, row_count)
+         VALUES(?1, ?2, ?3, ?4)",
+    )?;
+    for descriptor in OPTIONAL_FACT_DESCRIPTORS {
+        let kind = descriptor.kind;
+        let count = counts.get(kind);
+        if count > 0 {
+            stmt.execute(params![oid, lang, kind as i64, usize_to_i64(count)?])?;
+        }
+    }
+    Ok(())
 }
 
 fn saturating_sum(values: impl IntoIterator<Item = usize>) -> usize {
@@ -3934,8 +4094,16 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
     let mut type_identifiers: Vec<_> = state.type_identifiers.iter().cloned().collect();
     type_identifiers.sort();
 
+    let optional_counts = optional_fact_counts(
+        cpp_template_metadata.len(),
+        ruby_dispatch_modes.len(),
+        scala_traits.len(),
+        scala_exports.len(),
+        materialization_records.len(),
+    );
     let logical_rows = saturating_sum([
         3,
+        optional_counts.nonzero_len(),
         units.len(),
         ranges.len(),
         signatures.len(),
@@ -4173,9 +4341,8 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
         "INSERT OR IGNORE INTO blob_meta(
            blob_oid, lang, contains_tests, content_package, stored_unit_count,
            range_count, signature_count, signature_metadata_count, supertype_count,
-           child_count, import_statement_count, import_count, type_identifier_count,
-           ruby_dispatch_count, scala_trait_count, cpp_template_metadata_count, is_complete
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 1)",
+           child_count, import_statement_count, import_count, type_identifier_count, is_complete
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1)",
         params![
             oid,
             lang,
@@ -4190,15 +4357,25 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
             usize_to_i64(blob.import_statements.len())?,
             usize_to_i64(blob.imports.len())?,
             usize_to_i64(blob.type_identifiers.len())?,
-            usize_to_i64(blob.ruby_dispatch_modes.len())?,
-            usize_to_i64(blob.scala_traits.len())?,
-            usize_to_i64(blob.cpp_template_metadata.len())?,
         ],
     )?;
+    insert_optional_fact_manifest(
+        tx,
+        oid,
+        lang,
+        optional_fact_counts(
+            blob.cpp_template_metadata.len(),
+            blob.ruby_dispatch_modes.len(),
+            blob.scala_traits.len(),
+            blob.scala_exports.len(),
+            blob.materialization_records.len(),
+        ),
+    )?;
+    let integrity_condition = PARSED_BLOB_INTEGRITY_CONDITION.as_str();
     let integrity_sql = format!(
         "SELECT 1 FROM blob_meta AS meta
          WHERE meta.blob_oid = ?1 AND meta.lang = ?2
-           AND {PARSED_BLOB_INTEGRITY_CONDITION}"
+           AND {integrity_condition}"
     );
     let complete = tx
         .query_row(&integrity_sql, params![oid, lang], |_| Ok(()))
@@ -4304,20 +4481,26 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
     )?;
     let scala_trait_count = insert_scala_traits(tx, &oid, lang, &unit_keys, &state.scala_traits)?;
     let (import_statement_count, import_count) = insert_imports(tx, &oid, lang, state)?;
-    insert_scala_exports(tx, &oid, lang, &unit_keys, &state.scala_exports)?;
-    insert_materialization_records(tx, &oid, lang, &unit_keys, &state.materialization_records)?;
+    let scala_export_count =
+        insert_scala_exports(tx, &oid, lang, &unit_keys, &state.scala_exports)?;
+    let materialization_record_count =
+        insert_materialization_records(tx, &oid, lang, &unit_keys, &state.materialization_records)?;
     let side_counts = PersistedSideTableCounts {
         range_count,
         signature_count,
         signature_metadata_count,
-        cpp_template_metadata_count,
         supertype_count,
         child_count,
         import_statement_count,
         import_count,
         type_identifier_count: state.type_identifiers.len(),
-        ruby_dispatch_count,
-        scala_trait_count,
+        optional: optional_fact_counts(
+            cpp_template_metadata_count,
+            ruby_dispatch_count,
+            scala_trait_count,
+            scala_export_count,
+            materialization_record_count,
+        ),
     };
     insert_blob_meta(tx, &oid, lang, adapter, state, units.len(), side_counts)?;
     update_blob_payload_cost_tx(tx, &oid, lang)?;
@@ -4716,9 +4899,8 @@ fn insert_blob_meta<A: LanguageAdapter>(
         "INSERT OR IGNORE INTO blob_meta(
            blob_oid, lang, contains_tests, content_package, stored_unit_count,
            range_count, signature_count, signature_metadata_count, supertype_count,
-           child_count, import_statement_count, import_count, type_identifier_count,
-           ruby_dispatch_count, scala_trait_count, cpp_template_metadata_count, is_complete
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+           child_count, import_statement_count, import_count, type_identifier_count, is_complete
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             oid,
             lang,
@@ -4733,12 +4915,10 @@ fn insert_blob_meta<A: LanguageAdapter>(
             usize_to_i64(side_counts.import_statement_count)?,
             usize_to_i64(side_counts.import_count)?,
             usize_to_i64(side_counts.type_identifier_count)?,
-            usize_to_i64(side_counts.ruby_dispatch_count)?,
-            usize_to_i64(side_counts.scala_trait_count)?,
-            usize_to_i64(side_counts.cpp_template_metadata_count)?,
             1,
         ],
     )?;
+    insert_optional_fact_manifest(tx, oid, lang, side_counts.optional)?;
     let mut type_identifiers: Vec<_> = state.type_identifiers.iter().collect();
     type_identifiers.sort();
     let mut stmt = tx.prepare(
@@ -4808,9 +4988,8 @@ struct RawSideTableCounts {
     import_statement_count: i64,
     import_count: i64,
     type_identifier_count: i64,
-    ruby_dispatch_count: i64,
-    scala_trait_count: i64,
-    cpp_template_metadata_count: i64,
+    optional: [i64; OPTIONAL_FACT_DESCRIPTORS.len()],
+    unknown_optional_count: i64,
 }
 
 type BlobMetaRows = HashMap<String, BlobMetaRow>;
@@ -4902,6 +5081,8 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
         type_identifier_count: meta.type_identifiers.len(),
         ruby_dispatch_count: ruby_method_dispatch_modes.len(),
         scala_trait_count: scala_traits.len(),
+        scala_export_count: scala_exports.values().map(Vec::len).sum(),
+        materialization_record_count: materialization_records.len(),
     });
     if actual_counts != meta.side_counts {
         return Ok(None);
@@ -5129,6 +5310,8 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             type_identifier_count: meta.type_identifiers.len(),
             ruby_dispatch_count: ruby_method_dispatch_modes.len(),
             scala_trait_count: scala_traits.len(),
+            scala_export_count: scala_exports.values().map(Vec::len).sum(),
+            materialization_record_count: materialization_records.len(),
         });
         if actual_counts != meta.side_counts {
             continue;
@@ -5179,16 +5362,20 @@ fn read_blob_meta<A: LanguageAdapter>(
     file: &ProjectFile,
     source: &str,
 ) -> Result<Option<BlobMetaRow>> {
+    let optional_fact_projection = OPTIONAL_FACT_COUNT_PROJECTION.as_str();
     let row: Option<(i64, String, i64, RawSideTableCounts)> = conn
         .query_row(
             &format!(
                 "SELECT contains_tests, content_package, stored_unit_count,
                     range_count, signature_count, signature_metadata_count, supertype_count,
                     child_count, import_statement_count, import_count, type_identifier_count,
-                    ruby_dispatch_count, scala_trait_count, cpp_template_metadata_count
+                    {optional_fact_projection}
              FROM blob_meta AS meta
-             WHERE blob_oid = ?1 AND lang = ?2
-               AND {PARSED_BLOB_COMPLETE_CONDITION}"
+             LEFT JOIN blob_optional_fact_manifest AS manifest
+               ON manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang
+             WHERE meta.blob_oid = ?1 AND meta.lang = ?2
+               AND {PARSED_BLOB_COMPLETE_CONDITION}
+             GROUP BY meta.blob_oid, meta.lang"
             ),
             params![oid, lang],
             |row| {
@@ -5205,13 +5392,14 @@ fn read_blob_meta<A: LanguageAdapter>(
         return Ok(None);
     };
     let type_identifiers = read_type_identifiers(conn, oid, lang)?;
+    let side_counts = side_table_counts_from_raw(raw_side_counts)?;
     Ok(Some(BlobMetaRow {
         contains_tests: adapter.hydrate_contains_tests(contains_tests != 0, file, source),
         content_package: adapter.hydrate_content_qualifier(&content_package, file),
         raw_content_package: content_package,
         type_identifiers,
         stored_unit_count: i64_to_usize(stored_unit_count)?,
-        side_counts: side_table_counts_from_raw(raw_side_counts)?,
+        side_counts,
     }))
 }
 
@@ -5270,13 +5458,28 @@ fn raw_side_table_counts_from_row(
         import_statement_count: row.get(offset + 5)?,
         import_count: row.get(offset + 6)?,
         type_identifier_count: row.get(offset + 7)?,
-        ruby_dispatch_count: row.get(offset + 8)?,
-        scala_trait_count: row.get(offset + 9)?,
-        cpp_template_metadata_count: row.get(offset + 10)?,
+        optional: [
+            row.get(offset + 8)?,
+            row.get(offset + 9)?,
+            row.get(offset + 10)?,
+            row.get(offset + 11)?,
+            row.get(offset + 12)?,
+        ],
+        unknown_optional_count: row.get(offset + 13)?,
     })
 }
 
 fn side_table_counts_from_raw(raw: RawSideTableCounts) -> Result<PersistedSideTableCounts> {
+    if raw.unknown_optional_count != 0 {
+        return Err(StoreError::new(format!(
+            "manifest contains {} unknown optional analyzer fact kinds",
+            raw.unknown_optional_count
+        )));
+    }
+    let mut optional = OptionalFactCounts::default();
+    for (descriptor, count) in OPTIONAL_FACT_DESCRIPTORS.into_iter().zip(raw.optional) {
+        optional.set(descriptor.kind, i64_to_usize(count)?);
+    }
     Ok(PersistedSideTableCounts {
         range_count: i64_to_usize(raw.range_count)?,
         signature_count: i64_to_usize(raw.signature_count)?,
@@ -5286,9 +5489,7 @@ fn side_table_counts_from_raw(raw: RawSideTableCounts) -> Result<PersistedSideTa
         import_statement_count: i64_to_usize(raw.import_statement_count)?,
         import_count: i64_to_usize(raw.import_count)?,
         type_identifier_count: i64_to_usize(raw.type_identifier_count)?,
-        ruby_dispatch_count: i64_to_usize(raw.ruby_dispatch_count)?,
-        scala_trait_count: i64_to_usize(raw.scala_trait_count)?,
-        cpp_template_metadata_count: i64_to_usize(raw.cpp_template_metadata_count)?,
+        optional,
     })
 }
 
@@ -5340,6 +5541,7 @@ fn chunk_placeholders(chunk: &[String]) -> String {
 
 fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result<BlobMetaRows> {
     let mut out = HashMap::default();
+    let optional_fact_projection = OPTIONAL_FACT_COUNT_PROJECTION.as_str();
     for chunk in oids.chunks(900) {
         if chunk.is_empty() {
             continue;
@@ -5349,10 +5551,13 @@ fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result
             "SELECT meta.blob_oid, contains_tests, content_package, stored_unit_count,
                     range_count, signature_count, signature_metadata_count, supertype_count,
                     child_count, import_statement_count, import_count, type_identifier_count,
-                    ruby_dispatch_count, scala_trait_count, cpp_template_metadata_count
+                    {optional_fact_projection}
              FROM blob_meta AS meta
+             LEFT JOIN blob_optional_fact_manifest AS manifest
+               ON manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang
              WHERE meta.lang = ? AND meta.blob_oid IN ({placeholders})
                AND {PARSED_BLOB_COMPLETE_CONDITION}
+             GROUP BY meta.blob_oid, meta.lang
              ORDER BY meta.blob_oid"
         );
         let params = chunk_params(lang, chunk);
@@ -6011,6 +6216,8 @@ struct HydratedSideTableParts<'a> {
     type_identifier_count: usize,
     ruby_dispatch_count: usize,
     scala_trait_count: usize,
+    scala_export_count: usize,
+    materialization_record_count: usize,
 }
 
 fn side_table_counts_from_hydrated_parts(
@@ -6020,14 +6227,18 @@ fn side_table_counts_from_hydrated_parts(
         range_count: count_vec_entries(parts.ranges),
         signature_count: count_vec_entries(parts.signatures),
         signature_metadata_count: count_vec_entries(parts.signature_metadata),
-        cpp_template_metadata_count: parts.cpp_template_metadata.len(),
         supertype_count: count_vec_entries(parts.raw_supertypes),
         child_count: count_vec_entries(parts.children),
         import_statement_count: parts.import_statement_count,
         import_count: parts.import_count,
         type_identifier_count: parts.type_identifier_count,
-        ruby_dispatch_count: parts.ruby_dispatch_count,
-        scala_trait_count: parts.scala_trait_count,
+        optional: optional_fact_counts(
+            parts.cpp_template_metadata.len(),
+            parts.ruby_dispatch_count,
+            parts.scala_trait_count,
+            parts.scala_export_count,
+            parts.materialization_record_count,
+        ),
     }
 }
 
@@ -7458,10 +7669,11 @@ fn current_generation_conn(conn: &Connection, lang: &str) -> Result<GenerationId
 }
 
 fn contains_parsed_blob_conn(conn: &Connection, oid: Oid, lang: &str) -> Result<bool> {
+    let integrity_condition = PARSED_BLOB_INTEGRITY_CONDITION.as_str();
     let sql = format!(
         "SELECT 1 FROM blob_meta AS meta
          WHERE meta.blob_oid = ?1 AND meta.lang = ?2
-           AND {PARSED_BLOB_INTEGRITY_CONDITION}
+           AND {integrity_condition}
          LIMIT 1"
     );
     Ok(conn
@@ -7560,12 +7772,12 @@ fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
            CASE WHEN blob.blob_oid IS NULL THEN 0
              WHEN meta.blob_oid IS NULL THEN 1
              ELSE 2 + meta.stored_unit_count + meta.range_count + meta.signature_count
-               + meta.signature_metadata_count + meta.cpp_template_metadata_count
+               + meta.signature_metadata_count
                + meta.supertype_count + meta.child_count
                + meta.import_statement_count + meta.import_count + meta.type_identifier_count
-               + meta.ruby_dispatch_count + meta.scala_trait_count
-               + (SELECT COUNT(*) FROM scala_exports AS exports
-                  WHERE exports.blob_oid = meta.blob_oid AND exports.lang = meta.lang)
+               + (SELECT COALESCE(SUM(row_count), 0) + COUNT(*)
+                  FROM blob_optional_fact_manifest AS manifest
+                  WHERE manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang)
                + (SELECT COUNT(*) FROM structural_facts_snapshots AS snapshots
                   WHERE snapshots.blob_oid = meta.blob_oid AND snapshots.lang = meta.lang)
                + CASE WHEN costs.blob_oid IS NULL THEN 0 ELSE 1 END END,
@@ -7599,12 +7811,12 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
     "SELECT
        1 + CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
          1 + meta.stored_unit_count + meta.range_count + meta.signature_count
-           + meta.signature_metadata_count + meta.cpp_template_metadata_count
+           + meta.signature_metadata_count
            + meta.supertype_count + meta.child_count
            + meta.import_statement_count + meta.import_count + meta.type_identifier_count
-           + meta.ruby_dispatch_count + meta.scala_trait_count
-           + (SELECT COUNT(*) FROM scala_exports AS exports
-              WHERE exports.blob_oid = meta.blob_oid AND exports.lang = meta.lang)
+           + (SELECT COALESCE(SUM(row_count), 0) + COUNT(*)
+              FROM blob_optional_fact_manifest AS manifest
+              WHERE manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang)
            + (SELECT COUNT(*) FROM structural_facts_snapshots AS snapshots
               WHERE snapshots.blob_oid = meta.blob_oid AND snapshots.lang = meta.lang) END,
        CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
@@ -7631,6 +7843,8 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
            + COALESCE((SELECT SUM(length(info)) FROM import_details
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(info)) FROM scala_exports
+               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+           + COALESCE((SELECT SUM(length(payload)) FROM materialization_records
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(CAST(type_identifier AS BLOB))) FROM type_identifiers
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
@@ -7679,7 +7893,12 @@ fn parsed_blob_keys_conn(
     conn: &Connection,
     entries: &[(Oid, String)],
 ) -> Result<HashSet<(Oid, String)>> {
-    parsed_blob_keys_conn_with_condition(conn, entries, "", PARSED_BLOB_INTEGRITY_CONDITION)
+    parsed_blob_keys_conn_with_condition(
+        conn,
+        entries,
+        "",
+        PARSED_BLOB_INTEGRITY_CONDITION.as_str(),
+    )
 }
 
 fn missing_published_parsed_blob_keys_conn(
@@ -7814,11 +8033,14 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
             "SELECT blobs.blob_oid, blobs.lang,
                     1 + CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
                       1 + meta.stored_unit_count + meta.range_count + meta.signature_count
-                        + meta.signature_metadata_count + meta.cpp_template_metadata_count
+                        + meta.signature_metadata_count
                         + meta.supertype_count + meta.child_count
                         + meta.import_statement_count + meta.import_count
-                        + meta.type_identifier_count + meta.ruby_dispatch_count
-                        + meta.scala_trait_count
+                        + meta.type_identifier_count
+                        + (SELECT COALESCE(SUM(row_count), 0) + COUNT(*)
+                           FROM blob_optional_fact_manifest AS manifest
+                           WHERE manifest.blob_oid = meta.blob_oid
+                             AND manifest.lang = meta.lang)
                         + (SELECT COUNT(*) FROM structural_facts_snapshots AS snapshots
                            WHERE snapshots.blob_oid = meta.blob_oid
                              AND snapshots.lang = meta.lang)
@@ -7910,14 +8132,34 @@ fn serialize_blob<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
 
 const FQ_SEGMENTS_MAGIC: &[u8; 4] = b"FQ2\0";
 const FQ_SEGMENTS_FULL: u8 = 0;
-const FQ_SEGMENTS_PATH_TAIL: u8 = 1;
+const FQ_SEGMENTS_OWN_MODULE: u8 = 1;
+const FQ_SEGMENTS_CRATE_ROOT: u8 = 2;
 const FQ_SEGMENTS_HEADER_LEN: usize = 9;
 
-/// Persist one structured declaration identity. Content-derived packages are
-/// stored in full. When a package depends on the live path, only the
-/// content-stable declaration tail is stored so one content-addressed blob can
-/// still be mounted at multiple paths; the adapter recreates that prefix from
-/// the live `ProjectFile` without parsing a rendered name.
+/// Pack the mode-dependent u32 header field for an anchored row.
+///
+/// Mode `FULL` reads that field as an absolute package segment count. The
+/// anchored modes read it as `{u16 boundary_in_tail, u8 pop, u8 reserved}`,
+/// little endian. Rows written before anchors existed always stored a literal
+/// `0`, which decodes as `boundary_in_tail = 0, pop = 0` — exactly the
+/// semantics they were written with, so they hydrate unchanged and their
+/// languages need no epoch bump.
+fn pack_anchored_header(boundary_in_tail: u16, pop: u8) -> u32 {
+    u32::from(boundary_in_tail) | (u32::from(pop) << 16)
+}
+
+fn unpack_anchored_header(field: u32) -> (u16, u8) {
+    ((field & 0xffff) as u16, ((field >> 16) & 0xff) as u8)
+}
+
+/// Persist one structured declaration identity as an anchor plus a
+/// content-stable tail.
+///
+/// A unit whose package is intrinsic to the blob (no effective anchor) is
+/// stored in full. Otherwise only the tail past the anchor's resolved prefix is
+/// stored, so one content-addressed blob can be mounted at several paths and
+/// still hydrate with per-mount package names; the adapter recreates the prefix
+/// from the live `ProjectFile` without parsing a rendered name.
 fn encode_unit_fq_segments<A: LanguageAdapter>(
     adapter: &A,
     unit: &CodeUnit,
@@ -7928,36 +8170,64 @@ fn encode_unit_fq_segments<A: LanguageAdapter>(
         return None;
     }
     let interner = segment_interner();
-    let path_prefix = adapter
-        .code_unit_package_is_path_derived(unit, content_qualifier)
-        .then(|| {
-            adapter
-                .path_derived_package_fq(content_qualifier, unit.source())
-                .expect("path-derived CodeUnit package requires an adapter prefix")
+    let explicit_anchor = unit.package_anchor();
+    let anchored = explicit_anchor
+        .or_else(|| adapter.default_package_anchor())
+        .and_then(|anchor| {
+            let prefix =
+                adapter.resolve_package_anchor(anchor, content_qualifier, unit.source())?;
+            let package = unit.package_fq();
+            // An extractor-supplied anchor names where a package *starts*, so
+            // the tail may carry content-written package segments. The adapter
+            // default only claims that a unit sits in its own package, so it
+            // applies only when the resolved prefix IS that package — otherwise
+            // a genuinely foreign package (`impl Trait for serde::Value`) would
+            // be re-anchored to the mount path whenever the file's own package
+            // happens to be empty and therefore a trivial prefix of it.
+            let placed = if explicit_anchor.is_some() {
+                package.starts_with(&prefix)
+            } else {
+                package == prefix
+            };
+            if !placed {
+                return None;
+            }
+            let boundary_in_tail = u16::try_from(package.len() - prefix.len()).ok()?;
+            let (mode, pop) = match anchor {
+                PackageAnchor::OwnModule { pop } => (FQ_SEGMENTS_OWN_MODULE, pop),
+                PackageAnchor::CrateRoot => (FQ_SEGMENTS_CRATE_ROOT, 0),
+            };
+            Some((
+                mode,
+                pack_anchored_header(boundary_in_tail, pop),
+                fq.suffix_from(prefix.len()),
+            ))
         });
-    let (mode, package_segment_count, persisted_fq) = match path_prefix {
-        Some(prefix) => {
-            assert_eq!(
-                prefix,
-                unit.package_fq(),
-                "path-derived package prefix must equal the CodeUnit's structured prefix \
-                 (content_qualifier={content_qualifier:?}, unit={unit:?})"
+    let (mode, header_field, persisted_fq) = match anchored {
+        Some(anchored) => anchored,
+        None => {
+            // Falling back to a full name is a safety valve, not a plan: an
+            // extractor that recorded an anchor asserted the unit can be placed
+            // from its live path, so failing to place it is an extractor bug.
+            // An adapter DEFAULT anchor legitimately fails to apply — a unit
+            // whose package is foreign to its own file keeps its complete name
+            // — so that path stays silent.
+            debug_assert!(
+                explicit_anchor.is_none(),
+                "an explicitly anchored CodeUnit must resolve to a prefix of its package \
+                 (anchor={explicit_anchor:?}, content_qualifier={content_qualifier:?}, \
+                 unit={unit:?})"
             );
-            (
-                FQ_SEGMENTS_PATH_TAIL,
-                0usize,
-                fq.suffix_from(unit.package_segment_count()),
-            )
+            let package_segment_count = u32::try_from(unit.package_segment_count())
+                .expect("CodeUnit package segment count must fit in u32");
+            (FQ_SEGMENTS_FULL, package_segment_count, fq.clone())
         }
-        None => (FQ_SEGMENTS_FULL, unit.package_segment_count(), fq.clone()),
     };
-    let package_segment_count = u32::try_from(package_segment_count)
-        .expect("CodeUnit package segment count must fit in u32");
     let encoded_segments = persisted_fq.encode_segments(interner);
     let mut encoded = Vec::with_capacity(FQ_SEGMENTS_HEADER_LEN + encoded_segments.len());
     encoded.extend_from_slice(FQ_SEGMENTS_MAGIC);
     encoded.push(mode);
-    encoded.extend_from_slice(&package_segment_count.to_le_bytes());
+    encoded.extend_from_slice(&header_field.to_le_bytes());
     encoded.extend_from_slice(&encoded_segments);
     Some(encoded)
 }
@@ -7979,34 +8249,47 @@ pub(crate) fn hydrate_unit_fq<A: LanguageAdapter>(
         ));
     }
     let mode = bytes[4];
-    let stored_package_segment_count = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+    let header_field = u32::from_le_bytes(bytes[5..9].try_into().unwrap());
     let stored_fq = FqName::decode_segments(&bytes[FQ_SEGMENTS_HEADER_LEN..], interner)
         .map_err(|err| StoreError::new(format!("analyzer store fq segment decode error: {err}")))?;
-    match mode {
+    let anchor = match mode {
         FQ_SEGMENTS_FULL => {
+            let stored_package_segment_count = header_field as usize;
             if stored_package_segment_count >= stored_fq.len() {
                 return Err(StoreError::new(
                     "analyzer store FqName package boundary leaves no declaration tail",
                 ));
             }
-            Ok((stored_fq, stored_package_segment_count))
+            return Ok((stored_fq, stored_package_segment_count));
         }
-        FQ_SEGMENTS_PATH_TAIL => {
-            let mut prefix = adapter
-                .path_derived_package_fq(content_qualifier, file)
-                .ok_or_else(|| {
-                    StoreError::new(
-                        "analyzer adapter did not provide the persisted path-derived package prefix",
-                    )
-                })?;
-            let package_segment_count = prefix.len();
-            prefix.extend_from(&stored_fq);
-            Ok((prefix, package_segment_count))
+        // The reserved header byte is ignored: a writer that starts using it
+        // must take a new mode so old readers cannot silently misread it.
+        FQ_SEGMENTS_OWN_MODULE => PackageAnchor::OwnModule {
+            pop: unpack_anchored_header(header_field).1,
+        },
+        FQ_SEGMENTS_CRATE_ROOT => PackageAnchor::CrateRoot,
+        _ => {
+            return Err(StoreError::new(format!(
+                "analyzer store FqName has unknown mode {mode}"
+            )));
         }
-        _ => Err(StoreError::new(format!(
-            "analyzer store FqName has unknown mode {mode}"
-        ))),
+    };
+    let boundary_in_tail = usize::from(unpack_anchored_header(header_field).0);
+    let mut prefix = adapter
+        .resolve_package_anchor(anchor, content_qualifier, file)
+        .ok_or_else(|| {
+            StoreError::new(
+                "analyzer adapter did not provide the persisted anchored package prefix",
+            )
+        })?;
+    let package_segment_count = prefix.len() + boundary_in_tail;
+    prefix.extend_from(&stored_fq);
+    if package_segment_count >= prefix.len() {
+        return Err(StoreError::new(
+            "analyzer store FqName package boundary leaves no declaration tail",
+        ));
     }
+    Ok((prefix, package_segment_count))
 }
 
 fn serialize_signature_metadata_blob(value: &SignatureMetadata) -> Result<Vec<u8>> {
@@ -9803,6 +10086,85 @@ mod tests {
     }
 
     #[test]
+    fn unknown_optional_fact_kind_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "pkg/unknown.py", "class Unknown:\n    pass\n");
+        let source = file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(
+                oid,
+                "python",
+                &PythonAdapter,
+                &parse_state(&PythonAdapter, &file),
+            )
+            .unwrap();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO blob_optional_fact_manifest(
+                   blob_oid, lang, fact_kind, row_count
+                 ) VALUES(?1, 'python', 99, 1)",
+                [oid.to_string()],
+            )
+            .unwrap();
+        }
+
+        assert!(!store.contains_parsed_blob(oid, "python").unwrap());
+        let error = store
+            .hydrate_file_state(oid, "python", &PythonAdapter, &file)
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown optional analyzer fact"));
+    }
+
+    #[test]
+    fn missing_optional_fact_manifest_row_is_treated_as_incomplete() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "include/missing.h",
+            "template <typename T, typename U = T*> class Missing {};\n",
+        );
+        let source = file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "cpp", &CppAdapter, &parse_state(&CppAdapter, &file))
+            .unwrap();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            let deleted = conn
+                .execute(
+                    "DELETE FROM blob_optional_fact_manifest
+                     WHERE blob_oid = ?1 AND lang = 'cpp' AND fact_kind = 1",
+                    [oid.to_string()],
+                )
+                .unwrap();
+            assert_eq!(deleted, 1);
+        }
+
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert!(
+            store
+                .hydrate_file_state(oid, "cpp", &CppAdapter, &file)
+                .unwrap()
+                .is_none()
+        );
+        let hydrated = store
+            .hydrate_file_states(
+                &[(file.clone(), oid)],
+                "cpp",
+                &CppAdapter,
+                &HashMap::from_iter([(file.clone(), source)]),
+            )
+            .unwrap();
+        assert!(!hydrated.contains_key(&file));
+    }
+
+    #[test]
     fn metadata_side_table_count_mismatches_are_treated_as_incomplete() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path();
@@ -9824,12 +10186,17 @@ mod tests {
         let scala_file = write_file(
             root,
             "src/main/scala/app/Corrupt.scala",
-            "package app\ntrait Runnable\nclass Worker extends Runnable\n",
+            "package app\ntrait Runnable\nclass Worker extends Runnable\nobject Core { def run(): Int = 1 }\nobject Facade { export Core.{run as execute, *} }\n",
         );
         let cpp_file = write_file(
             root,
             "include/corrupt.h",
             "template <typename T, typename U = T*> class Corrupt {};\ntemplate <typename T> class Corrupt<T, T*> {};\n",
+        );
+        let typescript_file = write_file(
+            root,
+            "src/corrupt.ts",
+            "export interface Shape { area(): number }\nexport class Corrupt implements Shape { area(): number { return 1; } }\n",
         );
 
         for table in [
@@ -9852,11 +10219,14 @@ mod tests {
         for table in ["unit_supertypes", "type_identifiers"] {
             assert_deleting_side_table_marks_incomplete(&JavaAdapter, "java", &java_file, table);
         }
+        for table in ["scala_traits", "scala_exports"] {
+            assert_deleting_side_table_marks_incomplete(&ScalaAdapter, "scala", &scala_file, table);
+        }
         assert_deleting_side_table_marks_incomplete(
-            &ScalaAdapter,
-            "scala",
-            &scala_file,
-            "scala_traits",
+            &TypescriptAdapter,
+            "typescript",
+            &typescript_file,
+            "materialization_records",
         );
         assert_deleting_side_table_marks_incomplete(
             &CppAdapter,
@@ -10163,6 +10533,50 @@ mod tests {
         let oid = oid_for(state.source.as_bytes());
         let store = AnalyzerStore::open_in_memory().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_conditional_alias_physical_ranges();
+        let prior_generation = store
+            .ensure_language_epoch_value("cpp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .unwrap(),
+            vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    #[test]
+    fn cpp_macro_argument_typedef_declarator_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "internal/cgen/base/token-public.h",
+            "#define WUFFS_BASE__SLICE(T) struct { T* ptr; size_t len; }\n\
+             typedef struct wuffs_base__token__struct {\n\
+               unsigned long long repr;\n\
+             } wuffs_base__token;\n\
+             typedef WUFFS_BASE__SLICE(wuffs_base__token) wuffs_base__slice_token;\n",
+        );
+        let state = Arc::new(parse_state(&CppAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_epoch = epoch::cpp_epoch_before_macro_argument_typedef_declarator();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
             .unwrap();
@@ -11533,7 +11947,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_ruby_dispatch_and_scala_trait_side_tables() {
+    fn round_trips_optional_fact_manifest_languages_and_unrelated_language() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path();
         let ruby_file = write_file(
@@ -11546,9 +11960,39 @@ mod tests {
             "src/main/scala/app/Demo.scala",
             "package app\ntrait Runnable { def run(first: Int = 0)(rest: String*): Int }\nclass Worker extends Runnable\nobject Core { def run(): Int = 1 }\nobject Facade { export Core.{run as execute, *} }\n",
         );
+        let cpp_file = write_file(
+            root,
+            "include/demo.h",
+            "template <typename T, typename U = T*> class Demo {};\ntemplate <typename T> class Demo<T, T*> {};\n",
+        );
+        let python_file = write_file(root, "pkg/demo.py", "class Demo:\n    pass\n");
 
         assert_round_trip(&RubyAdapter, "ruby", &ruby_file);
         assert_round_trip(&ScalaAdapter, "scala", &scala_file);
+        assert_round_trip(&CppAdapter, "cpp", &cpp_file);
+        assert_round_trip(&PythonAdapter, "python", &python_file);
+
+        let source = python_file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(
+                oid,
+                "python",
+                &PythonAdapter,
+                &parse_state(&PythonAdapter, &python_file),
+            )
+            .unwrap();
+        let conn = store.conn.lock().unwrap();
+        let manifest_rows: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blob_optional_fact_manifest
+                 WHERE blob_oid = ?1 AND lang = 'python'",
+                [oid.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(manifest_rows, 0);
     }
 
     #[test]
@@ -11570,10 +12014,16 @@ mod tests {
             "src/demo.test.ts",
             "import {Thing} from './thing';\nexport class Demo { run(value: Thing): Thing { return value; } }\n",
         );
+        let cpp_file = write_file(
+            root,
+            "include/demo.h",
+            "template <typename T, typename U = T*> class Demo {};\ntemplate <typename T> class Demo<T, T*> {};\n",
+        );
 
         assert_legacy_prepared_parity(&RubyAdapter, "ruby", &ruby_file);
         assert_legacy_prepared_parity(&ScalaAdapter, "scala", &scala_file);
         assert_legacy_prepared_parity(&TypescriptAdapter, "typescript", &ts_file);
+        assert_legacy_prepared_parity(&CppAdapter, "cpp", &cpp_file);
     }
 
     #[test]
@@ -11625,6 +12075,380 @@ mod tests {
                 .iter()
                 .any(|unit| unit.fq_name() == "pkg_b.sub.mod.Shared")
         );
+    }
+
+    /// The persisted row for the unit whose rendered name is `fq_name`, plus
+    /// the mode byte, the anchored header's `(boundary_in_tail, pop)`, and the
+    /// content-stable tail the row actually stores.
+    fn encoded_unit_row<A: LanguageAdapter>(
+        adapter: &A,
+        state: &FileState,
+        fq_name: &str,
+    ) -> (u8, u16, u8, String) {
+        let unit = state
+            .declarations
+            .iter()
+            .find(|unit| unit.fq_name() == fq_name)
+            .unwrap_or_else(|| panic!("fixture must declare {fq_name}: {:?}", state.declarations));
+        let content_qualifier = adapter.storage_content_qualifier(unit, &state.content_qualifier);
+        let encoded = encode_unit_fq_segments(adapter, unit, &content_qualifier).unwrap();
+        let (boundary_in_tail, pop) =
+            unpack_anchored_header(u32::from_le_bytes(encoded[5..9].try_into().unwrap()));
+        let interner = segment_interner();
+        let tail = FqName::decode_segments(&encoded[FQ_SEGMENTS_HEADER_LEN..], interner)
+            .unwrap()
+            .display(interner);
+        (encoded[4], boundary_in_tail, pop, tail)
+    }
+
+    /// A crate-root-qualified impl owner (`use crate::JsError; impl T for
+    /// JsError`) has a package that is neither the file's own nor foreign: it
+    /// is the crate root. Persisting it in full would bake the extracting
+    /// mount's directory names into a content-addressed row, and treating it as
+    /// the file's own package would be wrong wherever those differ. It must
+    /// persist as a crate-root anchor plus a package-free tail, and hydrate
+    /// with each mount's own crate root.
+    #[test]
+    fn identical_rust_crate_impl_blob_hydrates_with_live_crate_roots() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let _ = write_file(root, "src/lib.rs", "pub struct JsError;\n");
+        let _ = write_file(root, "crates/webidl/src/lib.rs", "pub struct JsError;\n");
+        let content = "use crate::JsError;\n\npub trait WasmDescribe {\n    fn describe();\n}\n\nimpl WasmDescribe for JsError {\n    fn describe() {}\n}\n";
+        let file_a = write_file(root, "src/describe.rs", content);
+        let file_b = write_file(root, "crates/webidl/src/describe.rs", content);
+        let oid = oid_for(content.as_bytes());
+        let adapter = RustAdapter;
+        let state = parse_state(&adapter, &file_a);
+
+        let (mode, boundary_in_tail, pop, tail) =
+            encoded_unit_row(&adapter, &state, "JsError.describe");
+        assert_eq!(mode, FQ_SEGMENTS_CRATE_ROOT);
+        assert_eq!((boundary_in_tail, pop), (0, 0));
+        assert_eq!(tail, "JsError.describe");
+
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .unwrap();
+        let hydrated_a = store
+            .hydrate_file_state(oid, "rust", &adapter, &file_a)
+            .unwrap()
+            .unwrap();
+        let hydrated_b = store
+            .hydrate_file_state(oid, "rust", &adapter, &file_b)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            hydrated_a
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "JsError.describe")
+        );
+        assert!(
+            hydrated_b
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "crates.webidl.src.JsError.describe"),
+            "{:?}",
+            hydrated_b.declarations
+        );
+    }
+
+    /// The same impl-bearing blob mounted at two directory depths must hydrate
+    /// with per-mount package prefixes: an own-module impl stores only the
+    /// declaration tail, never the directory names it was extracted under.
+    #[test]
+    fn identical_rust_impl_blob_hydrates_with_live_module_packages() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let content = "pub struct Client;\n\nimpl Client {\n    pub fn connect(&self) {}\n}\n";
+        let file_a = write_file(root, "alpha/src/service.rs", content);
+        let file_b = write_file(root, "beta/nested/src/service.rs", content);
+        let oid = oid_for(content.as_bytes());
+        let adapter = RustAdapter;
+        let state = parse_state(&adapter, &file_a);
+
+        let (mode, boundary_in_tail, pop, tail) =
+            encoded_unit_row(&adapter, &state, "alpha.src.service.Client.connect");
+        assert_eq!(mode, FQ_SEGMENTS_OWN_MODULE);
+        assert_eq!((boundary_in_tail, pop), (0, 0));
+        assert_eq!(tail, "Client.connect");
+
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .unwrap();
+        let hydrated_a = store
+            .hydrate_file_state(oid, "rust", &adapter, &file_a)
+            .unwrap()
+            .unwrap();
+        let hydrated_b = store
+            .hydrate_file_state(oid, "rust", &adapter, &file_b)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            hydrated_a
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "alpha.src.service.Client.connect")
+        );
+        assert!(
+            hydrated_b
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "beta.nested.src.service.Client.connect"),
+            "{:?}",
+            hydrated_b.declarations
+        );
+    }
+
+    /// `super` pops the LEXICAL package, which inside an inline `mod` starts
+    /// with a content-written component. Only the pops that survive past those
+    /// components cross the file-package boundary, so this owner resolves back
+    /// to the file's own module with an effective pop of zero. Counting the
+    /// `super` naively would anchor one level up and push the file's
+    /// path-derived final component (`b`) into the content-addressed tail.
+    #[test]
+    fn inline_module_super_impl_owner_persists_no_path_derived_segments() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let content = "mod m {\n    use super::T;\n\n    pub trait X {\n        fn f();\n    }\n\n    impl X for T {\n        fn f() {}\n    }\n}\n";
+        let file = write_file(root, "src/a/b.rs", content);
+        let adapter = RustAdapter;
+        let state = parse_state(&adapter, &file);
+
+        let (mode, boundary_in_tail, pop, tail) = encoded_unit_row(&adapter, &state, "a.b.T.f");
+        assert_eq!(mode, FQ_SEGMENTS_OWN_MODULE);
+        assert_eq!((boundary_in_tail, pop), (0, 0));
+        assert_eq!(tail, "T.f");
+    }
+
+    /// An import and the `impl` it feeds can sit in different lexical scopes: a
+    /// file-level `use super::T` resolves against the file's package while an
+    /// `impl` inside `mod m` resolves against `<file>.m`. The anchor is derived
+    /// from the package the owner actually ends up with, so the two scopes
+    /// disagreeing cannot produce an anchor that fails to place its own package
+    /// (the debug assertions this suite runs under would abort if it did).
+    #[test]
+    fn file_level_import_feeding_an_inline_module_impl_stays_placeable() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let content = "use super::T;\n\nmod m {\n    pub trait X {\n        fn f();\n    }\n\n    impl X for T {\n        fn f() {}\n    }\n}\n";
+        let file_a = write_file(root, "src/a/b.rs", content);
+        let file_b = write_file(root, "crates/z/src/a/b.rs", content);
+        let oid = oid_for(content.as_bytes());
+        let adapter = RustAdapter;
+        let state = parse_state(&adapter, &file_a);
+
+        // The file-level binding is not in scope inside `mod m` (the module
+        // body gets its own binder), so this owner resolves as a bare local
+        // name under the inline module and keeps `m` in the content tail.
+        let (mode, boundary_in_tail, pop, tail) = encoded_unit_row(&adapter, &state, "a.b.m.T.f");
+        assert_eq!(mode, FQ_SEGMENTS_OWN_MODULE);
+        assert_eq!((boundary_in_tail, pop), (0, 0));
+        assert_eq!(tail, "m.T.f");
+
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .unwrap();
+        let hydrated_b = store
+            .hydrate_file_state(oid, "rust", &adapter, &file_b)
+            .unwrap()
+            .unwrap();
+        assert!(
+            hydrated_b
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "crates.z.src.a.b.m.T.f"),
+            "{:?}",
+            hydrated_b.declarations
+        );
+    }
+
+    /// `impl crate::foo::Bar` names a module below the crate root, so the
+    /// crate-root anchor leaves a source-written `foo` package segment inside
+    /// the persisted tail. The package boundary is one segment past the anchor,
+    /// and that offset must survive the round trip at a mount whose crate root
+    /// has a different depth.
+    #[test]
+    fn crate_rooted_module_impl_owner_persists_a_package_segment_in_its_tail() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let _ = write_file(root, "crates/webidl/src/lib.rs", "pub mod foo;\n");
+        let _ = write_file(root, "src/lib.rs", "pub mod foo;\n");
+        let content = "use crate::foo::Bar;\n\npub trait X {\n    fn f();\n}\n\nimpl X for Bar {\n    fn f() {}\n}\n";
+        let file_a = write_file(root, "crates/webidl/src/generator.rs", content);
+        let file_b = write_file(root, "src/generator.rs", content);
+        let oid = oid_for(content.as_bytes());
+        let adapter = RustAdapter;
+        let state = parse_state(&adapter, &file_a);
+
+        let (mode, boundary_in_tail, pop, tail) =
+            encoded_unit_row(&adapter, &state, "crates.webidl.src.foo.Bar.f");
+        assert_eq!(mode, FQ_SEGMENTS_CRATE_ROOT);
+        assert_eq!((boundary_in_tail, pop), (1, 0));
+        assert_eq!(tail, "foo.Bar.f");
+
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .unwrap();
+        let hydrated_b = store
+            .hydrate_file_state(oid, "rust", &adapter, &file_b)
+            .unwrap()
+            .unwrap();
+        let member = hydrated_b
+            .declarations
+            .iter()
+            .find(|unit| unit.fq_name() == "foo.Bar.f")
+            .unwrap_or_else(|| panic!("{:?}", hydrated_b.declarations));
+        assert_eq!(member.package_name(), "foo");
+    }
+
+    /// A file-level `use super::T` genuinely crosses the file-package boundary,
+    /// so the owner anchors one module above the file and hydrates against the
+    /// live mount's parent package rather than the extraction-time one.
+    #[test]
+    fn cross_file_super_impl_owner_persists_a_popped_own_module_anchor() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let content =
+            "use super::T;\n\npub trait X {\n    fn f();\n}\n\nimpl X for T {\n    fn f() {}\n}\n";
+        let file_a = write_file(root, "src/a/b.rs", content);
+        let file_b = write_file(root, "crates/z/src/a/b.rs", content);
+        let oid = oid_for(content.as_bytes());
+        let adapter = RustAdapter;
+        let state = parse_state(&adapter, &file_a);
+
+        let (mode, boundary_in_tail, pop, tail) = encoded_unit_row(&adapter, &state, "a.T.f");
+        assert_eq!(mode, FQ_SEGMENTS_OWN_MODULE);
+        assert_eq!((boundary_in_tail, pop), (0, 1));
+        assert_eq!(tail, "T.f");
+
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .unwrap();
+        let hydrated_b = store
+            .hydrate_file_state(oid, "rust", &adapter, &file_b)
+            .unwrap()
+            .unwrap();
+        assert!(
+            hydrated_b
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "crates.z.src.a.T.f"),
+            "{:?}",
+            hydrated_b.declarations
+        );
+    }
+
+    /// An impl owner rooted in another crate has no placeable anchor: its
+    /// package is not derived from this file's path at any depth. It keeps its
+    /// complete persisted name, and because the anchor came from the adapter
+    /// default rather than the extractor, that fallback is silent (a debug
+    /// build would abort here if it were treated as an extractor bug).
+    #[test]
+    fn foreign_crate_impl_owner_persists_its_complete_name() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let content = "pub trait Local {\n    fn f();\n}\n\nimpl Local for serde::Value {\n    fn f() {}\n}\n";
+        let file = write_file(root, "src/model.rs", content);
+        let oid = oid_for(content.as_bytes());
+        let adapter = RustAdapter;
+        let state = parse_state(&adapter, &file);
+
+        let (mode, _, _, tail) = encoded_unit_row(&adapter, &state, "serde.Value.f");
+        assert_eq!(mode, FQ_SEGMENTS_FULL);
+        assert_eq!(tail, "serde.Value.f");
+
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .unwrap();
+        let hydrated = store
+            .hydrate_file_state(oid, "rust", &adapter, &file)
+            .unwrap()
+            .unwrap();
+        assert!(
+            hydrated
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "serde.Value.f"),
+            "{:?}",
+            hydrated.declarations
+        );
+    }
+
+    /// The anchored encoding changes only Rust rows. Rust blobs cached under
+    /// the pre-change salt must be discarded, and a Go blob cached alongside
+    /// them must stay warm through that cutover.
+    #[test]
+    fn rust_anchored_fq_epoch_invalidates_rust_blobs_and_leaves_go_warm() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let rust_file = write_file(
+            root,
+            "src/service.rs",
+            "pub struct Client;\n\nimpl Client {\n    pub fn connect(&self) {}\n}\n",
+        );
+        let rust_state = Arc::new(parse_state(&RustAdapter, &rust_file));
+        let rust_oid = oid_for(rust_state.source.as_bytes());
+        let _ = write_file(root, "go.mod", "module example.com/demo\n");
+        let go_file = write_file(
+            root,
+            "internal/service/service.go",
+            "package service\ntype Client struct{}\n",
+        );
+        let go_state = Arc::new(parse_state(&GoAdapter, &go_file));
+        let go_oid = oid_for(go_state.source.as_bytes());
+
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_rust_generation = store
+            .ensure_language_epoch_value("rust", &epoch::rust_epoch_before_anchored_fq_encoding())
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                rust_oid,
+                "rust",
+                prior_rust_generation,
+                &RustAdapter,
+                rust_state.as_ref(),
+            )
+            .unwrap();
+        let go_generation = store
+            .ensure_language_epoch(Language::Go, &tree_sitter_go::LANGUAGE.into())
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                go_oid,
+                "go",
+                go_generation,
+                &GoAdapter,
+                go_state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(rust_oid, "rust").unwrap());
+        assert!(store.contains_parsed_blob(go_oid, "go").unwrap());
+
+        let current_rust_generation = store
+            .ensure_language_epoch(Language::Rust, &tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_rust_generation, prior_rust_generation);
+        assert!(!store.contains_parsed_blob(rust_oid, "rust").unwrap());
+        assert_eq!(
+            store
+                .ensure_language_epoch(Language::Go, &tree_sitter_go::LANGUAGE.into())
+                .unwrap(),
+            go_generation,
+            "the Rust salt bump must not move Go's epoch"
+        );
+        assert!(store.contains_parsed_blob(go_oid, "go").unwrap());
     }
 
     #[test]

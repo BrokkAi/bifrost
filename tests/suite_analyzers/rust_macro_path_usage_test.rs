@@ -104,19 +104,19 @@ macro_rules! span {
 
     for (fq_name, expression, terminal, decoy) in [
         (
-            "fixture.src.support.enabled",
+            "fixture.support.enabled",
             "$crate::support::enabled()",
             "enabled",
             "$crate::decoy::enabled()",
         ),
         (
-            "fixture.src.support.Name",
+            "fixture.support.Name",
             "$crate::support::Name",
             "Name",
             "$crate::decoy::Name",
         ),
         (
-            "fixture.src.Visit",
+            "fixture.Visit",
             "$crate::Visit",
             "Visit",
             "$crate::decoy::Visit",
@@ -140,7 +140,7 @@ macro_rules! span {
         );
     }
 
-    let span_definitions = analyzer.get_definitions("fixture.src.span");
+    let span_definitions = analyzer.get_definitions("fixture.span");
     assert!(
         span_definitions.iter().any(CodeUnit::is_macro),
         "fixture must contain the same-FQN span macro"

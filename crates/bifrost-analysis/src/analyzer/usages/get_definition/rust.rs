@@ -1238,7 +1238,14 @@ fn resolve_rust_unscoped(
         // issue_1162's rust pin), so this fires only as the #1126 safety net for
         // a future upstream regression — a genuinely-external `::` path yields
         // `None` here and still draws the boundary.
-        if let Some(unit) =
+        if rust_qualified_head_is_proven_route(
+            analyzer,
+            rust,
+            file,
+            source,
+            reference,
+            site.focus_start_byte,
+        ) && let Some(unit) =
             rust_enclosing_scope_type_fallback(analyzer, file, reference, site.focus_start_byte)
         {
             return candidates_outcome(vec![unit]);
@@ -3619,7 +3626,14 @@ fn rust_focused_prefix_resolution_outcome(
                 if !local.is_empty() {
                     return candidates_outcome(local);
                 }
-                if let Some(unit) = rust_enclosing_scope_type_fallback(
+                if rust_qualified_head_is_proven_route(
+                    analyzer,
+                    rust,
+                    file,
+                    source,
+                    focused_path,
+                    site.focus_start_byte,
+                ) && let Some(unit) = rust_enclosing_scope_type_fallback(
                     analyzer,
                     file,
                     focused_text,
@@ -3788,7 +3802,14 @@ fn rust_focused_prefix_resolution_outcome(
         // the associated type `Connection::TransactionManager`, which shares its
         // spelling with an imported trait but is a distinct namespace and lives
         // in this file (issue #1126 diesel `TransactionManager`).
-        if let Some(unit) =
+        if rust_qualified_head_is_proven_route(
+            analyzer,
+            rust,
+            file,
+            source,
+            focused_path,
+            site.focus_start_byte,
+        ) && let Some(unit) =
             rust_enclosing_scope_type_fallback(analyzer, file, focused_text, site.focus_start_byte)
         {
             return candidates_outcome(vec![unit]);
@@ -3947,6 +3968,14 @@ fn rust_extern_prelude_root(
             })
         })
         && resolve_module_files(rust, file, root_name).is_empty()
+        // A module of this crate is evidence that the name is not an extern
+        // crate, even where the bare spelling does not reach it (Rust 2018+
+        // needs `crate::`). Crate-aware naming made that spelling explicit: the
+        // crate-root prefix used to be empty, so the bare lookup above answered
+        // for both. Without this the workspace's own `src/http.rs` would look
+        // like an unindexed `http` dependency and turn a plain miss into a
+        // confident boundary claim.
+        && resolve_module_files(rust, file, &format!("crate::{root_name}")).is_empty()
 }
 
 fn rust_focused_nonterminal_prefix<'tree>(focused: Node<'tree>) -> Option<Node<'tree>> {
@@ -6454,6 +6483,53 @@ fn rust_enclosing_scope_type_fallback(
     byte: usize,
 ) -> Option<CodeUnit> {
     resolve_in_enclosing_scopes(analyzer, file, name, byte, CodeUnit::is_class)
+}
+
+/// Whether the head of a `::`-qualified unrooted path names a route that is
+/// actually in scope here: a visible `use` binding, or a module this file
+/// declares outright.
+///
+/// The enclosing-scope fallback below composes `{enclosing scope prefix} +
+/// reference`, so at a crate root file it would spell the crate-relative path
+/// that Rust 2018+ requires an explicit `crate::` for -- and would answer with
+/// a same-named module the reference never named (`http::Version` inside
+/// `src/http.rs` with no `http` dependency), or with a module that exists only
+/// inside unproven macro content. Both are boundaries, not definitions. Before
+/// crate-aware naming the composed candidate had an empty crate-root prefix and
+/// could not match anything, which hid this route by accident; the predicate
+/// makes the requirement explicit.
+fn rust_qualified_head_is_proven_route(
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    path: &str,
+    byte: usize,
+) -> bool {
+    let Some((head, _)) = path.split_once("::") else {
+        // An unqualified name carries no route to prove; the enclosing-scope
+        // walk is then the ordinary lexical rule.
+        return true;
+    };
+    let head = head.trim();
+    // Rooted and lexical heads name a scope directly rather than going through
+    // the crate-root-relative route this gate is about.
+    if matches!(head, "crate" | "self" | "super" | "Self") {
+        return true;
+    }
+    if head.is_empty() {
+        return false;
+    }
+    if analyzer
+        .declarations(file)
+        .into_iter()
+        .any(|unit| unit.is_module() && unit.identifier() == head)
+    {
+        return true;
+    }
+    lexical_scope::visible_import_binders_at(source, byte)
+        .into_iter()
+        .any(|binder| !resolve_visible_import_targets_forward(rust, file, &binder, head).is_empty())
 }
 
 /// True when the focused owner/qualifier resolves to a Rust crate or module that

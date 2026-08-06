@@ -51,12 +51,22 @@ impl LanguageAdapter for PythonAdapter {
         python_module_name(file)
     }
 
-    fn path_derived_package_fq(
+    fn default_package_anchor(&self) -> Option<crate::analyzer::PackageAnchor> {
+        Some(crate::analyzer::PackageAnchor::OwnModule { pop: 0 })
+    }
+
+    /// Every Python declaration is packaged by the module its file backs, so
+    /// the file's own module is the only anchor this adapter can place.
+    fn resolve_package_anchor(
         &self,
+        anchor: crate::analyzer::PackageAnchor,
         _content_qualifier: &str,
         file: &ProjectFile,
     ) -> Option<crate::analyzer::FqName> {
-        Some(python_module_fq(file))
+        match anchor {
+            crate::analyzer::PackageAnchor::OwnModule { pop: 0 } => Some(python_module_fq(file)),
+            _ => None,
+        }
     }
 
     fn should_persist_code_unit(&self, code_unit: &CodeUnit) -> bool {

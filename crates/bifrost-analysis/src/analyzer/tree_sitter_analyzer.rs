@@ -36,9 +36,9 @@ use crate::analyzer::structural::materialization::MaterializationRecord;
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, CppTemplateMetadata, DeclarationInfo,
     DefinitionIndexHandle, FqName, GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language,
-    LanguageDialect, Project, ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate,
-    SearchSymbolCandidates, SearchSymbolPatternBatch, SignatureMetadata, SummaryFileProjection,
-    UsageFactsIndex,
+    LanguageDialect, PackageAnchor, Project, ProjectFile, Range, RubyMethodDispatchMode,
+    SearchSymbolCandidate, SearchSymbolCandidates, SearchSymbolPatternBatch, SignatureMetadata,
+    SummaryFileProjection, UsageFactsIndex,
 };
 use crate::cancellation::CancellationToken;
 use crate::gitblob;
@@ -306,23 +306,20 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn hydrate_content_qualifier(&self, content_qualifier: &str, _file: &ProjectFile) -> String {
         content_qualifier.to_string()
     }
-    /// Whether this unit's structured package prefix must be rebuilt from its
-    /// live path when hydrating a content-addressed blob. This is distinct from
-    /// the persisted qualifier text: an explicitly root-qualified declaration
-    /// may legitimately have an empty package without being path-derived.
-    fn code_unit_package_is_path_derived(
-        &self,
-        code_unit: &CodeUnit,
-        content_qualifier: &str,
-    ) -> bool {
-        self.path_derived_package_fq(content_qualifier, code_unit.source())
-            .is_some()
+    /// The anchor a unit's persisted package prefix is resolved against when
+    /// the extractor recorded none. `None` means this language's packages are
+    /// intrinsic to the blob and must be persisted in full.
+    fn default_package_anchor(&self) -> Option<PackageAnchor> {
+        None
     }
-    /// Return the structured package/module prefix when it depends on the
-    /// live path rather than solely on the persisted source blob. `None` means
-    /// the complete structured name can be persisted with the blob.
-    fn path_derived_package_fq(
+    /// Resolve `anchor` to the live package prefix it names for `file`. `None`
+    /// means this adapter cannot place that anchor, which makes the unit fall
+    /// back to a fully persisted name. `content_qualifier` is the unit's stored
+    /// qualifier text, which some languages (Go) need to reconstruct the
+    /// prefix.
+    fn resolve_package_anchor(
         &self,
+        _anchor: PackageAnchor,
         _content_qualifier: &str,
         _file: &ProjectFile,
     ) -> Option<FqName> {
@@ -9105,40 +9102,31 @@ mod tests {
             Some("impl Writer::fn write(&self) { ... }".to_string()),
             false,
         );
-        assert_eq!(
-            rust.storage_content_qualifier(&rust_impl_member, "net"),
-            "model"
-        );
+        // Rust names are persisted as an anchor plus a content-stable tail, so
+        // no unit — however it is qualified — bakes package text into its row.
+        assert_eq!(rust.storage_content_qualifier(&rust_impl_member, "net"), "");
         assert_eq!(rust.hydrate_content_qualifier("model", &rust_file), "model");
-        let local_rust_impl_member = CodeUnit::with_signature(
-            rust_file.clone(),
-            CodeUnitType::Function,
-            "net",
-            "Client.connect",
-            Some("impl Client::fn connect(&self) { ... }".to_string()),
-            false,
+        let file_package = rust
+            .resolve_package_anchor(PackageAnchor::OwnModule { pop: 0 }, "", &rust_file)
+            .expect("Rust resolves its own-module anchor");
+        assert_eq!(
+            file_package.display(crate::analyzer::fq_name::segment_interner()),
+            "net"
         );
         assert_eq!(
-            rust.storage_content_qualifier(&local_rust_impl_member, "net"),
+            rust.resolve_package_anchor(PackageAnchor::OwnModule { pop: 1 }, "", &rust_file)
+                .expect("Rust resolves a popped own-module anchor")
+                .display(crate::analyzer::fq_name::segment_interner()),
             ""
         );
-        assert!(rust.code_unit_package_is_path_derived(&local_rust_impl_member, ""));
-        let explicit_root_rust_impl_member = CodeUnit::with_signature(
-            rust_file.clone(),
-            CodeUnitType::Function,
-            "",
-            "ExplicitPaths.into",
-            Some(
-                "impl core::convert::Into<bool> for crate::ExplicitPaths::fn into(self) -> bool { ... }"
-                    .to_string(),
-            ),
-            false,
-        );
+        // A crate mounted at the repository root has an empty crate-root
+        // prefix; that is a resolved empty prefix, not an unresolvable anchor.
         assert_eq!(
-            rust.storage_content_qualifier(&explicit_root_rust_impl_member, "net"),
+            rust.resolve_package_anchor(PackageAnchor::CrateRoot, "", &rust_file)
+                .expect("Rust resolves its crate-root anchor")
+                .display(crate::analyzer::fq_name::segment_interner()),
             ""
         );
-        assert!(!rust.code_unit_package_is_path_derived(&explicit_root_rust_impl_member, ""));
 
         std::fs::write(root.join("go.mod"), "module example.com/demo\n").unwrap();
         let go_file = temp_file(&root, "internal/service/service.go");

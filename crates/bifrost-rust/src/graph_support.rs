@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 use crate::cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
+use crate::crate_naming;
 use crate::declarations::rust_package_name;
 use crate::imports::{
     RustVisibility, resolve_rust_module_path_with_crate, rust_crate_root_package,
@@ -1731,7 +1732,7 @@ fn rust_relative_module_segments(file: &ProjectFile, segments: &[String]) -> Opt
             append(&mut path, &rest[index..]);
             path
         }
-        crate_name if Some(crate_name) == rust_current_crate_name(file).as_deref() => {
+        crate_name if Some(crate_name) == crate_naming::rust_file_crate_name(file).as_deref() => {
             let mut path = PathBuf::new();
             append(&mut path, rest);
             path
@@ -1763,7 +1764,8 @@ fn rust_relative_module_path(file: &ProjectFile, module_specifier: &str) -> Opti
         })
         .or_else(|| {
             let (crate_name, rest) = module_specifier.split_once("::")?;
-            (Some(crate_name) == rust_current_crate_name(file).as_deref()).then(|| rest.into())
+            (Some(crate_name) == crate_naming::rust_file_crate_name(file).as_deref())
+                .then(|| rest.into())
         })
         .or_else(|| {
             let relative = PathBuf::from(module_specifier);
@@ -1780,22 +1782,6 @@ fn rust_relative_module_path(file: &ProjectFile, module_specifier: &str) -> Opti
             Some(module_root.join(relative))
         })?;
     Some(module.to_string_lossy().replace("::", "/").into())
-}
-
-fn rust_current_crate_name(file: &ProjectFile) -> Option<String> {
-    let manifest = file.root().join("Cargo.toml");
-    let source = std::fs::read_to_string(manifest).ok()?;
-    source.lines().find_map(|line| {
-        let trimmed = line.trim();
-        let value = trimmed.strip_prefix("name")?.trim_start();
-        let value = value.strip_prefix('=')?.trim();
-        value
-            .trim_matches('"')
-            .split('"')
-            .next()
-            .filter(|name| !name.is_empty())
-            .map(|name| name.replace('-', "_"))
-    })
 }
 
 fn rust_visibility_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
