@@ -30,16 +30,19 @@ pub use brokk_bifrost_analysis::{
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,
     TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
     WorkspaceAnalyzer, collect_workspace_files, execute_request, execute_request_with_cancellation,
-    execute_request_with_limits, reset_rust_tree_parse_counters_for_test,
-    resolve_ruby_semantic_pack_dependencies, resolve_rust_semantic_pack_dependencies,
-    rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
-    rust_tree_parsed_bytes_for_test, summarize_inputs,
+    execute_request_with_limits, resolve_ruby_semantic_pack_dependencies,
+    resolve_rust_semantic_pack_dependencies, summarize_inputs,
 };
 pub use brokk_bifrost_analysis::{
     analyzer, cache_db, cache_gc, cancellation, code_quality, compact_graph, diff_analysis,
     file_tools, git_file, gitblob, hash, model_context, navigation, path_normalization, path_utils,
     process, profiling, relevance, schema_version, searchtools, searchtools_render, sexp, summary,
     symbol_rename, text_utils, usages, util, workspace_document,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use brokk_bifrost_analysis::{
+    reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
+    rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
 pub use brokk_bifrost_lsp::lsp;
 pub use brokk_bifrost_mcp::{

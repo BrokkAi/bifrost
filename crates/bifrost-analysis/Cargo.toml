@@ -87,6 +87,7 @@ test-support = [
     "brokk-bifrost-go/test-support",
     "brokk-bifrost-js-ts/test-support",
     "brokk-bifrost-jvm/test-support",
+    "brokk-bifrost-rust/test-support",
 ]
 
 [dev-dependencies]
@@ -98,6 +99,7 @@ brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.8.22", features = [
 brokk-bifrost-go = { path = "../bifrost-go", version = "=0.8.22", features = ["test-support"] }
 brokk-bifrost-js-ts = { path = "../bifrost-js-ts", version = "=0.8.22", features = ["test-support"] }
 brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.8.22", features = ["test-support"] }
+brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.8.22", features = ["test-support"] }
 filetime = "0.2"
 jsonschema = { version = "0.48.0", default-features = false }
 pretty_assertions = "1.4.1"

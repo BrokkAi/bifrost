@@ -557,11 +557,12 @@ thread_local! {
     static HASH_WORKING_FILE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Throwaway repositories for tests. Unconditional rather than `#[cfg(test)]`
-/// because the analyzer store, workspace and tree-sitter unit tests in
-/// `brokk-bifrost-analysis` build these fixtures too, and a `cfg(test)` module
-/// is invisible across a crate boundary. Same reasoning as the `*_for_test`
-/// entry points in [`crate::cache_gc`].
+/// Throwaway repositories for tests, not published API. The analyzer store,
+/// workspace and tree-sitter unit tests in `brokk-bifrost-analysis` build these
+/// fixtures too, and a `cfg(test)` module is invisible across a crate boundary,
+/// so dependents reach it by enabling this crate's `test-support` feature. Same
+/// gate as the `*_for_test` entry points in [`crate::cache_gc`].
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_repo {
     use git2::{IndexAddOption, Oid, Repository, Signature};
     use std::path::Path;

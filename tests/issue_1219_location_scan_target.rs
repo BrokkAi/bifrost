@@ -38,10 +38,14 @@ use brokk_bifrost::searchtools::{
     ScanUsagesByLocationParams, ScanUsagesEntry, ScanUsagesStatus, ScanUsagesTarget,
     scan_usages_by_location,
 };
-use brokk_bifrost::{
-    Language, RustAnalyzer, reset_rust_tree_parse_counters_for_test,
-    rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
-    rust_tree_parsed_bytes_for_test,
+use brokk_bifrost::{Language, RustAnalyzer};
+// The counters are gated behind `test-support`, which this package cannot turn
+// on for its own lib. The `analyzer` module re-export carries them instead: the
+// dev-dependency on brokk-bifrost-analysis enables that crate's `test-support`
+// for these test targets.
+use brokk_bifrost::analyzer::{
+    reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
+    rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
 use common::InlineTestProject;
 use std::sync::{Mutex, MutexGuard, OnceLock};

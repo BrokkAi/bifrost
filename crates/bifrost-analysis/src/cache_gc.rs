@@ -5,10 +5,13 @@
 //! that path off an [`AnalyzerStore`].
 
 pub use brokk_bifrost_core::cache_gc::{
-    GC_AUTO_BLOB_THRESHOLD, GC_MIN_INTERVAL_SECS, GcOutcome, GcTuningGuard,
-    VERSION_STORE_GRACE_SECS, force_gc as force_gc_for_semantic, maybe_gc as maybe_gc_for_semantic,
-    set_accounting_for_test, set_tuning_for_test, sweep_disused_version_stores,
-    total_blob_count_for_test,
+    GC_AUTO_BLOB_THRESHOLD, GC_MIN_INTERVAL_SECS, GcOutcome, VERSION_STORE_GRACE_SECS,
+    force_gc as force_gc_for_semantic, maybe_gc as maybe_gc_for_semantic,
+    sweep_disused_version_stores,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use brokk_bifrost_core::cache_gc::{
+    GcTuningGuard, set_accounting_for_test, set_tuning_for_test, total_blob_count_for_test,
 };
 
 use brokk_bifrost_core::cache_gc::{force_gc, maybe_gc};

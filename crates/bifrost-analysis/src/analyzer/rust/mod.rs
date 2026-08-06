@@ -77,6 +77,7 @@ pub(crate) use brokk_bifrost_rust::graph_support::{
 
 use brokk_bifrost_rust::hierarchy::RustHierarchyIndex;
 pub(crate) use brokk_bifrost_rust::hierarchy::canonical_rust_hierarchy_type;
+#[cfg(any(test, feature = "test-support"))]
 pub use brokk_bifrost_rust::lexical_scope::{
     reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
     rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,

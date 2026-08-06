@@ -100,12 +100,12 @@ impl Drop for AnalyzerGcCoordinator {
     }
 }
 
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct GcIntervalGuard {
     _inner: crate::cache_gc::GcTuningGuard,
 }
 
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_min_interval_secs_for_test(seconds: i64) -> GcIntervalGuard {
     GcIntervalGuard {
         _inner: crate::cache_gc::set_tuning_for_test(

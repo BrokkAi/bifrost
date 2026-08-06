@@ -89,13 +89,13 @@ pub fn parse_rust_region_tree(source: &str, start: usize, end: usize) -> Option<
 
 /// Number of Rust source texts actually handed to tree-sitter since the last
 /// reset — the complexity signal pinned by the issue #1219 regression tests.
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn rust_tree_parse_count_for_test() -> usize {
     RUST_TREE_PARSES.load(Ordering::Relaxed)
 }
 
 /// Number of `parse_rust_tree` calls since the last reset, cache hits included.
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn rust_tree_parse_request_count_for_test() -> usize {
     RUST_TREE_PARSE_REQUESTS.load(Ordering::Relaxed)
 }
@@ -104,12 +104,12 @@ pub fn rust_tree_parse_request_count_for_test() -> usize {
 /// the load-bearing complexity signal: re-parsing a whole file per reference
 /// site and parsing one small token-tree fragment per reference site both grow
 /// the *call* count, but only the former grows the byte count with file size.
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn rust_tree_parsed_bytes_for_test() -> usize {
     RUST_TREE_PARSED_BYTES.load(Ordering::Relaxed)
 }
 
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn reset_rust_tree_parse_counters_for_test() {
     RUST_TREE_PARSES.store(0, Ordering::Relaxed);
     RUST_TREE_PARSE_REQUESTS.store(0, Ordering::Relaxed);

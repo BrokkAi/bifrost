@@ -219,6 +219,13 @@ release-tooling = ["brokk-bifrost-semantic-packs/release-tooling"]
 # still fails to link, exactly as before -- maturin supplies the
 # `-undefined dynamic_lookup` that a bare `cargo build` does not.
 extension-module = ["pyo3/extension-module"]
+# Root-level re-exports of the implementation crates' test-only hooks, for a
+# downstream consumer that wants them in its own tests. Off in every shipped
+# build. This package's own `tests/` cannot turn it on -- that would need a
+# dev-dependency on itself, which scripts/check-workspace-dependencies.mjs
+# rejects -- so they reach the same hooks through the `analyzer` and `cache_gc`
+# module re-exports, which the dev-dependency below already gates open.
+test-support = ["brokk-bifrost-analysis/test-support"]
 
 [dev-dependencies]
 # Cargo unifies this with the plain `[dependencies]` entry above for test targets, turning

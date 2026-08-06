@@ -61,8 +61,11 @@ pub use analyzer::{
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,
     TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
     WorkspaceAnalyzer, WorkspaceFileListingCache, collect_workspace_files, ingest_source_bytes,
-    reset_rust_tree_parse_counters_for_test, resolve_ruby_semantic_pack_dependencies,
-    resolve_rust_semantic_pack_dependencies, rust_tree_parse_count_for_test,
+    resolve_ruby_semantic_pack_dependencies, resolve_rust_semantic_pack_dependencies,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use analyzer::{
+    reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
     rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
 pub use cancellation::CancellationToken;

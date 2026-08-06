@@ -3,6 +3,7 @@
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use git2::Repository;
@@ -328,13 +329,14 @@ fn total_blob_count_conn(conn: &Connection) -> Result<i64, String> {
     .map_err(|err| format!("cache GC SQLite error: {err}"))
 }
 
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct GcTuningGuard {
     previous_threshold: i64,
     previous_interval: i64,
     _lock: MutexGuard<'static, ()>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for GcTuningGuard {
     fn drop(&mut self) {
         AUTO_BLOB_THRESHOLD.store(self.previous_threshold, Ordering::Relaxed);
@@ -342,7 +344,7 @@ impl Drop for GcTuningGuard {
     }
 }
 
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_tuning_for_test(auto_threshold: i64, min_interval_secs: i64) -> GcTuningGuard {
     let lock = gc_tuning_lock()
         .lock()
@@ -356,12 +358,13 @@ pub fn set_tuning_for_test(auto_threshold: i64, min_interval_secs: i64) -> GcTun
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn gc_tuning_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_accounting_for_test(
     db_path: &Path,
     last_gc_at: i64,
@@ -383,7 +386,7 @@ pub fn set_accounting_for_test(
     Ok(())
 }
 
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn total_blob_count_for_test(db_path: &Path) -> Result<i64, String> {
     total_blob_count(db_path)
 }

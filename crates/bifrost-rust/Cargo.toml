@@ -26,6 +26,15 @@ toml = "0.8.23"
 tree-sitter = "0.25.10"
 tree-sitter-rust = "0.24.0"
 
+[features]
+default = []
+# Mirrors `brokk-bifrost-analysis`'s feature of the same name. The tree-parse
+# counters in `lexical_scope` are the complexity signal the issue #1219
+# regression tests assert on, and a `cfg(test)` item is invisible across a
+# crate boundary, so dependents reach them under this gate instead of through
+# permanent public API.
+test-support = []
+
 [dev-dependencies]
 brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22", features = ["test-support"] }
 # crate_naming's mtime-invalidation test stamps manifest timestamps directly.
