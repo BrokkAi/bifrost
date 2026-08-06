@@ -1618,7 +1618,16 @@ impl ServerHandler for BifrostMcpHandler {
             .ok()
             .map(|id| request_correlation_id(&id));
         let serial = !named_mode && serial_tool_request(&name);
-        let _serial_guard = if serial { state } else { None };
+        // `state` must leave scope here either way. `if serial { state } else
+        // { None }` moves it only in the serial branch; the non-serial branch
+        // leaves the maybe-moved binding alive until the end of this function,
+        // holding the workspace lock across readiness, admission, and the
+        // whole analyzer execution -- which serializes every tool call on the
+        // connection and starves light requests behind heavy scans (the
+        // `mcp_fairness` benchmark failure). `then_some` evaluates its
+        // argument eagerly, so the guard moves and drops now for non-serial
+        // calls.
+        let _serial_guard = serial.then_some(state).flatten();
 
         let accepted_at = Instant::now();
         let cold_workspace = service.workspace_build_pending();

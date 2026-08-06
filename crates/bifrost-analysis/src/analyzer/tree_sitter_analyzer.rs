@@ -6516,14 +6516,17 @@ where
         let normalized = self.adapter.normalize_full_name(fq_name);
         let langs = self.storage_language_keys_for_queries();
         let candidate_names = self.definition_candidate_short_names(fq_name);
+        // No per-name profiling scopes here: usage scans resolve thousands of
+        // candidate names per request, and a BEGIN/END pair per name floods
+        // stderr (an unbuffered global-locked write per line) faster than the
+        // benchmark harness's bounded tail can retain anything else. The
+        // `definition_candidates_query_count` counter remains the aggregate
+        // signal.
         let rows = if candidate_names.is_empty() {
             Vec::new()
         } else {
             let mut rows = Vec::new();
             for short_name in candidate_names {
-                let _rows_scope = crate::profiling::scope(format!(
-                    "sql_definition_candidates.rows[{short_name}]"
-                ));
                 let candidates = if include_definition_lookup_units {
                     self.store_context
                         .store
@@ -6547,41 +6550,26 @@ where
             }
             rows
         };
-        let mut candidates = {
-            let _resolve_scope = crate::profiling::scope(format!(
-                "sql_definition_candidates.resolve_rows[{fq_name}]"
-            ));
-            self.resolve_definition_order_candidate_rows(rows)
-        };
-        {
-            let _dirty_scope = crate::profiling::scope(format!(
-                "sql_definition_candidates.dirty_units[{fq_name}]"
-            ));
-            candidates.extend(
-                self.dirty_units_matching(include_definition_lookup_units, |unit| {
-                    unit.fq_name() == fq_name
-                        || self.adapter.normalize_full_name(&unit.fq_name()) == normalized
-                })
+        let mut candidates = self.resolve_definition_order_candidate_rows(rows);
+        candidates.extend(
+            self.dirty_units_matching(include_definition_lookup_units, |unit| {
+                unit.fq_name() == fq_name
+                    || self.adapter.normalize_full_name(&unit.fq_name()) == normalized
+            })
+            .into_iter()
+            .map(|unit| DefinitionSortCandidate {
+                unit,
+                range_start: DefinitionRangeStart::FileState,
+            }),
+        );
+        candidates.extend(
+            self.sql_path_symbol_units(fq_name, &normalized)?
                 .into_iter()
                 .map(|unit| DefinitionSortCandidate {
                     unit,
                     range_start: DefinitionRangeStart::FileState,
                 }),
-            );
-        }
-        {
-            let _path_scope = crate::profiling::scope(format!(
-                "sql_definition_candidates.path_symbol[{fq_name}]"
-            ));
-            candidates.extend(
-                self.sql_path_symbol_units(fq_name, &normalized)?
-                    .into_iter()
-                    .map(|unit| DefinitionSortCandidate {
-                        unit,
-                        range_start: DefinitionRangeStart::FileState,
-                    }),
-            );
-        }
+        );
         let has_exact = candidates
             .iter()
             .any(|candidate| candidate.unit.fq_name() == fq_name);
