@@ -46,7 +46,7 @@ fn most_relevant_files(fixture: &str, seed: &str) -> Value {
     let service = SearchToolsService::new_manual_without_semantic_index(fixture_root(fixture))
         .expect("service");
     let arguments =
-        format!(r#"{{"seed_file_paths":[{seed:?}],"ranking_mode":"usage_graph","limit":1}}"#);
+        format!(r#"{{"seed_file_paths":[{seed:?}],"ranking_mode":"usage_graph_exact","limit":1}}"#);
     let payload = service
         .call_tool_json("most_relevant_files", &arguments)
         .expect("most_relevant_files call failed");
@@ -200,7 +200,7 @@ fn usage_relevance_keeps_identical_cross_language_fqns_distinct() {
     let payload = service
         .call_tool_json(
             "most_relevant_files",
-            r#"{"seed_file_paths":["main.go"],"ranking_mode":"usage_graph","limit":1}"#,
+            r#"{"seed_file_paths":["main.go"],"ranking_mode":"usage_graph_exact","limit":1}"#,
         )
         .expect("most_relevant_files call failed");
     let result: Value = serde_json::from_str(&payload).unwrap();
@@ -234,7 +234,7 @@ fn usage_relevance_resolves_typescript_callers_to_javascript_callees() {
     let payload = service
         .call_tool_json(
             "most_relevant_files",
-            r#"{"seed_file_paths":["main.ts"],"ranking_mode":"usage_graph","limit":1}"#,
+            r#"{"seed_file_paths":["main.ts"],"ranking_mode":"usage_graph_exact","limit":1}"#,
         )
         .expect("most_relevant_files call failed");
     let result: Value = serde_json::from_str(&payload).unwrap();
@@ -268,7 +268,7 @@ fn usage_relevance_resolves_javascript_callers_to_typescript_callees() {
     let payload = service
         .call_tool_json(
             "most_relevant_files",
-            r#"{"seed_file_paths":["main.js"],"ranking_mode":"usage_graph","limit":1}"#,
+            r#"{"seed_file_paths":["main.js"],"ranking_mode":"usage_graph_exact","limit":1}"#,
         )
         .expect("most_relevant_files call failed");
     let result: Value = serde_json::from_str(&payload).unwrap();

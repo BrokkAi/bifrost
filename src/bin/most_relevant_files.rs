@@ -48,7 +48,8 @@ fn run() -> Result<(), String> {
             }
             "--ranking-mode" => {
                 let value = args.next().ok_or_else(|| {
-                    "--ranking-mode requires history_imports or usage_graph".to_string()
+                    "--ranking-mode requires history_imports, usage_graph, or usage_graph_exact"
+                        .to_string()
                 })?;
                 ranking_mode = parse_ranking_mode(&value)?;
             }
@@ -85,7 +86,12 @@ fn run() -> Result<(), String> {
                     .filter(|language| *language != Language::None)
             })
             .collect();
-        if ranking_mode == MostRelevantFilesRankingMode::UsageGraph || seed_languages.is_empty() {
+        if matches!(
+            ranking_mode,
+            MostRelevantFilesRankingMode::UsageGraph
+                | MostRelevantFilesRankingMode::UsageGraphExact
+        ) || seed_languages.is_empty()
+        {
             WorkspaceAnalyzer::build(project, AnalyzerConfig::default())
         } else {
             WorkspaceAnalyzer::build_for_languages(
@@ -163,15 +169,16 @@ fn parse_ranking_mode(value: &str) -> Result<MostRelevantFilesRankingMode, Strin
     match value {
         "history_imports" => Ok(MostRelevantFilesRankingMode::HistoryImports),
         "usage_graph" => Ok(MostRelevantFilesRankingMode::UsageGraph),
+        "usage_graph_exact" => Ok(MostRelevantFilesRankingMode::UsageGraphExact),
         _ => Err(format!(
-            "Invalid --ranking-mode value {value:?}; expected history_imports or usage_graph"
+            "Invalid --ranking-mode value {value:?}; expected history_imports, usage_graph, or usage_graph_exact"
         )),
     }
 }
 
 fn print_help() {
     println!(
-        "Usage: most_relevant_files [--root PROJECT_ROOT] [--recency-half-life COMMITS|none] [--ranking-mode history_imports|usage_graph] [--exclude-tests] <seed-file>...\n\
+        "Usage: most_relevant_files [--root PROJECT_ROOT] [--recency-half-life COMMITS|none] [--ranking-mode history_imports|usage_graph|usage_graph_exact] [--exclude-tests] <seed-file>...\n\
          \n\
          Each line is `path<TAB>test-kind`, where the kind is test, test_support, production, or ambiguous.\n\
          --exclude-tests drops the test and test_support lines from the ranked page, so it can print fewer results."
@@ -191,6 +198,10 @@ mod tests {
         assert_eq!(
             parse_ranking_mode("usage_graph").unwrap(),
             MostRelevantFilesRankingMode::UsageGraph
+        );
+        assert_eq!(
+            parse_ranking_mode("usage_graph_exact").unwrap(),
+            MostRelevantFilesRankingMode::UsageGraphExact
         );
         assert!(parse_ranking_mode("imports").is_err());
     }

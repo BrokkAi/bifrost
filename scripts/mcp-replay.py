@@ -514,7 +514,23 @@ def main():
         print(f"stack={args.stack} server={server.get('name')} {server.get('version')} roots={not args.no_roots}")
         if args.warm:
             t0 = time.monotonic()
-            client.call_tool("search_symbols", {"patterns": ["warmup_nonexistent_zzz"], "limit": 1}, timeout=300)
+            deadline = t0 + 300
+            while True:
+                warmed = client.call_tool(
+                    "search_symbols",
+                    {"patterns": ["warmup_nonexistent_zzz"], "limit": 1},
+                    timeout=300,
+                )
+                kind, detail = outcome(warmed)
+                if kind == "OK":
+                    break
+                transient = (
+                    "workspace snapshot was not ready" in detail
+                    or "exhausted its 5s request budget" in detail
+                )
+                if not transient or time.monotonic() >= deadline:
+                    raise RuntimeError(f"workspace warmup failed: {kind}: {detail}")
+                time.sleep(0.1)
             print(f"warmup finished in {(time.monotonic()-t0)*1000:.0f} ms")
         failures = []
         for name in names:

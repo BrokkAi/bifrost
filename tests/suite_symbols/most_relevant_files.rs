@@ -1,7 +1,7 @@
 use crate::common::InlineTestProject;
 use brokk_bifrost::{
     CSharpAnalyzer, CppAnalyzer, FilesystemProject, GoAnalyzer, ImportAnalysisProvider,
-    JavaAnalyzer, Language, ProjectFile, TestProject,
+    JavaAnalyzer, Language, ProjectFile, RustAnalyzer, TestProject,
     searchtools::{
         ClassifyTestFilesParams, MostRelevantFilesParams, MostRelevantFilesRankingMode,
         MostRelevantFilesResult, TestFileKind, classify_test_files, most_relevant_files,
@@ -1052,7 +1052,7 @@ fn usage_mode_prefers_resolved_calls_and_respects_edge_weights() {
             seed_file_paths: vec!["test/Seed.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
-            ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraphExact,
             limit: 3,
         },
     )
@@ -1060,13 +1060,138 @@ fn usage_mode_prefers_resolved_calls_and_respects_edge_weights() {
 
     assert!(results.complete);
     assert_eq!(
-        MostRelevantFilesRankingMode::UsageGraph,
+        MostRelevantFilesRankingMode::UsageGraphExact,
         results.ranking_mode_used
     );
     assert_eq!(None, results.incomplete_reason);
     assert_eq!("test/WeightedUse.java", paths(&results)[0]);
     assert_eq!("test/SingleUse.java", paths(&results)[1]);
     assert_eq!("test/ImportOnly.java", paths(&results)[2]);
+}
+
+#[test]
+fn usage_mode_uses_the_fast_file_graph_and_exact_mode_keeps_symbol_weights() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "test/Seed.java",
+            r#"
+            package test;
+            import test.AImportOnly;
+            import test.ZCalled;
+            public class Seed {
+                void run() {
+                    ZCalled.work();
+                    ZCalled.work();
+                }
+            }
+            "#,
+        )
+        .file(
+            "test/AImportOnly.java",
+            "package test; public class AImportOnly {}",
+        )
+        .file(
+            "test/ZCalled.java",
+            "package test; public class ZCalled { static void work() {} }",
+        )
+        .build();
+    let analyzer = java_analyzer(project.root());
+    let params = |ranking_mode| MostRelevantFilesParams {
+        seed_file_paths: vec!["test/Seed.java".to_string()],
+        seed_weights: None,
+        recency_half_life: Some(250.0),
+        ranking_mode,
+        limit: 1,
+    };
+
+    let fast =
+        most_relevant_files(&analyzer, params(MostRelevantFilesRankingMode::UsageGraph)).unwrap();
+    let exact = most_relevant_files(
+        &analyzer,
+        params(MostRelevantFilesRankingMode::UsageGraphExact),
+    )
+    .unwrap();
+
+    assert_eq!(vec!["test/AImportOnly.java"], paths(&fast));
+    assert_eq!(vec!["test/ZCalled.java"], paths(&exact));
+    assert_eq!(
+        MostRelevantFilesRankingMode::UsageGraph,
+        fast.ranking_mode_used
+    );
+    assert_eq!(
+        MostRelevantFilesRankingMode::UsageGraphExact,
+        exact.ranking_mode_used
+    );
+}
+
+#[test]
+fn fast_usage_mode_resolves_rust_imports_without_exact_symbol_edges() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "pub mod dependency;\npub mod seed;\n")
+        .file(
+            "src/seed.rs",
+            "use crate::dependency::Thing;\npub fn seed(_: Thing) {}\n",
+        )
+        .file("src/dependency.rs", "pub struct Thing;\n")
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+
+    let results = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["src/seed.rs".to_string()],
+            seed_weights: None,
+            recency_half_life: Some(250.0),
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            limit: 1,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(vec!["src/dependency.rs"], paths(&results));
+}
+
+#[test]
+fn fast_usage_mode_maps_rust_crate_names_from_manifests() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "crates/app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "crates/app/src/lib.rs",
+            "use brokk_dependency::Thing;\npub fn seed(_: Thing) {}\n",
+        )
+        .file(
+            "crates/dependency/Cargo.toml",
+            "[package]\nname = \"brokk-dependency\"\nversion = \"0.1.0\"\n",
+        )
+        .file("crates/dependency/src/lib.rs", "pub struct Thing;\n")
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let seed = project.file("crates/app/src/lib.rs");
+    let imports = analyzer.import_info_of(&seed);
+    let imported_files = analyzer
+        .imported_files_from_infos(&seed, &imports)
+        .expect("Rust exposes coarse import files");
+    assert!(
+        imported_files.contains(&project.file("crates/dependency/src/lib.rs")),
+        "imports={imports:?} imported_files={imported_files:?}"
+    );
+
+    let results = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["crates/app/src/lib.rs".to_string()],
+            seed_weights: None,
+            recency_half_life: Some(250.0),
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            limit: 1,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(vec!["crates/dependency/src/lib.rs"], paths(&results));
 }
 
 #[test]
@@ -1093,7 +1218,7 @@ fn usage_rank_flows_from_caller_to_callee_not_backward() {
             seed_file_paths: vec!["test/Seed.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
-            ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraphExact,
             limit: 1,
         },
     )
@@ -1131,7 +1256,7 @@ fn usage_mode_combines_seed_weights_and_same_file_symbol_scores_deterministicall
         ],
         seed_weights: Some(vec![1.0, 3.0]),
         recency_half_life: Some(250.0),
-        ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+        ranking_mode: MostRelevantFilesRankingMode::UsageGraphExact,
         limit: 2,
     };
     let first = most_relevant_files(&analyzer, params.clone()).unwrap();
@@ -1178,7 +1303,7 @@ fn usage_mode_fills_from_legacy_and_falls_back_for_unmapped_seed() {
             seed_file_paths: vec!["test/Seed.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
-            ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraphExact,
             limit: 2,
         },
     )
@@ -1209,7 +1334,7 @@ fn usage_mode_fills_from_legacy_and_falls_back_for_unmapped_seed() {
             seed_file_paths: vec!["resources/seed.txt".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
-            ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraphExact,
             limit: 3,
         },
     )
@@ -1244,7 +1369,7 @@ fn usage_mode_does_not_promote_a_truncated_callee() {
             seed_file_paths: vec!["test/Seed.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
-            ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraphExact,
             limit: 1,
         },
     )
@@ -1341,7 +1466,7 @@ fn usage_mode_labels_ranked_files_so_callers_can_apply_a_test_policy() {
             seed_file_paths: vec!["src/main/java/app/Seed.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
-            ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraphExact,
             limit: 2,
         },
     )
@@ -1372,7 +1497,7 @@ fn usage_mode_labels_ranked_files_so_callers_can_apply_a_test_policy() {
             seed_file_paths: vec!["src/main/java/app/Seed.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
-            ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraphExact,
             limit: 4,
         },
     )
