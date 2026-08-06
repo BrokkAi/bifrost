@@ -13,6 +13,7 @@ pub mod common;
 pub mod config;
 pub mod definition_lookup;
 pub mod dense_id;
+pub mod exception_handling;
 pub mod fq_name;
 pub mod identifier;
 pub mod model;

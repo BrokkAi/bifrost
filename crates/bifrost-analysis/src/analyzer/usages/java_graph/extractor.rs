@@ -1,4 +1,3 @@
-use crate::analyzer::java::structural::expression_name_node;
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::java_graph::hits;
@@ -23,6 +22,7 @@ use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
 use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile};
 use crate::hash::HashMap;
 use crate::text_utils::compute_line_starts;
+use brokk_bifrost_jvm::java::structural::expression_name_node;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};

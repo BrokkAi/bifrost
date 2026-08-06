@@ -70,6 +70,22 @@ pub fn is_unparseable_source(source: &str) -> bool {
     }
 }
 
+/// `text` with every whitespace run collapsed to a single space and the ends
+/// trimmed.
+///
+/// Used to render a multi-line source header (a class or callable signature)
+/// as one stable line.
+pub fn collapse_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for token in text.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(token);
+    }
+    out
+}
+
 /// Verbatim source text spanned by `node`, or `""` when the byte range is not a
 /// valid `str` boundary (adversarial or partially-parsed input).
 ///

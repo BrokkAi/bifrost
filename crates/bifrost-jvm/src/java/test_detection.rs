@@ -1,8 +1,11 @@
-use super::exceptions::named_child_by_kind;
-use super::*;
-use crate::analyzer::test_assertions::compact_assertion_excerpt;
-use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::path_utils::rel_path_string;
+use crate::java::declarations::{node_text, parse_tree};
+use crate::java::exceptions::named_child_by_kind;
+use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
+use brokk_bifrost_core::analyzer::test_assertions::compact_assertion_excerpt;
+use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::{CodeUnitIndex, ProjectFile};
+use brokk_bifrost_core::hash::HashMap;
+use brokk_bifrost_core::path_utils::rel_path_string;
 use tree_sitter::Node;
 
 const TEST_ASSERTION_EXCERPT_MAX_LEN: usize = 180;
@@ -88,7 +91,7 @@ fn compact_test_assertion_excerpt(text: &str) -> String {
     compact_assertion_excerpt(text, TEST_ASSERTION_EXCERPT_MAX_LEN)
 }
 
-pub(super) fn java_source_contains_tests(root: Node<'_>, source: &str) -> bool {
+pub fn java_source_contains_tests(root: Node<'_>, source: &str) -> bool {
     let mut found = false;
     walk_named_tree_preorder(root, true, |node| {
         found |= match node.kind() {
@@ -183,8 +186,8 @@ fn compact_no_whitespace(text: &str) -> String {
     text.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
-pub(super) fn detect_test_assertion_smells_java(
-    analyzer: &dyn IAnalyzer,
+pub fn detect_test_assertion_smells_java(
+    analyzer: &dyn CodeUnitIndex,
     file: &ProjectFile,
     source: &str,
     weights: &TestAssertionWeights,
@@ -220,11 +223,7 @@ pub(super) fn detect_test_assertion_smells_java(
     findings
 }
 
-pub(super) fn collect_nodes_by_kind<'tree>(
-    node: Node<'tree>,
-    kind: &str,
-    out: &mut Vec<Node<'tree>>,
-) {
+pub fn collect_nodes_by_kind<'tree>(node: Node<'tree>, kind: &str, out: &mut Vec<Node<'tree>>) {
     if node.kind() == kind {
         out.push(node);
     }
@@ -263,7 +262,7 @@ fn annotation_name(annotation: Node<'_>, source: &str) -> Option<String> {
 }
 
 fn analyze_test_method_assertions(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     file: &ProjectFile,
     source: &str,
     method: Node<'_>,
@@ -342,7 +341,7 @@ fn analyze_test_method_assertions(
 }
 
 fn analyze_anonymous_test_doubles(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     file: &ProjectFile,
     source: &str,
     method: Node<'_>,

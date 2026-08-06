@@ -3,7 +3,6 @@ use super::java_artifact::{
     source_api_types, source_declaration_index, zip_directory_status_with_limits,
 };
 use crate::CancellationToken;
-use crate::analyzer::java::declarations::{node_text, parse_tree};
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
     AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics, Completeness,
@@ -11,6 +10,7 @@ use crate::analyzer::semantic_model::{
     ProducerDiagnosticSeverity, Visibility, read_exact_artifact_while,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_jvm::java::declarations::{node_text, parse_tree};
 use std::io::{Cursor, Read};
 use std::path::{Component, Path};
 use zip::ZipArchive;

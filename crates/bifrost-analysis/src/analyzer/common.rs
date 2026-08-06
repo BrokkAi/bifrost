@@ -1,5 +1,6 @@
 pub(crate) use brokk_bifrost_core::analyzer::common::{
-    max_line_length_limit, node_ident_text, node_source_text, node_source_text_trimmed, node_span,
+    collapse_whitespace, max_line_length_limit, node_ident_text, node_source_text,
+    node_source_text_trimmed, node_span,
 };
 // The line cap's only remaining in-crate readers are the three suites that
 // build an over-long line to prove the parse guard fires; production reads it
@@ -224,22 +225,6 @@ pub(crate) fn render_skeleton(
         }
     }
 
-    out
-}
-
-/// `text` with every whitespace run collapsed to a single space and the ends
-/// trimmed.
-///
-/// Used to render a multi-line source header (a class or callable signature)
-/// as one stable line.
-pub(crate) fn collapse_whitespace(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for token in text.split_whitespace() {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(token);
-    }
     out
 }
 

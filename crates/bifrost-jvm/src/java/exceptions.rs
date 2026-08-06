@@ -1,9 +1,11 @@
-use super::*;
-use crate::analyzer::exception_handling::{
+use crate::java::declarations::parse_tree;
+use brokk_bifrost_core::analyzer::exception_handling::{
     HandlerScoreInput, collect_nodes_by_kind, compact_excerpt, find_first_named_descendant,
     has_descendant_of_any_kind_inclusive, has_descendant_of_kind, score_handler, sort_findings,
 };
-use crate::path_utils::rel_path_string;
+use brokk_bifrost_core::analyzer::model::{ExceptionHandlingSmell, ExceptionSmellWeights};
+use brokk_bifrost_core::analyzer::{CodeUnitIndex, ProjectFile};
+use brokk_bifrost_core::path_utils::rel_path_string;
 use tree_sitter::Node;
 
 // heuristic. Kept as a private const list so the port stays explicit; do
@@ -28,8 +30,8 @@ const JAVA_COMMENT_NODE_TYPES: &[&str] = &["line_comment", "block_comment"];
 
 const LOG_RECEIVER_NAMES: &[&str] = &["log", "logger"];
 
-pub(super) fn detect_exception_handling_smells_java(
-    analyzer: &dyn IAnalyzer,
+pub fn detect_exception_handling_smells_java(
+    analyzer: &dyn CodeUnitIndex,
     file: &ProjectFile,
     source: &str,
     weights: &ExceptionSmellWeights,
@@ -49,7 +51,7 @@ pub(super) fn detect_exception_handling_smells_java(
 }
 
 fn analyze_catch_clause(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     file: &ProjectFile,
     source: &str,
     catch_node: Node<'_>,
@@ -121,7 +123,7 @@ fn analyze_catch_clause(
     })
 }
 
-pub(super) fn named_child_by_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+pub fn named_child_by_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| child.kind() == kind)

@@ -1,14 +1,11 @@
 mod adapter;
 mod cache;
 mod clones;
-pub(crate) mod declarations;
 pub(crate) mod diagnostics;
-mod exceptions;
 mod hierarchy;
 pub(crate) mod imports;
 mod semantic;
-pub(crate) mod structural;
-mod tests;
+mod structural;
 use crate::analyzer::Range;
 use crate::analyzer::store::LimitedQueryRows;
 
@@ -32,11 +29,11 @@ use crate::analyzer::usages::java_graph::{
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BuildProgressEvent, BulkFileStateSource,
-    CallableArity, CloneSmell, CloneSmellWeights, CodeUnit, DeclarationInfo, DeclarationKind,
-    ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights, ForwardQueryProvider,
-    IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeHierarchyProvider, UsageFactsIndex, resolve_analyzer,
+    CallableArity, CloneSmell, CloneSmellWeights, CodeUnit, DeclarationKind,
+    ExceptionHandlingAnalysis, ExceptionSmellWeights, ForwardQueryProvider, IAnalyzer,
+    ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    UsageFactsIndex, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -47,15 +44,15 @@ use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 use crate::analyzer::structural::resolution::BoundaryStatus;
 pub(crate) use adapter::JavaAdapter;
-use cache::JavaMemoCaches;
-use clones::build_clone_candidate_data;
-use declarations::{
+use brokk_bifrost_jvm::java::declarations::{
     collect_type_identifiers, find_nearest_declaration_from_node, is_comment_node,
     is_declaration_parent, is_java_anonymous_structure, node_text, normalize_java_full_name,
     parse_tree,
 };
-use exceptions::detect_exception_handling_smells_java;
-use tests::detect_test_assertion_smells_java;
+use brokk_bifrost_jvm::java::exceptions::detect_exception_handling_smells_java;
+use brokk_bifrost_jvm::java::test_detection::detect_test_assertion_smells_java;
+use cache::JavaMemoCaches;
+use clones::build_clone_candidate_data;
 
 #[derive(Clone)]
 pub struct JavaAnalyzer {
@@ -936,7 +933,7 @@ impl LanguageSupport for JavaSupport {
     }
 
     fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
-        &structural::JAVA_STRUCTURAL_SPEC
+        &brokk_bifrost_jvm::java::structural::JAVA_STRUCTURAL_SPEC
     }
 
     fn highlight_query(&self) -> Option<&'static str> {

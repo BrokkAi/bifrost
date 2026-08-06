@@ -1,7 +1,9 @@
-use super::*;
-use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
-use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::analyzer::{CallableArity, SignatureMetadata};
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::model::{CallableArity, SignatureMetadata};
+use brokk_bifrost_core::analyzer::model::{DeclarationInfo, DeclarationKind};
+use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Parser, Tree};
 
 /// Intern one qualified-name segment in the process-global interner.
@@ -26,7 +28,7 @@ fn java_package_fq(package_name: &str) -> FqName {
     fq
 }
 
-pub(crate) fn determine_package_name(root: Node<'_>, source: &str) -> String {
+pub fn determine_package_name(root: Node<'_>, source: &str) -> String {
     for index in 0..root.named_child_count() {
         let Some(child) = root.named_child(index) else {
             continue;
@@ -67,7 +69,7 @@ fn strip_generic_type_arguments(input: &str) -> String {
     out
 }
 
-pub(crate) fn normalize_java_full_name(fq_name: &str) -> String {
+pub fn normalize_java_full_name(fq_name: &str) -> String {
     let mut normalized = strip_generic_type_arguments(fq_name);
 
     if normalized.contains("$anon$") {
@@ -131,7 +133,7 @@ fn strip_location_suffix(input: &str) -> String {
     head.to_string()
 }
 
-pub(super) fn extract_java_call_receiver(reference: &str) -> Option<String> {
+pub fn extract_java_call_receiver(reference: &str) -> Option<String> {
     let trimmed = reference.trim();
     if trimmed.is_empty() || !trimmed.is_ascii() {
         return None;
@@ -193,7 +195,7 @@ fn looks_like_pascal_identifier(name: &str) -> bool {
     first.is_ascii_uppercase() && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-pub(super) fn is_java_anonymous_structure(fq_name: &str) -> bool {
+pub fn is_java_anonymous_structure(fq_name: &str) -> bool {
     fq_name.contains("$anon$")
         || fq_name
             // fqname-M4: classifies a JVM bytecode-derived anonymous-structure name, not a CodeUnit fq
@@ -202,11 +204,7 @@ pub(super) fn is_java_anonymous_structure(fq_name: &str) -> bool {
             .unwrap_or(false)
 }
 
-pub(crate) fn collect_type_identifiers(
-    node: Node<'_>,
-    source: &str,
-    identifiers: &mut HashSet<String>,
-) {
+pub fn collect_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
     walk_named_tree_preorder(node, true, |node| {
         match node.kind() {
             "type_identifier" | "scoped_type_identifier" => {
@@ -221,14 +219,14 @@ pub(crate) fn collect_type_identifiers(
     });
 }
 
-pub(super) fn visit_class_like(
+pub fn visit_class_like(
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
     package_name: &str,
     parent: Option<&CodeUnit>,
     top_level_owner: Option<&CodeUnit>,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
 ) -> Option<CodeUnit> {
     let mut first = None;
     let mut stack = vec![(node, parent.cloned(), top_level_owner.cloned())];
@@ -261,7 +259,7 @@ pub(super) fn visit_class_like(
 
         let code_unit = CodeUnit::new_fq(
             file.clone(),
-            crate::analyzer::CodeUnitType::Class,
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Class,
             package_name.to_string(),
             short_name,
             fq,
@@ -362,7 +360,7 @@ fn visit_callable(
     package_name: &str,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
 ) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
@@ -388,7 +386,7 @@ fn visit_callable(
         .with_pushed(java_segment(name, SegmentKind::Member));
     let code_unit = CodeUnit::with_signature_and_fq(
         file.clone(),
-        crate::analyzer::CodeUnitType::Function,
+        brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
         package_name.to_string(),
         short_name,
         signature.clone(),
@@ -435,7 +433,7 @@ fn visit_compact_constructor(
     package_name: &str,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
 ) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
@@ -458,7 +456,7 @@ fn visit_compact_constructor(
         .with_pushed(java_segment(name, SegmentKind::Member));
     let code_unit = CodeUnit::with_signature_and_fq(
         file.clone(),
-        crate::analyzer::CodeUnitType::Function,
+        brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
         package_name.to_string(),
         short_name,
         Some(signature),
@@ -501,7 +499,7 @@ fn visit_field_declaration(
     package_name: &str,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -524,7 +522,7 @@ fn visit_field_declaration(
             .with_pushed(java_segment(name, SegmentKind::Member));
         let code_unit = CodeUnit::new_fq(
             file.clone(),
-            crate::analyzer::CodeUnitType::Field,
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
             package_name.to_string(),
             format!("{}.{}", parent.short_name(), name),
             fq,
@@ -591,7 +589,7 @@ fn visit_record_components(
     package_name: &str,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
 ) {
     let Some(parameters) = node.child_by_field_name("parameters") else {
         return;
@@ -618,7 +616,7 @@ fn visit_record_components(
             .with_pushed(java_segment(name, SegmentKind::Member));
         let code_unit = CodeUnit::new_fq(
             file.clone(),
-            crate::analyzer::CodeUnitType::Field,
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
             package_name.to_string(),
             format!("{}.{}", parent.short_name(), name),
             fq,
@@ -641,7 +639,7 @@ fn visit_enum_constant(
     package_name: &str,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
 ) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
@@ -658,7 +656,7 @@ fn visit_enum_constant(
         .with_pushed(java_segment(name, SegmentKind::Member));
     let code_unit = CodeUnit::new_fq(
         file.clone(),
-        crate::analyzer::CodeUnitType::Field,
+        brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
         package_name.to_string(),
         format!("{}.{}", parent.short_name(), name),
         fq,
@@ -680,7 +678,7 @@ fn collect_lambda_expressions(
     package_name: &str,
     parent: &CodeUnit,
     top_level: &CodeUnit,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
 ) {
     let mut stack = vec![(node, parent.clone())];
     while let Some((node, parent)) = stack.pop() {
@@ -748,7 +746,7 @@ fn lambda_code_unit(
     };
     CodeUnit::with_signature_and_fq(
         file.clone(),
-        crate::analyzer::CodeUnitType::Function,
+        brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
         package_name.to_string(),
         short_name,
         None,
@@ -757,15 +755,15 @@ fn lambda_code_unit(
     )
 }
 
-pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text(node, source)
+pub fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
-pub(super) fn normalize_whitespace(text: &str) -> String {
-    crate::analyzer::common::collapse_whitespace(text)
+pub fn normalize_whitespace(text: &str) -> String {
+    brokk_bifrost_core::analyzer::common::collapse_whitespace(text)
 }
 
-pub(crate) fn parse_tree(source: &str) -> Option<Tree> {
+pub fn parse_tree(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_java::LANGUAGE.into())
@@ -773,11 +771,11 @@ pub(crate) fn parse_tree(source: &str) -> Option<Tree> {
     parser.parse(source, None)
 }
 
-pub(super) fn is_comment_node(node: Node<'_>) -> bool {
+pub fn is_comment_node(node: Node<'_>) -> bool {
     matches!(node.kind(), "line_comment" | "block_comment")
 }
 
-pub(super) fn is_declaration_parent(kind: &str) -> bool {
+pub fn is_declaration_parent(kind: &str) -> bool {
     matches!(
         kind,
         "method_declaration"
@@ -794,7 +792,7 @@ pub(super) fn is_declaration_parent(kind: &str) -> bool {
     )
 }
 
-pub(crate) fn is_class_like_declaration_kind(kind: &str) -> bool {
+pub fn is_class_like_declaration_kind(kind: &str) -> bool {
     matches!(
         kind,
         "class_declaration"
@@ -805,7 +803,7 @@ pub(crate) fn is_class_like_declaration_kind(kind: &str) -> bool {
     )
 }
 
-pub(crate) fn class_like_body_children_rev<'tree>(body: Node<'tree>) -> Vec<Node<'tree>> {
+pub fn class_like_body_children_rev<'tree>(body: Node<'tree>) -> Vec<Node<'tree>> {
     let mut children = Vec::new();
     for index in (0..body.named_child_count()).rev() {
         let Some(child) = body.named_child(index) else {
@@ -816,7 +814,7 @@ pub(crate) fn class_like_body_children_rev<'tree>(body: Node<'tree>) -> Vec<Node
     children
 }
 
-pub(super) fn find_nearest_declaration_from_node(
+pub fn find_nearest_declaration_from_node(
     start_node: Node<'_>,
     identifier: &str,
     source: &str,
@@ -1001,7 +999,7 @@ fn declaration_info(identifier: &str, kind: DeclarationKind, node: Node<'_>) -> 
     DeclarationInfo {
         identifier: identifier.to_string(),
         kind,
-        range: crate::analyzer::Range {
+        range: brokk_bifrost_core::analyzer::Range {
             start_byte: node.start_byte(),
             end_byte: node.end_byte(),
             start_line: node.start_position().row + 1,
@@ -1226,19 +1224,19 @@ fn enum_constant_signature(node: Node<'_>, source: &str) -> String {
     text
 }
 
-pub(super) fn module_code_unit(file: &ProjectFile, package_name: &str) -> CodeUnit {
+pub fn module_code_unit(file: &ProjectFile, package_name: &str) -> CodeUnit {
     let fq = java_package_fq(package_name);
     match package_name.rsplit_once('.') {
         Some((parent, leaf)) => CodeUnit::new_fq(
             file.clone(),
-            crate::analyzer::CodeUnitType::Module,
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Module,
             parent.to_string(),
             leaf.to_string(),
             fq,
         ),
         None => CodeUnit::new_fq(
             file.clone(),
-            crate::analyzer::CodeUnitType::Module,
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Module,
             String::new(),
             package_name.to_string(),
             fq,
@@ -1246,7 +1244,7 @@ pub(super) fn module_code_unit(file: &ProjectFile, package_name: &str) -> CodeUn
     }
 }
 
-pub(super) fn extract_raw_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
+pub fn extract_raw_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
     let mut raw = Vec::new();
 
     if let Some(superclass) = node.child_by_field_name("superclass") {

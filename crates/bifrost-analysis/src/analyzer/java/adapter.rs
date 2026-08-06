@@ -1,13 +1,13 @@
-use super::declarations::{
+use super::imports::parse_import_info;
+use super::*;
+use crate::analyzer::cognitive_complexity;
+use crate::analyzer::{LanguageAdapter, SignatureMetadata};
+use brokk_bifrost_jvm::java::declarations::{
     collect_type_identifiers, determine_package_name, extract_java_call_receiver,
     is_java_anonymous_structure, module_code_unit, node_text, normalize_java_full_name,
     visit_class_like,
 };
-use super::imports::parse_import_info;
-use super::tests::java_source_contains_tests;
-use super::*;
-use crate::analyzer::cognitive_complexity;
-use crate::analyzer::{LanguageAdapter, SignatureMetadata};
+use brokk_bifrost_jvm::java::test_detection::java_source_contains_tests;
 use brokk_bifrost_jvm::queries::JAVA_QUERY_DIRECTORY;
 use std::sync::LazyLock;
 use tree_sitter::{Node, Parser, Tree};

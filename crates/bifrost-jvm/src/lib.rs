@@ -42,6 +42,7 @@
 //! downcasts that produce the arguments -- including the three that build a
 //! [`realm::JvmSourceRealm`].
 
+pub mod java;
 pub mod kotlin;
 pub mod queries;
 pub mod realm;

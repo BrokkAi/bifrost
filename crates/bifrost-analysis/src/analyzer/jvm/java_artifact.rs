@@ -1,5 +1,4 @@
 use crate::CancellationToken;
-use crate::analyzer::java::declarations::{determine_package_name, node_text, parse_tree};
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
     AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics, Completeness,
@@ -10,6 +9,7 @@ use crate::analyzer::semantic_model::{
     type_declaration_id,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_jvm::java::declarations::{determine_package_name, node_text, parse_tree};
 use jclassfile::attributes::{Attribute, NestedClassFlags};
 use jclassfile::class_file::{ClassFile, ClassFlags};
 use jclassfile::constant_pool::ConstantPool;

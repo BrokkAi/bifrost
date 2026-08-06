@@ -1,7 +1,3 @@
-use crate::analyzer::java::declarations::{
-    class_like_body_children_rev, determine_package_name, is_class_like_declaration_kind,
-    node_text, normalize_java_full_name, parse_tree,
-};
 use crate::analyzer::jvm::dependency_discovery::{discover_build_tools, discover_metadata};
 use crate::analyzer::jvm::java_artifact::{
     JavaJarPackProducer, ZipDirectoryStatus, zip_directory_status,
@@ -27,6 +23,10 @@ use crate::analyzer::{
     JvmExternalDependencies, JvmMavenCoordinate, Project, ProjectFile,
 };
 use crate::hash::HashMap;
+use brokk_bifrost_jvm::java::declarations::{
+    class_like_body_children_rev, determine_package_name, is_class_like_declaration_kind,
+    node_text, normalize_java_full_name, parse_tree,
+};
 use jclassfile::attributes::{Attribute, NestedClassFlags};
 use jclassfile::class_file::{ClassFile, ClassFlags};
 use jclassfile::constant_pool::ConstantPool;
