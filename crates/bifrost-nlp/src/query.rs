@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use brokk_bifrost_analysis::analyzer::{IAnalyzer, WorkspaceAnalyzer};
 use brokk_bifrost_analysis::path_utils::rel_path_string;
 use brokk_bifrost_analysis::searchtools::{
-    MostRelevantFilesParams, MostRelevantFilesRankingMode, most_relevant_files,
+    MostRelevantFilesParams, most_relevant_files_history_only,
 };
 use brokk_bifrost_analysis::searchtools_render::{RenderOptions, RenderText};
 
@@ -354,13 +354,17 @@ pub fn semantic_search(
     let coedit_ranked = if coedit_limit == 0 || seed_paths.is_empty() {
         Vec::new()
     } else {
-        match most_relevant_files(
+        match most_relevant_files_history_only(
             analyzer,
             MostRelevantFilesParams {
                 seed_file_paths: seed_paths,
                 seed_weights: Some(seed_weights),
                 recency_half_life: Some(COEDIT_HALF_LIFE),
-                ranking_mode: MostRelevantFilesRankingMode::HistoryImports,
+                // Semantic co-edit is the Git history leg. The user-facing
+                // most_relevant_files tool still adds import ranking, but that
+                // graph is unrelated to this retrieval signal and can expand
+                // for minutes in large Java workspaces.
+                ranking_mode: Default::default(),
                 limit: coedit_limit,
             },
         ) {

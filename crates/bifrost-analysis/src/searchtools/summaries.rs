@@ -1037,6 +1037,97 @@ pub fn most_relevant_files_with_cancellation(
     })
 }
 
+/// Rank files by recent Git co-change without expanding the import graph.
+///
+/// This is an internal retrieval primitive for semantic search. The public
+/// `most_relevant_files` tool keeps its history-plus-import behavior.
+pub fn most_relevant_files_history_only(
+    analyzer: &dyn IAnalyzer,
+    params: MostRelevantFilesParams,
+) -> Result<MostRelevantFilesResult, String> {
+    let _scope = profiling::scope("searchtools::most_relevant_files_history_only");
+    validate_most_relevant_files_params(&params)?;
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
+    let mut seeds = Vec::new();
+    let mut not_found = Vec::new();
+    let mut ambiguous_paths = Vec::new();
+    let mut duplicates = Vec::new();
+    let seed_weights = params
+        .seed_weights
+        .unwrap_or_else(|| vec![1.0; params.seed_file_paths.len()]);
+    let recency_half_life = params.recency_half_life;
+    let requested_limit = params.limit;
+    let mut resolved_by_file = HashMap::default();
+
+    for (input, weight) in params.seed_file_paths.into_iter().zip(seed_weights) {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match resolver.resolve_literal(trimmed) {
+            ResolvedFileInput::File(file) => {
+                let display_path = rel_path_string(&file);
+                if resolved_by_file.insert(file.clone(), ()).is_some() {
+                    duplicates.push(display_path);
+                    continue;
+                }
+                seeds.push((file, weight));
+            }
+            ResolvedFileInput::Ambiguous(item) => ambiguous_paths.push(item),
+            ResolvedFileInput::NotFound(item) => not_found.push(file_not_found_input(item)),
+        }
+    }
+
+    duplicates.sort();
+    duplicates.dedup();
+    if !duplicates.is_empty() {
+        return Ok(MostRelevantFilesResult {
+            files: Vec::new(),
+            not_found,
+            ambiguous_paths,
+            duplicates,
+            complete: true,
+            ranking_mode_used: MostRelevantFilesRankingMode::HistoryImports,
+            incomplete_reason: None,
+        });
+    }
+
+    let (ranked, history_status) = most_relevant_project_files_history_only(
+        analyzer,
+        &seeds,
+        requested_limit,
+        recency_half_life,
+        &crate::CancellationToken::default(),
+    );
+    let files = ranked
+        .into_iter()
+        .map(|file| MostRelevantFile {
+            test: super::scan_usages::classify_resolved_test_file(analyzer, &file).kind,
+            path: rel_path_string(&file),
+        })
+        .collect();
+    let (complete, incomplete_reason) = match history_status {
+        crate::relevance::HistoryRankingStatus::Complete => (true, None),
+        crate::relevance::HistoryRankingStatus::HistoryUnavailable => (
+            false,
+            Some(MostRelevantFilesIncompleteReason::HistoryUnavailable),
+        ),
+        crate::relevance::HistoryRankingStatus::Cancelled => {
+            (false, Some(MostRelevantFilesIncompleteReason::Cancelled))
+        }
+    };
+
+    Ok(MostRelevantFilesResult {
+        files,
+        not_found,
+        ambiguous_paths,
+        duplicates,
+        complete,
+        ranking_mode_used: MostRelevantFilesRankingMode::HistoryImports,
+        incomplete_reason,
+    })
+}
+
 fn most_relevant_files_cancellation_message(cancellation: &crate::CancellationToken) -> String {
     if cancellation.is_timed_out() {
         "most_relevant_files exceeded its request-wide time budget".to_string()

@@ -2,6 +2,7 @@ use brokk_bifrost::{
     AnalyzerConfig, FilesystemProject, Language, WorkspaceAnalyzer,
     searchtools::{
         MostRelevantFilesParams, MostRelevantFilesRankingMode, TestFileKind, most_relevant_files,
+        most_relevant_files_history_only,
     },
 };
 use std::env;
@@ -31,6 +32,7 @@ fn run() -> Result<(), String> {
     let mut recency_half_life = None;
     let mut ranking_mode = MostRelevantFilesRankingMode::HistoryImports;
     let mut exclude_tests = false;
+    let mut history_only = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -53,6 +55,7 @@ fn run() -> Result<(), String> {
                 ranking_mode = parse_ranking_mode(&value)?;
             }
             "--exclude-tests" => exclude_tests = true,
+            "--history-only" => history_only = true,
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
@@ -97,16 +100,18 @@ fn run() -> Result<(), String> {
     };
     let result = {
         let _scope = brokk_bifrost::profiling::scope("cli.rank");
-        most_relevant_files(
-            workspace.analyzer(),
-            MostRelevantFilesParams {
-                seed_file_paths,
-                seed_weights: None,
-                recency_half_life: recency_half_life.unwrap_or(Some(DEFAULT_RECENCY_HALF_LIFE)),
-                ranking_mode,
-                limit: DEFAULT_LIMIT,
-            },
-        )
+        let params = MostRelevantFilesParams {
+            seed_file_paths,
+            seed_weights: None,
+            recency_half_life: recency_half_life.unwrap_or(Some(DEFAULT_RECENCY_HALF_LIFE)),
+            ranking_mode,
+            limit: DEFAULT_LIMIT,
+        };
+        if history_only {
+            most_relevant_files_history_only(workspace.analyzer(), params)
+        } else {
+            most_relevant_files(workspace.analyzer(), params)
+        }
         .map_err(|err| format!("Failed to rank relevant files: {err}"))?
     };
 
@@ -171,9 +176,10 @@ fn parse_ranking_mode(value: &str) -> Result<MostRelevantFilesRankingMode, Strin
 
 fn print_help() {
     println!(
-        "Usage: most_relevant_files [--root PROJECT_ROOT] [--recency-half-life COMMITS|none] [--ranking-mode history_imports|usage_graph] [--exclude-tests] <seed-file>...\n\
+        "Usage: most_relevant_files [--root PROJECT_ROOT] [--recency-half-life COMMITS|none] [--ranking-mode history_imports|usage_graph] [--history-only] [--exclude-tests] <seed-file>...\n\
          \n\
          Each line is `path<TAB>test-kind`, where the kind is test, test_support, production, or ambiguous.\n\
+         --history-only ranks by Git co-change and skips import-graph expansion.\n\
          --exclude-tests drops the test and test_support lines from the ranked page, so it can print fewer results."
     );
 }

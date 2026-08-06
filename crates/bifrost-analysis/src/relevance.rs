@@ -207,6 +207,51 @@ pub(crate) fn most_relevant_project_files_with_half_life(
     (results, history_status)
 }
 
+/// Rank files by Git co-change only.
+///
+/// Semantic search already has a vector leg. It uses this path for the
+/// independent co-edit signal. Do not add the import graph here: that graph
+/// resolves every reverse importer and can turn one search into minutes of
+/// analyzer work in large Java repositories.
+pub(crate) fn most_relevant_project_files_history_only(
+    analyzer: &dyn IAnalyzer,
+    seeds: &[(ProjectFile, f64)],
+    top_k: usize,
+    half_life: Option<f64>,
+    cancellation: &CancellationToken,
+) -> (Vec<ProjectFile>, HistoryRankingStatus) {
+    let _scope = profiling::scope("relevance::most_relevant_project_files_history_only");
+    if top_k == 0 {
+        return (Vec::new(), HistoryRankingStatus::Complete);
+    }
+    if cancellation.is_cancelled() {
+        return (Vec::new(), HistoryRankingStatus::Cancelled);
+    }
+
+    let seed_weights = seed_weight_map(seeds);
+    if seed_weights.is_empty() {
+        return (Vec::new(), HistoryRankingStatus::Complete);
+    }
+    let excluded: HashSet<_> = seed_weights.keys().cloned().collect();
+    let (candidates, history_status) =
+        related_files_by_git(analyzer, &seed_weights, top_k, half_life, cancellation)
+            .unwrap_or_else(|_| (Vec::new(), HistoryRankingStatus::HistoryUnavailable));
+
+    let mut results = Vec::new();
+    let mut seen = HashSet::default();
+    for candidate in candidates {
+        if append_candidate(&mut results, &mut seen, &excluded, candidate.file, top_k) {
+            break;
+        }
+    }
+    let status = if cancellation.is_cancelled() {
+        HistoryRankingStatus::Cancelled
+    } else {
+        history_status
+    };
+    (results, status)
+}
+
 pub(crate) fn most_relevant_project_files_with_ranking_mode_and_cancellation(
     analyzer: &dyn IAnalyzer,
     seeds: &[(ProjectFile, f64)],

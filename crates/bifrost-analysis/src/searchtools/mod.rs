@@ -38,7 +38,8 @@ use crate::profiling;
 pub use crate::relevance::MostRelevantFilesRankingMode;
 use crate::relevance::{
     DEFAULT_RECENCY_HALF_LIFE, MostRelevantProjectFilesOutcome, most_important_project_files,
-    most_important_project_files_with_cancellation, most_relevant_project_files_with_half_life,
+    most_important_project_files_with_cancellation, most_relevant_project_files_history_only,
+    most_relevant_project_files_with_half_life,
     most_relevant_project_files_with_ranking_mode_and_cancellation,
 };
 use crate::text_utils::{
@@ -196,6 +197,7 @@ pub use summaries::get_summaries;
 pub use summaries::get_summaries_with_cancellation;
 pub use summaries::list_symbols;
 pub use summaries::most_relevant_files;
+pub use summaries::most_relevant_files_history_only;
 pub use summaries::most_relevant_files_with_cancellation;
 
 // Only the moved `#[cfg(test)]` test module reaches this name through the
