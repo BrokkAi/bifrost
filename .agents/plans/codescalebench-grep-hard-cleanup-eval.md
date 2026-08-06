@@ -34,6 +34,8 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - [x] (2026-08-06 03:05Z) Removed OpenJDK from the paired set after its cold generated-file parse tail exceeded 35 minutes.
 - [x] (2026-08-06 03:45Z) Filed Bifrost issue #1690 and bounded each complete-file tree-sitter parse to ten seconds.
 - [x] (2026-08-06 04:20Z) Versioned immutable prewarm records by profiler identity in Brokkbench commit `9c7102391c5`.
+- [x] (2026-08-06 05:25Z) Rescored all 64 baseline archives with the corrected answer contract. The result is 39 scorable tasks, 25 invalid outputs, and 2 solves. The rescore report is `baseline-rescore-v2.json` in the campaign directory.
+- [x] (2026-08-06 05:28Z) Started a sequential host-only DW10 prewarm for the 18 unique source revisions used by the 20-task near-miss set. No evaluation container performs prewarm.
 - [ ] Prewarm the replacement 20-task set and restart the corrected symbol arm.
 - [ ] (2026-08-05 23:25Z) Run the selected tasks with symbol tools. The first 20-task arm stopped after a linked-worktree fault and a false cache-readiness assumption.
 - [ ] Run the same tasks with symbol and NLP tools.
@@ -94,6 +96,8 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Evidence: The exact three-symbol CockroachDB reproduction fell from more than 90 seconds to 4.55 seconds, including 0.96 seconds of process startup.
 - Observation: The old corrected baseline still called contract-breaking answers scorable.
   Evidence: Only 37 of 64 outputs are valid grep failures. Two are solves, six are missing, and nineteen have answer-contract errors.
+- Observation: The stored baseline result records used the old contract scorer.
+  Evidence: The rescore of their archived `task-output` files reports 39 scorable tasks and 25 invalid outputs: six missing artifacts and nineteen contract or repository-shape errors.
 - Observation: The reported 15 of 20 result was a completion count, not a solve count.
   Evidence: The corrected Luna maximum baseline has only two solves across all 64 tasks. Every task called `grep_search`.
 - Observation: The `grep_hard` source list came from manual task and oracle review.
@@ -166,6 +170,9 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Date/Author: 2026-08-06 / Codex
 - Decision: Include the profiler digest in each immutable CodeScale readiness file name.
   Rationale: The record content already validates this digest. Its path must permit records from more than one Bifrost build.
+  Date/Author: 2026-08-06 / Codex
+- Decision: Run the replacement prewarm outside task containers.
+  Rationale: Container-local prewarm contends with evaluation reads and can hide query latency. The host profiler shares the cache and uses Bifrost's normal multi-device sidecar scheduler.
   Date/Author: 2026-08-06 / Codex
 
 ## Outcomes & Retrospective
