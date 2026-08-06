@@ -68,7 +68,6 @@ use crate::analyzer::scala::{
     scala_supertype_lookup_nodes, scala_type_lookup_segments,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
-use crate::analyzer::usage_facts::CallableFacts;
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, UsageReferenceKind,
     build_edge_output, build_file_declarations_from_state, class_range_index_from_state,
@@ -78,7 +77,7 @@ use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInfere
 use crate::analyzer::usages::model::UsageHitKind;
 use crate::analyzer::usages::same_owner::route_same_owner;
 use crate::analyzer::{
-    CallableArity, CodeUnit, GlobalUsageDefinitionIndex, Range, UsageFactsIndex,
+    CallableArity, CallableFacts, CodeUnit, GlobalUsageDefinitionIndex, Range, UsageFactsIndex,
 };
 use crate::analyzer::{
     IAnalyzer, ImportAnalysisProvider, ProjectFile, ScalaAnalyzer, TypeHierarchyProvider,

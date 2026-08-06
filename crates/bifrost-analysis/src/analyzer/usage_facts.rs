@@ -1,13 +1,5 @@
-use crate::analyzer::{CallableArity, CodeUnit, DefinitionIndexHandle, IAnalyzer, LanguageAdapter};
+use crate::analyzer::{CallableFacts, CodeUnit, DefinitionIndexHandle, IAnalyzer, LanguageAdapter};
 use crate::hash::{HashMap, HashSet};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CallableFacts {
-    pub(crate) arity: Option<usize>,
-    pub(crate) callable_arity: Option<CallableArity>,
-    pub(crate) return_type_fqn: Option<String>,
-    pub(crate) is_function: bool,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CallableFactsEntry {
