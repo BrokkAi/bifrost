@@ -466,10 +466,6 @@ impl CppSource for CppAnalyzer {
         CppAnalyzer::include_target_index(self)
     }
 
-    fn cpp_import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
-    }
-
     fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner.raw_supertypes_of(code_unit)
     }

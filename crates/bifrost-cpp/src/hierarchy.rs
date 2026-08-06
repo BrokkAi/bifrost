@@ -40,7 +40,7 @@ pub fn build_cpp_visible_type_units(cpp: &dyn CppSource, file: &ProjectFile) -> 
 
         let imports = {
             let _imports = profiling::scope("cpp.visible_types.imports");
-            cpp.cpp_import_statements(&current)
+            cpp.import_statements(&current)
         };
         for include in include_paths(&imports) {
             for target in resolve_include_targets_with_index(&current, &include, include_targets) {
