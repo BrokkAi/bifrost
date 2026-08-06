@@ -13,8 +13,8 @@ exclude = ["tests/**"]
 name = "brokk_bifrost_runtime"
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.22" }
-brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.8.22" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.23" }
+brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.8.23" }
 
 [dev-dependencies]
 serde_json = "1.0.145"
