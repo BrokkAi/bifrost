@@ -3186,12 +3186,6 @@ where
         let Some(source) = self.current_source(file) else {
             return indexed.or_else(|| self.fetch_file_state_from_current_source(file));
         };
-        if indexed
-            .as_ref()
-            .is_some_and(|state| !Self::same_source_ignoring_crlf(&state.source, &source))
-        {
-            return indexed;
-        }
         self.fetch_file_state_from_source(file, source).or(indexed)
     }
 
