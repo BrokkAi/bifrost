@@ -31,6 +31,7 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - [x] (2026-08-06 02:13Z) Built runtime r9 and started the corrected symbol arm.
 - [x] (2026-08-06 02:16Z) Stopped runtime r9 after the paired-set audit found invalid baseline evidence.
 - [x] (2026-08-06 02:25Z) Made answer-contract errors unscorable and selected 20 valid empirical Luna grep near-misses.
+- [x] (2026-08-06 03:05Z) Removed OpenJDK from the paired set after its cold generated-file parse tail exceeded 35 minutes.
 - [ ] Prewarm the replacement 20-task set and restart the corrected symbol arm.
 - [ ] (2026-08-05 23:25Z) Run the selected tasks with symbol tools. The first 20-task arm stopped after a linked-worktree fault and a false cache-readiness assumption.
 - [ ] Run the same tasks with symbol and NLP tools.
@@ -95,6 +96,8 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Evidence: The corrected Luna maximum baseline has only two solves across all 64 tasks. Every task called `grep_search`.
 - Observation: The `grep_hard` source list came from manual task and oracle review.
   Evidence: Its `selection_basis` fields cite behavioral instructions and dispersed oracles. They do not cite a measured grep baseline.
+- Observation: OpenJDK is not shovel-ready with the current analyzer cache.
+  Evidence: Its prewarm wrote about 40 GB, then spent more than 35 minutes on one CPU core in tree-sitter. The largest Java files are generated-style tables and field fixtures. The run stopped before agent execution.
 
 ## Decision Log
 
@@ -149,6 +152,9 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - Decision: Define the evaluation set from measured Luna maximum grep failures.
   Rationale: Manual oracle dispersion does not prove grep difficulty. The replacement set contains the 20 highest valid scores below 0.8.
   Date/Author: 2026-08-06 / Codex
+- Decision: Replace the OpenJDK near-miss with the next valid Kubernetes near-miss.
+  Rationale: This campaign measures warm interactive tools. A repository with an unfinished 35-minute cold parse is not shovel-ready.
+  Date/Author: 2026-08-06 / Codex
 
 ## Outcomes & Retrospective
 
@@ -162,7 +168,7 @@ A completion outcome means the agent and verifier completed normally. It is not 
 
 The shovel-ready subset contains tasks whose images exist and whose exact source revisions and Bifrost vectors are already available. This restriction prevents image builds or new embeddings from changing the tool comparison.
 
-The replacement paired manifest is `.agents/docs/codescale-grep-hard-luna-max-nearmiss20.tasks`. Each task has one valid Luna maximum baseline output, at least one `grep_search` call, and a canonical score below 0.8. Its scores range from 0.5545 through 0.7727. The set uses near-misses because they provide more sensitivity to localization-tool gains than arbitrary low-score failures.
+The replacement paired manifest is `.agents/docs/codescale-grep-hard-luna-max-nearmiss20.tasks`. Each task has one valid Luna maximum baseline output, at least one `grep_search` call, and a canonical score below 0.8. Its scores range from 0.5522 through 0.7727. The set uses near-misses because they provide more sensitivity to localization-tool gains than arbitrary low-score failures. It excludes OpenJDK because that repository did not meet the warm-readiness requirement.
 
 ## Plan of Work
 
