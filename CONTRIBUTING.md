@@ -222,8 +222,8 @@ The package-set check creates and unpacks every `.crate` archive, then
 builds a temporary consumer with local registry patches. Publication follows
 the dependency graph: `brokk-bifrost-core`, then the language crates
 `brokk-bifrost-cpp`, `brokk-bifrost-csharp`, `brokk-bifrost-go`,
-`brokk-bifrost-php`, `brokk-bifrost-python`, `brokk-bifrost-ruby` and
-`brokk-bifrost-rust` (which may
+`brokk-bifrost-jvm`, `brokk-bifrost-php`, `brokk-bifrost-python`,
+`brokk-bifrost-ruby` and `brokk-bifrost-rust` (which may
 run in parallel), then `brokk-bifrost-analysis`, then
 its direct dependents `brokk-bifrost-policy`, `brokk-bifrost-nlp`, and
 `brokk-bifrost-semantic-packs` (which may run in parallel), then
@@ -241,6 +241,7 @@ This table is the expected crates.io publication set for the workspace.
 | `brokk-bifrost-cpp` | `crates/bifrost-cpp/Cargo.toml` | 2 |
 | `brokk-bifrost-csharp` | `crates/bifrost-csharp/Cargo.toml` | 2 |
 | `brokk-bifrost-go` | `crates/bifrost-go/Cargo.toml` | 2 |
+| `brokk-bifrost-jvm` | `crates/bifrost-jvm/Cargo.toml` | 2 |
 | `brokk-bifrost-php` | `crates/bifrost-php/Cargo.toml` | 2 |
 | `brokk-bifrost-python` | `crates/bifrost-python/Cargo.toml` | 2 |
 | `brokk-bifrost-ruby` | `crates/bifrost-ruby/Cargo.toml` | 2 |
@@ -272,8 +273,8 @@ change before the next version release. Configure its trusted publisher during
 that bootstrap.
 
 `brokk-bifrost-cpp`, `brokk-bifrost-csharp`, `brokk-bifrost-go`,
-`brokk-bifrost-php`, `brokk-bifrost-python`, `brokk-bifrost-ruby` and
-`brokk-bifrost-rust` are new
+`brokk-bifrost-jvm`, `brokk-bifrost-php`, `brokk-bifrost-python`,
+`brokk-bifrost-ruby` and `brokk-bifrost-rust` are new
 packages that still await that bootstrap publication. Trusted publishing cannot create a new crate, so
 each one's first version must be uploaded with a scoped crates.io API token
 from a clean, reviewed commit. Then set the crate owners and configure the

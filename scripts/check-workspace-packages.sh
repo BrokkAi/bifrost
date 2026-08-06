@@ -7,6 +7,7 @@ readonly packages=(
   brokk-bifrost-cpp
   brokk-bifrost-csharp
   brokk-bifrost-go
+  brokk-bifrost-jvm
   brokk-bifrost-php
   brokk-bifrost-python
   brokk-bifrost-ruby
@@ -37,6 +38,7 @@ readonly cargo_patch_args=(
   --config 'patch.crates-io.brokk-bifrost-cpp.path="crates/bifrost-cpp"'
   --config 'patch.crates-io.brokk-bifrost-csharp.path="crates/bifrost-csharp"'
   --config 'patch.crates-io.brokk-bifrost-go.path="crates/bifrost-go"'
+  --config 'patch.crates-io.brokk-bifrost-jvm.path="crates/bifrost-jvm"'
   --config 'patch.crates-io.brokk-bifrost-php.path="crates/bifrost-php"'
   --config 'patch.crates-io.brokk-bifrost-python.path="crates/bifrost-python"'
   --config 'patch.crates-io.brokk-bifrost-ruby.path="crates/bifrost-ruby"'
@@ -115,9 +117,11 @@ done
 require_archive_file brokk-bifrost-core src/lib.rs
 # The unified cache DB's migrations moved down with cache_db.rs.
 require_archive_file brokk-bifrost-core migrations/cache/0001-current-baseline.sql
-# The C++, C#, Go, PHP, Python, Ruby and Rust tree-sitter query assets moved down
-# with their language crates; the epoch salt hashes them from there, so a missing
-# file is a silent epoch change.
+# The C++, C#, Go, Java, PHP, Python, Ruby, Rust and Scala tree-sitter query
+# assets moved down with their language crates; the epoch salt hashes them from
+# there, so a missing file is a silent epoch change. Kotlin's `highlights.scm`
+# is never salted but `KotlinSupport::highlight_query` embeds it, so it is
+# required for the same reason.
 require_archive_file brokk-bifrost-cpp resources/treesitter/cpp/definitions.scm
 require_archive_file brokk-bifrost-cpp resources/treesitter/cpp/identifiers.scm
 require_archive_file brokk-bifrost-cpp resources/treesitter/cpp/imports.scm
@@ -126,6 +130,13 @@ require_archive_file brokk-bifrost-csharp resources/treesitter/c_sharp/imports.s
 require_archive_file brokk-bifrost-go resources/treesitter/go/definitions.scm
 require_archive_file brokk-bifrost-go resources/treesitter/go/identifiers.scm
 require_archive_file brokk-bifrost-go resources/treesitter/go/imports.scm
+require_archive_file brokk-bifrost-jvm resources/treesitter/java/definitions.scm
+require_archive_file brokk-bifrost-jvm resources/treesitter/java/identifiers.scm
+require_archive_file brokk-bifrost-jvm resources/treesitter/java/imports.scm
+require_archive_file brokk-bifrost-jvm resources/treesitter/scala/definitions.scm
+require_archive_file brokk-bifrost-jvm resources/treesitter/scala/imports.scm
+require_archive_file brokk-bifrost-jvm resources/treesitter/kotlin/highlights.scm
+require_archive_file brokk-bifrost-jvm build.rs
 require_archive_file brokk-bifrost-php resources/treesitter/php/definitions.scm
 require_archive_file brokk-bifrost-php resources/treesitter/php/imports.scm
 require_archive_file brokk-bifrost-python resources/treesitter/python/definitions.scm
@@ -136,9 +147,7 @@ require_archive_file brokk-bifrost-ruby resources/treesitter/ruby/identifiers.sc
 require_archive_file brokk-bifrost-ruby resources/treesitter/ruby/imports.scm
 require_archive_file brokk-bifrost-rust resources/treesitter/rust/definitions.scm
 require_archive_file brokk-bifrost-rust resources/treesitter/rust/imports.scm
-require_archive_file brokk-bifrost-analysis build.rs
 require_archive_file brokk-bifrost-analysis migrations/semantic-pack-catalog/0001-current-baseline.sql
-require_archive_file brokk-bifrost-analysis resources/treesitter/java/definitions.scm
 require_archive_file brokk-bifrost-analysis testdata/semantic-model-packs/declarations-v1.json
 require_archive_file brokk-bifrost-nlp src/lib.rs
 require_archive_file brokk-bifrost-policy src/lib.rs
@@ -147,7 +156,11 @@ require_archive_file brokk-bifrost-semantic-packs src/lib.rs
 require_archive_file brokk-bifrost-semantic-packs src/release_bundle.rs
 require_archive_file brokk-bifrost-semantic-packs src/bin/bifrost-semantic-pack.rs
 
-required_analysis_vendor_files=(
+# The vendored Scala and Kotlin grammars moved into brokk-bifrost-jvm with
+# build.rs; their `parser.c` bytes are named in the Scala and Kotlin epoch
+# salts, so an archive missing one would publish a crate that cannot build the
+# parser those salts promise.
+required_jvm_vendor_files=(
   vendor/tree-sitter-scala/LICENSE
   vendor/tree-sitter-scala/BIFROST_PATCH.md
   vendor/tree-sitter-scala/grammar.js
@@ -165,8 +178,8 @@ required_analysis_vendor_files=(
   vendor/tree-sitter-kotlin/src/tree_sitter/array.h
   vendor/tree-sitter-kotlin/src/tree_sitter/parser.h
 )
-for required_file in "${required_analysis_vendor_files[@]}"; do
-  require_archive_file brokk-bifrost-analysis "$required_file"
+for required_file in "${required_jvm_vendor_files[@]}"; do
+  require_archive_file brokk-bifrost-jvm "$required_file"
 done
 
 manifest_policy_files="$temporary/manifest-policy-files.txt"
@@ -236,6 +249,7 @@ brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
 brokk-bifrost-cpp = { path = "$unpacked/brokk-bifrost-cpp-$version" }
 brokk-bifrost-csharp = { path = "$unpacked/brokk-bifrost-csharp-$version" }
 brokk-bifrost-go = { path = "$unpacked/brokk-bifrost-go-$version" }
+brokk-bifrost-jvm = { path = "$unpacked/brokk-bifrost-jvm-$version" }
 brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
 brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }
 brokk-bifrost-ruby = { path = "$unpacked/brokk-bifrost-ruby-$version" }
@@ -275,6 +289,7 @@ brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
 brokk-bifrost-cpp = { path = "$unpacked/brokk-bifrost-cpp-$version" }
 brokk-bifrost-csharp = { path = "$unpacked/brokk-bifrost-csharp-$version" }
 brokk-bifrost-go = { path = "$unpacked/brokk-bifrost-go-$version" }
+brokk-bifrost-jvm = { path = "$unpacked/brokk-bifrost-jvm-$version" }
 brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
 brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }
 brokk-bifrost-ruby = { path = "$unpacked/brokk-bifrost-ruby-$version" }

@@ -1,0 +1,62 @@
+[package]
+name = "brokk-bifrost-jvm"
+version.workspace = true
+edition.workspace = true
+description = "JVM language knowledge for brokk-bifrost: Java, Scala and Kotlin declarations, imports and hierarchy, the shared JVM source realm, and the vendored Scala and Kotlin tree-sitter grammars"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+build = "build.rs"
+# Order matters: gitignore semantics, last match wins. A "!" negation only
+# re-includes a file if it appears AFTER the broad pattern it carves out of.
+# Moved verbatim from `brokk-bifrost-analysis` with the vendor trees; the
+# `queries/highlights.scm` re-include is load-bearing because
+# `ScalaSupport::highlight_query` embeds it.
+exclude = [
+    "vendor/tree-sitter-scala/README.md",
+    "vendor/tree-sitter-scala/queries/**",
+    "!vendor/tree-sitter-scala/queries/highlights.scm",
+    "vendor/tree-sitter-scala/src/grammar.json",
+    "vendor/tree-sitter-scala/src/node-types.json",
+    "vendor/tree-sitter-scala/tree-sitter.json",
+    "resources/treesitter/kotlin/tags.scm",
+    "vendor/tree-sitter-kotlin/src/grammar.json",
+    "vendor/tree-sitter-kotlin/src/node-types.json",
+    "vendor/tree-sitter-kotlin/tree-sitter.json",
+]
+
+[lib]
+name = "brokk_bifrost_jvm"
+
+[dependencies]
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22" }
+regex = "1.12.2"
+tree-sitter = "0.25.10"
+# tree-sitter-java is a grammar generation behind the fleet's 0.25 line, in the
+# same class as tree-sitter-cpp 0.23.4, tree-sitter-c-sharp 0.23.1,
+# tree-sitter-php 0.23.11 and tree-sitter-ruby 0.23.1.
+tree-sitter-java = "0.23.5"
+# Scala and Kotlin have no crates.io grammar: `build.rs` compiles the vendored
+# `parser.c`/`scanner.c` under renamed symbols and `LanguageFn::from_raw` binds
+# the result. The crates.io `tree-sitter-scala` that `brokk-bifrost-analysis`
+# keeps as a dev-dependency is a deliberately different parser.
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1.2"
+
+[features]
+default = []
+# Mirrors `brokk-bifrost-analysis`'s feature of the same name, chained exactly
+# like `brokk-bifrost-cpp`'s: Scala's definition route records build counters
+# from production paths under the same gate, so the hooks must stay reachable
+# across the crate boundary.
+test-support = ["brokk-bifrost-core/test-support"]
+
+[dev-dependencies]
+# Cargo unifies this with the plain `[dependencies]` entry above for this
+# crate's test targets, which is what makes core's test-support surface exist
+# while this crate's unit tests are built.
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22", features = ["test-support"] }
+tempfile = "3.23.0"

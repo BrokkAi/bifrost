@@ -8,6 +8,7 @@ use super::tests::java_source_contains_tests;
 use super::*;
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::{LanguageAdapter, SignatureMetadata};
+use brokk_bifrost_jvm::queries::JAVA_QUERY_DIRECTORY;
 use std::sync::LazyLock;
 use tree_sitter::{Node, Parser, Tree};
 
@@ -48,8 +49,10 @@ impl LanguageAdapter for JavaAdapter {
         Language::Java
     }
 
+    /// Relative to `brokk-bifrost-jvm`'s crate root: the `.scm` assets moved
+    /// with the vendored grammars and are embedded there.
     fn query_directory(&self) -> &'static str {
-        "resources/treesitter/java"
+        JAVA_QUERY_DIRECTORY
     }
 
     fn file_extension(&self) -> &'static str {

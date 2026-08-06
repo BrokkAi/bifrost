@@ -7,19 +7,6 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 publish = true
-build = "build.rs"
-exclude = [
-    "vendor/tree-sitter-scala/README.md",
-    "vendor/tree-sitter-scala/queries/**",
-    "!vendor/tree-sitter-scala/queries/highlights.scm",
-    "vendor/tree-sitter-scala/src/grammar.json",
-    "vendor/tree-sitter-scala/src/node-types.json",
-    "vendor/tree-sitter-scala/tree-sitter.json",
-    "resources/treesitter/kotlin/tags.scm",
-    "vendor/tree-sitter-kotlin/src/grammar.json",
-    "vendor/tree-sitter-kotlin/src/node-types.json",
-    "vendor/tree-sitter-kotlin/tree-sitter.json",
-]
 
 [lib]
 name = "brokk_bifrost_analysis"
@@ -29,6 +16,7 @@ brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22" }
 brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.8.22" }
 brokk-bifrost-csharp = { path = "../bifrost-csharp", version = "=0.8.22" }
 brokk-bifrost-go = { path = "../bifrost-go", version = "=0.8.22" }
+brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.8.22" }
 brokk-bifrost-php = { path = "../bifrost-php", version = "=0.8.22" }
 brokk-bifrost-python = { path = "../bifrost-python", version = "=0.8.22" }
 brokk-bifrost-ruby = { path = "../bifrost-ruby", version = "=0.8.22" }
@@ -73,7 +61,6 @@ tree-sitter = "0.25.10"
 tree-sitter-go = "0.25.0"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
-tree-sitter-language = "0.1"
 tree-sitter-c-sharp = "0.23.1"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-java = "0.23.5"
@@ -88,9 +75,6 @@ quick-xml = "0.40"
 jclassfile = "0.6.0"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 
-[build-dependencies]
-cc = "1.2"
-
 [features]
 default = []
 # Deliberately no `nlp` feature: semantic search is its own crate
@@ -100,6 +84,7 @@ test-support = [
     "brokk-bifrost-core/test-support",
     "brokk-bifrost-cpp/test-support",
     "brokk-bifrost-go/test-support",
+    "brokk-bifrost-jvm/test-support",
 ]
 
 [dev-dependencies]
@@ -109,6 +94,7 @@ test-support = [
 brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22", features = ["test-support"] }
 brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.8.22", features = ["test-support"] }
 brokk-bifrost-go = { path = "../bifrost-go", version = "=0.8.22", features = ["test-support"] }
+brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.8.22", features = ["test-support"] }
 filetime = "0.2"
 jsonschema = { version = "0.48.0", default-features = false }
 pretty_assertions = "1.4.1"

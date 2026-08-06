@@ -1,6 +1,7 @@
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::tree_walk::named_children;
 use crate::analyzer::{Language, LanguageAdapter, ProjectFile, SignatureMetadata};
+use brokk_bifrost_jvm::queries::KOTLIN_QUERY_DIRECTORY;
 use std::sync::LazyLock;
 use tree_sitter::{Node, Tree};
 
@@ -77,8 +78,10 @@ impl LanguageAdapter for KotlinAdapter {
         Language::Kotlin
     }
 
+    /// Relative to `brokk-bifrost-jvm`'s crate root: the `.scm` assets moved
+    /// with the vendored grammars and are embedded there.
     fn query_directory(&self) -> &'static str {
-        "resources/treesitter/kotlin"
+        KOTLIN_QUERY_DIRECTORY
     }
 
     fn file_extension(&self) -> &'static str {

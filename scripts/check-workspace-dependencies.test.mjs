@@ -9,6 +9,7 @@ const names = [
   "brokk-bifrost-cpp",
   "brokk-bifrost-csharp",
   "brokk-bifrost-go",
+  "brokk-bifrost-jvm",
   "brokk-bifrost-php",
   "brokk-bifrost-python",
   "brokk-bifrost-ruby",
@@ -33,6 +34,7 @@ function metadata(overrides = {}) {
     "brokk-bifrost-cpp": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-csharp": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-go": [dependency("brokk-bifrost-core")],
+    "brokk-bifrost-jvm": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-php": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-python": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-ruby": [dependency("brokk-bifrost-core")],
@@ -42,6 +44,7 @@ function metadata(overrides = {}) {
       dependency("brokk-bifrost-cpp"),
       dependency("brokk-bifrost-csharp"),
       dependency("brokk-bifrost-go"),
+      dependency("brokk-bifrost-jvm"),
       dependency("brokk-bifrost-php"),
       dependency("brokk-bifrost-python"),
       dependency("brokk-bifrost-ruby"),
@@ -111,6 +114,7 @@ test("rejects an analysis dependency on prebuilt semantic packs", () => {
             dependency("brokk-bifrost-cpp"),
             dependency("brokk-bifrost-csharp"),
             dependency("brokk-bifrost-go"),
+            dependency("brokk-bifrost-jvm"),
             dependency("brokk-bifrost-php"),
             dependency("brokk-bifrost-python"),
             dependency("brokk-bifrost-ruby"),
@@ -248,6 +252,22 @@ test("rejects a cpp crate reaching back up to analysis", () => {
       }),
     ),
     ["brokk-bifrost-cpp must not depend on workspace package brokk-bifrost-analysis"],
+  );
+});
+
+test("rejects a jvm crate reaching back up to analysis", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({
+        dependencies: {
+          "brokk-bifrost-jvm": [
+            dependency("brokk-bifrost-core"),
+            dependency("brokk-bifrost-analysis"),
+          ],
+        },
+      }),
+    ),
+    ["brokk-bifrost-jvm must not depend on workspace package brokk-bifrost-analysis"],
   );
 });
 

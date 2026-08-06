@@ -266,13 +266,13 @@ dependencies = [
  "brokk-bifrost-cpp",
  "brokk-bifrost-csharp",
  "brokk-bifrost-go",
+ "brokk-bifrost-jvm",
  "brokk-bifrost-php",
  "brokk-bifrost-python",
  "brokk-bifrost-ruby",
  "brokk-bifrost-rust",
  "cap-fs-ext",
  "cap-std",
- "cc",
  "chrono",
  "csv",
  "cvss",
@@ -316,7 +316,6 @@ dependencies = [
  "tree-sitter-go",
  "tree-sitter-java",
  "tree-sitter-javascript",
- "tree-sitter-language",
  "tree-sitter-php",
  "tree-sitter-python",
  "tree-sitter-rbs",
@@ -386,6 +385,19 @@ dependencies = [
  "regex",
  "tree-sitter",
  "tree-sitter-go",
+]
+
+[[package]]
+name = "brokk-bifrost-jvm"
+version = "0.8.22"
+dependencies = [
+ "brokk-bifrost-core",
+ "cc",
+ "regex",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-java",
+ "tree-sitter-language",
 ]
 
 [[package]]

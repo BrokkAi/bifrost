@@ -1,6 +1,7 @@
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile, SignatureMetadata};
+use brokk_bifrost_jvm::queries::SCALA_QUERY_DIRECTORY;
 use std::sync::LazyLock;
 use tree_sitter::Tree;
 
@@ -34,8 +35,10 @@ impl LanguageAdapter for ScalaAdapter {
         Language::Scala
     }
 
+    /// Relative to `brokk-bifrost-jvm`'s crate root: the `.scm` assets moved
+    /// with the vendored grammars and are embedded there.
     fn query_directory(&self) -> &'static str {
-        "resources/treesitter/scala"
+        SCALA_QUERY_DIRECTORY
     }
 
     fn file_extension(&self) -> &'static str {

@@ -8,6 +8,7 @@ const CORE = "brokk-bifrost-core";
 const CPP = "brokk-bifrost-cpp";
 const CSHARP = "brokk-bifrost-csharp";
 const GO = "brokk-bifrost-go";
+const JVM = "brokk-bifrost-jvm";
 const PHP = "brokk-bifrost-php";
 const PYTHON = "brokk-bifrost-python";
 const RUBY = "brokk-bifrost-ruby";
@@ -26,6 +27,7 @@ const EXPECTED_MEMBERS = new Set([
   CPP,
   CSHARP,
   GO,
+  JVM,
   PHP,
   PYTHON,
   RUBY,
@@ -40,8 +42,10 @@ const EXPECTED_MEMBERS = new Set([
 ]);
 // Core is the bottom of the graph and depends on no workspace package; the
 // analysis crate sits directly on it. The per-language crates (cpp, csharp, go,
-// php, python, ruby, rust) sit between the two and depend on core alone -- that is what keeps a
-// language's knowledge out of the analysis compilation unit. Policy and nlp sit directly
+// jvm, php, python, ruby, rust) sit between the two and depend on core alone -- that is what keeps a
+// language's knowledge out of the analysis compilation unit. `jvm` is one crate
+// for Java, Scala and Kotlin because the JVM source realm makes their routes
+// mutually dependent and all three share one `JvmAnalyzerConfig`. Policy and nlp sit directly
 // on analysis as siblings (#1548) so that neither can be pulled into the
 // analysis compilation unit again.
 const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
@@ -49,11 +53,12 @@ const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [CPP, new Set([CORE])],
   [CSHARP, new Set([CORE])],
   [GO, new Set([CORE])],
+  [JVM, new Set([CORE])],
   [PHP, new Set([CORE])],
   [PYTHON, new Set([CORE])],
   [RUBY, new Set([CORE])],
   [RUST, new Set([CORE])],
-  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, PHP, PYTHON, RUBY, RUST])],
+  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JVM, PHP, PYTHON, RUBY, RUST])],
   [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
@@ -67,11 +72,12 @@ const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [CPP, new Set([CORE])],
   [CSHARP, new Set([CORE])],
   [GO, new Set([CORE])],
+  [JVM, new Set([CORE])],
   [PHP, new Set([CORE])],
   [PYTHON, new Set([CORE])],
   [RUBY, new Set([CORE])],
   [RUST, new Set([CORE])],
-  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, PHP, PYTHON, RUBY, RUST])],
+  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JVM, PHP, PYTHON, RUBY, RUST])],
   [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
@@ -100,6 +106,10 @@ const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
   ],
   [
     GO,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [
+    JVM,
     new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
   ],
   [

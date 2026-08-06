@@ -86,6 +86,7 @@ fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str
         .chain(brokk_bifrost_cpp::queries::CPP_QUERY_ASSETS)
         .chain(brokk_bifrost_csharp::queries::CSHARP_QUERY_ASSETS)
         .chain(brokk_bifrost_go::queries::GO_QUERY_ASSETS)
+        .chain(brokk_bifrost_jvm::queries::JVM_QUERY_ASSETS)
         .chain(brokk_bifrost_php::queries::PHP_QUERY_ASSETS)
         .chain(brokk_bifrost_python::queries::PYTHON_QUERY_ASSETS)
         .chain(brokk_bifrost_ruby::queries::RUBY_QUERY_ASSETS)
@@ -159,27 +160,16 @@ fn hash_grammar(hasher: &mut Sha256, lang: &TsLanguage) {
 /// contents)`. Adding/removing or editing a query file rebuilds the crate and
 /// changes the per-language epoch.
 ///
-/// C++'s, C#'s, Go's, PHP's, Python's and Rust's assets live in
-/// `brokk-bifrost-cpp`, `brokk-bifrost-csharp`, `brokk-bifrost-go`,
-/// `brokk-bifrost-php`, `brokk-bifrost-python` and `brokk-bifrost-rust` (they
+/// C++'s, C#'s, Go's, Java's, PHP's, Python's, Ruby's, Rust's and Scala's
+/// assets live in `brokk-bifrost-cpp`, `brokk-bifrost-csharp`,
+/// `brokk-bifrost-go`, `brokk-bifrost-jvm`, `brokk-bifrost-php`,
+/// `brokk-bifrost-python`, `brokk-bifrost-ruby` and `brokk-bifrost-rust` (they
 /// moved with their language knowledge) and are chained in above under the same
 /// `treesitter/cpp/`, `treesitter/c_sharp/`, `treesitter/go/`,
-/// `treesitter/php/`, `treesitter/python/` and `treesitter/rust/` prefixes, so
+/// `treesitter/java/`, `treesitter/php/`, `treesitter/python/`,
+/// `treesitter/ruby/`, `treesitter/rust/` and `treesitter/scala/` prefixes, so
 /// the per-language filter stays one rule.
 const EMBEDDED_QUERIES: &[(&str, &str)] = &[
-    // Java
-    (
-        "treesitter/java/definitions.scm",
-        include_str!("../../../resources/treesitter/java/definitions.scm"),
-    ),
-    (
-        "treesitter/java/imports.scm",
-        include_str!("../../../resources/treesitter/java/imports.scm"),
-    ),
-    (
-        "treesitter/java/identifiers.scm",
-        include_str!("../../../resources/treesitter/java/identifiers.scm"),
-    ),
     // JavaScript
     (
         "treesitter/javascript/definitions.scm",
@@ -208,16 +198,9 @@ const EMBEDDED_QUERIES: &[(&str, &str)] = &[
     ),
     // C++
     // C#
+    // Java
     // PHP
     // Scala
-    (
-        "treesitter/scala/definitions.scm",
-        include_str!("../../../resources/treesitter/scala/definitions.scm"),
-    ),
-    (
-        "treesitter/scala/imports.scm",
-        include_str!("../../../resources/treesitter/scala/imports.scm"),
-    ),
 ];
 
 macro_rules! lang_epoch {
@@ -242,11 +225,16 @@ macro_rules! lang_epoch {
 // `StructuredImportPathKind::StaticMember`. Rows persisted before this change
 // labeled every import `Namespace`, and consumers that now branch on the kind
 // would read a warm workspace's static imports as ordinary type imports.
+// Salt bumped again (#1548 stage 3 fleet): the Java `.scm` query assets moved
+// from this crate's `resources/treesitter/java/` into `brokk-bifrost-jvm`, so
+// the salted content now comes from a different crate's `include_str!`. The
+// bytes are unchanged, which is exactly why the salt has to carry the
+// relocation.
 lang_epoch!(
     Java,
     "java",
     "treesitter/java/",
-    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07;callable-arity-metadata-2026-07;annotated-spread-parameter-metadata-2026-07;compact-record-constructors-2026-07;fq-interned-segments-2026-07;field-modifier-metadata-2026-08;static-import-path-kind-2026-08"
+    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07;callable-arity-metadata-2026-07;annotated-spread-parameter-metadata-2026-07;compact-record-constructors-2026-07;fq-interned-segments-2026-07;field-modifier-metadata-2026-08;static-import-path-kind-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08"
 );
 // Salt bumped: Go `package_name` is now the canonical import path, changing
 // every persisted Go `fq_name`. Forces stale rows to be re-analyzed.
@@ -459,11 +447,16 @@ pub(super) fn php_epoch_before_conditional_free_function_declarations() -> Strin
 // The live grammar fingerprint does not include parser tables. Keep the
 // vendored Scala revision in the salt so conflict-resolution-only grammar
 // changes cannot reuse analysis produced by an older parser.
+// Salt bumped (#1548 stage 3 fleet): the Scala `.scm` query assets and the
+// vendored grammar itself moved from this crate into `brokk-bifrost-jvm`, so
+// the salted content now comes from a different crate's `include_str!`. The
+// bytes are unchanged, which is exactly why the salt has to carry the
+// relocation.
 lang_epoch!(
     Scala,
     "scala",
     "treesitter/scala/",
-    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07"
+    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the C# `.scm` query assets moved from this
 // crate's `resources/treesitter/c_sharp/` into `brokk-bifrost-csharp`, so the
@@ -499,11 +492,17 @@ lang_epoch!(
 // own name without re-parsing the declaring file. A companion indexed before
 // this change carries no metadata at all, and a warm workspace would read every
 // companion as an ordinary nested object — losing every `Base.of()` edge.
+// Salt bumped (#1548 stage 3 fleet): Kotlin's `highlights.scm` and the vendored
+// grammar moved from this crate into `brokk-bifrost-jvm`. Unlike Java's and
+// Scala's, this bump is not forced by the mechanism -- `treesitter/kotlin/`
+// selects no entry in the salted asset set, because Kotlin is
+// declaration-walk-only and neither of its `.scm` files has ever been in
+// `EMBEDDED_QUERIES`. It is here for consistency with its two realm peers.
 lang_epoch!(
     Kotlin,
     "kotlin",
     "treesitter/kotlin/",
-    "tree-sitter-kotlin-fwcd-c8ac3d26-2026-07;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07"
+    "tree-sitter-kotlin-fwcd-c8ac3d26-2026-07;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08"
 );
 
 #[cfg(test)]

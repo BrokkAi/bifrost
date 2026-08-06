@@ -1350,9 +1350,7 @@ impl LanguageSupport for ScalaSupport {
     }
 
     fn highlight_query(&self) -> Option<&'static str> {
-        Some(include_str!(
-            "../../../vendor/tree-sitter-scala/queries/highlights.scm"
-        ))
+        Some(brokk_bifrost_jvm::queries::SCALA_HIGHLIGHTS_QUERY)
     }
 }
 

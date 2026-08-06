@@ -781,9 +781,7 @@ impl LanguageSupport for KotlinSupport {
     }
 
     fn highlight_query(&self) -> Option<&'static str> {
-        Some(include_str!(
-            "../../../resources/treesitter/kotlin/highlights.scm"
-        ))
+        Some(brokk_bifrost_jvm::queries::KOTLIN_HIGHLIGHTS_QUERY)
     }
 }
 
