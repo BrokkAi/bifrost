@@ -368,7 +368,7 @@ pub fn cpp_reconciled_definitions(
     cpp: &dyn CppAnalysisSource,
     fq_name: &str,
 ) -> CppReconciledDefinitionIndex {
-    let _scope = profiling::scope(format!("cpp.reconciled.build[{fq_name}]"));
+    let _scope = profiling::scope_with(|| format!("cpp.reconciled.build[{fq_name}]"));
     let mut index = CppReconciledDefinitionIndex::default();
     let interner = segment_interner();
     // The queried name's terminal segment is the member identifier to probe
@@ -407,15 +407,21 @@ pub fn cpp_reconciled_definitions(
 
     let mut using_by_file: HashMap<ProjectFile, Arc<Vec<String>>> = HashMap::default();
     let candidates: BTreeSet<CodeUnit> = {
-        let _lookup = profiling::scope(format!("cpp.reconcile.lookup[{member_identifier}]"));
+        let _lookup =
+            profiling::scope_with(|| format!("cpp.reconcile.lookup[{member_identifier}]"));
         cpp.lookup_candidates_by_identifier(member_identifier)
     };
-    profiling::note(format!(
-        "cpp.reconcile.candidates[{member_identifier}] n={}",
-        candidates.len()
-    ));
+    profiling::note_with(|| {
+        format!(
+            "cpp.reconcile.candidates[{member_identifier}] n={}",
+            candidates.len()
+        )
+    });
     for unit in candidates {
-        let _candidate = profiling::scope(format!("cpp.reconcile.candidate[{}]", unit.fq_name()));
+        // Lazy: `fq_name` clones a String, and this loop runs once per
+        // same-named candidate in the repo (2.5M per probe file on chromium).
+        let _candidate =
+            profiling::scope_with(|| format!("cpp.reconcile.candidate[{}]", unit.fq_name()));
         let candidate_owner_terminal = unit
             .fq()
             .segments()
@@ -541,10 +547,9 @@ fn cpp_reconcile_definition_identity(
     namespace_candidates.extend(using.iter().map(String::as_str));
 
     let visible = {
-        let _visible = profiling::scope(format!(
-            "cpp.reconcile.visible[{}]",
-            rel_path_string(unit.source())
-        ));
+        let _visible = profiling::scope_with(|| {
+            format!("cpp.reconcile.visible[{}]", rel_path_string(unit.source()))
+        });
         cpp.visible_type_units(unit.source())
     };
     let class_table: Vec<VisibleClass> = visible

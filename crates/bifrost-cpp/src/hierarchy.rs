@@ -23,10 +23,8 @@ pub fn build_cpp_visible_type_units(
     cpp: &dyn CppAnalysisSource,
     file: &ProjectFile,
 ) -> Vec<CodeUnit> {
-    let _scope = profiling::scope(format!(
-        "cpp.visible_types.build[{}]",
-        rel_path_string(file)
-    ));
+    let _scope =
+        profiling::scope_with(|| format!("cpp.visible_types.build[{}]", rel_path_string(file)));
     let include_targets = cpp.include_target_index();
     let mut visited = HashSet::default();
     let mut declarations = Vec::new();
@@ -58,12 +56,14 @@ pub fn build_cpp_visible_type_units(
 
     declarations.sort();
     declarations.dedup();
-    profiling::note(format!(
-        "cpp.visible_types.done[{}] visited={} declarations={}",
-        rel_path_string(file),
-        visited.len(),
-        declarations.len()
-    ));
+    profiling::note_with(|| {
+        format!(
+            "cpp.visible_types.done[{}] visited={} declarations={}",
+            rel_path_string(file),
+            visited.len(),
+            declarations.len()
+        )
+    });
     declarations
 }
 
