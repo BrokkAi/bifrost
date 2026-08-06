@@ -223,3 +223,52 @@ planned ~1.1k, then fleet with the full pattern. The alternative -- fleet now wi
 fat shims -- still buys the frontend and test-loop wins but leaves ~25% of each
 language's mass in analysis and bakes the couplings in eleven more times before the
 workstreams undo them. Fleet execution is on hold for that call.
+
+## Stage-3 fleet: closing measurements (2026-08-06, all eleven languages extracted)
+
+Measured at 249c1121 (js_ts extraction merged, fleet complete), same methodology:
+isolated cargo target (`scripts/with-isolated-cargo-target.sh`), featureless dev
+profile, cold, sequential on an otherwise idle machine.
+
+| | baseline 1071d78a | pre-pilot 49a7f535 | fleet tip 249c1121 |
+| --- | ---: | ---: | ---: |
+| workspace wall | 168.4s | 152.7s | 132.0s |
+| analysis full unit | 123.8s | 109.6s | 88.0s |
+| analysis share of wall | 74% | 72% | 67% |
+| analysis rmeta gate (policy/nlp start) | - | t=105.9 | t=90.7 |
+| language-crate band | - | - | 9 crates, t=26.4 start, all parallel |
+
+Language crate cold units (all start together at t=26.4 on core's rmeta, all
+complete before analysis needs them at t=33.1 -- the entire band is off the
+critical path): php 2.1s, ruby 2.1s, go 2.9s, python 3.3s, csharp 3.5s,
+js-ts 5.1s, rust 6.6s, cpp 6.9s, jvm 8.5s. Core 5.8s at t=22.1.
+
+Steady-state per-crate test loops (`cargo-nextest -p <crate> --lib`, warm):
+js-ts 0.46s, go 0.44s (pilot number reproduced at fleet scale). The
+pre-campaign alternative was the 19s analysis edit loop for any language
+change.
+
+Against the plan's expectations:
+
+- The ~25-30% wall ceiling was the projection for the FULL split including the
+  parked bands (semantic lowerers ~36.8k, semantic_model pack bands ~14.5k+,
+  definition/type routes ~15k+). The landed fleet -- ~165k LOC relocated, parks
+  retained -- delivers -13.6% wall against the pre-pilot tip and -21.6% against
+  the pre-split baseline, with the analysis pole itself down 21.6s (-20%) from
+  the pre-pilot 109.6s. Consistent with the ceiling: the remaining pole is
+  exactly the parked mass plus the framework (analysis src is now 414.0k LOC,
+  from 519k pre-campaign).
+- The per-language locality economics (the pilot's headline) held across the
+  fleet: every language now has a sub-second steady test loop against the
+  pre-campaign 19s, and the 0.47s/kLOC frontend rate held within noise across
+  eleven extractions of very different shape.
+- The xee-xpath/icu_datetime external band (6bcd3cdb) is gone from the cold
+  path; the heaviest remaining externals are libgit2-sys/libsqlite3-sys cc
+  builds and rmcp/lsp-types, all fully overlapped.
+
+Remaining known pole-shrinking work, all parked by design with recorded
+reasons (census docs + decision log): the per-language semantic lowerers, the
+semantic_model pack bands, and the definition/type routes. The routes' js_ts
+share shrank 42% during Js-1/1b (3,984 -> 2,314 LOC) as a side effect of the
+closure relocations, suggesting the route park is softer than the census
+matrix assumed once each language's syntax helpers live crate-side.
