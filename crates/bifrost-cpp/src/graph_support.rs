@@ -11,7 +11,7 @@
 //! The census found no re-entrancy among these accessors, so this is a single
 //! tier rather than the two-tier split some fleet languages needed: the #1134
 //! reconciliation reads `visible_type_units`, which reads `include_target_index`
-//! and `cpp_import_statements`, and none of those reads back into
+//! and the supertrait's `import_statements`, and none of those reads back into
 //! reconciliation.
 //!
 //! Three members are load-bearing beyond their signature:
@@ -20,9 +20,6 @@
 //!   class table. Its *builder* is [`crate::hierarchy::build_cpp_visible_type_units`];
 //!   the cell and its `test-support` build counter stay analyzer-side, so this
 //!   accessor is the only way the reconciler reaches a warm table.
-//! * [`CppSource::cpp_import_statements`] is `IAnalyzer::import_statements`,
-//!   the raw `#include` lines. No core capability exposes it, so it is spelled
-//!   out rather than inherited from a supertrait.
 //! * [`CppSource::raw_supertypes_of`] is
 //!   `TreeSitterAnalyzer::raw_supertypes_of`, whose rows are crate-private to
 //!   analysis; the analyzer hands the decoded base-specifier strings across.
@@ -42,18 +39,6 @@ pub trait CppSource:
     /// The workspace-wide `#include` resolution table, built once per analyzer
     /// generation from [`IncludeTargetIndex::build`].
     fn include_target_index(&self) -> &IncludeTargetIndex;
-
-    /// The raw `#include` lines recorded for `file` (`IAnalyzer::import_statements`).
-    ///
-    /// The one member of this trait that keeps its `cpp_` prefix. Dropping it
-    /// is an E0034 ambiguity, because [`CppWorkspaceSource`] is a supertrait
-    /// here and already spells the same query `import_statements`. The prefix
-    /// is not the real problem: for `CppAnalyzer`, the only implementor of
-    /// both, the two bodies are the same `self.inner.import_statements(file)`
-    /// call, so this member duplicates one it inherits. Removing a published
-    /// trait method is surface curation rather than renaming, so it is left
-    /// for #1731 item 2 instead of being folded in here.
-    fn cpp_import_statements(&self, file: &ProjectFile) -> Vec<String>;
 
     /// The declared base specifiers of `code_unit`, as written
     /// (`TreeSitterAnalyzer::raw_supertypes_of`).

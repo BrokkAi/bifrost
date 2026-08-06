@@ -22,6 +22,13 @@ use std::sync::{Arc, Mutex};
 
 /// Resolve a concrete analyzer of type `T` out of a `&dyn IAnalyzer`, whether it is
 /// that analyzer directly or a [`MultiAnalyzer`] holding it as a per-language delegate.
+///
+/// The contract: `T` must be a concrete analyzer type (`RustAnalyzer`,
+/// `CppAnalyzer`, ...); `None` means the workspace holds no analyzer of that
+/// type, which callers treat as "no declarations of that language exist" --
+/// never as an error. This is the one supported downcast from the framework's
+/// `&dyn IAnalyzer` into a language analyzer; host crates (e.g. the LSP
+/// handlers) call it rather than re-deriving the delegate walk.
 pub fn resolve_analyzer<T: Any>(analyzer: &dyn IAnalyzer) -> Option<&T> {
     if let Some(direct) = (analyzer as &dyn Any).downcast_ref::<T>() {
         return Some(direct);
