@@ -401,6 +401,35 @@ the focus.
     `81e80740bdda0b4017d1bde7e84d9f78ad470ff6987e451db8ca5ca7cf16d915`
     and
     `2592520007ef93b828ff6a5e10e9c56d0714c55055776ac3fc63bda9397a23b7`.
+  - [x] (2026-08-06) Completed C++ rank twenty
+    `cppcheck-opensource__cppcheck` at pinned head `4517bc76`. Its fresh
+    persisted-cache replay at pushed Bifrost `1f0bd3ac` audited 290 files,
+    296,420 structured candidates, 10,000 sites, and all 1,226 inverse target
+    groups. It reported 3,137 consistent, 110 editor-only, 33 honestly
+    unproven, 6,720 inconclusive, and zero missing rows, with no file errors,
+    skipped targets, or truncation. The report SHA-256 is
+    `8b6aeab029f8a4ceff0998f07c679dce38e6eeb5e95b6e18bae18041273c7768`;
+    the exact-head release runner SHA-256 is
+    `59c352607e9c57c171c2a654fb1e0773bf0f5dff8079803bbeecfdae4dcc5363`.
+    Jonathan-assigned issue #1691 fixed exhaustive conditional same-FQN alias
+    families, physical alias ranges, branch isolation, and C++ store
+    invalidation. Jonathan-assigned issue #1694 made cache mode part of the
+    repository and corpus completion fingerprint. Both issues are closed and
+    assigned only to `jbellis`. Formatting, 233 C++ usage tests, all nine
+    differential runner tests, the persisted-cache epoch test, and strict
+    workspace all-target/all-feature Clippy pass. The broad featureless run
+    reached one unrelated C# wall-clock failure after 1,529 sibling tests;
+    that exact test passed alone.
+  - [ ] (2026-08-06) Complete the fresh-epoch language certification and
+    reclose earlier ranks in repository order. The first ten-repository replay
+    at clean pushed head `1f0bd3ac` queried every configured target with no
+    file errors, skips, or truncation, but it correctly rejected the language
+    envelope. Fresh C++ blobs exposed 34 missing rows in rank-eleven
+    libarchive, 16 in rank-thirteen open62541, 7 in rank-fourteen Wuffs, 5 in
+    rank-sixteen esp-v2, and 8 in rank-seventeen Abseil. Ranks twelve,
+    fifteen, eighteen, nineteen, and twenty remained clean. Triage resumed at
+    libarchive; later repositories remain read-only until each earlier rank is
+    closed.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
@@ -560,6 +589,16 @@ the focus.
   `operator_name` and a constructor `identifier`, retain the OpenJDK control,
   and bump the C++ persistence epoch.
 
+- Observation: the rank-twenty C++ epoch bump invalidated all older C++
+  persisted blobs, so the final language certification became the first
+  same-head fresh extraction for several earlier ranks. It exposed 70 raw
+  missing rows across libarchive, open62541, Wuffs, esp-v2, and Abseil while
+  cppcheck, cJSON, BehaviorTree, Mbed TLS, and Pyro stayed clean. This proves
+  that a clean replay from an older analyzer blob is not final evidence after
+  a declaration-extraction epoch change. The campaign therefore returned to
+  rank eleven and will repeat repository-depth-first closure before it accepts
+  a C++ language manifest.
+
 ## Decision Log
 
 - Decision: Treat this as a new ranks-eleven-through-twenty expansion rather
@@ -611,11 +650,12 @@ the focus.
 
 ## Outcomes & Retrospective
 
-The expansion is in progress. The exact 110-repository scope has been derived
-from the live filtered selector. C rank eleven is locally complete as an honest
-zero-file envelope with no issue scope; the remaining 109 repository
-transitions, C final certification, durable evidence publication, and campaign
-gates remain.
+The expansion is in progress. The exact 110-repository scope comes from the
+live filtered selector. C ranks eleven through twenty are complete and have a
+published language manifest. C++ rank twenty is clean and its two issues are
+closed on `origin/master`, but the required fresh-epoch language certification
+reopened earlier C++ repository work. The campaign is processing those
+regressions from rank eleven forward before it starts C#.
 
 ## Context and Orientation
 

@@ -200,3 +200,192 @@ public:
          {mutated_authoritative_ranges:?}"
     );
 }
+
+#[test]
+fn authoritative_cpp_conditional_member_alias_is_retained() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "mathlib.h",
+            r#"#pragma once
+class MathLib {
+public:
+#if defined(HAVE_BOOST) && defined(HAVE_BOOST_INT128)
+    using bigint = int;
+    using biguint = unsigned int;
+#else
+    using bigint = long long;
+    using biguint = unsigned long long;
+#endif
+};
+"#,
+        )
+        .file(
+            "use.cpp",
+            r#"#include "mathlib.h"
+MathLib::bigint value;
+MathLib::biguint unsigned_value;
+#if defined(HAVE_BOOST) && defined(HAVE_BOOST_INT128)
+MathLib::bigint boost_value;
+MathLib::biguint boost_unsigned_value;
+#else
+MathLib::bigint fallback_value;
+MathLib::biguint fallback_unsigned_value;
+#endif
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let source_file = project.file("mathlib.h");
+    let caller = project.file("use.cpp");
+    let source = caller.read_to_string().expect("caller source");
+    for (fq_name, line, written_name) in [
+        ("MathLib$bigint", "MathLib::bigint value;", "bigint"),
+        (
+            "MathLib$biguint",
+            "MathLib::biguint unsigned_value;",
+            "biguint",
+        ),
+    ] {
+        let targets = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .filter(|unit| {
+                unit.kind() == CodeUnitType::Class
+                    && unit.fq_name() == fq_name
+                    && unit.source() == &source_file
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets.len(),
+            2,
+            "both conditional member aliases are indexed"
+        );
+        let expected = owner_token_range(&source, line, written_name);
+        let ranges = usage_ranges(&analyzer, &targets, &caller);
+        assert!(
+            ranges.contains(&expected),
+            "missing {written_name} member alias owner: {ranges:?}"
+        );
+        let authoritative_ranges = authoritative_usage_ranges(&analyzer, &targets, &caller);
+        assert!(
+            authoritative_ranges.contains(&expected),
+            "authoritative batch must retain {written_name} member alias owner: {authoritative_ranges:?}"
+        );
+    }
+
+    let targets = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "MathLib$bigint"
+                && unit.source() == &source_file
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets.len(),
+        2,
+        "both conditional bigint aliases are indexed"
+    );
+    let header_source = source_file.read_to_string().expect("header source");
+    let boost_target = targets
+        .iter()
+        .find(|target| {
+            analyzer
+                .ranges(target)
+                .iter()
+                .any(|range| header_source[range.start_byte..range.end_byte].contains("int;"))
+        })
+        .cloned()
+        .expect("boost bigint target");
+    let fallback_target = targets
+        .iter()
+        .find(|target| {
+            analyzer
+                .ranges(target)
+                .iter()
+                .any(|range| header_source[range.start_byte..range.end_byte].contains("long long"))
+        })
+        .cloned()
+        .expect("fallback bigint target");
+    let boost_range = owner_token_range(&source, "MathLib::bigint boost_value;", "bigint");
+    let fallback_range = owner_token_range(&source, "MathLib::bigint fallback_value;", "bigint");
+    let boost_hits = usage_ranges(&analyzer, std::slice::from_ref(&boost_target), &caller);
+    let fallback_hits = usage_ranges(&analyzer, std::slice::from_ref(&fallback_target), &caller);
+    let boost_authoritative =
+        authoritative_usage_ranges(&analyzer, std::slice::from_ref(&boost_target), &caller);
+    let fallback_authoritative =
+        authoritative_usage_ranges(&analyzer, std::slice::from_ref(&fallback_target), &caller);
+    assert!(
+        boost_hits.contains(&boost_range),
+        "boost alias misses active branch: {boost_hits:?}"
+    );
+    assert!(
+        !boost_hits.contains(&fallback_range),
+        "boost alias leaks into fallback branch: {boost_hits:?}"
+    );
+    assert!(
+        fallback_hits.contains(&fallback_range),
+        "fallback alias misses active branch: {fallback_hits:?}"
+    );
+    assert!(
+        !fallback_hits.contains(&boost_range),
+        "fallback alias leaks into boost branch: {fallback_hits:?}"
+    );
+    assert!(
+        boost_authoritative.contains(&boost_range)
+            && !boost_authoritative.contains(&fallback_range),
+        "authoritative boost alias branch isolation failed: {boost_authoritative:?}"
+    );
+    assert!(
+        fallback_authoritative.contains(&fallback_range)
+            && !fallback_authoritative.contains(&boost_range),
+        "authoritative fallback alias branch isolation failed: {fallback_authoritative:?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_completed_conditional_alias_survives_later_macro_mutation() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "same_file.cpp",
+            r#"class LocalMath {
+public:
+#if defined(USE_WIDE_VALUE)
+    using value_type = long long;
+#else
+    using value_type = int;
+#endif
+};
+#undef USE_WIDE_VALUE
+LocalMath::value_type retained_value;
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let source_file = project.file("same_file.cpp");
+    let source = source_file.read_to_string().expect("same-file source");
+    let targets = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "LocalMath$value_type"
+                && unit.source() == &source_file
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(targets.len(), 2, "both same-file aliases are indexed");
+    let expected = owner_token_range(
+        &source,
+        "LocalMath::value_type retained_value;",
+        "value_type",
+    );
+    assert!(
+        usage_ranges(&analyzer, &targets, &source_file).contains(&expected),
+        "the completed family keeps one active alias after the macro mutation"
+    );
+    assert!(
+        authoritative_usage_ranges(&analyzer, &targets, &source_file).contains(&expected),
+        "the authoritative batch keeps the completed family after the macro mutation"
+    );
+}

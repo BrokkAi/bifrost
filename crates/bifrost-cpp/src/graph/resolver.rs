@@ -2443,22 +2443,48 @@ impl<'a> VisibilityIndex<'a> {
                     && peer.source() == candidate.source()
             })
             .collect::<Vec<_>>();
-        let complementary_visible =
-            self.complementary_same_fqn_type_declarations(analyzer, &complementary, candidate)
-                && if candidate.source() == file {
-                    declaration_guard_requirements(analyzer, self.cpp, candidate)
-                        .iter()
-                        .any(|(declaration_byte, _)| *declaration_byte < reference.start_byte())
-                } else {
-                    self.include_activation_for_source(
-                        self.cpp,
-                        file,
-                        prepared.as_ref(),
-                        candidate.source(),
-                    )
-                    .is_some_and(|activation| activation <= reference.start_byte())
-                };
+        // A completed #if/#else family declares the shared source-level name
+        // before this reference. A later macro mutation cannot revoke that
+        // declaration. The family gate below rejects declarations split across
+        // separate conditional blocks, where mutation can change coverage.
+        let candidate_branch_compatible = reference_guards.as_ref().is_some_and(|active| {
+            declaration_guard_requirements(analyzer, self.cpp, candidate)
+                .iter()
+                .any(|(_, required)| merge_preprocessor_guards(required, active).is_some())
+        });
+        let complementary_visible = candidate_branch_compatible
+            && self.complementary_same_fqn_type_declarations(analyzer, &complementary, candidate)
+            && if candidate.source() == file {
+                declaration_guard_requirements(analyzer, self.cpp, candidate)
+                    .iter()
+                    .any(|(declaration_byte, _)| *declaration_byte < reference.start_byte())
+            } else {
+                self.include_activation_for_source(
+                    self.cpp,
+                    file,
+                    prepared.as_ref(),
+                    candidate.source(),
+                )
+                .is_some_and(|activation| activation <= reference.start_byte())
+            };
         directly_visible || complementary_visible
+    }
+
+    pub fn is_exhaustive_same_fqn_type_declaration_family(
+        &self,
+        analyzer: CppGraphSource<'_>,
+        file: &ProjectFile,
+        candidate: &CodeUnit,
+    ) -> bool {
+        let candidates = self
+            .visible_identifier_candidates(file, candidate.identifier())
+            .filter(|peer| {
+                peer.kind() == candidate.kind()
+                    && peer.fq_name() == candidate.fq_name()
+                    && peer.source() == candidate.source()
+            })
+            .collect::<Vec<_>>();
+        self.complementary_same_fqn_type_declarations(analyzer, &candidates, candidate)
     }
 
     /// Prove a nested type alias used as a dependent member-pointer owner when
