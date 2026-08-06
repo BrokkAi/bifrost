@@ -8,6 +8,7 @@ use brokk_bifrost::{
 use git2::{IndexAddOption, Repository, Signature};
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -50,6 +51,19 @@ fn commit_all(repo: &Repository, message: &str) {
     let parent_refs = parents.iter().collect::<Vec<_>>();
     repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)
         .unwrap();
+}
+
+fn run_git(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("git {args:?} failed to spawn: {error}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -527,6 +541,113 @@ fn dirty_file_scoped_reads_use_live_worktree_content() {
         analyzer.get_skeleton(&dirty_class),
         fresh.get_skeleton(&fresh_class)
     );
+}
+
+#[test]
+fn csharp_clean_crlf_persisted_source_ranges_match_ephemeral() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let source = "namespace Demo\n{\n    public class Service\n    {\n        public int Run()\n        {\n            return 1;\n        }\n    }\n}\n";
+    std::fs::write(root.join(".gitignore"), ".bifrost/\n").unwrap();
+    std::fs::write(root.join("Service.cs"), source).unwrap();
+    let repo = init_git_repo(&root);
+    commit_all(&repo, "LF C# source");
+
+    let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::CSharp));
+    let file = ProjectFile::new(root.clone(), "Service.cs");
+
+    // Seed the persisted store with the canonical LF blob. The later checkout
+    // keeps this row reachable while exposing CRLF bytes to the analyzer.
+    WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+        .expect("LF persisted analyzer should build");
+
+    std::fs::write(root.join(".gitattributes"), "*.cs text eol=crlf\n").unwrap();
+    commit_all(&repo, "CRLF checkout attributes");
+    std::fs::remove_file(root.join("Service.cs")).unwrap();
+    run_git(&root, &["checkout", "--", "Service.cs"]);
+
+    let visible = std::fs::read(root.join("Service.cs")).unwrap();
+    assert!(
+        visible.windows(2).any(|window| window == b"\r\n"),
+        "Git checkout must expose CRLF bytes"
+    );
+    let mut index = repo.index().unwrap();
+    index.read(true).unwrap();
+    let index_entry = index
+        .get_path(Path::new("Service.cs"), 0)
+        .expect("C# source must be tracked");
+    let visible_oid = git2::Oid::hash_object(git2::ObjectType::Blob, &visible).unwrap();
+    assert_ne!(
+        visible_oid, index_entry.id,
+        "CRLF worktree bytes must differ from the canonical LF index blob"
+    );
+    assert_eq!(
+        index_entry.file_size as usize,
+        visible.len(),
+        "checkout must refresh index stat data so the clean fast path is exercised"
+    );
+    let status = Command::new("git")
+        .current_dir(&root)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(
+        status.stdout.is_empty(),
+        "the transformed checkout must remain clean: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    let persisted_parses = Arc::new(AtomicUsize::new(0));
+    let parse_counter = Arc::clone(&persisted_parses);
+    let persisted = WorkspaceAnalyzer::build_persisted_with_progress(
+        Arc::clone(&project),
+        AnalyzerConfig::default(),
+        move |event| {
+            if event.language == Language::CSharp
+                && event.phase == BuildProgressPhase::Parse
+                && event.file.is_some()
+            {
+                parse_counter.fetch_add(1, Ordering::Relaxed);
+            }
+        },
+    )
+    .expect("CRLF persisted analyzer should build");
+    assert_eq!(
+        persisted_parses.load(Ordering::Relaxed),
+        1,
+        "the visible CRLF blob must be parsed instead of hydrating the LF row"
+    );
+
+    let ephemeral = WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default());
+    let persisted_units = persisted.analyzer().declarations(&file);
+    let ephemeral_units = ephemeral.analyzer().declarations(&file);
+    assert_eq!(
+        unit_keys(persisted_units.clone()),
+        unit_keys(ephemeral_units.clone()),
+        "persisted and ephemeral analyzers must expose the same C# declarations"
+    );
+
+    for fq_name in ["Demo.Service", "Demo.Service.Run"] {
+        let persisted_unit = persisted_units
+            .iter()
+            .find(|unit| unit.fq_name() == fq_name)
+            .unwrap_or_else(|| panic!("missing persisted declaration {fq_name}"));
+        let ephemeral_unit = ephemeral_units
+            .iter()
+            .find(|unit| unit.fq_name() == fq_name)
+            .unwrap_or_else(|| panic!("missing ephemeral declaration {fq_name}"));
+        assert_eq!(
+            persisted.analyzer().get_source(persisted_unit, false),
+            ephemeral.analyzer().get_source(ephemeral_unit, false),
+            "source must use the visible CRLF bytes for {fq_name}"
+        );
+        assert_eq!(
+            persisted.analyzer().ranges(persisted_unit),
+            ephemeral.analyzer().ranges(ephemeral_unit),
+            "tree-sitter ranges must match for {fq_name}"
+        );
+    }
 }
 
 #[test]

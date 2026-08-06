@@ -689,7 +689,9 @@ impl PlatformStat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gitblob::test_repo::{commit_all, init_repo};
+    use crate::gitblob::test_repo::{
+        commit_all, commit_paths, init_repo, refresh_index_stat_preserving_oid,
+    };
     use git2::{IndexAddOption, ObjectType};
 
     fn project_file(root: &Path, rel: &str) -> ProjectFile {
@@ -774,6 +776,42 @@ mod tests {
             after.get(&file),
             Some(&Oid::hash_object(ObjectType::Blob, b"fn refreshed() {}\n").unwrap())
         );
+    }
+
+    #[test]
+    fn bulk_oid_projection_hashes_clean_eol_transformed_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        let source_path = temp.path().join("a.cs");
+        std::fs::write(&source_path, "class A {}\n").unwrap();
+        commit_all(&repo, "source");
+
+        // The attribute is committed before the line-ending conversion so Git
+        // treats the CRLF worktree bytes as clean.
+        std::fs::write(temp.path().join(".gitattributes"), "*.cs text eol=crlf\n").unwrap();
+        commit_paths(&repo, &[".gitattributes"], "attributes");
+        std::fs::write(&source_path, "class A {}\r\n").unwrap();
+
+        // Match the index stat Git records after a transformed checkout while
+        // retaining the canonical LF blob OID. This exercises the clean fast
+        // path; a stat-only implementation would incorrectly return the index
+        // OID without hashing the visible CRLF bytes.
+        let index_oid = refresh_index_stat_preserving_oid(&repo, "a.cs");
+
+        assert!(
+            repo.statuses(None).unwrap().is_empty(),
+            "Git must treat the transformed worktree as clean"
+        );
+        let visible_oid = Oid::hash_object(ObjectType::Blob, b"class A {}\r\n").unwrap();
+        assert_ne!(visible_oid, index_oid, "LF and CRLF OIDs must differ");
+
+        let file = project_file(temp.path(), "a.cs");
+        let liveness = Liveness::new(repo).unwrap();
+        let resolved = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(resolved.get(&file), Some(&visible_oid));
+        assert_ne!(resolved.get(&file), Some(&index_oid));
     }
 
     #[cfg(unix)]
