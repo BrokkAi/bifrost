@@ -1010,3 +1010,45 @@ impl Stream for Other {
         "Self::Item in another impl must not resolve to the target: {found:#?}"
     );
 }
+
+#[test]
+fn inverse_rust_grouped_reexport_survives_nested_workspace_crate_root() {
+    // #1376: a crate that lives at `rust/src/lib/` with a non-standard
+    // `[lib] path = "lib.rs"` must still route `crate::` to the Cargo library
+    // root. The legacy path-derived scheme collapsed `rust/src/lib/...` to
+    // `rust.src`, so grouped `pub use crate::{module::Type}` reexport hits were
+    // dropped by inverse usage analysis. The same topology under `src/lib.rs`
+    // already resolves, so the manifest layout, not the reexport shape, was the
+    // fault. Mirrors nmstate `rust/src/lib/lib.rs:132,135`.
+    let lib = "pub mod dispatch;\npub mod hostname;\npub use crate::{dispatch::DispatchConfig, hostname::HostNameState};\n";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "rust/Cargo.toml",
+            "[workspace]\nresolver = \"2\"\nmembers = [\"src/lib\"]\n",
+        )
+        .file(
+            "rust/src/lib/Cargo.toml",
+            "[package]\nname = \"nmstate\"\nversion = \"2.2.61\"\n\n[lib]\npath = \"lib.rs\"\n",
+        )
+        .file("rust/src/lib/lib.rs", lib)
+        .file("rust/src/lib/dispatch.rs", "pub struct DispatchConfig;\n")
+        .file("rust/src/lib/hostname.rs", "pub struct HostNameState;\n")
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+
+    let lib_file = project.file("rust/src/lib/lib.rs");
+    for (fq, name) in [
+        ("nmstate.dispatch.DispatchConfig", "DispatchConfig"),
+        ("nmstate.hostname.HostNameState", "HostNameState"),
+    ] {
+        let target = definition(&analyzer, fq);
+        let candidates = [lib_file.clone()].into_iter().collect();
+        let found = authoritative_hits(&analyzer, target, candidates);
+        let start = lib.find(name).expect("reexport token");
+        assert!(
+            found.iter().any(|hit| hit.file == lib_file
+                && (hit.start_offset, hit.end_offset) == (start, start + name.len())),
+            "grouped reexport hit for {name} under a nested workspace crate root must survive: {found:#?}"
+        );
+    }
+}
