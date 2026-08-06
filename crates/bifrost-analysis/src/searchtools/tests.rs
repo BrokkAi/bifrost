@@ -245,6 +245,37 @@ fn broad_navigation_fallback_omits_unproven_columns() {
 }
 
 #[test]
+fn definition_outcome_key_reuses_declaration_context() {
+    use crate::analyzer::usages::get_definition::{
+        DefinitionLookupOutcome, DefinitionLookupStatus,
+    };
+    use crate::test_support::AnalyzerFixture;
+
+    let fixture =
+        AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", "pub fn target() {}\n")]);
+    let analyzer = fixture.analyzer.analyzer();
+    let unit = analyzer
+        .search_definitions("target", false)
+        .into_iter()
+        .next()
+        .expect("target declaration");
+    let outcome = DefinitionLookupOutcome {
+        status: DefinitionLookupStatus::Resolved,
+        reference: None,
+        definitions: vec![unit],
+        lexical_definition: None,
+        diagnostics: Vec::new(),
+    };
+    let mut render_cache = DefinitionCandidateRenderCache::default();
+
+    let first = super::definitions::semantic_outcome_key(analyzer, &outcome, &mut render_cache);
+    let second = super::definitions::semantic_outcome_key(analyzer, &outcome, &mut render_cache);
+
+    assert_eq!(first, second);
+    assert_eq!(render_cache.declaration_context_count(), 1);
+}
+
+#[test]
 fn python_module_functions_are_not_duplicated_in_file_summary() {
     use crate::analyzer::{Language, PythonAnalyzer, TestProject};
 

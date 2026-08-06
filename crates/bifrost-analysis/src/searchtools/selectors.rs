@@ -346,6 +346,11 @@ pub(super) struct DefinitionCandidateRenderCache {
 }
 
 impl DefinitionCandidateRenderCache {
+    #[cfg(test)]
+    pub(super) fn declaration_context_count(&self) -> usize {
+        self.contexts.len()
+    }
+
     fn exact_display_range(
         context: &DeclarationNameRangeContext,
         mut name_range: Range,
@@ -487,17 +492,6 @@ pub(super) fn navigation_candidates_with_cache(
             ))
         })
         .collect()
-}
-
-pub(super) fn definition_candidate(
-    analyzer: &dyn IAnalyzer,
-    unit: &CodeUnit,
-) -> Option<DefinitionCandidate> {
-    definition_candidate_with_cache(
-        analyzer,
-        unit,
-        &mut DefinitionCandidateRenderCache::default(),
-    )
 }
 
 pub(super) fn definition_candidate_with_cache(
