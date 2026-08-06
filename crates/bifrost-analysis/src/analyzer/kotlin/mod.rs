@@ -67,6 +67,8 @@ use crate::analyzer::store::LimitedQueryRows;
 /// [`brokk_bifrost_jvm::kotlin`]. Re-exporting the modules under their
 /// historical names keeps every `crate::analyzer::kotlin::…` path in this crate
 /// pointing at the same items.
+pub(crate) use brokk_bifrost_jvm::kotlin::graph_support::KotlinSource;
+use brokk_bifrost_jvm::kotlin::imports::build_kotlin_top_level_declarations_by_package;
 pub(crate) use brokk_bifrost_jvm::kotlin::{declarations, syntax};
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
@@ -283,6 +285,46 @@ impl KotlinAnalyzer {
 impl TypeAliasProvider for KotlinAnalyzer {
     fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
         self.inner.is_type_alias(code_unit)
+    }
+}
+
+impl KotlinSource for KotlinAnalyzer {
+    fn kotlin_all_files(&self) -> Vec<ProjectFile> {
+        self.inner.all_files()
+    }
+
+    fn kotlin_package_name_of(&self, file: &ProjectFile) -> Option<String> {
+        self.inner.package_name_of(file)
+    }
+
+    fn usage_definitions(&self) -> &dyn crate::analyzer::BoundedDefinitionLookup {
+        self.inner.global_usage_definition_index_ref()
+    }
+
+    fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>> {
+        self.inner.type_identifiers_of(file)
+    }
+
+    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.inner.raw_supertypes_of(code_unit)
+    }
+
+    /// Built once per analyzer generation: a star import has to widen to a
+    /// whole package, and repeating that scan per file would be quadratic in
+    /// workspace size.
+    fn top_level_declarations_by_package(&self) -> &HashMap<String, Arc<Vec<CodeUnit>>> {
+        self.top_level_declarations_by_package
+            .get_or_init(|| build_kotlin_top_level_declarations_by_package(self))
+    }
+
+    fn external_index_is_empty(&self) -> bool {
+        self.external_declaration_index().is_empty()
+    }
+
+    fn external_qualified_name_exists(&self, fqn: &str, access_package: &str) -> bool {
+        self.external_declaration_index()
+            .resolve_qualified_name(fqn, access_package)
+            .is_some()
     }
 }
 

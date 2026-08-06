@@ -28,14 +28,21 @@
 //! `analyzer/kotlin/imports.rs`, because both halves read the analyzer's
 //! memoized products.
 
-use brokk_bifrost_core::analyzer::CodeUnit;
+use std::sync::Arc;
+
+use brokk_bifrost_core::analyzer::capabilities::build_reverse_file_index;
+use brokk_bifrost_core::analyzer::common::language_for_file;
 use brokk_bifrost_core::analyzer::model::{ImportInfo, StructuredImportPath};
 use brokk_bifrost_core::analyzer::tree_walk::{
     first_named_child_of_kind as first_named_child, named_children,
 };
+use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
 use crate::kotlin::declarations::kotlin_identifier_text;
+use crate::kotlin::graph_support::KotlinSource;
+use crate::realm::JvmSourceRealm;
 
 /// The packages every Kotlin/JVM file imports without writing an `import` line.
 ///
@@ -159,6 +166,191 @@ pub fn kotlin_import_path(import: &ImportInfo) -> Option<String> {
 /// a package-level star import does not reach.
 pub fn is_kotlin_importable_top_level(unit: &CodeUnit) -> bool {
     !unit.is_synthetic() && !unit.short_name().contains('.')
+}
+
+// ---------------------------------------------------------------------------
+// Import resolution over the analyzer's memoized products
+// ---------------------------------------------------------------------------
+
+/// Every declaration an import path can name directly.
+///
+/// Kotlin fully-qualified names are dotted all the way down — package
+/// segments, nested types, and members alike — so `import a.b.Outer.Inner`
+/// and `import a.b.Registry.register` are the same single lookup as
+/// `import a.b.C`, with no need to split the path and walk owners.
+pub fn kotlin_declarations_named(
+    source: &dyn KotlinSource,
+    fqn: &str,
+    realm: Option<&JvmSourceRealm<'_>>,
+) -> Vec<CodeUnit> {
+    let mut units: Vec<CodeUnit> = source
+        .usage_definitions()
+        .fqn(fqn)
+        .into_iter()
+        .filter(|unit| unit.fq_name() == fqn && !unit.is_synthetic())
+        .collect();
+    // A Kotlin file can import a Java or Scala declaration from the same
+    // workspace, so the realm's other members answer for the names Kotlin's
+    // own index does not hold.
+    if let Some(realm) = realm {
+        units.extend(realm.peer_declarations_by_fqn(fqn, Language::Kotlin));
+    }
+    units
+}
+
+/// The top-level declarations a Kotlin package exports, keyed by package.
+///
+/// The uncached build behind
+/// [`KotlinSource::top_level_declarations_by_package`], which is memoized once
+/// per analyzer generation because a star import has to widen to a whole
+/// package and repeating that scan per file would be quadratic in workspace
+/// size.
+pub fn build_kotlin_top_level_declarations_by_package(
+    source: &dyn KotlinSource,
+) -> HashMap<String, Arc<Vec<CodeUnit>>> {
+    let mut by_package: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+    for unit in source.all_declarations() {
+        if is_kotlin_importable_top_level(&unit) {
+            by_package
+                .entry(unit.package_name().to_string())
+                .or_default()
+                .push(unit);
+        }
+    }
+    by_package
+        .into_iter()
+        .map(|(package, units)| (package, Arc::new(units)))
+        .collect()
+}
+
+/// The declarations a star import over `path` makes visible.
+///
+/// `path` is a package (`import a.b.*`) or a single object-like owner
+/// (`import a.b.Mode.*`, which imports an enum's entries or an object's
+/// members). Both forms are legal Kotlin and are distinguished by what the
+/// workspace actually declares, not by guessing from the spelling.
+pub fn kotlin_star_imported_declarations(
+    source: &dyn KotlinSource,
+    path: &str,
+    realm: Option<&JvmSourceRealm<'_>>,
+) -> Vec<CodeUnit> {
+    if let Some(units) = source.top_level_declarations_by_package().get(path) {
+        return units.as_ref().clone();
+    }
+    kotlin_declarations_named(source, path, realm)
+        .iter()
+        .filter(|owner| owner.is_class())
+        .flat_map(|owner| source.direct_children(owner))
+        .filter(|unit| !unit.is_synthetic())
+        .collect()
+}
+
+/// The declarations `imports` resolve to, widened to the whole JVM source realm
+/// when a realm view is supplied.
+pub fn resolve_kotlin_import_infos(
+    source: &dyn KotlinSource,
+    imports: &[ImportInfo],
+    realm: Option<&JvmSourceRealm<'_>>,
+) -> HashSet<CodeUnit> {
+    let mut resolved = HashSet::default();
+    for import in imports {
+        let Some(path) = kotlin_import_path(import) else {
+            continue;
+        };
+        if import.is_wildcard {
+            resolved.extend(kotlin_star_imported_declarations(source, &path, realm));
+        } else {
+            resolved.extend(kotlin_declarations_named(source, &path, realm));
+        }
+    }
+    resolved
+}
+
+/// Files that can see one another without an import because they declare the
+/// same package and spell one another's names.
+///
+/// The uncached build behind `KotlinAnalyzer`'s `PoolSafeMemo` cell.
+pub fn compute_kotlin_same_package_reference_index(
+    source: &dyn KotlinSource,
+    parallel: bool,
+) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
+    let mut targets_by_package_and_name: HashMap<(String, String), Vec<ProjectFile>> =
+        HashMap::default();
+    for file in source.kotlin_all_files() {
+        if language_for_file(&file) != Language::Kotlin {
+            continue;
+        }
+        let package = source.kotlin_package_name_of(&file).unwrap_or_default();
+        for declaration in source.top_level_declarations(&file) {
+            targets_by_package_and_name
+                .entry((package.clone(), declaration.identifier().to_string()))
+                .or_default()
+                .push(file.clone());
+        }
+    }
+
+    let files: Vec<_> = source.kotlin_all_files();
+    build_reverse_file_index(
+        &files,
+        |candidate| {
+            if language_for_file(candidate) != Language::Kotlin {
+                return Vec::new();
+            }
+            let package = source.kotlin_package_name_of(candidate).unwrap_or_default();
+            let Some(identifiers) = source.type_identifiers_of(candidate) else {
+                return Vec::new();
+            };
+            identifiers
+                .iter()
+                .filter_map(|identifier| {
+                    targets_by_package_and_name.get(&(package.clone(), identifier.clone()))
+                })
+                .flat_map(|targets| targets.iter().cloned())
+                .collect()
+        },
+        parallel,
+    )
+}
+
+/// Whether `source_file`'s `imports` could make `target`'s declarations
+/// visible.
+pub fn kotlin_could_import_file(
+    source: &dyn KotlinSource,
+    source_file: &ProjectFile,
+    imports: &[ImportInfo],
+    target: &ProjectFile,
+) -> bool {
+    if source_file == target {
+        return false;
+    }
+    if language_for_file(source_file) != Language::Kotlin
+        || language_for_file(target) != Language::Kotlin
+    {
+        return false;
+    }
+
+    let source_package = source
+        .kotlin_package_name_of(source_file)
+        .unwrap_or_default();
+    let target_package = source.kotlin_package_name_of(target).unwrap_or_default();
+    if source_package == target_package {
+        return true;
+    }
+
+    imports.iter().any(|import| {
+        let Some(path) = kotlin_import_path(import) else {
+            return false;
+        };
+        if import.is_wildcard {
+            return path == target_package
+                || kotlin_star_imported_declarations(source, &path, None)
+                    .iter()
+                    .any(|unit| unit.source() == target);
+        }
+        kotlin_declarations_named(source, &path, None)
+            .iter()
+            .any(|unit| unit.source() == target)
+    })
 }
 
 #[cfg(test)]
