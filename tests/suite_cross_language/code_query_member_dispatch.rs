@@ -169,6 +169,133 @@ export function caller(service: Service, decoy: Decoy) {
     );
 }
 
+/// Every language family emits the mandatory selection summary for a member
+/// occurrence with a same-name wrong-owner decoy present, and its stated
+/// completeness/coverage pairing is honest. A language whose adapter records
+/// no trace must say `untraced`/`unsupported`, never a proven-empty set, and
+/// a selecting language must never select the decoy.
+#[test]
+fn every_language_family_emits_an_honest_mandatory_selection_summary() {
+    let fixtures: &[(&str, &str, &str)] = &[
+        (
+            "typescript",
+            "app.ts",
+            "class Service { run() {} }\nclass Decoy { run() {} }\nexport function caller(service: Service) { service.run(); }\n",
+        ),
+        (
+            "go",
+            "app.go",
+            "package main\n\ntype Service struct{}\n\nfunc (s Service) Run() {}\n\ntype Decoy struct{}\n\nfunc (d Decoy) Run() {}\n\nfunc caller(s Service) { s.Run() }\n",
+        ),
+        (
+            "csharp",
+            "App.cs",
+            "namespace Demo;\npublic class Service { public void Run() {} }\npublic class Decoy { public void Run() {} }\npublic class Caller { public void Call(Service service) { service.Run(); } }\n",
+        ),
+        (
+            "python",
+            "app.py",
+            "class Service:\n    def run(self):\n        pass\n\nclass Decoy:\n    def run(self):\n        pass\n\ndef caller(service: Service):\n    service.run()\n",
+        ),
+        (
+            "rust",
+            "app.rs",
+            "struct Service;\nimpl Service { fn run(&self) {} }\nstruct Decoy;\nimpl Decoy { fn run(&self) {} }\nfn caller(service: Service) { service.run(); }\n",
+        ),
+        (
+            "cpp",
+            "app.cpp",
+            "class Service { public: void run() {} };\nclass Decoy { public: void run() {} };\nvoid caller(Service service) { service.run(); }\n",
+        ),
+        (
+            "php",
+            "app.php",
+            "<?php\nclass Service { public function run() {} }\nclass Decoy { public function run() {} }\nfunction caller(Service $service) { $service->run(); }\n",
+        ),
+        (
+            "ruby",
+            "app.rb",
+            "class Service\n  def run\n  end\nend\n\nclass Decoy\n  def run\n  end\nend\n\ndef caller(service)\n  service.run\nend\n",
+        ),
+    ];
+    for (language, path, source) in fixtures {
+        let files = [(*path, *source)];
+        let selection = serialized(&run(
+            &files,
+            json!({
+                "where": [path],
+                "occurrences": { "role": ["member_position"] },
+                "steps": [{"op": "member_selection"}],
+                "result_detail": "full"
+            }),
+        ));
+        let summaries = rows(&selection);
+        if summaries.is_empty() {
+            // A language whose structural adapter does not classify
+            // member-position occurrences at all has no site to summarize.
+            // That gap must be *stated* through an incomplete diagnostic --
+            // which is what turns a policy over these rows unreliable --
+            // never a silent empty result.
+            let role_unsupported = selection["diagnostics"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|diagnostic| {
+                    diagnostic["code"] == "occurrence_role_unsupported"
+                        && diagnostic["impact"] == "incomplete"
+                });
+            assert!(
+                role_unsupported,
+                "{language}: zero summaries require a stated occurrence-role capability gap: {selection}"
+            );
+            continue;
+        }
+        for summary in summaries {
+            let completeness = summary["trace_completeness"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{language}: completeness missing: {selection}"));
+            match completeness {
+                "full" => assert_eq!(summary["coverage"], "exhaustive", "{language}: {selection}"),
+                "selection_only" => {
+                    assert_eq!(summary["coverage"], "open", "{language}: {selection}")
+                }
+                "absent" => {
+                    assert_eq!(
+                        summary["coverage"], "unsupported",
+                        "{language}: {selection}"
+                    );
+                    assert_eq!(summary["outcome"], "untraced", "{language}: {selection}");
+                    assert_eq!(summary["selected_count"], 0, "{language}: {selection}");
+                }
+                other => panic!("{language}: unregistered completeness {other:?}: {selection}"),
+            }
+            if summary["outcome"] == "selected" {
+                let candidates = serialized(&run(
+                    &files,
+                    json!({
+                        "where": [path],
+                        "occurrences": { "role": ["member_position"] },
+                        "steps": [{"op": "candidates_of"}],
+                        "result_detail": "full"
+                    }),
+                ));
+                assert!(
+                    rows(&candidates)
+                        .iter()
+                        .filter(|row| row["outcome"] == "selected"
+                            && row["ast_id"] == summary["site_ast_id"])
+                        .all(|row| {
+                            row["candidate"]["unit"]["fq_name"]
+                                .as_str()
+                                .is_none_or(|name| !name.contains("Decoy"))
+                        }),
+                    "{language}: the wrong-owner decoy must never be selected: {candidates}"
+                );
+            }
+        }
+    }
+}
+
 /// Java: the summary row is mandatory and joins its candidates by AST
 /// identity, with an inherited-member fixture and a same-name decoy.
 #[test]
