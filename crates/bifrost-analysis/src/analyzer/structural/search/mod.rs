@@ -83,6 +83,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+mod call_shape;
 mod edges;
 mod environment;
 mod execution;
@@ -163,6 +164,9 @@ use crate::analyzer::usages::get_definition::TraceCandidateRef;
 pub use results::ALL_DETAILED_CODE_QUERY_DOMAINS;
 pub use results::CodeQueryBinding;
 pub use results::CodeQueryCallArgument;
+pub use results::CodeQueryCallArgumentGroup;
+pub use results::CodeQueryCallShape;
+pub use results::CodeQueryCallShapeArgument;
 pub use results::CodeQueryCallSite;
 pub use results::CodeQueryCandidateRef;
 pub use results::CodeQueryCapture;
@@ -198,6 +202,7 @@ pub use results::CodeQueryGenerationSite;
 pub use results::CodeQueryImportBinder;
 pub use results::CodeQueryLexicalScope;
 pub use results::CodeQueryMatch;
+pub use results::CodeQueryMemberSelection;
 pub use results::CodeQueryOccurrence;
 pub use results::CodeQueryOccurrenceTarget;
 pub use results::CodeQueryPathSegment;
@@ -398,6 +403,26 @@ struct ReceiverEvidenceValue {
     factory: Option<CodeUnit>,
 }
 
+/// One derived call-shape report shared by its outcome, group, and argument
+/// pipeline rows. Group and argument values index into the shared report
+/// instead of cloning row data per pipeline expansion.
+#[derive(Debug, Clone)]
+struct CallShapeValue {
+    report: Arc<crate::analyzer::usages::call_shape::CallShapeReport>,
+}
+
+#[derive(Debug, Clone)]
+struct CallArgumentGroupValue {
+    shape: CallShapeValue,
+    group_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CallArgumentValue {
+    shape: CallShapeValue,
+    argument_index: usize,
+}
+
 #[derive(Default)]
 struct IndexedDeclarations {
     by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>>,
@@ -516,6 +541,10 @@ enum PipelineValue {
     ReceiverAnalysis(ReceiverAnalysisValue),
     ReceiverOutcome(ReceiverAnalysisValue),
     ReceiverEvidence(ReceiverEvidenceValue),
+    CallShape(CallShapeValue),
+    CallArgumentGroup(CallArgumentGroupValue),
+    CallArgument(CallArgumentValue),
+    MemberSelection(MemberSelectionValue),
     Occurrence(OccurrenceValue),
     LexicalScope(ScopeValue),
     Binding(BindingValue),
@@ -526,6 +555,27 @@ enum PipelineValue {
     ReferenceEdge(Box<EdgeValue>),
     QualifiedPath(PathValue),
     PathSegment(SegmentValue),
+}
+
+/// One member-selection summary computed from the production resolver's own
+/// candidate trace for one reference occurrence. `completeness` is `None`
+/// exactly when the traced file recorded no candidate trace for the row.
+#[derive(Debug, Clone)]
+struct MemberSelectionValue {
+    occurrence: Arc<OccurrenceRow>,
+    selected: usize,
+    candidates: usize,
+    completeness: Option<crate::analyzer::usages::get_definition::trace::TraceCompleteness>,
+}
+
+impl MemberSelectionValue {
+    fn stable_id(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"bifrost.member_selection.v1");
+        hasher.update(self.occurrence.ast_id().as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -562,6 +612,10 @@ enum PipelineKey {
     ReceiverAnalysis(ReceiverQueryOperation, ProjectFile, Range),
     ReceiverOutcome(String),
     ReceiverEvidence(String),
+    CallShape(String),
+    CallArgumentGroup(String),
+    CallArgument(String),
+    MemberSelection(String),
     Occurrence(OccurrenceKey),
     LexicalScope(ScopeKey),
     Binding(BindingKey),
@@ -605,6 +659,16 @@ impl PipelineValue {
             ),
             Self::ReceiverOutcome(value) => PipelineKey::ReceiverOutcome(value.site_id.clone()),
             Self::ReceiverEvidence(value) => PipelineKey::ReceiverEvidence(value.id.clone()),
+            Self::CallShape(value) => PipelineKey::CallShape(value.report.outcome.site_id.clone()),
+            Self::CallArgumentGroup(value) => PipelineKey::CallArgumentGroup(
+                value.shape.report.groups[value.group_index].id.clone(),
+            ),
+            Self::CallArgument(value) => PipelineKey::CallArgument(
+                value.shape.report.arguments[value.argument_index]
+                    .id
+                    .clone(),
+            ),
+            Self::MemberSelection(value) => PipelineKey::MemberSelection(value.occurrence.ast_id()),
             Self::Occurrence(value) => PipelineKey::Occurrence(value.key()),
             Self::LexicalScope(value) => PipelineKey::LexicalScope(value.key()),
             Self::GenerationSite(value) => PipelineKey::GenerationSite(value.key()),
@@ -830,6 +894,10 @@ enum PipelineTraceValue {
     ReceiverAnalysis(ReceiverAnalysisValue),
     ReceiverOutcome(ReceiverAnalysisValue),
     ReceiverEvidence(ReceiverEvidenceValue),
+    CallShape(CallShapeValue),
+    CallArgumentGroup(CallArgumentGroupValue),
+    CallArgument(CallArgumentValue),
+    MemberSelection(MemberSelectionValue),
     Occurrence(OccurrenceValue),
     LexicalScope(ScopeValue),
     Binding(BindingValue),
@@ -2766,6 +2834,76 @@ fn detailed_evidence_for_pipeline_value(
                 provenance: Vec::new(),
             }
         }
+        PipelineValue::CallShape(value) => {
+            let outcome = &value.report.outcome;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::CallShape,
+                key: DetailedCodeQueryKey::CallShape {
+                    id: outcome.id.clone(),
+                    site_id: outcome.site_id.clone(),
+                },
+                file: outcome.file.clone(),
+                source_slice_sha256: None,
+                byte_span: Some(range_byte_span(outcome.range)),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::CallArgumentGroup(value) => {
+            let outcome = &value.shape.report.outcome;
+            let group = &value.shape.report.groups[value.group_index];
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::CallArgumentGroup,
+                key: DetailedCodeQueryKey::CallArgumentGroup {
+                    id: group.id.clone(),
+                    site_id: group.site_id.clone(),
+                },
+                file: outcome.file.clone(),
+                source_slice_sha256: None,
+                byte_span: Some(range_byte_span(outcome.range)),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::CallArgument(value) => {
+            let outcome = &value.shape.report.outcome;
+            let argument = &value.shape.report.arguments[value.argument_index];
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::CallArgument,
+                key: DetailedCodeQueryKey::CallArgument {
+                    id: argument.id.clone(),
+                    group_id: argument.group_id.clone(),
+                },
+                file: outcome.file.clone(),
+                source_slice_sha256: None,
+                byte_span: Some(range_byte_span(argument.range)),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::MemberSelection(value) => {
+            let row = &value.occurrence;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::MemberSelection,
+                key: DetailedCodeQueryKey::MemberSelection {
+                    id: value.stable_id(),
+                    site_ast_id: row.ast_id(),
+                },
+                file: row.file.clone(),
+                source_slice_sha256: None,
+                byte_span: Some(range_byte_span(row.range)),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
         PipelineValue::Occurrence(value) => {
             let row = &value.row;
             let byte_span = row.range.start_byte..row.range.end_byte;
@@ -3036,7 +3174,11 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::ReferenceSite(site) => Some(&site.file),
         PipelineValue::CallSite(site) => Some(&site.0.file),
         PipelineValue::ExpressionSite(site) => Some(&site.call_site.0.file),
+        PipelineValue::CallShape(value) => Some(&value.report.outcome.file),
+        PipelineValue::CallArgumentGroup(value) => Some(&value.shape.report.outcome.file),
+        PipelineValue::CallArgument(value) => Some(&value.shape.report.outcome.file),
         PipelineValue::Occurrence(value) => Some(value.file()),
+        PipelineValue::MemberSelection(value) => Some(&value.occurrence.file),
         PipelineValue::LexicalScope(value) => Some(value.file()),
         PipelineValue::QualifiedPath(value) => Some(value.file()),
         PipelineValue::PathSegment(value) => Some(value.file()),
@@ -3146,6 +3288,18 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::ReceiverEvidence(value) => {
             collect_receiver_source_files(&value.receiver, files)
         }
+        PipelineValue::CallShape(value) => {
+            files.insert(value.report.outcome.file.clone());
+        }
+        PipelineValue::CallArgumentGroup(value) => {
+            files.insert(value.shape.report.outcome.file.clone());
+        }
+        PipelineValue::CallArgument(value) => {
+            files.insert(value.shape.report.outcome.file.clone());
+        }
+        PipelineValue::MemberSelection(value) => {
+            files.insert(value.occurrence.file.clone());
+        }
         PipelineValue::Occurrence(value) => {
             files.insert(value.file().clone());
         }
@@ -3195,6 +3349,18 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
         PipelineTraceValue::ReceiverOutcome(value) => collect_receiver_source_files(value, files),
         PipelineTraceValue::ReceiverEvidence(value) => {
             collect_receiver_source_files(&value.receiver, files)
+        }
+        PipelineTraceValue::CallShape(value) => {
+            files.insert(value.report.outcome.file.clone());
+        }
+        PipelineTraceValue::CallArgumentGroup(value) => {
+            files.insert(value.shape.report.outcome.file.clone());
+        }
+        PipelineTraceValue::CallArgument(value) => {
+            files.insert(value.shape.report.outcome.file.clone());
+        }
+        PipelineTraceValue::MemberSelection(value) => {
+            files.insert(value.occurrence.file.clone());
         }
         PipelineTraceValue::Occurrence(value) => {
             files.insert(value.file().clone());
@@ -3419,6 +3585,45 @@ fn detailed_trace_provenance_ref(
         }
         PipelineTraceValue::ReceiverEvidence(value) => {
             detailed_receiver_evidence_provenance_ref(value, cache)
+        }
+        PipelineTraceValue::CallShape(value) => detailed_call_shape_provenance_ref(
+            DetailedCodeQueryDomain::CallShape,
+            DetailedCodeQueryKey::CallShape {
+                id: value.report.outcome.id.clone(),
+                site_id: value.report.outcome.site_id.clone(),
+            },
+            &value.report.outcome.file,
+            value.report.outcome.range,
+            cache,
+        ),
+        PipelineTraceValue::CallArgumentGroup(value) => {
+            let group = &value.shape.report.groups[value.group_index];
+            detailed_call_shape_provenance_ref(
+                DetailedCodeQueryDomain::CallArgumentGroup,
+                DetailedCodeQueryKey::CallArgumentGroup {
+                    id: group.id.clone(),
+                    site_id: group.site_id.clone(),
+                },
+                &value.shape.report.outcome.file,
+                value.shape.report.outcome.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::CallArgument(value) => {
+            let argument = &value.shape.report.arguments[value.argument_index];
+            detailed_call_shape_provenance_ref(
+                DetailedCodeQueryDomain::CallArgument,
+                DetailedCodeQueryKey::CallArgument {
+                    id: argument.id.clone(),
+                    group_id: argument.group_id.clone(),
+                },
+                &value.shape.report.outcome.file,
+                argument.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::MemberSelection(value) => {
+            detailed_member_selection_provenance_ref(value, cache)
         }
         PipelineTraceValue::Occurrence(value) => detailed_occurrence_provenance_ref(value, cache),
         PipelineTraceValue::GenerationSite(value) => {
@@ -3759,6 +3964,26 @@ fn detailed_receiver_evidence_provenance_ref(
     }
 }
 
+fn detailed_member_selection_provenance_ref(
+    value: &MemberSelectionValue,
+    cache: &PipelineRenderCache,
+) -> DetailedCodeQueryProvenanceRefEvidence {
+    let row = &value.occurrence;
+    let byte_span = range_byte_span(row.range);
+    DetailedCodeQueryProvenanceRefEvidence {
+        domain: DetailedCodeQueryDomain::MemberSelection,
+        key: DetailedCodeQueryKey::MemberSelection {
+            id: value.stable_id(),
+            site_ast_id: row.ast_id(),
+        },
+        file: row.file.clone(),
+        source_slice_sha256: cached_source_slice_sha256(cache, &row.file, &byte_span),
+        byte_span: Some(byte_span),
+        display_range: cached_display_range(cache, &row.file, row.range),
+        identities: DetailedCodeQueryProvenanceIdentities::None,
+    }
+}
+
 fn detailed_occurrence_provenance_ref(
     value: &OccurrenceValue,
     cache: &PipelineRenderCache,
@@ -3778,6 +4003,18 @@ fn detailed_occurrence_provenance_ref(
         display_range: cached_display_range(cache, &row.file, row.range),
         identities: DetailedCodeQueryProvenanceIdentities::None,
     }
+}
+
+/// The provenance-ref evidence shape shared by the three call-shape row
+/// families: a typed key, the owning file, and the exact source range.
+fn detailed_call_shape_provenance_ref(
+    domain: DetailedCodeQueryDomain,
+    key: DetailedCodeQueryKey,
+    file: &ProjectFile,
+    range: Range,
+    cache: &PipelineRenderCache,
+) -> DetailedCodeQueryProvenanceRefEvidence {
+    detailed_environment_provenance_ref(domain, key, file, range, cache)
 }
 
 /// The provenance-ref evidence shape shared by the three lexical-environment
@@ -3967,6 +4204,14 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         }
         PipelineValue::ReceiverEvidence(value) => {
             Some(PipelineTraceValue::ReceiverEvidence(value.clone()))
+        }
+        PipelineValue::CallShape(value) => Some(PipelineTraceValue::CallShape(value.clone())),
+        PipelineValue::CallArgumentGroup(value) => {
+            Some(PipelineTraceValue::CallArgumentGroup(value.clone()))
+        }
+        PipelineValue::CallArgument(value) => Some(PipelineTraceValue::CallArgument(value.clone())),
+        PipelineValue::MemberSelection(value) => {
+            Some(PipelineTraceValue::MemberSelection(value.clone()))
         }
         PipelineValue::Occurrence(value) => Some(PipelineTraceValue::Occurrence(value.clone())),
         PipelineValue::LexicalScope(value) => Some(PipelineTraceValue::LexicalScope(value.clone())),

@@ -1962,7 +1962,7 @@ impl<'a> CppVisitor<'a> {
             // retain their declaration-preserving wrapper traversal when the
             // sentinel predicate does not match.
             "ERROR" => {
-                if !self.visit_sentinel_macro_region(node, scope) {
+                if !self.visit_sentinel_macro_region(node, scope, stack) {
                     stack.push(CppWork::Container(CppContainer {
                         node,
                         scope: scope.clone(),
@@ -2311,13 +2311,17 @@ impl<'a> CppVisitor<'a> {
             if self.parsed.contains_declaration(&code_unit) {
                 return WalkControl::Continue;
             }
-            self.parsed
-                .add_code_unit(code_unit.clone(), child, self.source, None, None);
-            self.parsed.add_signature(
+            self.parsed.add_code_unit(
                 code_unit.clone(),
+                child,
+                self.source,
+                Some(parent.clone()),
+                None,
+            );
+            self.parsed.add_signature(
+                code_unit,
                 normalize_cpp_whitespace(node_text(child, self.source)),
             );
-            self.parsed.add_child(parent.clone(), code_unit);
             WalkControl::Continue
         });
     }
@@ -2360,11 +2364,14 @@ impl<'a> CppVisitor<'a> {
             if self.parsed.contains_declaration(&code_unit) {
                 continue;
             }
-            self.parsed
-                .add_code_unit(code_unit.clone(), node, self.source, None, None);
-            self.parsed
-                .add_signature(code_unit.clone(), trimmed.to_string());
-            self.parsed.add_child(parent.clone(), code_unit);
+            self.parsed.add_code_unit(
+                code_unit.clone(),
+                node,
+                self.source,
+                Some(parent.clone()),
+                None,
+            );
+            self.parsed.add_signature(code_unit, trimmed.to_string());
         }
     }
 
@@ -2379,7 +2386,7 @@ impl<'a> CppVisitor<'a> {
         // prefixes as a bogus `function_definition` that swallows real namespaces,
         // classes, and members. Reparse the swallowed interior as C++ items so the
         // ordinary declaration visitors index it with byte/line-exact ownership.
-        if self.visit_sentinel_macro_region(node, scope) {
+        if self.visit_sentinel_macro_region(node, scope, stack) {
             return;
         }
         if let Some((class_node, name, raw_supertypes)) =
@@ -2715,7 +2722,12 @@ impl<'a> CppVisitor<'a> {
     /// regions recover recursively: the reparsed interior is walked through the
     /// same `visit_function_definition` path, so a sentinel inside the region hits
     /// this recovery again.
-    fn visit_sentinel_macro_region(&mut self, node: Node<'_>, scope: &ScopeInfo) -> bool {
+    fn visit_sentinel_macro_region<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &ScopeInfo,
+        stack: &mut Vec<CppWork<'tree>>,
+    ) -> bool {
         if self.visit_nested_namespace_sentinel(node, scope) {
             return true;
         }
@@ -2789,6 +2801,18 @@ impl<'a> CppVisitor<'a> {
             // retain offsets inside the consumed region and must be visited first.
             self.consumed_fragment_regions
                 .push((node.start_byte(), class_close_end));
+            // An ERROR envelope can hold real sibling declarations after the
+            // recovered class's close (the suffix-reparse boundary in
+            // `cpp_sentinel_macro_class_region` partitions, it does not
+            // consume). Walk the envelope's remaining children normally; the
+            // consumed region above keeps the recovered class from being
+            // indexed twice.
+            if node.kind() == "ERROR" && node.end_byte() > class_close_end {
+                stack.push(CppWork::Container(CppContainer {
+                    node,
+                    scope: scope.clone(),
+                }));
+            }
             return true;
         }
         let Some((start, end)) = cpp_sentinel_macro_region(node, self.source) else {
@@ -2812,6 +2836,19 @@ impl<'a> CppVisitor<'a> {
         if end > node.end_byte() {
             self.consumed_fragment_regions
                 .push((node.start_byte(), end));
+        } else if node.kind() == "ERROR" && node.end_byte() > end {
+            // The sentinel region ended at the first recovered class-like item
+            // but the ERROR envelope keeps real sibling declarations after it
+            // (fmt's color.h: `enum class color` under stacked FMT_BEGIN
+            // sentinels, followed by `terminal_color`, `rgb`, ...). Walk the
+            // envelope's remaining children normally; the consumed region
+            // keeps the reparsed prefix from being indexed twice.
+            self.consumed_fragment_regions
+                .push((node.start_byte(), end));
+            stack.push(CppWork::Container(CppContainer {
+                node,
+                scope: scope.clone(),
+            }));
         }
         true
     }
@@ -2914,7 +2951,7 @@ impl<'a> CppVisitor<'a> {
         in_class_body: bool,
         stack: &mut Vec<CppWork<'tree>>,
     ) {
-        if self.visit_sentinel_macro_region(node, scope) {
+        if self.visit_sentinel_macro_region(node, scope, stack) {
             return;
         }
         if recovered_macro_return_type_node(node, self.source).is_some_and(|declarator| {

@@ -1059,6 +1059,46 @@ fn receiver_analysis_projects_typed_outcome_and_evidence_rows() {
 }
 
 #[test]
+fn call_shape_projects_typed_group_and_argument_rows() {
+    let shape =
+        CodeQuery::from_sexp(r#"(call-shape (call :callee "run"))"#).expect("call shape RQL");
+    assert_eq!(shape.validate_steps().unwrap(), QueryValueKind::CallShape);
+    assert_eq!(shape.schema_version, SCHEMA_VERSION);
+
+    let arguments = parse_ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "match": { "kind": "call", "callee": { "name": "run" } },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "call_argument_groups" },
+            { "op": "call_arguments" }
+        ]
+    }));
+    assert_eq!(
+        arguments.validate_steps().unwrap(),
+        QueryValueKind::CallArgument
+    );
+    assert_eq!(
+        arguments.to_canonical_json()["steps"][2]["op"],
+        "call_arguments"
+    );
+
+    let rql = CodeQuery::from_sexp(
+        r#"(call-arguments (call-argument-groups (call-shape (call :callee "run"))))"#,
+    )
+    .expect("chained call shape RQL");
+    assert_eq!(rql.validate_steps().unwrap(), QueryValueKind::CallArgument);
+
+    // Group and argument projections only accept their own upstream domain.
+    let wrong = CodeQuery::from_json(&json!({
+        "match": { "kind": "call" },
+        "steps": [{ "op": "call_arguments" }]
+    }))
+    .expect_err("call_arguments must reject a structural upstream");
+    assert!(wrong.message.contains("requires call_argument_group"));
+}
+
+#[test]
 fn parses_configured_hierarchy_and_member_steps() {
     let query = parse_ok(json!({
         "match": { "kind": "class" },

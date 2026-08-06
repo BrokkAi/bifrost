@@ -162,6 +162,33 @@ pub struct CodeQueryReceiverOutcome {
     pub scope_nodes: usize,
 }
 
+/// The mandatory member-selection summary row for one reference occurrence,
+/// projected from the production resolver's own candidate trace. The row
+/// exists even when the file records no trace for the occurrence, so an empty
+/// candidate relation can never masquerade as a proven-empty selection.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryMemberSelection {
+    pub id: String,
+    /// The occurrence's content-scoped AST identity; joins selection rows to
+    /// occurrence and receiver rows without text or range comparison.
+    pub site_ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    /// The decoded member spelling at the occurrence.
+    pub member: String,
+    pub role: &'static str,
+    /// `selected`, `unresolved`, or `untraced`.
+    pub outcome: &'static str,
+    pub selected_count: usize,
+    pub candidate_count: usize,
+    /// `full`, `selection_only`, or `absent`.
+    pub trace_completeness: &'static str,
+    /// `exhaustive` for a full trace, `open` for a selection-only trace, and
+    /// `unsupported` when the language records no trace at all.
+    pub coverage: &'static str,
+}
+
 /// One typed receiver value retained for a site. Nested factory returns are
 /// flattened into a parent-linked chain instead of nested presentation data.
 #[derive(Debug, Clone, Serialize)]
@@ -186,6 +213,50 @@ pub struct CodeQueryReceiverEvidence {
     pub factory_id: Option<String>,
     pub proof: &'static str,
     pub completeness: &'static str,
+}
+
+/// The mandatory structured call-shape outcome row for one exact call site.
+/// Group and argument rows may be empty, but this row always states the
+/// call kind and how much of the shape the analyzer could see.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryCallShape {
+    pub id: String,
+    pub site_id: String,
+    pub site_ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callee_range: Option<CodeQueryRange>,
+    pub call_kind: &'static str,
+    pub coverage: &'static str,
+    pub group_count: usize,
+}
+
+/// One ordered argument-list group of a call shape.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryCallArgumentGroup {
+    pub id: String,
+    pub site_id: String,
+    pub path: String,
+    pub range: CodeQueryRange,
+    pub group_index: usize,
+    pub kind: &'static str,
+    pub argument_count: usize,
+}
+
+/// One ordered argument inside one argument-list group.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryCallShapeArgument {
+    pub id: String,
+    pub group_id: String,
+    pub site_id: String,
+    pub path: String,
+    pub range: CodeQueryRange,
+    pub argument_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub spread: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

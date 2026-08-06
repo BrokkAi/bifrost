@@ -77,6 +77,18 @@ pub(super) fn render_pipeline_item(
         PipelineValue::ReceiverEvidence(value) => CodeQueryResultValue::ReceiverEvidence {
             value: Box::new(render_receiver_evidence(analyzer, &value, cache)),
         },
+        PipelineValue::CallShape(value) => CodeQueryResultValue::CallShape {
+            value: Box::new(render_call_shape(analyzer, &value, cache)),
+        },
+        PipelineValue::CallArgumentGroup(value) => CodeQueryResultValue::CallArgumentGroup {
+            value: Box::new(render_call_argument_group(analyzer, &value, cache)),
+        },
+        PipelineValue::CallArgument(value) => CodeQueryResultValue::CallArgument {
+            value: Box::new(render_call_shape_argument(analyzer, &value, cache)),
+        },
+        PipelineValue::MemberSelection(value) => CodeQueryResultValue::MemberSelection {
+            value: Box::new(render_member_selection(analyzer, &value, cache)),
+        },
         PipelineValue::Occurrence(value) => CodeQueryResultValue::Occurrence {
             value: Box::new(render_occurrence(analyzer, &value, detail, cache)),
         },
@@ -152,6 +164,40 @@ pub(super) fn render_provenance(
                     }
                     PipelineTraceValue::ReceiverEvidence(value) => {
                         render_receiver_evidence_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::CallShape(value) => {
+                        let rendered = render_call_shape(analyzer, value, cache);
+                        CodeQueryResultRef::CallShape {
+                            id: rendered.id,
+                            site_id: rendered.site_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            call_kind: rendered.call_kind,
+                            coverage: rendered.coverage,
+                        }
+                    }
+                    PipelineTraceValue::CallArgumentGroup(value) => {
+                        let rendered = render_call_argument_group(analyzer, value, cache);
+                        CodeQueryResultRef::CallArgumentGroup {
+                            id: rendered.id,
+                            site_id: rendered.site_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            kind: rendered.kind,
+                        }
+                    }
+                    PipelineTraceValue::CallArgument(value) => {
+                        let rendered = render_call_shape_argument(analyzer, value, cache);
+                        CodeQueryResultRef::CallArgument {
+                            id: rendered.id,
+                            group_id: rendered.group_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            argument_index: rendered.argument_index,
+                        }
+                    }
+                    PipelineTraceValue::MemberSelection(value) => {
+                        render_member_selection_ref(analyzer, value, cache)
                     }
                     PipelineTraceValue::Occurrence(value) => {
                         render_occurrence_ref(analyzer, value, cache)
@@ -382,6 +428,58 @@ pub(super) fn render_edge_ref(
     }
 }
 
+/// The mandatory member-selection summary for one occurrence, computed from
+/// the production resolver's candidate trace. `untraced` states the language
+/// recorded no trace; it is never rendered as a proven-empty selection.
+pub(super) fn render_member_selection(
+    analyzer: &dyn IAnalyzer,
+    value: &MemberSelectionValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryMemberSelection {
+    use crate::analyzer::usages::get_definition::trace::TraceCompleteness;
+    let row = &value.occurrence;
+    let resolved = if value.selected > 0 {
+        "selected"
+    } else {
+        "unresolved"
+    };
+    let (outcome, trace_completeness, coverage) = match value.completeness {
+        Some(TraceCompleteness::Full) => (resolved, "full", "exhaustive"),
+        Some(TraceCompleteness::SelectionOnly) => (resolved, "selection_only", "open"),
+        None => ("untraced", "absent", "unsupported"),
+    };
+    CodeQueryMemberSelection {
+        id: value.stable_id(),
+        site_ast_id: row.ast_id(),
+        path: rel_path_string(&row.file),
+        language: crate::analyzer::common::language_for_file(&row.file).config_label(),
+        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        member: row.effective_spelling().to_string(),
+        role: row.role.label(),
+        outcome,
+        selected_count: value.selected,
+        candidate_count: value.candidates,
+        trace_completeness,
+        coverage,
+    }
+}
+
+pub(super) fn render_member_selection_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &MemberSelectionValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let rendered = render_member_selection(analyzer, value, cache);
+    CodeQueryResultRef::MemberSelection {
+        id: rendered.id,
+        site_ast_id: rendered.site_ast_id,
+        path: rendered.path,
+        range: rendered.range,
+        outcome: rendered.outcome,
+        coverage: rendered.coverage,
+    }
+}
+
 pub(super) fn render_occurrence(
     analyzer: &dyn IAnalyzer,
     value: &OccurrenceValue,
@@ -535,7 +633,23 @@ pub(super) fn render_resolution_candidate(
             CodeQueryCandidateRef::ExternalRoute { name: name.clone() }
         }
     };
-    environment::public_candidate(value, range, candidate)
+    let canonical_member_id = environment::candidate_unit(&value.candidate.candidate)
+        .map(|unit| canonical_member_digest(analyzer, unit));
+    environment::public_candidate(value, range, candidate, canonical_member_id)
+}
+
+/// A stable, domain-separated digest of one declaration's #1475 canonical
+/// identity. The digest input is the structured identity (kind-tagged
+/// segments, namespace, language, recorded generic arity), never a rendered
+/// FQN or signature string, so same-spelling decoys with different segment
+/// kinds hash apart and aliases/partial types canonicalized by the analyzer
+/// hash together.
+fn canonical_member_digest(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> String {
+    let identity = crate::analyzer::structural::canonical_identity_of(analyzer, unit);
+    let mut hasher = Sha256::new();
+    hasher.update(b"bifrost.canonical_member_id.v1");
+    hasher.update(serde_json::to_vec(&identity).expect("canonical identity serializes"));
+    format!("{:x}", hasher.finalize())
 }
 
 pub(super) fn render_generation_site_ref(
@@ -1239,6 +1353,65 @@ pub(super) fn render_receiver_outcome(
         setup_nodes: value.report.work.setup_nodes,
         summary_expansions: value.report.work.summary_expansions,
         scope_nodes: value.report.work.scope_nodes,
+    }
+}
+
+pub(super) fn render_call_shape(
+    analyzer: &dyn IAnalyzer,
+    value: &CallShapeValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCallShape {
+    let outcome = &value.report.outcome;
+    CodeQueryCallShape {
+        id: outcome.id.clone(),
+        site_id: outcome.site_id.clone(),
+        site_ast_id: outcome.site_ast_id.clone(),
+        path: rel_path_string(&outcome.file),
+        language: crate::analyzer::common::language_for_file(&outcome.file).config_label(),
+        range: render_source_range(analyzer, &outcome.file, &outcome.range, cache),
+        callee_range: outcome
+            .callee_range
+            .map(|range| render_source_range(analyzer, &outcome.file, &range, cache)),
+        call_kind: outcome.call_kind.label(),
+        coverage: outcome.coverage.label(),
+        group_count: value.report.groups.len(),
+    }
+}
+
+pub(super) fn render_call_argument_group(
+    analyzer: &dyn IAnalyzer,
+    value: &CallArgumentGroupValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCallArgumentGroup {
+    let outcome = &value.shape.report.outcome;
+    let group = &value.shape.report.groups[value.group_index];
+    CodeQueryCallArgumentGroup {
+        id: group.id.clone(),
+        site_id: group.site_id.clone(),
+        path: rel_path_string(&outcome.file),
+        range: render_source_range(analyzer, &outcome.file, &outcome.range, cache),
+        group_index: group.group_index,
+        kind: group.kind.label(),
+        argument_count: group.argument_count,
+    }
+}
+
+pub(super) fn render_call_shape_argument(
+    analyzer: &dyn IAnalyzer,
+    value: &CallArgumentValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCallShapeArgument {
+    let outcome = &value.shape.report.outcome;
+    let argument = &value.shape.report.arguments[value.argument_index];
+    CodeQueryCallShapeArgument {
+        id: argument.id.clone(),
+        group_id: argument.group_id.clone(),
+        site_id: outcome.site_id.clone(),
+        path: rel_path_string(&outcome.file),
+        range: render_source_range(analyzer, &outcome.file, &argument.range, cache),
+        argument_index: argument.argument_index,
+        name: argument.name.clone(),
+        spread: argument.spread,
     }
 }
 

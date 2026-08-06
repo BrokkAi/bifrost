@@ -503,6 +503,21 @@ pub(super) fn selected_site_quality(
                 ProofStatus::Unproven("selector evidence is not exact".into()),
                 EvidenceCompleteness::Partial("selector evidence is not exhaustive".into()),
             ),
+            CodeQueryResultValue::CallShape { value } => (
+                ProofStatus::Proven,
+                if value.coverage == "exact" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("call shape coverage is {}", value.coverage).into(),
+                    )
+                },
+            ),
+            CodeQueryResultValue::CallArgumentGroup { .. }
+            | CodeQueryResultValue::CallArgument { .. } => (
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+            ),
             CodeQueryResultValue::ReceiverOutcome { value } => (
                 ProofStatus::Proven,
                 if value.coverage == "exhaustive" {
@@ -520,6 +535,16 @@ pub(super) fn selected_site_quality(
                 } else {
                     EvidenceCompleteness::Partial(
                         format!("receiver evidence is {}", value.completeness).into(),
+                    )
+                },
+            ),
+            CodeQueryResultValue::MemberSelection { value } => (
+                ProofStatus::Proven,
+                if value.coverage == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("member selection coverage is {}", value.coverage).into(),
                     )
                 },
             ),

@@ -22,6 +22,10 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::ReceiverAnalysis { .. }
                 | CodeQueryResultValue::ReceiverOutcome { .. }
                 | CodeQueryResultValue::ReceiverEvidence { .. }
+                | CodeQueryResultValue::CallShape { .. }
+                | CodeQueryResultValue::CallArgumentGroup { .. }
+                | CodeQueryResultValue::CallArgument { .. }
+                | CodeQueryResultValue::MemberSelection { .. }
                 | CodeQueryResultValue::Occurrence { .. }
                 | CodeQueryResultValue::LexicalScope { .. }
                 | CodeQueryResultValue::Binding { .. }
@@ -260,6 +264,58 @@ impl CodeQueryResult {
                             value.completeness,
                             value.site_id,
                             value.id
+                        ));
+                    }
+                    CodeQueryResultValue::CallShape { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [call shape; {}; {}] groups={}; site={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.call_kind,
+                            value.coverage,
+                            value.group_count,
+                            value.site_id
+                        ));
+                    }
+                    CodeQueryResultValue::CallArgumentGroup { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [argument group {}; {}] arguments={}; site={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.group_index,
+                            value.kind,
+                            value.argument_count,
+                            value.site_id
+                        ));
+                    }
+                    CodeQueryResultValue::CallArgument { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [argument {}{}{}] group={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.argument_index,
+                            value
+                                .name
+                                .as_deref()
+                                .map(|name| format!("; name={name}"))
+                                .unwrap_or_default(),
+                            if value.spread { "; spread" } else { "" },
+                            value.group_id
+                        ));
+                    }
+                    CodeQueryResultValue::MemberSelection { value } => {
+                        out.push_str(&format!(
+                            "[member selection; {}; {}; {}] `{}` selected={} candidates={} site_ast={}\n",
+                            value.outcome,
+                            value.trace_completeness,
+                            value.coverage,
+                            value.member,
+                            value.selected_count,
+                            value.candidate_count,
+                            value.site_ast_id
                         ));
                     }
                     CodeQueryResultValue::Occurrence { value } => {
