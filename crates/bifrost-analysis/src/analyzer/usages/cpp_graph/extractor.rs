@@ -54,7 +54,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) line_starts: &'a [usize],
     pub(super) spec: &'a TargetSpec,
     pub(super) target_group: &'a HashSet<CodeUnit>,
-    has_physically_visible_type_target: bool,
+    pub(super) has_physically_visible_type_target: bool,
     type_reference_component_names: HashSet<String>,
     pub(super) target_declaration_ranges: Vec<Range>,
     orphaned_namespaces: Vec<OrphanedNamespaceEnvelope>,
@@ -117,6 +117,19 @@ pub(super) fn scan_prepared_file(
             same_logical_symbol(target, &spec.target)
                 && visibility.is_physically_visible(file, target)
         });
+    if spec.kind == TargetKind::Type
+        && !has_physically_visible_type_target
+        && visibility
+            .visible_identifier_candidates(file, spec.target.identifier())
+            .any(|candidate| {
+                candidate != &spec.target
+                    && !target_group.contains(candidate)
+                    && same_logical_symbol(candidate, &spec.target)
+                    && visibility.is_physically_visible(file, candidate)
+            })
+    {
+        return;
+    }
     let target_declaration_ranges = if spec.kind == TargetKind::Type {
         target_group
             .iter()
@@ -644,12 +657,6 @@ fn maybe_record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    // Type scan specs collapse same-logical physical declarations. Do not
-    // resolve a target from a consumer unless this target group has at least
-    // one physically visible peer in that consumer's include closure.
-    if !ctx.has_physically_visible_type_target {
-        return;
-    }
     if let Some(return_type) = recovered_macro_return_type_node(node, ctx.source) {
         maybe_record_recovered_macro_return_type_hit(return_type, ctx);
         return;
