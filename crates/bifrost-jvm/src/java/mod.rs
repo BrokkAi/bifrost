@@ -1,7 +1,9 @@
 //! Java language knowledge.
 
+pub mod adapter;
 pub mod clones;
 pub mod declarations;
+pub mod diagnostics;
 pub mod exceptions;
 pub mod graph_support;
 pub mod hierarchy;

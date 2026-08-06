@@ -1,10 +1,13 @@
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{CallableArity, SignatureMetadata};
 use brokk_bifrost_core::analyzer::model::{DeclarationInfo, DeclarationKind};
+use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Parser, Tree};
+
+use crate::java::imports::parse_import_info;
 
 /// Intern one qualified-name segment in the process-global interner.
 fn java_segment(text: &str, kind: SegmentKind) -> SegmentId {
@@ -1277,4 +1280,51 @@ fn collect_supertype_nodes(node: Node<'_>, source: &str, raw: &mut Vec<String>) 
         }
         WalkControl::Continue
     });
+}
+
+/// The whole-file declaration walk behind `JavaAdapter::parse_file`: the
+/// package module unit, the import facts, and every top-level class-like
+/// declaration with its members.
+pub fn parse_java_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
+    let root = tree.root_node();
+    let package_name = determine_package_name(root, source);
+    let mut parsed = ParsedFile::new(package_name.clone());
+    collect_type_identifiers(root, source, &mut parsed.type_identifiers);
+    let module_code_unit =
+        (!package_name.is_empty()).then(|| module_code_unit(file, &package_name));
+
+    for index in 0..root.named_child_count() {
+        let Some(child) = root.named_child(index) else {
+            continue;
+        };
+
+        match child.kind() {
+            "package_declaration" => {
+                if let Some(module) = &module_code_unit {
+                    parsed.add_code_unit(module.clone(), child, source, None, Some(module.clone()));
+                    parsed.add_signature(module.clone(), format!("package {};", package_name));
+                }
+            }
+            "import_declaration" => {
+                let raw = node_text(child, source).trim().to_string();
+                parsed.import_statements.push(raw.clone());
+                parsed.imports.push(parse_import_info(child, source, raw));
+            }
+            "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration" => {
+                let class_code_unit =
+                    visit_class_like(file, source, child, &package_name, None, None, &mut parsed);
+                if let (Some(module), Some(class_code_unit)) = (&module_code_unit, class_code_unit)
+                {
+                    parsed.add_child(module.clone(), class_code_unit);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    parsed
 }

@@ -53,7 +53,6 @@ use brokk_bifrost_jvm::java::exceptions::detect_exception_handling_smells_java;
 use brokk_bifrost_jvm::java::graph_support::{
     JavaSource, java_constructor_context, java_extract_type_identifiers, java_package_name_of,
     resolve_java_forward_type_name, resolve_java_forward_type_name_candidates,
-    resolve_java_type_name_candidates_in_realm,
 };
 use brokk_bifrost_jvm::java::test_detection::detect_test_assertion_smells_java;
 use cache::JavaMemoCaches;
@@ -214,20 +213,6 @@ impl JavaAnalyzer {
         raw_name: &str,
     ) -> Vec<CodeUnit> {
         resolve_java_forward_type_name_candidates(self, file, raw_name)
-    }
-
-    pub(crate) fn resolve_type_name_candidates_in_realm(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        file: &ProjectFile,
-        raw_name: &str,
-    ) -> Vec<CodeUnit> {
-        resolve_java_type_name_candidates_in_realm(
-            self,
-            &analyzer.global_usage_definition_index(),
-            file,
-            raw_name,
-        )
     }
 
     pub fn is_known_type_name_in_file(&self, file: &ProjectFile, raw_name: &str) -> bool {
