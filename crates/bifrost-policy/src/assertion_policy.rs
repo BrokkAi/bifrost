@@ -711,15 +711,22 @@ pub fn evaluate_relational_assertion_rows(
         }
     }
 
+    // Deterministic finding order: one sort over every (group, key) pair,
+    // not map order and not a per-assertion sort. Assertions over one group
+    // read their contiguous slice of the same ordering.
+    let mut sorted_group_keys: Vec<(&RowGroupName, Vec<Option<RowScalar>>)> = aggregate_values
+        .keys()
+        .map(|(group, key)| (*group, key.clone()))
+        .collect();
+    sorted_group_keys.sort();
+
     let mut violations = Vec::new();
     for assertion in &plan.assertions {
-        // Deterministic finding order: sorted group keys, not map order.
-        let mut group_keys = aggregate_values
-            .keys()
+        let group_keys = sorted_group_keys
+            .iter()
             .filter(|(group, _)| *group == &assertion.group)
             .map(|(_, key)| key.clone())
             .collect::<Vec<_>>();
-        group_keys.sort();
         for key in group_keys {
             let values = &aggregate_values[&(&assertion.group, key.clone())];
             let actual = values.get(&assertion.aggregate).copied().ok_or_else(|| {
