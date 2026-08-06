@@ -212,7 +212,7 @@ fn route_summary_targets_with_cancellation(
     // 2,700-file C# tree, half the fuzzer census's tool time). The directory
     // question is now answered by a `stat` and the listing is built only when
     // that says yes.
-    let workspace_files: OnceCell<BTreeSet<ProjectFile>> = OnceCell::new();
+    let workspace_files: OnceCell<Arc<BTreeSet<ProjectFile>>> = OnceCell::new();
     let mut file_targets = BTreeSet::new();
     let mut listings = Vec::new();
     let mut listed_containers = HashSet::default();
@@ -250,7 +250,15 @@ fn route_summary_targets_with_cancellation(
         if let Some(directory) = directory_listing_root(target)
             && analyzer.project().has_directory(&directory)
             && let Some(listing) = directory_listing(
-                workspace_files.get_or_init(|| analyzer.project().all_files().unwrap_or_default()),
+                // `all_files_shared` hands back the project's own cached listing
+                // behind an `Arc`; `all_files` would deep-clone that whole
+                // `BTreeSet` on every call (#1738).
+                workspace_files.get_or_init(|| {
+                    analyzer
+                        .project()
+                        .all_files_shared()
+                        .unwrap_or_else(|_| Arc::new(BTreeSet::new()))
+                }),
                 target,
             )
         {
@@ -339,6 +347,11 @@ pub(super) fn directory_listing(
     files: &BTreeSet<ProjectFile>,
     target: &str,
 ) -> Option<ContainerListing> {
+    // Reconstructed per call: it scans every workspace file to keep the direct
+    // children of one directory. Spanned so #1738 can split this cost from the
+    // walk that produced `files` (`project::collect_workspace_files`) and from
+    // the git-status subprocess inside it (`gitblob::dirty_worktree_paths`).
+    let _scope = profiling::scope("searchtools::directory_listing");
     let directory = directory_listing_root(target)?;
 
     let mut entries_by_path = HashMap::default();

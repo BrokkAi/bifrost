@@ -177,7 +177,7 @@ fn get_symbol_sources_glob_under_cap_returns_every_matched_file() {
     let project = fixture();
     let service = service(&project);
 
-    assert!(NARROW_FILES <= GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET);
+    const { assert!(NARROW_FILES <= GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET) };
     let value = symbol_sources_json(&service, r#"{"symbols":["narrow/**"]}"#);
 
     assert!(array(&value, "too_broad").is_empty(), "{value}");

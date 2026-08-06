@@ -1399,7 +1399,7 @@ fn widget_declarations(root: &Path, count: usize) -> Vec<CodeUnit> {
                 file.clone(),
                 CodeUnitType::Class,
                 "app",
-                &format!("Widget{index}"),
+                format!("Widget{index}"),
             )
         })
         .collect()

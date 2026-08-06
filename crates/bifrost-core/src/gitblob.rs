@@ -474,6 +474,7 @@ fn dirty_paths(repo: &Repository) -> Result<HashSet<String>> {
 }
 
 fn dirty_worktree_paths(repo: &Repository) -> Result<HashSet<String>> {
+    let _scope = crate::profiling::scope("gitblob::dirty_worktree_paths");
     let workdir = workdir(repo)?;
     // libgit2's recursive index-to-worktree diff can rescan very large trees
     // one entry at a time. Native Git uses its optimized index and filesystem

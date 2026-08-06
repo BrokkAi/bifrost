@@ -958,6 +958,7 @@ fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
 /// workspace. The walk is ignore-aware, skips `.git/`, and keeps other dotted
 /// directories in scope.
 pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
+    let _scope = crate::profiling::scope("project::collect_workspace_files");
     if let Some(repo) = crate::gitblob::discover(root) {
         let workdir = repo
             .workdir()
