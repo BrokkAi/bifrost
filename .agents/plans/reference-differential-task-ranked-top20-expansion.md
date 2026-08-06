@@ -320,17 +320,21 @@ the focus.
     `9226096a6e139deb4c29c52096b13cf825a55a0249dcca7f891f4bfdf24fbfa7`
     and
     `3ca260b1e163edd3916a0f6310ea15ab767ad38cc40445e3acb5a624e2cfeee3`.
-  - [ ] (2026-08-05) Revalidated C++ rank fifteen after later C++ resolver
+  - [x] (2026-08-05) Revalidated C++ rank fifteen after later C++ resolver
     changes at Bifrost `e926cd4d`. The new baseline audited 168 files and
     10,000 sites against 941 inverse target groups. It exposed 27 missing
     rows in four related structured C++ root causes. Jonathan-assigned issues
     #1684 through #1687 cover partial-specialization alias ownership, owner
     qualifiers, template forward-declaration names, and class-owned aliases.
-    The grouped local fix now audits 944 target groups with zero missing rows.
-    Exact probes for `invalid_iterator`, `error_handler_t`, and `value_t` are
-    consistent. The stable featureless CLI suite and strict all-target,
-    all-feature Clippy pass. Commit, push, clean-head replay, issue closure,
-    and scratch cleanup remain before this revalidation is complete.
+    The grouped fixes were pushed through commits `0e6df36d` and `780cacc6`.
+    Exact probes for `invalid_iterator`, `error_handler_t`, `value_t`, and the
+    final `error_type` witness are consistent. The stable featureless CLI
+    suite, six focused BehaviorTree tests, and strict workspace all-target,
+    all-feature Clippy pass. The final clean replay at pushed head `780cacc6`
+    audited all 168 files, 10,000 sites, and 944 target groups with zero
+    missing, skipped, truncated, or file-error rows. Its JSONL SHA-256 was
+    `54c0858e85ff10d1cf564562ce82db39f38a804412524fc98e64c304dbc457a3`.
+    Issues #1684 through #1687 are closed with the clean evidence.
   - [x] (2026-08-03 03:21Z) Completed C++ rank sixteen
     `GoogleCloudPlatform__esp-v2` at pinned head `1c176f5a`. Its starting
     81/81-file, 10,000-site envelope queried 535 inverse targets and exposed
