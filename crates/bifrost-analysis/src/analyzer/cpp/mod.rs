@@ -242,6 +242,14 @@ impl CppAnalyzer {
 }
 
 impl CppAnalyzer {
+    pub(crate) fn import_statements_from_projection(&self, file: &ProjectFile) -> Vec<String> {
+        self.inner
+            .import_info_of(file)
+            .into_iter()
+            .map(|import| import.raw_snippet)
+            .collect()
+    }
+
     pub(crate) fn compile_context_for(&self, file: &ProjectFile) -> Option<&CppCompileContext> {
         self.compile_contexts
             .get_or_init(|| CppCompileContexts::load(self.inner.project()))
@@ -595,7 +603,7 @@ impl CppSource for CppAnalyzer {
 /// what that coercion did.
 impl CppWorkspaceSource for CppAnalyzer {
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
+        self.import_statements_from_projection(file)
     }
 
     fn definitions_by_fqn(&self, fqn: &str) -> Vec<&CodeUnit> {
@@ -870,7 +878,7 @@ impl IAnalyzer for CppAnalyzer {
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
+        self.import_statements_from_projection(file)
     }
 
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {

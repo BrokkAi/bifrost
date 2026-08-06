@@ -22,7 +22,7 @@ impl ImportAnalysisProvider for CppAnalyzer {
 
         let mut resolved = HashSet::default();
         let include_targets = self.include_target_index();
-        let imports = self.inner.import_statements(file);
+        let imports = self.import_statements_from_projection(file);
         for path in quoted_include_paths(&imports) {
             for target in resolve_direct_include_targets_with_index(file, &path, include_targets) {
                 resolved.extend(self.inner.top_level_declarations(&target));
@@ -77,8 +77,7 @@ impl ImportAnalysisProvider for CppAnalyzer {
         let identifiers = brokk_bifrost_cpp::imports::extract_type_identifiers(
             &self.inner.get_source(code_unit, true).unwrap_or_default(),
         );
-        self.inner
-            .import_statements(source)
+        self.import_statements_from_projection(source)
             .iter()
             .filter(|line| {
                 parse_quoted_include(line).is_some_and(|path| {
@@ -133,7 +132,7 @@ impl CppAnalyzer {
         let include_targets = self.include_target_index();
         let mut matched_targets = HashSet::default();
         let mut resolved_targets = Vec::new();
-        let imports = self.inner.import_statements(candidate);
+        let imports = self.import_statements_from_projection(candidate);
         for include in quoted_include_paths(&imports) {
             for target in include_targets.resolve_indexed(&include) {
                 if matched_targets.insert(target.clone()) {

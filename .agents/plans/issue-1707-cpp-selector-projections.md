@@ -25,6 +25,7 @@ C++ navigation must render a canonical selector without loading every stored fac
 - [x] Read alias signatures without hydrating a complete FileState.
 - [x] Index large cached declaration-range sets for owner lookup.
 - [x] Reuse declaration syntax contexts while comparing repeated reference outcomes.
+- [x] Read C++ include lines from persisted import rows.
 - [ ] Run the required policy check after MCP tool registration is repaired.
 
 ## Surprises & Discoveries
@@ -83,6 +84,8 @@ C++ navigation must render a canonical selector without loading every stored fac
   Evidence: The new regression resolves 129 functions in one C++ file, builds one index, and has zero full hydrations.
 - Observation: Reference outcome comparison rebuilt one declaration syntax context for each matching context occurrence.
   Evidence: The post-index sample attributes 5,187 samples to `DeclarationNameRangeContext::new` and `parse_tree_for_language` through `semantic_outcome_key`.
+- Observation: The next C++ visibility build hydrates complete FileState values for import statements.
+  Evidence: The post-context-cache sample attributes the dominant stack to `VisibilityIndex::build_with_cancellation`, `CppWorkspaceSource::import_statements`, and `fetch_file_state`.
 
 ## Decision Log
 
@@ -104,6 +107,9 @@ C++ navigation must render a canonical selector without loading every stored fac
 - Decision: Share one declaration render cache for all outcomes in one reference query.
   Rationale: Equivalent outcome comparison and final rendering need the same display ranges. A request-local cache parses each source once without cross-request retention.
   Date/Author: 2026-08-06 / Codex
+- Decision: Derive C++ raw include lines from persisted `ImportInfo` rows.
+  Rationale: C++ import facts retain the same raw include text. The direct projection keeps visibility construction from loading unrelated FileState facts.
+  Date/Author: 2026-08-06 / Codex
 
 ## Outcomes & Retrospective
 
@@ -112,6 +118,8 @@ The selector path no longer needs full FileState hydration when persisted rows a
 Focused validation passed: `cargo fmt --check`, the persisted selector and alias tests, the enclosing-owner, signature, and large-range index tests, the six issue-1092 C++ identity tests, the global-field linkage regression, two BehaviorTree alias regression tests, and `cargo clippy -p brokk-bifrost-analysis -p brokk-bifrost-cpp --all-targets -- -D warnings`. The policy skill is installed, but `list_policies` and `run_policy` are not registered in this task. The required policy result is therefore unavailable.
 
 Reference result comparison now shares one declaration render cache with final result rendering. The new unit test calls the outcome-key path twice and proves that one source has one cached declaration context.
+
+C++ graph, workspace, and analyzer import reads now use persisted import rows. The new regression checks 129 headers and proves no complete FileState hydration occurs.
 
 ## Context and Orientation
 
