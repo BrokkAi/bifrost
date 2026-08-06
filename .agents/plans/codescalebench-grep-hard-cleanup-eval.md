@@ -37,7 +37,9 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - [x] (2026-08-06 05:25Z) Rescored all 64 baseline archives with the corrected answer contract. The result is 39 scorable tasks, 25 invalid outputs, and 2 solves. The rescore report is `baseline-rescore-v2.json` in the campaign directory.
 - [x] (2026-08-06 05:28Z) Started a sequential host-only DW10 prewarm for the 18 unique source revisions used by the 20-task near-miss set. No evaluation container performs prewarm.
 - [x] (2026-08-06 09:05Z) Profiled the Java source timeout and added a complete-index miss fast path. Four concurrent Kafka source calls fell from an unbounded 90-second SQLite scan to 6.3 seconds total.
-- [ ] Prewarm the replacement 20-task set and restart the corrected symbol arm.
+- [x] (2026-08-06 09:34Z) Committed the complete-index owner recovery fix as `1c2e90b9` with a regression test.
+- [ ] (2026-08-06 09:35Z) Started a new sequential host-only DW10 prewarm for the exact 14-task shovel-ready set. The live external session is `25924`; no evaluation container performs prewarm.
+- [ ] Complete the replacement prewarm and restart the corrected symbol arm.
 - [ ] (2026-08-05 23:25Z) Run the selected tasks with symbol tools. The first 20-task arm stopped after a linked-worktree fault and a false cache-readiness assumption.
 - [ ] Run the same tasks with symbol and NLP tools.
 - [ ] Add synthetic semantic step zero if natural semantic use is too low.
