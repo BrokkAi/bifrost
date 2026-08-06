@@ -20416,6 +20416,70 @@ fn csharp_external_using_reports_boundary() {
 }
 
 #[test]
+fn csharp_namespace_using_target_does_not_resolve_same_named_type() {
+    let global_source = "global using Ocelot;\ninternal class GlobalConsumer {}\n";
+    let plain_source = "using Ocelot;\ninternal class PlainConsumer {}\n";
+    let controls_source =
+        "using Alias = Demo.AliasTarget;\nusing static Demo.StaticTarget;\nclass Consumer {}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "testing/Ocelot.cs",
+            "namespace Ocelot.Testing { internal class Ocelot {} }\n",
+        )
+        .file(
+            "Demo/Targets.cs",
+            "namespace Demo { public class AliasTarget {} public static class StaticTarget { public static void Run() {} } }\n",
+        )
+        .file("acceptance/GlobalUsings.cs", global_source)
+        .file("manual/Usings.cs", plain_source)
+        .file("controls/Usings.cs", controls_source)
+        .build();
+
+    for (path, source) in [
+        ("acceptance/GlobalUsings.cs", global_source),
+        ("manual/Usings.cs", plain_source),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference(
+                path,
+                source,
+                source.find("Ocelot").expect("namespace using target"),
+            ),
+        );
+
+        assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+        assert!(
+            value["results"][0]["definitions"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "a namespace using target must not resolve to a same-named type: {value}"
+        );
+    }
+
+    for (needle, expected_fqn) in [
+        ("Demo.AliasTarget", "Demo.AliasTarget"),
+        ("Demo.StaticTarget", "Demo.StaticTarget"),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference(
+                "controls/Usings.cs",
+                controls_source,
+                controls_source
+                    .find(needle)
+                    .expect("structured using target"),
+            ),
+        );
+        assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], expected_fqn,
+            "{value}"
+        );
+    }
+}
+
+#[test]
 fn csharp_local_value_resolves_to_the_local_binder() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
