@@ -1,7 +1,7 @@
 use super::{TypeLookupOutcome, candidates_outcome_with_target_kind, no_type};
 use crate::analyzer::usages::get_definition::{
-    JavaTypeLookupResolution,
-    java::{BoundedJavaResolution, JavaResolutionSession, java_type_lookup_resolution_in_session},
+    BoundedResolution, JavaTypeLookupResolution,
+    java::{JavaResolutionSession, java_type_lookup_resolution_in_session},
     java_type_lookup_resolution,
 };
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
@@ -58,7 +58,7 @@ pub(crate) fn resolve_java_type_bounded(
     source: &str,
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
-) -> BoundedJavaResolution<TypeLookupOutcome> {
+) -> BoundedResolution<TypeLookupOutcome> {
     let Some(tree) = tree else {
         return session.finish(no_type(
             "java_parse_failed",

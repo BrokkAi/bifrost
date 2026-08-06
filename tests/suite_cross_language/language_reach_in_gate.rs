@@ -150,11 +150,14 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "per-language node-kind classification; cpp import pends the C++ crate",
     ),
     // Java's receiver route: it answers `None` to `structural_receiver` by design and runs
-    // a resolution session instead, and `BoundedJavaResolution` carries the work accounting
-    // the receiver query threads back through its budget. A capability would put that Java
-    // type in a framework signature -- a type-level leak, not a method addition. This is the
-    // class of leak that `ScalaExportInfo` was until it moved to the core model layer.
-    // Follow-up: lower `BoundedJavaResolution` with the extraction plan.
+    // a resolution session instead. The type-level leak this entry recorded is closed --
+    // `BoundedJavaResolution` was a character-for-character duplicate of core's
+    // `BoundedResolution`, so `JavaResolutionSession::finish` now returns core's and the
+    // two identical `charge_*` helpers this file carried collapsed into one. What is left
+    // is the eleven `java_*` free functions and `analyze_java`: a per-language
+    // implementation set in a framework file, the `get_definition/mod.rs` class, and no
+    // longer a type-level leak.
+    // Follow-up: move that set behind a bounded-receiver capability.
     (
         "analyzer/usages/receiver_query/mod.rs",
         "Java resolution-session route; follow-up",

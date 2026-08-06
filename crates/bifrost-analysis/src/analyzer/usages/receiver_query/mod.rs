@@ -19,7 +19,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 };
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, DefinitionLookupStatus,
-    java::{BoundedJavaResolution, JavaResolutionSession, resolve_java_bounded},
+    java::{JavaResolutionSession, resolve_java_bounded},
     parse_tree_for_language, resolve_reference_site_with_line_starts,
 };
 use crate::analyzer::usages::get_type::{
@@ -355,23 +355,6 @@ impl ReceiverWorkLedger {
 enum CompatibilityOutcome<T> {
     Complete(T),
     Exceeded(ReceiverBudgetLimit),
-}
-
-fn charge_compatibility<T>(
-    ledger: &mut ReceiverWorkLedger,
-    resolution: BoundedJavaResolution<T>,
-) -> Result<CompatibilityOutcome<T>, ReceiverQueryError> {
-    let aggregate_limit = ledger.charge_analysis(resolution.work()).err();
-    match resolution {
-        BoundedJavaResolution::Complete { value, .. } => Ok(match aggregate_limit {
-            Some(limit) => CompatibilityOutcome::Exceeded(limit),
-            None => CompatibilityOutcome::Complete(value),
-        }),
-        BoundedJavaResolution::Exceeded { limit, .. } => Ok(CompatibilityOutcome::Exceeded(
-            aggregate_limit.unwrap_or(limit),
-        )),
-        BoundedJavaResolution::Cancelled { .. } => Err(ReceiverQueryError::Cancelled),
-    }
 }
 
 fn charge_bounded_resolution<T>(
@@ -1659,7 +1642,7 @@ impl<'a> ReceiverQueryService<'a> {
                 ledger.remaining_budget(),
                 cancellation,
             );
-            let outcome = match charge_compatibility(&mut ledger, outcome)? {
+            let outcome = match charge_bounded_resolution(&mut ledger, outcome)? {
                 CompatibilityOutcome::Complete(outcome) => outcome,
                 CompatibilityOutcome::Exceeded(limit) => {
                     return Ok(budget_report(
@@ -1710,7 +1693,7 @@ impl<'a> ReceiverQueryService<'a> {
             ledger.remaining_budget(),
             cancellation,
         );
-        let mut type_outcome = match charge_compatibility(&mut ledger, type_resolution)? {
+        let mut type_outcome = match charge_bounded_resolution(&mut ledger, type_resolution)? {
             CompatibilityOutcome::Complete(outcome) => outcome,
             CompatibilityOutcome::Exceeded(limit) => {
                 return Ok(budget_report(
@@ -1788,7 +1771,7 @@ impl<'a> ReceiverQueryService<'a> {
                     ledger.remaining_budget(),
                     cancellation,
                 );
-                type_outcome = match charge_compatibility(&mut ledger, contextual)? {
+                type_outcome = match charge_bounded_resolution(&mut ledger, contextual)? {
                     CompatibilityOutcome::Complete(outcome) => outcome,
                     CompatibilityOutcome::Exceeded(limit) => {
                         return Ok(budget_report(
@@ -1827,7 +1810,7 @@ impl<'a> ReceiverQueryService<'a> {
                 ledger.remaining_budget(),
                 cancellation,
             );
-            match charge_compatibility(&mut ledger, factory_resolution)? {
+            match charge_bounded_resolution(&mut ledger, factory_resolution)? {
                 CompatibilityOutcome::Complete(outcome) => (outcome.definitions.len() == 1)
                     .then(|| outcome.definitions.into_iter().next())
                     .flatten(),
@@ -1860,7 +1843,7 @@ impl<'a> ReceiverQueryService<'a> {
             ledger.remaining_budget(),
             cancellation,
         );
-        let type_reference = match charge_compatibility(&mut ledger, type_resolution)? {
+        let type_reference = match charge_bounded_resolution(&mut ledger, type_resolution)? {
             CompatibilityOutcome::Complete(outcome) => {
                 !outcome.definitions.is_empty()
                     && outcome.definitions.iter().all(CodeUnit::is_class)
@@ -2912,14 +2895,14 @@ fn java_definition_at(
     node: Node<'_>,
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
-) -> BoundedJavaResolution<DefinitionLookupOutcome> {
+) -> BoundedResolution<DefinitionLookupOutcome> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return BoundedJavaResolution::Cancelled {
+        return BoundedResolution::Cancelled {
             work: ReceiverAnalysisWork::default(),
         };
     }
     if budget.max_scope_nodes == 0 {
-        return BoundedJavaResolution::Exceeded {
+        return BoundedResolution::Exceeded {
             work: ReceiverAnalysisWork::default(),
             limit: ReceiverBudgetLimit::ScopeNodes,
         };
@@ -2929,7 +2912,7 @@ fn java_definition_at(
         ..ReceiverAnalysisWork::default()
     };
     let Some(site) = java_reference_site(file, input.source, input.line_starts, node) else {
-        return BoundedJavaResolution::Complete {
+        return BoundedResolution::Complete {
             value: DefinitionLookupOutcome {
                 status: DefinitionLookupStatus::InvalidLocation,
                 reference: None,
@@ -2941,7 +2924,7 @@ fn java_definition_at(
         };
     };
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return BoundedJavaResolution::Cancelled {
+        return BoundedResolution::Cancelled {
             work: preprocessing_work,
         };
     }
@@ -2966,14 +2949,14 @@ fn java_type_outcome_at(
     node: Node<'_>,
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
-) -> BoundedJavaResolution<TypeLookupOutcome> {
+) -> BoundedResolution<TypeLookupOutcome> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return BoundedJavaResolution::Cancelled {
+        return BoundedResolution::Cancelled {
             work: ReceiverAnalysisWork::default(),
         };
     }
     if budget.max_scope_nodes == 0 {
-        return BoundedJavaResolution::Exceeded {
+        return BoundedResolution::Exceeded {
             work: ReceiverAnalysisWork::default(),
             limit: ReceiverBudgetLimit::ScopeNodes,
         };
@@ -2983,7 +2966,7 @@ fn java_type_outcome_at(
         ..ReceiverAnalysisWork::default()
     };
     let Some(site) = java_reference_site(file, input.source, input.line_starts, node) else {
-        return BoundedJavaResolution::Complete {
+        return BoundedResolution::Complete {
             value: TypeLookupOutcome {
                 status: TypeLookupStatus::InvalidLocation,
                 reference: None,
@@ -2995,7 +2978,7 @@ fn java_type_outcome_at(
         };
     };
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return BoundedJavaResolution::Cancelled {
+        return BoundedResolution::Cancelled {
             work: preprocessing_work,
         };
     }
@@ -3012,23 +2995,21 @@ fn java_type_outcome_at(
     ))
 }
 
-fn prepend_java_preprocessing_work<T>(
-    resolution: BoundedJavaResolution<T>,
-) -> BoundedJavaResolution<T> {
+fn prepend_java_preprocessing_work<T>(resolution: BoundedResolution<T>) -> BoundedResolution<T> {
     let add_preprocessing = |mut work: ReceiverAnalysisWork| {
         work.scope_nodes = work.scope_nodes.saturating_add(1);
         work
     };
     match resolution {
-        BoundedJavaResolution::Complete { value, work } => BoundedJavaResolution::Complete {
+        BoundedResolution::Complete { value, work } => BoundedResolution::Complete {
             value,
             work: add_preprocessing(work),
         },
-        BoundedJavaResolution::Exceeded { work, limit } => BoundedJavaResolution::Exceeded {
+        BoundedResolution::Exceeded { work, limit } => BoundedResolution::Exceeded {
             work: add_preprocessing(work),
             limit,
         },
-        BoundedJavaResolution::Cancelled { work } => BoundedJavaResolution::Cancelled {
+        BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled {
             work: add_preprocessing(work),
         },
     }

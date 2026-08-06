@@ -7,31 +7,6 @@ use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 
-#[derive(Debug, Clone)]
-pub(crate) enum BoundedJavaResolution<T> {
-    Complete {
-        value: T,
-        work: ReceiverAnalysisWork,
-    },
-    Exceeded {
-        work: ReceiverAnalysisWork,
-        limit: ReceiverBudgetLimit,
-    },
-    Cancelled {
-        work: ReceiverAnalysisWork,
-    },
-}
-
-impl<T> BoundedJavaResolution<T> {
-    pub(crate) fn work(&self) -> ReceiverAnalysisWork {
-        match self {
-            Self::Complete { work, .. }
-            | Self::Exceeded { work, .. }
-            | Self::Cancelled { work } => *work,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 enum JavaResolutionStop {
     Exceeded(ReceiverBudgetLimit),
@@ -76,18 +51,18 @@ impl<'a> JavaResolutionSession<'a> {
         }
     }
 
-    pub(crate) fn finish<T>(&self, value: T) -> BoundedJavaResolution<T> {
+    pub(crate) fn finish<T>(&self, value: T) -> BoundedResolution<T> {
         self.observe_cancellation();
         let state = *self.state.borrow();
         match state.stop {
-            Some(JavaResolutionStop::Exceeded(limit)) => BoundedJavaResolution::Exceeded {
+            Some(JavaResolutionStop::Exceeded(limit)) => BoundedResolution::Exceeded {
                 work: state.work,
                 limit,
             },
             Some(JavaResolutionStop::Cancelled) => {
-                BoundedJavaResolution::Cancelled { work: state.work }
+                BoundedResolution::Cancelled { work: state.work }
             }
-            None => BoundedJavaResolution::Complete {
+            None => BoundedResolution::Complete {
                 value,
                 work: state.work,
             },
@@ -422,8 +397,8 @@ pub(crate) fn resolve_java(
 ) -> DefinitionLookupOutcome {
     let session = JavaResolutionSession::unbounded(support);
     match resolve_java_in_session(analyzer, &session, file, source, tree, site) {
-        BoundedJavaResolution::Complete { value, .. } => value,
-        BoundedJavaResolution::Exceeded { .. } | BoundedJavaResolution::Cancelled { .. } => {
+        BoundedResolution::Complete { value, .. } => value,
+        BoundedResolution::Exceeded { .. } | BoundedResolution::Cancelled { .. } => {
             unreachable!("unbounded Java resolution cannot be interrupted")
         }
     }
@@ -436,7 +411,7 @@ pub(crate) fn resolve_java_bounded(
     source: &str,
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
-) -> BoundedJavaResolution<DefinitionLookupOutcome> {
+) -> BoundedResolution<DefinitionLookupOutcome> {
     resolve_java_in_session(analyzer, session, file, source, tree, site)
 }
 
@@ -447,7 +422,7 @@ fn resolve_java_in_session(
     source: &str,
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
-) -> BoundedJavaResolution<DefinitionLookupOutcome> {
+) -> BoundedResolution<DefinitionLookupOutcome> {
     // Java's tier ladder resolves the reference this site names, so the deep
     // scope covers the whole dispatch: the type-name tiers in
     // `java::imports::resolve_type_name_with`, the member tier, the

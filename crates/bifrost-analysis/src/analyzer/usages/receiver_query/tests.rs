@@ -1462,7 +1462,7 @@ fn java_compatibility_resolution_bounds_deep_hierarchy_and_precancellation() {
     );
     assert!(matches!(
         preprocessing_exceeded,
-        BoundedJavaResolution::Exceeded {
+        BoundedResolution::Exceeded {
             limit: ReceiverBudgetLimit::ScopeNodes,
             work,
         } if work == ReceiverAnalysisWork::default()
@@ -1480,7 +1480,7 @@ fn java_compatibility_resolution_bounds_deep_hierarchy_and_precancellation() {
     );
     assert!(matches!(
         preprocessing_cancelled,
-        BoundedJavaResolution::Cancelled { work }
+        BoundedResolution::Cancelled { work }
             if work == ReceiverAnalysisWork::default()
     ));
     let one_preprocessing_step = java_definition_at(
@@ -1497,7 +1497,7 @@ fn java_compatibility_resolution_bounds_deep_hierarchy_and_precancellation() {
     );
     assert!(matches!(
         one_preprocessing_step,
-        BoundedJavaResolution::Complete {
+        BoundedResolution::Complete {
             value: DefinitionLookupOutcome {
                 status: DefinitionLookupStatus::InvalidLocation,
                 ..
@@ -1525,7 +1525,7 @@ fn java_compatibility_resolution_bounds_deep_hierarchy_and_precancellation() {
     assert!(
         matches!(
             &exceeded,
-            BoundedJavaResolution::Exceeded {
+            BoundedResolution::Exceeded {
                 limit: ReceiverBudgetLimit::SummaryExpansions,
                 work,
             } if work.summary_expansions == budget.max_summary_expansions
@@ -1548,7 +1548,7 @@ fn java_compatibility_resolution_bounds_deep_hierarchy_and_precancellation() {
     assert!(
         matches!(
             &cancelled,
-            BoundedJavaResolution::Cancelled { work }
+            BoundedResolution::Cancelled { work }
                 if *work == ReceiverAnalysisWork::default()
         ),
         "pre-cancelled resolution must not perform compatibility work: {cancelled:#?}"
