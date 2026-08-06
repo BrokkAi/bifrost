@@ -9,11 +9,6 @@
 //! `KotlinSource` instead of holding a `JvmExternalType`.
 
 use crate::analyzer::{CodeUnit, ProjectFile};
-/// The resolution ladder itself, re-exported under its historical path so the
-/// definition route and the usage graph keep reading it where they always did.
-pub(crate) use brokk_bifrost_jvm::kotlin::types::{
-    KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name,
-};
 use brokk_bifrost_jvm::kotlin::types::{
     kotlin_type_name_is_known_in_file, resolve_kotlin_type_name_in_file,
 };

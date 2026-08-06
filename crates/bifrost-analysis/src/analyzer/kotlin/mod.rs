@@ -62,14 +62,9 @@ pub(crate) mod types;
 
 use crate::analyzer::Range;
 use crate::analyzer::store::LimitedQueryRows;
-/// The Kotlin declaration walk, its positional syntax readers, structured
-/// import decoding, raw-supertype extraction and test detection now live in
-/// [`brokk_bifrost_jvm::kotlin`]. Re-exporting the modules under their
-/// historical names keeps every `crate::analyzer::kotlin::…` path in this crate
-/// pointing at the same items.
-pub(crate) use brokk_bifrost_jvm::kotlin::graph_support::KotlinSource;
+use brokk_bifrost_jvm::kotlin::graph_support::KotlinSource;
 use brokk_bifrost_jvm::kotlin::imports::build_kotlin_top_level_declarations_by_package;
-pub(crate) use brokk_bifrost_jvm::kotlin::{declarations, syntax};
+use brokk_bifrost_jvm::kotlin::syntax;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;

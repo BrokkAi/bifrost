@@ -12,9 +12,6 @@
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ImportInfo, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
-/// Re-exported under its historical path for the parked Kotlin source-jar pack
-/// producer, which reads the same default-import table.
-pub(crate) use brokk_bifrost_jvm::kotlin::imports::KOTLIN_DEFAULT_IMPORT_PACKAGES;
 use brokk_bifrost_jvm::kotlin::imports::{
     compute_kotlin_same_package_reference_index, kotlin_could_import_file,
     resolve_kotlin_import_infos,

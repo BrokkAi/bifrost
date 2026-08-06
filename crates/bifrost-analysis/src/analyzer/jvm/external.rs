@@ -2065,7 +2065,7 @@ fn kotlin_source_types(
 
     let synthetic_file = ProjectFile::new(std::env::temp_dir(), "external.kt");
     let parsed =
-        crate::analyzer::kotlin::declarations::parse_kotlin_file(&synthetic_file, source, &tree);
+        brokk_bifrost_jvm::kotlin::declarations::parse_kotlin_file(&synthetic_file, source, &tree);
     parsed
         .declarations()
         .iter()
@@ -2104,7 +2104,7 @@ fn kotlin_source_declaration_node<'tree>(
         .root_node()
         .descendant_for_byte_range(range.start_byte, range.end_byte)?;
     loop {
-        if crate::analyzer::kotlin::declarations::KOTLIN_CLASS_LIKE_KINDS.contains(&node.kind()) {
+        if brokk_bifrost_jvm::kotlin::declarations::KOTLIN_CLASS_LIKE_KINDS.contains(&node.kind()) {
             return Some(node);
         }
         node = node.parent()?;
@@ -2118,8 +2118,8 @@ fn kotlin_source_declaration_node<'tree>(
 /// the perspective of code consuming a published artifact it is exactly as
 /// invisible as `private` — neither belongs in the index at all.
 fn kotlin_external_visibility(node: tree_sitter::Node<'_>, source: &str) -> Option<JvmVisibility> {
-    use crate::analyzer::kotlin::declarations::KotlinDeclaredVisibility;
-    match crate::analyzer::kotlin::declarations::kotlin_declared_visibility(node, source) {
+    use brokk_bifrost_jvm::kotlin::declarations::KotlinDeclaredVisibility;
+    match brokk_bifrost_jvm::kotlin::declarations::kotlin_declared_visibility(node, source) {
         KotlinDeclaredVisibility::Public => Some(JvmVisibility::Public),
         // Kotlin has no package-private tier; `protected` is modelled with the
         // index's nearest same-package-only tier so a consumer in another
@@ -2130,9 +2130,9 @@ fn kotlin_external_visibility(node: tree_sitter::Node<'_>, source: &str) -> Opti
 }
 
 fn kotlin_external_kind(node: tree_sitter::Node<'_>) -> Option<JvmExternalTypeKind> {
-    use crate::analyzer::kotlin::declarations::KotlinClassLikeKind;
+    use brokk_bifrost_jvm::kotlin::declarations::KotlinClassLikeKind;
     Some(
-        match crate::analyzer::kotlin::declarations::kotlin_class_like_kind(node)? {
+        match brokk_bifrost_jvm::kotlin::declarations::kotlin_class_like_kind(node)? {
             KotlinClassLikeKind::Interface => JvmExternalTypeKind::Interface,
             KotlinClassLikeKind::Enum => JvmExternalTypeKind::Enum,
             KotlinClassLikeKind::Annotation => JvmExternalTypeKind::Annotation,
