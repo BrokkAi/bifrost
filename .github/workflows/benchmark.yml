@@ -75,9 +75,9 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: benchmark/.cache/repos
-          key: benchmark-repos-${{ runner.os }}-${{ hashFiles('benchmark/targets.toml') }}
+          key: benchmark-repos-full-${{ runner.os }}-${{ hashFiles('benchmark/targets.toml') }}
           restore-keys: |
-            benchmark-repos-${{ runner.os }}-
+            benchmark-repos-full-${{ runner.os }}-
 
       - name: Build benchmark binaries
         run: cargo build --locked --bin bifrost --bin bifrost_benchmark
@@ -412,9 +412,9 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: benchmark/.cache/repos
-          key: interactive-latency-repo-${{ runner.os }}-${{ hashFiles('benchmark/interactive-latency.toml') }}
+          key: interactive-latency-repo-full-${{ runner.os }}-${{ hashFiles('benchmark/interactive-latency.toml') }}
           restore-keys: |
-            interactive-latency-repo-${{ runner.os }}-
+            interactive-latency-repo-full-${{ runner.os }}-
 
       - name: Run interactive latency gate
         id: run_interactive_latency

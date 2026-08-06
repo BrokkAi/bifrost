@@ -1862,8 +1862,56 @@ pub(crate) fn scan_usages_by_location_with_context(
     result
 }
 
+/// Dedicated rayon pool for usage-scan fan-out.
+///
+/// A scan's per-candidate work saturates whichever pool runs it. On the
+/// global pool that starves every concurrent light request whose own
+/// resolution injects nested parallel work from a non-worker thread: the
+/// injected job parks on a latch until a worker frees, and none frees until
+/// the scan finishes. The `mcp_fairness` scenario in
+/// benchmark/interactive-latency.toml measures exactly this overlap. Scans
+/// therefore fan out on their own pool, sized one thread below the machine so
+/// interactive queries keep idle global workers and CPU headroom.
+static HEAVY_SCAN_POOL: std::sync::LazyLock<rayon::ThreadPool> = std::sync::LazyLock::new(|| {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .saturating_sub(1)
+        .max(1);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|index| format!("bifrost-scan-{index}"))
+        .build()
+        .expect("failed to build the usage-scan thread pool")
+});
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_usages_backend(
+    analyzer: &dyn IAnalyzer,
+    surface: ScanUsagesSurface,
+    include_tests: bool,
+    paths: Option<&[String]>,
+    symbols: Vec<ScanUsageRequest>,
+    targets: Vec<ScanUsageRequest>,
+    include_same_owner: bool,
+    context: &ScanUsagesExecutionContext,
+) -> ScanUsagesResult {
+    HEAVY_SCAN_POOL.install(|| {
+        scan_usages_backend_on_pool(
+            analyzer,
+            surface,
+            include_tests,
+            paths,
+            symbols,
+            targets,
+            include_same_owner,
+            context,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_usages_backend_on_pool(
     analyzer: &dyn IAnalyzer,
     surface: ScanUsagesSurface,
     include_tests: bool,

@@ -56,8 +56,11 @@ pub fn scope(label: impl Into<String>) -> Scope {
 }
 
 pub fn enabled() -> bool {
-    static KEY: &str = "BIFROST_TIMING";
-    env::var_os(KEY).is_some()
+    // Read once: the flag is set in the process environment at spawn and
+    // never toggled at run time, and `scope` sits on per-candidate hot paths
+    // where a per-call `env::var_os` (a global env lock) is measurable.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env::var_os("BIFROST_TIMING").is_some())
 }
 
 pub fn note(label: impl AsRef<str>) {
