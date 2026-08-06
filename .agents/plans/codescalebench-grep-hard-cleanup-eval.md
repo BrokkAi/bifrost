@@ -28,7 +28,10 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - [x] (2026-08-06 01:47Z) Refreshed all 11 paired tasks with schema-3 readiness records for the current profiler.
 - [x] (2026-08-06 01:55Z) Stopped the second symbol arm after one source call took 92 seconds and three exceeded two minutes.
 - [x] (2026-08-06 02:05Z) Routed structured suffix lookup through the indexed terminal identifier before its table-scan fallback.
-- [ ] Build a new runtime bundle and restart the corrected symbol arm.
+- [x] (2026-08-06 02:13Z) Built runtime r9 and started the corrected symbol arm.
+- [x] (2026-08-06 02:16Z) Stopped runtime r9 after the paired-set audit found invalid baseline evidence.
+- [x] (2026-08-06 02:25Z) Made answer-contract errors unscorable and selected 20 valid empirical Luna grep near-misses.
+- [ ] Prewarm the replacement 20-task set and restart the corrected symbol arm.
 - [ ] (2026-08-05 23:25Z) Run the selected tasks with symbol tools. The first 20-task arm stopped after a linked-worktree fault and a false cache-readiness assumption.
 - [ ] Run the same tasks with symbol and NLP tools.
 - [ ] Add synthetic semantic step zero if natural semantic use is too low.
@@ -86,6 +89,12 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Evidence: `get_symbol_sources` took 92.0 seconds for one call. Timing showed `suffix_resolution.pattern_stage`, and a CPU profile stayed inside SQLite. The persisted row had short name `Replica.handleRaftReady` and indexed identifier `handleRaftReady`.
 - Observation: The indexed terminal lookup removes the pathological fallback.
   Evidence: The exact three-symbol CockroachDB reproduction fell from more than 90 seconds to 4.55 seconds, including 0.96 seconds of process startup.
+- Observation: The old corrected baseline still called contract-breaking answers scorable.
+  Evidence: Only 37 of 64 outputs are valid grep failures. Two are solves, six are missing, and nineteen have answer-contract errors.
+- Observation: The reported 15 of 20 result was a completion count, not a solve count.
+  Evidence: The corrected Luna maximum baseline has only two solves across all 64 tasks. Every task called `grep_search`.
+- Observation: The `grep_hard` source list came from manual task and oracle review.
+  Evidence: Its `selection_basis` fields cite behavioral instructions and dispersed oracles. They do not cite a measured grep baseline.
 
 ## Decision Log
 
@@ -134,6 +143,12 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - Decision: Add terminal-identifier candidates to structured suffix resolution before substring search.
   Rationale: The terminal is already a parsed symbol segment and has a persistent index. The existing alias matcher remains the final authority, so the faster candidate source does not change accepted matches.
   Date/Author: 2026-08-06 / Codex
+- Decision: Treat every answer-contract error as unscorable.
+  Rationale: A partial score from a malformed answer cannot prove that grep did or did not solve the task.
+  Date/Author: 2026-08-06 / Codex
+- Decision: Define the evaluation set from measured Luna maximum grep failures.
+  Rationale: Manual oracle dispersion does not prove grep difficulty. The replacement set contains the 20 highest valid scores below 0.8.
+  Date/Author: 2026-08-06 / Codex
 
 ## Outcomes & Retrospective
 
@@ -146,6 +161,8 @@ The Bifrost worktree is `/mnt/optane/bifrost-nlp`. It stores this plan and provi
 A completion outcome means the agent and verifier completed normally. It is not a solve. Composite score is the weighted task score from zero through one. A format failure means the agent found useful code but its artifact did not match the required shape. A repository-alias failure means the answer used an equivalent repository name that the scorer did not recognize. A localization failure means the scorer received a valid, normalized artifact that omitted required code.
 
 The shovel-ready subset contains tasks whose images exist and whose exact source revisions and Bifrost vectors are already available. This restriction prevents image builds or new embeddings from changing the tool comparison.
+
+The replacement paired manifest is `.agents/docs/codescale-grep-hard-luna-max-nearmiss20.tasks`. Each task has one valid Luna maximum baseline output, at least one `grep_search` call, and a canonical score below 0.8. Its scores range from 0.5545 through 0.7727. The set uses near-misses because they provide more sensitivity to localization-tool gains than arbitrary low-score failures.
 
 ## Plan of Work
 
@@ -213,3 +230,5 @@ Revision note: The corrected symbol arm exposed rule-first semantic-pack activat
 Revision note: The grouped and parallel traversal reduced warm Kafka first-call latency to 3.55 seconds. The prewarm profiler now creates the required structural snapshots before an evaluation.
 
 Revision note: The second symbol arm stopped after issue #1688 exposed a full `code_units` substring scan for near-canonical Go receiver selectors. Indexed terminal lookup reduced the exact reproduction to 4.55 seconds including startup.
+
+Revision note: Runtime r9 stopped before use after a new audit found that the 11-task paired set included malformed baseline answers. The replacement set uses only valid empirical Luna maximum grep failures.
