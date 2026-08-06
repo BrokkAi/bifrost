@@ -386,6 +386,31 @@ fn missing_explicit_source_paths_skip_fuzzy_symbol_resolution() {
 }
 
 #[test]
+fn missing_extensionless_directory_paths_skip_package_and_fuzzy_resolution() {
+    let root = std::env::current_dir().unwrap();
+    let analyzer = CountingAnalyzer::new(root, &["src/Present.java"]);
+    let summaries = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["pkg/admission/plugin/webhook".to_string()],
+        },
+    );
+
+    assert_eq!(1, summaries.not_found.len(), "{summaries:#?}");
+    assert!(summaries.summaries.is_empty(), "{summaries:#?}");
+    assert_eq!(
+        0,
+        analyzer.search_definitions_calls(),
+        "missing relative directory paths must not enter fuzzy symbol resolution"
+    );
+    assert_eq!(
+        0,
+        analyzer.analyzed_files_calls(),
+        "missing relative directory paths must not enumerate analyzed files"
+    );
+}
+
+#[test]
 fn glob_file_pattern_scans_analyzed_files() {
     let root = std::env::current_dir().unwrap();
     let analyzer = CountingAnalyzer::new(root, &["A.java", "nested/B.java", "notes.txt"]);

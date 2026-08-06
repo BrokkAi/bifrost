@@ -372,6 +372,17 @@ pub(super) fn package_listing(analyzer: &dyn IAnalyzer, target: &str) -> Option<
     if package.is_empty() {
         return None;
     }
+    // Relative paths that are not real directories are handled as misses.
+    // Import paths have a dotted first component (for example, github.com or
+    // k8s.io) and remain eligible for package resolution.
+    if package.contains('/')
+        && !package
+            .split('/')
+            .next()
+            .is_some_and(|component| component.contains('.'))
+    {
+        return None;
+    }
     let index = analyzer.global_usage_definition_index();
     if !index.package_container_exists(package) {
         return None;
@@ -480,6 +491,17 @@ fn summarize_symbol_targets_with_cancellation(
             break;
         }
         let _target_scope = profiling::scope(format!("summarize_symbol_target[{target}]"));
+        // A slash-bearing target without a source extension is a missing
+        // relative directory or package path, not a useful fuzzy symbol. Do
+        // not build the workspace-wide definition index to prove that a path
+        // typo is not a symbol (#1608: a 399k-row Go index added 20 seconds
+        // to an ordinary directory listing request).
+        if (target.contains('/') || target.contains('\\'))
+            && !looks_like_explicit_source_file_target(&target)
+        {
+            not_found.push(file_not_found_input(target));
+            continue;
+        }
         if looks_like_explicit_source_file_target(&target) {
             match resolve_selectable_definitions(analyzer, &target, exact_codeunit_resolution) {
                 SelectableDefinitionResolution::Resolved(code_units) => {

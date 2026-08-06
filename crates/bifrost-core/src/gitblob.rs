@@ -508,10 +508,10 @@ fn dirty_worktree_paths(repo: &Repository) -> Result<HashSet<String>> {
         let path = &field[3..];
         if status != b"  " && status != b"!!" {
             dirty.insert(String::from_utf8_lossy(path).into_owned());
-            if status.contains(&b'R') || status.contains(&b'C') {
-                if let Some(previous) = fields.next().filter(|previous| !previous.is_empty()) {
-                    dirty.insert(String::from_utf8_lossy(previous).into_owned());
-                }
+            if (status.contains(&b'R') || status.contains(&b'C'))
+                && let Some(previous) = fields.next().filter(|previous| !previous.is_empty())
+            {
+                dirty.insert(String::from_utf8_lossy(previous).into_owned());
             }
         }
     }
