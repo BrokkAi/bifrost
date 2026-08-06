@@ -426,6 +426,7 @@ query_step_ops! {
     MemberTargets { label: "member_targets", signature: "structural_match|reference_site|occurrence -> receiver_analysis", description: "Resolve exact member declarations through bounded structured receiver facts." }
     ReceiverOutcome { label: "receiver_outcome", signature: "receiver_analysis -> receiver_outcome", description: "Project the mandatory terminal outcome row for each receiver analysis." }
     ReceiverEvidence { label: "receiver_evidence", signature: "receiver_analysis -> receiver_evidence", description: "Project zero or more parent-linked typed receiver evidence rows." }
+    MemberSelection { label: "member_selection", signature: "occurrence -> member_selection", description: "Project the mandatory member-selection summary row for each reference occurrence, from the production resolver's own candidate trace." }
     OccurrencesOf { label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it." }
     OccurrencesIn { label: "occurrences_in", signature: "structural_match|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or file." }
     OccurrenceTarget { label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences." }
@@ -586,6 +587,7 @@ macro_rules! rql_forms {
                     | Self::MemberTargets
                     | Self::ReceiverOutcome
                     | Self::ReceiverEvidence
+                    | Self::MemberSelection
                     | Self::Occurrences
                     | Self::OccurrencesOf
                     | Self::OccurrencesIn
@@ -965,6 +967,14 @@ rql_forms! {
         signature: "(receiver-evidence query)",
         description: (QueryStepOp::ReceiverEvidence),
         step: ReceiverEvidence,
+    }
+    MemberSelection {
+        labels: ["member-selection", "member_selection"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(member-selection query)",
+        description: (QueryStepOp::MemberSelection),
+        step: MemberSelection,
     }
     Occurrences {
         labels: ["occurrences", "occurrence"],

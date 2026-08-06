@@ -63,6 +63,7 @@ pub enum QueryValueKind {
     ReceiverAnalysis,
     ReceiverOutcome,
     ReceiverEvidence,
+    MemberSelection,
     Occurrence,
     LexicalScope,
     Binding,
@@ -95,6 +96,7 @@ impl QueryValueKind {
             Self::ReceiverAnalysis => "receiver_analysis",
             Self::ReceiverOutcome => "receiver_outcome",
             Self::ReceiverEvidence => "receiver_evidence",
+            Self::MemberSelection => "member_selection",
             Self::Occurrence => "occurrence",
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
@@ -256,6 +258,7 @@ pub enum QueryStep {
     MemberTargets(ReceiverTraversalFilter),
     ReceiverOutcome,
     ReceiverEvidence,
+    MemberSelection,
     OccurrencesOf(OccurrenceFilter),
     OccurrencesIn(OccurrenceFilter),
     OccurrenceTarget,
@@ -734,6 +737,7 @@ impl QueryStep {
             Self::MemberTargets(_) => QueryStepOp::MemberTargets,
             Self::ReceiverOutcome => QueryStepOp::ReceiverOutcome,
             Self::ReceiverEvidence => QueryStepOp::ReceiverEvidence,
+            Self::MemberSelection => QueryStepOp::MemberSelection,
             Self::OccurrencesOf(_) => QueryStepOp::OccurrencesOf,
             Self::OccurrencesIn(_) => QueryStepOp::OccurrencesIn,
             Self::OccurrenceTarget => QueryStepOp::OccurrenceTarget,
@@ -799,6 +803,7 @@ impl QueryStep {
             }
             QueryStepOp::ReceiverOutcome => Some(Self::ReceiverOutcome),
             QueryStepOp::ReceiverEvidence => Some(Self::ReceiverEvidence),
+            QueryStepOp::MemberSelection => Some(Self::MemberSelection),
             QueryStepOp::OccurrencesOf => Some(Self::OccurrencesOf(OccurrenceFilter::default())),
             QueryStepOp::OccurrencesIn => Some(Self::OccurrencesIn(OccurrenceFilter::default())),
             QueryStepOp::OccurrenceTarget => Some(Self::OccurrenceTarget),
@@ -870,6 +875,7 @@ impl QueryStep {
                 | QueryValueKind::ReceiverAnalysis
                 | QueryValueKind::ReceiverOutcome
                 | QueryValueKind::ReceiverEvidence
+                | QueryValueKind::MemberSelection
                 | QueryValueKind::Occurrence
                 | QueryValueKind::LexicalScope
                 | QueryValueKind::Binding
@@ -922,6 +928,9 @@ impl QueryStep {
             }
             (Self::ReceiverEvidence, QueryValueKind::ReceiverAnalysis) => {
                 Some(QueryValueKind::ReceiverEvidence)
+            }
+            (Self::MemberSelection, QueryValueKind::Occurrence) => {
+                Some(QueryValueKind::MemberSelection)
             }
             (Self::OccurrencesOf(_), QueryValueKind::Declaration) => {
                 Some(QueryValueKind::Occurrence)
@@ -1042,6 +1051,7 @@ pub(super) fn validate_query_steps(
             }
             QueryStep::MemberTargets(_) => "structural_match, reference_site, or occurrence",
             QueryStep::ReceiverOutcome | QueryStep::ReceiverEvidence => "receiver_analysis",
+            QueryStep::MemberSelection => "occurrence",
             QueryStep::OccurrencesOf(_) => "declaration",
             QueryStep::OccurrencesIn(_) => "structural_match or file",
             QueryStep::OccurrenceTarget => "occurrence",

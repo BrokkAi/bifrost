@@ -573,6 +573,300 @@ export function caller() { const service = makeService(); service.run(); }
     );
 }
 
+/// An aliased receiver resolves through the alias to the same typed evidence
+/// as the direct binding, and the row set is deterministic across runs.
+#[test]
+fn aliased_receiver_evidence_rows_are_deterministic_and_typed() {
+    let source = r#"class Service { run() {} }
+export function caller() { const service = new Service(); const alias = service; alias.run(); }
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+        .write(source)
+        .expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let query = |terminal| {
+        CodeQuery::from_json(&json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "capture": "receiver" }
+            },
+            "steps": [
+                { "op": "points_to", "capture": "receiver" },
+                { "op": terminal }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("aliased receiver query")
+    };
+
+    let outcome = execute(&analyzer, &query("receiver_outcome"));
+    let CodeQueryResultValue::ReceiverOutcome { value: outcome } = &outcome.results[0].value else {
+        panic!("expected receiver outcome")
+    };
+    assert_eq!(outcome.outcome, "precise", "{outcome:#?}");
+    assert_eq!(outcome.coverage, "exhaustive");
+
+    let first = execute(&analyzer, &query("receiver_evidence"));
+    let second = execute(&analyzer, &query("receiver_evidence"));
+    let rows = |result: &CodeQueryResult| {
+        result
+            .results
+            .iter()
+            .map(|item| match &item.value {
+                CodeQueryResultValue::ReceiverEvidence { value } => {
+                    (value.id.clone(), value.evidence_kind, value.ordinal)
+                }
+                _ => panic!("expected receiver evidence"),
+            })
+            .collect::<Vec<_>>()
+    };
+    let first_rows = rows(&first);
+    assert!(!first_rows.is_empty(), "{}", first.render_text());
+    assert_eq!(first_rows, rows(&second), "alias evidence must be stable");
+    assert!(
+        first.results.iter().any(
+            |item| matches!(&item.value, CodeQueryResultValue::ReceiverEvidence { value }
+                if value.evidence_kind == "allocation_site"
+                    && value.declaration_fq_name.as_deref() == Some("Service"))
+        ),
+        "the alias resolves to the allocation of Service: {}",
+        first.render_text()
+    );
+}
+
+/// A receiver that may hold either of two allocation types keeps both
+/// candidates visible: the outcome row is ambiguous with open coverage, and
+/// each candidate type has its own evidence row.
+#[test]
+fn ambiguous_receiver_keeps_both_types_as_open_evidence() {
+    let source = r#"class ServiceA { run() {} }
+class ServiceB { run() {} }
+export function caller(flag: boolean) {
+  const service = flag ? new ServiceA() : new ServiceB();
+  service.run();
+}
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+        .write(source)
+        .expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let query = |terminal| {
+        CodeQuery::from_json(&json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "capture": "receiver" }
+            },
+            "steps": [
+                { "op": "points_to", "capture": "receiver" },
+                { "op": terminal }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("ambiguous receiver query")
+    };
+
+    let outcome = execute(&analyzer, &query("receiver_outcome"));
+    let CodeQueryResultValue::ReceiverOutcome { value: outcome } = &outcome.results[0].value else {
+        panic!("expected receiver outcome, got {}", outcome.render_text())
+    };
+    assert_eq!(outcome.outcome, "ambiguous", "{outcome:#?}");
+    assert_eq!(
+        outcome.coverage, "open",
+        "an ambiguous receiver is never an exhaustive single answer: {outcome:#?}"
+    );
+
+    let evidence = execute(&analyzer, &query("receiver_evidence"));
+    let types = evidence
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::ReceiverEvidence { value } => value.declaration_fq_name.clone(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        types.iter().any(|fq_name| fq_name == "ServiceA")
+            && types.iter().any(|fq_name| fq_name == "ServiceB"),
+        "both candidate types stay visible as evidence rows: {}",
+        evidence.render_text()
+    );
+    assert_eq!(
+        outcome.candidate_count,
+        evidence.results.len(),
+        "the outcome row accounts for exactly the emitted evidence rows"
+    );
+}
+
+/// Every reference occurrence projects exactly one member-selection summary
+/// row from the production resolver's candidate trace, and the summary's
+/// selected set agrees with the ordinary get-definition answer.
+#[test]
+fn member_selection_summary_projects_the_production_trace() {
+    let source = r#"class Service { run() {} }
+class Other { run() {} }
+export function caller(service: Service) { service.run(); }
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+        .write(source)
+        .expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let query = CodeQuery::from_json(&json!({
+        "where": ["app.ts"],
+        "occurrences": { "role": ["member_position"] },
+        "steps": [{ "op": "member_selection" }],
+        "result_detail": "full"
+    }))
+    .expect("member selection query");
+
+    let first = execute(&analyzer, &query);
+    let second = execute(&analyzer, &query);
+    assert_eq!(first.results.len(), 1, "{}", first.render_text());
+    let CodeQueryResultValue::MemberSelection { value: row } = &first.results[0].value else {
+        panic!("expected member selection, got {}", first.render_text())
+    };
+    assert_eq!(row.member, "run");
+    assert_eq!(row.outcome, "selected", "{row:#?}");
+    assert!(row.selected_count >= 1);
+    assert!(row.candidate_count >= row.selected_count);
+    assert!(!row.site_ast_id.is_empty());
+    assert!(matches!(row.trace_completeness, "full" | "selection_only"));
+    match row.trace_completeness {
+        "full" => assert_eq!(row.coverage, "exhaustive"),
+        _ => assert_eq!(row.coverage, "open"),
+    }
+    let CodeQueryResultValue::MemberSelection { value: again } = &second.results[0].value else {
+        panic!("expected member selection")
+    };
+    assert_eq!(again.id, row.id, "the summary row identity is stable");
+
+    // The summary joins to the candidate rows it summarizes by AST identity.
+    let candidates = execute(
+        &analyzer,
+        &CodeQuery::from_json(&json!({
+            "where": ["app.ts"],
+            "occurrences": { "role": ["member_position"] },
+            "steps": [{ "op": "candidates_of" }],
+            "result_detail": "full"
+        }))
+        .expect("candidate query"),
+    );
+    let candidate_rows = candidates
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::ResolutionCandidate { value } => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(candidate_rows.len(), row.candidate_count, "{candidates:#?}");
+    assert!(
+        candidate_rows
+            .iter()
+            .all(|candidate| candidate.ast_id == row.site_ast_id),
+        "candidate rows join the summary by ast identity"
+    );
+}
+
+/// An unresolvable receiver still emits its mandatory outcome row. The row
+/// states `unknown` with unknown coverage and zero evidence rows, so an empty
+/// evidence relation can never masquerade as a proven-empty value set.
+#[test]
+fn unknown_receiver_reports_one_outcome_row_with_no_evidence() {
+    let source = r#"export function caller(service) { service.run(); }
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+        .write(source)
+        .expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let query = |terminal| {
+        CodeQuery::from_json(&json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [
+                { "op": "receiver_targets" },
+                { "op": terminal }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("unknown receiver query")
+    };
+
+    let outcome = execute(&analyzer, &query("receiver_outcome"));
+    assert_eq!(outcome.results.len(), 1, "{}", outcome.render_text());
+    let CodeQueryResultValue::ReceiverOutcome { value: outcome } = &outcome.results[0].value else {
+        panic!("expected receiver outcome, got {}", outcome.render_text())
+    };
+    assert_eq!(outcome.outcome, "unknown", "{outcome:#?}");
+    assert_eq!(outcome.coverage, "unknown");
+    assert_eq!(outcome.candidate_count, 0);
+    assert!(outcome.site_ast_id.is_some());
+
+    let evidence = execute(&analyzer, &query("receiver_evidence"));
+    assert!(
+        evidence.results.is_empty(),
+        "an unknown site has an outcome row and zero evidence rows: {}",
+        evidence.render_text()
+    );
+}
+
+/// A dynamic receiver has no analyzable value set. The mandatory outcome row
+/// states `unsupported` explicitly and no evidence row exists, so absence can
+/// never be read as a proven-empty set.
+#[test]
+fn dynamic_receiver_reports_an_unsupported_outcome_row_with_no_evidence() {
+    let source = r#"
+namespace Demo;
+public class Caller {
+    public void Call(dynamic opaque) { opaque.Run(); }
+}
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "Caller.cs")
+        .write(source)
+        .expect("write source");
+    let workspace = WorkspaceAnalyzer::build(
+        Arc::new(TestProject::new(root, Language::CSharp)),
+        AnalyzerConfig::default(),
+    );
+    let query = |terminal| {
+        CodeQuery::from_json(&json!({
+            "match": { "kind": "call", "callee": { "name": "Run" } },
+            "steps": [
+                { "op": "receiver_targets" },
+                { "op": terminal }
+            ],
+            "result_detail": "full"
+        }))
+        .expect("dynamic receiver query")
+    };
+
+    let outcome = execute_workspace(&workspace, &query("receiver_outcome"));
+    let CodeQueryResultValue::ReceiverOutcome { value: outcome } = &outcome.results[0].value else {
+        panic!("expected receiver outcome, got {}", outcome.render_text())
+    };
+    assert_eq!(outcome.outcome, "unsupported", "{outcome:#?}");
+    assert_eq!(outcome.coverage, "unsupported");
+    assert_eq!(outcome.candidate_count, 0);
+    assert_eq!(outcome.reason, Some("csharp_dynamic_receiver_unsupported"));
+
+    let evidence = execute_workspace(&workspace, &query("receiver_evidence"));
+    assert!(
+        evidence.results.is_empty(),
+        "an unsupported site has an outcome row and zero evidence rows: {}",
+        evidence.render_text()
+    );
+}
+
 #[test]
 fn csharp_cross_file_receiver_step_reuses_bounded_reference_facts() {
     let definitions = r#"

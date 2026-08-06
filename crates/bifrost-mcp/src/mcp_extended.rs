@@ -1018,6 +1018,7 @@ mod tests {
                 "owner",
                 "receiver_outcome",
                 "receiver_evidence",
+                "member_selection",
                 "occurrence_target",
                 "scope_of",
                 "scope_ancestors",

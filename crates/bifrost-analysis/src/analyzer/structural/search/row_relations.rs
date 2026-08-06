@@ -301,6 +301,54 @@ pub(super) fn candidate_expansions(
         .collect()
 }
 
+/// The mandatory member-selection summary for one occurrence.
+///
+/// Exactly one row is always produced for the row the traced file can
+/// re-locate: a missing candidate trace becomes an `untraced` summary rather
+/// than an absent row, so a policy can never mistake a language without trace
+/// support for a proven-empty candidate set. Only a file whose traced
+/// derivation cannot be produced at all (budget) yields no row, and that is
+/// reported through `row_exhausted`.
+pub(super) fn member_selection_expansions(
+    analyzer: &dyn IAnalyzer,
+    environment_cache: &mut EnvironmentTraversalCache,
+    row: &OccurrenceRow,
+    cancellation: Option<&CancellationToken>,
+    row_exhausted: &mut bool,
+) -> Vec<PipelineExpansion> {
+    let Some(traced) = environment_cache.traced_occurrences_for(analyzer, &row.file, cancellation)
+    else {
+        *row_exhausted = true;
+        return Vec::new();
+    };
+    let traced_row = traced
+        .rows
+        .iter()
+        .find(|other| other.node == row.node && other.role == row.role);
+    let occurrence = Arc::new(traced_row.cloned().unwrap_or_else(|| row.clone()));
+    let (selected, candidates, completeness) =
+        match traced_row.and_then(|row| row.candidates.as_ref()) {
+            Some(trace) => (
+                trace
+                    .candidates
+                    .iter()
+                    .filter(|row| row.is_selected())
+                    .count(),
+                trace.candidates.len(),
+                Some(trace.completeness),
+            ),
+            None => (0, 0, None),
+        };
+    vec![pipeline_expansion(PipelineValue::MemberSelection(
+        MemberSelectionValue {
+            occurrence,
+            selected,
+            candidates,
+            completeness,
+        },
+    ))]
+}
+
 /// The canonical inverse edges of one declaration, filtered and indexed.
 ///
 /// A row whose target cannot be located as an exact indexed declaration is

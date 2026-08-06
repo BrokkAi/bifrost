@@ -1249,6 +1249,23 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         out.push_str(&format!("  {}\n", sanitize_terminal_text(&detail)));
                     }
                 }
+                CodeQueryResultValue::MemberSelection { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let member = sanitize_terminal_text(&value.member);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} `{}` {} ({}; {} selected of {} candidate{})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "member selection:", use_color),
+                        member,
+                        value.outcome,
+                        value.coverage,
+                        value.selected_count,
+                        value.candidate_count,
+                        if value.candidate_count == 1 { "" } else { "s" },
+                    ));
+                }
                 CodeQueryResultValue::ReceiverOutcome { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let site_id = sanitize_terminal_text(&value.site_id);
