@@ -58,7 +58,7 @@ fn field_target(
             unit.kind() == CodeUnitType::Field
                 && unit.fq_name() == format!("{owner}.{field}")
                 && !unit.is_synthetic()
-                && unit.source().to_string().ends_with(source_suffix)
+                && unit.source().rel_path().ends_with(source_suffix)
         })
         .unwrap_or_else(|| panic!("missing {owner}.{field} target in {source_suffix}"))
 }
