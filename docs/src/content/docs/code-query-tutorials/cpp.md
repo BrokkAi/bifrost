@@ -3,7 +3,7 @@ title: C and C++
 description: Query C and C++ together through the cpp structural adapter and language filter.
 ---
 
-> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-14 (`query_code` schema version 1).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
 
@@ -192,7 +192,7 @@ The path glob excludes the C fixture. Receiver, callee, and argument roles ident
 
 ## Precision Boundary
 
-C naturally produces only the subset of normalized facts its syntax supports. Neither C nor C++ models `kwargs` or decorators, and version 2 does not resolve the static type of `service`.
+C naturally produces only the subset of normalized facts its syntax supports. Neither C nor C++ models `kwargs` or decorators, and the query engine does not resolve the static type of `service`.
 
 ## Traverse Indexed Types And Members
 

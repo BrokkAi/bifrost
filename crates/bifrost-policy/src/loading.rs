@@ -318,9 +318,9 @@ mod tests {
     fn closes_file_endpoint_and_charges_referenced_bytes() {
         let temp = TempDir::new().unwrap();
         fs::create_dir(temp.path().join("queries")).unwrap();
-        let query = "(rql :schema-version 2 (name \"A\"))";
+        let query = "(rql :schema-version 1 (name \"A\"))";
         fs::write(temp.path().join("queries/a.rql"), query).unwrap();
-        let source = endpoint("(rql-file :schema-version 2 :path \"queries/a.rql\")");
+        let source = endpoint("(rql-file :schema-version 1 :path \"queries/a.rql\")");
         let parsed = parse_rqlp_source(
             &source,
             PolicySourceIdentity::new("policies/endpoint-a.rqlp"),
@@ -331,8 +331,8 @@ mod tests {
         let loaded = load_endpoint_closure(Some(&root), parsed, source.as_bytes()).unwrap();
 
         let reference = loaded.referenced_selector().unwrap();
-        assert_eq!(reference.wrapper_authored_schema_version(), Some(2));
-        assert_eq!(reference.document_authored_schema_version(), Some(2));
+        assert_eq!(reference.wrapper_authored_schema_version(), Some(1));
+        assert_eq!(reference.document_authored_schema_version(), Some(1));
         assert_eq!(
             loaded.retained_source_and_selector_bytes(),
             source.len() + query.len()

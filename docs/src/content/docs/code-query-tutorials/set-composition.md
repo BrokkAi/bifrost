@@ -3,7 +3,7 @@ title: Typed Set Composition
 description: Combine compatible query_code pipelines with union, intersection, and subtraction.
 ---
 
-> Last verified end to end: 2026-07-16 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-16 (`query_code` schema version 1).
 
 Typed set composition combines the terminal values of complete query branches. Every branch at one set node must produce the same domain: structural matches, declarations, reference sites, call sites, expression sites, receiver analyses, or files. The result can then feed another ordinary typed step.
 

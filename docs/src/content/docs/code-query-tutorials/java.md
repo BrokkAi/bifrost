@@ -3,7 +3,7 @@ title: Java
 description: Query Java member calls, constructors, annotations, exceptions, and control flow with query_code.
 ---
 
-> Last verified end to end: 2026-08-04 (`query_code` schema version 2).
+> Last verified end to end: 2026-08-04 (`query_code` schema version 1).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
 

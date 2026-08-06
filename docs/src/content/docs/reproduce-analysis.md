@@ -48,7 +48,7 @@ Use a machine-readable manifest such as:
   "query": {
     "path": "queries/rule.json",
     "sha256": "<query file hash>",
-    "schema_version": 2
+    "schema_version": 1
   },
   "execution": {
     "command": "bifrost --root . --query-file queries/rule.json",

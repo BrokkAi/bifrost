@@ -115,7 +115,7 @@ With `--fail-on never`, the complete human report is:
 
 <!-- policy-doc-test:human:dynamic-eval -->
 ```text
-note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 13
+note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 1
 [warning]  app.py:2:12
     Dynamic evaluation is forbidden
 
@@ -136,7 +136,7 @@ independently:
 | Source form | Omitted version | Explicit version |
 | --- | --- | --- |
 | `(policy ...)` or `(endpoint ...)` | Select the newest compiled-in version in the compatible policy lineage (currently 1). | An exact pin; unsupported versions fail instead of falling back. |
-| `(rql QUERY)` | Select the compatible RQL head (currently 3). | Add `:schema-version N` for an exact RQL pin. |
+| `(rql QUERY)` | Select the compatible RQL head (currently 1). | Add `:schema-version N` for an exact RQL pin. |
 | `(rql-file :path "queries/rule.rql")` | With no wrapper pin, an explicit pin in the referenced document wins; if both omit a version, resolve the compatible RQL head. | A wrapper pin is exact; an explicit referenced-document pin must agree. |
 
 File-backed selectors have four version-resolution cases:
@@ -473,7 +473,7 @@ first is not. The requirement is therefore that the sorted receiver be declared
       :type assertion
       :subject
         (rql
-          :schema-version 9
+          :schema-version 1
           (union
             (language rust
               (inside (loop :capture "region")

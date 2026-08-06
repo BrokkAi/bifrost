@@ -1952,7 +1952,7 @@ mod tests {
     (analysis
       :type match
       :selector
-        (rql :schema-version 2
+        (rql :schema-version 1
           (language typescript (function :name "target")))))"#,
         )
     }

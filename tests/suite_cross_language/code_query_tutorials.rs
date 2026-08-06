@@ -30,7 +30,7 @@ struct TutorialCase {
 #[test]
 fn executable_tutorial_marker_contract_runs_end_to_end() {
     let markdown = r#"
-> Last verified end to end: 2026-07-13 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-13 (`query_code` schema version 1).
 
 <!-- code-query-fixture:sample.py -->
 ```python
@@ -364,7 +364,7 @@ fn parse_tutorial(path: &Path, markdown: &str) -> Tutorial {
         .find_map(|line| {
             line.trim()
                 .strip_prefix("> Last verified end to end: ")
-                .and_then(|rest| rest.strip_suffix(" (`query_code` schema version 2)."))
+                .and_then(|rest| rest.strip_suffix(" (`query_code` schema version 1)."))
         })
         .unwrap_or_else(|| panic!("{} has no last-verified note", path.display()))
         .to_string();

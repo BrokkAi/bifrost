@@ -5,14 +5,14 @@ description: Use the canonical JSON representation for Bifrost's query_code engi
 
 JSON `CodeQuery` is the canonical machine-facing representation accepted by Bifrost's `query_code` tool. MCP hosts and the Python client send this shape directly. The RQL REPL prints the same representation with `:json`.
 
-The compatible head is schema version 7. It retains the version 2-6 vocabulary and adds projection of host-retained production taint findings. Explicit version pins keep their old meanings and reject later operations. A schema-v7 query names only a registered immutable result; it cannot load a policy, compile selectors, run propagation, reconstruct witnesses, or perform policy classification.
+The single supported schema version is 1; it carries the complete vocabulary below. A taint query names only a registered immutable result; it cannot load a policy, compile selectors, run propagation, reconstruct witnesses, or perform policy classification.
 
 ## Minimal Query
 
 <!-- code-query-test:json:minimal-call -->
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 1,
   "match": {
     "kind": "call",
     "callee": {
@@ -28,7 +28,7 @@ The `match` object is the root pattern. It must constrain at least one of `kind`
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
-| `schema_version` | integer | Optional. Omit it for compatible head version 7; pass `2` through `6` to pin an earlier vocabulary, or `7` explicitly. Other versions are rejected. |
+| `schema_version` | integer | Optional. Version `1` is the only supported version; omit it or pin it explicitly. Other versions are rejected. |
 | `match` | pattern | Required root pattern. |
 | `where` | string array | Optional project-relative globs. Absolute paths or globs inside the active workspace are normalized by MCP and CLI entrypoints. |
 | `languages` | string array | Optional language labels such as `python`, `typescript`, `cpp`, or `csharp`. Empty means every structural adapter. |
@@ -130,7 +130,7 @@ Roles are normalized edges from one structural fact to a related node or source 
 | `decorators` | list | callable or class-like declarations | Decorators, annotations, or attributes. |
 | `object`, `field` | one each | `field_access` | Object and terminal field sides of member access. |
 
-Each `args` pattern must match a distinct positional argument in source order, but the matches need not be contiguous and do not assert exact arity. For exact positions or arity, narrow the surrounding source shape in a follow-up query; version 2 has no positional-index operator.
+Each `args` pattern must match a distinct positional argument in source order, but the matches need not be contiguous and do not assert exact arity. For exact positions or arity, narrow the surrounding source shape in a follow-up query; there is no positional-index operator.
 
 `kwargs` support is adapter-specific. Python, PHP, Scala, C#, Ruby, and Kotlin expose normalized named arguments; languages without that role return a capability diagnostic.
 
@@ -181,17 +181,17 @@ Steps execute in array order and are validated before the workspace is searched:
 | Operation | Input | Output | Meaning |
 | --- | --- | --- | --- |
 | `enclosing_decl` | structural match | declaration | Smallest non-synthetic indexed declaration containing the exact match range, inclusive of a matched declaration itself. |
-| `procedure_of` (v3) | structural match or declaration | procedure | Unique smallest source-backed executable procedure enclosing the exact input range. |
-| `cfg_entry` (v3) | procedure | program point | Validated entry boundary. |
-| `cfg_exits` (v3) | procedure | program point | Validated normal then exceptional exit boundaries. |
-| `cfg_successor_edges` (v3) | program point | control edge | One-hop outgoing control edges. |
-| `cfg_predecessor_edges` (v3) | program point | control edge | One-hop incoming control edges. |
-| `cfg_edge_source` (v3) | control edge | program point | Source endpoint of an edge. |
-| `cfg_edge_target` (v3) | control edge | program point | Target endpoint of an edge. |
-| `typestate` (v4) | procedure | typestate finding | Run the host-registered protocol/binding pair named by `protocol_ref` once for the exact procedure. |
-| `value_flow` (v6) | procedure | flow endpoint | Run the host-registered `ValueFlowPlan` named by `plan_ref` once for the exact procedure. |
-| `taint` (v7) | procedure | taint finding | Project the retained production `TaintFindingReport` named by `taint_ref` for the exact procedure. |
-| `witness` (v4/v6) | typestate finding or flow endpoint | matching witness domain | Project already-retained evidence, optionally reducing it with non-negative `max_steps` and `max_bytes`. |
+| `procedure_of` | structural match or declaration | procedure | Unique smallest source-backed executable procedure enclosing the exact input range. |
+| `cfg_entry` | procedure | program point | Validated entry boundary. |
+| `cfg_exits` | procedure | program point | Validated normal then exceptional exit boundaries. |
+| `cfg_successor_edges` | program point | control edge | One-hop outgoing control edges. |
+| `cfg_predecessor_edges` | program point | control edge | One-hop incoming control edges. |
+| `cfg_edge_source` | control edge | program point | Source endpoint of an edge. |
+| `cfg_edge_target` | control edge | program point | Target endpoint of an edge. |
+| `typestate` | procedure | typestate finding | Run the host-registered protocol/binding pair named by `protocol_ref` once for the exact procedure. |
+| `value_flow` | procedure | flow endpoint | Run the host-registered `ValueFlowPlan` named by `plan_ref` once for the exact procedure. |
+| `taint` | procedure | taint finding | Project the retained production `TaintFindingReport` named by `taint_ref` for the exact procedure. |
+| `witness` | typestate finding or flow endpoint | matching witness domain | Project already-retained evidence, optionally reducing it with non-negative `max_steps` and `max_bytes`. |
 | `references_of` | declaration | reference site | Exact structured source sites targeting the declaration. |
 | `used_by` | declaration | declaration | Smallest exact declaration enclosing each matching site. |
 | `uses` | declaration | declaration | Exact indexed declarations referenced by this semantic owner. |
@@ -210,30 +210,30 @@ Steps execute in array order and are validated before the workspace is searched:
 | `subtypes` | declaration | declaration | Direct descendants by default, or a bounded/full indexed descendant closure. |
 | `members` | declaration | declaration | Real direct declaration children of a type. |
 | `owner` | declaration | declaration | Exact declaring type of a direct member. |
-| `occurrences_in` (v8) | structural match or file | occurrence | Classified identifier occurrences lexically inside the node or file; accepts `class`, `role`, and `namespace`. |
-| `occurrences_of` (v8) | declaration | occurrence | The declaration's own name occurrence plus every reference-class occurrence resolving to it. |
-| `occurrence_target` (v8) | occurrence | declaration | Resolved semantic targets of reference-class occurrences. |
-| `scope_of` (v9) | binding, occurrence, or structural match | lexical scope | Innermost lexical scope owning the input. |
-| `scope_ancestors` (v9) | lexical scope | lexical scope | Enclosing scopes, innermost first, excluding the scope itself. |
-| `bindings_in` (v9) | lexical scope or structural match | binding | Bindings declared in the scope, or whose binder token is inside the match; accepts `kind`, `name`, and `hoisting`. |
-| `reaching_binding` (v9) | occurrence | binding | The binding of the occurrence's name in effect at its exact position; accepts `include_shadowed`. |
-| `binding_occurrence` (v9) | binding | occurrence | The binder-class occurrence row of the binding's declaring token. |
-| `candidates_of` (v9) | occurrence | resolution candidate | Candidates the resolver considered; accepts `tier`, `outcome`, and `boundary`. |
-| `candidate_target` (v9) | resolution candidate | declaration | Workspace declarations of unit-backed candidates; partial by construction. |
-| `edges_of` (v11) | declaration | reference edge | The inverse projection: every usage site the usage index enumerates for the declaration; accepts `reference_kinds`, `proof`, `surface`, `usage`, `relation`, and `site_class`. |
-| `edges_from` (v11) | occurrence | reference edge | The forward projection: the resolver's own resolved targets for that exact token; accepts the same six filters. |
-| `edge_target` (v11) | reference edge | declaration | Exact indexed target declaration of each edge. |
+| `occurrences_in` | structural match or file | occurrence | Classified identifier occurrences lexically inside the node or file; accepts `class`, `role`, and `namespace`. |
+| `occurrences_of` | declaration | occurrence | The declaration's own name occurrence plus every reference-class occurrence resolving to it. |
+| `occurrence_target` | occurrence | declaration | Resolved semantic targets of reference-class occurrences. |
+| `scope_of` | binding, occurrence, or structural match | lexical scope | Innermost lexical scope owning the input. |
+| `scope_ancestors` | lexical scope | lexical scope | Enclosing scopes, innermost first, excluding the scope itself. |
+| `bindings_in` | lexical scope or structural match | binding | Bindings declared in the scope, or whose binder token is inside the match; accepts `kind`, `name`, and `hoisting`. |
+| `reaching_binding` | occurrence | binding | The binding of the occurrence's name in effect at its exact position; accepts `include_shadowed`. |
+| `binding_occurrence` | binding | occurrence | The binder-class occurrence row of the binding's declaring token. |
+| `candidates_of` | occurrence | resolution candidate | Candidates the resolver considered; accepts `tier`, `outcome`, and `boundary`. |
+| `candidate_target` | resolution candidate | declaration | Workspace declarations of unit-backed candidates; partial by construction. |
+| `edges_of` | declaration | reference edge | The inverse projection: every usage site the usage index enumerates for the declaration; accepts `reference_kinds`, `proof`, `surface`, `usage`, `relation`, and `site_class`. |
+| `edges_from` | occurrence | reference edge | The forward projection: the resolver's own resolved targets for that exact token; accepts the same six filters. |
+| `edge_target` | reference edge | declaration | Exact indexed target declaration of each edge. |
 
 Repeat an import step for multiple hops. Traversal is cycle-safe and deterministic; it does not silently compute a transitive closure.
 
-### Procedure-local CFG inspection (schema v3)
+### Procedure-local CFG inspection
 
 This query starts from a structural function match, resolves its executable procedure, enters its CFG, follows one outgoing edge, and projects the target point:
 
 <!-- code-query-test:json:cfg-entry-successor -->
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 1,
   "languages": ["typescript"],
   "match": {"kind": "function", "name": "run"},
   "steps": [
@@ -249,16 +249,16 @@ This query starts from a structural function match, resolves its executable proc
 
 Every semantic row carries `evidence.proof` (`proven` or `unproven`) and `evidence.completeness` (`complete` or `partial`), with a bounded reason when either status is degraded. Public IDs never expose dense semantic arena IDs and remain stable for identical indexed content mounted at different absolute checkout paths. Diagnostics distinguish unsupported/partial capability, provider failure, missing workspace services, no enclosing procedure, cancellation, and budget exhaustion. An incomplete diagnostic prevents a complete-negative conclusion even when the result array is empty.
 
-Each edge operation is exactly one hop. Compose more steps for a finite traversal; schema v3 does not provide an unbounded closure, ICFG, data-flow, taint, typestate, finding, or witness endpoint. Schema v4 adds only the registered typestate adapter described next.
+Each edge operation is exactly one hop. Compose more steps for a finite traversal; the CFG surface does not provide an unbounded closure, ICFG, data-flow, taint, typestate, finding, or witness endpoint. The registered typestate adapter described next is the only typestate entry point.
 
-### Registered typestate findings and witnesses (schema v4)
+### Registered typestate findings and witnesses
 
 An embedding first registers an in-memory compiled protocol and its pre-resolved binding plan under a namespaced reference. The JSON request supplies only that reference; it never supplies a protocol path, binding JSON, policy severity, or query-time mode override.
 
 <!-- code-query-test:json:typestate-witness -->
 ```json
 {
-  "schema_version": 4,
+  "schema_version": 1,
   "match": {"kind": "function", "name": "lifecycle"},
   "steps": [
     {"op": "procedure_of"},
@@ -272,14 +272,14 @@ An embedding first registers an in-memory compiled protocol and its pre-resolved
 
 One request solves each exact procedure/protocol/binding tuple at most once. `witness` only trims retained evidence and never reruns the solver. Solver, finding, witness, semantic, and ordinary pipeline work all remain finitely bounded; profile mode reports typestate solves, request-cache hits, reached rows, findings, witnesses, steps, bytes, termination, and exhaustion. Missing references, stale workspace generations or artifacts, wrong roots, cancellation, provider failure, and exhausted budgets are explicit incomplete diagnostics, never clean empty negatives.
 
-### Registered value-flow endpoints and witnesses (schema v6)
+### Registered value-flow endpoints and witnesses
 
 The host registers an already-built `ValueFlowPlan` under a namespaced reference. A query sends only that reference:
 
 <!-- code-query-test:json:value-flow-witness -->
 ```json
 {
-  "schema_version": 6,
+  "schema_version": 1,
   "match": {"kind": "method", "name": "run"},
   "steps": [
     {"op": "procedure_of"},
@@ -291,13 +291,13 @@ The host registers an already-built `ValueFlowPlan` under a namespaced reference
 
 `flow_endpoint` rows keep reachability (`reached`, `not_reached`, or `inconclusive`), exact/may certainty, ambiguity, completion, must-status (`not_established`), and solver termination as separate fields. `flow_witness` rows contain bounded ordered source-backed steps plus truncation metadata. The adapter consumes the existing plan and solver, caches one solve per procedure/plan tuple within the request, and never performs policy classification.
 
-### Retained production taint findings (schema v7)
+### Retained production taint findings
 
 The host registers immutable results produced by the production taint policy compiler, batch planner, solver, collector, and public projector. A query selects the exact procedure root and projects only retained evidence:
 
 ```json
 {
-  "schema_version": 7,
+  "schema_version": 1,
   "match": {"kind": "method", "name": "run"},
   "steps": [
     {"op": "procedure_of"},
@@ -308,7 +308,7 @@ The host registers immutable results produced by the production taint policy com
 
 `taint_finding` rows preserve stable IDs, reached labels, origins, witnesses, proof/completeness, ambiguity, and truncation metadata. Registration aliases never enter those IDs. Matching projection limits produce rows field-for-field equal to the production policy outcome's public taint findings.
 
-### Typed occurrences (schema v8)
+### Typed occurrences
 
 An occurrence is what the parser says one identifier token *is* at one exact position: a declaration name, a binder, a type operand, a map key, a path segment, a plain read. `occurrences` is a query source of its own, scoped by the usual `where` and `languages`:
 
@@ -352,7 +352,7 @@ Containment is expressed by `occurrences_in` over a structural query rather than
 
 Occurrence support is declared per language and per role. Where a language's adapter does not classify a role a query names -- or classifies it but cannot place it in a namespace, as Rust and Java cannot for `path_segment` -- the run reports `occurrence_role_unsupported` with `incomplete` impact instead of returning a clean empty answer. A role the adapter *does* support is not degraded by an unsupported sibling role.
 
-### The lexical environment and resolution candidates (schema v9)
+### The lexical environment and resolution candidates
 
 An occurrence says *what* an identifier resolved to. Schema v9 adds the rows that say *why*, and why not.
 
@@ -427,7 +427,7 @@ Seed with the roles you need rather than with a class. `{"class": ["reference"]}
 
 The **package clause** is fields on the file row rather than a fourth row kind, because it is exactly one row per file. `package_fq` and `package_syntactic` appear together; `package_syntactic` is `true` when the language spells the package in the source (Java's `package a.b;`) and `false` when it is derived from the file's path (Python, Rust, JavaScript). Both being absent means no package could be named at all, which is not the same as "the file is in the root package".
 
-### Canonical reference edges (schema v11)
+### Canonical reference edges
 
 Bifrost derives "X uses Y" twice: the resolver derives it forward, from one classified token to the declaration it resolved to, and the usage index derives it backward, from one declaration to the sites that point at it. Schema v11 states both in one row shape so the two answers can be compared instead of merely coexisting.
 
@@ -521,7 +521,7 @@ These steps use normalized tree-sitter call shapes and the selected adapter's ex
 }
 ```
 
-### Qualified paths and their segments (schema v10)
+### Qualified paths and their segments
 
 A **qualified path** is one linear chain of segments (`java.util.Map`, `crate::util::Widget`), anchored at its terminal segment token's AST identity. `paths` is a source of its own:
 
@@ -715,7 +715,7 @@ That diagnostic means the affected language was not searched for that feature; i
 
 ## Limits And Validation Errors
 
-The compatible schema-v3 head enforces these budgets (version-2 pins share the structural limits):
+The engine enforces these budgets:
 
 | Budget | Maximum |
 | --- | --- |

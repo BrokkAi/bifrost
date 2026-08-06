@@ -189,7 +189,7 @@ Use this strict smoke prompt to prove Cursor called the plugin's MCP server
 instead of silently falling back to file or shell tools:
 
 ```text
-Use only the installed Bifrost plugin MCP tools. First confirm query_code is in the callable Bifrost MCP surface. Call search_symbols with patterns ["cursor_bifrost_host_probe_4f6f2b7"]. Then call query_code with schema_version 2, languages ["rust"], match {"kind":"function","name":"cursor_bifrost_host_probe_4f6f2b7"}, limit 10, and result_detail "full". Do not use Shell, terminal, rg, codebase search, file reading, or the bifrost CLI. Show both exact structured MCP results. PASS only if both return src/cursor_bifrost_host_probe_4f6f2b7.rs.
+Use only the installed Bifrost plugin MCP tools. First confirm query_code is in the callable Bifrost MCP surface. Call search_symbols with patterns ["cursor_bifrost_host_probe_4f6f2b7"]. Then call query_code with schema_version 1, languages ["rust"], match {"kind":"function","name":"cursor_bifrost_host_probe_4f6f2b7"}, limit 10, and result_detail "full". Do not use Shell, terminal, rg, codebase search, file reading, or the bifrost CLI. Show both exact structured MCP results. PASS only if both return src/cursor_bifrost_host_probe_4f6f2b7.rs.
 ```
 
 Apply the shared
