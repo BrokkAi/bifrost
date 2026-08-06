@@ -25,7 +25,7 @@ name = "brokk_bifrost_nlp"
 tokenizers = ["dep:tokenizers"]
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.22" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.23" }
 fastrq = "0.2.0"
 git2 = { version = "0.20.2", default-features = false }
 growable-bloom-filter = "2.1"
@@ -43,5 +43,5 @@ tokenizers = { version = "0.21", optional = true }
 libc = "0.2"
 
 [dev-dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.22", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.23", features = ["test-support"] }
 tempfile = "3.23.0"
