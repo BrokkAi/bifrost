@@ -1305,6 +1305,57 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         ));
                     }
                 }
+                CodeQueryResultValue::CallShape { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let site_id = sanitize_terminal_text(&value.site_id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({}; {} group{})\n  site {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "call shape:", use_color),
+                        value.call_kind,
+                        value.coverage,
+                        value.group_count,
+                        if value.group_count == 1 { "" } else { "s" },
+                        site_id,
+                    ));
+                }
+                CodeQueryResultValue::CallArgumentGroup { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let site_id = sanitize_terminal_text(&value.site_id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} #{} {} ({} argument{})\n  site {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "argument group:", use_color),
+                        value.group_index,
+                        value.kind,
+                        value.argument_count,
+                        if value.argument_count == 1 { "" } else { "s" },
+                        site_id,
+                    ));
+                }
+                CodeQueryResultValue::CallArgument { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let group_id = sanitize_terminal_text(&value.group_id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} #{}{}{}\n  group {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "argument:", use_color),
+                        value.argument_index,
+                        value
+                            .name
+                            .as_deref()
+                            .map(|name| format!(" name={}", sanitize_terminal_text(name)))
+                            .unwrap_or_default(),
+                        if value.spread { " spread" } else { "" },
+                        group_id,
+                    ));
+                }
                 CodeQueryResultValue::Occurrence { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let spelling = sanitize_terminal_text(
