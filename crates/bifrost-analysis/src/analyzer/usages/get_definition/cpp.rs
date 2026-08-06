@@ -3038,7 +3038,12 @@ fn resolve_cpp_type_without_focused_qualifier(
                 unit.is_class() || cpp_unit_is_type_alias(analyzer, unit)
             })
         {
-            return candidates_outcome(vec![unit]);
+            let candidates = if cpp_unit_is_type_alias(analyzer, &unit) {
+                vec![unit]
+            } else {
+                cpp_type_definition_candidates(analyzer, visibility, file, support, unit)
+            };
+            return candidates_outcome(candidates);
         }
     }
     if let Some(unit) = visibility.resolve_type(file, text)
@@ -3688,13 +3693,24 @@ fn cpp_type_definition_candidates(
     let mut seen = HashSet::default();
     let target =
         cpp_alias_target_unit(analyzer, visibility, file, &unit, &mut seen).unwrap_or(unit);
-    let indexed = support
+    let mut indexed = support
         .fqn(&target.fq_name())
         .into_iter()
         .filter(|candidate| {
             cpp_unit_matches_kind(analyzer, support, candidate, CppTargetKind::Type)
         })
         .collect::<Vec<_>>();
+    indexed.extend(
+        visibility
+            .visible_identifier_candidates(file, target.identifier())
+            .filter(|candidate| candidate.fq_name() == target.fq_name())
+            .filter(|candidate| {
+                cpp_unit_matches_kind(analyzer, support, candidate, CppTargetKind::Type)
+            })
+            .cloned(),
+    );
+    sort_units(&mut indexed);
+    indexed.dedup();
     if indexed.is_empty() {
         vec![target]
     } else {
