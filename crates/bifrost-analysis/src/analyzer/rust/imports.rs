@@ -846,7 +846,30 @@ pub(super) fn rust_external_module_segments(segments: &[String]) -> Option<(&str
     Some((root, (!nested.is_empty()).then_some(nested)))
 }
 
+/// Kind-level root (`C.tests`, `C.benches`, `C.examples`) for a file that sits
+/// at its own target root, i.e. the package prefix under which the modules
+/// shared between sibling targets live. `None` when the file has no separate
+/// kind root, so callers only pay for the target-directory case.
+///
+/// A target root file owns its `crate::` root (sibling benches must not see
+/// each other's items), so a name that misses under that root may still be one
+/// of the shared modules beside it -- `mod common;` in `benches/a.rs` and in
+/// `benches/b.rs` both name the single `benches/common/mod.rs` identity.
+pub(crate) fn rust_target_kind_root_package(file: &ProjectFile) -> Option<String> {
+    super::crate_naming::rust_target_kind_root(file).map(|root| root.join("."))
+}
+
+/// Package that `crate::` resolves to from `file`: crate-anchored when a
+/// `Cargo.toml` governs the file, otherwise the legacy path-derived root.
 pub(crate) fn rust_crate_root_package(file: &ProjectFile) -> String {
+    if let Some(paths) = super::crate_naming::rust_crate_paths(file) {
+        return paths.crate_root.join(".");
+    }
+    rust_path_derived_crate_root_package(file)
+}
+
+/// Directory-derived crate root, kept verbatim for manifest-less trees.
+fn rust_path_derived_crate_root_package(file: &ProjectFile) -> String {
     let rel = file.rel_path();
     let mut components: Vec<_> = rel
         .components()

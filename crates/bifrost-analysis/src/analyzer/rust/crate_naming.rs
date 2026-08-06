@@ -13,8 +13,9 @@
 //! filesystem ancestor walk plus pure manifest interpretation, mirroring the Go
 //! precedent in `go/packages.rs`.
 //!
-//! Nothing calls this yet; the `rust_package_components` /
-//! `rust_crate_root_package` flip lands in a follow-up commit.
+//! `rust_package_components` (`declarations.rs`) and `rust_crate_root_package`
+//! (`imports.rs`) are the two consumers; both fall back to the legacy
+//! path-derived scheme when this module answers `None`.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -28,9 +29,10 @@ use super::cargo_routes::{
 };
 
 /// Directory names that Cargo gives their own target tree, relative to the
-/// manifest directory. Files under them share a per-kind `crate::` root so the
-/// string-concat import resolver keeps working (`use crate::common::x` from
-/// `tests/it.rs` names the package of `tests/common/mod.rs`).
+/// manifest directory. A file directly in one of them is a target root and is
+/// its own `crate::` root (`benches/b.rs` sees its own consts under
+/// `crate::`); the shared modules beside it (`tests/common/mod.rs`) keep the
+/// kind-level root so cross-target references still name one file.
 const TARGET_DIRECTORIES: [&str; 3] = ["tests", "examples", "benches"];
 
 /// The crate-aware names of one file.
@@ -39,7 +41,6 @@ const TARGET_DIRECTORIES: [&str; 3] = ["tests", "examples", "benches"];
 /// `Domain::Crate`) depend on that, and it is asserted over the whole mapping
 /// table in this module's tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code, reason = "wired into rust naming in a follow-up commit")]
 pub(super) struct CratePaths {
     /// Package components of the file itself, e.g. `[wasm_bindgen, describe]`.
     pub(super) package: Vec<String>,
@@ -53,7 +54,6 @@ pub(super) struct CratePaths {
 ///
 /// `None` means "not a Cargo-managed file"; callers fall back to the legacy
 /// path-derived scheme, which this module deliberately does not reimplement.
-#[allow(dead_code, reason = "wired into rust naming in a follow-up commit")]
 pub(super) fn rust_crate_paths(file: &ProjectFile) -> Option<CratePaths> {
     let (manifest_directory, crate_name) = nearest_crate(file)?;
     let relative = file.rel_path().strip_prefix(&manifest_directory).ok()?;
@@ -62,6 +62,37 @@ pub(super) fn rust_crate_paths(file: &ProjectFile) -> Option<CratePaths> {
         relative,
         crate_name,
     ))
+}
+
+/// Name of the crate `file` belongs to, i.e. the identifier its own code may
+/// spell in place of `crate` (`wasm_bindgen::foo` from inside `wasm-bindgen`).
+/// `None` when no manifest governs the file.
+pub(super) fn rust_file_crate_name(file: &ProjectFile) -> Option<String> {
+    nearest_crate(file).map(|(_, crate_name)| crate_name)
+}
+
+/// Kind-level root (`C.tests`, `C.benches`, `C.examples`) of the multi-target
+/// directory holding `file`, when that is not already the file's own
+/// `crate::` root.
+///
+/// A target root file owns its `crate::` root so sibling targets stay isolated,
+/// but the modules they share (`tests/common/mod.rs`) have a single identity
+/// under the kind root. This is therefore the second candidate for anything
+/// that resolves a name out of a target root file: own root first, kind root on
+/// a miss. `None` for files that already sit at the kind root, for `src/`
+/// files, and for manifest-less trees.
+pub(super) fn rust_target_kind_root(file: &ProjectFile) -> Option<Vec<String>> {
+    let (manifest_directory, crate_name) = nearest_crate(file)?;
+    let relative = file.rel_path().strip_prefix(&manifest_directory).ok()?;
+    let head = relative
+        .components()
+        .find_map(|component| match component {
+            Component::Normal(component) => Some(component.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .filter(|head| TARGET_DIRECTORIES.contains(&head.as_str()))?;
+    let kind_root = vec![crate_name, head];
+    (rust_crate_paths(file)?.crate_root != kind_root).then_some(kind_root)
 }
 
 /// Nearest ancestor directory holding a `Cargo.toml` that names a crate, paired
@@ -146,9 +177,18 @@ fn classify(manifest_root: &Path, relative: &Path, crate_name: String) -> CrateP
         Some((head, rest)) if TARGET_DIRECTORIES.contains(&head.as_str()) => {
             let mut tail = vec![head.clone()];
             tail.extend_from_slice(rest);
+            let package = package_of(&tail);
+            // A file directly in the kind directory is a target root: it is
+            // compiled as its own crate, so `crate::` names its own items and
+            // sibling targets stay isolated from each other.
+            let crate_root = if rest.is_empty() {
+                package.clone()
+            } else {
+                target_root(&crate_name, &manifest_root.join(head), head, rest)
+            };
             CratePaths {
-                package: package_of(&tail),
-                crate_root: target_root(&crate_name, &manifest_root.join(head), head, rest),
+                package,
+                crate_root,
             }
         }
         // `build.rs` is compiled as its own crate, so it is its own root.
@@ -317,7 +357,11 @@ mod tests {
                 "wasm_bindgen.bin.tool",
             ),
             ("build.rs", "wasm_bindgen.build", "wasm_bindgen.build"),
-            ("tests/it.rs", "wasm_bindgen.tests.it", "wasm_bindgen.tests"),
+            (
+                "tests/it.rs",
+                "wasm_bindgen.tests.it",
+                "wasm_bindgen.tests.it",
+            ),
             (
                 "tests/common/mod.rs",
                 "wasm_bindgen.tests.common",
@@ -326,12 +370,12 @@ mod tests {
             (
                 "examples/demo.rs",
                 "wasm_bindgen.examples.demo",
-                "wasm_bindgen.examples",
+                "wasm_bindgen.examples.demo",
             ),
             (
                 "benches/b.rs",
                 "wasm_bindgen.benches.b",
-                "wasm_bindgen.benches",
+                "wasm_bindgen.benches.b",
             ),
             ("weird/x.rs", "wasm_bindgen.weird.x", "wasm_bindgen"),
         ];

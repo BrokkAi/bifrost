@@ -228,7 +228,7 @@ pub fn caller() -> u32 {
     let result = &resolved["results"][0];
     assert_eq!("resolved", result["status"], "{resolved}");
     assert_eq!(
-        "mymod.coop.poll_proceed", result["definitions"][0]["fqn"],
+        "macro_mod.mymod.coop.poll_proceed", result["definitions"][0]["fqn"],
         "{resolved}"
     );
     assert_eq!(

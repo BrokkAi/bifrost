@@ -236,7 +236,17 @@ pub(crate) fn rust_package_name(file: &ProjectFile) -> String {
     rust_package_components(file).join(".")
 }
 
+/// Crate-anchored package components when a `Cargo.toml` governs `file`,
+/// otherwise the legacy path-derived scheme.
 fn rust_package_components(file: &ProjectFile) -> Vec<String> {
+    if let Some(paths) = super::crate_naming::rust_crate_paths(file) {
+        return paths.package;
+    }
+    rust_path_derived_package_components(file)
+}
+
+/// Directory-derived naming, kept verbatim for manifest-less trees.
+fn rust_path_derived_package_components(file: &ProjectFile) -> Vec<String> {
     let rel = file.rel_path();
     let mut components: Vec<_> = rel
         .components()

@@ -2458,15 +2458,15 @@ mod tests {
 
         assert_eq!(
             routes.resolve_module_package(&consumer, "matcher_lib"),
-            Some("matcher.src".to_string())
+            Some("matcher_lib".to_string())
         );
         assert_eq!(
             routes.resolve_module_package(&consumer, "matcher_lib::nested"),
-            Some("matcher.src.nested".to_string())
+            Some("matcher_lib.nested".to_string())
         );
         assert_eq!(
             routes.resolve_module_package(&renamed, "custom_alias"),
-            Some("matcher.src".to_string())
+            Some("matcher_lib".to_string())
         );
         assert_eq!(
             routes.resolve_module_package(&consumer, "registry_alias"),
@@ -2515,16 +2515,19 @@ mod tests {
         );
         assert_eq!(
             routes.resolve_module_package(&binary, "selfroute::options"),
-            Some("options".to_string()),
+            Some("selfroute.options".to_string()),
             "the package binary may import its library by crate name"
         );
         assert_eq!(
             routes.resolve_module_package(&example, "selfroute::options"),
-            Some("options".to_string())
+            Some("selfroute.options".to_string())
         );
         assert_eq!(
             routes.resolve_module_package_segments_with_kind(&example, &segments),
-            Some(("options".to_string(), RustCargoRouteKind::CurrentLibrary))
+            Some((
+                "selfroute.options".to_string(),
+                RustCargoRouteKind::CurrentLibrary
+            ))
         );
     }
 

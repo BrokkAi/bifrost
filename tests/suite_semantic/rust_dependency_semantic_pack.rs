@@ -324,6 +324,110 @@ fn exact_cargo_evidence_activates_registry_git_and_path_dependency_apis() {
     );
 }
 
+/// Crate-aware Rust naming lets a workspace crate render the same qualified
+/// names as a rustdoc dependency of the same crate name (`widget.Widget` for
+/// both a local `widget` crate and the `widget` registry pack). The two must
+/// stay separate: authored references resolve to the authored declaration and
+/// the pack overlay keeps exactly its own record.
+#[test]
+fn a_local_crate_named_like_a_dependency_keeps_its_own_declarations() {
+    let library = "pub struct Widget;\npub fn make() -> Widget { Widget }\n";
+    let fixture = RustDependencyFixture::new();
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"widget\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", library)
+        .build();
+    let analyzer_config = AnalyzerConfig {
+        rust: RustAnalyzerConfig {
+            dependency_api_evidence: vec![fixture.evidence.clone()],
+        },
+        ..Default::default()
+    };
+    let analyzer = project.workspace_analyzer(analyzer_config.clone());
+    let limits = DependencyPackLimits::default();
+    let discovery = brokk_bifrost::resolve_rust_semantic_pack_dependencies(
+        &analyzer_config.rust,
+        analyzer.analyzer().project(),
+        &limits,
+        None,
+    );
+    assert!(discovery.complete, "{:#?}", discovery.diagnostics);
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let prepared = prepare_dependency_semantic_packs(
+        &catalog,
+        &RustDependencyPackAdapter,
+        &discovery.dependencies,
+        &limits,
+        None,
+    );
+    assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+    let request = prepared
+        .compose_activation_request(SemanticModelActivationRequest {
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            evidence: Vec::new(),
+            controls: Vec::new(),
+            limits: Default::default(),
+        })
+        .unwrap();
+    let SemanticModelRuntimeOutcome::Ready { .. } = acquire_active_semantic_models(
+        analyzer.analyzer(),
+        &catalog,
+        None,
+        &request,
+        &CancellationToken::default(),
+    ) else {
+        panic!("dependency models must activate");
+    };
+
+    let overlay = analyzer
+        .analyzer()
+        .semantic_model_overlay()
+        .expect("activation must publish the dependency overlay");
+    assert_eq!(
+        overlay.symbols_named("widget.Widget").records.len(),
+        1,
+        "the pack keeps exactly its own record even though a local crate renders the same name",
+    );
+
+    let authored = analyzer.analyzer().get_definitions("widget.Widget");
+    assert!(
+        authored
+            .iter()
+            .any(|unit| unit.source().rel_path() == std::path::Path::new("src/lib.rs")),
+        "the local crate declaration must be reachable under its own crate-anchored name: {authored:#?}",
+    );
+
+    let return_type = library.find("-> Widget").expect("return type") + "-> ".len();
+    let line = library[..return_type].matches('\n').count() + 1;
+    let column = return_type
+        - library[..return_type]
+            .rfind('\n')
+            .map_or(0, |index| index + 1)
+        + 1;
+    let definitions = get_definitions_by_location(
+        analyzer.analyzer(),
+        GetDefinitionParams {
+            references: vec![DefinitionReferenceQuery {
+                path: "src/lib.rs".to_owned(),
+                line: Some(line),
+                column: Some(column),
+            }],
+        },
+    );
+    let result = &definitions.results[0];
+    assert_eq!(result.status, "resolved", "{result:#?}");
+    assert!(
+        result
+            .definitions
+            .iter()
+            .all(|definition| definition.path == "src/lib.rs"),
+        "a local type reference must not resolve into the same-named dependency pack: {result:#?}",
+    );
+}
+
 #[test]
 fn blanket_impl_is_preserved_as_an_explicit_partial_pack() {
     let fixture = RustDependencyFixture::new();
