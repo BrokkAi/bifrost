@@ -98,6 +98,13 @@ Benchmark-local runtime artifacts stay under ignored directories:
 - subset workspaces: `benchmark/.cache/repos/.subsets`
 - JSON reports: `benchmark/benchmark-output`
 
+The repo cache holds full clones. A blobless clone (`--filter=blob:none`) of a
+network remote is not a valid fixture: `most_relevant_files` refuses the git
+co-change history walk on such a clone (issue #1373), which silently changes
+the measured code path to the import-only fallback. The harness upgrades a
+cached partial clone in place with `git fetch --refetch` and removes the
+promisor markers.
+
 The important checked-in files in this directory are:
 
 - `targets.toml`: pinned corpus, per-repo probes, and default local paths

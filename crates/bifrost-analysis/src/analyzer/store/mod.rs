@@ -1284,6 +1284,37 @@ impl AnalyzerStore {
         ensure_language_epochs_tx(&mut conn, entries)
     }
 
+    /// Sum persisted analyzer payload bytes for complete blobs in the active
+    /// language generations. The cache budget uses this as a corpus-size hint;
+    /// it is not an exact heap measurement because source text is not stored in
+    /// `blob_payload_costs`.
+    pub(crate) fn active_file_state_payload_bytes(
+        &self,
+        generations: &HashMap<String, GenerationId>,
+    ) -> Result<usize> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let mut total = 0usize;
+        let mut statement = tx.prepare_cached(
+            "SELECT COALESCE(SUM(costs.payload_bytes), 0)
+             FROM blobs
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = blobs.blob_oid AND meta.lang = blobs.lang
+             LEFT JOIN blob_payload_costs AS costs
+               ON costs.blob_oid = blobs.blob_oid AND costs.lang = blobs.lang
+             WHERE blobs.lang = ?1 AND blobs.generation = ?2
+               AND meta.is_complete = 1",
+        )?;
+        for (lang, generation) in generations {
+            let bytes =
+                statement.query_row(params![lang, generation.0], |row| row.get::<_, usize>(0))?;
+            total = total.saturating_add(bytes);
+        }
+        drop(statement);
+        tx.commit()?;
+        Ok(total)
+    }
+
     pub fn missing_blobs(&self, oids: &[Oid], lang: &str) -> Result<Vec<Oid>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
