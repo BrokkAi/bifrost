@@ -634,6 +634,7 @@ mod issue_1228_response_budget_tests {
             not_found: Vec::new(),
             ambiguous: Vec::new(),
             ambiguous_paths: Vec::new(),
+            too_broad: Vec::new(),
         };
 
         let error = SearchToolsService::symbol_sources_output(result, RenderOptions::default())

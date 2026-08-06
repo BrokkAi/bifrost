@@ -258,6 +258,7 @@ fn complete_symbol_index_skips_enclosing_owner_regex_scan() {
         }],
         ambiguous: Vec::new(),
         ambiguous_paths: Vec::new(),
+        too_broad: Vec::new(),
     };
 
     let files = symbol_source_candidate_files(&analyzer, &result);

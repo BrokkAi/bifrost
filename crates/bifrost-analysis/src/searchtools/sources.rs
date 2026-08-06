@@ -10,6 +10,8 @@ pub struct SymbolSourcesResult {
     pub ambiguous: Vec<AmbiguousSymbol>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub too_broad: Vec<TooBroadScope>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -36,6 +38,7 @@ pub(super) enum SourceLookupOutcome {
     NotFound(NotFoundInput),
     Ambiguous(AmbiguousSymbol),
     AmbiguousPath(AmbiguousPathInput),
+    TooBroad(TooBroadScope),
 }
 
 pub(super) fn source_blocks_for_resolved_units(
@@ -226,6 +229,18 @@ pub fn get_symbol_sources(
     analyzer: &dyn IAnalyzer,
     params: SymbolLookupParams,
 ) -> SymbolSourcesResult {
+    get_symbol_sources_with_cap(analyzer, params, GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET)
+}
+
+/// `max_files_per_target` bounds how many files one glob-shaped symbol argument
+/// may expand to; a target over the bound is reported through `too_broad` and
+/// contributes no source blocks at all, because the full text of an arbitrary
+/// subset of a huge match looks complete while meaning nothing.
+fn get_symbol_sources_with_cap(
+    analyzer: &dyn IAnalyzer,
+    params: SymbolLookupParams,
+    max_files_per_target: usize,
+) -> SymbolSourcesResult {
     // One tool call is one read-only analyzer request. The scope is what lets
     // every `WorkspaceFileResolver` built below -- one per call site, times one
     // per symbol in the parallel loop -- share a single workspace listing
@@ -299,22 +314,10 @@ pub fn get_symbol_sources(
                 crate::profiling::scope(format!("get_symbol_sources.path_qualified[{symbol}]"));
             match split_path_qualified_definition_selector(analyzer, &symbol) {
                 Some(PathQualifiedSelector::Resolved { anchor, lookup }) => {
-                    return match resolve_file_anchored_symbol_sources(
-                        analyzer, &symbol, anchor, lookup,
-                    ) {
-                        SourceLookupOutcome::Found(blocks) => {
-                            (index, SourceLookupOutcome::Found(blocks))
-                        }
-                        SourceLookupOutcome::NotFound(item) => {
-                            (index, SourceLookupOutcome::NotFound(item))
-                        }
-                        SourceLookupOutcome::Ambiguous(item) => {
-                            (index, SourceLookupOutcome::Ambiguous(item))
-                        }
-                        SourceLookupOutcome::AmbiguousPath(item) => {
-                            (index, SourceLookupOutcome::AmbiguousPath(item))
-                        }
-                    };
+                    return (
+                        index,
+                        resolve_file_anchored_symbol_sources(analyzer, &symbol, anchor, lookup),
+                    );
                 }
                 Some(PathQualifiedSelector::AmbiguousPath(item)) => {
                     return (index, SourceLookupOutcome::AmbiguousPath(item));
@@ -357,6 +360,16 @@ pub fn get_symbol_sources(
                 return (index, SourceLookupOutcome::AmbiguousPath(item.clone()));
             }
             if !file_matches.files.is_empty() {
+                if file_matches.files.len() > max_files_per_target {
+                    return (
+                        index,
+                        SourceLookupOutcome::TooBroad(too_broad_scope(
+                            &symbol,
+                            &file_matches.files,
+                            max_files_per_target,
+                        )),
+                    );
+                }
                 let sources = source_blocks_for_files(analyzer, file_matches.files);
                 return if sources.is_empty() {
                     (
@@ -444,12 +457,14 @@ pub fn get_symbol_sources(
     let mut not_found = Vec::new();
     let mut ambiguous = Vec::new();
     let mut ambiguous_paths = Vec::new();
+    let mut too_broad = Vec::new();
     for (_, outcome) in outcomes {
         match outcome {
             SourceLookupOutcome::Found(blocks) => sources.extend(dedup_source_blocks(blocks)),
             SourceLookupOutcome::NotFound(symbol) => not_found.push(symbol),
             SourceLookupOutcome::Ambiguous(item) => ambiguous.push(item),
             SourceLookupOutcome::AmbiguousPath(item) => ambiguous_paths.push(item),
+            SourceLookupOutcome::TooBroad(item) => too_broad.push(item),
         }
     }
 
@@ -458,6 +473,7 @@ pub fn get_symbol_sources(
         not_found,
         ambiguous,
         ambiguous_paths,
+        too_broad,
     }
 }
 

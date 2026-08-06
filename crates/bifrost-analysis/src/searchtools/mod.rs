@@ -258,6 +258,11 @@ pub const FILE_PATTERN_FANOUT_SAMPLE: usize = 10;
 /// listing, so a larger cap needs new evidence first.
 pub const GET_SUMMARIES_MAX_FILES_PER_TARGET: usize = 20;
 
+/// Files a single `get_symbol_sources` glob target may expand to before the
+/// tool skips it. Half the `get_summaries` cap because this tool answers with
+/// full source text, the heaviest payload per file the searchtools produce.
+pub const GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET: usize = 10;
+
 /// A single request target that matched more of the workspace than the
 /// tool will process. The work was skipped, not truncated: `sample`
 /// holds the first `FILE_PATTERN_FANOUT_SAMPLE` matched paths so the
@@ -268,6 +273,24 @@ pub struct TooBroadScope {
     pub matched: usize,
     pub cap: usize,
     pub sample: Vec<String>,
+}
+
+/// `matched` is already ordered (it comes out of a `BTreeSet<ProjectFile>`), so
+/// the sample is the first `FILE_PATTERN_FANOUT_SAMPLE` paths; sorting those
+/// few strings makes the rendered order path-lexicographic on every platform.
+fn too_broad_scope(target: &str, matched: &[ProjectFile], cap: usize) -> TooBroadScope {
+    let mut sample: Vec<_> = matched
+        .iter()
+        .take(FILE_PATTERN_FANOUT_SAMPLE)
+        .map(rel_path_string)
+        .collect();
+    sample.sort();
+    TooBroadScope {
+        target: target.to_string(),
+        matched: matched.len(),
+        cap,
+        sample,
+    }
 }
 
 pub const TYPE_LOOKUP_MAX_REFERENCES: usize = 100;

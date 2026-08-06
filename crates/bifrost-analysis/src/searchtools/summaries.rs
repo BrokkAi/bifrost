@@ -319,24 +319,6 @@ fn route_summary_targets_with_cancellation(
     }
 }
 
-/// `matched` is already ordered (it comes out of a `BTreeSet<ProjectFile>`), so
-/// the sample is the first `FILE_PATTERN_FANOUT_SAMPLE` paths; sorting those
-/// few strings makes the rendered order path-lexicographic on every platform.
-fn too_broad_scope(target: &str, matched: &[ProjectFile], cap: usize) -> TooBroadScope {
-    let mut sample: Vec<_> = matched
-        .iter()
-        .take(FILE_PATTERN_FANOUT_SAMPLE)
-        .map(rel_path_string)
-        .collect();
-    sample.sort();
-    TooBroadScope {
-        target: target.to_string(),
-        matched: matched.len(),
-        cap,
-        sample,
-    }
-}
-
 /// The workspace-relative directory `target` would list, if any: the empty
 /// path for the workspace root, `None` for spellings that cannot name a
 /// workspace directory at all (absolute, root-anchored, or `..`-escaping).

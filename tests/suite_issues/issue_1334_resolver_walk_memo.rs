@@ -166,6 +166,7 @@ fn shared_listing_returns_identical_results() {
         not_found: Vec::new(),
         ambiguous: Vec::new(),
         ambiguous_paths: Vec::new(),
+        too_broad: Vec::new(),
     };
     for symbol in mixed {
         let one = sources(&analyzer, vec![symbol]);

@@ -16,7 +16,7 @@ You can see it working by running the new behavior tests (each fails before its 
 
 - [x] (2026-08-06) Audit of every searchtools entry point completed; unguarded fan-out paths identified (recorded in Context and Orientation below).
 - [x] (2026-08-06 18:22Z) Milestone 1: shared `TooBroadScope` type and the `get_summaries` per-target guard, with render support and behavior tests. Landed in `crates/bifrost-analysis/src/searchtools/mod.rs` (constants and type), `summaries.rs` (routing guard, `too_broad` on `SummaryTargets` and `SummaryResult`), `crates/bifrost-analysis/src/searchtools_render.rs` (`render_too_broad_scope`), `crates/bifrost-mcp/src/mcp_common.rs` (`render_too_broad_json` for the budgeted path), and four tests in `tests/suite_symbols/searchtools_too_broad_scope.rs`.
-- [ ] Milestone 2: `get_symbol_sources` glob-arm guard, with behavior tests.
+- [x] (2026-08-06 18:40Z) Milestone 2: `get_symbol_sources` glob-arm guard, with render support and behavior tests. Landed in `crates/bifrost-analysis/src/searchtools/mod.rs` (`GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET`, plus `too_broad_scope` moved here from `summaries.rs` so both glob consumers share it), `sources.rs` (`SourceLookupOutcome::TooBroad`, `too_broad` on `SymbolSourcesResult`, the guard in `get_symbol_sources_with_cap`), `crates/bifrost-analysis/src/searchtools_render.rs` (reuses `render_too_broad_scope`), and four more tests in `tests/suite_symbols/searchtools_too_broad_scope.rs`.
 - [ ] Milestone 3: `search_symbols` post-resolution candidate cap, with behavior tests and a provisional cap value.
 - [ ] Milestone 4: investigate workspace-root `get_summaries` latency (completed: read-only investigation and issue filed as https://github.com/BrokkAi/bifrost/issues/1738, 2026-08-06 18:40Z; remaining: profiling spans on the listing path and the `all_files_shared` swap, scoped in the milestone text below).
 - [ ] Milestone 5: tool description updates, full gate, checkpoint commit(s) verified.
@@ -75,6 +75,18 @@ You can see it working by running the new behavior tests (each fails before its 
 - Decision: fold two bounded code items into Milestone 4's remaining scope: `profiling::scope` spans at the listing-path cost points, and the same-semantics swap of `all_files()` to `all_files_shared()` in `route_summary_targets_with_cancellation`.
   Rationale: the spans are the prerequisite for the measurement #1738 needs, and are additive. The swap removes one confirmed real cost (rebuilding a ~401,804-node `BTreeSet` of `Arc` pointers per call) with no semantic change: it is the same `Project` instance's own listing behind an `Arc` instead of a deep clone. Neither item claims to be "the fix"; the dominant-cost question stays with #1738.
   Date/Author: 2026-08-06, Fable.
+- Decision: `too_broad_scope` moved from `summaries.rs` into `searchtools/mod.rs`, next to `TooBroadScope` itself, rather than being duplicated or re-exported.
+  Rationale: Milestone 2 is the second caller, and both callers already reach `mod.rs` through `use super::*`. The helper only needs `ProjectFile` and `rel_path_string`, both already imported there. Keeping it private (no `pub(super)`) matches the existing `FILE_SEARCH_LIMIT` idiom: child modules see their ancestors' private items, so no visibility widening is needed.
+  Date/Author: 2026-08-06, implementation.
+- Decision: `get_symbol_sources` threads its cap through a private `get_symbol_sources_with_cap(analyzer, params, max_files_per_target)`, with the public entry point supplying the constant.
+  Rationale: unlike `get_summaries`, this tool has no routing function to hang the parameter on -- the glob arm lives inside the per-symbol rayon closure. A thin private wrapper is the smallest shape that keeps the constant at the entry point, matches Milestone 1's structure, and leaves the public signature unchanged.
+  Date/Author: 2026-08-06, implementation.
+- Decision: `get_symbol_sources` needed only one render site, not two.
+  Rationale: `render_budgeted_get_summaries_text` and `GET_SUMMARIES_RESPONSE_BUDGET_BYTES` in `crates/bifrost-mcp/src/mcp_common.rs` are specific to `get_summaries`; `rg -n "RESPONSE_BUDGET_BYTES" crates/bifrost-mcp/src/mcp_common.rs` finds no other tool. `get_symbol_sources` budgets in `SearchToolsService::symbol_sources_output` (`searchtools_service.rs`), which rejects an over-budget response outright instead of rebuilding text from JSON, and otherwise calls `result.render_text(...)`. So the `RenderText` impl is the whole surface, and it reuses `render_too_broad_scope` unchanged -- the Milestone 1 wording ("target X matched N files, over the C file limit for one target, so it was skipped", plus the sample and the narrowing instruction) is already tool-neutral.
+  Date/Author: 2026-08-06, implementation.
+- Decision: collapse the five-arm identity `match` that re-wrapped `resolve_file_anchored_symbol_sources`' `SourceLookupOutcome` into `return (index, outcome)`.
+  Rationale: adding `TooBroad` would have required a fifth arm that maps a variant to itself. The match never did anything but rebuild what it destructured, so the new variant made an existing redundancy load-bearing; removing it is smaller than extending it and cannot change behavior.
+  Date/Author: 2026-08-06, implementation.
 - Decision: reject the single-level `readdir` listing (Option B of the investigation) for this plan.
   Rationale: today's `directory_listing` emits a child entry only when at least one actual project file exists beneath it (`summaries.rs:322-345`). A single-level `readdir` cannot know that without recursing, so it would either list directories whose contents are entirely ignored (a user-visible contract regression) or reintroduce a partial walk. It also does not compose with the git-index fast path, which returns a flat path set with no per-directory enumeration primitive. If #1738's measurement shows the walk dominates, that issue owns the redesign.
   Date/Author: 2026-08-06, Fable.
@@ -97,7 +109,23 @@ With the guard branch in `route_summary_targets_with_cancellation` commented out
 
 The two non-regression tests (under-cap glob, 25 explicit file targets) pass in both states, which is the point: the guard adds a branch and changes nothing else.
 
-Remaining: Milestones 2 through 5. Lesson for the next milestone: the plan's render-site pointer was one file off, and the MCP byte-budget renderer is a second, JSON-shaped copy of the same text; check both when adding a new result field that must reach the agent.
+Remaining after Milestone 1: Milestones 2 through 5. Lesson for the next milestone: the plan's render-site pointer was one file off, and the MCP byte-budget renderer is a second, JSON-shaped copy of the same text; check both when adding a new result field that must reach the agent.
+
+Milestone 2 (2026-08-06): `get_symbol_sources` now answers a glob-shaped symbol argument matching more than `GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET` (10) files with the same structured `too_broad` entry and no source blocks at all, instead of the full text of every matched file. The cap is half the summaries cap because a source block is the heaviest per-file payload the searchtools produce. Exact symbol names, path-qualified selectors, and explicit single-file paths resolve before the glob arm and are untouched, as is any glob at or under the cap.
+
+Proof, on the same 25-file / 5-file inline fixture:
+
+    cargo nextest run --test suite_symbols -E 'test(too_broad)'
+    Summary [0.238s] 8 tests run: 8 passed, 1200 skipped
+
+With the guard branch in `get_symbol_sources_with_cap` removed, the same command reports:
+
+    Summary [0.247s] 8 tests run: 6 passed, 2 failed
+    FAIL searchtools_too_broad_scope::get_symbol_sources_glob_over_cap_reports_too_broad_and_skips_sources
+         assertion `left == right` failed ... left: 1  right: 0   (25 file-outline source blocks came back instead)
+    FAIL searchtools_too_broad_scope::get_symbol_sources_too_broad_render_names_target_counts_and_narrowing
+
+The four Milestone 1 tests and the two new non-regression tests (under-cap glob, exact name plus explicit path) pass in both states. The wider selection `cargo nextest run --workspace -E 'test(/searchtools|summaries|symbol_sources|search_symbols/)'` reports only failures from the pre-existing list in `Surprises & Discoveries`.
 
 ## Context and Orientation
 
@@ -257,9 +285,10 @@ In `crates/bifrost-analysis/src/searchtools/mod.rs`:
         pub sample: Vec<String>,
     }
 
-In `summaries.rs`: `SummaryTargets` and `SummaryResult` gain `too_broad: Vec<TooBroadScope>`. In `sources.rs`: `SymbolSourcesResult` gains `too_broad: Vec<TooBroadScope>`; `SourceLookupOutcome` gains a `TooBroad` variant. In `navigation.rs`: `SearchSymbolsResult` gains `too_many_matches: Option<TooManySymbolMatches>` with the struct as specified in Milestone 3. Internal enforcement functions take the cap as a `usize` parameter; public tool entry points pass the constants. As implemented in Milestone 1, `route_summary_targets_with_cancellation(analyzer, targets, max_files_per_target, cancellation)` is that function for `get_summaries`, and the module-private helper `too_broad_scope(target, matched, cap) -> TooBroadScope` in `summaries.rs` builds the report. Rendering lives in `crates/bifrost-analysis/src/searchtools_render.rs` (the `RenderText` impls) with a second JSON-shaped copy in `crates/bifrost-mcp/src/mcp_common.rs` for the byte-budget path; descriptions in `crates/bifrost-mcp/src/mcp_core.rs` / `mcp_extended.rs`.
+In `summaries.rs`: `SummaryTargets` and `SummaryResult` gain `too_broad: Vec<TooBroadScope>`. In `sources.rs`: `SymbolSourcesResult` gains `too_broad: Vec<TooBroadScope>`; `SourceLookupOutcome` gains a `TooBroad` variant. In `navigation.rs`: `SearchSymbolsResult` gains `too_many_matches: Option<TooManySymbolMatches>` with the struct as specified in Milestone 3. Internal enforcement functions take the cap as a `usize` parameter; public tool entry points pass the constants. As implemented in Milestone 1, `route_summary_targets_with_cancellation(analyzer, targets, max_files_per_target, cancellation)` is that function for `get_summaries`, `get_symbol_sources_with_cap(analyzer, params, max_files_per_target)` is that function for `get_symbol_sources`, and the module-private helper `too_broad_scope(target, matched, cap) -> TooBroadScope` in `searchtools/mod.rs` builds the report for both. Rendering lives in `crates/bifrost-analysis/src/searchtools_render.rs` (the `RenderText` impls) with a second JSON-shaped copy in `crates/bifrost-mcp/src/mcp_common.rs` for the byte-budget path; descriptions in `crates/bifrost-mcp/src/mcp_core.rs` / `mcp_extended.rs`.
 
 ## Revision notes
 
 - 2026-08-06 (Milestone 1 implementation): corrected the render-site pointer from `crates/bifrost-mcp/src/searchtools_service.rs` to `crates/bifrost-analysis/src/searchtools_render.rs`, and added the second render site in `crates/bifrost-mcp/src/mcp_common.rs`, because that is where the text is actually produced; a plan that sent the next contributor to the wrong file would cost them the same search. Replaced the tiny-cap test recipe with the shipped-constant recipe and named the real test file, because the routing function is crate-private and unreachable from an integration suite; the reasoning is in the Decision Log. Recorded the pre-existing unrelated test failures in `Surprises & Discoveries` so a later contributor does not attribute them to this plan.
+- 2026-08-06 (Milestone 2 implementation): corrected the Milestone 2 render-site expectation. The section warned that `get_symbol_sources` might need a second, JSON-shaped renderer like `get_summaries`; it does not, because the MCP byte budget for this tool rejects rather than degrades. Recorded where the helper `too_broad_scope` now lives (`searchtools/mod.rs`) and the private-wrapper shape used to thread the cap, so Milestone 3 does not rediscover either.
 - 2026-08-06 (Milestone 4 investigation): rewrote Milestone 4 from an open investigation into its outcome. The read-only investigation confirmed the mechanism (trivially-true `has_directory("")`, per-call deep clone, no listing cache under `UpdateStrategy::Manual`, whole-tree `git status` subprocess) but could not attribute the 126.98 s to one dominant cost without new profiling spans, so the deliverable became issue #1738 plus two bounded code items kept in this plan: the spans that make the measurement possible, and the semantics-preserving `all_files_shared()` swap. The single-level `readdir` alternative was evaluated and rejected; reasons in the Decision Log.

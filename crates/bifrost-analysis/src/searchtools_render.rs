@@ -275,6 +275,7 @@ impl RenderText for SymbolSourcesResult {
         if !self.ambiguous_paths.is_empty() {
             blocks.push(render_ambiguous_paths(&self.ambiguous_paths));
         }
+        blocks.extend(self.too_broad.iter().map(render_too_broad_scope));
         blocks.extend(
             self.sources
                 .iter()
@@ -1185,6 +1186,7 @@ mod tests {
                 input: "Foo.java".to_string(),
                 matches: vec!["app/Foo.java".to_string(), "lib/Foo.java".to_string()],
             }],
+            too_broad: Vec::new(),
         };
 
         let text = result.render_text(RenderOptions::default());
