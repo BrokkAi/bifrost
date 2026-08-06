@@ -482,11 +482,14 @@ lang_epoch!(
 // crate's `resources/treesitter/c_sharp/` into `brokk-bifrost-csharp`, so the
 // salted content now comes from a different crate's `include_str!`. The bytes
 // are unchanged, which is exactly why the salt has to carry the relocation.
+// Salt bumped again (#1735): C# callable metadata now treats the interop
+// OptionalAttribute as omittable. Warm rows recorded the old exact arity and
+// would make persisted inverse usage search reject valid omitted arguments.
 lang_epoch!(
     CSharp,
     "csharp",
     "treesitter/c_sharp/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08;interop-optional-callable-arity-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the Ruby `.scm` query assets moved from
 // this crate's `resources/treesitter/ruby/` into `brokk-bifrost-ruby`, so the
