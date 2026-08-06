@@ -42,17 +42,35 @@ use crate::syntax::{
 /// `TypeHierarchyProvider` is a supertrait because the analyzer answers
 /// `Some(self)` to `IAnalyzer::type_hierarchy_provider`, and the resolution
 /// paths that hold only the concrete C# analyzer used it in both roles.
+///
+/// Several names below appear twice, plain and `_limited`. The two spellings
+/// are two different queries, not one query and a capped view of it: the plain
+/// one answers from the hydrating in-memory path, while the `_limited` one
+/// answers from a single bounded store query whose row-byte budget is fixed
+/// independently of `limit`. A `_limited` call can therefore report
+/// `complete = false` at any budget, `usize::MAX` included, so no plain method
+/// here can be redefined as a default over its twin without silently turning a
+/// truncated batch into an authoritative answer. The per-pair divergences --
+/// different filtering, ordering, fallback or index -- are recorded on the
+/// methods themselves.
 pub trait CSharpAnalysisSource:
     CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider
 {
     // --- bounded declaration lookups ---
 
+    /// Declarations the persisted store records under `fqn`, keyed exactly or,
+    /// when `normalized` is set, by the generic-arity-stripped name. The
+    /// normalized index over-matches, so callers re-apply the arity test.
     fn persisted_declaration_candidates_by_fqn(
         &self,
         fqn: &str,
         normalized: bool,
     ) -> BTreeSet<CodeUnit>;
 
+    /// [`Self::persisted_declaration_candidates_by_fqn`] under a budget.
+    /// `limit` caps the store rows inspected and `continue_query` is polled for
+    /// cancellation; either one exhausted leaves `complete` false, which a
+    /// caller must not read as an empty result.
     fn persisted_declaration_candidates_by_fqn_limited(
         &self,
         fqn: &str,
@@ -61,8 +79,15 @@ pub trait CSharpAnalysisSource:
         continue_query: &mut dyn FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit>;
 
+    /// Declarations whose short identifier is `identifier`, from the persisted
+    /// store and the definition-lookup units. Resolution enters here when it
+    /// holds a bare name with no namespace to qualify it with.
     fn declaration_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit>;
 
+    /// [`Self::declaration_candidates_by_identifier`] under a budget. The plain
+    /// spelling also drops hydrated units whose identifier no longer equals
+    /// `identifier`; this one filters in the store query alone and so admits
+    /// rows the plain spelling rejects.
     fn declaration_candidates_by_identifier_limited(
         &self,
         identifier: &str,
@@ -70,8 +95,14 @@ pub trait CSharpAnalysisSource:
         continue_query: &mut dyn FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit>;
 
+    /// Members named `name` declared on the type `owner_fqn`, matched on the
+    /// exact owner name first and on the normalized owner name only when that
+    /// misses.
     fn member_candidates_for_owner(&self, owner_fqn: &str, name: &str) -> BTreeSet<CodeUnit>;
 
+    /// [`Self::member_candidates_for_owner`] under a budget shared by both
+    /// phases. An exhausted exact phase returns without consulting the
+    /// normalized-owner phase that the plain spelling always reaches.
     fn member_candidates_for_owner_limited(
         &self,
         owner_fqn: &str,
@@ -80,8 +111,14 @@ pub trait CSharpAnalysisSource:
         continue_query: &mut dyn FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit>;
 
+    /// Whether any persisted declaration sits in `namespace`. Resolution reads
+    /// it to tell a namespace-qualified prefix from a type name spelled the
+    /// same way.
     fn workspace_namespace_exists(&self, namespace: &str) -> bool;
 
+    /// Definitions of `fqn` after the store forwards renamed or relocated units
+    /// to their current identity. The persisted counterpart of the `usage_*`
+    /// fq-name lookups, which answer from the usage-definition index instead.
     fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit>;
 
     /// The workspace's usage-definition index, as the bounded lookup contract.
@@ -91,56 +128,99 @@ pub trait CSharpAnalysisSource:
 
     // --- indexed file facts ---
 
+    /// Every analyzed C# file in the workspace. The `global using` cells and
+    /// the implicit-reference index walk this rather than the store's own file
+    /// table.
     fn all_files(&self) -> Vec<ProjectFile>;
 
+    /// The namespace the store recorded for `file`: `None` when the file has no
+    /// recorded state at all, empty when it has state but no namespace. The
+    /// first input to [`Self::namespace_of_file`].
     fn package_name_of(&self, file: &ProjectFile) -> Option<String>;
 
+    /// The recorded namespace of `file` as at most one row, falling back to the
+    /// first top-level declaration that carries one. `limit` caps the
+    /// declarations inspected. This is a narrower fallback than the one
+    /// [`Self::namespace_of_file`] uses, which is why that method is not a
+    /// default over this one.
     fn file_namespace_hint_limited(
         &self,
         file: &ProjectFile,
         limit: usize,
     ) -> LimitedQueryRows<String>;
 
+    /// [`ImportAnalysisProvider::import_info_of`] under a budget: the import
+    /// records of `file`, whose `raw_snippet` still holds the `using` directive
+    /// verbatim for the C# spellings to parse. `limit` caps rows.
     fn import_info_of_limited(
         &self,
         file: &ProjectFile,
         limit: usize,
     ) -> LimitedQueryRows<ImportInfo>;
 
+    /// Every file's import records in one store walk, so the `global using`
+    /// cells need not iterate [`Self::all_files`] themselves. `limit` caps rows
+    /// and `continue_query` is polled for cancellation.
     fn workspace_import_info_limited(
         &self,
         limit: usize,
         continue_query: &mut dyn FnMut() -> bool,
     ) -> LimitedQueryRows<ImportInfo>;
 
+    /// Base-type and interface names as written at the declaration of
+    /// `code_unit`, unresolved and in declaration order.
     fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String>;
 
+    /// [`Self::raw_supertypes_of`] under a budget, answered from the store's
+    /// supertype rows in stored ordinal order and matched on signature and
+    /// syntheticness as well as name. A predicate miss is reported as an empty
+    /// complete batch, so it does not distinguish itself from a real absence.
     fn raw_supertypes_limited(
         &self,
         code_unit: &CodeUnit,
         limit: usize,
     ) -> LimitedQueryRows<String>;
 
+    /// The stored signature metadata of `code_unit` -- parameters, return type
+    /// and modifiers -- under a budget. `limit` caps the rows inspected.
     fn signature_metadata_limited(
         &self,
         code_unit: &CodeUnit,
         limit: usize,
     ) -> LimitedQueryRows<SignatureMetadata>;
 
+    /// Every type-name token `file` mentions, `None` when the file has no
+    /// recorded identifier set. [`compute_implicit_reference_index`] resolves
+    /// these against the declaring files to build the reverse index.
     fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>>;
 
     // --- memoized products the analyzer owns ---
 
+    /// The namespace `file`'s declarations sit in, empty when it declares
+    /// nothing. When the store recorded no namespace this falls back to the
+    /// first of all the file's declarations that carries one. Memoized per
+    /// file.
     fn namespace_of_file(&self, file: &ProjectFile) -> String;
 
+    /// [`Self::namespace_of_file`] under a budget. Its fallback scans only
+    /// top-level declarations, in source order rather than in declaration
+    /// order, so for a file holding more than one namespace the two spellings
+    /// can name different ones.
     fn namespace_of_file_limited(
         &self,
         file: &ProjectFile,
         limit: usize,
     ) -> LimitedQueryRows<String>;
 
+    /// The namespaces `file` can name unqualified: its own `using` directives
+    /// in source order, then the workspace `global using` namespaces it does
+    /// not already repeat. Memoized per file.
     fn using_namespaces_of(&self, file: &ProjectFile) -> Vec<String>;
 
+    /// [`Self::using_namespaces_of`] under one budget shared between the file's
+    /// own imports and the global ones, with `continue_query` polled before
+    /// each phase. The globals arrive from a store-wide import walk rather than
+    /// from [`Self::global_using_namespaces`].
     fn using_namespaces_of_limited(
         &self,
         file: &ProjectFile,
@@ -148,8 +228,14 @@ pub trait CSharpAnalysisSource:
         continue_query: &mut dyn FnMut() -> bool,
     ) -> LimitedQueryRows<String>;
 
+    /// Alias to target for every `using X = Y;` in `file`, with workspace
+    /// `global using` aliases filling only the names the file does not bind
+    /// itself. Memoized per file.
     fn using_aliases_of(&self, file: &ProjectFile) -> HashMap<String, String>;
 
+    /// [`Self::using_aliases_of`] under one budget shared between both phases,
+    /// as pairs rather than as a map. File-local bindings still win over global
+    /// ones.
     fn using_aliases_of_limited(
         &self,
         file: &ProjectFile,
@@ -157,26 +243,46 @@ pub trait CSharpAnalysisSource:
         continue_query: &mut dyn FnMut() -> bool,
     ) -> LimitedQueryRows<(String, String)>;
 
+    /// The normalized type names named by the workspace's `global using static`
+    /// directives, sorted and deduplicated, under a budget. Names only;
+    /// [`Self::global_static_using_types`] is the resolved form.
     fn global_static_using_type_names_limited(
         &self,
         limit: usize,
         continue_query: &mut dyn FnMut() -> bool,
     ) -> LimitedQueryRows<String>;
 
+    /// Those `global using static` targets resolved against the persisted
+    /// store, memoized whole. Borrowed out of the memo cell, so it has no
+    /// budgeted form: there is nothing to cap once the cell is filled.
     fn global_static_using_types(&self) -> &[CodeUnit];
 
+    /// [`Self::global_static_using_types`] resolved against the
+    /// usage-definition index instead of the persisted store. Two cells because
+    /// the index differs, not the walk.
     fn usage_global_static_using_types(&self) -> &[CodeUnit];
 
+    /// The normalized namespaces of every `global using` directive in the
+    /// workspace, memoized whole. Borrowed out of the memo cell, so it cannot
+    /// be expressed as a default over the budgeted spelling below.
     fn global_using_namespaces(&self) -> &HashSet<String>;
 
+    /// [`Self::global_using_namespaces`] under a budget, from one store-wide
+    /// import walk. It fills the same memo cell when the batch completes.
     fn global_using_namespaces_limited(
         &self,
         limit: usize,
         continue_query: &mut dyn FnMut() -> bool,
     ) -> LimitedQueryRows<String>;
 
+    /// Alias to target for every `global using X = Y;` in the workspace,
+    /// memoized whole. Borrowed out of the memo cell, so it cannot be expressed
+    /// as a default over the budgeted spelling below.
     fn global_using_aliases(&self) -> &HashMap<String, String>;
 
+    /// [`Self::global_using_aliases`] under a budget, as pairs, from one
+    /// store-wide import walk. It fills the same memo cell when the batch
+    /// completes.
     fn global_using_aliases_limited(
         &self,
         limit: usize,
