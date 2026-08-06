@@ -74,17 +74,21 @@ pub(crate) fn resolve_js_ts_source(
 pub(crate) fn imported_code_units_of(
     host: &dyn JsTsMemoSource,
     file: &ProjectFile,
-) -> HashSet<CodeUnit> {
+) -> Arc<HashSet<CodeUnit>> {
     let caches = host.memo_caches();
     if let Some(cached) = caches.imported_code_units.get(file) {
-        return (*cached).clone();
+        return cached;
     }
 
-    let resolved = resolve_imported_code_units(host, file, host.import_info_of(file));
+    let resolved = Arc::new(resolve_imported_code_units(
+        host,
+        file,
+        host.import_info_of(file),
+    ));
 
     caches
         .imported_code_units
-        .insert(file.clone(), Arc::new(resolved.clone()));
+        .insert(file.clone(), Arc::clone(&resolved));
     resolved
 }
 
@@ -96,7 +100,7 @@ pub(crate) fn imported_code_units_from_infos(
     host: &dyn JsTsMemoSource,
     file: &ProjectFile,
     _imports: &[ImportInfo],
-) -> Option<HashSet<CodeUnit>> {
+) -> Option<Arc<HashSet<CodeUnit>>> {
     Some(imported_code_units_of(host, file))
 }
 

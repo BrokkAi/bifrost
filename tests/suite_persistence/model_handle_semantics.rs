@@ -91,7 +91,7 @@ fn java_wildcard_imports_resolve_from_package_index() {
     let analyzer = JavaAnalyzer::from_project(TestProject::new(root.clone(), Language::Java));
     let imports = analyzer.imported_code_units_of(&ProjectFile::new(root, "consumer/Use.java"));
     let names: BTreeSet<_> = imports
-        .into_iter()
+        .iter()
         .map(|code_unit| code_unit.fq_name())
         .collect();
 

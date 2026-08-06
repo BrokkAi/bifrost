@@ -161,8 +161,9 @@ fn ruby_resolve_mixin_target(
         .find(|unit| ruby_type_matches(unit, raw))
         .or_else(|| {
             ruby.imported_code_units_of(file)
-                .into_iter()
+                .iter()
                 .find(|unit| ruby_type_matches(unit, raw))
+                .cloned()
         })
         .or_else(|| {
             ruby.definitions(raw).find(|unit| {
@@ -181,7 +182,7 @@ fn ruby_visible_mixin_files(ruby: &dyn RubySource, file: &ProjectFile) -> HashSe
     files.insert(file.clone());
     files.extend(
         ruby.imported_code_units_of(file)
-            .into_iter()
+            .iter()
             .map(|unit| unit.source().clone()),
     );
     files

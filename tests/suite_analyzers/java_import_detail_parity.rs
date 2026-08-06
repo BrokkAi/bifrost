@@ -206,7 +206,7 @@ fn resolved_imports_exclude_static_imports_and_keep_mixed_resolution() {
         .clone();
     let mut resolved: Vec<_> = analyzer
         .imported_code_units_of(&consumer_file)
-        .into_iter()
+        .iter()
         .map(|code_unit| code_unit.fq_name())
         .collect();
     resolved.sort();
@@ -268,7 +268,7 @@ fn unresolved_and_circular_imports_stay_stable() {
         vec!["pkg.B".to_string()],
         circular
             .imported_code_units_of(&a_file)
-            .into_iter()
+            .iter()
             .map(|code_unit| code_unit.fq_name())
             .collect::<Vec<_>>()
     );

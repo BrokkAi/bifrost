@@ -20,7 +20,12 @@ impl<T: Any> CapabilityProvider for T {
 }
 
 pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit>;
+    /// Shared, not owned: every memoizing implementation already stores the set
+    /// behind an `Arc` in its per-file cache, and the hottest consumers only
+    /// read it (a membership test in candidate discovery, a projection to
+    /// source files in the reverse-import index). Returning the `Arc` removes a
+    /// whole-set clone per cache hit and per insert.
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>>;
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile>;
 
     /// Return import facts for a group of files without requiring each caller
@@ -43,7 +48,7 @@ pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
         &self,
         _file: &ProjectFile,
         _imports: &[ImportInfo],
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Option<Arc<HashSet<CodeUnit>>> {
         None
     }
 
@@ -142,7 +147,7 @@ pub fn resolve_imported_files_from_infos(
             provider
                 .imported_code_units_from_infos(file, imports)
                 .unwrap_or_else(|| provider.imported_code_units_of(file))
-                .into_iter()
+                .iter()
                 .map(|unit| unit.source().clone())
                 .collect()
         })
@@ -154,13 +159,13 @@ pub fn build_reverse_import_index<F>(
     parallel: bool,
 ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>
 where
-    F: Fn(&ProjectFile) -> HashSet<CodeUnit> + Sync,
+    F: Fn(&ProjectFile) -> Arc<HashSet<CodeUnit>> + Sync,
 {
     build_reverse_file_index(
         files,
         |file| {
             resolve_imported(file)
-                .into_iter()
+                .iter()
                 .map(|code_unit| code_unit.source().clone())
                 .collect::<Vec<_>>()
         },
@@ -176,12 +181,12 @@ pub fn memoized_reverse_import_index<F, Files>(
     resolve_imported: F,
 ) -> Arc<ReverseFileIndex>
 where
-    F: Fn(&ProjectFile) -> HashSet<CodeUnit> + Sync + Copy,
+    F: Fn(&ProjectFile) -> Arc<HashSet<CodeUnit>> + Sync + Copy,
     Files: Fn() -> Vec<ProjectFile> + Copy,
 {
     memoized_reverse_file_index(memo, files, |file| {
         resolve_imported(file)
-            .into_iter()
+            .iter()
             .map(|code_unit| code_unit.source().clone())
             .collect::<Vec<_>>()
     })

@@ -311,7 +311,7 @@ impl TypescriptAnalyzer {
 }
 
 impl ImportAnalysisProvider for TypescriptAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         providers::imported_code_units_of(self, file)
     }
 
@@ -334,7 +334,7 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         &self,
         file: &ProjectFile,
         imports: &[ImportInfo],
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Option<Arc<HashSet<CodeUnit>>> {
         providers::imported_code_units_from_infos(self, file, imports)
     }
 

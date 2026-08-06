@@ -32,20 +32,20 @@ impl KotlinAnalyzer {
         &self,
         file: &ProjectFile,
         realm: Option<&JvmSourceRealm<'_>>,
-    ) -> HashSet<CodeUnit> {
+    ) -> Arc<HashSet<CodeUnit>> {
         let cache = match realm {
             Some(_) => &self.realm_imported_code_units,
             None => &self.imported_code_units,
         };
         if let Some(cached) = cache.get(file) {
-            return (*cached).clone();
+            return cached;
         }
         if file_language(file) != Language::Kotlin {
-            return HashSet::default();
+            return Arc::new(HashSet::default());
         }
         let imports = self.inner.import_info_of(file);
-        let resolved = resolve_kotlin_import_infos(self, &imports, realm);
-        cache.insert(file.clone(), Arc::new(resolved.clone()));
+        let resolved = Arc::new(resolve_kotlin_import_infos(self, &imports, realm));
+        cache.insert(file.clone(), Arc::clone(&resolved));
         resolved
     }
 
@@ -60,7 +60,7 @@ impl KotlinAnalyzer {
 }
 
 impl ImportAnalysisProvider for KotlinAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         self.imported_code_units_in_realm(file, None)
     }
 
@@ -72,8 +72,8 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
         &self,
         _file: &ProjectFile,
         imports: &[ImportInfo],
-    ) -> Option<HashSet<CodeUnit>> {
-        Some(resolve_kotlin_import_infos(self, imports, None))
+    ) -> Option<Arc<HashSet<CodeUnit>>> {
+        Some(Arc::new(resolve_kotlin_import_infos(self, imports, None)))
     }
 
     /// Kotlin files that reference `file`.

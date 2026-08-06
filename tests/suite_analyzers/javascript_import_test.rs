@@ -15,7 +15,7 @@ fn analyzer_for(root: &Path) -> JavascriptAnalyzer {
 fn imported_fq_names(analyzer: &JavascriptAnalyzer, file: &ProjectFile) -> BTreeSet<String> {
     analyzer
         .imported_code_units_of(file)
-        .into_iter()
+        .iter()
         .map(|code_unit| code_unit.fq_name())
         .collect()
 }

@@ -18,14 +18,14 @@ use brokk_bifrost_python::imports::{
 use std::sync::Arc;
 
 impl ImportAnalysisProvider for PythonAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         if let Some(cached) = self.imported_code_units.get(file) {
-            return (*cached).clone();
+            return cached;
         }
 
-        let resolved: HashSet<_> = resolve_import_bindings(self, file).into_values().collect();
+        let resolved = Arc::new(resolve_import_bindings(self, file).into_values().collect());
         self.imported_code_units
-            .insert(file.clone(), Arc::new(resolved.clone()));
+            .insert(file.clone(), Arc::clone(&resolved));
         resolved
     }
 
@@ -59,14 +59,14 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         &self,
         file: &ProjectFile,
         imports: &[ImportInfo],
-    ) -> Option<HashSet<CodeUnit>> {
-        Some(
+    ) -> Option<Arc<HashSet<CodeUnit>>> {
+        Some(Arc::new(
             resolve_imports_batched(self, file, imports)
                 .into_iter()
                 .flatten()
                 .map(|(_, code_unit)| code_unit)
                 .collect(),
-        )
+        ))
     }
 
     /// Without this, `scan_usages` falls back to `import_info_of` one file at

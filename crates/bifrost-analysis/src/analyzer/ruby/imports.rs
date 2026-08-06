@@ -64,13 +64,13 @@ impl RubyAnalyzer {
 }
 
 impl ImportAnalysisProvider for RubyAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         if let Some(cached) = self.imported_code_units.get(file) {
-            return (*cached).clone();
+            return cached;
         }
-        let units = ruby_effective_imported_code_units(self, file);
+        let units = Arc::new(ruby_effective_imported_code_units(self, file));
         self.imported_code_units
-            .insert(file.clone(), Arc::new(units.clone()));
+            .insert(file.clone(), Arc::clone(&units));
         units
     }
 

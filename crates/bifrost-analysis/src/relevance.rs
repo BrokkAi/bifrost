@@ -1183,7 +1183,7 @@ fn imported_files_for(
         if !imported_units.is_empty() {
             resolved.extend(
                 imported_units
-                    .into_iter()
+                    .iter()
                     .map(|code_unit| code_unit.source().clone()),
             );
         }

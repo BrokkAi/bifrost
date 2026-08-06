@@ -272,7 +272,7 @@ impl JavascriptAnalyzer {
     }
 }
 impl ImportAnalysisProvider for JavascriptAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         providers::imported_code_units_of(self, file)
     }
 
@@ -295,7 +295,7 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
         &self,
         file: &ProjectFile,
         imports: &[ImportInfo],
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Option<Arc<HashSet<CodeUnit>>> {
         providers::imported_code_units_from_infos(self, file, imports)
     }
 

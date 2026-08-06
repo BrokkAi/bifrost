@@ -15,9 +15,9 @@ use std::sync::Arc;
 impl TestDetectionProvider for CppAnalyzer {}
 
 impl ImportAnalysisProvider for CppAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         if let Some(cached) = self.imported_code_units.get(file) {
-            return (*cached).clone();
+            return cached;
         }
 
         let mut resolved = HashSet::default();
@@ -29,8 +29,9 @@ impl ImportAnalysisProvider for CppAnalyzer {
             }
         }
 
+        let resolved = Arc::new(resolved);
         self.imported_code_units
-            .insert(file.clone(), Arc::new(resolved.clone()));
+            .insert(file.clone(), Arc::clone(&resolved));
         resolved
     }
 

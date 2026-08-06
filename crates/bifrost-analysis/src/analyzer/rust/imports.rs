@@ -13,15 +13,19 @@ use std::sync::Arc;
 use super::RustAnalyzer;
 
 impl ImportAnalysisProvider for RustAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         if let Some(cached) = self.imported_code_units.get(file) {
-            return (*cached).clone();
+            return cached;
         }
 
-        let resolved = rust_imported_code_units(self, file, &self.inner.import_info_of(file));
+        let resolved = Arc::new(rust_imported_code_units(
+            self,
+            file,
+            &self.inner.import_info_of(file),
+        ));
 
         self.imported_code_units
-            .insert(file.clone(), Arc::new(resolved.clone()));
+            .insert(file.clone(), Arc::clone(&resolved));
         resolved
     }
 

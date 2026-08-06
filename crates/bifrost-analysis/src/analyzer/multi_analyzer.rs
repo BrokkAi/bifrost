@@ -387,7 +387,7 @@ impl MultiAnalyzer {
 }
 
 impl ImportAnalysisProvider for MultiAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         // A Kotlin file can import a Java or Scala declaration from the same
         // workspace, and only the multi-analyzer can see both sides.
         if language_for_file(file) == Language::Kotlin
@@ -501,7 +501,7 @@ impl ImportAnalysisProvider for MultiAnalyzer {
         &self,
         file: &ProjectFile,
         imports: &[ImportInfo],
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Option<Arc<HashSet<CodeUnit>>> {
         self.delegate_for_file(file)
             .and_then(AnalyzerDelegate::import_analysis_provider)
             .and_then(|provider| provider.imported_code_units_from_infos(file, imports))
