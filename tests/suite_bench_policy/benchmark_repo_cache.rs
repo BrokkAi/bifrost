@@ -63,7 +63,9 @@ fn prepare_repo_disables_autocrlf_for_deterministic_checkout_bytes() {
 /// cache) must be upgraded to a full clone: `most_relevant_files` refuses the
 /// git history walk on a partial clone with a network promisor remote, so a
 /// blobless fixture benchmarks the import-only fallback instead of the pinned
-/// history ranking.
+/// history ranking. The upgrade runs in place through `git fetch --refetch` on
+/// git 2.36 or later, and through a discard-and-re-clone on older git (issue
+/// #1727); the assertions below describe the end state that both paths reach.
 #[test]
 fn prepare_repo_upgrades_a_cached_blobless_clone_to_a_full_clone() {
     let temp = TempDir::new().expect("temp dir");
