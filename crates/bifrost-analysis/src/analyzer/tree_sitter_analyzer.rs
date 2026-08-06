@@ -3204,10 +3204,6 @@ where
             .and_then(|source| self.fetch_file_state_from_source(file, source))
     }
 
-    fn same_source_ignoring_crlf(left: &str, right: &str) -> bool {
-        left.replace("\r\n", "\n") == right.replace("\r\n", "\n")
-    }
-
     /// The declaration-materialization provenance recorded for `file` by its
     /// language walk (issue #1476). Empty when the file has none or is not
     /// analyzed here.
