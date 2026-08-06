@@ -9,7 +9,7 @@ use crate::imports::require_call_module_specifier;
 use crate::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
 };
-use crate::providers::JsTsAnalyzerHost;
+use crate::providers::JsTsSource;
 use crate::syntax::compute_import_binder as compute_jsts_import_binder;
 use crate::syntax::parse_js_ts_tree;
 use crate::syntax::{JsTsImportBinder, slice};
@@ -43,7 +43,7 @@ use tree_sitter::Node;
 const MAX_JSTS_RECEIVER_RECURSION: usize = 8;
 
 pub struct JsTsReceiverFactProvider<'tree, 'a> {
-    host: &'a dyn JsTsAnalyzerHost,
+    host: &'a dyn JsTsSource,
     support: &'a dyn BoundedDefinitionLookup,
     language: Language,
     file: &'a ProjectFile,
@@ -82,7 +82,7 @@ pub enum JsTsReceiverSyntaxIndexBuild {
 
 impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
     pub fn new(
-        host: &'a dyn JsTsAnalyzerHost,
+        host: &'a dyn JsTsSource,
         support: &'a dyn BoundedDefinitionLookup,
         language: Language,
         file: &'a ProjectFile,
@@ -106,7 +106,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_syntax_index(
-        host: &'a dyn JsTsAnalyzerHost,
+        host: &'a dyn JsTsSource,
         support: &'a dyn BoundedDefinitionLookup,
         language: Language,
         file: &'a ProjectFile,
@@ -130,7 +130,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_batch_data(
-        host: &'a dyn JsTsAnalyzerHost,
+        host: &'a dyn JsTsSource,
         support: &'a dyn BoundedDefinitionLookup,
         language: Language,
         file: &'a ProjectFile,

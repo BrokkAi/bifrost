@@ -33,7 +33,7 @@ use crate::graph::resolver::{
     usage_method_return_type_fq_name_for_arity, usage_unqualified_value_member_shadows_type,
     usage_visible_extension_method_candidates,
 };
-use crate::graph_support::CSharpAnalysisSource;
+use crate::graph_support::CSharpSource;
 use crate::hierarchy;
 use crate::syntax::{
     CSharpMemberName, csharp_attribute_type_names, csharp_conditional_member_access,
@@ -59,7 +59,7 @@ use tree_sitter::Node;
 /// two sources.
 pub fn scan_file(
     graph: &CSharpGraphSource<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     input: &FileEdgeScanInput<'_>,
 ) -> PerFileEdges {
@@ -82,7 +82,7 @@ pub fn scan_file(
 
 struct CsScan<'a> {
     graph: &'a CSharpGraphSource<'a>,
-    csharp: &'a dyn CSharpAnalysisSource,
+    csharp: &'a dyn CSharpSource,
     file: &'a ProjectFile,
     source: &'a str,
     class_ranges: ClassRangeIndex,

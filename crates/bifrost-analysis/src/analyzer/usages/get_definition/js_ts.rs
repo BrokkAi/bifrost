@@ -1,6 +1,6 @@
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
-use crate::analyzer::js_ts::providers::resolve_js_ts_host;
+use crate::analyzer::js_ts::providers::resolve_js_ts_source;
 use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::usages::js_ts_graph::{
     browser_global_property_shape, unbound_browser_global_property,
@@ -8,7 +8,7 @@ use crate::analyzer::usages::js_ts_graph::{
 use brokk_bifrost_js_ts::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
 };
-use brokk_bifrost_js_ts::providers::JsTsAnalyzerHost;
+use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::syntax::parse_js_ts_tree;
 use brokk_bifrost_js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, MAX_STATIC_IMPORT_BINDINGS_PER_NAME,
@@ -89,11 +89,11 @@ pub(super) fn resolve_js_ts(
         return no_definition("jsts_parse_failed", "JS/TS source could not be parsed");
     };
     // The one downcast for the whole route: the JS/TS candidate logic is
-    // parameterized on `JsTsAnalyzerHost`, and `host` is threaded from here
+    // parameterized on `JsTsSource`, and `host` is threaded from here
     // rather than re-derived at each call. Without the matching analyzer there
     // is no JS/TS declaration index either, so every candidate this route could
     // produce would be empty anyway.
-    let Some(host) = resolve_js_ts_host(analyzer, language) else {
+    let Some(host) = resolve_js_ts_source(analyzer, language) else {
         return no_definition(
             "jsts_analyzer_unavailable",
             "no JavaScript/TypeScript analyzer is registered for this workspace",
@@ -532,7 +532,7 @@ fn resolve_js_ts_visible_module_bindings(
     language: Language,
     reference: &str,
     analyzer: &dyn IAnalyzer,
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     aliases: Option<&AliasResolver>,
     value_position: bool,
@@ -714,7 +714,7 @@ fn jsts_is_commonjs_host_export_assignment_object(node: Node<'_>, source: &str) 
 #[allow(clippy::too_many_arguments)]
 fn ts_contextual_object_literal_key_candidates(
     analyzer: &dyn IAnalyzer,
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -767,7 +767,7 @@ fn ts_object_literal_property_at_key<'tree>(
 
 #[allow(clippy::too_many_arguments)]
 fn ts_contextual_object_literal_owners(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -841,7 +841,7 @@ fn resolve_js_ts_module_binding(
     module: &str,
     exported_name: &str,
     analyzer: &dyn IAnalyzer,
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     aliases: Option<&AliasResolver>,
     value_position: bool,
@@ -894,7 +894,7 @@ fn resolve_js_ts_module_binding(
 /// Resolve a dotted FQN within one exact declaration file. JS/TS FQNs omit module
 /// paths, so callers that have already resolved a receiver must retain this scope.
 fn jsts_file_scoped_dotted_candidates(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     reference: &str,
@@ -1000,7 +1000,7 @@ fn jsts_nearest_reference_fallback_scope(node: Node<'_>) -> Option<JstsReceiverB
 #[derive(Clone, Copy)]
 struct JstsDottedLookup<'a, 'tree> {
     analyzer: &'a dyn IAnalyzer,
-    host: &'a dyn JsTsAnalyzerHost,
+    host: &'a dyn JsTsSource,
     support: &'a dyn BoundedDefinitionLookup,
     file: &'a ProjectFile,
     root: Node<'tree>,
@@ -1138,7 +1138,7 @@ fn jsts_focused_reference_receiver_property<'tree>(
 
 fn jsts_exact_dotted_candidates(
     analyzer: &dyn IAnalyzer,
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     reference: &str,
@@ -1233,7 +1233,7 @@ fn jsts_static_member_root(mut node: Node<'_>) -> Option<Node<'_>> {
 
 fn ts_exact_global_dotted_candidates(
     analyzer: &dyn IAnalyzer,
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     reference: &str,
     value_position: bool,
@@ -1645,7 +1645,7 @@ fn jsts_reference_prefix_for_focus(site: &ResolvedReferenceSite) -> Option<Strin
 #[allow(clippy::too_many_arguments)]
 fn jsts_construction_receiver_members(
     analyzer: &dyn IAnalyzer,
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
@@ -1690,7 +1690,7 @@ fn jsts_construction_receiver_members(
 
 #[allow(clippy::too_many_arguments)]
 fn jsts_receiver_provider_member_candidates(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
@@ -1732,7 +1732,7 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 }
 
 fn jsts_file_scoped_member_candidates(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     receiver_candidates: Vec<CodeUnit>,
     member: &str,
@@ -1753,7 +1753,7 @@ fn jsts_file_scoped_member_candidates(
 
 fn ts_member_candidates(
     analyzer: &dyn IAnalyzer,
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     receiver_candidates: Vec<CodeUnit>,
     member: &str,
@@ -1810,7 +1810,7 @@ fn ts_member_candidates(
 
 fn ts_synthetic_member_is_supported_by_receiver_initializer(
     analyzer: &dyn IAnalyzer,
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     receiver: &CodeUnit,
     member: &str,
@@ -1913,7 +1913,7 @@ fn ts_object_literal_has_member(object: Node<'_>, source: &str, member: &str) ->
 #[allow(clippy::too_many_arguments)]
 fn ts_call_preserves_argument_shape(
     analyzer: &dyn IAnalyzer,
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -2052,7 +2052,7 @@ fn ts_expression_preserves_parameter_shape(
 
 #[allow(clippy::too_many_arguments)]
 fn ts_local_receiver_owner_candidates(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -2095,7 +2095,7 @@ fn jsts_enclosing_function_or_program_scope(root: Node<'_>, byte: usize) -> Opti
 #[allow(clippy::too_many_arguments)]
 fn jsts_local_new_receiver_owner_candidates(
     analyzer: &dyn IAnalyzer,
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
@@ -2136,7 +2136,7 @@ fn jsts_local_new_receiver_owner_candidates(
 #[allow(clippy::too_many_arguments)]
 fn jsts_collect_local_new_receiver_owner_candidates(
     analyzer: &dyn IAnalyzer,
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
@@ -2233,7 +2233,7 @@ fn jsts_collect_local_new_receiver_owner_candidates(
 #[allow(clippy::too_many_arguments)]
 fn jsts_local_receiver_value_owner_candidates(
     analyzer: &dyn IAnalyzer,
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
@@ -2301,7 +2301,7 @@ fn jsts_local_receiver_value_owner_candidates(
 
 #[allow(clippy::too_many_arguments)]
 fn jsts_call_expression_callees(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,

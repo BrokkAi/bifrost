@@ -5,7 +5,7 @@
 //!
 //! `PythonAnalyzer` (in `brokk-bifrost-analysis`) owns the lazy cells (seven
 //! moka caches, one `OnceLock` and two `PoolSafeMemo`s) and implements
-//! [`PythonAnalysisSource`] out of its own accessors, so the functions below
+//! [`PythonSource`] out of its own accessors, so the functions below
 //! reach back for the memoized products they need without naming the analyzer
 //! type.
 
@@ -38,7 +38,7 @@ use crate::usage_index::PythonUsageIndex;
 /// everything it calls take this trait, so the build cannot re-enter the memo
 /// it is filling. Code that runs once the index exists takes
 /// [`PythonUsageSource`].
-pub trait PythonAnalysisSource: CodeUnitIndex + ImportAnalysisProvider {
+pub trait PythonSource: CodeUnitIndex + ImportAnalysisProvider {
     /// Path-derived module units for `module_fq`; `None` when the store could
     /// not answer the path-symbol query at all.
     fn path_module_fqn(&self, module_fq: &str) -> Option<Vec<CodeUnit>>;
@@ -77,9 +77,9 @@ pub trait PythonAnalysisSource: CodeUnitIndex + ImportAnalysisProvider {
     );
 }
 
-/// [`PythonAnalysisSource`] plus the built usage index. Everything reached from
+/// [`PythonSource`] plus the built usage index. Everything reached from
 /// the export/importer walks needs it; the index build itself must not.
-pub trait PythonUsageSource: PythonAnalysisSource {
+pub trait PythonUsageSource: PythonSource {
     fn usage_index(&self) -> Arc<PythonUsageIndex>;
 }
 
@@ -92,10 +92,7 @@ pub fn extract_type_identifiers(source: &str) -> BTreeSet<String> {
     identifiers.into_iter().collect()
 }
 
-pub fn resolve_module_code_unit(
-    python: &dyn PythonAnalysisSource,
-    module_fq: &str,
-) -> Option<CodeUnit> {
+pub fn resolve_module_code_unit(python: &dyn PythonSource, module_fq: &str) -> Option<CodeUnit> {
     if let Some(units) = python.path_module_fqn(module_fq) {
         return units.into_iter().find(|code_unit| code_unit.is_module());
     }
@@ -111,7 +108,7 @@ pub fn resolve_module_code_unit(
 /// semantics precisely, including that a path lookup which succeeds but finds no module unit does
 /// *not* fall through to the definition lookup.
 pub fn resolve_module_code_units_batch(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     module_fqs: &[String],
 ) -> Vec<Option<CodeUnit>> {
     let path_results = python.path_module_fqns_batch(module_fqs);
@@ -132,10 +129,7 @@ pub fn resolve_module_code_units_batch(
     results
 }
 
-pub fn compute_export_index_of(
-    python: &dyn PythonAnalysisSource,
-    file: &ProjectFile,
-) -> ExportIndex {
+pub fn compute_export_index_of(python: &dyn PythonSource, file: &ProjectFile) -> ExportIndex {
     let mut index = ExportIndex::empty();
     let mut events = Vec::new();
     let declarations = python.top_level_declarations(file);
@@ -172,7 +166,7 @@ pub fn compute_export_index_of(
 }
 
 pub fn export_index_from_file_facts(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     file: &ProjectFile,
     facts: &dyn IndexedFileFacts,
     module_name: &str,
@@ -272,7 +266,7 @@ fn finish_export_index(
 }
 
 fn collect_reexport_events(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     file: &ProjectFile,
     root: tree_sitter::Node<'_>,
     source: &str,
@@ -291,7 +285,7 @@ fn collect_reexport_events(
 }
 
 fn collect_reexport_events_from_imports(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     file: &ProjectFile,
     imports: &[ImportInfo],
     events: &mut Vec<(usize, String, ExportEntry)>,
@@ -303,7 +297,7 @@ fn collect_reexport_events_from_imports(
 }
 
 fn record_single_reexport_event(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     file: &ProjectFile,
     import: &ImportInfo,
     events: &mut Vec<(usize, String, ExportEntry)>,
@@ -362,7 +356,7 @@ fn record_single_reexport_event(
 }
 
 pub fn import_binder_from_imports(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     file: &ProjectFile,
     imports: &[ImportInfo],
 ) -> ImportBinder {
@@ -441,10 +435,7 @@ pub fn import_binder_from_imports(
     binder
 }
 
-pub fn public_declarations_in_module(
-    python: &dyn PythonAnalysisSource,
-    module_fq: &str,
-) -> Vec<CodeUnit> {
+pub fn public_declarations_in_module(python: &dyn PythonSource, module_fq: &str) -> Vec<CodeUnit> {
     let Some(module_code_unit) = resolve_module_code_unit(python, module_fq) else {
         return Vec::new();
     };
@@ -456,7 +447,7 @@ pub fn public_declarations_in_module(
 }
 
 pub fn resolve_base_class(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     code_unit: &CodeUnit,
     raw: &str,
 ) -> Option<CodeUnit> {

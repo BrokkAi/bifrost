@@ -15,7 +15,7 @@ use crate::graph::syntax::{
     static_member_parts, static_property_identifier, static_scope_type_fq_name,
     variable_identifier,
 };
-use crate::graph_support::PhpAnalysisSource;
+use crate::graph_support::PhpSource;
 use crate::graph_support::php_file_context_from_source;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
@@ -27,7 +27,7 @@ use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 
 pub fn scan_file(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
     spec: &TargetSpec,
@@ -95,7 +95,7 @@ pub fn scan_file(
 
 #[allow(clippy::too_many_arguments)]
 fn scan_node(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     node: Node<'_>,
     analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
@@ -224,7 +224,7 @@ fn is_local_namespace_use_binding_node(node: Node<'_>) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn handle_candidate(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     node: Node<'_>,
     analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
@@ -270,7 +270,7 @@ fn handle_candidate(
 
 #[allow(clippy::too_many_arguments)]
 fn candidate_resolves_to_type(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
     node: Node<'_>,
@@ -377,7 +377,7 @@ fn is_reference_context(node: Node<'_>) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn scan_member_patterns(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     root: Node<'_>,
     analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
@@ -423,7 +423,7 @@ fn scan_member_tree<'tree>(
     hierarchy: &PhpHierarchyIndex,
     owner: &str,
     spec: &TargetSpec,
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     hits: &mut BTreeSet<UsageHit>,
 ) {
     let mut scopes: Vec<(Node<'tree>, bool)> = vec![(node, false)];
@@ -461,7 +461,7 @@ fn scan_member_scope<'tree>(
     hierarchy: &PhpHierarchyIndex,
     owner: &str,
     spec: &TargetSpec,
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     engine: &mut LocalInferenceEngine<String>,
     scopes: &mut Vec<(Node<'tree>, bool)>,
     hits: &mut BTreeSet<UsageHit>,
@@ -549,7 +549,7 @@ fn seed_parameter_receivers(
 #[allow(clippy::too_many_arguments)]
 fn apply_receiver_assignment(
     node: Node<'_>,
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
     source: &str,
@@ -585,7 +585,7 @@ fn apply_receiver_assignment(
 
 fn assignment_receiver_type(
     node: Node<'_>,
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
     source: &str,
@@ -658,7 +658,7 @@ fn record_member_hit(
     hierarchy: &PhpHierarchyIndex,
     owner: &str,
     spec: &TargetSpec,
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     engine: &LocalInferenceEngine<String>,
     hits: &mut BTreeSet<UsageHit>,
 ) {
@@ -762,7 +762,7 @@ fn static_member_identifier<'a>(
 #[allow(clippy::too_many_arguments)]
 fn receiver_expression_type(
     node: Node<'_>,
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
     source: &str,

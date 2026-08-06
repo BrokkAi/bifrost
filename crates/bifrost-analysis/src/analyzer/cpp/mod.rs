@@ -50,7 +50,7 @@ pub(crate) use adapter::CppAdapter;
 use brokk_bifrost_cpp::clones::cpp_clone_parser;
 use brokk_bifrost_cpp::compile_context::{CppCompileContext, CppCompileContexts};
 use brokk_bifrost_cpp::graph::CppWorkspaceSource;
-use brokk_bifrost_cpp::graph_support::CppAnalysisSource;
+use brokk_bifrost_cpp::graph_support::CppSource;
 use brokk_bifrost_cpp::identity::{CppReconciledDefinitionIndex, cpp_reconciled_definitions};
 use brokk_bifrost_cpp::imports::IncludeTargetIndex;
 use brokk_bifrost_cpp::test_detection::detect_cpp_test_assertion_smells;
@@ -461,7 +461,7 @@ use crate::analyzer::CodeUnitIndex;
 /// through. Every method answers from an accessor `CppAnalyzer` already had, so
 /// the five caches, two `OnceLock`s and two `PoolSafeMemo`s stay here and no
 /// function on the other side of the crate line can reach past this surface.
-impl CppAnalysisSource for CppAnalyzer {
+impl CppSource for CppAnalyzer {
     fn include_target_index(&self) -> &IncludeTargetIndex {
         CppAnalyzer::include_target_index(self)
     }

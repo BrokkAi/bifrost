@@ -3,7 +3,7 @@
 //!
 //! Only the caching stays here. The two moka caches are analyzer state, so each
 //! method below fetches or fills a cache slot and hands the actual resolution to
-//! the Rust crate through the [`RustAnalysisSource`] the analyzer implements.
+//! the Rust crate through the [`RustSource`] the analyzer implements.
 
 use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ImportInfo, ProjectFile};
 use crate::hash::HashSet;

@@ -3,7 +3,7 @@
 //! What lives here is everything the language crate cannot name: the
 //! [`PythonAnalyzer`] newtype and its seven moka caches and three
 //! `PoolSafeMemo`s; the accessors that implement
-//! [`brokk_bifrost_python::graph_support::PythonAnalysisSource`] and
+//! [`brokk_bifrost_python::graph_support::PythonSource`] and
 //! [`brokk_bifrost_python::graph_support::PythonUsageSource`] out of them; the
 //! `PythonAdapter` forwarding shell; the `IAnalyzer`/`CodeUnitIndex` impls; and
 //! the `LanguageSupport` SPI block.
@@ -68,7 +68,7 @@ pub(crate) use adapter::PythonAdapter;
 use brokk_bifrost_python::declarations::python_expanded_comment_start;
 pub(crate) use brokk_bifrost_python::graph_support::resolve_module_code_unit;
 use brokk_bifrost_python::graph_support::{
-    PythonAnalysisSource, PythonUsageSource, compute_export_index_of, import_binder_from_imports,
+    PythonSource, PythonUsageSource, compute_export_index_of, import_binder_from_imports,
     render_skeleton_recursive,
 };
 pub(crate) use brokk_bifrost_python::imports::resolve_fqn_candidates;
@@ -356,7 +356,7 @@ impl PythonAnalyzer {
 
 use crate::analyzer::CodeUnitIndex;
 
-impl PythonAnalysisSource for PythonAnalyzer {
+impl PythonSource for PythonAnalyzer {
     fn path_module_fqn(&self, module_fq: &str) -> Option<Vec<CodeUnit>> {
         self.inner.forward_path_module_fqn(module_fq)
     }

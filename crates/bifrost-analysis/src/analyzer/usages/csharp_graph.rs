@@ -58,7 +58,7 @@ use tree_sitter::Node;
 /// reach. Both fields are borrowed handles rather than the callback
 /// `PythonGraphSource` needs, because neither builds anything on first access:
 /// the workspace definition index C# resolves through is reached through
-/// `CSharpAnalysisSource::usage_definitions`, exactly as before the move.
+/// `CSharpSource::usage_definitions`, exactly as before the move.
 pub(in crate::analyzer::usages) fn csharp_graph_source(
     analyzer: &dyn IAnalyzer,
 ) -> CSharpGraphSource<'_> {
@@ -70,7 +70,7 @@ pub(in crate::analyzer::usages) fn csharp_graph_source(
 
 // The five entry points below are the only ones the definition route imports
 // whose analyzer-typed parameter was the dispatching `&dyn IAnalyzer`.
-// `&CSharpAnalyzer` unsize-coerces to `&dyn CSharpAnalysisSource` at a call
+// `&CSharpAnalyzer` unsize-coerces to `&dyn CSharpSource` at a call
 // site on its own, so every other re-export above is a plain rename.
 
 pub(in crate::analyzer::usages) fn csharp_usage_direct_base(

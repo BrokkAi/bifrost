@@ -7,7 +7,7 @@ use crate::declarations::{
 };
 use crate::graph::CppGraphSource;
 use crate::graph::extractor::ScanCtx;
-use crate::graph_support::CppAnalysisSource;
+use crate::graph_support::CppSource;
 use crate::imports::{
     IncludeTargetIndex, include_paths as cpp_include_paths, resolve_include_targets_with_index,
 };
@@ -412,7 +412,7 @@ impl TargetSpec {
     pub fn with_visible_callable_arities<'a>(
         &'a self,
         analyzer: &CppGraphSource<'_>,
-        cpp: &dyn CppAnalysisSource,
+        cpp: &dyn CppSource,
         visibility: &VisibilityIndex<'_>,
         file: &ProjectFile,
         prepared: &PreparedSyntaxTree,
@@ -682,7 +682,7 @@ type IndexedEnclosingOwnerScopeCache = HashMap<(ProjectFile, usize, usize), Opti
 /// — the #1175 blow-up, where one scan re-parsed a 4.8 MB generated header
 /// tens of thousands of times.
 pub struct VisibilityIndex<'a> {
-    cpp: &'a dyn CppAnalysisSource,
+    cpp: &'a dyn CppSource,
     pub visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     visible_by_identifier: HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>>,
     global_field_internal_linkage: HashMap<CodeUnit, bool>,
@@ -938,7 +938,7 @@ fn distinct_visible_symbols<'u>(units: impl Iterator<Item = &'u CodeUnit>) -> Ve
 }
 
 impl<'a> VisibilityIndex<'a> {
-    pub fn cpp(&self) -> &'a dyn CppAnalysisSource {
+    pub fn cpp(&self) -> &'a dyn CppSource {
         self.cpp
     }
 
@@ -951,7 +951,7 @@ impl<'a> VisibilityIndex<'a> {
     /// to write inline is here instead of thirty-three public fields.
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_visible_files_for_test(
-        cpp: &'a dyn CppAnalysisSource,
+        cpp: &'a dyn CppSource,
         visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     ) -> Self {
         let visible_source_files_by_root = visible_by_file
@@ -1027,7 +1027,7 @@ impl<'a> VisibilityIndex<'a> {
     }
 
     pub fn build(
-        cpp: &'a dyn CppAnalysisSource,
+        cpp: &'a dyn CppSource,
         analyzer: &CppGraphSource<'_>,
         roots: &HashSet<ProjectFile>,
     ) -> Self {
@@ -1035,7 +1035,7 @@ impl<'a> VisibilityIndex<'a> {
     }
 
     pub fn build_with_cancellation(
-        cpp: &'a dyn CppAnalysisSource,
+        cpp: &'a dyn CppSource,
         analyzer: &CppGraphSource<'_>,
         roots: &HashSet<ProjectFile>,
         cancellation: Option<&CancellationToken>,
@@ -1986,7 +1986,7 @@ impl<'a> VisibilityIndex<'a> {
     fn callable_arities_for_target(
         &self,
         analyzer: &CppGraphSource<'_>,
-        cpp: &dyn CppAnalysisSource,
+        cpp: &dyn CppSource,
         file: &ProjectFile,
         prepared: &PreparedSyntaxTree,
         spec: &TargetSpec,
@@ -2133,7 +2133,7 @@ impl<'a> VisibilityIndex<'a> {
 
     pub fn include_activation_for_source(
         &self,
-        cpp: &dyn CppAnalysisSource,
+        cpp: &dyn CppSource,
         file: &ProjectFile,
         prepared: &PreparedSyntaxTree,
         donor_source: &ProjectFile,
@@ -4316,7 +4316,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn file_alias_matches(
         &self,
-        cpp: &dyn CppAnalysisSource,
+        cpp: &dyn CppSource,
         file: &ProjectFile,
         alias_name: &str,
         target: &CodeUnit,
@@ -5510,7 +5510,7 @@ fn unanimous_return_binding(
     resolved_return
 }
 
-fn aliases_from_prepared_source(cpp: &dyn CppAnalysisSource, file: &ProjectFile) -> Vec<CppAlias> {
+fn aliases_from_prepared_source(cpp: &dyn CppSource, file: &ProjectFile) -> Vec<CppAlias> {
     let Some(prepared) = cpp.prepared_syntax(file) else {
         return Vec::new();
     };
@@ -5746,7 +5746,7 @@ fn merge_compatible_callable_arities(
 }
 
 fn find_include_activation(
-    cpp: &dyn CppAnalysisSource,
+    cpp: &dyn CppSource,
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
     donor_source: &ProjectFile,
@@ -5795,7 +5795,7 @@ fn find_include_activation(
 }
 
 fn find_conditional_include_projections(
-    cpp: &dyn CppAnalysisSource,
+    cpp: &dyn CppSource,
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
     donor_source: &ProjectFile,
@@ -5852,7 +5852,7 @@ fn find_conditional_include_projections(
 }
 
 fn conditional_include_requirement_paths(
-    cpp: &dyn CppAnalysisSource,
+    cpp: &dyn CppSource,
     first: &ProjectFile,
     donor_source: &ProjectFile,
     required_guards: HashSet<PreprocessorGuard>,
@@ -5915,7 +5915,7 @@ fn conditional_include_requirement_paths(
 }
 
 fn unconditional_include_reaches(
-    cpp: &dyn CppAnalysisSource,
+    cpp: &dyn CppSource,
     include_targets: &IncludeTargetIndex,
     first: &ProjectFile,
     donor_source: &ProjectFile,
@@ -5972,7 +5972,7 @@ fn unconditional_include_reaches(
 
 fn declaration_guard_requirements(
     analyzer: &CppGraphSource<'_>,
-    cpp: &dyn CppAnalysisSource,
+    cpp: &dyn CppSource,
     candidate: &CodeUnit,
 ) -> Vec<(usize, HashSet<PreprocessorGuard>)> {
     let Some(prepared) = cpp.prepared_syntax(candidate.source()) else {
@@ -6283,7 +6283,7 @@ fn callable_preprocessor_context_is_visible_for_reference(
 
 fn flattened_macro_namespace_declaration_matches(
     analyzer: &CppGraphSource<'_>,
-    cpp: &dyn CppAnalysisSource,
+    cpp: &dyn CppSource,
     reference_file: &ProjectFile,
     visible_declaration: &CodeUnit,
     qualified_candidate: &CodeUnit,

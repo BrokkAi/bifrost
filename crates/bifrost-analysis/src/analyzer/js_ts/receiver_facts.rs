@@ -7,7 +7,7 @@
 //!
 //! JS/TS is the only implementer of `ReceiverFactsFactory` in the repo.
 
-use crate::analyzer::js_ts::providers::resolve_js_ts_host;
+use crate::analyzer::js_ts::providers::resolve_js_ts_source;
 use crate::analyzer::languages::{ReceiverFactContext, ReceiverFactsFactory};
 use crate::cancellation::CancellationToken;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverFacts;
@@ -82,11 +82,11 @@ impl ReceiverFactsFactory for JsTsReceiverFacts {
             .downcast::<JsTsReceiverFileFacts>()
             .expect("receiver facts are read back by the language that produced them");
         // The SPI hands the framework's `&dyn IAnalyzer`; everything below the
-        // factory is on `JsTsAnalyzerHost`, so the downcast happens once, here.
+        // factory is on `JsTsSource`, so the downcast happens once, here.
         // `ReceiverFactsFactory` has no error channel and only the JavaScript and
         // TypeScript language modules register this factory, so a miss is a
         // registration bug rather than a runtime condition.
-        let host = resolve_js_ts_host(ctx.analyzer, ctx.language).expect(
+        let host = resolve_js_ts_source(ctx.analyzer, ctx.language).expect(
             "JsTsReceiverFacts is registered only by the JavaScript and TypeScript language modules",
         );
         Box::new(JsTsReceiverFactProvider::new_with_syntax_index(

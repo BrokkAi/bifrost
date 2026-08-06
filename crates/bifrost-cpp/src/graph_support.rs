@@ -16,14 +16,14 @@
 //!
 //! Three members are load-bearing beyond their signature:
 //!
-//! * [`CppAnalysisSource::visible_type_units`] is the moka-cached include-closure
+//! * [`CppSource::visible_type_units`] is the moka-cached include-closure
 //!   class table. Its *builder* is [`crate::hierarchy::build_cpp_visible_type_units`];
 //!   the cell and its `test-support` build counter stay analyzer-side, so this
 //!   accessor is the only way the reconciler reaches a warm table.
-//! * [`CppAnalysisSource::cpp_import_statements`] is `IAnalyzer::import_statements`,
+//! * [`CppSource::cpp_import_statements`] is `IAnalyzer::import_statements`,
 //!   the raw `#include` lines. No core capability exposes it, so it is spelled
 //!   out rather than inherited from a supertrait.
-//! * [`CppAnalysisSource::cpp_raw_supertypes_of`] is
+//! * [`CppSource::cpp_raw_supertypes_of`] is
 //!   `TreeSitterAnalyzer::raw_supertypes_of`, whose rows are crate-private to
 //!   analysis; the analyzer hands the decoded base-specifier strings across.
 
@@ -36,7 +36,7 @@ use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
 use std::sync::Arc;
 
-pub trait CppAnalysisSource:
+pub trait CppSource:
     CodeUnitIndex + TypeAliasProvider + TypeHierarchyProvider + CppWorkspaceSource
 {
     /// The workspace-wide `#include` resolution table, built once per analyzer

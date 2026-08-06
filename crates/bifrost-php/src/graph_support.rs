@@ -4,7 +4,7 @@
 //! `PhpAnalyzer`.
 //!
 //! `PhpAnalyzer` owns the one lazy cell PHP has (a moka cache of direct
-//! ancestors) and implements [`PhpAnalysisSource`] out of its own accessors, so
+//! ancestors) and implements [`PhpSource`] out of its own accessors, so
 //! the functions below reach back for the memoized products they need without
 //! naming the analyzer type.
 
@@ -27,11 +27,11 @@ use tree_sitter::{Node, Parser};
 /// a trait object can name at most one non-auto trait. The free functions below
 /// need both halves behind a single `&dyn`, so this names the intersection and
 /// the blanket impl below makes every type that already satisfies both a
-/// `PhpAnalysisSource` without writing an impl. Adding a method here would
+/// `PhpSource` without writing an impl. Adding a method here would
 /// defeat that -- implementors would have to opt in one by one.
-pub trait PhpAnalysisSource: CodeUnitIndex + TypeHierarchyProvider {}
+pub trait PhpSource: CodeUnitIndex + TypeHierarchyProvider {}
 
-impl<T: CodeUnitIndex + TypeHierarchyProvider + ?Sized> PhpAnalysisSource for T {}
+impl<T: CodeUnitIndex + TypeHierarchyProvider + ?Sized> PhpSource for T {}
 
 pub fn php_is_constructor(method: &CodeUnit, class_unit: &CodeUnit, _package_name: &str) -> bool {
     method.is_function()
@@ -40,7 +40,7 @@ pub fn php_is_constructor(method: &CodeUnit, class_unit: &CodeUnit, _package_nam
         && method.fq_name() == format!("{}.__construct", class_unit.fq_name())
 }
 
-pub fn php_namespace_of_file(php: &dyn PhpAnalysisSource, file: &ProjectFile) -> String {
+pub fn php_namespace_of_file(php: &dyn PhpSource, file: &ProjectFile) -> String {
     php.top_level_declarations(file)
         .into_iter()
         .next()
@@ -48,17 +48,11 @@ pub fn php_namespace_of_file(php: &dyn PhpAnalysisSource, file: &ProjectFile) ->
         .unwrap_or_default()
 }
 
-pub fn php_use_aliases_of(
-    php: &dyn PhpAnalysisSource,
-    file: &ProjectFile,
-) -> HashMap<String, String> {
+pub fn php_use_aliases_of(php: &dyn PhpSource, file: &ProjectFile) -> HashMap<String, String> {
     php_use_aliases_by_kind_of(php, file).type_aliases
 }
 
-pub fn php_use_aliases_by_kind_of(
-    php: &dyn PhpAnalysisSource,
-    file: &ProjectFile,
-) -> PhpUseAliases {
+pub fn php_use_aliases_by_kind_of(php: &dyn PhpSource, file: &ProjectFile) -> PhpUseAliases {
     let Ok(source) = php.project().read_source(file) else {
         return PhpUseAliases::default();
     };
@@ -70,7 +64,7 @@ pub fn php_use_aliases_by_kind_from_source(source: &str) -> PhpUseAliases {
 }
 
 pub fn php_file_context_from_source(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     file: &ProjectFile,
     source: &str,
 ) -> PhpFileContext {
@@ -80,7 +74,7 @@ pub fn php_file_context_from_source(
     }
 }
 
-fn php_declaration_context(php: &dyn PhpAnalysisSource, code_unit: &CodeUnit) -> PhpFileContext {
+fn php_declaration_context(php: &dyn PhpSource, code_unit: &CodeUnit) -> PhpFileContext {
     let namespace = code_unit.package_name().to_string();
     let aliases = php_declaration_start(php, code_unit)
         .and_then(|start| php_aliases_visible_before_declaration(php, code_unit.source(), start))
@@ -88,7 +82,7 @@ fn php_declaration_context(php: &dyn PhpAnalysisSource, code_unit: &CodeUnit) ->
     PhpFileContext { namespace, aliases }
 }
 
-fn php_declaration_start(php: &dyn PhpAnalysisSource, code_unit: &CodeUnit) -> Option<usize> {
+fn php_declaration_start(php: &dyn PhpSource, code_unit: &CodeUnit) -> Option<usize> {
     php.ranges(code_unit)
         .iter()
         .map(|range| range.start_byte)
@@ -96,7 +90,7 @@ fn php_declaration_start(php: &dyn PhpAnalysisSource, code_unit: &CodeUnit) -> O
 }
 
 fn php_aliases_visible_before_declaration(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     file: &ProjectFile,
     declaration_start: usize,
 ) -> Option<PhpUseAliases> {
@@ -113,7 +107,7 @@ fn php_aliases_visible_before_declaration(
     ))
 }
 
-pub fn php_is_interface(php: &dyn PhpAnalysisSource, code_unit: &CodeUnit) -> bool {
+pub fn php_is_interface(php: &dyn PhpSource, code_unit: &CodeUnit) -> bool {
     if !code_unit.is_class() {
         return false;
     }
@@ -127,13 +121,13 @@ pub fn php_is_interface(php: &dyn PhpAnalysisSource, code_unit: &CodeUnit) -> bo
     })
 }
 
-pub fn php_is_trait(php: &dyn PhpAnalysisSource, code_unit: &CodeUnit) -> bool {
+pub fn php_is_trait(php: &dyn PhpSource, code_unit: &CodeUnit) -> bool {
     code_unit.is_class()
         && php_declaration_kind(php, code_unit).is_some_and(|kind| kind == "trait_declaration")
 }
 
 pub fn php_resolve_declared_supertype(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     code_unit: &CodeUnit,
     raw: &str,
 ) -> Option<CodeUnit> {
@@ -144,7 +138,7 @@ pub fn php_resolve_declared_supertype(
 }
 
 pub fn php_direct_declared_class_parent(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     code_unit: &CodeUnit,
 ) -> Option<CodeUnit> {
     php.get_direct_ancestors(code_unit)
@@ -152,7 +146,7 @@ pub fn php_direct_declared_class_parent(
         .find(|ancestor| !php_is_interface(php, ancestor) && !php_is_trait(php, ancestor))
 }
 
-fn php_declaration_kind(php: &dyn PhpAnalysisSource, code_unit: &CodeUnit) -> Option<&'static str> {
+fn php_declaration_kind(php: &dyn PhpSource, code_unit: &CodeUnit) -> Option<&'static str> {
     let source = php.project().read_source(code_unit.source()).ok()?;
     let mut parser = Parser::new();
     parser
@@ -251,7 +245,7 @@ pub fn php_import_alias_candidates(
     target: &CodeUnit,
     index: &dyn CodeUnitIndex,
     hierarchy: Option<&dyn TypeHierarchyProvider>,
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzed_php_files: &dyn Fn() -> Vec<ProjectFile>,
 ) -> HashSet<ProjectFile> {
     let mut candidates = HashSet::default();
@@ -283,7 +277,7 @@ pub fn php_import_alias_candidates(
 fn php_relevant_candidate_types(
     target: &CodeUnit,
     hierarchy: Option<&dyn TypeHierarchyProvider>,
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
 ) -> HashSet<String> {
     let mut types = HashSet::default();
     let owner = if target.is_class() {

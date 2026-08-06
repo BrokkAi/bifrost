@@ -5,7 +5,7 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::cache::JsTsMemoCaches;
 use crate::analyzer::js_ts::clones::build_js_ts_clone_candidate_data;
 use crate::analyzer::js_ts::diagnostics::collect_javascript_semantic_diagnostics;
-use crate::analyzer::js_ts::providers::{self, JsTsMemoHost};
+use crate::analyzer::js_ts::providers::{self, JsTsMemoSource};
 use crate::analyzer::js_ts::{
     contains_tests as js_ts_contains_tests, path_contains_tests as js_ts_path_contains_tests,
     source_contains_tests as js_ts_source_contains_tests,
@@ -24,7 +24,7 @@ use crate::{CloneSmell, CloneSmellWeights};
 use brokk_bifrost_js_ts::imports::extract_js_ts_call_receiver;
 use brokk_bifrost_js_ts::javascript::*;
 use brokk_bifrost_js_ts::model::{module_code_unit, module_scoped_field_uses_file_name};
-use brokk_bifrost_js_ts::providers::JsTsAnalyzerHost;
+use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::queries::JAVASCRIPT_QUERY_DIRECTORY;
 use brokk_bifrost_js_ts::test_detection::detect_js_ts_test_assertion_smells;
 use std::collections::BTreeSet;
@@ -133,7 +133,7 @@ pub struct JavascriptAnalyzer {
     alias_resolver: Arc<AliasResolver>,
 }
 
-impl JsTsAnalyzerHost for JavascriptAnalyzer {
+impl JsTsSource for JavascriptAnalyzer {
     fn alias_resolver(&self) -> &Arc<AliasResolver> {
         &self.alias_resolver
     }
@@ -184,7 +184,7 @@ impl JsTsAnalyzerHost for JavascriptAnalyzer {
     }
 }
 
-impl JsTsMemoHost for JavascriptAnalyzer {
+impl JsTsMemoSource for JavascriptAnalyzer {
     fn memo_caches(&self) -> &JsTsMemoCaches {
         &self.memo_caches
     }

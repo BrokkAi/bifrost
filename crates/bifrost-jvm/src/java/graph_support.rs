@@ -8,7 +8,7 @@
 //! the functions below reach back for the memoized products they need without
 //! naming the analyzer type.
 //!
-//! One tier is enough here, unlike Rust's `RustAnalysisSource`/`RustUsageSource`
+//! One tier is enough here, unlike Rust's `RustSource`/`RustUsageSource`
 //! split: no cell in the Java memo web re-enters the cell it is filling.
 //! `resolved_imports` is the deepest, and its builder resolves through the
 //! workspace definition index rather than through another cell.

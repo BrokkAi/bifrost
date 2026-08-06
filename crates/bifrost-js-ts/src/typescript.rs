@@ -16,7 +16,7 @@ use crate::imports::{
     parse_commonjs_require_import_infos_from_node, parse_es_import_infos_from_node,
 };
 use crate::model::*;
-use crate::providers::JsTsAnalyzerHost;
+use crate::providers::JsTsSource;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, SignatureMetadata};
@@ -108,7 +108,7 @@ pub fn parse_typescript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
 
 /// A type alias renders as its own signature line. TypeScript-only: no other
 /// dialect in this family has the form.
-pub fn ts_type_alias_skeleton(host: &dyn JsTsAnalyzerHost, code_unit: &CodeUnit) -> Option<String> {
+pub fn ts_type_alias_skeleton(host: &dyn JsTsSource, code_unit: &CodeUnit) -> Option<String> {
     host.js_ts_is_type_alias(code_unit)
         .then(|| host.js_ts_raw_signatures(code_unit).first().cloned())
         .flatten()

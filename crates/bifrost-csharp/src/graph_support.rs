@@ -4,11 +4,11 @@
 //! source trait instead of as methods on [`CSharpAnalyzer`].
 //!
 //! [`CSharpAnalyzer`] owns the lazy cells (six moka caches, six `OnceLock`s and
-//! two `PoolSafeMemo`s) and implements [`CSharpAnalysisSource`] out of its own
+//! two `PoolSafeMemo`s) and implements [`CSharpSource`] out of its own
 //! accessors, so the functions below reach back for the memoized products they
 //! need without naming the analyzer type.
 //!
-//! One tier is enough here, unlike Rust's `RustAnalysisSource`/`RustUsageSource`
+//! One tier is enough here, unlike Rust's `RustSource`/`RustUsageSource`
 //! split: no `OnceLock` in the C# memo web re-enters the cell it is filling.
 //! The deepest recursion, `visible_type_candidates_with_lookups`, was already
 //! written as a function of four injected lookups and stays that way -- it
@@ -55,9 +55,7 @@ use crate::syntax::{
 /// truncated batch into an authoritative answer. The per-pair divergences --
 /// different filtering, ordering, fallback or index -- are recorded on the
 /// methods themselves.
-pub trait CSharpAnalysisSource:
-    CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider
-{
+pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider {
     // --- bounded declaration lookups ---
 
     /// Declarations the persisted store records under `fqn`, keyed exactly or,
@@ -309,14 +307,14 @@ pub trait CSharpAnalysisSource:
 // ---------------------------------------------------------------------------
 
 pub fn usage_declaration_candidates_by_identifier(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     identifier: &str,
 ) -> Vec<CodeUnit> {
     source.usage_definitions().identifier(identifier)
 }
 
 pub fn declaration_candidates_by_fqn(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     fqn: &str,
     normalized: bool,
 ) -> BTreeSet<CodeUnit> {
@@ -332,7 +330,7 @@ pub fn declaration_candidates_by_fqn(
 }
 
 pub fn declaration_candidates_by_fqn_limited(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     fqn: &str,
     normalized: bool,
     limit: usize,
@@ -354,7 +352,7 @@ pub fn declaration_candidates_by_fqn_limited(
 }
 
 pub fn usage_member_candidates_for_owner(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     owner_fqn: &str,
     name: &str,
 ) -> Vec<CodeUnit> {
@@ -364,14 +362,11 @@ pub fn usage_member_candidates_for_owner(
         .members_for_owner_name(owner_fqn, &normalized, name)
 }
 
-pub fn usage_workspace_namespace_exists(
-    source: &dyn CSharpAnalysisSource,
-    namespace: &str,
-) -> bool {
+pub fn usage_workspace_namespace_exists(source: &dyn CSharpSource, namespace: &str) -> bool {
     source.usage_definitions().package_exists(namespace)
 }
 
-pub fn usage_type_candidates_by_fqn(source: &dyn CSharpAnalysisSource, fqn: &str) -> Vec<CodeUnit> {
+pub fn usage_type_candidates_by_fqn(source: &dyn CSharpSource, fqn: &str) -> Vec<CodeUnit> {
     let lookup = source.usage_definitions();
     let exact = lookup
         .fqn(fqn)
@@ -393,10 +388,7 @@ pub fn usage_type_candidates_by_fqn(source: &dyn CSharpAnalysisSource, fqn: &str
         .collect()
 }
 
-pub fn usage_definition_candidates_by_fqn(
-    source: &dyn CSharpAnalysisSource,
-    fqn: &str,
-) -> Vec<CodeUnit> {
+pub fn usage_definition_candidates_by_fqn(source: &dyn CSharpSource, fqn: &str) -> Vec<CodeUnit> {
     let lookup = source.usage_definitions();
     let exact = lookup.fqn(fqn);
     if !exact.is_empty() {
@@ -411,11 +403,7 @@ pub fn usage_definition_candidates_by_fqn(
         .collect()
 }
 
-pub fn type_candidates_by_fqn(
-    source: &dyn CSharpAnalysisSource,
-    fqn: &str,
-    usage: bool,
-) -> Vec<CodeUnit> {
+pub fn type_candidates_by_fqn(source: &dyn CSharpSource, fqn: &str, usage: bool) -> Vec<CodeUnit> {
     if usage {
         return usage_type_candidates_by_fqn(source, fqn);
     }
@@ -437,7 +425,7 @@ pub fn type_candidates_by_fqn(
 /// answer to the other (#1726). The earlier fallback scanned every declaration
 /// of the file out of a `BTreeSet`, which named whichever namespace sorted
 /// first rather than whichever one the file opens with.
-pub fn compute_namespace_of_file(source: &dyn CSharpAnalysisSource, file: &ProjectFile) -> String {
+pub fn compute_namespace_of_file(source: &dyn CSharpSource, file: &ProjectFile) -> String {
     let recorded = source.package_name_of(file).unwrap_or_default();
     file_namespace_from_top_level_declarations(
         &recorded,
@@ -454,7 +442,7 @@ pub fn compute_namespace_of_file(source: &dyn CSharpAnalysisSource, file: &Proje
 /// batch is what the analyzer memoizes; an incomplete one is passed straight
 /// through.
 pub fn compute_namespace_of_file_limited(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     file: &ProjectFile,
     limit: usize,
 ) -> LimitedQueryRows<String> {
@@ -467,7 +455,7 @@ pub fn compute_namespace_of_file_limited(
 }
 
 pub fn import_statements_limited(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     file: &ProjectFile,
     limit: usize,
 ) -> LimitedQueryRows<String> {
@@ -485,10 +473,7 @@ pub fn import_statements_limited(
 }
 
 /// The uncached half of the analyzer's `using_namespaces_of`.
-pub fn compute_using_namespaces_of(
-    source: &dyn CSharpAnalysisSource,
-    file: &ProjectFile,
-) -> Vec<String> {
+pub fn compute_using_namespaces_of(source: &dyn CSharpSource, file: &ProjectFile) -> Vec<String> {
     let mut namespaces: Vec<String> = source
         .import_info_of(file)
         .iter()
@@ -504,7 +489,7 @@ pub fn compute_using_namespaces_of(
 
 /// The uncached half of the analyzer's `using_namespaces_of_limited`.
 pub fn compute_using_namespaces_of_limited(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     file: &ProjectFile,
     limit: usize,
     continue_query: &mut dyn FnMut() -> bool,
@@ -587,7 +572,7 @@ pub fn compute_using_namespaces_of_limited(
 /// its imported declarations. The import-graph candidate walk never found
 /// those; it is not a regression to keep not finding them.
 pub fn csharp_import_reachability(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     source_file: &ProjectFile,
     imports: &[ImportInfo],
     target: &ProjectFile,
@@ -609,7 +594,7 @@ pub fn csharp_import_reachability(
 /// The cheap positive answer: the historical `could_import_file` body, which
 /// reports a possible reference and never a proven absence.
 fn csharp_reaches_target(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     source_file: &ProjectFile,
     imports: &[ImportInfo],
     target: &ProjectFile,
@@ -694,7 +679,7 @@ fn csharp_reaches_target(
 /// Both checks over-approximate on purpose: any doubt admits a match and the
 /// verdict falls back to `Unknown`.
 fn csharp_cannot_reach_target(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     source_file: &ProjectFile,
     imports: &[ImportInfo],
     target_classes: &[CodeUnit],
@@ -763,7 +748,7 @@ fn csharp_reference_name_segments(identifier: &str) -> impl Iterator<Item = &str
 /// contributes every dotted prefix of what it names rather than a decision
 /// about which of its segments are namespaces and which are types.
 fn csharp_visible_namespaces(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     source_file: &ProjectFile,
     imports: &[ImportInfo],
 ) -> HashSet<String> {
@@ -823,7 +808,7 @@ fn insert_namespace_prefixes(path: &str, visible: &mut HashSet<String>) {
 
 /// The uncached half of the analyzer's `using_aliases_of`.
 pub fn compute_using_aliases_of(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     file: &ProjectFile,
 ) -> HashMap<String, String> {
     let mut aliases: HashMap<String, String> = source
@@ -841,7 +826,7 @@ pub fn compute_using_aliases_of(
 
 /// The uncached half of the analyzer's `using_aliases_of_limited`.
 pub fn compute_using_aliases_of_limited(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     file: &ProjectFile,
     limit: usize,
     continue_query: &mut dyn FnMut() -> bool,
@@ -873,7 +858,7 @@ pub fn compute_using_aliases_of_limited(
 }
 
 /// The uncached half of the analyzer's `global_using_namespaces`.
-pub fn compute_global_using_namespaces(source: &dyn CSharpAnalysisSource) -> HashSet<String> {
+pub fn compute_global_using_namespaces(source: &dyn CSharpSource) -> HashSet<String> {
     source
         .all_files()
         .into_iter()
@@ -889,7 +874,7 @@ pub fn compute_global_using_namespaces(source: &dyn CSharpAnalysisSource) -> Has
 
 /// The uncached half of the analyzer's `global_using_namespaces_limited`.
 pub fn compute_global_using_namespaces_limited(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     limit: usize,
     continue_query: &mut dyn FnMut() -> bool,
 ) -> LimitedQueryRows<String> {
@@ -911,7 +896,7 @@ pub fn compute_global_using_namespaces_limited(
 }
 
 /// The uncached half of the analyzer's `global_using_aliases`.
-pub fn compute_global_using_aliases(source: &dyn CSharpAnalysisSource) -> HashMap<String, String> {
+pub fn compute_global_using_aliases(source: &dyn CSharpSource) -> HashMap<String, String> {
     source
         .all_files()
         .into_iter()
@@ -923,7 +908,7 @@ pub fn compute_global_using_aliases(source: &dyn CSharpAnalysisSource) -> HashMa
 
 /// The uncached half of the analyzer's `global_using_aliases_limited`.
 pub fn compute_global_using_aliases_limited(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     limit: usize,
     continue_query: &mut dyn FnMut() -> bool,
 ) -> LimitedQueryRows<(String, String)> {
@@ -942,7 +927,7 @@ pub fn compute_global_using_aliases_limited(
 
 /// The uncached half of the analyzer's `global_static_using_type_names_limited`.
 /// The uncached half of the analyzer's `global_static_using_type_names`.
-pub fn compute_global_static_using_type_names(source: &dyn CSharpAnalysisSource) -> Vec<String> {
+pub fn compute_global_static_using_type_names(source: &dyn CSharpSource) -> Vec<String> {
     let mut names: Vec<_> = source
         .all_files()
         .into_iter()
@@ -961,7 +946,7 @@ pub fn compute_global_static_using_type_names(source: &dyn CSharpAnalysisSource)
 }
 
 pub fn compute_global_static_using_type_names_limited(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     limit: usize,
     continue_query: &mut dyn FnMut() -> bool,
 ) -> LimitedQueryRows<String> {
@@ -986,7 +971,7 @@ pub fn compute_global_static_using_type_names_limited(
 
 /// The uncached half of the analyzer's two `global_static_using_types` cells;
 /// `usage` selects the usage-definition index over the persisted store.
-pub fn compute_global_static_using_types(source: &dyn CSharpAnalysisSource) -> Vec<CodeUnit> {
+pub fn compute_global_static_using_types(source: &dyn CSharpSource) -> Vec<CodeUnit> {
     let mut types = Vec::new();
     for file in source.all_files() {
         for target in source
@@ -1009,7 +994,7 @@ pub fn compute_global_static_using_types(source: &dyn CSharpAnalysisSource) -> V
 /// index instead of the persisted store. Two cells, two walks: the difference
 /// is which index resolves each target, and a `usage` flag threaded through one
 /// body would hide that behind a mode parameter.
-pub fn compute_usage_global_static_using_types(source: &dyn CSharpAnalysisSource) -> Vec<CodeUnit> {
+pub fn compute_usage_global_static_using_types(source: &dyn CSharpSource) -> Vec<CodeUnit> {
     let mut types = Vec::new();
     for file in source.all_files() {
         for target in source
@@ -1033,7 +1018,7 @@ pub fn compute_usage_global_static_using_types(source: &dyn CSharpAnalysisSource
 // ---------------------------------------------------------------------------
 
 pub fn visible_type_candidates(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     file: &ProjectFile,
     name: &str,
 ) -> Vec<CodeUnit> {
@@ -1041,7 +1026,7 @@ pub fn visible_type_candidates(
 }
 
 pub fn usage_visible_type_candidates(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     file: &ProjectFile,
     name: &str,
 ) -> Vec<CodeUnit> {
@@ -1049,7 +1034,7 @@ pub fn usage_visible_type_candidates(
 }
 
 fn visible_type_candidates_inner(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     file: &ProjectFile,
     name: &str,
     resolve_aliases: bool,
@@ -1167,7 +1152,7 @@ where
 }
 
 pub fn resolve_visible_type(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     file: &ProjectFile,
     name: &str,
 ) -> Option<CodeUnit> {
@@ -1182,7 +1167,7 @@ pub fn resolve_visible_type(
 }
 
 pub fn resolve_usage_visible_type(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     file: &ProjectFile,
     name: &str,
 ) -> Option<CodeUnit> {
@@ -1200,7 +1185,7 @@ pub fn resolve_usage_visible_type(
 // Partial types
 // ---------------------------------------------------------------------------
 
-pub fn partial_type_parts(source: &dyn CSharpAnalysisSource, owner: &CodeUnit) -> Vec<CodeUnit> {
+pub fn partial_type_parts(source: &dyn CSharpSource, owner: &CodeUnit) -> Vec<CodeUnit> {
     if !owner.is_class() {
         return Vec::new();
     }
@@ -1216,7 +1201,7 @@ pub fn partial_type_parts(source: &dyn CSharpAnalysisSource, owner: &CodeUnit) -
 }
 
 pub fn partial_type_parts_limited(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     owner: &CodeUnit,
     limit: usize,
     continue_query: impl FnMut() -> bool,
@@ -1245,10 +1230,7 @@ pub fn partial_type_parts_limited(
     LimitedQueryRows::complete(parts, batch.inspected)
 }
 
-pub fn usage_partial_type_parts(
-    source: &dyn CSharpAnalysisSource,
-    owner: &CodeUnit,
-) -> Vec<CodeUnit> {
+pub fn usage_partial_type_parts(source: &dyn CSharpSource, owner: &CodeUnit) -> Vec<CodeUnit> {
     if !owner.is_class() {
         return Vec::new();
     }
@@ -1316,7 +1298,7 @@ fn type_declaration_key(unit: &CodeUnit) -> String {
 /// name a type declared in another file without importing it, which in C# is
 /// every same-namespace reference.
 pub fn compute_implicit_reference_index(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     parallel: bool,
 ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
     let mut by_namespace_and_name: HashMap<String, HashMap<String, Vec<ProjectFile>>> =

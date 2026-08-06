@@ -440,7 +440,7 @@ impl TypeAliasProvider for RustAnalyzer {
 /// implementor of the source traits the Rust language logic is written against.
 /// Every method here forwards to an inherent accessor; inherent methods win
 /// name resolution, so these bodies do not recurse.
-impl brokk_bifrost_rust::graph_support::RustAnalysisSource for RustAnalyzer {
+impl brokk_bifrost_rust::graph_support::RustSource for RustAnalyzer {
     fn code_units(&self) -> &dyn CodeUnitIndex {
         self
     }

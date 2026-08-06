@@ -5,7 +5,7 @@
 //! `nearest_member_candidates_for_owner_inner` -- the session-metering inners
 //! themselves, not the wrappers -- against a real `CSharpAnalyzer` built by
 //! `AnalyzerFixture`, which is analysis-side test support the C# crate cannot
-//! depend on. Rewriting them against a hand-rolled `CSharpAnalysisSource` would
+//! depend on. Rewriting them against a hand-rolled `CSharpSource` would
 //! have changed what they prove, so the tests stay and the two inners are `pub`
 //! in the crate.
 

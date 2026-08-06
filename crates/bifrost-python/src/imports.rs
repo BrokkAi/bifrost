@@ -1,13 +1,13 @@
 //! Python import syntax, binding, and FQN resolution.
 //!
-//! Everything here is a free function over [`PythonAnalysisSource`]; the
+//! Everything here is a free function over [`PythonSource`]; the
 //! `ImportAnalysisProvider` impl that memoizes the per-file results stays on
 //! `PythonAnalyzer` in `analyzer/python/imports.rs`.
 
 use crate::bindings::python_direct_scope_bindings_bounded;
 use crate::declarations::{parse_python_tree, py_node_text, python_module_name};
 use crate::graph_support::{
-    PythonAnalysisSource, import_binder_from_imports, public_declarations_in_module,
+    PythonSource, import_binder_from_imports, public_declarations_in_module,
     resolve_module_code_unit, resolve_module_code_units_batch,
 };
 use brokk_bifrost_core::analyzer::common::node_source_text;
@@ -290,7 +290,7 @@ _sys.modules[__name__] = _canonical
 }
 
 pub fn module_replacement_of(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     file: &ProjectFile,
     source: &str,
 ) -> Option<PythonModuleReplacement> {
@@ -328,7 +328,7 @@ pub fn module_replacement_of(
 }
 
 pub fn resolve_import_bindings(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     file: &ProjectFile,
 ) -> HashMap<String, CodeUnit> {
     let imports = python.import_info_of(file);
@@ -348,7 +348,7 @@ pub fn resolve_import_bindings(
 /// candidate walker, so unbatched resolution here means one store transaction per import times
 /// every file in the workspace.
 pub fn resolve_imports_batched(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     file: &ProjectFile,
     imports: &[ImportInfo],
 ) -> Vec<Vec<(String, CodeUnit)>> {
@@ -399,7 +399,7 @@ fn primary_module_fqn(file: &ProjectFile, import: &ImportInfo) -> Option<String>
 }
 
 pub fn resolve_import(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     file: &ProjectFile,
     import: &ImportInfo,
 ) -> Vec<(String, CodeUnit)> {
@@ -409,7 +409,7 @@ pub fn resolve_import(
 /// `primary_hint`, when `Some`, is the already-resolved result of this import's primary module FQN
 /// (see `primary_module_fqn`) so the batched caller doesn't pay for a second lookup of the same FQN.
 fn resolve_import_with_hint(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     file: &ProjectFile,
     import: &ImportInfo,
     primary_hint: Option<&Option<CodeUnit>>,
@@ -487,7 +487,7 @@ fn resolve_import_with_hint(
     Vec::new()
 }
 
-pub fn resolve_exported_fqn(python: &dyn PythonAnalysisSource, fqn: &str) -> Vec<CodeUnit> {
+pub fn resolve_exported_fqn(python: &dyn PythonSource, fqn: &str) -> Vec<CodeUnit> {
     let Some((module, name)) = fqn.rsplit_once('.') else {
         return Vec::new();
     };
@@ -499,7 +499,7 @@ pub fn resolve_exported_fqn(python: &dyn PythonAnalysisSource, fqn: &str) -> Vec
 /// shadowing, and every other ambiguous shape return `None` so callers can
 /// use the complete, source-order-aware export resolver below.
 fn resolve_direct_named_exported_fqn(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     fqn: &str,
 ) -> Option<Vec<CodeUnit>> {
     let (module, name) = fqn.rsplit_once('.')?;
@@ -549,7 +549,7 @@ fn resolve_direct_named_exported_fqn(
 /// collision-free chains; ambiguous shapes use the ordered export index,
 /// and the exact lookup remains the final fallback for non-export symbols.
 pub fn resolve_fqn_candidates(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     fqn: &str,
     exact: impl FnOnce(&str) -> Vec<CodeUnit>,
 ) -> Vec<CodeUnit> {
@@ -564,7 +564,7 @@ pub fn resolve_fqn_candidates(
 }
 
 fn resolve_exported_name_from_module(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     module: &str,
     name: &str,
 ) -> Vec<CodeUnit> {
@@ -575,7 +575,7 @@ fn resolve_exported_name_from_module(
 }
 
 fn resolve_exported_name(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     module_file: &ProjectFile,
     name: &str,
 ) -> Vec<CodeUnit> {
@@ -646,7 +646,7 @@ fn local_export_declarations(
 }
 
 fn resolve_module_files_for_export(
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     importing_file: &ProjectFile,
     module_specifier: &str,
 ) -> Vec<ProjectFile> {

@@ -15,7 +15,7 @@
 //!   keeps rebuilding them wholesale.
 
 use crate::declarations::{cpp_file_using_namespaces, cpp_member_fq};
-use crate::graph_support::CppAnalysisSource;
+use crate::graph_support::CppSource;
 use crate::imports::{IncludeTargetIndex, include_paths, resolve_include_targets_with_index};
 use crate::reconcile::{ReconciledIdentity, VisibleClass, reconcile_out_of_line_member_identity};
 use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
@@ -365,7 +365,7 @@ pub struct CppReconciledDefinitionIndex {
 /// index already offers, which is the same bounded lookup the ordinary
 /// resolution path uses.
 pub fn cpp_reconciled_definitions(
-    cpp: &dyn CppAnalysisSource,
+    cpp: &dyn CppSource,
     fq_name: &str,
 ) -> CppReconciledDefinitionIndex {
     let _scope = profiling::scope_with(|| format!("cpp.reconciled.build[{fq_name}]"));
@@ -494,7 +494,7 @@ pub fn cpp_reconciled_definitions(
 /// not a re-keyable out-of-line member (free functions with no owner, single
 /// segment qualifiers) or that the class table does not confirm.
 fn cpp_reconcile_definition_identity(
-    cpp: &dyn CppAnalysisSource,
+    cpp: &dyn CppSource,
     unit: &CodeUnit,
     using_by_file: &mut HashMap<ProjectFile, Arc<Vec<String>>>,
 ) -> Option<ReconciledIdentity> {

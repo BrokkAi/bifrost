@@ -1,6 +1,6 @@
 use crate::graph::PhpGraphSource;
 use crate::graph::resolver::TargetSpec;
-use crate::graph_support::PhpAnalysisSource;
+use crate::graph_support::PhpSource;
 use brokk_bifrost_core::analyzer::model::Range;
 use brokk_bifrost_core::analyzer::usages::common::{
     SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, reclassify_override_declaration_hit_at,
@@ -99,7 +99,7 @@ pub fn push_self_receiver_hit_range(
 }
 
 pub fn push_override_declaration_hit(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     declaration: &CodeUnit,
     hits: &mut BTreeSet<UsageHit>,
@@ -139,7 +139,7 @@ pub fn push_override_declaration_hit(
 }
 
 fn declaration_name_range(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     declaration: &CodeUnit,
     source: &str,
 ) -> Option<(usize, usize)> {

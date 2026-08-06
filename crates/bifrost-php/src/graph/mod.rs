@@ -5,7 +5,7 @@
 //!
 //! No analyzer handle appears here. `brokk-bifrost-analysis` downcasts once and
 //! hands over a [`PhpGraphSource`] plus the
-//! [`PhpAnalysisSource`](crate::graph_support::PhpAnalysisSource) the memoized
+//! [`PhpSource`](crate::graph_support::PhpSource) the memoized
 //! PHP products come from.
 
 pub mod extractor;
@@ -22,7 +22,7 @@ use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex};
 /// against a `MultiAnalyzer`, whose `definitions` merges every language's shards
 /// and whose enclosing-unit lookup crosses language boundaries. The walks depend
 /// on that reach, so this stays separate from the
-/// [`PhpAnalysisSource`](crate::graph_support::PhpAnalysisSource) that answers
+/// [`PhpSource`](crate::graph_support::PhpSource) that answers
 /// the PHP-only questions.
 #[derive(Clone, Copy)]
 pub struct PhpGraphSource<'a> {

@@ -12,7 +12,7 @@
 //! wrapper `IAnalyzer::semantic_diagnostics` returns stays on the analyzer.
 
 use crate::compile_context::CppCompileContext;
-use crate::graph_support::CppAnalysisSource;
+use crate::graph_support::CppSource;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::model::SemanticDiagnostic;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{node_range, node_text};
@@ -27,7 +27,7 @@ const MAX_CPP_SEMANTIC_DIAGNOSTIC_BYTES: usize = 512 * 1024;
 const MAX_CPP_SEMANTIC_DIAGNOSTICS: usize = 200;
 
 pub fn collect_cpp_semantic_diagnostics(
-    analyzer: &dyn CppAnalysisSource,
+    analyzer: &dyn CppSource,
     file: &ProjectFile,
     source: &str,
 ) -> Vec<SemanticDiagnostic> {

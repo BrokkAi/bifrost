@@ -1,11 +1,11 @@
 //! Python's semantic diagnostics: conservative unresolved-name reporting.
 //!
-//! The analyzer facts this needs are the [`PythonAnalysisSource`] the import
+//! The analyzer facts this needs are the [`PythonSource`] the import
 //! resolver already takes, plus a [`BoundedDefinitionLookup`] for "is this fqn
 //! indexed". `analyzer/python/diagnostics.rs` in `brokk-bifrost-analysis` keeps
 //! the downcast that produces them.
 
-use crate::graph_support::PythonAnalysisSource;
+use crate::graph_support::PythonSource;
 use crate::imports::{resolve_import, resolve_import_bindings};
 use brokk_bifrost_core::analyzer::model::SemanticDiagnostic;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{
@@ -48,7 +48,7 @@ impl From<PythonSemanticDiagnostic> for SemanticDiagnostic {
 /// attributes, and dynamic imports; those cases make absence unknowable without
 /// a fuller Python runtime model.
 pub fn collect_python_semantic_diagnostics(
-    py: &dyn PythonAnalysisSource,
+    py: &dyn PythonSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -89,7 +89,7 @@ fn parse_python_tree(source: &str) -> Option<Tree> {
 }
 
 struct PythonDiagnosticCollector<'a> {
-    py: &'a dyn PythonAnalysisSource,
+    py: &'a dyn PythonSource,
     support: &'a dyn BoundedDefinitionLookup,
     file: &'a ProjectFile,
     source: &'a str,
@@ -339,7 +339,7 @@ impl PythonDiagnosticCollector<'_> {
 }
 
 fn file_has_dynamic_unknowns(
-    py: &dyn PythonAnalysisSource,
+    py: &dyn PythonSource,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -349,7 +349,7 @@ fn file_has_dynamic_unknowns(
         || has_dynamic_namespace_call(source, root)
 }
 
-fn has_unresolved_wildcard_import(py: &dyn PythonAnalysisSource, file: &ProjectFile) -> bool {
+fn has_unresolved_wildcard_import(py: &dyn PythonSource, file: &ProjectFile) -> bool {
     py.import_info_of(file)
         .iter()
         .filter(|import| import.is_wildcard)

@@ -8,7 +8,7 @@
 //!
 //! No analyzer handle appears here. `brokk-bifrost-analysis` downcasts once and
 //! hands over a [`CppGraphSource`] -- the *dispatching* analyzer's side of a
-//! scan -- which carries the [`CppAnalysisSource`] the memoized C++ products
+//! scan -- which carries the [`CppSource`] the memoized C++ products
 //! come from.
 
 pub mod extractor;
@@ -17,7 +17,7 @@ pub mod inverted;
 pub mod resolver;
 pub mod syntax;
 
-use crate::graph_support::CppAnalysisSource;
+use crate::graph_support::CppSource;
 use brokk_bifrost_core::analyzer::capabilities::{TypeAliasProvider, TypeHierarchyProvider};
 use brokk_bifrost_core::analyzer::model::SignatureMetadata;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile, Range};
@@ -76,7 +76,7 @@ impl<'a> CppWorkspaceDefinitions<'a> {
 #[derive(Clone, Copy)]
 pub struct CppGraphSource<'a> {
     pub index: &'a dyn CodeUnitIndex,
-    pub cpp: Option<&'a dyn CppAnalysisSource>,
+    pub cpp: Option<&'a dyn CppSource>,
     pub aliases: Option<&'a dyn TypeAliasProvider>,
     pub hierarchy: Option<&'a dyn TypeHierarchyProvider>,
     pub workspace: &'a dyn CppWorkspaceSource,
@@ -89,7 +89,7 @@ impl<'a> CppGraphSource<'a> {
     /// analyzer in hand: they passed `&CppAnalyzer` where a `&dyn IAnalyzer`
     /// was wanted, and its `type_alias_provider()`/`type_hierarchy_provider()`
     /// both answered `Some(self)`, so every field is the same object here too.
-    pub fn from_source(source: &'a dyn CppAnalysisSource) -> Self {
+    pub fn from_source(source: &'a dyn CppSource) -> Self {
         Self {
             index: source,
             cpp: Some(source),

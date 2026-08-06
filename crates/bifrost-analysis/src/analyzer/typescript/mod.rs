@@ -18,7 +18,7 @@ use tree_sitter::{Language as TsLanguage, Parser, Tree};
 use crate::analyzer::js_ts::cache::JsTsMemoCaches;
 use crate::analyzer::js_ts::clones::build_js_ts_clone_candidate_data;
 use crate::analyzer::js_ts::diagnostics::collect_typescript_semantic_diagnostics;
-use crate::analyzer::js_ts::providers::{self, JsTsMemoHost};
+use crate::analyzer::js_ts::providers::{self, JsTsMemoSource};
 use crate::analyzer::js_ts::{
     path_contains_tests as js_ts_path_contains_tests,
     source_contains_tests as js_ts_source_contains_tests,
@@ -29,7 +29,7 @@ use crate::analyzer::usages::js_ts_graph::JsTsUsageIndex;
 use brokk_bifrost_js_ts::identifiers::collect_js_ts_identifiers;
 use brokk_bifrost_js_ts::imports::extract_js_ts_call_receiver;
 use brokk_bifrost_js_ts::model::{module_code_unit, module_scoped_field_uses_file_name};
-use brokk_bifrost_js_ts::providers::JsTsAnalyzerHost;
+use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::test_detection::detect_js_ts_test_assertion_smells;
 use brokk_bifrost_js_ts::typescript::*;
 
@@ -156,7 +156,7 @@ pub struct TypescriptAnalyzer {
     alias_resolver: Arc<AliasResolver>,
 }
 
-impl JsTsAnalyzerHost for TypescriptAnalyzer {
+impl JsTsSource for TypescriptAnalyzer {
     fn alias_resolver(&self) -> &Arc<AliasResolver> {
         &self.alias_resolver
     }
@@ -207,7 +207,7 @@ impl JsTsAnalyzerHost for TypescriptAnalyzer {
     }
 }
 
-impl JsTsMemoHost for TypescriptAnalyzer {
+impl JsTsMemoSource for TypescriptAnalyzer {
     fn memo_caches(&self) -> &JsTsMemoCaches {
         &self.memo_caches
     }

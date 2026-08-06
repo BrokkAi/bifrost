@@ -11,7 +11,7 @@ use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
 
 use crate::graph_support::{
-    CSharpAnalysisSource, logical_type_count, partial_type_parts, resolve_usage_visible_type,
+    CSharpSource, logical_type_count, partial_type_parts, resolve_usage_visible_type,
     resolve_visible_type, sort_dedup_type_candidates, sort_type_candidates,
     usage_partial_type_parts, usage_visible_type_candidates, visible_type_candidates,
 };
@@ -35,7 +35,7 @@ enum AttributeTypeResolution {
 /// ancestry is unavailable. Indexed declarations proven not to be
 /// attributes must not steal an attribute shorthand reference.
 pub fn attribute_type_candidates_with_ambiguity(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     file: &ProjectFile,
     names: &[String],
 ) -> (Vec<CodeUnit>, bool) {
@@ -69,7 +69,7 @@ where
 /// Inverse usage proof requires one logical attribute type. An ambiguous
 /// annotation is not a proven reference to every declaration it might name.
 pub fn usage_unambiguous_attribute_type_candidates(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     file: &ProjectFile,
     names: &[String],
 ) -> Vec<CodeUnit> {
@@ -80,7 +80,7 @@ pub fn usage_unambiguous_attribute_type_candidates(
 }
 
 fn attribute_type_resolution(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     file: &ProjectFile,
     names: &[String],
 ) -> AttributeTypeResolution {
@@ -88,7 +88,7 @@ fn attribute_type_resolution(
 }
 
 fn attribute_type_resolution_inner(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     file: &ProjectFile,
     names: &[String],
     usage: bool,
@@ -156,7 +156,7 @@ where
 }
 
 fn attribute_class_evidence(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     candidate: &CodeUnit,
     usage: bool,
 ) -> AttributeClassEvidence {
@@ -220,15 +220,12 @@ fn attribute_class_evidence(
     }
 }
 
-pub fn usage_direct_ancestors(
-    source: &dyn CSharpAnalysisSource,
-    code_unit: &CodeUnit,
-) -> Vec<CodeUnit> {
+pub fn usage_direct_ancestors(source: &dyn CSharpSource, code_unit: &CodeUnit) -> Vec<CodeUnit> {
     logical_direct_ancestors(source, code_unit, true)
 }
 
 pub fn logical_direct_ancestors(
-    source: &dyn CSharpAnalysisSource,
+    source: &dyn CSharpSource,
     code_unit: &CodeUnit,
     usage: bool,
 ) -> Vec<CodeUnit> {

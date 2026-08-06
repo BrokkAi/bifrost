@@ -12,7 +12,7 @@
 //! `IAnalyzer`, `TreeSitterAnalyzer`, or `PhpAnalyzer`.
 //!
 //! Where analysis code would reach for an analyzer handle, the functions here
-//! take [`graph_support::PhpAnalysisSource`] -- a core
+//! take [`graph_support::PhpSource`] -- a core
 //! [`brokk_bifrost_core::analyzer::CodeUnitIndex`] plus the memoized type
 //! hierarchy PHP resolves supertypes through. `analyzer/php/` in
 //! `brokk-bifrost-analysis` keeps the shim: the `PhpAnalyzer` struct with its

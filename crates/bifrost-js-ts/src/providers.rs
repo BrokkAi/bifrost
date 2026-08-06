@@ -4,7 +4,7 @@
 //! `JavascriptAnalyzer` and `TypescriptAnalyzer` wrap the same
 //! `TreeSitterAnalyzer`, the same `JsTsMemoCaches` bucket and the same
 //! [`AliasResolver`], and differ only in their `Language` tag. Every function
-//! here is parameterized over a [`JsTsAnalyzerHost`], so the two analysis-side
+//! here is parameterized over a [`JsTsSource`], so the two analysis-side
 //! `impl` blocks reduce to one-line delegations and the resolution policy lives
 //! in exactly one place.
 //!
@@ -55,7 +55,7 @@ use crate::graph::resolver::JsTsUsageIndex;
 /// `js_ts_raw_supertypes_of` returns the unresolved supertype spellings that
 /// [`TypeHierarchyProvider`] never exposes, and `js_ts_import_statements` reads
 /// the raw import statement text the module skeleton renders.
-pub trait JsTsAnalyzerHost: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider {
+pub trait JsTsSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider {
     /// The analyzer's shared alias resolver. Returned by handle so a caller
     /// that must own one (the receiver-fact provider) shares this instance's
     /// config memo instead of constructing a resolver whose memo starts cold.
@@ -114,7 +114,7 @@ pub trait JsTsAnalyzerHost: CodeUnitIndex + ImportAnalysisProvider + TypeHierarc
 /// The uncached body behind `ImportAnalysisProvider::imported_code_units_of`,
 /// whose per-file memo lives on the analysis-side cache bucket.
 pub fn resolve_imported_code_units(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     file: &ProjectFile,
     imports: impl IntoIterator<Item = ImportInfo>,
 ) -> HashSet<CodeUnit> {
@@ -168,14 +168,14 @@ pub fn resolve_imported_code_units(
 }
 
 pub fn import_infos_for_files(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     files: &[ProjectFile],
 ) -> Option<HashMap<ProjectFile, Vec<ImportInfo>>> {
     Some(host.js_ts_bulk_import_infos(files))
 }
 
 pub fn imported_files_from_infos(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     file: &ProjectFile,
     imports: &[ImportInfo],
 ) -> Option<HashSet<ProjectFile>> {
@@ -200,10 +200,7 @@ pub fn imported_files_from_infos(
 /// source actually spells, plus every import that binds no token at all.
 ///
 /// The uncached body behind `ImportAnalysisProvider::relevant_imports_for`.
-pub fn compute_relevant_imports(
-    host: &dyn JsTsAnalyzerHost,
-    code_unit: &CodeUnit,
-) -> HashSet<String> {
+pub fn compute_relevant_imports(host: &dyn JsTsSource, code_unit: &CodeUnit) -> HashSet<String> {
     let source = host.get_source(code_unit, false).unwrap_or_default();
     let mut relevant = HashSet::default();
     for import in host.import_info_of(code_unit.source()) {
@@ -223,7 +220,7 @@ pub fn compute_relevant_imports(
 /// usages candidate walker checks -- unbounded per-call cost on a large
 /// workspace.
 pub fn resolve_import_target_files(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     file: &ProjectFile,
 ) -> HashSet<ProjectFile> {
     let language = host.js_ts_language();
@@ -240,7 +237,7 @@ pub fn resolve_import_target_files(
 
 /// A module unit's skeleton is its own import block: both dialects render the
 /// same thing, so this is one function rather than a method on each analyzer.
-pub fn module_import_skeleton(host: &dyn JsTsAnalyzerHost, code_unit: &CodeUnit) -> Option<String> {
+pub fn module_import_skeleton(host: &dyn JsTsSource, code_unit: &CodeUnit) -> Option<String> {
     if !code_unit.is_module() {
         return None;
     }
@@ -254,10 +251,7 @@ pub fn module_import_skeleton(host: &dyn JsTsAnalyzerHost, code_unit: &CodeUnit)
 /// Resolve `code_unit`'s unresolved supertype spellings to declarations.
 ///
 /// The uncached body behind `TypeHierarchyProvider::get_direct_ancestors`.
-pub fn compute_direct_ancestors(
-    host: &dyn JsTsAnalyzerHost,
-    code_unit: &CodeUnit,
-) -> Vec<CodeUnit> {
+pub fn compute_direct_ancestors(host: &dyn JsTsSource, code_unit: &CodeUnit) -> Vec<CodeUnit> {
     let Some(index) = host.js_ts_usage_index(None) else {
         return Vec::new();
     };

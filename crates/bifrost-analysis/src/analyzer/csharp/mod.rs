@@ -3,7 +3,7 @@
 //! What lives here is everything the language crate cannot name: the
 //! [`CSharpAnalyzer`] newtype and its six moka caches, six `OnceLock`s and two
 //! `PoolSafeMemo`s; the accessors that implement
-//! [`graph_support::CSharpAnalysisSource`] out of them; the `CSharpAdapter`
+//! [`graph_support::CSharpSource`] out of them; the `CSharpAdapter`
 //! forwarding shell; the `IAnalyzer`/`CodeUnitIndex` impls; and the
 //! `LanguageSupport` SPI block.
 
@@ -80,7 +80,7 @@ use brokk_bifrost_csharp::test_detection::detect_csharp_test_assertion_smells;
 use cache::CSharpMemoCaches;
 use clones::build_csharp_clone_candidate_data;
 use external::{CSharpExternalDeclarationIndex, CSharpExternalMember, CSharpExternalType};
-use graph_support::CSharpAnalysisSource;
+use graph_support::CSharpSource;
 
 fn limited_known_values<T>(
     len: usize,
@@ -447,7 +447,7 @@ impl CSharpAnalyzer {
     }
 }
 
-impl CSharpAnalysisSource for CSharpAnalyzer {
+impl CSharpSource for CSharpAnalyzer {
     fn persisted_declaration_candidates_by_fqn(
         &self,
         fqn: &str,

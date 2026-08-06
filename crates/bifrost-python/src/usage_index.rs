@@ -23,8 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::declarations::python_module_name;
 use crate::graph_support::{
-    PythonAnalysisSource, PythonUsageSource, export_index_from_file_facts,
-    import_binder_from_imports,
+    PythonSource, PythonUsageSource, export_index_from_file_facts, import_binder_from_imports,
 };
 use crate::imports::{module_replacement_of, resolve_python_relative_module};
 
@@ -92,10 +91,10 @@ fn is_sys_namespace_binding(binding: &ImportBinding) -> bool {
 }
 
 impl PythonUsageIndex {
-    /// Takes [`PythonAnalysisSource`], not [`PythonUsageSource`]: the cell this
+    /// Takes [`PythonSource`], not [`PythonUsageSource`]: the cell this
     /// build fills is only reachable through the latter, so the narrower
     /// parameter is what stops the build from re-entering it.
-    pub fn build(python: &dyn PythonAnalysisSource) -> Self {
+    pub fn build(python: &dyn PythonSource) -> Self {
         let _scope = brokk_bifrost_core::profiling::scope("PythonUsageIndex::build");
         let mut files: Vec<ProjectFile> = python
             .project()

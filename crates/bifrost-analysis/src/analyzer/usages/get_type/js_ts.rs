@@ -2,7 +2,7 @@ use super::{
     TypeLookupOutcome, candidates_outcome, candidates_outcome_with_target_kind, no_type,
     type_reference_outcome,
 };
-use crate::analyzer::js_ts::providers::resolve_js_ts_host;
+use crate::analyzer::js_ts::providers::resolve_js_ts_source;
 use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
 use crate::analyzer::usages::model::ImportKind;
 use crate::analyzer::usages::reference_site::{
@@ -15,7 +15,7 @@ use crate::analyzer::{
 use brokk_bifrost_js_ts::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
 };
-use brokk_bifrost_js_ts::providers::JsTsAnalyzerHost;
+use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::syntax::JsTsImportBinder;
 use brokk_bifrost_js_ts::ts_owners::{
     ts_function_return_property_owners, ts_receiver_owner_candidates_at_byte,
@@ -43,7 +43,7 @@ pub(crate) fn resolve_js_ts_type(
         );
     }
     // The one downcast for this route; see `get_definition::js_ts::resolve_js_ts`.
-    let Some(host) = resolve_js_ts_host(analyzer, language) else {
+    let Some(host) = resolve_js_ts_source(analyzer, language) else {
         return no_type(
             "jsts_analyzer_unavailable",
             "no TypeScript analyzer is registered for this workspace",
@@ -182,7 +182,7 @@ pub(crate) fn resolve_js_ts_type(
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_declared_type_text(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -237,7 +237,7 @@ fn resolve_declared_type_text(
 }
 
 fn resolve_declared_type_name(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
@@ -259,7 +259,7 @@ fn resolve_declared_type_name(
 
 #[allow(clippy::too_many_arguments)]
 fn identifier_candidates(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
@@ -646,7 +646,7 @@ fn leading_type_identifier(text: &str) -> Option<&str> {
 
 #[allow(clippy::too_many_arguments)]
 fn qualified_imported_type_candidates(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     type_node: Node<'_>,
