@@ -579,6 +579,60 @@ the focus.
       `ab8e8801562ec1a967107ded8ef6eff06fdb358aac52a330a88658a46e4a81e8`.
       No new issue was necessary. The next active repository is rank seventeen
       `abseil__abseil-cpp`.
+    - [x] (2026-08-06 15:33Z) Rank seventeen `abseil__abseil-cpp`
+      completed at pinned head `e65a8cbf`. The fresh baseline at Bifrost
+      `f3ceca2c` audited all 614 files and 10,000 sites. It exposed six missing
+      rows across one recovered namespace-sentinel root cause. Two were
+      qualified `EnableIf` template-alias references. One was a nested
+      `StructuredProtoField::Varint` alias. Three were out-of-line
+      `ElfMemImage` and `Win32Waiter` owner qualifiers under unknown guards.
+      Jonathan-assigned issue #1728 grouped these related forms. An oldskool
+      implementation pass, an independent oldskool owner review, and a final
+      oldskool cycle review informed the change. Root review retained exact
+      structured alias identity, required unique visible candidates, reused
+      recovered lexical scope, rejected alias cycles, and kept incompatible
+      unknown guards unproven. Implementation commit `0b70286f` reached
+      `origin/master` through merge head `46be6d27`; issue #1728 is closed and
+      remains assigned only to `jbellis`.
+      All 241 C++ usage tests and featureless workspace Clippy pass. The
+      featureless workspace unit gate also passes. The full 1,539-test usage
+      suite passed 1,538 tests; its unrelated C# wall-clock test failed under
+      load and passed alone in 1.04 seconds. All six clean exact probes report
+      zero missing. Both `EnableIf` rows and `Varint` are consistent. Both
+      Win32 rows retain exact unproven inverse hits. The `ElfMemImage` probe is
+      honestly inconclusive because the inverse unproven sample is truncated.
+      The exact-report SHA-256 values are
+      `d0319c1c0f19be270aebbee396db05895730bd45884289e4fbe18edff69efee4`,
+      `38ec5b3b40d560cacfb185a1ba9e1a674977aa4b44630d3ebbf0aec4225bcc64`,
+      `ede17800771976dfbf8b7043779a32a32fc6dd599ded9cd410545fdc789ddea3`,
+      `c4eed47284d36cafa8a75ede7b335660e0246476313535dcf555924487622a76`,
+      `c867c4f4bef75554c023b781fcac40180efe8356b98f097704205522cd4332ea`,
+      and
+      `74c9fec06db36ba2465c6c41ce0ec7b8cdb6a3796d69d7f91fbae4b804ea528d`.
+      The final clean replay at pushed head `46be6d27` audited 614/614 files,
+      6,233,064 source bytes, 211,947 candidates, and 10,000 sites. It resolved
+      4,912 forward sites and queried 1,000 of 1,143 target groups. It reported
+      1,357 consistent, 73 editor-only, 97 honestly unproven, 8,473
+      inconclusive, and zero missing rows, with no file errors or configured
+      limit failures. The final report and runner SHA-256 values are
+      `6fd1ee1ad37ec964ebbf04fe57cbe48c67a7184b7eb967b586085fd24d3fd75c`
+      and
+      `5508ea3494449e8c8d8b44e0c3e53c37a12a11e2cfae8899d2b60d577ac4c611`.
+      The next active repository is rank eighteen `Mbed-TLS__mbedtls`.
+    - [x] (2026-08-06 15:39Z) Rank eighteen `Mbed-TLS__mbedtls`
+      completed at pinned head `9e9eb069`. The live `tasks.py` selector assigns
+      it 16 qualifying C++ tasks after the `large-repos.csv` exclusion. The
+      fresh clean replay at Bifrost `939c64e9` audited all 57 eligible files,
+      743,297 source bytes, all 6,716 candidates, and all 4,521 sites. It
+      resolved 2,283 forward sites and queried all 91 inverse targets. It
+      reported 407 consistent, 148 honestly unproven, 3,966 inconclusive, and
+      zero editor-only or missing rows. It had no invalid locations, file
+      errors, skipped targets, truncation, or configured-limit failures. No
+      issue was necessary. The report and exact-head runner SHA-256 values are
+      `cc757db21e7e9e065700aa5899aa1d71a5d263d5c0a0a506f45cb28e3ba2aafb`
+      and
+      `133f08a76c7db61e02603f1570624f5a15da980c13578301985fcbab1c307493`.
+      The next active repository is rank nineteen `pyro-ppl__pyro`.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user

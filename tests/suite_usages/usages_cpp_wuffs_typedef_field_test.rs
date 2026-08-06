@@ -186,7 +186,7 @@ static inline int64_t wuffs_base__token__value(const wuffs_base__token* t) {
     );
     assert_eq!(
         "internal/cgen/base/token-public.h",
-        target.source().to_string(),
+        target.source().rel_path(),
         "the target must be the visible physical owner"
     );
     let (proven, unproven) = usage_ranges(analyzer, &target, &caller);

@@ -842,13 +842,17 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         for (owner_node, owner) in owners.owners {
             if same_visible_symbol(&owner, &ctx.spec.target) {
                 matched_owner = true;
-                push_hit(owner_node, ctx);
+                push_guarded_owner_hit(owner_node, &owner, node, ctx);
             }
         }
         if !matched_owner && let Some(scopes) = target_guided_qualifier_type_scopes(node, ctx) {
             for scope in scopes {
                 push_hit(scope, ctx);
             }
+        } else if !matched_owner
+            && let Some(scope) = target_guided_unproven_out_of_line_owner(node, ctx)
+        {
+            push_unproven_hit(scope, ctx);
         }
         if let Some(terminal_destructor) = terminal_destructor
             && innermost
@@ -1034,6 +1038,15 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         return;
     }
+    if let Some((hit, proven)) = target_guided_alias_template_reference(node, ctx) {
+        *ctx.raw_match_count += 1;
+        if proven {
+            push_type_hit(hit, ctx);
+        } else {
+            push_unproven_hit(hit, ctx);
+        }
+        return;
+    }
     if !recovered_type && is_declaration_name(node) {
         let mut matched_owner = false;
         if let Some(owners) = out_of_line_member_definition_owner(
@@ -1047,7 +1060,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 if same_visible_symbol(&owner, &ctx.spec.target) {
                     matched_owner = true;
                     *ctx.raw_match_count += 1;
-                    push_hit(owner_node, ctx);
+                    push_guarded_owner_hit(owner_node, &owner, node, ctx);
                 }
             }
         }
@@ -1056,6 +1069,11 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             for scope in scopes {
                 push_hit(scope, ctx);
             }
+        } else if !matched_owner
+            && let Some(scope) = target_guided_unproven_out_of_line_owner(node, ctx)
+        {
+            *ctx.raw_match_count += 1;
+            push_unproven_hit(scope, ctx);
         }
         return;
     }
@@ -1251,6 +1269,96 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             push_unproven_hit(hit_node, ctx);
         }
     }
+}
+
+fn push_guarded_owner_hit(
+    owner_node: Node<'_>,
+    owner: &CodeUnit,
+    reference: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+) {
+    if ctx
+        .visibility
+        .external_type_candidate_guard_compatible_in_context(
+            &ctx.analyzer,
+            ctx.file,
+            owner,
+            reference,
+        )
+    {
+        push_hit(owner_node, ctx);
+    } else {
+        push_unproven_hit(owner_node, ctx);
+    }
+}
+
+/// Preserve a direct template-alias reference when a macro namespace sentinel
+/// makes tree-sitter drop the first source path component.
+fn target_guided_alias_template_reference<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<(Node<'tree>, bool)> {
+    let alias_provider = ctx.analyzer.type_alias_provider()?;
+    if !matches!(
+        node.kind(),
+        "qualified_identifier" | "scoped_type_identifier"
+    ) || !alias_provider.is_type_alias(&ctx.spec.target)
+    {
+        return None;
+    }
+    cpp_template_reference_arguments(node, ctx.source)?;
+    let (components, global) = type_reference_components(node, ctx.source)?;
+    if components.last().map(String::as_str) != Some(ctx.spec.target.identifier()) {
+        return None;
+    }
+    let target = physically_visible_type_target(ctx)?;
+    let target_components = canonical_cpp_scope_components(target);
+    let parser_namespace = enclosing_namespace_components(node, ctx.source);
+    let path_matches = if global {
+        components == target_components
+            || (!parser_namespace.is_empty()
+                && target_components.starts_with(&parser_namespace)
+                && target_components[parser_namespace.len()..] == components)
+    } else {
+        let lexical_scope = match enclosing_lexical_scope_components(
+            node,
+            &ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+        ) {
+            LexicalScopeResolution::Resolved(scope) => scope,
+            LexicalScopeResolution::Ambiguous | LexicalScopeResolution::Missing => parser_namespace,
+        };
+        lexical_component_tiers(&components, false, &lexical_scope)
+            .any(|scope| scope == target_components)
+    };
+    let scoped_candidates = ctx
+        .visibility
+        .visible_identifier_candidates(ctx.file, target.identifier())
+        .filter(|candidate| canonical_cpp_scope_components(candidate) == target_components)
+        .collect::<Vec<_>>();
+    if !path_matches
+        || scoped_candidates.is_empty()
+        || scoped_candidates
+            .iter()
+            .any(|candidate| !same_visible_symbol(candidate, target))
+        || !ctx.visibility.structured_alias_primary_preserves_target(
+            &ctx.analyzer,
+            ctx.file,
+            target,
+            target,
+        )
+    {
+        return None;
+    }
+    let proven = ctx.visibility.external_type_candidate_visible_in_context(
+        &ctx.analyzer,
+        ctx.file,
+        target,
+        node,
+    );
+    Some((node, proven))
 }
 
 /// Tree-sitter can split a macro-qualified member return type into a phantom
@@ -1511,9 +1619,20 @@ fn type_reference_components_may_name_target(node: Node<'_>, ctx: &ScanCtx<'_>) 
     let Some((components, _)) = type_reference_components(node, ctx.source) else {
         return false;
     };
-    components
-        .iter()
-        .any(|component| ctx.type_reference_component_names.contains(component))
+    components.iter().any(|component| {
+        ctx.type_reference_component_names.contains(component)
+            || (component == ctx.spec.target.identifier()
+                && matches!(
+                    node.kind(),
+                    "qualified_identifier" | "scoped_type_identifier"
+                )
+                && cpp_template_reference_arguments(node, ctx.source).is_some()
+                && ctx
+                    .analyzer
+                    .type_alias_provider()
+                    .is_some_and(|provider| provider.is_type_alias(&ctx.spec.target))
+                && physically_visible_type_target(ctx).is_some())
+    })
 }
 
 fn qualified_type_scope_contains_template(node: Node<'_>) -> bool {
@@ -2667,18 +2786,20 @@ fn qualified_reference_selects_type_candidate(
         return false;
     }
     let candidate_components = canonical_cpp_scope_components(candidate);
-    let lexical_scope = match enclosing_lexical_scope_components(
-        reference,
-        &ctx.analyzer,
-        ctx.visibility,
-        ctx.file,
-        ctx.source,
-    ) {
-        LexicalScopeResolution::Resolved(scope) => scope,
-        LexicalScopeResolution::Ambiguous | LexicalScopeResolution::Missing => {
-            enclosing_namespace_components(reference, ctx.source)
+    let lexical_scope = ctx.recovered_sentinel_scope(reference).unwrap_or_else(|| {
+        match enclosing_lexical_scope_components(
+            reference,
+            &ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+        ) {
+            LexicalScopeResolution::Resolved(scope) => scope,
+            LexicalScopeResolution::Ambiguous | LexicalScopeResolution::Missing => {
+                enclosing_namespace_components(reference, ctx.source)
+            }
         }
-    };
+    });
     lexical_component_tiers(&components, global, &lexical_scope)
         .any(|qualified| qualified == candidate_components)
 }
@@ -3078,6 +3199,60 @@ fn target_guided_qualifier_type_scopes<'tree>(
         }
     }
     (!matches.is_empty()).then_some(matches)
+}
+
+/// Recover an out-of-line owner when the owner declaration and the reference
+/// use different unknown preprocessor guards. Keep this result unproven.
+fn target_guided_unproven_out_of_line_owner<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    if !matches!(node.kind(), "qualified_identifier" | "scoped_identifier")
+        || !is_declaration_name(node)
+    {
+        return None;
+    }
+    let target = physically_visible_type_target(ctx)?;
+    if !target.is_class() {
+        return None;
+    }
+    let qualified = qualified_owner_components(node, ctx.source)?;
+    let target_components = canonical_cpp_scope_components(target);
+    let mut scope = ctx
+        .recovered_sentinel_scope(node)
+        .or_else(|| {
+            let parser_scope = enclosing_namespace_components(node, ctx.source);
+            (!parser_scope.is_empty()).then_some(parser_scope)
+        })
+        .or_else(|| indexed_enclosing_lexical_scope(&ctx.analyzer, ctx.file, node))?;
+    let target_namespace = &target_components[..target_components.len().saturating_sub(1)];
+    if has_malformed_wrapper_function_definition_ancestor(node)
+        && target_namespace.starts_with(&scope)
+        && target_namespace.len() > scope.len()
+    {
+        scope = target_namespace.to_vec();
+    }
+    if !lexical_component_tiers(&qualified.names, qualified.global, &scope)
+        .any(|components| components == target_components)
+    {
+        return None;
+    }
+    let owner_name = qualified.names.last()?;
+    let candidates = ctx
+        .visibility
+        .visible_identifier_candidates(ctx.file, owner_name)
+        .filter(|candidate| {
+            candidate.is_class() && canonical_cpp_scope_components(candidate) == target_components
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty()
+        || candidates
+            .iter()
+            .any(|candidate| !same_visible_symbol(candidate, target))
+    {
+        return None;
+    }
+    qualified.nodes.last().copied()
 }
 
 fn macro_namespace_scope_matches(
