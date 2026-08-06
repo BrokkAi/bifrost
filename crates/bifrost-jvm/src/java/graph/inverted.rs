@@ -18,6 +18,7 @@
 //! a wrong edge. Method-invocation receivers are typed from the callee's declared
 //! return type, matching the same inference used when seeding locals.
 
+use super::JavaGraphSource;
 use super::resolver::{
     constructor_method_reference_receiver, is_ignored_type_context, node_text,
     resolve_field_access_type, resolve_nested_type_for_owner, resolve_type_segments,
@@ -28,69 +29,62 @@ use super::return_type::{
     java_lexical_type_from_node, java_type_name_from_node, merge_receiver_type_outcomes,
     method_return_type_for_owner_fqn,
 };
-use crate::analyzer::tree_sitter_analyzer::FileState;
-use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
-use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
-    build_file_declarations, build_file_declarations_from_state, class_range_index_from_state,
-    classify_reference_node, parse_and_collect_with_declarations,
+use crate::java::graph_support::{JavaSource, resolve_java_usage_type_name_in};
+use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node,
 };
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
-use crate::analyzer::usages::same_owner::route_same_owner;
-use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile};
-use crate::hash::{HashMap, HashSet};
-use std::sync::Mutex;
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
+};
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
+use brokk_bifrost_core::analyzer::usages::same_owner::route_same_owner;
 use tree_sitter::Node;
 
-pub(super) fn build_java_edges<Output, F>(
-    analyzer: &dyn IAnalyzer,
-    java: &JavaAnalyzer,
-    files: &[ProjectFile],
-    file_states: &HashMap<ProjectFile, FileState>,
-    nodes: &HashSet<String>,
-    keep_file: F,
-) -> Output
-where
-    Output: UsageEdgeBuildOutput<String>,
-    F: Fn(&ProjectFile) -> bool + Sync,
-{
-    let language = tree_sitter_java::LANGUAGE.into();
-    let return_type_cache: MethodReturnCache = Mutex::new(HashMap::default());
-    let anonymous_return_cache: MethodAnonymousReturnCache = Mutex::new(HashMap::default());
-    let file_return_cache: FileReturnCache = Mutex::new(HashMap::default());
-    build_edge_output(files, keep_file, |file| {
-        let state = file_states.get(file);
-        let declarations = state
-            .map(build_file_declarations_from_state)
-            .unwrap_or_else(|| build_file_declarations(analyzer, file));
-        let class_ranges = state
-            .map(class_range_index_from_state)
-            .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
-        parse_and_collect_with_declarations(file, nodes, &language, declarations, |input| {
-            let mut ctx = JavaScan {
-                java,
-                analyzer,
-                file,
-                source: input.source,
-                root: input.root(),
-                class_ranges,
-                return_type_cache: &return_type_cache,
-                anonymous_return_cache: &anonymous_return_cache,
-                file_return_cache: &file_return_cache,
-                input,
-                edges: PerFileEdges::default(),
-            };
-            let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            walk(input.root(), &mut ctx, &mut bindings);
-            ctx.edges
-        })
-    })
+/// The three per-scan return-type caches the walk shares across files.
+pub struct JavaEdgeScanCaches<'a> {
+    pub method_return: &'a MethodReturnCache,
+    pub method_anonymous_return: &'a MethodAnonymousReturnCache,
+    pub file_return: &'a FileReturnCache,
+}
+
+/// The per-file half of the whole-workspace inverted pass.
+///
+/// The parallel fan-out, the on-demand parse, and the per-file declaration and
+/// class-range indexes stay in `brokk-bifrost-analysis`: two of the three are
+/// decoded from a persisted `FileState`, whose type is crate-private there.
+/// This is everything downstream of them -- the walk that turns one parsed file
+/// into its outbound edges.
+pub fn scan_file(
+    java: &dyn JavaSource,
+    graph: &JavaGraphSource<'_>,
+    file: &ProjectFile,
+    input: &FileEdgeScanInput<'_>,
+    class_ranges: ClassRangeIndex,
+    caches: &JavaEdgeScanCaches<'_>,
+) -> PerFileEdges {
+    let mut ctx = JavaScan {
+        java,
+        graph,
+        file,
+        source: input.source,
+        root: input.root(),
+        class_ranges,
+        return_type_cache: caches.method_return,
+        anonymous_return_cache: caches.method_anonymous_return,
+        file_return_cache: caches.file_return,
+        input,
+        edges: PerFileEdges::default(),
+    };
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    walk(input.root(), &mut ctx, &mut bindings);
+    ctx.edges
 }
 
 struct JavaScan<'a> {
-    java: &'a JavaAnalyzer,
-    analyzer: &'a dyn IAnalyzer,
+    java: &'a dyn JavaSource,
+    graph: &'a JavaGraphSource<'a>,
     file: &'a ProjectFile,
     source: &'a str,
     root: Node<'a>,
@@ -124,7 +118,7 @@ impl JavaScan<'_> {
     }
 
     fn resolve_non_nested_type(&self, node: Node<'_>) -> Option<CodeUnit> {
-        match java_lexical_type_from_node(self.java, self.analyzer, self.file, self.source, node) {
+        match java_lexical_type_from_node(self.java, self.graph, self.file, self.source, node) {
             LexicalTypeResolution::Resolved(unit) => return Some(unit),
             LexicalTypeResolution::Blocked => return None,
             LexicalTypeResolution::NotFound => {}
@@ -145,15 +139,13 @@ impl JavaScan<'_> {
     /// milestone 4). Java's visibility rules are unchanged — only the universe
     /// of declarations those rules search.
     fn resolve_realm_type_name(&self, type_name: &str) -> Option<CodeUnit> {
-        self.java.resolve_usage_type_name_in(
-            &self.analyzer.global_usage_definition_index(),
-            self.file,
-            type_name,
-        )
+        self.graph.with_definitions(|definitions| {
+            resolve_java_usage_type_name_in(self.java, definitions, self.file, type_name)
+        })
     }
 
     fn resolve_nested_type(&self, owner: &CodeUnit, name: &str) -> Option<CodeUnit> {
-        resolve_nested_type_for_owner(self.analyzer, owner, name)
+        resolve_nested_type_for_owner(self.graph, owner, name)
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
@@ -173,7 +165,7 @@ impl JavaScan<'_> {
 }
 
 impl JavaReturnTypeContext for JavaScan<'_> {
-    fn java(&self) -> &JavaAnalyzer {
+    fn java(&self) -> &dyn JavaSource {
         self.java
     }
 
@@ -362,12 +354,12 @@ fn record_constructor_reference_for_type(
     };
     ctx.record(owner.fq_name().to_string(), type_node);
     let constructor_fqn = format!("{}.{}", owner.fq_name(), owner.identifier());
-    let declared = ctx
-        .analyzer
-        .global_usage_definition_index()
-        .fqn(&constructor_fqn)
-        .iter()
-        .any(|candidate| candidate.is_function() && !candidate.is_synthetic());
+    let declared = ctx.graph.with_definitions(|definitions| {
+        definitions
+            .fqn(&constructor_fqn)
+            .iter()
+            .any(|candidate| candidate.is_function() && !candidate.is_synthetic())
+    });
     if declared {
         ctx.record(constructor_fqn, reference_node);
     }
@@ -386,27 +378,28 @@ fn method_reference_callee(
     member: &str,
     ctx: &JavaScan<'_>,
 ) -> Option<String> {
-    let index = ctx.analyzer.global_usage_definition_index();
-    let mut candidates = index
-        .fqn(&format!("{owner_fq_name}.{member}"))
-        .iter()
-        .filter(|unit| unit.is_function())
-        .cloned()
-        .collect::<Vec<_>>();
-    let owner = ctx.analyzer.definitions(owner_fq_name).next()?;
-    let provider = ctx.analyzer.type_hierarchy_provider()?;
-    for ancestor in provider.get_ancestors(&owner) {
-        candidates.extend(
-            index
-                .fqn(&format!("{}.{}", ancestor.fq_name(), member))
-                .iter()
-                .filter(|unit| unit.is_function())
-                .cloned(),
-        );
-    }
-    candidates.sort();
-    candidates.dedup();
-    (candidates.len() == 1).then(|| candidates[0].fq_name())
+    let owner = ctx.graph.index.definitions(owner_fq_name).next()?;
+    let provider = ctx.graph.hierarchy?;
+    ctx.graph.with_definitions(|index| {
+        let mut candidates = index
+            .fqn(&format!("{owner_fq_name}.{member}"))
+            .iter()
+            .filter(|unit| unit.is_function())
+            .cloned()
+            .collect::<Vec<_>>();
+        for ancestor in provider.get_ancestors(&owner) {
+            candidates.extend(
+                index
+                    .fqn(&format!("{}.{}", ancestor.fq_name(), member))
+                    .iter()
+                    .filter(|unit| unit.is_function())
+                    .cloned(),
+            );
+        }
+        candidates.sort();
+        candidates.dedup();
+        (candidates.len() == 1).then(|| candidates[0].fq_name())
+    })
 }
 
 /// Whether a method invocation's receiver is a same-owner receiver: an

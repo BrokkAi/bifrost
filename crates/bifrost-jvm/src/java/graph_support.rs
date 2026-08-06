@@ -31,7 +31,7 @@
 //! `JavaAnalyzer` lives in `brokk-bifrost-analysis`; this crate never names it.
 
 use brokk_bifrost_core::analyzer::capabilities::{
-    ImportAnalysisProvider, build_reverse_file_index,
+    ImportAnalysisProvider, TypeHierarchyProvider, build_reverse_file_index,
 };
 use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
@@ -45,11 +45,16 @@ use crate::java::declarations::{collect_type_identifiers, parse_tree};
 use crate::java::imports::{import_package, non_static_import_path, static_import_path};
 
 /// The analyzer-resident products Java's language logic resolves through, on
-/// top of the two core capability traits it reads declarations and imports
-/// with. The analyzer is the only implementor and every method forwards to one
-/// of its own accessors or memo cells, so the cells stay where they are and no
-/// free function below can reach past this surface.
-pub trait JavaSource: CodeUnitIndex + ImportAnalysisProvider {
+/// top of the three core capability traits it reads declarations, imports and
+/// supertypes with. The analyzer is the only implementor and every method
+/// forwards to one of its own accessors or memo cells, so the cells stay where
+/// they are and no free function below can reach past this surface.
+///
+/// `TypeHierarchyProvider` is a supertrait because the analyzer answers
+/// `Some(self)` to `IAnalyzer::type_hierarchy_provider`, and the target-spec
+/// and receiver-compatibility paths that hold only the concrete Java analyzer
+/// used it in both roles.
+pub trait JavaSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider {
     /// The analyzed live file set (`TreeSitterAnalyzer::all_files`).
     fn java_all_files(&self) -> Vec<ProjectFile>;
 
@@ -170,6 +175,16 @@ pub fn resolve_java_forward_type_name_candidates(
     resolve_java_type_name_with(source, file, raw_name, |fqn| {
         forward_source_type_by_fqn(source, fqn)
     })
+}
+
+/// Resolve a source type while a usage query already owns the complete
+/// workspace declaration index, against this analyzer's own index.
+pub fn resolve_java_usage_type_name(
+    source: &dyn JavaSource,
+    file: &ProjectFile,
+    raw_name: &str,
+) -> Option<CodeUnit> {
+    resolve_java_usage_type_name_in(source, source.usage_definitions(), file, raw_name)
 }
 
 /// Resolve a source type against a *supplied* declaration index, applying

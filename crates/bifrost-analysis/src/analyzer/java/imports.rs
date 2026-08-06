@@ -18,7 +18,7 @@ use crate::analyzer::usages::get_definition::trace;
 use brokk_bifrost_jvm::java::graph_support::{
     compute_java_relevant_imports, compute_java_same_package_reference_index,
     java_could_import_file, java_could_import_file_without_source, java_same_package_fqn,
-    resolve_java_import_infos, resolve_java_type_name, resolve_java_usage_type_name_in,
+    resolve_java_import_infos, resolve_java_type_name,
 };
 use brokk_bifrost_jvm::java::imports::non_static_import_path;
 use std::sync::Arc;
@@ -103,36 +103,6 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         target: &ProjectFile,
     ) -> bool {
         java_could_import_file(self, source_file, imports, target)
-    }
-}
-
-impl JavaAnalyzer {
-    /// Resolve a source type while a usage query already owns the complete
-    /// workspace declaration index. This preserves the same import and package
-    /// tiers as forward resolution without serializing every AST type node on
-    /// the persisted SQLite connection.
-    pub(crate) fn resolve_usage_type_name(
-        &self,
-        file: &ProjectFile,
-        raw_name: &str,
-    ) -> Option<CodeUnit> {
-        self.resolve_usage_type_name_in(&self.global_usage_definition_index(), file, raw_name)
-    }
-
-    /// Resolve a source type against a *supplied* declaration index, applying
-    /// Java's own import and package tiers.
-    ///
-    /// The index is a parameter because Java, Scala, and Kotlin share one JVM
-    /// candidate space (issue #1237); see
-    /// [`resolve_java_usage_type_name_in`] for what widening it does and does
-    /// not change.
-    pub(crate) fn resolve_usage_type_name_in(
-        &self,
-        index: &crate::analyzer::DefinitionIndexHandle<'_>,
-        file: &ProjectFile,
-        raw_name: &str,
-    ) -> Option<CodeUnit> {
-        resolve_java_usage_type_name_in(self, index, file, raw_name)
     }
 }
 

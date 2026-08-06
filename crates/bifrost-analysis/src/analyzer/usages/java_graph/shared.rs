@@ -1,8 +1,4 @@
-use super::extractor::{ReturnTypeCaches, ScanState, scan_file};
-use super::inverted;
-use super::jvm_scala::scan_scala_files_for_java_target;
-use super::resolver::TargetSpec;
-use super::return_type::{FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache};
+use super::{build_java_edges, with_java_graph_source};
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
@@ -14,6 +10,11 @@ use crate::analyzer::{
 };
 use crate::hash::HashMap;
 use crate::hash::HashSet;
+use brokk_bifrost_jvm::java::graph::extractor::{ReturnTypeCaches, ScanState, scan_file};
+use brokk_bifrost_jvm::java::graph::resolver::TargetSpec;
+use brokk_bifrost_jvm::java::graph::return_type::{
+    FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache,
+};
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
@@ -79,22 +80,23 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
             raw_match_count: &mut raw_match_count,
             limit_exceeded: &mut limit_exceeded,
         };
-        for file in files {
-            let _scan_scope = crate::profiling::scope("java_graph::scan_file");
-            scan_file(
-                self.java,
-                analyzer,
-                &file,
-                &spec,
-                &return_caches,
-                &mut state,
-            );
-            if *state.limit_exceeded {
-                break;
+        with_java_graph_source(analyzer, |graph| {
+            for file in files {
+                let _scan_scope = crate::profiling::scope("java_graph::scan_file");
+                scan_file(self.java, &graph, &file, &spec, &return_caches, &mut state);
+                if *state.limit_exceeded {
+                    break;
+                }
             }
-        }
+        });
         let _scala_scope = crate::profiling::scope("java_graph::scan_scala_files");
-        scan_scala_files_for_java_target(analyzer, candidate_files, &spec, &mut state, None);
+        super::jvm_scala::scan_scala_files_for_java_target(
+            analyzer,
+            candidate_files,
+            &spec,
+            &mut state,
+            None,
+        );
         drop(_scala_scope);
         // A Java class is equally nameable from Kotlin source; the realm is one
         // candidate space, so find-references on a Java type must see its Kotlin
@@ -166,7 +168,7 @@ impl<'a> JavaEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_java_edges(
+        build_java_edges(
             analyzer,
             self.java,
             &self.files,
@@ -185,7 +187,7 @@ impl<'a> JavaEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_java_edges(
+        build_java_edges(
             analyzer,
             self.java,
             &self.files,

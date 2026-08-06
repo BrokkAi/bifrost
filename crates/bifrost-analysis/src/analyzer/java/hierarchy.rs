@@ -9,7 +9,7 @@ use super::*;
 use crate::analyzer::tree_sitter_analyzer::HierarchyDeclarationFacts;
 use crate::analyzer::{CodeUnitType, DirectDescendantIndex, ImportInfo, Range};
 use brokk_bifrost_jvm::java::hierarchy::{
-    JavaHierarchyFact, build_java_direct_descendant_index, java_direct_ancestors, java_is_interface,
+    JavaHierarchyFact, build_java_direct_descendant_index, java_direct_ancestors,
 };
 use std::sync::Arc;
 
@@ -53,10 +53,6 @@ impl TypeHierarchyProvider for JavaAnalyzer {
 }
 
 impl JavaAnalyzer {
-    pub(crate) fn is_interface(&self, code_unit: &CodeUnit) -> bool {
-        java_is_interface(self, code_unit)
-    }
-
     fn build_direct_descendant_index(&self) -> DirectDescendantIndex {
         let _scope = crate::profiling::scope("JavaAnalyzer::build_direct_descendant_index");
         let candidates = self

@@ -1,31 +1,33 @@
+use super::JavaGraphSource;
 use super::resolver::java_callable_arity;
-use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::usages::common::node_text;
-use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
-use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile, Range};
-use crate::hash::HashMap;
+use crate::java::graph_support::{JavaSource, resolve_java_usage_type_name};
+use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile, Range};
+use brokk_bifrost_core::analyzer::usages::common::node_text;
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
+    ReceiverAnalysisBudget, ReceiverAnalysisOutcome,
+};
+use brokk_bifrost_core::hash::HashMap;
 use std::sync::Mutex;
 use tree_sitter::{Node, Parser};
 
-pub(in crate::analyzer::usages) const METHOD_RECEIVER_CHAIN_LIMIT: usize = 64;
-pub(super) const METHOD_RECEIVER_CHAIN_LIMIT_NAME: &str = "java_method_receiver_chain_depth";
+pub const METHOD_RECEIVER_CHAIN_LIMIT: usize = 64;
+pub const METHOD_RECEIVER_CHAIN_LIMIT_NAME: &str = "java_method_receiver_chain_depth";
 
-pub(super) type MethodReturnCacheKey = (ProjectFile, String, Option<String>);
-pub(super) type MethodReturnCache =
+pub type MethodReturnCacheKey = (ProjectFile, String, Option<String>);
+pub type MethodReturnCache = Mutex<HashMap<MethodReturnCacheKey, ReceiverAnalysisOutcome<String>>>;
+pub type MethodAnonymousReturnCache =
     Mutex<HashMap<MethodReturnCacheKey, ReceiverAnalysisOutcome<String>>>;
-pub(super) type MethodAnonymousReturnCache =
-    Mutex<HashMap<MethodReturnCacheKey, ReceiverAnalysisOutcome<String>>>;
-pub(super) type FileReturnCacheKey = (String, Option<String>);
-pub(super) type FileReturnCache = Mutex<HashMap<ProjectFile, JavaFileReturnFacts>>;
+pub type FileReturnCacheKey = (String, Option<String>);
+pub type FileReturnCache = Mutex<HashMap<ProjectFile, JavaFileReturnFacts>>;
 
 #[derive(Clone, Default)]
-pub(super) struct JavaFileReturnFacts {
+pub struct JavaFileReturnFacts {
     declared_types: HashMap<FileReturnCacheKey, ReceiverAnalysisOutcome<String>>,
     anonymous_return_types: HashMap<FileReturnCacheKey, ReceiverAnalysisOutcome<String>>,
 }
 
-pub(super) trait JavaReturnTypeContext {
-    fn java(&self) -> &JavaAnalyzer;
+pub trait JavaReturnTypeContext {
+    fn java(&self) -> &dyn JavaSource;
     fn file(&self) -> &ProjectFile;
     fn source(&self) -> &str;
     fn root(&self) -> Node<'_>;
@@ -34,7 +36,7 @@ pub(super) trait JavaReturnTypeContext {
     fn file_return_cache(&self) -> &FileReturnCache;
 }
 
-pub(super) fn method_return_type_for_owner_fqns<'a, C, I>(
+pub fn method_return_type_for_owner_fqns<'a, C, I>(
     owners: I,
     name: &str,
     arity: usize,
@@ -51,7 +53,7 @@ where
     )
 }
 
-pub(super) fn method_return_type_for_owner_fqn<C>(
+pub fn method_return_type_for_owner_fqn<C>(
     owner: &str,
     name: &str,
     arity: usize,
@@ -63,7 +65,7 @@ where
     let fqn = format!("{owner}.{name}");
     let units = ctx
         .java()
-        .global_usage_definition_index()
+        .usage_definitions()
         .fqn(&fqn)
         .iter()
         .filter(|unit| unit.is_function() && java_callable_arity(ctx.java(), unit).accepts(arity))
@@ -133,7 +135,7 @@ where
         .unwrap_or(ReceiverAnalysisOutcome::Unknown)
 }
 
-pub(super) fn method_anonymous_return_type_for_owner_fqn<C>(
+pub fn method_anonymous_return_type_for_owner_fqn<C>(
     owner: &str,
     name: &str,
     arity: usize,
@@ -145,7 +147,7 @@ where
     let fqn = format!("{owner}.{name}");
     let units = ctx
         .java()
-        .global_usage_definition_index()
+        .usage_definitions()
         .fqn(&fqn)
         .iter()
         .filter(|unit| unit.is_function() && java_callable_arity(ctx.java(), unit).accepts(arity))
@@ -293,7 +295,7 @@ where
 }
 
 fn java_declared_type_fqn(
-    java: &JavaAnalyzer,
+    java: &dyn JavaSource,
     file: &ProjectFile,
     source: &str,
     type_node: Node<'_>,
@@ -303,13 +305,14 @@ fn java_declared_type_fqn(
     match java_lexical_type_from_declaration(java, declaration, &components) {
         LexicalTypeResolution::Resolved(unit) => Some(unit.fq_name()),
         LexicalTypeResolution::Blocked => None,
-        LexicalTypeResolution::NotFound => java
-            .resolve_usage_type_name(file, &components.join("."))
-            .map(|unit| unit.fq_name()),
+        LexicalTypeResolution::NotFound => {
+            resolve_java_usage_type_name(java, file, &components.join("."))
+                .map(|unit| unit.fq_name())
+        }
     }
 }
 
-pub(super) fn java_type_name_from_node(type_node: Node<'_>, source: &str) -> Option<String> {
+pub fn java_type_name_from_node(type_node: Node<'_>, source: &str) -> Option<String> {
     java_type_name_components(type_node, source).map(|components| components.join("."))
 }
 
@@ -350,7 +353,7 @@ fn java_type_name_components(type_node: Node<'_>, source: &str) -> Option<Vec<St
     (!components.is_empty()).then_some(components)
 }
 
-pub(super) fn is_java_nominal_type_node(kind: &str) -> bool {
+pub fn is_java_nominal_type_node(kind: &str) -> bool {
     matches!(
         kind,
         "identifier"
@@ -363,15 +366,15 @@ pub(super) fn is_java_nominal_type_node(kind: &str) -> bool {
     )
 }
 
-pub(super) enum LexicalTypeResolution {
+pub enum LexicalTypeResolution {
     Resolved(CodeUnit),
     NotFound,
     Blocked,
 }
 
-pub(super) fn java_lexical_type_from_node(
-    java: &JavaAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn java_lexical_type_from_node(
+    java: &dyn JavaSource,
+    graph: &JavaGraphSource<'_>,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -385,14 +388,14 @@ pub(super) fn java_lexical_type_from_node(
         start_line: node.start_position().row,
         end_line: node.end_position().row,
     };
-    let Some(declaration) = analyzer.enclosing_code_unit(file, &range) else {
+    let Some(declaration) = graph.index.enclosing_code_unit(file, &range) else {
         return LexicalTypeResolution::NotFound;
     };
     java_lexical_type_from_declaration(java, &declaration, &components)
 }
 
 fn java_lexical_type_from_declaration(
-    java: &JavaAnalyzer,
+    java: &dyn JavaSource,
     declaration: &CodeUnit,
     components: &[String],
 ) -> LexicalTypeResolution {
@@ -403,7 +406,7 @@ fn java_lexical_type_from_declaration(
         .is_class()
         .then(|| declaration.clone())
         .or_else(|| java.parent_of(declaration));
-    let mut visited = crate::hash::HashSet::default();
+    let mut visited = brokk_bifrost_core::hash::HashSet::default();
     while let Some(owner) = scope {
         if !visited.insert(owner.clone()) {
             return LexicalTypeResolution::Blocked;
@@ -440,11 +443,11 @@ fn java_lexical_type_from_declaration(
 }
 
 fn unique_java_class_by_fqn_in_file(
-    java: &JavaAnalyzer,
+    java: &dyn JavaSource,
     fqn: &str,
     file: &ProjectFile,
 ) -> Result<Option<CodeUnit>, ()> {
-    let units = java.global_usage_definition_index().fqn(fqn);
+    let units = java.usage_definitions().fqn(fqn);
     let mut candidates = units
         .iter()
         .filter(|unit| unit.is_class() && unit.source() == file);
@@ -497,7 +500,7 @@ fn method_declaration_covering<'tree>(root: Node<'tree>, range: &Range) -> Optio
 }
 
 fn method_declaration_anonymous_return_type(
-    java: &JavaAnalyzer,
+    java: &dyn JavaSource,
     file: &ProjectFile,
     source: &str,
     method: Node<'_>,
@@ -554,7 +557,7 @@ fn has_anonymous_class_body(node: Node<'_>) -> bool {
         .any(|child| child.kind() == "class_body")
 }
 
-pub(super) fn merge_receiver_type_outcomes(
+pub fn merge_receiver_type_outcomes(
     outcomes: impl IntoIterator<Item = ReceiverAnalysisOutcome<String>>,
 ) -> ReceiverAnalysisOutcome<String> {
     ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, ReceiverAnalysisBudget::default())

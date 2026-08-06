@@ -1,23 +1,62 @@
-mod extractor;
-mod hits;
-mod inverted;
+//! The analysis-side wrappers over [`brokk_bifrost_jvm::java::graph`].
+//!
+//! The scans themselves moved with the language knowledge. What stays here is
+//! the downcast that produces their arguments, the `GraphUsageAnalyzer` /
+//! `UsageQueryResolver` / `UsageAnalyzer` strategy shells (all analysis-owned
+//! traits), the inverted pass's fan-out and its two `FileState` decoders, the
+//! Java-to-Scala cross-language scan, and the dead-code bulk routing predicate.
+
 mod jvm_scala;
-mod resolver;
-pub(super) mod return_type;
 mod shared;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
-use crate::analyzer::usages::java_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::java_graph::shared::{JavaEdgeResolver, JavaQueryResolver};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
-use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile, resolve_analyzer};
+use crate::analyzer::{
+    BoundedDefinitionLookup, CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile,
+    resolve_analyzer,
+};
 use crate::hash::HashSet;
+use brokk_bifrost_jvm::java::graph::JavaGraphSource;
+use brokk_bifrost_jvm::java::graph::extractor::{self, ReturnTypeCaches, ScanState};
+use brokk_bifrost_jvm::java::graph::inverted::{
+    JavaEdgeScanCaches, scan_file as scan_inverted_file,
+};
+use brokk_bifrost_jvm::java::graph::resolver::{TargetKind, TargetSpec};
+use brokk_bifrost_jvm::java::graph::return_type::{
+    FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache,
+};
+use std::sync::Mutex;
 
-pub(in crate::analyzer::usages) use resolver::signature_arity as java_signature_arity;
+pub(in crate::analyzer::usages) use brokk_bifrost_jvm::java::graph::resolver::signature_arity as java_signature_arity;
+
+/// Run `visit` with the [`JavaGraphSource`] built from the *dispatching*
+/// analyzer.
+///
+/// A callback rather than a constructor because the definition-index accessor is
+/// itself a borrowed closure: `analyzer.global_usage_definition_index()` returns
+/// a handle that borrows the analyzer and merges one shard per delegate, and the
+/// Java side takes it lazily so a scan that never reaches a realm-wide lookup
+/// never pays for the merge.
+pub(in crate::analyzer::usages) fn with_java_graph_source<R>(
+    analyzer: &dyn IAnalyzer,
+    visit: impl FnOnce(JavaGraphSource<'_>) -> R,
+) -> R {
+    let definitions = |consume: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| {
+        consume(&analyzer.global_usage_definition_index());
+    };
+    let import_statements = |file: &ProjectFile| analyzer.import_statements(file);
+    visit(JavaGraphSource {
+        index: analyzer,
+        hierarchy: analyzer.type_hierarchy_provider(),
+        definitions: &definitions,
+        import_statements: &import_statements,
+    })
+}
 
 pub(crate) fn build_java_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
@@ -74,17 +113,17 @@ pub(crate) fn scan_jvm_files_for_foreign_type(
     let Some(spec) = TargetSpec::from_target(java, target) else {
         return;
     };
-    let mut state = extractor::ScanState {
+    let mut state = ScanState {
         max_usages,
         hits,
         unproven_hits,
         raw_match_count,
         limit_exceeded,
     };
-    let method_return_cache = std::sync::Mutex::new(crate::hash::HashMap::default());
-    let method_anonymous_return_cache = std::sync::Mutex::new(crate::hash::HashMap::default());
-    let file_return_cache = std::sync::Mutex::new(crate::hash::HashMap::default());
-    let return_caches = extractor::ReturnTypeCaches {
+    let method_return_cache = Mutex::new(crate::hash::HashMap::default());
+    let method_anonymous_return_cache = Mutex::new(crate::hash::HashMap::default());
+    let file_return_cache = Mutex::new(crate::hash::HashMap::default());
+    let return_caches = ReturnTypeCaches {
         method_return: &method_return_cache,
         method_anonymous_return: &method_anonymous_return_cache,
         file_return: &file_return_cache,
@@ -95,13 +134,21 @@ pub(crate) fn scan_jvm_files_for_foreign_type(
         .cloned()
         .collect();
     java_files.sort();
-    for file in java_files {
-        extractor::scan_file(java, analyzer, &file, &spec, &return_caches, &mut state);
-        if *state.limit_exceeded {
-            return;
+    with_java_graph_source(analyzer, |graph| {
+        for file in java_files {
+            extractor::scan_file(java, &graph, &file, &spec, &return_caches, &mut state);
+            if *state.limit_exceeded {
+                return;
+            }
         }
-    }
-    jvm_scala::scan_scala_files_for_java_target(analyzer, candidate_files, &spec, &mut state, None);
+        jvm_scala::scan_scala_files_for_java_target(
+            analyzer,
+            candidate_files,
+            &spec,
+            &mut state,
+            None,
+        );
+    });
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,4 +245,59 @@ impl UsageAnalyzer for JavaUsageGraphStrategy {
         self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
             .into_fuzzy_result()
     }
+}
+
+/// The whole-workspace inverted pass: the shared driver's parallel fan-out plus
+/// on-demand parsing, with
+/// [`brokk_bifrost_jvm::java::graph::inverted::scan_file`] resolving each file.
+///
+/// The two per-file indexes are built here rather than crate-side because both
+/// have a `FileState` fast path, and `FileState` is analysis-crate-private
+/// (Ruby's `forward_owner_relation_facts` precedent: decode on this side, hand
+/// the decoded facts across).
+fn build_java_edges<Output, F>(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    files: &[ProjectFile],
+    file_states: &crate::hash::HashMap<
+        ProjectFile,
+        crate::analyzer::tree_sitter_analyzer::FileState,
+    >,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Output
+where
+    Output: crate::analyzer::usages::inverted_edges::UsageEdgeBuildOutput<String>,
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    use crate::analyzer::usages::inverted_edges::{
+        ClassRangeIndex, build_edge_output, build_file_declarations,
+        build_file_declarations_from_state, class_range_index_from_state,
+        parse_and_collect_with_declarations,
+    };
+
+    let language = tree_sitter_java::LANGUAGE.into();
+    let method_return_cache: MethodReturnCache = Mutex::new(crate::hash::HashMap::default());
+    let method_anonymous_return_cache: MethodAnonymousReturnCache =
+        Mutex::new(crate::hash::HashMap::default());
+    let file_return_cache: FileReturnCache = Mutex::new(crate::hash::HashMap::default());
+    let caches = JavaEdgeScanCaches {
+        method_return: &method_return_cache,
+        method_anonymous_return: &method_anonymous_return_cache,
+        file_return: &file_return_cache,
+    };
+    with_java_graph_source(analyzer, |graph| {
+        build_edge_output(files, keep_file, |file| {
+            let state = file_states.get(file);
+            let declarations = state
+                .map(build_file_declarations_from_state)
+                .unwrap_or_else(|| build_file_declarations(analyzer, file));
+            let class_ranges = state
+                .map(class_range_index_from_state)
+                .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
+            parse_and_collect_with_declarations(file, nodes, &language, declarations, |input| {
+                scan_inverted_file(java, &graph, file, input, class_ranges, &caches)
+            })
+        })
+    })
 }

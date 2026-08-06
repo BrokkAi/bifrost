@@ -1,7 +1,5 @@
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, language_for_file, usage_hit};
-use crate::analyzer::usages::java_graph::extractor::ScanState;
-use crate::analyzer::usages::java_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::scala_graph::syntax::{
     call_site_shape_for_reference, has_ancestor_kind, is_identifier_node, is_type_like_reference,
@@ -15,6 +13,8 @@ use crate::analyzer::{
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset, snippet_around_line};
+use brokk_bifrost_jvm::java::graph::extractor::ScanState;
+use brokk_bifrost_jvm::java::graph::resolver::{TargetKind, TargetSpec};
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 
