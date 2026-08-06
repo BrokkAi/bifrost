@@ -5383,6 +5383,8 @@ public sealed class BinaryMethodGroups {
         Accept(configure ?? (OnChanged));
         Accept(configure + ((Handler)OnChanged!));
         Accept(configure ?? ((Handler)OnChanged!));
+        (configure + OnChanged).Invoke(1);
+        (configure ?? OnChanged).Invoke(1);
         AcceptInt(1 + otherValue);
     }
 
@@ -5422,6 +5424,8 @@ public sealed class BinaryAmbiguous {
         "Accept(configure ?? (OnChanged));",
         "Accept(configure + ((Handler)OnChanged!));",
         "Accept(configure ?? ((Handler)OnChanged!));",
+        "(configure + OnChanged).Invoke(1);",
+        "(configure ?? OnChanged).Invoke(1);",
     ]
     .into_iter()
     .map(|line| {
@@ -5432,7 +5436,7 @@ public sealed class BinaryAmbiguous {
 
     let graph = graph_hits(&analyzer, &target);
     assert_eq!(
-        5,
+        7,
         graph.len(),
         "binary method groups must exclude shadows and fields: {graph:#?}"
     );
@@ -5461,7 +5465,7 @@ public sealed class BinaryAmbiguous {
         .into_either()
         .expect("binary method-group query should resolve");
     assert_eq!(
-        5,
+        7,
         routed.len(),
         "targeted extraction must match inverted binary method groups: {routed:#?}"
     );
