@@ -22,6 +22,7 @@ use crate::graph::resolver::{JsTsUsageIndex, is_static_member, member_name};
 use crate::parse::js_ts_tree_sitter_language_for_file;
 use crate::providers::JsTsAnalyzerHost;
 use crate::syntax::{direct_property_definitions, slice};
+use crate::tsconfig::AliasResolver;
 use brokk_bifrost_core::analyzer::usages::model::{
     ExportEntry, FuzzyResult, UsageHit, UsageHitSurface, UsageProof,
 };
@@ -49,6 +50,16 @@ impl<'a> JsTsHosts<'a> {
     /// A view over `hosts`, in the order the builder found them.
     pub fn new(hosts: Vec<(Language, &'a dyn JsTsAnalyzerHost)>) -> Self {
         Self { hosts }
+    }
+
+    /// Any member's shared alias resolver, or `None` when the workspace
+    /// analyzes neither dialect. Every member is built over the same project
+    /// root, so a scan that spans both dialects resolves specifiers through one
+    /// warm config memo instead of building its own cold one.
+    pub fn alias_resolver(&self) -> Option<&'a AliasResolver> {
+        self.hosts
+            .first()
+            .map(|(_, host)| host.alias_resolver().as_ref())
     }
 
     /// The host for `language`, when the workspace analyzes it.

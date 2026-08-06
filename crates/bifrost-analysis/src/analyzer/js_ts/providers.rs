@@ -236,8 +236,8 @@ pub(crate) fn get_direct_descendants(
 pub(crate) fn jsts_usage_index(host: &dyn JsTsMemoHost) -> Arc<JsTsUsageIndex> {
     let language = host.js_ts_language();
     host.memo_caches().jsts_usage_index.get_or_build(
-        || build_jsts_usage_index(host, language, true),
-        || build_jsts_usage_index(host, language, false),
+        || build_jsts_usage_index(host, host.alias_resolver(), language, true),
+        || build_jsts_usage_index(host, host.alias_resolver(), language, false),
     )
 }
 
@@ -250,12 +250,24 @@ pub(crate) fn jsts_usage_index_with_cancellation(
         .jsts_usage_index
         .get_or_try_build(
             || {
-                build_jsts_usage_index_with_cancellation(host, language, true, Some(cancellation))
-                    .ok_or(())
+                build_jsts_usage_index_with_cancellation(
+                    host,
+                    host.alias_resolver(),
+                    language,
+                    true,
+                    Some(cancellation),
+                )
+                .ok_or(())
             },
             || {
-                build_jsts_usage_index_with_cancellation(host, language, false, Some(cancellation))
-                    .ok_or(())
+                build_jsts_usage_index_with_cancellation(
+                    host,
+                    host.alias_resolver(),
+                    language,
+                    false,
+                    Some(cancellation),
+                )
+                .ok_or(())
             },
         )
         .ok()
@@ -264,7 +276,7 @@ pub(crate) fn jsts_usage_index_with_cancellation(
 pub(crate) fn prewarm_jsts_usage_index(host: &dyn JsTsMemoHost) -> Arc<JsTsUsageIndex> {
     let language = host.js_ts_language();
     host.memo_caches().jsts_usage_index.get_or_build_parallel(
-        || build_jsts_usage_index(host, language, true),
-        || build_jsts_usage_index(host, language, false),
+        || build_jsts_usage_index(host, host.alias_resolver(), language, true),
+        || build_jsts_usage_index(host, host.alias_resolver(), language, false),
     )
 }

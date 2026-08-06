@@ -38,14 +38,22 @@ pub struct JsTsUsageIndex {
 /// thing the analyzer caches; the scan phase re-parses its candidate files on demand).
 pub fn build_jsts_usage_index(
     analyzer: &dyn CodeUnitIndex,
+    aliases: &AliasResolver,
     language: Language,
     parallel: bool,
 ) -> JsTsUsageIndex {
-    build_jsts_usage_index_with_cancellation(analyzer, language, parallel, None).unwrap_or_default()
+    build_jsts_usage_index_with_cancellation(analyzer, aliases, language, parallel, None)
+        .unwrap_or_default()
 }
 
+/// `aliases` is the analyzer's shared resolver rather than one built here from
+/// `analyzer.project().root()`: the specifier resolution below walks every file's
+/// ancestor chain, and a resolver scoped to this build would parse each
+/// `tsconfig.json` again on every rebuild instead of reusing the config memo the
+/// rest of the analyzer has already warmed.
 pub fn build_jsts_usage_index_with_cancellation(
     analyzer: &dyn CodeUnitIndex,
+    aliases: &AliasResolver,
     language: Language,
     parallel: bool,
     cancellation: Option<&CancellationToken>,
@@ -98,9 +106,8 @@ pub fn build_jsts_usage_index_with_cancellation(
         binders_by_file.insert(file, binder);
     }
 
-    let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
     let resolve = |file: &ProjectFile, module_specifier: &str| {
-        resolve_js_ts_module_specifier(file, module_specifier, language, Some(&aliases))
+        resolve_js_ts_module_specifier(file, module_specifier, language, Some(aliases))
     };
     let ReexportEdges {
         reexport_edges,
@@ -326,8 +333,10 @@ impl JsTsUsageIndex {
     }
 }
 
+/// `aliases` is the workspace's shared resolver; see
+/// [`build_jsts_usage_index_with_cancellation`].
 pub fn combine_jsts_usage_indices<'a>(
-    analyzer: &dyn CodeUnitIndex,
+    aliases: &AliasResolver,
     indices: impl Iterator<Item = &'a JsTsUsageIndex>,
 ) -> JsTsUsageIndex {
     let mut exports_by_file = HashMap::default();
@@ -337,7 +346,6 @@ pub fn combine_jsts_usage_indices<'a>(
         binders_by_file.extend(index.binders_by_file.clone());
     }
 
-    let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
     let resolve = |file: &ProjectFile, module_specifier: &str| {
         let mut resolved = Vec::new();
         for language in [Language::TypeScript, Language::JavaScript] {
@@ -345,7 +353,7 @@ pub fn combine_jsts_usage_indices<'a>(
                 file,
                 module_specifier,
                 language,
-                Some(&aliases),
+                Some(aliases),
             ));
         }
         resolved.sort();

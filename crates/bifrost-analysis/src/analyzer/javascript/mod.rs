@@ -134,7 +134,7 @@ pub struct JavascriptAnalyzer {
 }
 
 impl JsTsAnalyzerHost for JavascriptAnalyzer {
-    fn alias_resolver(&self) -> &AliasResolver {
+    fn alias_resolver(&self) -> &Arc<AliasResolver> {
         &self.alias_resolver
     }
 
@@ -194,6 +194,16 @@ crate::analyzer::impl_forward_query_provider!(JavascriptAnalyzer);
 
 impl JavascriptAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        // The clone keeps this analyzer's `alias_resolver`, whose config memo is
+        // keyed on the root it was built with. Re-projecting is a same-root
+        // operation (the only caller wraps the same project in an overlay), and
+        // the shared resolver every JS/TS resolution path now reads would answer
+        // for the wrong tree if that stopped holding.
+        debug_assert_eq!(
+            self.inner.project().root(),
+            project.root(),
+            "re-projecting a JS/TS analyzer must not change its root"
+        );
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
         clone

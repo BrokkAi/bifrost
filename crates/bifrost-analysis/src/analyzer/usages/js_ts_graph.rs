@@ -302,8 +302,11 @@ where
             cached_indices.push(index);
         }
     }
+    // No JS/TS analyzer means no analyzed files for either dialect either, so
+    // `any` would stay false and this would return `None` regardless.
+    let aliases = hosts.alias_resolver()?;
     let combined_index = combine_jsts_usage_indices(
-        analyzer,
+        aliases,
         cached_indices.iter().map(std::convert::AsRef::as_ref),
     );
 

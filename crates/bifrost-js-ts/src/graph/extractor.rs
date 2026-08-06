@@ -17,7 +17,6 @@ use crate::syntax::{
     is_property_key_in_member, nested_type_identifier_parts, slice, static_member_receiver,
 };
 use crate::ts_owners::ts_resolve_type_text_to_property_owners;
-use crate::tsconfig::AliasResolver;
 use crate::type_text::ts_type_annotation_text;
 use brokk_bifrost_core::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use brokk_bifrost_core::analyzer::usages::local_inference::{
@@ -123,7 +122,6 @@ pub fn scan_files_for_seeds(
         let tree_ref = &tree;
 
         let imports = index.binders_by_file.get(file).cloned().unwrap_or_default();
-        let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
 
         let mut local_hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut local_unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
@@ -197,7 +195,6 @@ pub fn scan_files_for_seeds(
             target_owner: target_owner.as_ref(),
             target_owner_source: target_owner_source.as_ref(),
             imports,
-            aliases,
             receiver_facts,
             lexical_bindings,
             scope_stack: vec![HashMap::default()],
@@ -299,7 +296,6 @@ pub struct ScanCtx<'a> {
     target_owner: Option<&'a CodeUnit>,
     target_owner_source: Option<&'a ProjectFile>,
     imports: JsTsImportBinder,
-    aliases: AliasResolver,
     receiver_facts: JsTsReceiverFactProvider<'a, 'a>,
     lexical_bindings: Option<JsTsLexicalBindingIndex>,
     scope_stack: Vec<HashMap<String, LocalBinding>>,
@@ -1254,7 +1250,7 @@ fn contextual_object_literal_owners(node: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Co
             ctx.file,
             ctx.source,
             &ctx.imports,
-            &ctx.aliases,
+            ctx.host.alias_resolver(),
             ts_type_annotation_text(type_node, ctx.source).as_str(),
             0,
         );
@@ -1286,7 +1282,7 @@ fn contextual_object_literal_owners(node: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Co
         ctx.file,
         ctx.source,
         &ctx.imports,
-        &ctx.aliases,
+        ctx.host.alias_resolver(),
         ts_type_annotation_text(type_node, ctx.source).as_str(),
         0,
     )

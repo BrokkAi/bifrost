@@ -123,7 +123,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             source,
             root,
             imports,
-            Arc::new(AliasResolver::new(host.project().root().to_path_buf())),
+            Arc::clone(host.alias_resolver()),
             syntax_index,
         )
     }
@@ -389,7 +389,6 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             return Vec::new();
         };
         let imports = compute_jsts_import_binder(&source, &tree);
-        let aliases = AliasResolver::new(self.host.project().root().to_path_buf());
         let mut owners = nodes_for_code_unit(self.host, component, tree.root_node())
             .into_iter()
             .filter_map(|node| jsx_component_props_type(node, component.identifier(), &source))
@@ -400,7 +399,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                     component.source(),
                     &source,
                     &imports,
-                    &aliases,
+                    self.host.alias_resolver(),
                     ts_type_annotation_text(type_node, &source).as_str(),
                     0,
                 )

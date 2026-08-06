@@ -56,7 +56,10 @@ use crate::graph::resolver::JsTsUsageIndex;
 /// [`TypeHierarchyProvider`] never exposes, and `js_ts_import_statements` reads
 /// the raw import statement text the module skeleton renders.
 pub trait JsTsAnalyzerHost: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider {
-    fn alias_resolver(&self) -> &AliasResolver;
+    /// The analyzer's shared alias resolver. Returned by handle so a caller
+    /// that must own one (the receiver-fact provider) shares this instance's
+    /// config memo instead of constructing a resolver whose memo starts cold.
+    fn alias_resolver(&self) -> &Arc<AliasResolver>;
     fn js_ts_language(&self) -> Language;
 
     /// The analyzed live file set (`TreeSitterAnalyzer::all_files`).
