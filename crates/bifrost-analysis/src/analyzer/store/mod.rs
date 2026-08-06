@@ -1284,6 +1284,37 @@ impl AnalyzerStore {
         ensure_language_epochs_tx(&mut conn, entries)
     }
 
+    /// Sum persisted analyzer payload bytes for complete blobs in the active
+    /// language generations. The cache budget uses this as a corpus-size hint;
+    /// it is not an exact heap measurement because source text is not stored in
+    /// `blob_payload_costs`.
+    pub(crate) fn active_file_state_payload_bytes(
+        &self,
+        generations: &HashMap<String, GenerationId>,
+    ) -> Result<usize> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let mut total = 0usize;
+        let mut statement = tx.prepare_cached(
+            "SELECT COALESCE(SUM(costs.payload_bytes), 0)
+             FROM blobs
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = blobs.blob_oid AND meta.lang = blobs.lang
+             LEFT JOIN blob_payload_costs AS costs
+               ON costs.blob_oid = blobs.blob_oid AND costs.lang = blobs.lang
+             WHERE blobs.lang = ?1 AND blobs.generation = ?2
+               AND meta.is_complete = 1",
+        )?;
+        for (lang, generation) in generations {
+            let bytes =
+                statement.query_row(params![lang, generation.0], |row| row.get::<_, usize>(0))?;
+            total = total.saturating_add(bytes);
+        }
+        drop(statement);
+        tx.commit()?;
+        Ok(total)
+    }
+
     pub fn missing_blobs(&self, oids: &[Oid], lang: &str) -> Result<Vec<Oid>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
@@ -10541,6 +10572,50 @@ mod tests {
         let oid = oid_for(state.source.as_bytes());
         let store = AnalyzerStore::open_in_memory().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_conditional_alias_physical_ranges();
+        let prior_generation = store
+            .ensure_language_epoch_value("cpp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .unwrap(),
+            vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    #[test]
+    fn cpp_macro_argument_typedef_declarator_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "internal/cgen/base/token-public.h",
+            "#define WUFFS_BASE__SLICE(T) struct { T* ptr; size_t len; }\n\
+             typedef struct wuffs_base__token__struct {\n\
+               unsigned long long repr;\n\
+             } wuffs_base__token;\n\
+             typedef WUFFS_BASE__SLICE(wuffs_base__token) wuffs_base__slice_token;\n",
+        );
+        let state = Arc::new(parse_state(&CppAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_epoch = epoch::cpp_epoch_before_macro_argument_typedef_declarator();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
             .unwrap();

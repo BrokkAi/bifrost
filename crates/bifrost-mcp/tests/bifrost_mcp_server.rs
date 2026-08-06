@@ -4175,6 +4175,103 @@ fn profiled_tool_calls_emit_all_transport_phases_on(host: McpHost) {
     }
 }
 
+/// A lightweight lookup on the same connection must overtake a long usage
+/// scan instead of serializing behind it.
+///
+/// Two regressions are pinned here. First, `call_tool` once kept the
+/// connection's workspace preparation guard alive in a maybe-moved binding
+/// (`if serial { state } else { None }`) for the whole non-serial call, so
+/// every tool call held the lock through analyzer execution and responses
+/// could only arrive in request order. Second, the scan's rayon fan-out ran
+/// on the global pool, so a concurrent request whose resolution injects
+/// nested parallel work parked until the scan finished. The `mcp_fairness`
+/// scenario in benchmark/interactive-latency.toml gates the same overlap
+/// against a five-second budget; this is its fast in-repo counterpart.
+#[test]
+fn light_lookup_overtakes_long_usage_scan() {
+    let mut project = InlineTestProject::with_language(Language::Rust).file(
+        "hot.rs",
+        "pub struct Hot;\npub fn touch(_value: Hot) -> Hot {\n    Hot\n}\n",
+    );
+    // Enough referencing files that the scan's per-candidate work reliably
+    // outlasts one warmed single-symbol lookup by orders of magnitude, while
+    // staying quick to write and index.
+    for index in 0..300 {
+        project = project.file(
+            format!("user_{index}.rs"),
+            format!(
+                "pub fn user_{index}() {{\n    let value = crate::hot::Hot;\n    let _ = crate::hot::touch(value);\n}}\n"
+            ),
+        );
+    }
+    let workspace = project.build();
+    let mut child = spawn_server_on(McpHost::Rmcp, workspace.root(), "searchtools");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    // Warm the lookup once so the measured run is dispatch plus a cache hit,
+    // not cold workspace readiness or first-touch hydration.
+    let warm = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 60,
+            "method": "tools/call",
+            "params": {
+                "name": "get_symbol_sources",
+                "arguments": { "symbols": ["hot.rs#Hot"] }
+            }
+        }),
+    );
+    assert_eq!(warm["result"]["isError"], false, "{warm}");
+
+    // Heavy first on the wire, light second. With fair scheduling the light
+    // response overtakes; a serialized host can only answer in request order.
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 61,
+            "method": "tools/call",
+            "params": {
+                "name": "scan_usages_by_location",
+                "arguments": {
+                    "targets": [{ "path": "hot.rs", "line": 1, "symbol": "Hot" }],
+                    "include_tests": true,
+                    "include_same_owner": true
+                }
+            }
+        }),
+    );
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 62,
+            "method": "tools/call",
+            "params": {
+                "name": "get_symbol_sources",
+                "arguments": { "symbols": ["hot.rs#Hot"] }
+            }
+        }),
+    );
+    let first = read_line(&mut reader, &mut stderr);
+    assert_eq!(
+        first["id"], 62,
+        "the light lookup must answer while the scan is still running: {first}"
+    );
+    let second = read_line(&mut reader, &mut stderr);
+    assert_eq!(second["id"], 61, "{second}");
+    assert_eq!(second["result"]["isError"], false, "{second}");
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
 /// Which MCP host serves a session.
 ///
 /// The rmcp stack is the default. `BIFROST_MCP_RMCP=off` selects the

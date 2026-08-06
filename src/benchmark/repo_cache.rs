@@ -13,6 +13,10 @@ pub fn prepare_repo(
         )
     })?;
 
+    // The fixtures must be full clones. `most_relevant_files` refuses the git
+    // co-change history walk on a partial clone with a network promisor remote
+    // (issue #1373), so a blobless fixture would silently benchmark the
+    // import-only fallback instead of the history ranking the baseline pinned.
     let checkout_path = repo_cache_dir.join(&target.name);
     if !checkout_path.exists() {
         run_git_command(
@@ -20,24 +24,25 @@ pub fn prepare_repo(
                 .arg("clone")
                 .args(["-c", "core.autocrlf=false"])
                 .arg("--no-checkout")
-                .arg("--filter=blob:none")
                 .arg(&target.url)
                 .arg(&checkout_path),
             None,
             format!("clone `{}` into `{}`", target.url, checkout_path.display()),
         )?;
-    } else if !repo_has_commit(&checkout_path, &target.commit)? {
-        run_git_command(
-            Command::new("git")
-                .arg("-C")
-                .arg(&checkout_path)
-                .arg("fetch")
-                .arg("--filter=blob:none")
-                .arg("--all")
-                .arg("--tags"),
-            None,
-            format!("fetch `{}`", checkout_path.display()),
-        )?;
+    } else {
+        unpartial_cached_clone(&checkout_path)?;
+        if !repo_has_commit(&checkout_path, &target.commit)? {
+            run_git_command(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&checkout_path)
+                    .arg("fetch")
+                    .arg("--all")
+                    .arg("--tags"),
+                None,
+                format!("fetch `{}`", checkout_path.display()),
+            )?;
+        }
     }
 
     // Benchmark input must be byte-stable across hosts: the persisted analyzer
@@ -77,6 +82,103 @@ pub fn prepare_repo(
             checkout_path.display()
         )
     })
+}
+
+/// Upgrade a cached blobless clone left behind by the pre-#1373 harness into a
+/// full clone. Earlier harness versions cloned with `--filter=blob:none`;
+/// restored CI caches and local caches keep that shape until targets change.
+/// `git fetch --refetch` transfers every object for the advertised refs as a
+/// fresh clone would, after which the promisor and filter markers are removed
+/// so the repository is an ordinary full clone.
+fn unpartial_cached_clone(checkout_path: &Path) -> Result<(), String> {
+    let repo = git2::Repository::open(checkout_path).map_err(|err| {
+        format!(
+            "failed to open cached checkout `{}`: {err}",
+            checkout_path.display()
+        )
+    })?;
+    let config = repo.config().map_err(|err| {
+        format!(
+            "failed to read config of `{}`: {err}",
+            checkout_path.display()
+        )
+    })?;
+    let remotes = repo.remotes().map_err(|err| {
+        format!(
+            "failed to list remotes of `{}`: {err}",
+            checkout_path.display()
+        )
+    })?;
+    let partial_remotes: Vec<String> = remotes
+        .iter()
+        .flatten()
+        .filter(|remote| {
+            config
+                .get_bool(&format!("remote.{remote}.promisor"))
+                .unwrap_or(false)
+                || config
+                    .get_string(&format!("remote.{remote}.partialclonefilter"))
+                    .is_ok()
+        })
+        .map(str::to_string)
+        .collect();
+    drop(config);
+    drop(repo);
+
+    for remote in partial_remotes {
+        // Drop the filter first so the refetch negotiates unfiltered.
+        run_git_command(
+            Command::new("git").arg("-C").arg(checkout_path).args([
+                "config",
+                "--unset-all",
+                &format!("remote.{remote}.partialclonefilter"),
+            ]),
+            None,
+            format!(
+                "remove partial-clone filter of remote `{remote}` in `{}`",
+                checkout_path.display()
+            ),
+        )
+        .or_else(ignore_unset_of_missing_key)?;
+        run_git_command(
+            Command::new("git")
+                .arg("-C")
+                .arg(checkout_path)
+                .arg("fetch")
+                .arg("--refetch")
+                .arg("--tags")
+                .arg(&remote),
+            None,
+            format!(
+                "refetch full objects from remote `{remote}` in `{}`",
+                checkout_path.display()
+            ),
+        )?;
+        run_git_command(
+            Command::new("git").arg("-C").arg(checkout_path).args([
+                "config",
+                "--unset-all",
+                &format!("remote.{remote}.promisor"),
+            ]),
+            None,
+            format!(
+                "remove promisor marker of remote `{remote}` in `{}`",
+                checkout_path.display()
+            ),
+        )
+        .or_else(ignore_unset_of_missing_key)?;
+    }
+    Ok(())
+}
+
+/// `git config --unset-all` exits with status 5 when the key does not exist.
+/// A partial clone can carry only one of the two markers; removing the absent
+/// one is not an error.
+fn ignore_unset_of_missing_key(error: String) -> Result<(), String> {
+    if error.contains("status=5") {
+        return Ok(());
+    }
+    Err(error)
 }
 
 fn repo_has_commit(checkout_path: &Path, commit: &str) -> Result<bool, String> {
