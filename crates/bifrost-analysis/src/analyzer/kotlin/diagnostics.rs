@@ -19,7 +19,6 @@
 //! is far likelier than for a bare type name.
 
 use crate::analyzer::ImportInfo;
-use crate::analyzer::jvm::realm::JvmSourceRealm;
 use crate::analyzer::kotlin::syntax::{kotlin_enclosing_import_header, kotlin_type_spelling};
 use crate::analyzer::kotlin::types::KotlinNameScope;
 use crate::analyzer::semantic_diagnostics::node_range;
@@ -28,6 +27,7 @@ use crate::analyzer::{
     IAnalyzer, KotlinAnalyzer, ProjectFile, Range, SemanticDiagnostic, resolve_analyzer,
 };
 use crate::text_utils::compute_line_starts;
+use brokk_bifrost_jvm::realm::JvmSourceRealm;
 use tree_sitter::{Node, Parser, Tree};
 
 pub(crate) const KOTLIN_UNRECOGNIZED_SYMBOL: &str = "kotlin_unrecognized_symbol";

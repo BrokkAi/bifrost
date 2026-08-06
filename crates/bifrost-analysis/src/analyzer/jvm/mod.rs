@@ -11,5 +11,5 @@ pub(crate) mod external;
 pub(crate) mod java_artifact;
 pub(crate) mod jdk_artifact;
 pub(crate) mod kotlin_artifact;
-pub(crate) mod realm;
+pub(crate) mod realm_builder;
 pub(crate) mod scala_artifact;

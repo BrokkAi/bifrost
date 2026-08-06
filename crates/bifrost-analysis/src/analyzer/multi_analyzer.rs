@@ -1,5 +1,5 @@
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::jvm::realm::JvmSourceRealm;
+use crate::analyzer::jvm::realm_builder::jvm_source_realm;
 use crate::analyzer::store::StoreError;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CSharpAnalyzer, CloneSmell,
@@ -14,6 +14,7 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
+use brokk_bifrost_jvm::realm::JvmSourceRealm;
 use rayon::prelude::*;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -378,7 +379,7 @@ impl MultiAnalyzer {
         let Some(AnalyzerDelegate::Kotlin(kotlin)) = self.delegates.get(&Language::Kotlin) else {
             return None;
         };
-        let realm = JvmSourceRealm::of(self);
+        let realm = jvm_source_realm(self);
         realm
             .has_peers_of(Language::Kotlin)
             .then_some((kotlin, realm))

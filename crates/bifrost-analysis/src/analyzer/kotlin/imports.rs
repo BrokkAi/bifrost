@@ -25,13 +25,13 @@
 
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::jvm::realm::JvmSourceRealm;
 use crate::analyzer::tree_walk::{first_named_child_of_kind as first_named_child, named_children};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, ProjectFile,
     StructuredImportPath, build_reverse_file_index,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_jvm::realm::JvmSourceRealm;
 use std::sync::Arc;
 use tree_sitter::Node;
 

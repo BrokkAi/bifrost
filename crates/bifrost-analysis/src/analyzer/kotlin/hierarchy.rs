@@ -7,11 +7,11 @@
 //! each candidate's supertype paths and imports together, so inverting the
 //! whole workspace costs one hydration pass rather than one per class.
 
-use crate::analyzer::jvm::realm::JvmSourceRealm;
 use crate::analyzer::{
     CodeUnit, CodeUnitType, DirectDescendantIndex, ImportInfo, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_jvm::realm::JvmSourceRealm;
 use std::sync::Arc;
 
 use super::KotlinAnalyzer;

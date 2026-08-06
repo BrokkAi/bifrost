@@ -13,7 +13,7 @@
 //! (ancestors and descendants). Kotlin also joins the shared JVM realm here:
 //! it reads the same jar-backed dependency index Java and Scala use, and
 //! `MultiAnalyzer` widens its import and hierarchy resolution across Java and
-//! Scala sources through `crate::analyzer::jvm::realm` (issue #1237).
+//! Scala sources through `brokk_bifrost_jvm::realm` (issue #1237).
 //!
 //! Deliberate boundaries within Kotlin/JVM name resolution: Kotlin/JS and
 //! Kotlin/Native default imports are not modelled, `expect`/`actual` pairs are

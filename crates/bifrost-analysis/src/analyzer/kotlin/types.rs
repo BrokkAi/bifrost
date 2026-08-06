@@ -32,8 +32,8 @@
 
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::jvm::external::JvmExternalType;
-use crate::analyzer::jvm::realm::JvmSourceRealm;
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportInfo, Language, ProjectFile};
+use brokk_bifrost_jvm::realm::JvmSourceRealm;
 
 use super::KotlinAnalyzer;
 use super::imports::{KOTLIN_DEFAULT_IMPORT_PACKAGES, kotlin_import_path};
