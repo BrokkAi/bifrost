@@ -32,7 +32,6 @@ fn record(id: &str, tool: &'static str, kind: ProbeKind, structured: Value) -> P
         kind,
         outcome: Some(ProbeOutcome::Structured {
             structured,
-            rendered_text: None,
             mode_b_structured: None,
         }),
         elapsed_ms: None,

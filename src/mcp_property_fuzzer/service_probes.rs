@@ -392,7 +392,6 @@ pub enum ProbeKind {
 pub enum ProbeOutcome {
     Structured {
         structured: Value,
-        rendered_text: Option<String>,
         /// Structured payload from the same call with
         /// `render_line_numbers: false`; `None` for single-mode probes
         /// (expensive scans) and for `Text` outputs.
@@ -407,8 +406,9 @@ pub enum ProbeOutcome {
 /// `config.invariants` are checked, though cross-cutting checkers (I3c, I4,
 /// I5) consume every response the requested probes produced. When
 /// `probe_dump` is set, every executed record (arguments plus outcomes) is
-/// written to that path as JSONL for triage; the dump is observability only
-/// and does not change the run fingerprint.
+/// streamed to that path as JSONL the moment its outcome lands, so a crashed
+/// or OOM-killed run still names the probes it completed (#1689); the dump is
+/// observability only and does not change the run fingerprint.
 pub fn run_service_invariants(
     service: &SearchToolsService,
     input: &I1Input,
@@ -419,14 +419,32 @@ pub fn run_service_invariants(
     probe_parallelism: usize,
 ) -> Result<Vec<Violation>, String> {
     let language = config.corpus_language.as_str();
+    let mut dump_writer = probe_dump
+        .map(|path| {
+            std::fs::File::create(path)
+                .map(std::io::BufWriter::new)
+                .map_err(|error| {
+                    format!("failed to create probe dump `{}`: {error}", path.display())
+                })
+        })
+        .transpose()?;
     let mut probes = generate_probes(input, invalid, config, summary);
-    execute_probes(service, &mut probes, summary, probe_parallelism);
+    execute_probes(
+        service,
+        &mut probes,
+        summary,
+        probe_parallelism,
+        dump_writer.as_mut(),
+    )?;
     let mut follow_ups = derive_follow_ups(&probes, config, summary);
-    execute_probes(service, &mut follow_ups, summary, probe_parallelism);
+    execute_probes(
+        service,
+        &mut follow_ups,
+        summary,
+        probe_parallelism,
+        dump_writer.as_mut(),
+    )?;
     let records: Vec<&ProbeRecord> = probes.iter().chain(follow_ups.iter()).collect();
-    if let Some(path) = probe_dump {
-        dump_probe_records(&records, path)?;
-    }
 
     let mut sink = ViolationSink::default();
     check_render_mode_drift(&records, language, &mut sink, summary);
@@ -569,91 +587,127 @@ fn batch_asymmetry_reproduces(service: &SearchToolsService, references: &[Value]
 /// triage sees exact statuses; large ones (summaries, scans) are excerpted.
 const DUMP_PAYLOAD_EXCERPT_BYTES: usize = 4_096;
 
-/// Write every executed probe record to `path` as JSONL, one line per record:
-/// identity, exact arguments, kind, and the outcome (structured payload or
-/// transport error, plus the mode-B payload when both render modes ran). This
-/// is the triage instrument: a silent run's outcomes are invisible in the
-/// ledger, and a firing one's shrunk evidence shows only the pair that fired.
-pub fn dump_probe_records(records: &[&ProbeRecord], path: &Path) -> Result<(), String> {
-    use std::io::Write as _;
-    let mut file = std::fs::File::create(path)
-        .map_err(|error| format!("failed to create probe dump `{}`: {error}", path.display()))?;
-    for record in records {
-        let kind = match &record.kind {
-            ProbeKind::Spelling { order, spelling } => {
-                json!({"kind": "spelling", "order": order, "spelling": spelling})
-            }
-            ProbeKind::DefinitionBatch { spellings } => {
-                json!({"kind": "definition_batch", "spellings": spellings})
-            }
-            ProbeKind::SummaryFile => json!({"kind": "summary_file"}),
-            ProbeKind::SummaryElementSource { element_path } => {
-                json!({"kind": "summary_element_source", "element_path": element_path})
-            }
-            ProbeKind::Scan {
-                expected_display_fq,
-                is_module,
-            } => {
-                json!({"kind": "scan", "expected_display_fq": expected_display_fq, "is_module": is_module})
-            }
-            ProbeKind::ScanSearch {
-                expected_display_fq,
-                expected_path,
-                is_module,
-            } => json!({
-                "kind": "scan_search",
-                "expected_display_fq": expected_display_fq,
-                "expected_path": expected_path,
-                "is_module": is_module,
-            }),
-            ProbeKind::Negative { shape } => json!({"kind": "negative", "shape": shape}),
-            ProbeKind::HonestySearch {
-                failed_selector,
-                disputed_name,
-                origin_tool,
-                ..
-            } => json!({
-                "kind": "honesty_search",
-                "failed_selector": failed_selector,
-                "disputed_name": disputed_name,
-                "origin_tool": origin_tool,
-            }),
-        };
-        let (outcome, structured, mode_b, error) = match &record.outcome {
-            Some(ProbeOutcome::Structured {
-                structured,
-                mode_b_structured,
-                ..
-            }) => (
-                "structured",
-                dump_payload(structured),
-                mode_b_structured.as_ref().map(dump_payload),
-                None,
-            ),
-            Some(ProbeOutcome::Error(message)) => {
-                ("error", Value::Null, None, Some(message.as_str()))
-            }
-            None => ("pending", Value::Null, None, None),
-        };
-        let line = json!({
-            "id": record.id,
-            "tool": record.tool,
-            "kind": kind,
-            "arguments": record.arguments,
-            "symbol_fq": record.symbol_fq,
-            "symbol_path": record.symbol_path,
-            "outcome": outcome,
-            "elapsed_ms": record.elapsed_ms,
-            "structured": structured,
-            "mode_b_structured": mode_b,
-            "error": error,
-        });
-        serde_json::to_writer(&mut file, &line)
-            .map_err(|error| format!("failed to write probe dump `{}`: {error}", path.display()))?;
-        file.write_all(b"\n")
-            .map_err(|error| format!("failed to write probe dump `{}`: {error}", path.display()))?;
+/// Truncate over-long string values at record time. Checkers consume only
+/// short identity/status fields, while block `text` payloads run to
+/// megabytes each on generated amalgamations; before this cap the full
+/// payload (plus its mode-B duplicate) lived in memory for the whole run
+/// (#1689). The dump-time excerpt cap still applies on top for whole-payload
+/// serialization size.
+fn cap_strings_for_record(value: Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(truncate_record_string(text)),
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(cap_strings_for_record).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, cap_strings_for_record(value)))
+                .collect(),
+        ),
+        other => other,
     }
-    Ok(())
+}
+
+fn truncate_record_string(text: String) -> String {
+    if text.len() <= DUMP_PAYLOAD_EXCERPT_BYTES {
+        return text;
+    }
+    let mut end = DUMP_PAYLOAD_EXCERPT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[truncated, {} bytes total]", &text[..end], text.len())
+}
+
+/// The JSONL line for one executed probe record: identity, exact arguments,
+/// kind, and the outcome (structured payload or transport error, plus the
+/// mode-B payload when both render modes ran). Shared by the streaming dump
+/// writer.
+fn probe_record_line(record: &ProbeRecord) -> Value {
+    let kind = match &record.kind {
+        ProbeKind::Spelling { order, spelling } => {
+            json!({"kind": "spelling", "order": order, "spelling": spelling})
+        }
+        ProbeKind::DefinitionBatch { spellings } => {
+            json!({"kind": "definition_batch", "spellings": spellings})
+        }
+        ProbeKind::SummaryFile => json!({"kind": "summary_file"}),
+        ProbeKind::SummaryElementSource { element_path } => {
+            json!({"kind": "summary_element_source", "element_path": element_path})
+        }
+        ProbeKind::Scan {
+            expected_display_fq,
+            is_module,
+        } => {
+            json!({"kind": "scan", "expected_display_fq": expected_display_fq, "is_module": is_module})
+        }
+        ProbeKind::ScanSearch {
+            expected_display_fq,
+            expected_path,
+            is_module,
+        } => json!({
+            "kind": "scan_search",
+            "expected_display_fq": expected_display_fq,
+            "expected_path": expected_path,
+            "is_module": is_module,
+        }),
+        ProbeKind::Negative { shape } => json!({"kind": "negative", "shape": shape}),
+        ProbeKind::HonestySearch {
+            failed_selector,
+            disputed_name,
+            origin_tool,
+            ..
+        } => json!({
+            "kind": "honesty_search",
+            "failed_selector": failed_selector,
+            "disputed_name": disputed_name,
+            "origin_tool": origin_tool,
+        }),
+    };
+    let (outcome, structured, mode_b, error) = match &record.outcome {
+        Some(ProbeOutcome::Structured {
+            structured,
+            mode_b_structured,
+            ..
+        }) => (
+            "structured",
+            dump_payload(structured),
+            mode_b_structured.as_ref().map(dump_payload),
+            None,
+        ),
+        Some(ProbeOutcome::Error(message)) => ("error", Value::Null, None, Some(message.as_str())),
+        None => ("pending", Value::Null, None, None),
+    };
+    json!({
+        "id": record.id,
+        "tool": record.tool,
+        "kind": kind,
+        "arguments": record.arguments,
+        "symbol_fq": record.symbol_fq,
+        "symbol_path": record.symbol_path,
+        "outcome": outcome,
+        "elapsed_ms": record.elapsed_ms,
+        "structured": structured,
+        "mode_b_structured": mode_b,
+        "error": error,
+    })
+}
+
+/// Append one record's JSONL line and flush: the dump is the only evidence a
+/// crashed or OOM-killed run leaves behind (#1689), so no record may sit in
+/// the buffer when the process dies.
+fn write_probe_record_line(
+    writer: &mut std::io::BufWriter<std::fs::File>,
+    record: &ProbeRecord,
+) -> Result<(), String> {
+    use std::io::Write as _;
+    let line = probe_record_line(record);
+    serde_json::to_writer(&mut *writer, &line)
+        .map_err(|error| format!("failed to write probe dump: {error}"))?;
+    writer
+        .write_all(b"\n")
+        .and_then(|()| writer.flush())
+        .map_err(|error| format!("failed to write probe dump: {error}"))
 }
 
 fn dump_payload(structured: &Value) -> Value {
@@ -1028,7 +1082,8 @@ fn execute_probes(
     probes: &mut [ProbeRecord],
     summary: &mut ProbeSummary,
     probe_parallelism: usize,
-) {
+    mut dump: Option<&mut std::io::BufWriter<std::fs::File>>,
+) -> Result<(), String> {
     // Owned work items: workers never borrow the probe slice, which keeps the
     // borrow story trivial and lets the calling thread apply results.
     let work: Vec<(usize, &'static str, Value, bool, String)> = probes
@@ -1048,7 +1103,7 @@ fn execute_probes(
         .collect();
     let trace = std::env::var_os("BIFROST_FUZZER_PROBE_TRACE").is_some();
     if work.is_empty() {
-        return;
+        return Ok(());
     }
     let worker_count = probe_parallelism.min(work.len()).max(1);
     let next = AtomicUsize::new(0);
@@ -1106,7 +1161,13 @@ fn execute_probes(
         summary.calls_executed += 1;
         probes[index].elapsed_ms = Some(elapsed_ms);
         probes[index].outcome = Some(outcome);
+        // Stream the record as soon as its outcome lands: an OOM or panic
+        // mid-run must still leave the completed probes on disk (#1689).
+        if let Some(writer) = dump.as_deref_mut() {
+            write_probe_record_line(writer, &probes[index])?;
+        }
     }
+    Ok(())
 }
 
 fn call_tool(
@@ -1123,16 +1184,11 @@ fn call_tool(
         },
     ) {
         Ok(ToolOutput::Text(text)) => ProbeOutcome::Structured {
-            structured: Value::String(text),
-            rendered_text: None,
+            structured: cap_strings_for_record(Value::String(text)),
             mode_b_structured: None,
         },
-        Ok(ToolOutput::Structured {
-            structured,
-            rendered_text,
-        }) => ProbeOutcome::Structured {
-            structured,
-            rendered_text,
+        Ok(ToolOutput::Structured { structured, .. }) => ProbeOutcome::Structured {
+            structured: cap_strings_for_record(structured),
             mode_b_structured: None,
         },
         Err(error) => ProbeOutcome::Error(error.to_string()),
@@ -2690,5 +2746,41 @@ mod tests {
         // CRLF keeps working, including a block ending between the pair.
         let returned_crlf = "@PostMapping(\"/{erupt}/delete\")\r\n    @EruptRouter(skipAuthIndex = 3)\r\n    public void deleteEruptData() {\r";
         assert!(text_matches_reported_lines(&expected, returned_crlf));
+    }
+
+    #[test]
+    fn record_string_truncation_preserves_short_and_caps_long() {
+        let short = "short payload".to_string();
+        assert_eq!(truncate_record_string(short.clone()), short);
+
+        let long = "x".repeat(DUMP_PAYLOAD_EXCERPT_BYTES + 500);
+        let capped = truncate_record_string(long);
+        assert!(capped.len() < DUMP_PAYLOAD_EXCERPT_BYTES + 100);
+        assert!(capped.starts_with(&"x".repeat(100)));
+        assert!(capped.contains("[truncated,"));
+
+        // Multi-byte characters must not be split mid-codepoint.
+        let wide = "é".repeat(DUMP_PAYLOAD_EXCERPT_BYTES + 10);
+        let capped_wide = truncate_record_string(wide);
+        assert!(capped_wide.contains("[truncated,"));
+    }
+
+    #[test]
+    fn cap_strings_for_record_walks_nested_values() {
+        let long = "y".repeat(DUMP_PAYLOAD_EXCERPT_BYTES * 2);
+        let value = json!({
+            "status": "resolved",
+            "blocks": [{"text": long, "start_line": 3}],
+            "names": ["a", "b"],
+            "count": 7,
+        });
+        let capped = cap_strings_for_record(value);
+        assert_eq!(capped["status"], "resolved");
+        assert_eq!(capped["count"], 7);
+        assert_eq!(capped["names"], json!(["a", "b"]));
+        assert_eq!(capped["blocks"][0]["start_line"], 3);
+        let text = capped["blocks"][0]["text"].as_str().unwrap();
+        assert!(text.contains("[truncated,"));
+        assert!(text.len() < DUMP_PAYLOAD_EXCERPT_BYTES * 2);
     }
 }
