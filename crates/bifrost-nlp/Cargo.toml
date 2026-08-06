@@ -12,9 +12,18 @@ publish = true
 name = "brokk_bifrost_nlp"
 
 # This crate *is* the `nlp` feature. Hosts opt in by depending on it (the facade
-# and bifrost-mcp gate it behind their own `nlp` feature), so nothing here is
-# feature-gated and enabling semantic search no longer changes the analysis
-# crate's fingerprint.
+# and bifrost-mcp gate it behind their own `nlp` feature). The runtime stack stays
+# unconditional, so enabling semantic search never changes the analysis crate's
+# fingerprint. The one gated item is the `tokenizers` re-export (see below); it
+# backs only a diagnostic binary, so featureless workspace builds skip its ~6.5s
+# compile.
+[features]
+# The `tokenizers` crate is used only by the `embed_seq_probe` sequence-length
+# diagnostic (through the `pub use tokenizers` re-export in lib.rs). Gate it so a
+# featureless `cargo build --workspace` does not compile it. The facade's `nlp`
+# feature turns it on for hosts that build the probe.
+tokenizers = ["dep:tokenizers"]
+
 [dependencies]
 brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.22" }
 fastrq = "0.2.0"
@@ -27,7 +36,7 @@ rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.8"
-tokenizers = "0.21"
+tokenizers = { version = "0.21", optional = true }
 
 # Unix: process-group kill for the embedding sidecar.
 [target.'cfg(unix)'.dependencies]

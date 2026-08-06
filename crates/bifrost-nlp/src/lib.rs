@@ -21,7 +21,10 @@ pub mod store;
 pub mod voyage_sidecar;
 
 // This crate owns the tokenizer stack; re-exported for sequence-length diagnostics
-// without redeclaring the dependency in the facade.
+// without redeclaring the dependency in the facade. Only the `embed_seq_probe`
+// binary consumes it, so it sits behind the `tokenizers` feature and stays out of
+// featureless workspace builds.
+#[cfg(feature = "tokenizers")]
 pub use tokenizers;
 
 /// Whether `semantic_search` should be offered. The voyage-4-nano embedder (PyTorch
