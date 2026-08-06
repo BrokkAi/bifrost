@@ -188,6 +188,50 @@ pub struct CodeQueryReceiverEvidence {
     pub completeness: &'static str,
 }
 
+/// The mandatory structured call-shape outcome row for one exact call site.
+/// Group and argument rows may be empty, but this row always states the
+/// call kind and how much of the shape the analyzer could see.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryCallShape {
+    pub id: String,
+    pub site_id: String,
+    pub site_ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callee_range: Option<CodeQueryRange>,
+    pub call_kind: &'static str,
+    pub coverage: &'static str,
+    pub group_count: usize,
+}
+
+/// One ordered argument-list group of a call shape.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryCallArgumentGroup {
+    pub id: String,
+    pub site_id: String,
+    pub path: String,
+    pub range: CodeQueryRange,
+    pub group_index: usize,
+    pub kind: &'static str,
+    pub argument_count: usize,
+}
+
+/// One ordered argument inside one argument-list group.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryCallShapeArgument {
+    pub id: String,
+    pub group_id: String,
+    pub site_id: String,
+    pub path: String,
+    pub range: CodeQueryRange,
+    pub argument_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub spread: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "receiver_value_kind", rename_all = "snake_case")]
 pub enum CodeQueryReceiverValue {

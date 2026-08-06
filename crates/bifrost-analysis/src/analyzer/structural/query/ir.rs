@@ -63,6 +63,9 @@ pub enum QueryValueKind {
     ReceiverAnalysis,
     ReceiverOutcome,
     ReceiverEvidence,
+    CallShape,
+    CallArgumentGroup,
+    CallArgument,
     Occurrence,
     LexicalScope,
     Binding,
@@ -95,6 +98,9 @@ impl QueryValueKind {
             Self::ReceiverAnalysis => "receiver_analysis",
             Self::ReceiverOutcome => "receiver_outcome",
             Self::ReceiverEvidence => "receiver_evidence",
+            Self::CallShape => "call_shape",
+            Self::CallArgumentGroup => "call_argument_group",
+            Self::CallArgument => "call_argument",
             Self::Occurrence => "occurrence",
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
@@ -256,6 +262,9 @@ pub enum QueryStep {
     MemberTargets(ReceiverTraversalFilter),
     ReceiverOutcome,
     ReceiverEvidence,
+    CallShape,
+    CallArgumentGroups,
+    CallArguments,
     OccurrencesOf(OccurrenceFilter),
     OccurrencesIn(OccurrenceFilter),
     OccurrenceTarget,
@@ -734,6 +743,9 @@ impl QueryStep {
             Self::MemberTargets(_) => QueryStepOp::MemberTargets,
             Self::ReceiverOutcome => QueryStepOp::ReceiverOutcome,
             Self::ReceiverEvidence => QueryStepOp::ReceiverEvidence,
+            Self::CallShape => QueryStepOp::CallShape,
+            Self::CallArgumentGroups => QueryStepOp::CallArgumentGroups,
+            Self::CallArguments => QueryStepOp::CallArguments,
             Self::OccurrencesOf(_) => QueryStepOp::OccurrencesOf,
             Self::OccurrencesIn(_) => QueryStepOp::OccurrencesIn,
             Self::OccurrenceTarget => QueryStepOp::OccurrenceTarget,
@@ -799,6 +811,9 @@ impl QueryStep {
             }
             QueryStepOp::ReceiverOutcome => Some(Self::ReceiverOutcome),
             QueryStepOp::ReceiverEvidence => Some(Self::ReceiverEvidence),
+            QueryStepOp::CallShape => Some(Self::CallShape),
+            QueryStepOp::CallArgumentGroups => Some(Self::CallArgumentGroups),
+            QueryStepOp::CallArguments => Some(Self::CallArguments),
             QueryStepOp::OccurrencesOf => Some(Self::OccurrencesOf(OccurrenceFilter::default())),
             QueryStepOp::OccurrencesIn => Some(Self::OccurrencesIn(OccurrenceFilter::default())),
             QueryStepOp::OccurrenceTarget => Some(Self::OccurrenceTarget),
@@ -870,6 +885,9 @@ impl QueryStep {
                 | QueryValueKind::ReceiverAnalysis
                 | QueryValueKind::ReceiverOutcome
                 | QueryValueKind::ReceiverEvidence
+                | QueryValueKind::CallShape
+                | QueryValueKind::CallArgumentGroup
+                | QueryValueKind::CallArgument
                 | QueryValueKind::Occurrence
                 | QueryValueKind::LexicalScope
                 | QueryValueKind::Binding
@@ -922,6 +940,18 @@ impl QueryStep {
             }
             (Self::ReceiverEvidence, QueryValueKind::ReceiverAnalysis) => {
                 Some(QueryValueKind::ReceiverEvidence)
+            }
+            (
+                Self::CallShape,
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::CallSite
+                | QueryValueKind::Occurrence,
+            ) => Some(QueryValueKind::CallShape),
+            (Self::CallArgumentGroups, QueryValueKind::CallShape) => {
+                Some(QueryValueKind::CallArgumentGroup)
+            }
+            (Self::CallArguments, QueryValueKind::CallArgumentGroup) => {
+                Some(QueryValueKind::CallArgument)
             }
             (Self::OccurrencesOf(_), QueryValueKind::Declaration) => {
                 Some(QueryValueKind::Occurrence)
@@ -1042,6 +1072,9 @@ pub(super) fn validate_query_steps(
             }
             QueryStep::MemberTargets(_) => "structural_match, reference_site, or occurrence",
             QueryStep::ReceiverOutcome | QueryStep::ReceiverEvidence => "receiver_analysis",
+            QueryStep::CallShape => "structural_match, call_site, or occurrence",
+            QueryStep::CallArgumentGroups => "call_shape",
+            QueryStep::CallArguments => "call_argument_group",
             QueryStep::OccurrencesOf(_) => "declaration",
             QueryStep::OccurrencesIn(_) => "structural_match or file",
             QueryStep::OccurrenceTarget => "occurrence",

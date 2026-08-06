@@ -95,6 +95,9 @@ pub enum DetailedCodeQueryDomain {
     ExpressionSite,
     ReceiverAnalysis,
     ReceiverOutcome,
+    CallShape,
+    CallArgumentGroup,
+    CallArgument,
     ReceiverEvidence,
     Occurrence,
     LexicalScope,
@@ -125,6 +128,9 @@ pub const ALL_DETAILED_CODE_QUERY_DOMAINS: &[DetailedCodeQueryDomain] = &[
     DetailedCodeQueryDomain::ExpressionSite,
     DetailedCodeQueryDomain::ReceiverAnalysis,
     DetailedCodeQueryDomain::ReceiverOutcome,
+    DetailedCodeQueryDomain::CallShape,
+    DetailedCodeQueryDomain::CallArgumentGroup,
+    DetailedCodeQueryDomain::CallArgument,
     DetailedCodeQueryDomain::ReceiverEvidence,
     DetailedCodeQueryDomain::Occurrence,
     DetailedCodeQueryDomain::LexicalScope,
@@ -263,6 +269,9 @@ impl DetailedCodeQueryDomain {
             QueryValueKind::ExpressionSite => Self::ExpressionSite,
             QueryValueKind::ReceiverAnalysis => Self::ReceiverAnalysis,
             QueryValueKind::ReceiverOutcome => Self::ReceiverOutcome,
+            QueryValueKind::CallShape => Self::CallShape,
+            QueryValueKind::CallArgumentGroup => Self::CallArgumentGroup,
+            QueryValueKind::CallArgument => Self::CallArgument,
             QueryValueKind::ReceiverEvidence => Self::ReceiverEvidence,
             QueryValueKind::Occurrence => Self::Occurrence,
             QueryValueKind::LexicalScope => Self::LexicalScope,
@@ -296,6 +305,9 @@ impl DetailedCodeQueryDomain {
             Self::ExpressionSite => "expression_site",
             Self::ReceiverAnalysis => "receiver_analysis",
             Self::ReceiverOutcome => "receiver_outcome",
+            Self::CallShape => "call_shape",
+            Self::CallArgumentGroup => "call_argument_group",
+            Self::CallArgument => "call_argument",
             Self::ReceiverEvidence => "receiver_evidence",
             Self::Occurrence => "occurrence",
             Self::LexicalScope => "lexical_scope",
@@ -430,6 +442,29 @@ impl DetailedCodeQueryDomain {
                 CodeQueryRowField::required("proof", Scalar::ConstrainedEnum),
                 CodeQueryRowField::required("completeness", Scalar::ConstrainedEnum),
             ],
+            Self::CallShape => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("site_id", Scalar::StableId),
+                CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                CodeQueryRowField::required("call_kind", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("group_count", Scalar::Integer),
+            ],
+            Self::CallArgumentGroup => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("site_id", Scalar::StableId),
+                CodeQueryRowField::required("group_index", Scalar::Integer),
+                CodeQueryRowField::required("kind", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("argument_count", Scalar::Integer),
+            ],
+            Self::CallArgument => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("group_id", Scalar::StableId),
+                CodeQueryRowField::required("site_id", Scalar::StableId),
+                CodeQueryRowField::required("argument_index", Scalar::Integer),
+                CodeQueryRowField::optional("name", Scalar::String),
+                CodeQueryRowField::required("spread", Scalar::Boolean),
+            ],
             Self::Occurrence => code_query_row_fields![
                 CodeQueryRowField::required("id", Scalar::StableId),
                 CodeQueryRowField::required("ast_id", Scalar::StableId),
@@ -558,6 +593,9 @@ impl CodeQueryResultValue {
             Self::ReceiverAnalysis { .. } => DetailedCodeQueryDomain::ReceiverAnalysis,
             Self::ReceiverOutcome { .. } => DetailedCodeQueryDomain::ReceiverOutcome,
             Self::ReceiverEvidence { .. } => DetailedCodeQueryDomain::ReceiverEvidence,
+            Self::CallShape { .. } => DetailedCodeQueryDomain::CallShape,
+            Self::CallArgumentGroup { .. } => DetailedCodeQueryDomain::CallArgumentGroup,
+            Self::CallArgument { .. } => DetailedCodeQueryDomain::CallArgument,
             Self::Occurrence { .. } => DetailedCodeQueryDomain::Occurrence,
             Self::LexicalScope { .. } => DetailedCodeQueryDomain::LexicalScope,
             Self::Binding { .. } => DetailedCodeQueryDomain::Binding,
@@ -806,6 +844,53 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::ReceiverOutcome { value }, "semantic_unsupported") => {
             value.semantic_unsupported.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallShape { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::CallShape { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::CallShape { value }, "site_ast_id") => {
+            Some(Scalar::StableId(&value.site_ast_id))
+        }
+        (CodeQueryResultValue::CallShape { value }, "call_kind") => {
+            Some(Scalar::ConstrainedEnum(value.call_kind))
+        }
+        (CodeQueryResultValue::CallShape { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::CallShape { value }, "group_count") => {
+            Some(Scalar::Integer(value.group_count as u64))
+        }
+        (CodeQueryResultValue::CallArgumentGroup { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::CallArgumentGroup { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::CallArgumentGroup { value }, "group_index") => {
+            Some(Scalar::Integer(value.group_index as u64))
+        }
+        (CodeQueryResultValue::CallArgumentGroup { value }, "kind") => {
+            Some(Scalar::ConstrainedEnum(value.kind))
+        }
+        (CodeQueryResultValue::CallArgumentGroup { value }, "argument_count") => {
+            Some(Scalar::Integer(value.argument_count as u64))
+        }
+        (CodeQueryResultValue::CallArgument { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::CallArgument { value }, "group_id") => {
+            Some(Scalar::StableId(&value.group_id))
+        }
+        (CodeQueryResultValue::CallArgument { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::CallArgument { value }, "argument_index") => {
+            Some(Scalar::Integer(value.argument_index as u64))
+        }
+        (CodeQueryResultValue::CallArgument { value }, "name") => {
+            value.name.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallArgument { value }, "spread") => {
+            Some(Scalar::Boolean(value.spread))
         }
         (CodeQueryResultValue::ReceiverEvidence { value }, "id") => {
             Some(Scalar::StableId(&value.id))
@@ -1148,6 +1233,18 @@ pub enum DetailedCodeQueryKey {
         id: String,
         site_id: String,
     },
+    CallShape {
+        id: String,
+        site_id: String,
+    },
+    CallArgumentGroup {
+        id: String,
+        site_id: String,
+    },
+    CallArgument {
+        id: String,
+        group_id: String,
+    },
     Occurrence {
         id: String,
         ast_id: String,
@@ -1291,6 +1388,18 @@ impl DetailedCodeQueryResult {
                         | (
                             DetailedCodeQueryDomain::ReceiverEvidence,
                             DetailedCodeQueryKey::ReceiverEvidence { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::CallShape,
+                            DetailedCodeQueryKey::CallShape { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::CallArgumentGroup,
+                            DetailedCodeQueryKey::CallArgumentGroup { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::CallArgument,
+                            DetailedCodeQueryKey::CallArgument { .. }
                         )
                         | (
                             DetailedCodeQueryDomain::Occurrence,
@@ -1455,6 +1564,9 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::ReceiverAnalysis { .. }
         | CodeQueryResultValue::ReceiverOutcome { .. }
         | CodeQueryResultValue::ReceiverEvidence { .. }
+        | CodeQueryResultValue::CallShape { .. }
+        | CodeQueryResultValue::CallArgumentGroup { .. }
+        | CodeQueryResultValue::CallArgument { .. }
         | CodeQueryResultValue::Occurrence { .. }
         | CodeQueryResultValue::LexicalScope { .. }
         | CodeQueryResultValue::Binding { .. }
@@ -1509,6 +1621,9 @@ fn assert_detailed_terminal_identities(
                 | DetailedCodeQueryDomain::ReceiverAnalysis
                 | DetailedCodeQueryDomain::ReceiverOutcome
                 | DetailedCodeQueryDomain::ReceiverEvidence
+                | DetailedCodeQueryDomain::CallShape
+                | DetailedCodeQueryDomain::CallArgumentGroup
+                | DetailedCodeQueryDomain::CallArgument
                 // An occurrence's identity is its own content-scoped digest,
                 // carried in the typed key rather than in a semantic-artifact
                 // identity candidate. The three lexical-environment domains
@@ -1562,6 +1677,9 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::ReceiverAnalysis { .. }
         | DetailedCodeQueryKey::ReceiverOutcome { .. }
         | DetailedCodeQueryKey::ReceiverEvidence { .. }
+        | DetailedCodeQueryKey::CallShape { .. }
+        | DetailedCodeQueryKey::CallArgumentGroup { .. }
+        | DetailedCodeQueryKey::CallArgument { .. }
         | DetailedCodeQueryKey::Occurrence { .. }
         | DetailedCodeQueryKey::LexicalScope { .. }
         | DetailedCodeQueryKey::Binding { .. }

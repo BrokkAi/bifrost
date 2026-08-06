@@ -77,6 +77,15 @@ pub(super) fn render_pipeline_item(
         PipelineValue::ReceiverEvidence(value) => CodeQueryResultValue::ReceiverEvidence {
             value: Box::new(render_receiver_evidence(analyzer, &value, cache)),
         },
+        PipelineValue::CallShape(value) => CodeQueryResultValue::CallShape {
+            value: Box::new(render_call_shape(analyzer, &value, cache)),
+        },
+        PipelineValue::CallArgumentGroup(value) => CodeQueryResultValue::CallArgumentGroup {
+            value: Box::new(render_call_argument_group(analyzer, &value, cache)),
+        },
+        PipelineValue::CallArgument(value) => CodeQueryResultValue::CallArgument {
+            value: Box::new(render_call_shape_argument(analyzer, &value, cache)),
+        },
         PipelineValue::Occurrence(value) => CodeQueryResultValue::Occurrence {
             value: Box::new(render_occurrence(analyzer, &value, detail, cache)),
         },
@@ -152,6 +161,37 @@ pub(super) fn render_provenance(
                     }
                     PipelineTraceValue::ReceiverEvidence(value) => {
                         render_receiver_evidence_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::CallShape(value) => {
+                        let rendered = render_call_shape(analyzer, value, cache);
+                        CodeQueryResultRef::CallShape {
+                            id: rendered.id,
+                            site_id: rendered.site_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            call_kind: rendered.call_kind,
+                            coverage: rendered.coverage,
+                        }
+                    }
+                    PipelineTraceValue::CallArgumentGroup(value) => {
+                        let rendered = render_call_argument_group(analyzer, value, cache);
+                        CodeQueryResultRef::CallArgumentGroup {
+                            id: rendered.id,
+                            site_id: rendered.site_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            kind: rendered.kind,
+                        }
+                    }
+                    PipelineTraceValue::CallArgument(value) => {
+                        let rendered = render_call_shape_argument(analyzer, value, cache);
+                        CodeQueryResultRef::CallArgument {
+                            id: rendered.id,
+                            group_id: rendered.group_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            argument_index: rendered.argument_index,
+                        }
                     }
                     PipelineTraceValue::Occurrence(value) => {
                         render_occurrence_ref(analyzer, value, cache)
@@ -1239,6 +1279,65 @@ pub(super) fn render_receiver_outcome(
         setup_nodes: value.report.work.setup_nodes,
         summary_expansions: value.report.work.summary_expansions,
         scope_nodes: value.report.work.scope_nodes,
+    }
+}
+
+pub(super) fn render_call_shape(
+    analyzer: &dyn IAnalyzer,
+    value: &CallShapeValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCallShape {
+    let outcome = &value.report.outcome;
+    CodeQueryCallShape {
+        id: outcome.id.clone(),
+        site_id: outcome.site_id.clone(),
+        site_ast_id: outcome.site_ast_id.clone(),
+        path: rel_path_string(&outcome.file),
+        language: crate::analyzer::common::language_for_file(&outcome.file).config_label(),
+        range: render_source_range(analyzer, &outcome.file, &outcome.range, cache),
+        callee_range: outcome
+            .callee_range
+            .map(|range| render_source_range(analyzer, &outcome.file, &range, cache)),
+        call_kind: outcome.call_kind.label(),
+        coverage: outcome.coverage.label(),
+        group_count: value.report.groups.len(),
+    }
+}
+
+pub(super) fn render_call_argument_group(
+    analyzer: &dyn IAnalyzer,
+    value: &CallArgumentGroupValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCallArgumentGroup {
+    let outcome = &value.shape.report.outcome;
+    let group = &value.shape.report.groups[value.group_index];
+    CodeQueryCallArgumentGroup {
+        id: group.id.clone(),
+        site_id: group.site_id.clone(),
+        path: rel_path_string(&outcome.file),
+        range: render_source_range(analyzer, &outcome.file, &outcome.range, cache),
+        group_index: group.group_index,
+        kind: group.kind.label(),
+        argument_count: group.argument_count,
+    }
+}
+
+pub(super) fn render_call_shape_argument(
+    analyzer: &dyn IAnalyzer,
+    value: &CallArgumentValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCallShapeArgument {
+    let outcome = &value.shape.report.outcome;
+    let argument = &value.shape.report.arguments[value.argument_index];
+    CodeQueryCallShapeArgument {
+        id: argument.id.clone(),
+        group_id: argument.group_id.clone(),
+        site_id: outcome.site_id.clone(),
+        path: rel_path_string(&outcome.file),
+        range: render_source_range(analyzer, &outcome.file, &argument.range, cache),
+        argument_index: argument.argument_index,
+        name: argument.name.clone(),
+        spread: argument.spread,
     }
 }
 

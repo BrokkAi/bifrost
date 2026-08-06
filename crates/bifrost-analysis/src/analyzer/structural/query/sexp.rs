@@ -731,12 +731,19 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
         }
-        RqlForm::ReceiverOutcome | RqlForm::ReceiverEvidence => {
+        RqlForm::ReceiverOutcome
+        | RqlForm::ReceiverEvidence
+        | RqlForm::CallShape
+        | RqlForm::CallArgumentGroups
+        | RqlForm::CallArguments => {
             expect_len(expr, items, 2, head)?;
             let mut query = query_object(&items[1])?;
             let op = match form {
                 RqlForm::ReceiverOutcome => "receiver_outcome",
                 RqlForm::ReceiverEvidence => "receiver_evidence",
+                RqlForm::CallShape => "call_shape",
+                RqlForm::CallArgumentGroups => "call_argument_groups",
+                RqlForm::CallArguments => "call_arguments",
                 _ => unreachable!("receiver row wrapper filtered above"),
             };
             query
@@ -1490,6 +1497,9 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::MemberTargets
         | RqlForm::ReceiverOutcome
         | RqlForm::ReceiverEvidence
+        | RqlForm::CallShape
+        | RqlForm::CallArgumentGroups
+        | RqlForm::CallArguments
         | RqlForm::Occurrences
         | RqlForm::OccurrencesOf
         | RqlForm::OccurrencesIn

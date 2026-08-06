@@ -406,7 +406,7 @@ query_step_ops! {
     ValueFlow { label: "value_flow", signature: "procedure -> flow_endpoint", description: "Run one registered diagnostic-neutral value-flow plan for the exact procedure root.", semantic: [Procedures, ValueFlow] }
     Taint { label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint] }
     Witness { label: "witness", signature: "typestate_finding|flow_endpoint -> typestate_witness|flow_witness", description: "Project bounded retained evidence from each typestate finding or reached flow endpoint without rerunning analysis." }
-    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, or receiver analyses to their workspace files." }
+    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis|call_shape|call_argument_group|call_argument -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, or receiver analyses to their workspace files." }
     ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
     Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
@@ -426,6 +426,9 @@ query_step_ops! {
     MemberTargets { label: "member_targets", signature: "structural_match|reference_site|occurrence -> receiver_analysis", description: "Resolve exact member declarations through bounded structured receiver facts." }
     ReceiverOutcome { label: "receiver_outcome", signature: "receiver_analysis -> receiver_outcome", description: "Project the mandatory terminal outcome row for each receiver analysis." }
     ReceiverEvidence { label: "receiver_evidence", signature: "receiver_analysis -> receiver_evidence", description: "Project zero or more parent-linked typed receiver evidence rows." }
+    CallShape { label: "call_shape", signature: "structural_match|call_site|occurrence -> call_shape", description: "Project the mandatory structured call-shape outcome row for each exact call site." }
+    CallArgumentGroups { label: "call_argument_groups", signature: "call_shape -> call_argument_group", description: "Project the ordered argument-list group rows of each call shape." }
+    CallArguments { label: "call_arguments", signature: "call_argument_group -> call_argument", description: "Project the ordered argument rows of each argument-list group." }
     OccurrencesOf { label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it." }
     OccurrencesIn { label: "occurrences_in", signature: "structural_match|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or file." }
     OccurrenceTarget { label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences." }
@@ -586,6 +589,9 @@ macro_rules! rql_forms {
                     | Self::MemberTargets
                     | Self::ReceiverOutcome
                     | Self::ReceiverEvidence
+                    | Self::CallShape
+                    | Self::CallArgumentGroups
+                    | Self::CallArguments
                     | Self::Occurrences
                     | Self::OccurrencesOf
                     | Self::OccurrencesIn
@@ -965,6 +971,30 @@ rql_forms! {
         signature: "(receiver-evidence query)",
         description: (QueryStepOp::ReceiverEvidence),
         step: ReceiverEvidence,
+    }
+    CallShape {
+        labels: ["call-shape", "call_shape"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-shape query)",
+        description: (QueryStepOp::CallShape),
+        step: CallShape,
+    }
+    CallArgumentGroups {
+        labels: ["call-argument-groups", "call_argument_groups"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-argument-groups query)",
+        description: (QueryStepOp::CallArgumentGroups),
+        step: CallArgumentGroups,
+    }
+    CallArguments {
+        labels: ["call-arguments", "call_arguments"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-arguments query)",
+        description: (QueryStepOp::CallArguments),
+        step: CallArguments,
     }
     Occurrences {
         labels: ["occurrences", "occurrence"],
