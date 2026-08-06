@@ -3332,9 +3332,8 @@ impl<'a> CppVisitor<'a> {
                 false,
                 fq,
             );
-            if self.parsed.contains_declaration_identity(&code_unit) {
-                continue;
-            }
+            // Declaration identity does not include the alias signature. Keep
+            // each physical range so conditional aliases retain their guards.
             self.parsed
                 .add_code_unit(code_unit.clone(), node, self.source, None, None);
             self.parsed

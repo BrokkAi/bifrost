@@ -224,19 +224,33 @@ pub struct RustPackageFileIndex {
     files: Vec<ProjectFile>,
     /// Package name -> indices into `files`, ascending.
     by_package: HashMap<String, Vec<u32>>,
+    /// Import crate name -> root package names, from nearby Cargo manifests.
+    crate_packages_by_name: HashMap<String, Vec<String>>,
 }
 
 impl RustPackageFileIndex {
     pub fn build(files: BTreeSet<ProjectFile>) -> Self {
         let files: Vec<ProjectFile> = files.into_iter().collect();
         let mut by_package: HashMap<String, Vec<u32>> = HashMap::default();
+        let mut crate_packages_by_name: HashMap<String, Vec<String>> = HashMap::default();
         for (index, file) in files.iter().enumerate() {
+            let package = rust_package_name(file);
             by_package
-                .entry(rust_package_name(file))
+                .entry(package.clone())
                 .or_default()
                 .push(u32::try_from(index).unwrap_or(u32::MAX));
+            if let Some(crate_name) = manifest_crate_name(file) {
+                let packages = crate_packages_by_name.entry(crate_name).or_default();
+                if !packages.contains(&package) {
+                    packages.push(package);
+                }
+            }
         }
-        Self { files, by_package }
+        Self {
+            files,
+            by_package,
+            crate_packages_by_name,
+        }
     }
 
     fn contains(&self, file: &ProjectFile) -> bool {
@@ -250,6 +264,43 @@ impl RustPackageFileIndex {
             .flatten()
             .filter_map(|index| self.files.get(*index as usize))
     }
+
+    fn crate_packages(&self, import_name: &str) -> &[String] {
+        self.crate_packages_by_name
+            .get(import_name)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+fn manifest_crate_name(file: &ProjectFile) -> Option<String> {
+    let rel_path = file.rel_path();
+    if !matches!(
+        rel_path.file_name().and_then(|name| name.to_str()),
+        Some("lib.rs" | "main.rs")
+    ) {
+        return None;
+    }
+    let source_dir = rel_path.parent()?;
+    if source_dir.file_name().and_then(|name| name.to_str()) != Some("src") {
+        return None;
+    }
+    let manifest =
+        std::fs::read_to_string(file.root().join(source_dir.parent()?.join("Cargo.toml")))
+            .ok()?
+            .parse::<toml::Value>()
+            .ok()?;
+    let name = manifest
+        .get("lib")
+        .and_then(|lib| lib.get("name"))
+        .and_then(toml::Value::as_str)
+        .or_else(|| {
+            manifest
+                .get("package")
+                .and_then(|package| package.get("name"))
+                .and_then(toml::Value::as_str)
+        })?;
+    Some(name.replace('-', "_"))
 }
 
 fn insert_single_reexport_target(
@@ -1893,4 +1944,58 @@ fn trait_reference_matches(
                 .into_iter()
                 .any(|file| file == *trait_owner.source())
         })
+}
+
+pub fn resolve_direct_import_files(
+    rust: &dyn RustAnalysisSource,
+    importing_file: &ProjectFile,
+    segments: &[String],
+) -> Vec<ProjectFile> {
+    let analyzed_files = rust.package_file_index();
+    let package = rust_package_name(importing_file);
+    let crate_package = rust_crate_root_package(importing_file);
+
+    for end in (1..=segments.len()).rev() {
+        let prefix = &segments[..end];
+        let module_specifier = prefix.join("::");
+        let rooted = is_rooted_rust_module_path(&module_specifier);
+        let resolved_modules = if rooted {
+            resolve_rust_module_path_with_crate(&package, &crate_package, &module_specifier)
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else if let Some((root, nested)) = prefix.split_first()
+            && !analyzed_files.crate_packages(root).is_empty()
+        {
+            let suffix = nested.join(".");
+            analyzed_files
+                .crate_packages(root)
+                .iter()
+                .map(|package| {
+                    if suffix.is_empty() {
+                        package.clone()
+                    } else {
+                        format!("{package}.{suffix}")
+                    }
+                })
+                .collect()
+        } else {
+            resolve_rust_module_path_with_crate(&package, &crate_package, &module_specifier)
+                .into_iter()
+                .collect()
+        };
+        let files = resolved_modules
+            .into_iter()
+            .flat_map(|module| {
+                analyzed_files
+                    .files_in_package(&module)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        if !files.is_empty() {
+            return files;
+        }
+    }
+
+    Vec::new()
 }

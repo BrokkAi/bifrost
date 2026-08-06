@@ -17,6 +17,7 @@ mod candidates;
 pub(crate) mod common;
 pub mod cpp_graph;
 pub(crate) mod csharp_graph;
+pub(crate) mod file_usage_graph;
 mod finder;
 pub mod get_definition;
 pub mod get_type;

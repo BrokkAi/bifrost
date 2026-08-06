@@ -3915,14 +3915,113 @@ impl<'a> VisibilityIndex<'a> {
             })
     }
 
+    fn preprocessor_guard_terms_cover_all_paths(terms: &[HashSet<PreprocessorGuard>]) -> bool {
+        let mut pending = vec![terms.to_vec()];
+        while let Some(branch_terms) = pending.pop() {
+            let mut normalized = Vec::new();
+            let mut covers_branch = false;
+            for term in branch_terms {
+                if term.iter().any(|guard| term.contains(&guard.negated())) {
+                    continue;
+                }
+                if term.is_empty() {
+                    covers_branch = true;
+                    break;
+                }
+                if !normalized.iter().any(|existing| existing == &term) {
+                    normalized.push(term);
+                }
+            }
+            if covers_branch {
+                continue;
+            }
+            let Some(split_guard) = normalized
+                .iter()
+                .flat_map(|term| term.iter())
+                .next()
+                .cloned()
+            else {
+                return false;
+            };
+            let negated_guard = split_guard.negated();
+            let mut when_defined = Vec::new();
+            let mut when_undefined = Vec::new();
+            for term in normalized {
+                if term.contains(&negated_guard) {
+                    // This term cannot hold when `split_guard` is true.
+                } else if term.contains(&split_guard) {
+                    let mut reduced = term.clone();
+                    reduced.remove(&split_guard);
+                    when_defined.push(reduced);
+                } else {
+                    when_defined.push(term.clone());
+                }
+                if term.contains(&split_guard) {
+                    // This term cannot hold when `split_guard` is false.
+                } else if term.contains(&negated_guard) {
+                    let mut reduced = term;
+                    reduced.remove(&negated_guard);
+                    when_undefined.push(reduced);
+                } else {
+                    when_undefined.push(term);
+                }
+            }
+            pending.push(when_defined);
+            pending.push(when_undefined);
+        }
+        true
+    }
+
+    fn declarations_share_exhaustive_conditional_family(
+        &self,
+        analyzer: CppGraphSource<'_>,
+        candidates: &[&CodeUnit],
+    ) -> bool {
+        // Guard terms alone cannot distinguish one #if family from separate
+        // blocks whose macros changed between declarations. Require every
+        // physical range to belong to one syntax-tree family with a terminal
+        // #else before the terms can prove branch coverage.
+        let mut family_range = None;
+        for candidate in candidates {
+            let Some(prepared) = self.cpp.prepared_syntax(candidate.source()) else {
+                return false;
+            };
+            let root = prepared.tree().root_node();
+            let mut candidate_family = None;
+            for range in analyzer.ranges(candidate) {
+                let Some(node) = root.descendant_for_byte_range(range.start_byte, range.end_byte)
+                else {
+                    return false;
+                };
+                let Some(family) = preprocessor_conditional_family_for_declaration(node) else {
+                    return false;
+                };
+                let key = (family.start_byte(), family.end_byte());
+                if candidate_family.is_some_and(|existing| existing != key) {
+                    return false;
+                }
+                candidate_family = Some(key);
+            }
+            let Some(candidate_family) = candidate_family else {
+                return false;
+            };
+            if family_range.is_some_and(|existing| existing != candidate_family) {
+                return false;
+            }
+            family_range = Some(candidate_family);
+        }
+        family_range.is_some()
+    }
+
     pub fn complementary_same_fqn_type_declarations(
         &self,
         analyzer: CppGraphSource<'_>,
         candidates: &[&CodeUnit],
         target: &CodeUnit,
     ) -> bool {
-        if candidates.len() != 2
+        if candidates.len() < 2
             || !self.alternate_same_fqn_type_declarations(analyzer, candidates, target)
+            || !self.declarations_share_exhaustive_conditional_family(analyzer, candidates)
         {
             return false;
         }
@@ -3930,22 +4029,11 @@ impl<'a> VisibilityIndex<'a> {
             .iter()
             .map(|candidate| declaration_guard_requirements(analyzer, self.cpp, candidate))
             .collect::<Vec<_>>();
-        let [left, right] = requirements.as_slice() else {
-            return false;
-        };
-        let Some((_, left_guards)) = left.first() else {
-            return false;
-        };
-        let Some((_, right_guards)) = right.first() else {
-            return false;
-        };
-        if left.len() != 1 || right.len() != 1 || left_guards.len() != 1 || right_guards.len() != 1
-        {
-            return false;
-        }
-        let left_guard = left_guards.iter().next().expect("singleton guard");
-        let right_guard = right_guards.iter().next().expect("singleton guard");
-        left_guard.negated() == right_guard.clone()
+        let terms = requirements
+            .into_iter()
+            .flat_map(|ranges| ranges.into_iter().map(|(_, guards)| guards))
+            .collect::<Vec<_>>();
+        Self::preprocessor_guard_terms_cover_all_paths(&terms)
     }
 
     fn type_candidate_preserving_target(
@@ -5845,6 +5933,49 @@ fn guard_requirements_hold_at_reference(
     reference.is_some_and(|active| required.is_subset(active))
 }
 
+fn preprocessor_conditional_family_for_declaration(node: Node<'_>) -> Option<Node<'_>> {
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if is_preprocessor_conditional(current) {
+            let family = preprocessor_conditional_family_root(current);
+            if preprocessor_conditional_family_has_terminal_else(family) {
+                return Some(family);
+            }
+        }
+        ancestor = current.parent();
+    }
+    None
+}
+
+fn preprocessor_conditional_family_root(mut conditional: Node<'_>) -> Node<'_> {
+    while let Some(parent) = conditional.parent() {
+        let is_alternative = parent
+            .child_by_field_name("alternative")
+            .is_some_and(|alternative| {
+                alternative.start_byte() == conditional.start_byte()
+                    && alternative.end_byte() == conditional.end_byte()
+            });
+        if !is_alternative {
+            break;
+        }
+        conditional = parent;
+    }
+    conditional
+}
+
+fn preprocessor_conditional_family_has_terminal_else(mut conditional: Node<'_>) -> bool {
+    loop {
+        let Some(alternative) = conditional.child_by_field_name("alternative") else {
+            return false;
+        };
+        match alternative.kind() {
+            "preproc_else" => return true,
+            "preproc_elif" => conditional = alternative,
+            _ => return false,
+        }
+    }
+}
+
 pub fn preprocessor_guard_environment(
     node: Node<'_>,
     source: &str,
@@ -5852,8 +5983,10 @@ pub fn preprocessor_guard_environment(
     let mut guards = HashSet::default();
     let mut ancestor = node.parent();
     while let Some(conditional) = ancestor {
-        if matches!(conditional.kind(), "preproc_if" | "preproc_ifdef")
-            && !is_file_covering_include_guard(conditional, source)
+        if matches!(
+            conditional.kind(),
+            "preproc_if" | "preproc_ifdef" | "preproc_elif"
+        ) && !is_file_covering_include_guard(conditional, source)
         {
             let guard = preprocessor_guard_for_descendant(conditional, node, source)?;
             match guard {
@@ -5888,7 +6021,10 @@ fn preprocessor_guard_for_descendant(
         })
     {
         let alternative = conditional.child_by_field_name("alternative")?;
-        if alternative.kind() != "preproc_else" {
+        // Tree-sitter nests an `#elif` chain in each `alternative` field. A
+        // descendant in any later branch must first exclude the parent branch,
+        // then collect the nested `preproc_elif` guard from its own ancestor.
+        if !matches!(alternative.kind(), "preproc_else" | "preproc_elif") {
             return None;
         }
         guard = guard.negated();
