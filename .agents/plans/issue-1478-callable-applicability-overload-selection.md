@@ -19,7 +19,7 @@ The behavior is visible through `query_code` JSON/RQL result rows and through `r
 - [x] (2026-08-06 08:55Z) Confirmed the current `RejectionReason` vocabulary has no callable-applicability variants: arity, list shape, named arguments, and generic arity rejections are computed but unlabeled today.
 - [x] (2026-08-06 08:55Z) Classified the 31 motivating commit subjects into the fixture families listed under `Artifacts and Notes`.
 - [x] (2026-08-06 08:55Z) Authored this implementation-ready ExecPlan.
-- [ ] Milestone 1: core call-shape and applicability vocabulary plus structured call-shape extraction rows.
+- [ ] Milestone 1: core call-shape and applicability vocabulary plus structured call-shape extraction rows (2026-08-06 09:20Z progress: `crates/bifrost-core/src/analyzer/structural/callable.rs` lands `CallKind`, `ArgumentListKind`, `CallShapeCoverage`, `ApplicabilityVerdict`, `CallableRejectionReason`, `SelectionResolution`, and `ReceiverContract` with unique round-trip labels, committed as `705e18f6a`. Remaining: analysis-side `CallShapeOutcome`/`ArgumentGroupRow`/`ArgumentRow` production from the per-language call-site parsing, CodeQuery `call-shape`/`call-argument-groups`/`call-arguments` registration, row-field registry entries, and the Java/Scala/C++/C# plus macro-coverage fixtures).
 - [ ] Milestone 2: callable-signature rows projected from the persisted semantic signature contract.
 - [ ] Milestone 3: per-candidate applicability rows from the production resolvers, rolled out by language family.
 - [ ] Milestone 4: ordered-list predicates, uniqueness and winning-tier assertions, registries, editor vocabulary, and docs.
