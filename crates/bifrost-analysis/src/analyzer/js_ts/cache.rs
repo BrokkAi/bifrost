@@ -3,7 +3,7 @@ use crate::analyzer::{CodeUnit, DirectDescendantIndex, PoolSafeMemo, ProjectFile
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::mem::size_of;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::analyzer::weighted_cache::{
     build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
@@ -33,7 +33,12 @@ pub(crate) struct JsTsMemoCaches {
     /// Resolved direct supertypes of a class-like code unit.
     pub(crate) direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     /// Whole-workspace class descendant index, built once per bucket.
-    pub(crate) direct_descendant_index: OnceLock<DirectDescendantIndex>,
+    /// `PoolSafeMemo`, not `OnceLock`: the build walks every workspace class
+    /// through `get_direct_ancestors`, whose misses reach `js_ts_usage_index`
+    /// and its rayon fan-out -- a blocking `get_or_init` held across that is
+    /// the #1416 self-deadlock shape its two sibling cells below already
+    /// migrated away from.
+    pub(crate) direct_descendant_index: PoolSafeMemo<DirectDescendantIndex>,
     /// Reverse import edges (importer files by imported file), built once per bucket.
     pub(crate) reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     /// JS/TS usage-resolution maps, built once per bucket and reused across queries.
@@ -48,7 +53,7 @@ impl JsTsMemoCaches {
             referencing_files: build_weighted_cache(budget_bytes / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(budget_bytes / 6, weight_string_set),
             direct_ancestors: build_weighted_cache(budget_bytes / 8, weight_code_unit_vec_by_unit),
-            direct_descendant_index: OnceLock::new(),
+            direct_descendant_index: PoolSafeMemo::new(),
             reverse_import_index: PoolSafeMemo::new(),
             jsts_usage_index: PoolSafeMemo::new(),
         }

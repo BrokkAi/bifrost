@@ -216,9 +216,15 @@ pub(crate) fn get_direct_descendants(
     host: &dyn JsTsMemoHost,
     code_unit: &CodeUnit,
 ) -> HashSet<CodeUnit> {
+    // The builder itself is serial; the memo exists because its per-class
+    // ancestor misses transitively enter the rayon-built usage index, so the
+    // same closure serves both the off-pool and on-pool arms.
     host.memo_caches()
         .direct_descendant_index
-        .get_or_init(|| build_direct_descendant_index_by_unit(host, host))
+        .get_or_build(
+            || build_direct_descendant_index_by_unit(host, host),
+            || build_direct_descendant_index_by_unit(host, host),
+        )
         .descendants(code_unit)
 }
 
