@@ -4,14 +4,10 @@ use brokk_bifrost::{CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, Language, Pr
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-/// Line/column pairs of proven and unproven usage hits.
-type UsageRanges = BTreeSet<(usize, usize)>;
+type SourceRange = (usize, usize);
+type UsageRanges = (BTreeSet<SourceRange>, BTreeSet<SourceRange>);
 
-fn usage_ranges(
-    analyzer: &CppAnalyzer,
-    target: &CodeUnit,
-    caller: &ProjectFile,
-) -> (UsageRanges, UsageRanges) {
+fn usage_ranges(analyzer: &CppAnalyzer, target: &CodeUnit, caller: &ProjectFile) -> UsageRanges {
     let provider =
         ExplicitCandidateProvider::new(Arc::new(std::iter::once(caller.clone()).collect()));
     let query = UsageFinder::new()

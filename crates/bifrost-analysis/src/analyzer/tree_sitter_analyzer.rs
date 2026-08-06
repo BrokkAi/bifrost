@@ -37,18 +37,49 @@ use tree_sitter::{Language as TsLanguage, Node, ParseOptions, Parser, Tree};
 // `FileState` holds the full parsed source (`source: String`) plus every
 // declaration-shaped collection derived from it (imports, signatures,
 // supertypes, ranges, children, ...) keyed by `CodeUnit`. For a typical
-// source file (a few KB to tens of KB of text, tens to low hundreds of
-// declarations) that's conservatively ~50-100 KB per entry once the
-// per-CodeUnit maps are counted; large files run higher. This cache is
-// shared across all concurrent calls behind one `Arc<Mutex<..>>>`, so its
-// capacity is a single shared budget, not per-call: at 1024 entries the
-// worst-case footprint is on the order of ~50-100 MB, which is an
-// acceptable trade against the O(n) `VecDeque::retain` this cache used to
-// pay on every touch under that same shared lock.
-const TRANSIENT_FILE_STATE_CACHE_CAPACITY: usize = 1_024;
-// A broad usage traversal may visit more files than the small cross-request
-// cache holds. Retain hydrated states for one request, then release them.
-const QUERY_FILE_STATE_CACHE_CAPACITY: usize = 1_024;
+// FileState values have widely different retained sizes. A generated
+// amalgamation can be orders of magnitude larger than an ordinary source file,
+// so an entry-count limit gives neither a useful RSS limit nor useful cache
+// admission. Keep the shared and query-local caches within this one slice of
+// the existing analyzer memo budget.
+const FILE_STATE_CACHE_BUDGET_DIVISOR: u64 = 2;
+const QUERY_FILE_STATE_CACHE_BUDGET_DIVISOR: usize = 4;
+const MIN_FILE_STATE_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const FILE_STATE_CACHE_CORPUS_FRACTION_DIVISOR: usize = 10;
+const FILE_STATE_BYTES_PER_PERSISTED_BYTE: usize = 4;
+const SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY: usize = 1_024;
+const BULK_FILE_STATE_QUERY_LIMIT: usize = 1_024;
+
+fn file_state_cache_ceiling_bytes(config: &AnalyzerConfig) -> usize {
+    let total = usize::try_from(config.memo_cache_budget_bytes()).unwrap_or(usize::MAX);
+    let share = usize::try_from(config.memo_cache_budget_bytes() / FILE_STATE_CACHE_BUDGET_DIVISOR)
+        .unwrap_or(usize::MAX);
+    if share < MIN_FILE_STATE_CACHE_BYTES {
+        total
+    } else {
+        share
+    }
+}
+
+fn file_state_cache_budget_bytes(
+    config: &AnalyzerConfig,
+    active_persisted_payload_bytes: Option<usize>,
+) -> usize {
+    let ceiling = file_state_cache_ceiling_bytes(config);
+    let minimum = ceiling.min(MIN_FILE_STATE_CACHE_BYTES);
+    let Some(payload_bytes) = active_persisted_payload_bytes else {
+        return ceiling;
+    };
+    payload_bytes
+        .saturating_mul(FILE_STATE_BYTES_PER_PERSISTED_BYTE)
+        .saturating_div(FILE_STATE_CACHE_CORPUS_FRACTION_DIVISOR)
+        .max(minimum)
+        .min(ceiling)
+}
+
+fn query_file_state_cache_budget_bytes(file_state_cache_budget: usize) -> usize {
+    file_state_cache_budget / QUERY_FILE_STATE_CACHE_BUDGET_DIVISOR
+}
 const QUERY_PREPARED_SYNTAX_CACHE_CAPACITY: usize = 1_024;
 // Retained bytes per source byte for a prepared tree. The tree pins its source
 // text (1x), the tree-sitter subtree arena (8-11x source for the Rust and
@@ -599,6 +630,155 @@ pub struct FileState {
     pub(crate) parse_errors: Option<Vec<crate::analyzer::ParseError>>,
 }
 
+impl FileState {
+    /// Return a conservative retained-byte estimate for cache admission.
+    ///
+    /// Rust cannot report heap allocation sizes. This accounts for owned
+    /// buffers and map slots, then charges a fixed allocator allowance. The
+    /// value is a cache budget estimate, not an RSS measurement.
+    fn estimated_retained_bytes(&self) -> usize {
+        const ALLOCATION_ALLOWANCE_NUMERATOR: usize = 3;
+        const ALLOCATION_ALLOWANCE_DENOMINATOR: usize = 2;
+
+        let strings = self
+            .import_statements
+            .iter()
+            .map(|value| value.capacity())
+            .chain(self.type_identifiers.iter().map(|value| value.capacity()))
+            .chain(self.raw_supertypes.iter().flat_map(|(unit, values)| {
+                std::iter::once(unit.fq_name().capacity())
+                    .chain(values.iter().map(|value| value.capacity()))
+            }))
+            .chain(
+                self.supertype_lookup_paths
+                    .values()
+                    .flat_map(|values| values.iter().map(|value| value.capacity())),
+            )
+            .chain(
+                self.signatures
+                    .values()
+                    .flat_map(|values| values.iter().map(|value| value.capacity())),
+            )
+            .fold(0usize, usize::saturating_add);
+        let collection_slots = self
+            .top_level_declarations
+            .capacity()
+            .saturating_mul(std::mem::size_of::<CodeUnit>())
+            .saturating_add(
+                self.declarations
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<CodeUnit>()),
+            )
+            .saturating_add(
+                self.definition_lookup_units
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<CodeUnit>()),
+            )
+            .saturating_add(
+                self.import_statements
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(
+                self.imports
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ImportInfo>()),
+            )
+            .saturating_add(
+                self.scala_exports
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(
+                        CodeUnit,
+                        Vec<crate::analyzer::scala::ScalaExportInfo>,
+                    )>()),
+            )
+            .saturating_add(
+                self.raw_supertypes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, Vec<String>)>()),
+            )
+            .saturating_add(
+                self.supertype_lookup_paths
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, Vec<String>)>()),
+            )
+            .saturating_add(
+                self.type_identifiers
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(
+                self.signatures
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, Vec<String>)>()),
+            )
+            .saturating_add(
+                self.signature_metadata
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, Vec<SignatureMetadata>)>()),
+            )
+            .saturating_add(
+                self.cpp_template_metadata
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, CppTemplateMetadata)>()),
+            )
+            .saturating_add(
+                self.ruby_method_dispatch_modes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, RubyMethodDispatchMode)>()),
+            )
+            .saturating_add(
+                self.ranges
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, Vec<Range>)>()),
+            )
+            .saturating_add(
+                self.children
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, Vec<CodeUnit>)>()),
+            )
+            .saturating_add(
+                self.scala_traits
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<CodeUnit>()),
+            )
+            .saturating_add(
+                self.type_aliases
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<CodeUnit>()),
+            )
+            .saturating_add(
+                self.test_region_units
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<CodeUnit>()),
+            )
+            .saturating_add(
+                self.materialization_records
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<MaterializationRecord>()),
+            )
+            .saturating_add(
+                self.parse_errors
+                    .as_ref()
+                    .map(|errors| {
+                        errors
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<crate::analyzer::ParseError>())
+                    })
+                    .unwrap_or_default(),
+            );
+        let direct = std::mem::size_of::<Self>()
+            .saturating_add(self.source.capacity())
+            .saturating_add(self.package_name.capacity())
+            .saturating_add(self.content_qualifier.capacity())
+            .saturating_add(strings)
+            .saturating_add(collection_slots);
+        direct
+            .saturating_mul(ALLOCATION_ALLOWANCE_NUMERATOR)
+            .saturating_div(ALLOCATION_ALLOWANCE_DENOMINATOR)
+    }
+}
+
 /// Source backing for an immutable prepared syntax tree.
 ///
 /// Ordinary unbounded queries retain the indexed [`FileState`] needed by
@@ -769,7 +949,7 @@ impl AnalyzerRuntimeState {
         for (key, state) in self
             .seeded_file_states
             .iter()
-            .take(TRANSIENT_FILE_STATE_CACHE_CAPACITY)
+            .take(SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY)
         {
             cache.insert(key.clone(), Arc::clone(state));
         }
@@ -1086,7 +1266,295 @@ struct BoundedFileCache<T> {
     next_stamp: u64,
 }
 
-type FileStateCache = BoundedFileCache<FileState>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileStateCacheSegment {
+    Probation,
+    Protected,
+}
+
+#[derive(Debug)]
+struct FileStateCacheEntry {
+    state: Arc<FileState>,
+    estimated_bytes: usize,
+    stamp: u64,
+    segment: FileStateCacheSegment,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FileStateCacheStats {
+    hits: usize,
+    misses: usize,
+    admissions: usize,
+    promotions: usize,
+    evictions: usize,
+    rejected_admissions: usize,
+}
+
+/// A byte-bounded segmented LRU for complete file states.
+///
+/// One-time scans enter probation. A second access promotes an entry to the
+/// protected segment. This keeps an unrelated scan from displacing an already
+/// useful working set while the byte bound protects whale workspaces.
+#[derive(Debug)]
+struct SegmentedFileStateCache {
+    max_bytes: usize,
+    protected_max_bytes: usize,
+    retained_bytes: usize,
+    probation_bytes: usize,
+    protected_bytes: usize,
+    entries: HashMap<FileStateCacheKey, FileStateCacheEntry>,
+    probation_order: VecDeque<(FileStateCacheKey, u64)>,
+    protected_order: VecDeque<(FileStateCacheKey, u64)>,
+    next_stamp: u64,
+    stats: FileStateCacheStats,
+}
+
+impl SegmentedFileStateCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            protected_max_bytes: max_bytes.saturating_mul(4) / 5,
+            retained_bytes: 0,
+            probation_bytes: 0,
+            protected_bytes: 0,
+            entries: HashMap::default(),
+            probation_order: VecDeque::new(),
+            protected_order: VecDeque::new(),
+            next_stamp: 0,
+            stats: FileStateCacheStats::default(),
+        }
+    }
+
+    fn get(&mut self, key: &FileStateCacheKey) -> Option<Arc<FileState>> {
+        let Some(entry) = self.entries.get(key) else {
+            self.stats.misses = self.stats.misses.saturating_add(1);
+            return None;
+        };
+        self.stats.hits = self.stats.hits.saturating_add(1);
+        let state = Arc::clone(&entry.state);
+        self.touch(key);
+        Some(state)
+    }
+
+    fn insert(&mut self, key: FileStateCacheKey, state: Arc<FileState>) {
+        let estimated_bytes = state.estimated_retained_bytes();
+        if estimated_bytes > self.max_bytes {
+            self.stats.rejected_admissions = self.stats.rejected_admissions.saturating_add(1);
+            return;
+        }
+        if let Some(replaced) = self.entries.remove(&key) {
+            self.remove_accounting(&replaced);
+        }
+        let stamp = self.next_stamp();
+        self.entries.insert(
+            key.clone(),
+            FileStateCacheEntry {
+                state,
+                estimated_bytes,
+                stamp,
+                segment: FileStateCacheSegment::Probation,
+            },
+        );
+        self.retained_bytes = self.retained_bytes.saturating_add(estimated_bytes);
+        self.probation_bytes = self.probation_bytes.saturating_add(estimated_bytes);
+        self.probation_order.push_back((key, stamp));
+        self.stats.admissions = self.stats.admissions.saturating_add(1);
+        self.enforce_bounds();
+        self.maybe_compact();
+    }
+
+    #[cfg(test)]
+    fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    #[cfg(test)]
+    fn contains(&self, key: &FileStateCacheKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> FileStateCacheStats {
+        self.stats
+    }
+
+    fn touch(&mut self, key: &FileStateCacheKey) {
+        let stamp = self.next_stamp();
+        let Some(entry) = self.entries.get_mut(key) else {
+            return;
+        };
+        if entry.segment == FileStateCacheSegment::Probation {
+            entry.segment = FileStateCacheSegment::Protected;
+            self.probation_bytes = self.probation_bytes.saturating_sub(entry.estimated_bytes);
+            self.protected_bytes = self.protected_bytes.saturating_add(entry.estimated_bytes);
+            self.stats.promotions = self.stats.promotions.saturating_add(1);
+        }
+        entry.stamp = stamp;
+        match entry.segment {
+            FileStateCacheSegment::Probation => {
+                self.probation_order.push_back((key.clone(), stamp))
+            }
+            FileStateCacheSegment::Protected => {
+                self.protected_order.push_back((key.clone(), stamp))
+            }
+        }
+        self.enforce_bounds();
+        self.maybe_compact();
+    }
+
+    fn next_stamp(&mut self) -> u64 {
+        let stamp = self.next_stamp;
+        self.next_stamp = self.next_stamp.wrapping_add(1);
+        stamp
+    }
+
+    fn enforce_bounds(&mut self) {
+        while self.protected_bytes > self.protected_max_bytes {
+            if !self.demote_protected_one() {
+                break;
+            }
+        }
+        while self.retained_bytes > self.max_bytes {
+            if self.evict_one(FileStateCacheSegment::Probation) {
+                continue;
+            }
+            if !self.evict_one(FileStateCacheSegment::Protected) {
+                break;
+            }
+        }
+    }
+
+    fn demote_protected_one(&mut self) -> bool {
+        while let Some((key, stamp)) = self.protected_order.pop_front() {
+            let next_stamp = self.next_stamp();
+            let Some(entry) = self.entries.get_mut(&key) else {
+                continue;
+            };
+            if entry.segment != FileStateCacheSegment::Protected || entry.stamp != stamp {
+                continue;
+            }
+            entry.segment = FileStateCacheSegment::Probation;
+            entry.stamp = next_stamp;
+            self.protected_bytes = self.protected_bytes.saturating_sub(entry.estimated_bytes);
+            self.probation_bytes = self.probation_bytes.saturating_add(entry.estimated_bytes);
+            self.probation_order.push_back((key, entry.stamp));
+            return true;
+        }
+        false
+    }
+
+    fn evict_one(&mut self, segment: FileStateCacheSegment) -> bool {
+        let order = match segment {
+            FileStateCacheSegment::Probation => &mut self.probation_order,
+            FileStateCacheSegment::Protected => &mut self.protected_order,
+        };
+        while let Some((key, stamp)) = order.pop_front() {
+            let is_live = self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.segment == segment && entry.stamp == stamp);
+            if !is_live {
+                continue;
+            }
+            let entry = self
+                .entries
+                .remove(&key)
+                .expect("live file-state cache entry must remain present");
+            self.remove_accounting(&entry);
+            self.stats.evictions = self.stats.evictions.saturating_add(1);
+            return true;
+        }
+        false
+    }
+
+    fn remove_accounting(&mut self, entry: &FileStateCacheEntry) {
+        self.retained_bytes = self.retained_bytes.saturating_sub(entry.estimated_bytes);
+        match entry.segment {
+            FileStateCacheSegment::Probation => {
+                self.probation_bytes = self.probation_bytes.saturating_sub(entry.estimated_bytes);
+            }
+            FileStateCacheSegment::Protected => {
+                self.protected_bytes = self.protected_bytes.saturating_sub(entry.estimated_bytes);
+            }
+        }
+    }
+
+    fn maybe_compact(&mut self) {
+        let threshold = self
+            .entries
+            .len()
+            .saturating_mul(CACHE_ORDER_COMPACT_FACTOR);
+        if self.probation_order.len() > threshold.max(CACHE_ORDER_COMPACT_FACTOR) {
+            self.probation_order.retain(|(key, stamp)| {
+                self.entries.get(key).is_some_and(|entry| {
+                    entry.segment == FileStateCacheSegment::Probation && entry.stamp == *stamp
+                })
+            });
+        }
+        if self.protected_order.len() > threshold.max(CACHE_ORDER_COMPACT_FACTOR) {
+            self.protected_order.retain(|(key, stamp)| {
+                self.entries.get(key).is_some_and(|entry| {
+                    entry.segment == FileStateCacheSegment::Protected && entry.stamp == *stamp
+                })
+            });
+        }
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.probation_order.clear();
+        self.protected_order.clear();
+        self.retained_bytes = 0;
+        self.probation_bytes = 0;
+        self.protected_bytes = 0;
+    }
+}
+
+#[derive(Debug)]
+struct QueryFileStateCache {
+    entries: HashMap<FileStateCacheKey, Arc<FileState>>,
+    retained_bytes: usize,
+    max_bytes: usize,
+}
+
+impl QueryFileStateCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::default(),
+            retained_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn get(&self, key: &FileStateCacheKey) -> Option<Arc<FileState>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn retain(&mut self, key: FileStateCacheKey, state: Arc<FileState>) -> bool {
+        if let Some(existing) = self.entries.get_mut(&key) {
+            *existing = state;
+            return true;
+        }
+        let estimated_bytes = state.estimated_retained_bytes();
+        if estimated_bytes > self.max_bytes
+            || self.retained_bytes.saturating_add(estimated_bytes) > self.max_bytes
+        {
+            return false;
+        }
+        self.entries.insert(key, state);
+        self.retained_bytes = self.retained_bytes.saturating_add(estimated_bytes);
+        true
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.retained_bytes = 0;
+    }
+}
+
+type FileStateCache = SegmentedFileStateCache;
 type SummaryFileProjectionCache = BoundedFileCache<SummaryFileProjection>;
 type PreparedSyntaxRequestCache =
     HashMap<PreparedSyntaxCacheKey, Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>>;
@@ -1098,7 +1566,7 @@ type PreparedSyntaxRequestCache =
 type SourceSnapshotFileStateIndex = HashMap<FileStateCacheKey, Arc<FileState>>;
 type TopLevelClassUnitsByPackageCell = Arc<OnceLock<Arc<HashMap<String, Vec<CodeUnit>>>>>;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct QueryReadCache {
     contexts: Vec<Arc<crate::analyzer::AnalyzerQueryContext>>,
     /// Each request memo is independently synchronized. The outer cache lock
@@ -1109,7 +1577,7 @@ struct QueryReadCache {
     live_sources: Arc<RwLock<HashMap<ProjectFile, Option<ResolvedLiveSource>>>>,
     current_sources: Arc<RwLock<HashMap<ProjectFile, Option<String>>>>,
     prepared_sources: Arc<RwLock<HashMap<ProjectFile, Option<ResolvedPreparedSource>>>>,
-    file_states: Arc<RwLock<HashMap<FileStateCacheKey, Arc<FileState>>>>,
+    file_states: Arc<RwLock<QueryFileStateCache>>,
     prepared_syntax: Arc<RwLock<PreparedSyntaxRequestCache>>,
     /// Persisted top-level class declarations bucketed by package, hydrated at
     /// most once per request. `class_declarations_in_package` answers a
@@ -1149,6 +1617,12 @@ struct QueryReadCache {
     parent_units: Arc<RwLock<HashMap<String, Option<CodeUnit>>>>,
 }
 
+impl Default for QueryReadCache {
+    fn default() -> Self {
+        Self::new(MIN_FILE_STATE_CACHE_BYTES / QUERY_FILE_STATE_CACHE_BUDGET_DIVISOR)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum DefinitionRangeStart {
     Persisted(Option<usize>),
@@ -1162,6 +1636,23 @@ struct DefinitionSortCandidate {
 }
 
 impl QueryReadCache {
+    fn new(file_state_budget_bytes: usize) -> Self {
+        Self {
+            contexts: Vec::new(),
+            analyzed_live_files: Arc::new(RwLock::new(None)),
+            live_sources: Arc::new(RwLock::new(HashMap::default())),
+            current_sources: Arc::new(RwLock::new(HashMap::default())),
+            prepared_sources: Arc::new(RwLock::new(HashMap::default())),
+            file_states: Arc::new(RwLock::new(QueryFileStateCache::new(
+                file_state_budget_bytes,
+            ))),
+            prepared_syntax: Arc::new(RwLock::new(HashMap::default())),
+            top_level_class_units_by_package: Arc::new(OnceLock::new()),
+            workspace_file_index: Arc::new(OnceLock::new()),
+            parent_units: Arc::new(RwLock::new(HashMap::default())),
+        }
+    }
+
     fn begin(&mut self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         if self.contexts.is_empty() {
             self.reset_request_caches();
@@ -1195,7 +1686,12 @@ impl QueryReadCache {
         self.live_sources = Arc::new(RwLock::new(HashMap::default()));
         self.current_sources = Arc::new(RwLock::new(HashMap::default()));
         self.prepared_sources = Arc::new(RwLock::new(HashMap::default()));
-        self.file_states = Arc::new(RwLock::new(HashMap::default()));
+        let max_bytes = self
+            .file_states
+            .read()
+            .expect("query file-state cache read lock poisoned")
+            .max_bytes;
+        self.file_states = Arc::new(RwLock::new(QueryFileStateCache::new(max_bytes)));
         self.prepared_syntax = Arc::new(RwLock::new(HashMap::default()));
         self.parent_units = Arc::new(RwLock::new(HashMap::default()));
     }
@@ -2045,7 +2541,7 @@ where
             ))
         };
         let mut source_snapshot_file_states =
-            map_with_capacity(TRANSIENT_FILE_STATE_CACHE_CAPACITY);
+            map_with_capacity(SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY);
         state.seed_snapshot_file_states(&mut source_snapshot_file_states);
 
         let structural_cache = Arc::new(Self::build_structural_cache(&config));
@@ -2054,6 +2550,14 @@ where
         let semantic_cache = crate::analyzer::semantic::service::CompleteSemanticArtifactCache::new(
             config.memo_cache_budget_bytes() / 8,
         );
+        let active_persisted_payload_bytes = store_context
+            .store
+            .active_file_state_payload_bytes(&store_context.generations)
+            .ok();
+        let file_state_cache_budget =
+            file_state_cache_budget_bytes(&config, active_persisted_payload_bytes);
+        let query_file_state_cache_budget =
+            query_file_state_cache_budget_bytes(file_state_cache_budget);
         Ok(Self {
             project,
             adapter,
@@ -2064,7 +2568,9 @@ where
             snapshot_caches,
             semantic_cache,
             store_context,
-            query_read_cache: Arc::new(RwLock::new(QueryReadCache::default())),
+            query_read_cache: Arc::new(RwLock::new(QueryReadCache::new(
+                query_file_state_cache_budget,
+            ))),
             live_source_snapshot: Arc::new(ArcSwapOption::empty()),
             query_file_state_snapshot: Arc::new(ArcSwapOption::empty()),
             prepared_syntax_store: Arc::new(Mutex::new(PreparedSyntaxStore::new(
@@ -2078,7 +2584,7 @@ where
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
             syntax_parse_counts: Arc::new(Mutex::new(HashMap::default())),
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
-                TRANSIENT_FILE_STATE_CACHE_CAPACITY,
+                file_state_cache_budget,
             ))),
             source_snapshot_file_states: Arc::new(source_snapshot_file_states),
             summary_file_projections: Arc::new(Mutex::new(SummaryFileProjectionCache::new(
@@ -2247,10 +2753,18 @@ where
         store_context: AnalyzerStoreContext,
     ) -> Self {
         let mut source_snapshot_file_states =
-            map_with_capacity(TRANSIENT_FILE_STATE_CACHE_CAPACITY);
+            map_with_capacity(SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY);
         state.seed_snapshot_file_states(&mut source_snapshot_file_states);
         let structural_index_cache = Arc::new(Self::build_structural_index_cache(&config));
         let snapshot_caches = Arc::new(Self::build_snapshot_caches(&config));
+        let active_persisted_payload_bytes = store_context
+            .store
+            .active_file_state_payload_bytes(&store_context.generations)
+            .ok();
+        let file_state_cache_budget =
+            file_state_cache_budget_bytes(&config, active_persisted_payload_bytes);
+        let query_file_state_cache_budget =
+            query_file_state_cache_budget_bytes(file_state_cache_budget);
         Self {
             project,
             adapter,
@@ -2261,7 +2775,9 @@ where
             snapshot_caches,
             semantic_cache,
             store_context,
-            query_read_cache: Arc::new(RwLock::new(QueryReadCache::default())),
+            query_read_cache: Arc::new(RwLock::new(QueryReadCache::new(
+                query_file_state_cache_budget,
+            ))),
             live_source_snapshot: Arc::new(ArcSwapOption::empty()),
             query_file_state_snapshot: Arc::new(ArcSwapOption::empty()),
             prepared_syntax_store: Arc::new(Mutex::new(PreparedSyntaxStore::new(
@@ -2275,7 +2791,7 @@ where
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
             syntax_parse_counts: Arc::new(Mutex::new(HashMap::default())),
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
-                TRANSIENT_FILE_STATE_CACHE_CAPACITY,
+                file_state_cache_budget,
             ))),
             source_snapshot_file_states: Arc::new(source_snapshot_file_states),
             summary_file_projections: Arc::new(Mutex::new(SummaryFileProjectionCache::new(
@@ -3247,7 +3763,9 @@ where
                                 if let Some(errors) = state.parse_errors.clone() {
                                     fresh_parse_errors.insert(file.clone(), errors);
                                 }
-                                if seeded_file_states.len() < TRANSIENT_FILE_STATE_CACHE_CAPACITY {
+                                if seeded_file_states.len()
+                                    < SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY
+                                {
                                     seeded_file_states.push((key, Arc::clone(&state)));
                                 }
                                 parsed_files.insert(file);
@@ -3311,7 +3829,7 @@ where
                         fresh_parse_errors.insert(file.clone(), errors);
                     }
                     if let Some(key) = seed_key
-                        && seeded_file_states.len() < TRANSIENT_FILE_STATE_CACHE_CAPACITY
+                        && seeded_file_states.len() < SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY
                     {
                         seeded_file_states.push((key, Arc::new(state)));
                     }
@@ -3350,7 +3868,7 @@ where
                         fresh_parse_errors.insert(file.clone(), errors);
                     }
                     if let Some(key) = seed_key
-                        && seeded_file_states.len() < TRANSIENT_FILE_STATE_CACHE_CAPACITY
+                        && seeded_file_states.len() < SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY
                     {
                         seeded_file_states.push((key, Arc::new(state)));
                     }
@@ -3816,7 +4334,6 @@ where
                 .read()
                 .expect("query file-state cache read lock poisoned")
                 .get(key)
-                .cloned()
         {
             return Some(state);
         }
@@ -3830,11 +4347,7 @@ where
                 let mut file_states = file_states
                     .write()
                     .expect("query file-state cache write lock poisoned");
-                if file_states.contains_key(key)
-                    || file_states.len() < QUERY_FILE_STATE_CACHE_CAPACITY
-                {
-                    file_states.insert(key.clone(), Arc::clone(&state));
-                }
+                file_states.retain(key.clone(), Arc::clone(&state));
             }
             return Some(state);
         }
@@ -3871,10 +4384,7 @@ where
             let mut file_states = file_states
                 .write()
                 .expect("query file-state cache write lock poisoned");
-            if file_states.contains_key(key) || file_states.len() < QUERY_FILE_STATE_CACHE_CAPACITY
-            {
-                file_states.insert(key.clone(), Arc::clone(&state));
-            }
+            file_states.retain(key.clone(), Arc::clone(&state));
         }
         Some(state)
     }
@@ -4319,26 +4829,20 @@ where
             return;
         };
         let entries = self.bulk_file_state_entries(
-            files.into_iter().take(QUERY_FILE_STATE_CACHE_CAPACITY),
+            files.into_iter().take(BULK_FILE_STATE_QUERY_LIMIT),
             source_mode,
         );
-        let mut snapshot = map_with_capacity(entries.len().min(QUERY_FILE_STATE_CACHE_CAPACITY));
-        for (_, (key, state)) in entries.into_iter().take(QUERY_FILE_STATE_CACHE_CAPACITY) {
-            snapshot.insert(key, Arc::new(state));
-        }
-
-        {
-            let mut file_states = query_file_states
-                .write()
-                .expect("query file-state cache write lock poisoned");
-            for (key, state) in &snapshot {
-                if file_states.contains_key(key)
-                    || file_states.len() < QUERY_FILE_STATE_CACHE_CAPACITY
-                {
-                    file_states.insert(key.clone(), Arc::clone(state));
-                }
+        let mut snapshot = map_with_capacity(entries.len());
+        let mut file_states = query_file_states
+            .write()
+            .expect("query file-state cache write lock poisoned");
+        for (_, (key, state)) in entries {
+            let state = Arc::new(state);
+            if file_states.retain(key.clone(), Arc::clone(&state)) {
+                snapshot.insert(key, state);
             }
         }
+        drop(file_states);
         let cache = self.query_read_cache_lock();
         if cache.is_active() && Arc::ptr_eq(&query_file_states, &cache.file_states) {
             self.query_file_state_snapshot
@@ -6012,14 +6516,17 @@ where
         let normalized = self.adapter.normalize_full_name(fq_name);
         let langs = self.storage_language_keys_for_queries();
         let candidate_names = self.definition_candidate_short_names(fq_name);
+        // No per-name profiling scopes here: usage scans resolve thousands of
+        // candidate names per request, and a BEGIN/END pair per name floods
+        // stderr (an unbuffered global-locked write per line) faster than the
+        // benchmark harness's bounded tail can retain anything else. The
+        // `definition_candidates_query_count` counter remains the aggregate
+        // signal.
         let rows = if candidate_names.is_empty() {
             Vec::new()
         } else {
             let mut rows = Vec::new();
             for short_name in candidate_names {
-                let _rows_scope = crate::profiling::scope(format!(
-                    "sql_definition_candidates.rows[{short_name}]"
-                ));
                 let candidates = if include_definition_lookup_units {
                     self.store_context
                         .store
@@ -6043,41 +6550,26 @@ where
             }
             rows
         };
-        let mut candidates = {
-            let _resolve_scope = crate::profiling::scope(format!(
-                "sql_definition_candidates.resolve_rows[{fq_name}]"
-            ));
-            self.resolve_definition_order_candidate_rows(rows)
-        };
-        {
-            let _dirty_scope = crate::profiling::scope(format!(
-                "sql_definition_candidates.dirty_units[{fq_name}]"
-            ));
-            candidates.extend(
-                self.dirty_units_matching(include_definition_lookup_units, |unit| {
-                    unit.fq_name() == fq_name
-                        || self.adapter.normalize_full_name(&unit.fq_name()) == normalized
-                })
+        let mut candidates = self.resolve_definition_order_candidate_rows(rows);
+        candidates.extend(
+            self.dirty_units_matching(include_definition_lookup_units, |unit| {
+                unit.fq_name() == fq_name
+                    || self.adapter.normalize_full_name(&unit.fq_name()) == normalized
+            })
+            .into_iter()
+            .map(|unit| DefinitionSortCandidate {
+                unit,
+                range_start: DefinitionRangeStart::FileState,
+            }),
+        );
+        candidates.extend(
+            self.sql_path_symbol_units(fq_name, &normalized)?
                 .into_iter()
                 .map(|unit| DefinitionSortCandidate {
                     unit,
                     range_start: DefinitionRangeStart::FileState,
                 }),
-            );
-        }
-        {
-            let _path_scope = crate::profiling::scope(format!(
-                "sql_definition_candidates.path_symbol[{fq_name}]"
-            ));
-            candidates.extend(
-                self.sql_path_symbol_units(fq_name, &normalized)?
-                    .into_iter()
-                    .map(|unit| DefinitionSortCandidate {
-                        unit,
-                        range_start: DefinitionRangeStart::FileState,
-                    }),
-            );
-        }
+        );
         let has_exact = candidates
             .iter()
             .any(|candidate| candidate.unit.fq_name() == fq_name);
@@ -8727,6 +9219,50 @@ mod tests {
         assert_eq!(cache.len(), 2);
     }
 
+    #[test]
+    fn segmented_file_state_cache_keeps_reused_states_through_a_cold_scan() {
+        let state = Arc::new(empty_file_state("x".repeat(512), false));
+        let weight = state.estimated_retained_bytes();
+        let mut cache = SegmentedFileStateCache::new(weight.saturating_mul(4));
+        let hot_a = cache_key("hot-a");
+        let hot_b = cache_key("hot-b");
+        cache.insert(hot_a.clone(), Arc::clone(&state));
+        cache.insert(hot_b.clone(), Arc::clone(&state));
+        assert!(cache.get(&hot_a).is_some());
+        assert!(cache.get(&hot_b).is_some());
+
+        for index in 0..4 {
+            cache.insert(cache_key(&format!("cold-{index}")), Arc::clone(&state));
+        }
+
+        assert!(cache.contains(&hot_a), "a second use protects hot state a");
+        assert!(cache.contains(&hot_b), "a second use protects hot state b");
+        assert!(cache.retained_bytes() <= cache.max_bytes);
+        assert_eq!(cache.stats().promotions, 2);
+        assert!(cache.stats().evictions > 0);
+    }
+
+    #[test]
+    fn file_state_cache_budget_tracks_corpus_with_a_hard_ceiling() {
+        let config = AnalyzerConfig::default();
+        let ceiling = file_state_cache_ceiling_bytes(&config);
+        assert_eq!(
+            file_state_cache_budget_bytes(&config, None),
+            ceiling,
+            "an unavailable corpus estimate must preserve the safe ceiling"
+        );
+        assert_eq!(
+            file_state_cache_budget_bytes(&config, Some(100 * 1024 * 1024)),
+            40 * 1024 * 1024,
+            "the target is ten percent of the expanded persisted corpus"
+        );
+        assert_eq!(
+            file_state_cache_budget_bytes(&config, Some(usize::MAX)),
+            ceiling,
+            "a whale corpus cannot exceed the configured ceiling"
+        );
+    }
+
     #[derive(Clone)]
     struct CountingOverlayProject {
         delegate: TestProject,
@@ -10041,7 +10577,7 @@ mod tests {
         let root = temp.path().canonicalize().expect("canonical temp dir");
         std::fs::create_dir_all(root.join("src")).expect("source directory");
 
-        for index in 0..=TRANSIENT_FILE_STATE_CACHE_CAPACITY {
+        for index in 0..=SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY {
             std::fs::write(
                 root.join(format!("src/Type{index}.java")),
                 format!(
@@ -10274,7 +10810,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
         std::fs::create_dir_all(root.join("src")).expect("source directory");
-        let files: Vec<_> = (0..=TRANSIENT_FILE_STATE_CACHE_CAPACITY)
+        let files: Vec<_> = (0..=SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY)
             .map(|index| {
                 let file = temp_file(&root, &format!("src/Type{index}.java"));
                 file.write(format!("package demo; class Type{index} {{}}\n"))
@@ -10301,14 +10837,15 @@ mod tests {
 
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
-            TRANSIENT_FILE_STATE_CACHE_CAPACITY + 1
+            SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY + 1
         );
 
         analyzer.end_query(&outer);
         assert!(analyzer.fetch_file_state(&files[0]).is_some());
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
-            TRANSIENT_FILE_STATE_CACHE_CAPACITY + 2
+            SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY + 1,
+            "the shared byte budget retains this small working set after the query ends"
         );
     }
 
@@ -10495,8 +11032,20 @@ mod tests {
         let snapshot = snapshot_guard
             .as_ref()
             .expect("bulk hydration should publish a file-state snapshot");
+        let query_budget = {
+            let cache = analyzer.query_read_cache_lock();
+            cache
+                .file_states
+                .read()
+                .expect("query file-state cache read lock poisoned")
+                .max_bytes
+        };
+        let snapshot_bytes = snapshot
+            .values()
+            .map(|state| state.estimated_retained_bytes())
+            .fold(0usize, usize::saturating_add);
         assert!(
-            snapshot.len() <= QUERY_FILE_STATE_CACHE_CAPACITY,
+            snapshot_bytes <= query_budget,
             "snapshot must stay within its request budget"
         );
         assert!(snapshot.contains_key(&key));
@@ -10516,8 +11065,7 @@ mod tests {
                 .transient_file_states
                 .lock()
                 .expect("transient file-state cache mutex poisoned");
-            transient.entries.clear();
-            transient.order.clear();
+            transient.clear();
         }
 
         let state = analyzer
