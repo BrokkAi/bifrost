@@ -49,7 +49,7 @@ pub use analyzer::{
     DependencyPackEcosystem, DependencyPackEcosystemOutcome, DependencyPackWorkspaceContext,
     EmptyAnalyzer, ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights,
     FileSetProject, FilesystemProject, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo,
-    IngestedSource, JavaAnalyzer, JavascriptAnalyzer, JvmAnalyzerConfig,
+    ImportReachability, IngestedSource, JavaAnalyzer, JavascriptAnalyzer, JvmAnalyzerConfig,
     JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
     JvmExternalDependencies, JvmMavenCoordinate, JvmStandardLibraryDiscoveryConfig, KotlinAnalyzer,
     Language, MultiAnalyzer, MultiRootProject, OverlayProject, ParseError, ParseErrorKind,

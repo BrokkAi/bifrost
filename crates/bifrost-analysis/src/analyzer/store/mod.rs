@@ -2337,6 +2337,16 @@ impl AnalyzerStore {
         Ok(result)
     }
 
+    /// The namespace of `oid`'s first top-level declaration in source order, as
+    /// the persisted half of `file_namespace_hint_limited`'s fallback.
+    ///
+    /// `top_level_ordinal` is the index a unit had in the parsed file's
+    /// top-level vector, so restricting the scan to non-null ordinals and
+    /// ordering by them reproduces the source order the hydrated branch reads
+    /// off `FileState::top_level_declarations`. Ordering by `unit_key` instead
+    /// answered from an unrelated key order and admitted nested members, which
+    /// made a two-namespace file answer differently depending on whether its
+    /// state was hydrated (#1726).
     pub(crate) fn first_declaration_content_qualifier_for_key_limited(
         &self,
         oid: Oid,
@@ -2363,8 +2373,9 @@ impl AnalyzerStore {
              JOIN blob_meta AS meta
                ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
              WHERE units.blob_oid = ?1 AND units.lang = ?2
+               AND units.top_level_ordinal IS NOT NULL
                AND {PARSED_BLOB_COMPLETE_CONDITION}
-             ORDER BY units.unit_key
+             ORDER BY units.top_level_ordinal
              LIMIT ?3"
         );
         let mut statement = tx.prepare_cached(&sql)?;
@@ -8843,13 +8854,17 @@ mod tests {
         assert_eq!(limited.inspected, rows_before_qualifier);
     }
 
+    /// The fallback scans top-level declarations in source order (#1726), so
+    /// the fixture needs two of them and the qualifiers are staged by
+    /// `top_level_ordinal` rather than by `unit_key`. A file with one class and
+    /// two methods would offer the scan a single eligible row.
     #[test]
     fn limited_fallback_qualifier_charges_empty_rows_before_evidence() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
             temp.path(),
             "Target.java",
-            "class Target { void first() {} void second() {} }\n",
+            "class First { void first() {} }\nclass Target { void second() {} }\n",
         );
         let state = parse_state(&JavaAdapter, &file);
         let oid = oid_for(state.source.as_bytes());
@@ -8863,40 +8878,31 @@ mod tests {
 
         {
             let conn = store.conn.lock().unwrap();
-            let unit_count: usize = conn
+            let top_level_count: usize = conn
                 .query_row(
                     "SELECT COUNT(*) FROM code_units
-                     WHERE blob_oid = ?1 AND lang = ?2",
+                     WHERE blob_oid = ?1 AND lang = ?2 AND top_level_ordinal IS NOT NULL",
                     params![oid.to_string(), "java"],
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert!(unit_count >= 2, "fixture needs two ordered persisted units");
+            assert_eq!(
+                top_level_count, 2,
+                "fixture needs two ordered top-level declarations"
+            );
             assert_eq!(
                 conn.execute(
                     "UPDATE code_units
                      SET content_qualifier = CASE
-                         WHEN unit_key = (
-                             SELECT candidate.unit_key
-                             FROM code_units AS candidate
-                             WHERE candidate.blob_oid = ?1 AND candidate.lang = ?2
-                             ORDER BY candidate.unit_key
-                             LIMIT 1
-                         ) THEN ''
-                         WHEN unit_key = (
-                             SELECT candidate.unit_key
-                             FROM code_units AS candidate
-                             WHERE candidate.blob_oid = ?1 AND candidate.lang = ?2
-                             ORDER BY candidate.unit_key
-                             LIMIT 1 OFFSET 1
-                         ) THEN 'late.namespace'
-                         ELSE content_qualifier
+                         WHEN top_level_ordinal = 0 THEN ''
+                         ELSE 'late.namespace'
                      END
-                     WHERE blob_oid = ?1 AND lang = ?2",
+                     WHERE blob_oid = ?1 AND lang = ?2
+                       AND top_level_ordinal IS NOT NULL",
                     params![oid.to_string(), "java"],
                 )
                 .unwrap(),
-                unit_count
+                top_level_count
             );
         }
 

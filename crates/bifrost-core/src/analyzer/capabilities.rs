@@ -62,6 +62,11 @@ pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
         HashSet::default()
     }
 
+    /// Whether `source_file` can reference a declaration of `target`. A `true`
+    /// is an answer; a `false` is only an absence of evidence, which is why
+    /// callers still run the expansion backstop after one. Providers that can
+    /// prove the negative override [`Self::import_reachability`] instead and
+    /// derive this from it.
     fn could_import_file(
         &self,
         _source_file: &ProjectFile,
@@ -70,6 +75,56 @@ pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
     ) -> bool {
         false
     }
+
+    /// The three-valued form of [`Self::could_import_file`], which lets a
+    /// provider that has a completeness proof retire the caller's backstop.
+    ///
+    /// The default preserves the historical contract exactly by mapping the
+    /// bool spelling's `true` to [`ImportReachability::Reaches`] and its
+    /// `false` to [`ImportReachability::Unknown`] -- never to `DoesNotReach`,
+    /// because the bool contract never distinguished "no" from "I did not
+    /// find one".
+    ///
+    /// Bridging runs in this direction only. A provider overrides this method
+    /// and defines `could_import_file` over it, so the two spellings cannot
+    /// drift apart.
+    fn import_reachability(
+        &self,
+        source_file: &ProjectFile,
+        imports: &[ImportInfo],
+        target: &ProjectFile,
+    ) -> ImportReachability {
+        if self.could_import_file(source_file, imports, target) {
+            ImportReachability::Reaches
+        } else {
+            ImportReachability::Unknown
+        }
+    }
+}
+
+/// How completely a provider can answer "can `source_file` reference a
+/// declaration of `target`?".
+///
+/// Candidate discovery asks this per (candidate, target) pair and, when it
+/// gets no positive answer, materializes every declaration the candidate
+/// imports as a recall backstop. For a namespace-import language that
+/// expansion is the whole workspace's top-level types per using directive,
+/// which is the shape that burned #1194. The backstop exists only because the
+/// bool contract could not distinguish a proven "no" from an unproven one.
+///
+/// A provider must return `DoesNotReach` only from a proof that covers every
+/// way its language can name a declaration without importing it. Anything less
+/// is `Unknown`: the cost of an unnecessary expansion is time, the cost of a
+/// wrong `DoesNotReach` is a missing usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportReachability {
+    /// The candidate can reference the target. Accept it without expanding.
+    Reaches,
+    /// The candidate provably cannot. Reject it without expanding.
+    DoesNotReach,
+    /// Undecided. The caller runs its own backstop, exactly as before this
+    /// verdict existed.
+    Unknown,
 }
 
 /// Resolve direct project-file edges from structured import facts. Prefer a

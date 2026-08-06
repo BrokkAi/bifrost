@@ -225,7 +225,10 @@ impl CSharpAnalyzer {
         namespace
     }
 
-    pub(crate) fn namespace_of_file_limited(
+    /// The bounded twin of [`Self::namespace_of_file`], sharing its memo cell.
+    /// Public because the two spellings are required to agree and the #1726
+    /// regression test calls both against one analyzer in both orders.
+    pub fn namespace_of_file_limited(
         &self,
         file: &ProjectFile,
         limit: usize,
@@ -401,6 +404,12 @@ impl CSharpAnalyzer {
                 .set(batch.rows.iter().cloned().collect());
         }
         batch
+    }
+
+    pub(crate) fn global_static_using_type_names(&self) -> &[String] {
+        self.memo_caches
+            .global_static_using_type_names
+            .get_or_init(|| graph_support::compute_global_static_using_type_names(self))
     }
 
     pub(crate) fn global_static_using_type_names_limited(
@@ -606,6 +615,10 @@ impl CSharpAnalysisSource for CSharpAnalyzer {
         continue_query: &mut dyn FnMut() -> bool,
     ) -> LimitedQueryRows<(String, String)> {
         CSharpAnalyzer::using_aliases_of_limited(self, file, limit, continue_query)
+    }
+
+    fn global_static_using_type_names(&self) -> &[String] {
+        CSharpAnalyzer::global_static_using_type_names(self)
     }
 
     fn global_static_using_type_names_limited(

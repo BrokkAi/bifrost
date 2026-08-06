@@ -8,6 +8,10 @@ use crate::analyzer::weighted_cache::build_weighted_cache;
 
 pub(super) struct CSharpMemoCaches {
     budget_bytes: u64,
+    /// Shared by `namespace_of_file` and `namespace_of_file_limited`. Sound
+    /// only because both answer the one rule in
+    /// `file_namespace_from_top_level_declarations`; a spelling that computed
+    /// its own answer would be served the other's from here (#1726).
     pub(super) namespace_by_file: Cache<ProjectFile, Arc<String>>,
     pub(super) using_namespaces: Cache<ProjectFile, Arc<Vec<String>>>,
     pub(super) using_aliases: Cache<ProjectFile, Arc<HashMap<String, String>>>,
