@@ -539,6 +539,40 @@ impl CodeQueryResultValue {
         CodeQueryRowRef { value: self }
     }
 
+    /// The exact display region of this row's own source anchor. `None` when
+    /// the row has no source region of its own (a file row, or an evidence row
+    /// whose location is its site's outcome row).
+    pub fn display_range(&self) -> Option<CodeQueryRange> {
+        match self {
+            Self::StructuralMatch { value } => value.node_range,
+            Self::Declaration { value } => value.node_range,
+            Self::Procedure { value } => Some(value.range),
+            Self::ProgramPoint { value } => Some(value.range),
+            Self::ControlEdge { value } => Some(value.range),
+            Self::TypestateFinding { value } => Some(value.range),
+            Self::TypestateWitness { value } => Some(value.range),
+            Self::FlowEndpoint { value } => Some(value.range),
+            Self::FlowWitness { value } => Some(value.range),
+            Self::TaintFinding { value } => Some(value.range),
+            Self::File { .. } | Self::ReceiverEvidence { .. } => None,
+            Self::ReferenceSite { value } => Some(value.range),
+            Self::CallSite { value } => Some(value.range),
+            Self::ExpressionSite { value } => Some(value.range),
+            Self::ReceiverAnalysis { value } => Some(value.range),
+            Self::ReceiverOutcome { value } => Some(value.range),
+            Self::Occurrence { value } => Some(value.range),
+            Self::LexicalScope { value } => Some(value.range),
+            Self::Binding { value } => Some(value.range),
+            Self::ResolutionCandidate { value } => Some(value.range),
+            Self::GenerationSite { value } => Some(value.range),
+            Self::Export { value } => Some(value.range),
+            Self::DeclarationState { value } => value.range,
+            Self::ReferenceEdge { value } => Some(value.range),
+            Self::QualifiedPath { value } => Some(value.range),
+            Self::PathSegment { value } => Some(value.range),
+        }
+    }
+
     pub const fn detailed_domain(&self) -> DetailedCodeQueryDomain {
         match self {
             Self::StructuralMatch { .. } => DetailedCodeQueryDomain::StructuralMatch,

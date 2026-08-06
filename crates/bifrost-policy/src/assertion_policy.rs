@@ -5,7 +5,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use brokk_bifrost_analysis::analyzer::structural::search::DetailedCodeQueryDomain;
+use brokk_bifrost_analysis::analyzer::structural::search::{
+    CodeQueryResultItem, DetailedCodeQueryDomain,
+};
 use brokk_bifrost_analysis::analyzer::structural::{
     CodeQueryResultValue, CodeQueryRowScalarRef, CodeQueryRowScalarType,
 };
@@ -45,9 +47,22 @@ impl From<CodeQueryRowScalarRef<'_>> for RowScalar {
 #[derive(Debug, Clone, Copy)]
 pub struct RelationalInput<'a> {
     pub binding: &'a RowBindingName,
-    pub rows: &'a [CodeQueryResultValue],
+    pub rows: &'a [CodeQueryResultItem],
     pub exhaustive: bool,
 }
+
+/// One row of one binding that contributed to a violated group, addressed by
+/// its index into that binding's executed row set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalViolationRow {
+    pub binding: RowBindingName,
+    pub row: usize,
+}
+
+/// The number of contributing tuples a violation retains for diagnostics. The
+/// aggregate value already states the complete count; representatives exist so
+/// a finding can point at exact source ranges, not to enumerate the group.
+pub const MAX_VIOLATION_REPRESENTATIVE_TUPLES: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationalAssertionViolation {
@@ -55,6 +70,9 @@ pub struct RelationalAssertionViolation {
     pub group: RowGroupName,
     pub key: Vec<Option<RowScalar>>,
     pub actual: u64,
+    /// Bounded contributing tuples of the violated group. Each tuple lists its
+    /// rows in binding declaration order.
+    pub representatives: Vec<Vec<RelationalViolationRow>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,9 +522,11 @@ fn field_type(
         })
 }
 
-type JoinedTuple<'a> = HashMap<&'a RowBindingName, &'a CodeQueryResultValue>;
+type JoinedTuple<'a> = HashMap<&'a RowBindingName, (usize, &'a CodeQueryResultValue)>;
 type GroupAggregateValues<'a> =
     HashMap<(&'a RowGroupName, Vec<Option<RowScalar>>), HashMap<&'a RowAggregateName, u64>>;
+type GroupRepresentatives<'a> =
+    HashMap<(&'a RowGroupName, Vec<Option<RowScalar>>), Vec<Vec<RelationalViolationRow>>>;
 
 /// Evaluate a validated query-only relational plan over already executed
 /// CodeQuery row sets. Typed expansions use the same engine once their row
@@ -545,7 +565,8 @@ pub fn evaluate_relational_assertion_rows(
     }
     let mut tuples = first_input.rows[..source_count]
         .iter()
-        .map(|row| HashMap::from([(&first.name, row)]))
+        .enumerate()
+        .map(|(index, item)| HashMap::from([(&first.name, (index, &item.value))]))
         .collect::<Vec<_>>();
     let mut comparisons = 0usize;
 
@@ -567,16 +588,16 @@ pub fn evaluate_relational_assertion_rows(
         }
         let mut joined = Vec::new();
         'left: for tuple in &tuples {
-            let left_row = tuple[&join.left];
+            let (_, left_row) = tuple[&join.left];
             let mut matched = false;
-            for right_row in &right.rows[..right_count] {
+            for (right_index, right_item) in right.rows[..right_count].iter().enumerate() {
                 comparisons = comparisons.saturating_add(1);
                 if comparisons > plan.limits.max_join_comparisons {
                     exhaustive = false;
                     limit_exceeded = true;
                     break 'left;
                 }
-                if join_conditions_match(left_row, right_row, join)? {
+                if join_conditions_match(left_row, &right_item.value, join)? {
                     matched = true;
                     if join.kind == crate::definition::RowJoinKind::Inner {
                         if joined.len() == plan.limits.max_joined_rows {
@@ -585,7 +606,7 @@ pub fn evaluate_relational_assertion_rows(
                             break 'left;
                         }
                         let mut next = tuple.clone();
-                        next.insert(&join.right, right_row);
+                        next.insert(&join.right, (right_index, &right_item.value));
                         joined.push(next);
                     }
                 }
@@ -603,6 +624,7 @@ pub fn evaluate_relational_assertion_rows(
     }
 
     let mut aggregate_values: GroupAggregateValues<'_> = HashMap::new();
+    let mut group_representatives: GroupRepresentatives<'_> = HashMap::new();
     for group in &plan.groups {
         let mut grouped: HashMap<Vec<Option<RowScalar>>, Vec<&JoinedTuple<'_>>> = HashMap::new();
         for tuple in &tuples {
@@ -663,16 +685,39 @@ pub fn evaluate_relational_assertion_rows(
                 };
                 values.insert(&aggregate.name, value);
             }
+            let representatives = rows
+                .iter()
+                .take(MAX_VIOLATION_REPRESENTATIVE_TUPLES)
+                .map(|tuple| {
+                    plan.bindings
+                        .iter()
+                        .filter_map(|binding| {
+                            tuple
+                                .get(&binding.name)
+                                .map(|(index, _)| RelationalViolationRow {
+                                    binding: binding.name.clone(),
+                                    row: *index,
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            group_representatives.insert((&group.name, key.clone()), representatives);
             aggregate_values.insert((&group.name, key), values);
         }
     }
 
     let mut violations = Vec::new();
     for assertion in &plan.assertions {
-        for ((group, key), values) in &aggregate_values {
-            if *group != &assertion.group {
-                continue;
-            }
+        // Deterministic finding order: sorted group keys, not map order.
+        let mut group_keys = aggregate_values
+            .keys()
+            .filter(|(group, _)| *group == &assertion.group)
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
+        group_keys.sort();
+        for key in group_keys {
+            let values = &aggregate_values[&(&assertion.group, key.clone())];
             let actual = values.get(&assertion.aggregate).copied().ok_or_else(|| {
                 RelationalAssertionEvaluationError::MissingAggregate {
                     group: assertion.group.as_str().to_string(),
@@ -681,11 +726,16 @@ pub fn evaluate_relational_assertion_rows(
             })?;
             let bounded_actual = u32::try_from(actual).unwrap_or(u32::MAX);
             if !assertion.cardinality.satisfied_by(bounded_actual) {
+                let representatives = group_representatives
+                    .get(&(&assertion.group, key.clone()))
+                    .cloned()
+                    .unwrap_or_default();
                 violations.push(RelationalAssertionViolation {
                     assertion: assertion.id.clone(),
                     group: assertion.group.clone(),
-                    key: key.clone(),
+                    key,
                     actual,
+                    representatives,
                 });
             }
         }
@@ -716,7 +766,7 @@ fn tuple_field(
     tuple: &JoinedTuple<'_>,
     field: &RowFieldRef,
 ) -> Result<Option<RowScalar>, RelationalAssertionEvaluationError> {
-    let row = tuple.get(&field.binding).ok_or_else(|| {
+    let (_, row) = tuple.get(&field.binding).ok_or_else(|| {
         RelationalAssertionEvaluationError::MissingTupleBinding {
             binding: field.binding.as_str().to_string(),
         }
@@ -804,8 +854,8 @@ mod tests {
         }
     }
 
-    fn occurrence(id: &str, ast_id: &str) -> CodeQueryResultValue {
-        CodeQueryResultValue::Occurrence {
+    fn occurrence(id: &str, ast_id: &str) -> CodeQueryResultItem {
+        let value = CodeQueryResultValue::Occurrence {
             value: Box::new(CodeQueryOccurrence {
                 id: id.to_string(),
                 ast_id: ast_id.to_string(),
@@ -827,6 +877,11 @@ mod tests {
                 decoded_spelling: None,
                 target: CodeQueryOccurrenceTarget::None,
             }),
+        };
+        CodeQueryResultItem {
+            value,
+            provenance: Vec::new(),
+            provenance_truncated: false,
         }
     }
 

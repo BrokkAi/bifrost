@@ -50,6 +50,9 @@ pub(super) fn evaluate_assertion_policy(
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
 ) -> Result<PolicyRun, PolicyRunError> {
+    if let Some(plan) = &spec.relational {
+        return evaluate_relational_assertion_policy(policy, plan, context, budget);
+    }
     let Some(selector) = policy
         .resolved_selectors()
         .iter()
@@ -740,6 +743,468 @@ pub(super) fn evaluate_assertion_policy(
         "assertion evaluation produced an invalid policy run",
         budget,
     )
+}
+
+/// Execute a decoded relational assertion plan: run every named query and
+/// expansion binding as a CodeQuery, evaluate the bounded join/group/aggregate
+/// plan over the returned rows, and assemble each violated group into one
+/// finding anchored at exact source ranges.
+///
+/// Soundness follows the specialized families: a failed query fails the run; a
+/// non-exhaustive contributing relation or an exceeded plan limit makes the
+/// whole run inconclusive with zero findings, because every supported
+/// cardinality can be falsified by unobserved rows.
+fn evaluate_relational_assertion_policy(
+    policy: &LoadedPolicy,
+    plan: &super::super::definition::RelationalAssertionPlan,
+    context: &PolicyEvaluationContext<'_>,
+    budget: &PolicyBudget,
+) -> Result<PolicyRun, PolicyRunError> {
+    use super::super::assertion_policy::{
+        RelationalInput, RelationalViolationRow, evaluate_relational_assertion_rows,
+    };
+    use super::super::definition::{
+        RowBindingName, RowBindingSource, RowExpansionStep, relational_binding_selector_path,
+    };
+
+    let mut binding_queries: Vec<CodeQuery> = Vec::with_capacity(plan.bindings.len());
+    let mut binding_index_by_name: HashMap<&RowBindingName, usize> = HashMap::new();
+    for (index, binding) in plan.bindings.iter().enumerate() {
+        let query = match &binding.source {
+            RowBindingSource::Query(_) => {
+                let selector_path = relational_binding_selector_path(&binding.name);
+                let Some(selector) = policy
+                    .resolved_selectors()
+                    .iter()
+                    .find(|selector| selector.path.as_str() == selector_path)
+                else {
+                    return failed_policy_run(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        &format!(
+                            "resolved relational policy is missing binding selector `{}`",
+                            binding.name
+                        ),
+                        budget,
+                    );
+                };
+                let mut query = selector.query.clone();
+                query.result_detail = CodeQueryResultDetail::Full;
+                query.limit = budget.query_limits().max_pipeline_rows;
+                query
+            }
+            RowBindingSource::Expansion { from, step } => {
+                let Some(&source_index) = binding_index_by_name.get(from) else {
+                    return failed_policy_run(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        &format!(
+                            "relational binding `{}` expands `{from}` before it is declared",
+                            binding.name
+                        ),
+                        budget,
+                    );
+                };
+                let projection = match step {
+                    RowExpansionStep::ReceiverOutcome => QueryStep::ReceiverOutcome,
+                    RowExpansionStep::ReceiverEvidence => QueryStep::ReceiverEvidence,
+                    other => {
+                        return failed_policy_run(
+                            policy,
+                            PolicyAnalysisType::Assertion,
+                            &format!(
+                                "row expansion `{}` has no executable row domain yet",
+                                other.label()
+                            ),
+                            budget,
+                        );
+                    }
+                };
+                let mut query = binding_queries[source_index].clone();
+                // The receiver row projections consume a receiver analysis. A
+                // source binding that is not already a receiver analysis is
+                // lowered through the production receiver analysis first, so
+                // the expansion rows are projections of the same solver run
+                // the ordinary receiver queries use.
+                let source_is_receiver_analysis = query
+                    .validate_steps()
+                    .map(|kind| kind == QueryValueKind::ReceiverAnalysis)
+                    .unwrap_or(false);
+                if !source_is_receiver_analysis {
+                    query
+                        .plan
+                        .steps
+                        .push(QueryStep::ReceiverTargets(Default::default()));
+                }
+                query.plan.steps.push(projection);
+                query
+            }
+        };
+        binding_index_by_name.insert(&binding.name, index);
+        binding_queries.push(query);
+    }
+
+    let mut run_incomplete: Vec<PolicyIncompleteReason> = Vec::new();
+    let mut run_failures: Vec<PolicyFailureReason> = Vec::new();
+    let mut query_diagnostics: Vec<CodeQueryDiagnostic> = Vec::new();
+    let mut executed = Vec::with_capacity(binding_queries.len());
+    let mut total_work: Option<CodeQueryExecutionWork> = None;
+    for query in &binding_queries {
+        let outcome = execute_code_query_detailed_eager_index(
+            context.analyzer,
+            query,
+            budget.query_limits(),
+            context.cancellation,
+        );
+        run_incomplete.extend(incomplete_reasons(
+            &outcome.result.completion(),
+            outcome.result.truncated,
+        ));
+        run_failures.extend(failure_reasons(&outcome.result.completion()));
+        query_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
+        total_work = Some(match total_work {
+            Some(work) => work.saturating_add(outcome.work),
+            None => outcome.work,
+        });
+        executed.push(outcome);
+    }
+    let total_work = total_work.expect("a validated relational plan has at least one binding");
+    let work = work_report(total_work, 0, 0);
+
+    run_failures.sort();
+    run_failures.dedup();
+    if !run_failures.is_empty() {
+        return failed_policy_run_with_reason(
+            policy,
+            PolicyAnalysisType::Assertion,
+            Vec::new(),
+            run_failures[0],
+            "relational assertion evaluation could not execute a valid query plan",
+            work,
+            budget,
+        );
+    }
+    for outcome in &executed {
+        if outcome.result.results.len() != outcome.evidence.len() {
+            return failed_policy_run_with_reason(
+                policy,
+                PolicyAnalysisType::Assertion,
+                Vec::new(),
+                PolicyFailureReason::InternalInvariant,
+                "relational binding rows and their detailed evidence disagree",
+                work,
+                budget,
+            );
+        }
+    }
+
+    let inputs = plan
+        .bindings
+        .iter()
+        .zip(&executed)
+        .map(|(binding, outcome)| RelationalInput {
+            binding: &binding.name,
+            rows: &outcome.result.results,
+            exhaustive: matches!(outcome.result.completion(), CodeQueryCompletion::Complete)
+                && !outcome.result.truncated,
+        })
+        .collect::<Vec<_>>();
+    let evaluation = match evaluate_relational_assertion_rows(plan, &inputs) {
+        Ok(evaluation) => evaluation,
+        Err(error) => {
+            return failed_policy_run_with_reason(
+                policy,
+                PolicyAnalysisType::Assertion,
+                Vec::new(),
+                PolicyFailureReason::InvalidExecutionPlan,
+                &format!("relational assertion evaluation could not conclude: {error:?}"),
+                work,
+                budget,
+            );
+        }
+    };
+
+    let capability = assertion_capabilities(&query_diagnostics);
+    let adapted = adapt_query_diagnostics(&query_diagnostics, budget.max_diagnostics());
+    let mut diagnostics = adapted.diagnostics;
+    let mut diagnostics_truncated = adapted.truncated;
+    if diagnostics_truncated {
+        run_incomplete.push(PolicyIncompleteReason::ReportRetentionBudget);
+    }
+    if adapted.adaptation_failed {
+        retain_incomplete_diagnostic(
+            &mut diagnostics,
+            &mut diagnostics_truncated,
+            budget.max_diagnostics(),
+            "one or more query diagnostics could not be retained as validated policy diagnostics",
+        );
+    }
+
+    if evaluation.limit_exceeded {
+        run_incomplete.push(PolicyIncompleteReason::PipelineRowBudget);
+    }
+    if !evaluation.exhaustive && run_incomplete.is_empty() {
+        run_incomplete.push(PolicyIncompleteReason::PartialDiscovery);
+    }
+    run_incomplete.sort();
+    run_incomplete.dedup();
+    if !run_incomplete.is_empty() {
+        return inconclusive_policy_run_many(
+            policy,
+            PolicyAnalysisType::Assertion,
+            run_incomplete,
+            "relational assertion evaluation could not observe a complete row set",
+            work,
+            budget,
+        );
+    }
+
+    let metadata = &policy.definition().metadata;
+    let message = match &metadata.message {
+        PolicyMessageSpec::Static { text } => text.clone(),
+        PolicyMessageSpec::Generated { .. } => {
+            return failed_policy_run(
+                policy,
+                PolicyAnalysisType::Assertion,
+                "assertion policy presentation could not be projected into a finding",
+                budget,
+            );
+        }
+    };
+    let classification = match reduce_finding_classification(
+        policy.definition().classification.as_ref(),
+        ClassificationProjection::assertion_finding(),
+        None,
+    ) {
+        Ok(classification) => classification,
+        Err(_) => {
+            return failed_policy_run(
+                policy,
+                PolicyAnalysisType::Assertion,
+                "assertion policy classification could not be reduced",
+                budget,
+            );
+        }
+    };
+    let severity = finding_severity(&metadata.severity, None);
+
+    let row_location = |row: &RelationalViolationRow| -> Option<PolicySourceLocation> {
+        let index = *binding_index_by_name.get(&row.binding)?;
+        let outcome = &executed[index];
+        let item = outcome.result.results.get(row.row)?;
+        let evidence = outcome.evidence.get(row.row)?;
+        let path = WorkspaceRelativePath::try_from_path(evidence.file.rel_path()).ok()?;
+        match (evidence.byte_span.as_ref(), item.value.display_range()) {
+            (Some(byte_span), Some(range)) => policy_span_location(path, byte_span, range).ok(),
+            _ => Some(PolicySourceLocation::artifact(path)),
+        }
+    };
+
+    let mut findings = Vec::new();
+    for violation in &evaluation.violations {
+        let assertion = plan
+            .assertions
+            .iter()
+            .find(|assertion| assertion.id == violation.assertion)
+            .expect("a violation always references an assertion of its own plan");
+        let Some(primary_row) = violation
+            .representatives
+            .first()
+            .and_then(|tuple| tuple.first())
+        else {
+            return failed_policy_run_with_reason(
+                policy,
+                PolicyAnalysisType::Assertion,
+                findings,
+                PolicyFailureReason::InternalInvariant,
+                "a violated relational group retained no contributing row",
+                work,
+                budget,
+            );
+        };
+        let Some(primary_location) = row_location(primary_row) else {
+            return failed_policy_run_with_reason(
+                policy,
+                PolicyAnalysisType::Assertion,
+                findings,
+                PolicyFailureReason::InternalInvariant,
+                "a relational violation row could not be projected into a source location",
+                work,
+                budget,
+            );
+        };
+        let key_text = render_relational_key(&violation.key);
+
+        let mut related = Vec::new();
+        let mut related_truncated = false;
+        let mut omitted_related = 0_u64;
+        for (tuple_index, tuple) in violation.representatives.iter().enumerate() {
+            for (row_index, row) in tuple.iter().enumerate() {
+                let relationship = if tuple_index == 0 && row_index == 0 {
+                    PolicyLocationRelationship::Subject
+                } else {
+                    PolicyLocationRelationship::Evidence
+                };
+                if related.len() == budget.max_related_locations_per_finding() {
+                    related_truncated = true;
+                    omitted_related = omitted_related.saturating_add(1);
+                    continue;
+                }
+                let Some(location) = row_location(row) else {
+                    return failed_policy_run_with_reason(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        findings,
+                        PolicyFailureReason::InternalInvariant,
+                        "a relational violation row could not be projected into a source location",
+                        work,
+                        budget,
+                    );
+                };
+                let Ok(entry) = RelatedPolicyLocation::try_new(relationship, location, Vec::new())
+                else {
+                    return failed_policy_run_with_reason(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        findings,
+                        PolicyFailureReason::InternalInvariant,
+                        "an evidence row could not be projected into a related policy location",
+                        work,
+                        budget,
+                    );
+                };
+                related.push(entry);
+            }
+        }
+
+        let Ok(anchor_path) = WorkspaceRelativePath::new(primary_location.path()) else {
+            return failed_policy_run_with_reason(
+                policy,
+                PolicyAnalysisType::Assertion,
+                findings,
+                PolicyFailureReason::InternalInvariant,
+                "a relational violation location has no workspace-relative path",
+                work,
+                budget,
+            );
+        };
+        let anchor = super::super::finding_identity::AssertionFindingAnchor::new(
+            anchor_path,
+            &key_text,
+            assertion.id.as_str(),
+        );
+        let expectation = format!(
+            "({} {})",
+            assertion.cardinality.label(),
+            assertion.cardinality.count()
+        );
+        let observed = format!(
+            "aggregate `{}.{}` over group key `{key_text}` = {}",
+            assertion.group, assertion.aggregate, violation.actual
+        );
+        let Ok(evidence) = super::super::finding::AssertionFindingEvidence::try_new(
+            anchor,
+            "relational",
+            "row",
+            violation.group.as_str(),
+            expectation,
+            Some(observed),
+            violation.actual,
+            capability.clone(),
+        ) else {
+            return failed_policy_run_with_reason(
+                policy,
+                PolicyAnalysisType::Assertion,
+                findings,
+                PolicyFailureReason::InternalInvariant,
+                "a violated assertion could not be projected into validated policy evidence",
+                work,
+                budget,
+            );
+        };
+
+        let completeness = if related_truncated {
+            FindingCompleteness::partial(vec![FindingIncompleteReason::RelatedLocationsTruncated])
+                .expect("one typed finding-incomplete reason is canonical")
+        } else {
+            FindingCompleteness::Complete
+        };
+        let proof = ProofMetadata::try_new(
+            ProofState::Proven,
+            vec![ProofReason::DirectStructuralMatch],
+            Vec::new(),
+        )
+        .expect("a proven direct structural match is a canonical proof");
+        let finding = PolicyFinding::try_new(
+            metadata.id.clone(),
+            policy.semantic_hash(),
+            severity,
+            message.clone(),
+            classification.clone(),
+            FindingCertainty::Definite,
+            completeness,
+            primary_location,
+            related,
+            related_truncated,
+            omitted_related,
+            PolicyFindingEvidence::Assertion { evidence },
+            false,
+            0,
+            None,
+            None,
+            proof,
+            Vec::new(),
+            false,
+            0,
+            budget,
+        );
+        match finding {
+            Ok(finding) => findings.push(finding),
+            Err(_) => {
+                return failed_policy_run_with_reason(
+                    policy,
+                    PolicyAnalysisType::Assertion,
+                    findings,
+                    PolicyFailureReason::InternalInvariant,
+                    "a validated assertion violation could not be retained as a finding",
+                    work,
+                    budget,
+                );
+            }
+        }
+    }
+
+    let work = work_report(total_work, findings.len(), 0);
+    finish_assembled_run(
+        policy,
+        PolicyAnalysisType::Assertion,
+        PolicyRunCompletion::Complete,
+        findings,
+        diagnostics,
+        diagnostics_truncated,
+        work,
+        "relational assertion evaluation produced an invalid policy run",
+        budget,
+    )
+}
+
+/// Render one group key as a stable, human-readable correlation string. Group
+/// keys are stable row scalars, so this rendering is content-scoped exactly
+/// when the authored key fields are.
+fn render_relational_key(key: &[Option<super::super::assertion_policy::RowScalar>]) -> String {
+    use super::super::assertion_policy::RowScalar;
+    key.iter()
+        .map(|scalar| match scalar {
+            None => "<null>".to_string(),
+            Some(RowScalar::StableId(value))
+            | Some(RowScalar::String(value))
+            | Some(RowScalar::ConstrainedEnum(value))
+            | Some(RowScalar::DeclarationIdentity(value)) => value.clone(),
+            Some(RowScalar::Integer(value)) => value.to_string(),
+            Some(RowScalar::Boolean(value)) => value.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 /// The roles asserted by one family of asserts, deduplicated. Capability
