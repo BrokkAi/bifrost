@@ -1528,52 +1528,6 @@ pub(super) struct LineRangeAnchorSelector<'a> {
     anchor: &'a str,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::analyzer::{AnalyzerConfig, CppAnalyzer, WorkspaceAnalyzer};
-    use crate::test_support::AnalyzerFixture;
-    use std::sync::Arc;
-
-    #[test]
-    fn cpp_canonical_selectors_use_persisted_facts_without_full_hydration() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Cpp,
-            &[
-                ("include/api.h", "int compute(int value);\n"),
-                (
-                    "src/api.cpp",
-                    "#include \"../include/api.h\"\nint compute(int value) { return value; }\n",
-                ),
-            ],
-        );
-        let initial = fixture.analyzer.analyzer();
-        assert_eq!(2, initial.definitions("compute").count());
-
-        let reopened = WorkspaceAnalyzer::build(
-            Arc::new(fixture.test_project().clone()),
-            AnalyzerConfig::default(),
-        );
-        let analyzer = reopened.analyzer();
-        let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
-        let definitions: Vec<_> = analyzer.definitions("compute").collect();
-        assert_eq!(2, definitions.len());
-
-        cpp.reset_full_hydration_count_for_test();
-        let selectors = cpp_canonical_selectors(analyzer, &definitions);
-        assert!(
-            selectors
-                .values()
-                .all(|selector| selector == "include/api.h#compute")
-        );
-        assert_eq!(
-            0,
-            cpp.full_hydration_count_for_test(),
-            "selector facts must not hydrate the persisted header or implementation"
-        );
-    }
-}
-
 pub(super) fn line_range_anchor_selector(input: &str) -> Option<LineRangeAnchorSelector<'_>> {
     let (file_path, anchor) = input
         .rsplit_once("::")
@@ -1805,4 +1759,50 @@ pub(super) fn language_name(language: Language) -> String {
         Language::Kotlin => "kotlin",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{AnalyzerConfig, CppAnalyzer, WorkspaceAnalyzer};
+    use crate::test_support::AnalyzerFixture;
+    use std::sync::Arc;
+
+    #[test]
+    fn cpp_canonical_selectors_use_persisted_facts_without_full_hydration() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Cpp,
+            &[
+                ("include/api.h", "int compute(int value);\n"),
+                (
+                    "src/api.cpp",
+                    "#include \"../include/api.h\"\nint compute(int value) { return value; }\n",
+                ),
+            ],
+        );
+        let initial = fixture.analyzer.analyzer();
+        assert_eq!(2, initial.definitions("compute").count());
+
+        let reopened = WorkspaceAnalyzer::build(
+            Arc::new(fixture.test_project().clone()),
+            AnalyzerConfig::default(),
+        );
+        let analyzer = reopened.analyzer();
+        let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
+        let definitions: Vec<_> = analyzer.definitions("compute").collect();
+        assert_eq!(2, definitions.len());
+
+        cpp.reset_full_hydration_count_for_test();
+        let selectors = cpp_canonical_selectors(analyzer, &definitions);
+        assert!(
+            selectors
+                .values()
+                .all(|selector| selector == "include/api.h#compute")
+        );
+        assert_eq!(
+            0,
+            cpp.full_hydration_count_for_test(),
+            "selector facts must not hydrate the persisted header or implementation"
+        );
+    }
 }

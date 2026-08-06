@@ -2,8 +2,8 @@ use crate::call_match::{
     CppArgType, cpp_signature_param_types, cpp_split_top_level_commas, normalize_cpp_type_name,
 };
 use crate::declarations::{
-    cpp_export_macro_token, cpp_template_term, node_text, normalize_cpp_whitespace,
-    recovered_exported_class_has_body,
+    cpp_export_macro_token, cpp_field_declaration_linkage, cpp_template_term, node_text,
+    normalize_cpp_whitespace, recovered_exported_class_has_body,
 };
 use crate::graph::CppGraphSource;
 use crate::graph::extractor::ScanCtx;
@@ -12,7 +12,7 @@ use crate::imports::{
     IncludeTargetIndex, include_paths as cpp_include_paths, resolve_include_targets_with_index,
 };
 use brokk_bifrost_core::analyzer::model::{
-    CallableArity, CodeUnitType, CppTemplateExpression, CppTemplateMetadata,
+    CallableArity, CodeUnitType, CppFieldLinkage, CppTemplateExpression, CppTemplateMetadata,
     CppTemplateParameterMetadata, CppTemplateTerm,
 };
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
@@ -9871,7 +9871,7 @@ pub fn cpp_global_field_has_internal_linkage(
         CppFieldLinkage::InternalUnlessExternalPeer => {
             !cpp_global_field_linkage_peers(analyzer, candidate)
                 .filter_map(|peer| cpp_global_field_declaration_linkage(analyzer, peer))
-                .any(CppFieldLinkage::is_explicit_external)
+                .any(|linkage| matches!(linkage, CppFieldLinkage::External))
         }
     }
 }
@@ -9927,6 +9927,9 @@ fn cpp_global_field_declaration_linkage(
     analyzer: &CppGraphSource<'_>,
     candidate: &CodeUnit,
 ) -> Option<CppFieldLinkage> {
+    if let Some(linkage) = analyzer.cpp_field_linkage(candidate) {
+        return Some(linkage);
+    }
     let cpp = analyzer.cpp?;
     if let Some(prepared) = cpp.prepared_syntax(candidate.source()) {
         return cpp_global_field_declaration_linkage_in_tree(
@@ -9957,7 +9960,7 @@ fn cpp_global_field_declaration_linkage_in_tree(
     analyzer.ranges(candidate).iter().find_map(|range| {
         node_for_exact_range(root, range)
             .and_then(enclosing_cpp_field_declaration)
-            .map(|declaration| cpp_field_declaration_linkage(source, declaration))
+            .map(|declaration| cpp_field_declaration_linkage(declaration, source))
     })
 }
 
@@ -9967,82 +9970,6 @@ fn enclosing_cpp_field_declaration(mut node: Node<'_>) -> Option<Node<'_>> {
             return Some(node);
         }
         node = node.parent()?;
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CppFieldLinkage {
-    Internal,
-    External,
-    InternalUnlessExternalPeer,
-}
-
-impl CppFieldLinkage {
-    fn is_explicit_external(self) -> bool {
-        matches!(self, Self::External)
-    }
-}
-
-fn cpp_field_declaration_linkage(source: &str, declaration: Node<'_>) -> CppFieldLinkage {
-    let mut current = declaration.parent();
-    let mut enclosed_by_class = false;
-    while let Some(node) = current {
-        if node.kind() == "namespace_definition"
-            && node
-                .child_by_field_name("name")
-                .is_none_or(|name| normalize_cpp_whitespace(node_text(name, source)).is_empty())
-        {
-            return CppFieldLinkage::Internal;
-        }
-        if matches!(
-            node.kind(),
-            "class_specifier" | "struct_specifier" | "union_specifier"
-        ) && node
-            .child_by_field_name("name")
-            .is_none_or(|name| normalize_cpp_whitespace(node_text(name, source)).is_empty())
-        {
-            return CppFieldLinkage::Internal;
-        }
-        if matches!(
-            node.kind(),
-            "class_specifier" | "struct_specifier" | "union_specifier"
-        ) {
-            enclosed_by_class = true;
-        }
-        if matches!(node.kind(), "function_definition" | "lambda_expression") {
-            return CppFieldLinkage::Internal;
-        }
-        current = node.parent();
-    }
-    if enclosed_by_class {
-        return CppFieldLinkage::External;
-    }
-    let mut cursor = declaration.walk();
-    let mut has_static = false;
-    let mut has_extern = false;
-    let mut has_inline = false;
-    let mut has_const = false;
-    let mut has_constexpr = false;
-    for child in declaration.named_children(&mut cursor) {
-        let text = normalize_cpp_whitespace(node_text(child, source));
-        match (child.kind(), text.as_str()) {
-            ("storage_class_specifier", "static") => has_static = true,
-            ("storage_class_specifier", "extern") => has_extern = true,
-            ("storage_class_specifier", "inline") => has_inline = true,
-            ("storage_class_specifier", "constexpr") => has_constexpr = true,
-            ("type_qualifier", "const") => has_const = true,
-            ("type_qualifier", "constexpr") => has_constexpr = true,
-            _ => {}
-        }
-    }
-    if has_static {
-        CppFieldLinkage::Internal
-    } else if has_extern || has_inline {
-        CppFieldLinkage::External
-    } else if has_const || has_constexpr {
-        CppFieldLinkage::InternalUnlessExternalPeer
-    } else {
-        CppFieldLinkage::External
     }
 }
 

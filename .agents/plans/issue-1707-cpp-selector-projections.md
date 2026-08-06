@@ -13,6 +13,9 @@ C++ navigation must render a canonical selector without loading every stored fac
 - [x] Replace selector signature, role, linkage, range, and include reads with persisted projections.
 - [x] Add a persisted C++ behavior test that proves selector rendering does not hydrate a FileState.
 - [x] Run focused tests and the repeat Phalcon probe.
+- [x] Persist C++ global-field linkage and read it without preparing source syntax.
+- [x] Run a focused linkage regression and repeat the Phalcon probe.
+- [ ] Avoid repeated syntax preparation in unconditional C++ include-reachability checks.
 - [ ] Run the required policy check after MCP tool registration is repaired.
 
 ## Surprises & Discoveries
@@ -27,6 +30,12 @@ C++ navigation must render a canonical selector without loading every stored fac
   Evidence: The changed sample records `CppSelectorFacts::load`, `signatures_limited`, and `ranges_limited` without a FileState hydration below that stack.
 - Observation: The remaining dominant cost is C++ reference resolution, not selector rendering.
   Evidence: The changed sample shows `get_definitions_by_reference` building `VisibilityIndex`, which calls `cpp_global_field_declaration_linkage` and parses full source through `prepared_syntax`.
+- Observation: Persisted C++ global-field linkage removes that visibility-build syntax path.
+  Evidence: The focused regression preserves an `extern const` peer result with zero full FileState hydrations. The repeat sample calls `CppAnalyzer::cpp_field_linkage` directly.
+- Observation: The second change improves early progress but not the five-minute total.
+  Evidence: It reached 40 records at 1:40, but stayed at 44 records through 5:40. The selector-only run also reached 44.
+- Observation: Include-reachability is now the dominant syntax cost.
+  Evidence: The repeat sample attributes 1,237 `prepared_syntax` calls to `unconditional_include_reaches` during C++ reference resolution.
 
 ## Decision Log
 
@@ -36,9 +45,9 @@ C++ navigation must render a canonical selector without loading every stored fac
 
 ## Outcomes & Retrospective
 
-The selector path no longer needs full FileState hydration when persisted rows are complete. The dedicated test proves this behavior. The Phalcon probe made four more records, but it still stopped. The next focused change must avoid syntax preparation while C++ visibility resolution classifies global-field linkage. That work is separate from selector rendering.
+The selector path no longer needs full FileState hydration when persisted rows are complete. The dedicated test proves this behavior. Persisted global-field linkage also prevents a visibility-build parse. The Phalcon probe still stops at 44 records because unconditional include-reachability reparses the large include graph. The next focused change must persist or directly project the guard facts that this check needs.
 
-Focused validation passed: `cargo fmt --check`, the persisted selector test, the six issue-1092 C++ identity tests, and `cargo clippy -p brokk-bifrost-analysis --all-targets -- -D warnings`. The policy skill is installed, but `list_policies` and `run_policy` are not registered in this task. The required policy result is therefore unavailable.
+Focused validation passed: `cargo fmt --check`, the persisted selector test, the six issue-1092 C++ identity tests, the global-field linkage regression, and `cargo clippy -p brokk-bifrost-analysis --all-targets -- -D warnings`. The policy skill is installed, but `list_policies` and `run_policy` are not registered in this task. The required policy result is therefore unavailable.
 
 ## Context and Orientation
 

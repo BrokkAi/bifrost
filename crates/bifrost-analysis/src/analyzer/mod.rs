@@ -158,7 +158,7 @@ pub use model::{
     StructuredTypeIdentity, StructuredTypeName, SummaryFileProjection, TestAssertionAnalysis,
     TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
 };
-pub(crate) use model::{CallableLinkage, CppTemplateMetadata};
+pub(crate) use model::{CallableLinkage, CppFieldLinkage, CppTemplateMetadata};
 pub use multi_analyzer::resolve_analyzer;
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
 pub use php::{

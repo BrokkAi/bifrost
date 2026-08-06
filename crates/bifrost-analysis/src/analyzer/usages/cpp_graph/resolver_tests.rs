@@ -454,6 +454,7 @@ ABSL_NAMESPACE_END
                     && unit.source() == &definition
             })
             .expect("definition global field");
+        analyzer.reset_full_hydration_count_for_test();
         let (internal, inspected_peers) =
             with_cpp_global_field_linkage_peer_inspection_counter_for_test(|| {
                 cpp_global_field_has_internal_linkage(
@@ -469,6 +470,11 @@ ABSL_NAMESPACE_END
         assert_eq!(
             inspected_peers, 1,
             "exact-fqn peer lookup should inspect only the matching extern peer, not unrelated globals from the rest of the workspace"
+        );
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            0,
+            "persisted field linkage must avoid preparing source syntax during global-field resolution"
         );
     }
 

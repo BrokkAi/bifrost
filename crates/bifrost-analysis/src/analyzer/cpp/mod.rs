@@ -36,10 +36,10 @@ use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::weighted_cache::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    DirectDescendantIndex, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, ImportInfo,
-    Language, PoolSafeMemo, Project, ProjectFile, Range, SignatureMetadata, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
-    TypeHierarchyProvider, resolve_analyzer,
+    CppFieldLinkage, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer,
+    ImportAnalysisProvider, ImportInfo, Language, PoolSafeMemo, Project, ProjectFile, Range,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -501,6 +501,19 @@ impl CppSource for CppAnalyzer {
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
         CppAnalyzer::prepared_syntax(self, file)
+    }
+
+    fn cpp_field_linkage(&self, code_unit: &CodeUnit) -> Option<CppFieldLinkage> {
+        if !code_unit.is_field() {
+            return None;
+        }
+        let metadata = CppAnalyzer::signature_metadata_limited(self, code_unit, 2);
+        metadata
+            .complete
+            .then_some(metadata.rows)
+            .into_iter()
+            .flatten()
+            .find_map(|metadata| metadata.cpp_field_linkage())
     }
 
     fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
