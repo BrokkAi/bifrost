@@ -13,7 +13,7 @@
 //!
 //! Analyzer access is on [`JsTsSource`] wherever the cluster reaches a
 //! JS/TS-only capability (the type-vs-value candidate spaces, which read
-//! `js_ts_is_type_alias`, and the import-candidate resolvers, which reach the
+//! `is_type_alias`, and the import-candidate resolvers, which reach the
 //! per-language usage index through the host's memo caches). The three helpers
 //! that only read declaration ranges take `&dyn CodeUnitIndex` instead, so their
 //! framework callers need no downcast at all.

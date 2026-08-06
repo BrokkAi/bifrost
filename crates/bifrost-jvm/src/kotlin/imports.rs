@@ -276,11 +276,11 @@ pub fn compute_kotlin_same_package_reference_index(
 ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
     let mut targets_by_package_and_name: HashMap<(String, String), Vec<ProjectFile>> =
         HashMap::default();
-    for file in source.kotlin_all_files() {
+    for file in source.all_files() {
         if language_for_file(&file) != Language::Kotlin {
             continue;
         }
-        let package = source.kotlin_package_name_of(&file).unwrap_or_default();
+        let package = source.package_name_of(&file).unwrap_or_default();
         for declaration in source.top_level_declarations(&file) {
             targets_by_package_and_name
                 .entry((package.clone(), declaration.identifier().to_string()))
@@ -289,14 +289,14 @@ pub fn compute_kotlin_same_package_reference_index(
         }
     }
 
-    let files: Vec<_> = source.kotlin_all_files();
+    let files: Vec<_> = source.all_files();
     build_reverse_file_index(
         &files,
         |candidate| {
             if language_for_file(candidate) != Language::Kotlin {
                 return Vec::new();
             }
-            let package = source.kotlin_package_name_of(candidate).unwrap_or_default();
+            let package = source.package_name_of(candidate).unwrap_or_default();
             let Some(identifiers) = source.type_identifiers_of(candidate) else {
                 return Vec::new();
             };
@@ -329,10 +329,8 @@ pub fn kotlin_could_import_file(
         return false;
     }
 
-    let source_package = source
-        .kotlin_package_name_of(source_file)
-        .unwrap_or_default();
-    let target_package = source.kotlin_package_name_of(target).unwrap_or_default();
+    let source_package = source.package_name_of(source_file).unwrap_or_default();
+    let target_package = source.package_name_of(target).unwrap_or_default();
     if source_package == target_package {
         return true;
     }

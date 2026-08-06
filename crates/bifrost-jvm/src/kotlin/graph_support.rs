@@ -40,10 +40,10 @@ pub trait KotlinSource: CodeUnitIndex + ImportAnalysisProvider {
     ///
     /// `CodeUnitIndex::analyzed_files` is a different query, so this is spelled
     /// out rather than inferred from the supertrait.
-    fn kotlin_all_files(&self) -> Vec<ProjectFile>;
+    fn all_files(&self) -> Vec<ProjectFile>;
 
     /// The file's `package` declaration.
-    fn kotlin_package_name_of(&self, file: &ProjectFile) -> Option<String>;
+    fn package_name_of(&self, file: &ProjectFile) -> Option<String>;
 
     /// The workspace's usage-definition index, as the bounded lookup contract.
     fn usage_definitions(&self) -> &dyn BoundedDefinitionLookup;

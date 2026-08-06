@@ -15,7 +15,7 @@
 //! imports.rs`, `analyzer/java/imports.rs`, `analyzer/csharp/imports.rs` all
 //! keep the cache lookup on the analysis side and call the crate for the
 //! uncached work). So the trait below exposes *products* rather than the
-//! bucket: `js_ts_usage_index` is the analyzer-cached resolution index, and the
+//! bucket: `usage_index` is the analyzer-cached resolution index, and the
 //! get-then-insert wrappers for imported code units, referencing files,
 //! relevant imports, import target files and direct ancestors stay in
 //! `analyzer/js_ts/providers.rs`, calling the uncached functions here.
@@ -49,44 +49,45 @@ use crate::graph::resolver::JsTsUsageIndex;
 /// `import_info_of` on [`ImportAnalysisProvider`], `top_level_declarations` and
 /// `get_source` on [`CodeUnitIndex`] -- both analyzers' impls of all three are
 /// the same one-line delegation the free functions used directly before. The
-/// ones named below are not: `js_ts_all_files` is the analyzed *live* file set
+/// ones named below are not: `all_files` is the analyzed *live* file set
 /// (`CodeUnitIndex::analyzed_files` is a different query),
-/// `js_ts_bulk_import_infos` has no core counterpart,
-/// `js_ts_raw_supertypes_of` returns the unresolved supertype spellings that
-/// [`TypeHierarchyProvider`] never exposes, and `js_ts_import_statements` reads
+/// `bulk_import_infos` has no core counterpart,
+/// `raw_supertypes_of` returns the unresolved supertype spellings that
+/// [`TypeHierarchyProvider`] never exposes, and `import_statements` reads
 /// the raw import statement text the module skeleton renders.
 pub trait JsTsSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider {
     /// The analyzer's shared alias resolver. Returned by handle so a caller
     /// that must own one (the receiver-fact provider) shares this instance's
     /// config memo instead of constructing a resolver whose memo starts cold.
     fn alias_resolver(&self) -> &Arc<AliasResolver>;
-    fn js_ts_language(&self) -> Language;
+    fn language(&self) -> Language;
 
     /// The analyzed live file set (`TreeSitterAnalyzer::all_files`).
-    fn js_ts_all_files(&self) -> Vec<ProjectFile>;
+    fn all_files(&self) -> Vec<ProjectFile>;
 
     /// Import facts for a group of files in one read.
-    fn js_ts_bulk_import_infos(
-        &self,
-        files: &[ProjectFile],
-    ) -> HashMap<ProjectFile, Vec<ImportInfo>>;
+    fn bulk_import_infos(&self, files: &[ProjectFile]) -> HashMap<ProjectFile, Vec<ImportInfo>>;
 
     /// The supertype names written on `code_unit`, unresolved.
-    fn js_ts_raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String>;
+    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String>;
 
     /// The file's import statements as written, used to render a module skeleton.
-    fn js_ts_import_statements(&self, file: &ProjectFile) -> Vec<String>;
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String>;
 
     /// Whether the indexed declaration is a type alias. Distinct from
     /// `TypeAliasProvider::is_type_alias`, which only TypeScript answers: this
     /// reads the analyzer's own index, so both dialects can answer it and only
     /// TypeScript's skeleton path asks.
-    fn js_ts_is_type_alias(&self, code_unit: &CodeUnit) -> bool;
+    ///
+    /// The two share a name without ambiguity because `TypeAliasProvider` is
+    /// deliberately not a supertrait of this trait, and every caller reaches
+    /// this one through `&dyn JsTsSource`.
+    fn is_type_alias(&self, code_unit: &CodeUnit) -> bool;
 
     /// The indexed signatures for `code_unit` exactly as stored. TypeScript's
     /// `CodeUnitIndex::signatures` appends a `;` to alias signatures for
     /// rendering, which the alias skeleton must not double up on.
-    fn js_ts_raw_signatures(&self, code_unit: &CodeUnit) -> Vec<String>;
+    fn raw_signatures(&self, code_unit: &CodeUnit) -> Vec<String>;
 
     /// The workspace's usage-definition index, as the bounded lookup contract.
     ///
@@ -96,15 +97,12 @@ pub trait JsTsSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProv
     /// lookup is the part of it this crate actually reads.
     fn usage_definitions(&self) -> &dyn BoundedDefinitionLookup;
 
-    /// The analyzer-cached JS/TS resolution index for this host's own language,
+    /// The analyzer-cached JS/TS resolution index for this source's own language,
     /// built on first use. `None` only when `cancellation` fires mid-build.
     ///
     /// The memo cell behind it is a `PoolSafeMemo` on the analysis-side cache
     /// bucket; this is the product, not the cell.
-    fn js_ts_usage_index(
-        &self,
-        cancellation: Option<&CancellationToken>,
-    ) -> Option<Arc<JsTsUsageIndex>>;
+    fn usage_index(&self, cancellation: Option<&CancellationToken>) -> Option<Arc<JsTsUsageIndex>>;
 }
 
 // --- ImportAnalysisProvider ------------------------------------------------
@@ -118,7 +116,7 @@ pub fn resolve_imported_code_units(
     file: &ProjectFile,
     imports: impl IntoIterator<Item = ImportInfo>,
 ) -> HashSet<CodeUnit> {
-    let language = host.js_ts_language();
+    let language = host.language();
     let alias_resolver = host.alias_resolver();
     let mut resolved = HashSet::default();
     for import in imports {
@@ -171,7 +169,7 @@ pub fn import_infos_for_files(
     host: &dyn JsTsSource,
     files: &[ProjectFile],
 ) -> Option<HashMap<ProjectFile, Vec<ImportInfo>>> {
-    Some(host.js_ts_bulk_import_infos(files))
+    Some(host.bulk_import_infos(files))
 }
 
 pub fn imported_files_from_infos(
@@ -179,7 +177,7 @@ pub fn imported_files_from_infos(
     file: &ProjectFile,
     imports: &[ImportInfo],
 ) -> Option<HashSet<ProjectFile>> {
-    let language = host.js_ts_language();
+    let language = host.language();
     let alias_resolver = host.alias_resolver();
     Some(
         imports
@@ -223,7 +221,7 @@ pub fn resolve_import_target_files(
     host: &dyn JsTsSource,
     file: &ProjectFile,
 ) -> HashSet<ProjectFile> {
-    let language = host.js_ts_language();
+    let language = host.language();
     let alias_resolver = host.alias_resolver();
     host.import_info_of(file)
         .iter()
@@ -242,7 +240,7 @@ pub fn module_import_skeleton(host: &dyn JsTsSource, code_unit: &CodeUnit) -> Op
         return None;
     }
 
-    let imports = host.js_ts_import_statements(code_unit.source());
+    let imports = host.import_statements(code_unit.source());
     (!imports.is_empty()).then(|| imports.join("\n"))
 }
 
@@ -252,15 +250,15 @@ pub fn module_import_skeleton(host: &dyn JsTsSource, code_unit: &CodeUnit) -> Op
 ///
 /// The uncached body behind `TypeHierarchyProvider::get_direct_ancestors`.
 pub fn compute_direct_ancestors(host: &dyn JsTsSource, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-    let Some(index) = host.js_ts_usage_index(None) else {
+    let Some(index) = host.usage_index(None) else {
         return Vec::new();
     };
     resolve_direct_ancestors(
         host,
         index.as_ref(),
-        host.js_ts_language(),
+        host.language(),
         host.alias_resolver(),
         code_unit,
-        &host.js_ts_raw_supertypes_of(code_unit),
+        &host.raw_supertypes_of(code_unit),
     )
 }

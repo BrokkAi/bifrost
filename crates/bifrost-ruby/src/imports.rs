@@ -391,7 +391,7 @@ pub fn build_autoload_constant_files(
     ruby: &dyn RubySource,
 ) -> HashMap<String, HashSet<ProjectFile>> {
     let mut index: HashMap<String, HashSet<ProjectFile>> = HashMap::default();
-    for file in ruby.ruby_all_files() {
+    for file in ruby.all_files() {
         let Ok(source) = ruby.project().read_source(&file) else {
             continue;
         };

@@ -34,7 +34,7 @@ pub(crate) struct JsTsMemoCaches {
     pub(crate) direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     /// Whole-workspace class descendant index, built once per bucket.
     /// `PoolSafeMemo`, not `OnceLock`: the build walks every workspace class
-    /// through `get_direct_ancestors`, whose misses reach `js_ts_usage_index`
+    /// through `get_direct_ancestors`, whose misses reach `usage_index`
     /// and its rayon fan-out -- a blocking `get_or_init` held across that is
     /// the #1416 self-deadlock shape its two sibling cells below already
     /// migrated away from.

@@ -73,7 +73,7 @@ pub fn cpp_resolve_direct_ancestors(cpp: &dyn CppSource, code_unit: &CodeUnit) -
 
     let visible = cpp.visible_type_units(code_unit.source());
     let mut ancestors = Vec::new();
-    for raw in cpp.cpp_raw_supertypes_of(code_unit) {
+    for raw in cpp.raw_supertypes_of(code_unit) {
         if let Some(ancestor) = resolve_base_type(cpp, code_unit, &raw, &visible)
             && !ancestors.iter().any(|existing| existing == &ancestor)
         {

@@ -56,13 +56,13 @@ pub fn jsts_type_space_candidates(
     }
 }
 
-/// The type-alias question goes through [`JsTsSource::js_ts_is_type_alias`]
+/// The type-alias question goes through [`JsTsSource::is_type_alias`]
 /// rather than `IAnalyzer::type_alias_provider`: both spellings read the same
 /// TypeScript declaration index for a TypeScript unit, and both answer `false`
 /// for a JavaScript one (JavaScript has no `TypeAliasProvider`), but only the
 /// host spelling keeps this file off `IAnalyzer`.
 pub fn jsts_unit_is_type_only(host: &dyn JsTsSource, unit: &CodeUnit) -> bool {
-    if host.js_ts_is_type_alias(unit) {
+    if host.is_type_alias(unit) {
         return true;
     }
     unit.signature().is_some_and(jsts_signature_is_type_only)

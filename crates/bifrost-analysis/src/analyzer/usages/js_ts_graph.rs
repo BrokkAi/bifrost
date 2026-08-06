@@ -104,13 +104,13 @@ where
 /// The downcasting half of the pair: framework callers that hold only a
 /// `&dyn IAnalyzer` (the definition trace, the dead-code pass, the edge builders)
 /// come through here. Everything already holding a `JsTsSource` calls
-/// `JsTsSource::js_ts_usage_index` directly.
+/// `JsTsSource::usage_index` directly.
 pub(crate) fn cached_jsts_index(
     analyzer: &dyn IAnalyzer,
     language: Language,
     cancellation: Option<&CancellationToken>,
 ) -> Option<Arc<JsTsUsageIndex>> {
-    resolve_js_ts_source(analyzer, language)?.js_ts_usage_index(cancellation)
+    resolve_js_ts_source(analyzer, language)?.usage_index(cancellation)
 }
 
 pub(in crate::analyzer::usages) fn prewarm_cached_jsts_index(
@@ -158,10 +158,8 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
         }
 
         let cancellation = scan_scope.cancellation();
-        let index = resolve_js_ts_source(analyzer, language).and_then(|host| {
-            host.js_ts_usage_index(cancellation)
-                .map(|index| (host, index))
-        });
+        let index = resolve_js_ts_source(analyzer, language)
+            .and_then(|host| host.usage_index(cancellation).map(|index| (host, index)));
         let Some((host, index)) = index else {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());

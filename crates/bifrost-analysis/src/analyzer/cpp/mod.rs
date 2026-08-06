@@ -470,7 +470,7 @@ impl CppSource for CppAnalyzer {
         self.inner.import_statements(file)
     }
 
-    fn cpp_raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner.raw_supertypes_of(code_unit)
     }
 
@@ -478,7 +478,7 @@ impl CppSource for CppAnalyzer {
         CppAnalyzer::visible_type_units(self, file)
     }
 
-    fn cpp_file_source(&self, file: &ProjectFile) -> Option<String> {
+    fn file_source(&self, file: &ProjectFile) -> Option<String> {
         self.inner.file_source(file)
     }
 

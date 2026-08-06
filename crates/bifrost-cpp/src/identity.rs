@@ -537,7 +537,7 @@ fn cpp_reconcile_definition_identity(
         .entry(unit.source().clone())
         .or_insert_with(|| {
             Arc::new(
-                cpp.cpp_file_source(unit.source())
+                cpp.file_source(unit.source())
                     .map(|source| cpp_file_using_namespaces(&source))
                     .unwrap_or_default(),
             )

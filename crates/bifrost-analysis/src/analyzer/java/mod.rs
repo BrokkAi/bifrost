@@ -285,7 +285,7 @@ impl JavaAnalyzer {
 /// cells, so the cells stay here and the free functions in
 /// [`brokk_bifrost_jvm::java::graph_support`] cannot reach past this surface.
 impl JavaSource for JavaAnalyzer {
-    fn java_all_files(&self) -> Vec<ProjectFile> {
+    fn all_files(&self) -> Vec<ProjectFile> {
         self.inner.all_files()
     }
 

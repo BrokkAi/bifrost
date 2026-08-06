@@ -161,34 +161,31 @@ impl JsTsSource for TypescriptAnalyzer {
         &self.alias_resolver
     }
 
-    fn js_ts_language(&self) -> Language {
+    fn language(&self) -> Language {
         Language::TypeScript
     }
 
-    fn js_ts_all_files(&self) -> Vec<ProjectFile> {
+    fn all_files(&self) -> Vec<ProjectFile> {
         self.inner.all_files()
     }
 
-    fn js_ts_bulk_import_infos(
-        &self,
-        files: &[ProjectFile],
-    ) -> HashMap<ProjectFile, Vec<ImportInfo>> {
+    fn bulk_import_infos(&self, files: &[ProjectFile]) -> HashMap<ProjectFile, Vec<ImportInfo>> {
         self.inner.bulk_import_infos(files.iter().cloned())
     }
 
-    fn js_ts_raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner.raw_supertypes_of(code_unit)
     }
 
-    fn js_ts_import_statements(&self, file: &ProjectFile) -> Vec<String> {
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
         self.inner.import_statements(file)
     }
 
-    fn js_ts_is_type_alias(&self, code_unit: &CodeUnit) -> bool {
+    fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
         self.inner.is_type_alias(code_unit)
     }
 
-    fn js_ts_raw_signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
+    fn raw_signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner.signatures_vec_of(code_unit)
     }
 
@@ -196,7 +193,7 @@ impl JsTsSource for TypescriptAnalyzer {
         self.inner.global_usage_definition_index_ref()
     }
 
-    fn js_ts_usage_index(
+    fn usage_index(
         &self,
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> Option<Arc<JsTsUsageIndex>> {

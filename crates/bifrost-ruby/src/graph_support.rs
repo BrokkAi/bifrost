@@ -14,7 +14,7 @@
 //!   landed precedent. Its body reads `TreeSitterAnalyzer::fetch_file_state`,
 //!   whose `Arc<FileState>` is crate-private to analysis, so it stays there and
 //!   hands the decoded facts across (the Py-2 `collect_bounded` precedent).
-//! * [`RubySource::ruby_all_files`] is `TreeSitterAnalyzer::all_files`, i.e. the
+//! * [`RubySource::all_files`] is `TreeSitterAnalyzer::all_files`, i.e. the
 //!   analyzed *live* file set. `CodeUnitIndex::analyzed_files` is a different
 //!   query, so this is spelled out rather than inferred from the supertrait.
 
@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 pub trait RubySource: CodeUnitIndex + TypeHierarchyProvider + ImportAnalysisProvider {
     /// The analyzed live file set (`TreeSitterAnalyzer::all_files`).
-    fn ruby_all_files(&self) -> Vec<ProjectFile>;
+    fn all_files(&self) -> Vec<ProjectFile>;
 
     /// Workspace-wide `autoload :Const, "path"` edges, keyed by the `$`-joined
     /// constant name. Built by [`crate::imports::build_autoload_constant_files`].

@@ -111,7 +111,7 @@ pub(crate) fn referencing_files_of(
 
     let reverse_index = memoized_reverse_import_index(
         &caches.reverse_import_index,
-        || host.js_ts_all_files(),
+        || host.all_files(),
         |candidate| imported_code_units_of(host, candidate),
     );
     let referencing = reverse_index
@@ -237,7 +237,7 @@ pub(crate) fn get_direct_descendants(
 /// language. Built once per cache bucket and reused until `update`/`update_all`
 /// installs a fresh bucket.
 pub(crate) fn jsts_usage_index(host: &dyn JsTsMemoSource) -> Arc<JsTsUsageIndex> {
-    let language = host.js_ts_language();
+    let language = host.language();
     host.memo_caches().jsts_usage_index.get_or_build(
         || build_jsts_usage_index(host, host.alias_resolver(), language, true),
         || build_jsts_usage_index(host, host.alias_resolver(), language, false),
@@ -248,7 +248,7 @@ pub(crate) fn jsts_usage_index_with_cancellation(
     host: &dyn JsTsMemoSource,
     cancellation: &CancellationToken,
 ) -> Option<Arc<JsTsUsageIndex>> {
-    let language = host.js_ts_language();
+    let language = host.language();
     host.memo_caches()
         .jsts_usage_index
         .get_or_try_build(
@@ -277,7 +277,7 @@ pub(crate) fn jsts_usage_index_with_cancellation(
 }
 
 pub(crate) fn prewarm_jsts_usage_index(host: &dyn JsTsMemoSource) -> Arc<JsTsUsageIndex> {
-    let language = host.js_ts_language();
+    let language = host.language();
     host.memo_caches().jsts_usage_index.get_or_build_parallel(
         || build_jsts_usage_index(host, host.alias_resolver(), language, true),
         || build_jsts_usage_index(host, host.alias_resolver(), language, false),

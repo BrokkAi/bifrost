@@ -288,11 +288,11 @@ impl TypeAliasProvider for KotlinAnalyzer {
 }
 
 impl KotlinSource for KotlinAnalyzer {
-    fn kotlin_all_files(&self) -> Vec<ProjectFile> {
+    fn all_files(&self) -> Vec<ProjectFile> {
         self.inner.all_files()
     }
 
-    fn kotlin_package_name_of(&self, file: &ProjectFile) -> Option<String> {
+    fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
         self.inner.package_name_of(file)
     }
 

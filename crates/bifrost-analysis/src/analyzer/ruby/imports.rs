@@ -103,7 +103,7 @@ impl ImportAnalysisProvider for RubyAnalyzer {
 /// rebuild it wholesale through `Self::from_inner`; this impl is the only place
 /// the crate can reach them.
 impl brokk_bifrost_ruby::graph_support::RubySource for RubyAnalyzer {
-    fn ruby_all_files(&self) -> Vec<ProjectFile> {
+    fn all_files(&self) -> Vec<ProjectFile> {
         self.inner.all_files()
     }
 

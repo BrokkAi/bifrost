@@ -109,8 +109,8 @@ pub fn parse_typescript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
 /// A type alias renders as its own signature line. TypeScript-only: no other
 /// dialect in this family has the form.
 pub fn ts_type_alias_skeleton(host: &dyn JsTsSource, code_unit: &CodeUnit) -> Option<String> {
-    host.js_ts_is_type_alias(code_unit)
-        .then(|| host.js_ts_raw_signatures(code_unit).first().cloned())
+    host.is_type_alias(code_unit)
+        .then(|| host.raw_signatures(code_unit).first().cloned())
         .flatten()
 }
 

@@ -23,7 +23,7 @@
 //! * [`CppSource::cpp_import_statements`] is `IAnalyzer::import_statements`,
 //!   the raw `#include` lines. No core capability exposes it, so it is spelled
 //!   out rather than inherited from a supertrait.
-//! * [`CppSource::cpp_raw_supertypes_of`] is
+//! * [`CppSource::raw_supertypes_of`] is
 //!   `TreeSitterAnalyzer::raw_supertypes_of`, whose rows are crate-private to
 //!   analysis; the analyzer hands the decoded base-specifier strings across.
 
@@ -44,18 +44,27 @@ pub trait CppSource:
     fn include_target_index(&self) -> &IncludeTargetIndex;
 
     /// The raw `#include` lines recorded for `file` (`IAnalyzer::import_statements`).
+    ///
+    /// The one member of this trait that keeps its `cpp_` prefix. Dropping it
+    /// is an E0034 ambiguity, because [`CppWorkspaceSource`] is a supertrait
+    /// here and already spells the same query `import_statements`. The prefix
+    /// is not the real problem: for `CppAnalyzer`, the only implementor of
+    /// both, the two bodies are the same `self.inner.import_statements(file)`
+    /// call, so this member duplicates one it inherits. Removing a published
+    /// trait method is surface curation rather than renaming, so it is left
+    /// for #1731 item 2 instead of being folded in here.
     fn cpp_import_statements(&self, file: &ProjectFile) -> Vec<String>;
 
     /// The declared base specifiers of `code_unit`, as written
     /// (`TreeSitterAnalyzer::raw_supertypes_of`).
-    fn cpp_raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String>;
+    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String>;
 
     /// Every class-like or alias declaration reachable from `file` through its
     /// `#include` closure, memoized per file. See this module's note.
     fn visible_type_units(&self, file: &ProjectFile) -> Arc<Vec<CodeUnit>>;
 
     /// The indexed source of `file` (`TreeSitterAnalyzer::file_source`).
-    fn cpp_file_source(&self, file: &ProjectFile) -> Option<String>;
+    fn file_source(&self, file: &ProjectFile) -> Option<String>;
 
     /// The parsed tree and its source backing for `file`, from the analyzer's
     /// query read cache.

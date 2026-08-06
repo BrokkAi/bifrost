@@ -24,7 +24,7 @@
 //!   definition route's trace recorder, whose candidate vocabulary is
 //!   analysis-owned. Which tier decided is language knowledge and stays here;
 //!   how a decision is recorded does not.
-//! * [`JavaSource::java_all_files`] is `TreeSitterAnalyzer::all_files`, the
+//! * [`JavaSource::all_files`] is `TreeSitterAnalyzer::all_files`, the
 //!   analyzed *live* file set. `CodeUnitIndex::analyzed_files` is a different
 //!   query, so this is spelled out rather than inferred from the supertrait.
 //!
@@ -56,7 +56,7 @@ use crate::java::imports::{import_package, non_static_import_path, static_import
 /// used it in both roles.
 pub trait JavaSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider {
     /// The analyzed live file set (`TreeSitterAnalyzer::all_files`).
-    fn java_all_files(&self) -> Vec<ProjectFile>;
+    fn all_files(&self) -> Vec<ProjectFile>;
 
     /// The file's `package` declaration, memoized by the analyzer.
     fn cached_package_name(&self, file: &ProjectFile) -> Option<Arc<str>>;
@@ -652,7 +652,7 @@ pub fn compute_java_same_package_reference_index(
 ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
     let mut targets_by_package_and_name: HashMap<(String, String), Vec<ProjectFile>> =
         HashMap::default();
-    for file in source.java_all_files() {
+    for file in source.all_files() {
         let package = java_package_name_of(source, &file).unwrap_or_default();
         for declaration in source.top_level_declarations(&file) {
             if declaration.is_class() || declaration.is_module() {
@@ -664,7 +664,7 @@ pub fn compute_java_same_package_reference_index(
         }
     }
 
-    let files: Vec<_> = source.java_all_files();
+    let files: Vec<_> = source.all_files();
     build_reverse_file_index(
         &files,
         |candidate| {
