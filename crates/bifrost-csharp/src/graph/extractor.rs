@@ -754,6 +754,7 @@ fn containing_method_group_value_context(node: Node<'_>) -> bool {
             "property_declaration" => {
                 return parent.child_by_field_name("value") == Some(current);
             }
+            "binary_expression" => return is_delegate_binary_operand(current, parent),
             _ => {}
         }
         if transparent_expression_parent(current, parent) {
@@ -771,11 +772,21 @@ fn transparent_expression_parent(current: Node<'_>, parent: Node<'_>) -> bool {
         "parenthesized_expression" | "checked_expression"
     ) || (parent.kind() == "cast_expression"
         && parent.child_by_field_name("value") == Some(current))
+        || is_delegate_binary_operand(current, parent)
         || (parent.kind() == "postfix_unary_expression"
             && parent.named_child(0) == Some(current)
             && parent
                 .child(parent.child_count().saturating_sub(1))
                 .is_some_and(|operator| operator.kind() == "!"))
+}
+
+fn is_delegate_binary_operand(current: Node<'_>, parent: Node<'_>) -> bool {
+    parent.kind() == "binary_expression"
+        && parent
+            .child_by_field_name("operator")
+            .is_some_and(|operator| matches!(operator.kind(), "+" | "-" | "??"))
+        && (parent.child_by_field_name("left") == Some(current)
+            || parent.child_by_field_name("right") == Some(current))
 }
 
 fn unqualified_method_call_resolution(

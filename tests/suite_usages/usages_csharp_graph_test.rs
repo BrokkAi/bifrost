@@ -5364,6 +5364,144 @@ public sealed class Subscriber {
 }
 
 #[test]
+fn usage_finder_csharp_finds_binary_delegate_method_groups() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "Demo/BinaryMethodGroups.cs",
+        r#"
+namespace Demo;
+
+public delegate void Handler(int value);
+
+public sealed class BinaryMethodGroups {
+    private void OnChanged(int value) {}
+    private void Accept(Handler callback) {}
+    private void AcceptInt(int value) {}
+
+    public void Run(Handler configure, int otherValue) {
+        Accept(configure + OnChanged);
+        Accept(configure - OnChanged);
+        Accept(configure ?? (OnChanged));
+        Accept(configure + ((Handler)OnChanged!));
+        Accept(configure ?? ((Handler)OnChanged!));
+        (configure + OnChanged).Invoke(1);
+        (configure ?? OnChanged).Invoke(1);
+        AcceptInt(1 + otherValue);
+    }
+
+    public void RunShadowed(Handler OnChanged, Handler configure) {
+        Accept(configure + OnChanged);
+        Accept(configure ?? OnChanged);
+    }
+
+    public void RunLocal(Handler configure) {
+        Handler OnChanged = _ => {};
+        Accept(configure + OnChanged);
+        Accept(configure ?? OnChanged);
+    }
+}
+
+public sealed class BinaryAmbiguous {
+    private void Handle(int value) {}
+    private void Handle(string value) {}
+    private void Accept(Handler callback) {}
+
+    public void Run(Handler configure) {
+        Accept(configure + Handle);
+        Accept(configure ?? Handle);
+    }
+}
+"#,
+    )]);
+
+    let target = member_function_with_arity(&analyzer, "Demo.BinaryMethodGroups", "OnChanged", 1);
+    let consumer = project.file("Demo/BinaryMethodGroups.cs");
+    let source = consumer
+        .read_to_string()
+        .expect("binary method-group source");
+    let expected = [
+        "Accept(configure + OnChanged);",
+        "Accept(configure - OnChanged);",
+        "Accept(configure ?? (OnChanged));",
+        "Accept(configure + ((Handler)OnChanged!));",
+        "Accept(configure ?? ((Handler)OnChanged!));",
+        "(configure + OnChanged).Invoke(1);",
+        "(configure ?? OnChanged).Invoke(1);",
+    ]
+    .into_iter()
+    .map(|line| {
+        let start = source.find(line).expect("binary method-group line");
+        start + line.find("OnChanged").expect("binary method-group name")
+    })
+    .collect::<Vec<_>>();
+
+    let graph = graph_hits(&analyzer, &target);
+    assert_eq!(
+        7,
+        graph.len(),
+        "binary method groups must exclude shadows and fields: {graph:#?}"
+    );
+    for start in &expected {
+        assert!(
+            graph.iter().any(|hit| {
+                hit.start_offset <= *start && *start + "OnChanged".len() <= hit.end_offset
+            }),
+            "missing inverted binary method-group hit at {start}: {graph:#?}"
+        );
+    }
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let routed = query
+        .result
+        .into_either()
+        .expect("binary method-group query should resolve");
+    assert_eq!(
+        7,
+        routed.len(),
+        "targeted extraction must match inverted binary method groups: {routed:#?}"
+    );
+
+    let ambiguous =
+        member_function_with_signature(&analyzer, "Demo.BinaryAmbiguous", "Handle", "(int)");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = CSharpUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&ambiguous),
+        &candidates,
+        1000,
+    );
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } => {
+            assert!(
+                hits_by_overload
+                    .get(&ambiguous)
+                    .is_none_or(|hits| hits.is_empty()),
+                "ambiguous binary method groups must not be proven"
+            );
+            assert_eq!(
+                Some(&2),
+                unproven_total_by_overload.get(&ambiguous),
+                "both binary operands must remain visible as unproven evidence"
+            );
+        }
+        other => panic!("expected ambiguous binary method-group evidence, got {other:#?}"),
+    }
+}
+
+#[test]
 fn usage_finder_csharp_finds_unique_private_method_group_argument() {
     let (project, analyzer) = csharp_analyzer_with_files(&[(
         "Demo/Command.cs",

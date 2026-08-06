@@ -16,6 +16,9 @@ use crate::analyzer::{
     csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
     csharp_normalize_full_name, csharp_source_identifier,
 };
+use brokk_bifrost_csharp::syntax::{
+    csharp_using_directive_is_static, csharp_using_directive_target_node,
+};
 
 pub(super) struct CSharpDefinitionProvider<'a> {
     csharp: &'a CSharpAnalyzer,
@@ -494,7 +497,7 @@ fn resolve_csharp_in_session(
             ),
         );
     };
-    if csharp_is_declaration_name(node) {
+    if csharp_is_declaration_name(node) || csharp_is_namespace_using_target(node) {
         return no_definition(
             "declaration_or_import_site",
             format!("`{}` is not a C# reference site", site.text),
@@ -799,6 +802,24 @@ fn resolve_csharp_in_session(
             ),
         ),
     }
+}
+
+fn csharp_is_namespace_using_target(node: Node<'_>) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate.kind() == "using_directive" {
+            if csharp_using_directive_is_static(candidate)
+                || candidate.child_by_field_name("name").is_some()
+            {
+                return false;
+            }
+            return csharp_using_directive_target_node(candidate).is_some_and(|target| {
+                target.start_byte() <= node.start_byte() && target.end_byte() >= node.end_byte()
+            });
+        }
+        current = candidate.parent();
+    }
+    false
 }
 
 fn csharp_structured_receiver_type_names(
