@@ -32,6 +32,7 @@ use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
 
 pub struct ScanState<'a> {
@@ -46,7 +47,7 @@ pub struct PreparedCSharpFile {
     tree: Tree,
     line_starts: Vec<usize>,
     class_ranges: ClassRangeIndex,
-    using_aliases: HashMap<String, String>,
+    using_aliases: Arc<HashMap<String, String>>,
 }
 
 pub fn prepare_file(csharp: &dyn CSharpSource, file: &ProjectFile) -> Option<PreparedCSharpFile> {

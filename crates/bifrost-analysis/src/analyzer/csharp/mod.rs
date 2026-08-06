@@ -310,14 +310,14 @@ impl CSharpAnalyzer {
         batch
     }
 
-    pub fn using_aliases_of(&self, file: &ProjectFile) -> HashMap<String, String> {
+    pub fn using_aliases_of(&self, file: &ProjectFile) -> Arc<HashMap<String, String>> {
         if let Some(cached) = self.memo_caches.using_aliases.get(file) {
-            return (*cached).clone();
+            return cached;
         }
-        let aliases = graph_support::compute_using_aliases_of(self, file);
+        let aliases = Arc::new(graph_support::compute_using_aliases_of(self, file));
         self.memo_caches
             .using_aliases
-            .insert(file.clone(), Arc::new(aliases.clone()));
+            .insert(file.clone(), Arc::clone(&aliases));
         aliases
     }
 
@@ -604,7 +604,7 @@ impl CSharpSource for CSharpAnalyzer {
         CSharpAnalyzer::using_namespaces_of_limited(self, file, limit, continue_query)
     }
 
-    fn using_aliases_of(&self, file: &ProjectFile) -> HashMap<String, String> {
+    fn using_aliases_of(&self, file: &ProjectFile) -> Arc<HashMap<String, String>> {
         CSharpAnalyzer::using_aliases_of(self, file)
     }
 

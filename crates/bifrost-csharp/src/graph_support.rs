@@ -238,7 +238,12 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
     /// Alias to target for every `using X = Y;` in `file`, with workspace
     /// `global using` aliases filling only the names the file does not bind
     /// itself. Memoized per file.
-    fn using_aliases_of(&self, file: &ProjectFile) -> HashMap<String, String>;
+    ///
+    /// Shared, not owned: `visible_type_candidates_with_lookups` asks for this
+    /// map up to twice per type-name reference and reads one entry each time,
+    /// so an owned return made the whole map's worth of `String` allocations
+    /// the per-reference cost of a single alias lookup.
+    fn using_aliases_of(&self, file: &ProjectFile) -> Arc<HashMap<String, String>>;
 
     /// [`Self::using_aliases_of`] under one budget shared between both phases,
     /// as pairs rather than as a map. File-local bindings still win over global
@@ -1066,7 +1071,7 @@ pub fn visible_type_candidates_with_lookups<Aliases, Namespace, Usings, Candidat
     type_candidates_by_fqn: &mut Candidates,
 ) -> Vec<CodeUnit>
 where
-    Aliases: FnMut() -> Option<HashMap<String, String>>,
+    Aliases: FnMut() -> Option<Arc<HashMap<String, String>>>,
     Namespace: FnMut() -> Option<String>,
     Usings: FnMut() -> Option<Vec<String>>,
     Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
@@ -1080,7 +1085,8 @@ where
         normalized = if alias == "global" {
             global_qualified = true;
             suffix.to_string()
-        } else if let Some(target) = using_aliases().and_then(|mut aliases| aliases.remove(alias)) {
+        } else if let Some(target) = using_aliases().and_then(|aliases| aliases.get(alias).cloned())
+        {
             if suffix.is_empty() {
                 target
             } else {

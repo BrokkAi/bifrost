@@ -38,6 +38,7 @@ use brokk_bifrost_core::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
+use std::sync::Arc;
 use tree_sitter::Node;
 
 fn resolution_scope_step(session: Option<&ResolutionSession>) -> bool {
@@ -836,7 +837,7 @@ fn visible_type_candidates_in_session(
     session: &ResolutionSession,
 ) -> Vec<CodeUnit> {
     let mut using_aliases = || {
-        let aliases = using_aliases_for_file_in_session(csharp, file, session);
+        let aliases = Arc::new(using_aliases_for_file_in_session(csharp, file, session));
         session.observe_cancellation().then_some(aliases)
     };
     let mut namespace_of_file = || {
