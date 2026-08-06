@@ -7,7 +7,8 @@
 //! name them without importing the definition route, which the route then
 //! imports back (issue: the js_ts crate extraction, Js-1).
 
-use crate::analyzer::{CodeUnit, IAnalyzer};
+use crate::analyzer::CodeUnit;
+use crate::analyzer::js_ts::providers::JsTsAnalyzerHost;
 use tree_sitter::Node;
 
 pub(crate) fn ts_type_annotation_text(node: Node<'_>, source: &str) -> String {
@@ -24,12 +25,12 @@ pub(crate) fn ts_clean_type_text(text: &str) -> String {
 }
 
 pub(crate) fn jsts_value_space_candidates(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     candidates: Vec<CodeUnit>,
 ) -> Vec<CodeUnit> {
     let value_candidates: Vec<_> = candidates
         .iter()
-        .filter(|candidate| !jsts_unit_is_type_only(analyzer, candidate))
+        .filter(|candidate| !jsts_unit_is_type_only(host, candidate))
         .cloned()
         .collect();
     if value_candidates.is_empty() {
@@ -40,12 +41,12 @@ pub(crate) fn jsts_value_space_candidates(
 }
 
 pub(crate) fn jsts_type_space_candidates(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     candidates: Vec<CodeUnit>,
 ) -> Vec<CodeUnit> {
     let type_candidates: Vec<_> = candidates
         .iter()
-        .filter(|candidate| jsts_unit_is_type_only(analyzer, candidate))
+        .filter(|candidate| jsts_unit_is_type_only(host, candidate))
         .cloned()
         .collect();
     if type_candidates.is_empty() {
@@ -55,15 +56,17 @@ pub(crate) fn jsts_type_space_candidates(
     }
 }
 
-pub(crate) fn jsts_unit_is_type_only(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
-    if analyzer
-        .type_alias_provider()
-        .is_some_and(|provider| provider.is_type_alias(unit))
-    {
+/// The type-alias question goes through [`JsTsAnalyzerHost::js_ts_is_type_alias`]
+/// rather than `IAnalyzer::type_alias_provider`: both spellings read the same
+/// TypeScript declaration index for a TypeScript unit, and both answer `false`
+/// for a JavaScript one (JavaScript has no `TypeAliasProvider`), but only the
+/// host spelling keeps this file off `IAnalyzer`.
+pub(crate) fn jsts_unit_is_type_only(host: &dyn JsTsAnalyzerHost, unit: &CodeUnit) -> bool {
+    if host.js_ts_is_type_alias(unit) {
         return true;
     }
     unit.signature().is_some_and(jsts_signature_is_type_only)
-        || analyzer
+        || host
             .signatures(unit)
             .iter()
             .any(|signature| jsts_signature_is_type_only(signature))

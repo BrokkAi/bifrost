@@ -17,8 +17,9 @@ use crate::analyzer::usages::js_ts_graph::{
     JsTsUsageIndex, build_jsts_usage_index, build_jsts_usage_index_with_cancellation,
 };
 use crate::analyzer::{
-    AliasResolver, CodeUnit, ImportAnalysisProvider, ImportInfo, Language, ProjectFile,
-    TypeHierarchyProvider, memoized_reverse_import_index,
+    AliasResolver, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavascriptAnalyzer,
+    Language, ProjectFile, TypeHierarchyProvider, TypescriptAnalyzer,
+    memoized_reverse_import_index, resolve_analyzer,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -75,6 +76,36 @@ pub(crate) trait JsTsAnalyzerHost:
     /// `CodeUnitIndex::signatures` appends a `;` to alias signatures for
     /// rendering, which the alias skeleton must not double up on.
     fn js_ts_raw_signatures(&self, code_unit: &CodeUnit) -> Vec<String>;
+}
+
+/// The one downcast from the framework's `&dyn IAnalyzer` to the JS/TS host
+/// surface, for `language`. Every route and SPI boundary that holds only an
+/// `IAnalyzer` and needs to call the host-parameterized JS/TS logic comes
+/// through here, so `resolve_analyzer::<{Typescript,Javascript}Analyzer>` is
+/// written once instead of at each call site.
+///
+/// `language` selects the analyzer rather than "whichever of the two is
+/// present": a workspace can hold both, and the JS and TS analyzers keep
+/// separate declaration indices and separate usage indices, so answering a
+/// JavaScript question from the TypeScript analyzer would silently read the
+/// wrong index.
+///
+/// `None` when the workspace has no analyzer for `language` -- callers then have
+/// no JS/TS declarations to work with either, since every candidate they could
+/// produce comes out of that same missing index.
+pub(crate) fn resolve_js_ts_host(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+) -> Option<&dyn JsTsAnalyzerHost> {
+    match language {
+        Language::TypeScript => {
+            Some(resolve_analyzer::<TypescriptAnalyzer>(analyzer)? as &dyn JsTsAnalyzerHost)
+        }
+        Language::JavaScript => {
+            Some(resolve_analyzer::<JavascriptAnalyzer>(analyzer)? as &dyn JsTsAnalyzerHost)
+        }
+        _ => None,
+    }
 }
 
 // --- ImportAnalysisProvider ------------------------------------------------

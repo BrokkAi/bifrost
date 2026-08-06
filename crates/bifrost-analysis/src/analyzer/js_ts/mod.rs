@@ -11,6 +11,7 @@ pub(crate) mod semantic;
 pub(crate) mod structural;
 pub(crate) mod syntax;
 pub(crate) mod tests;
+pub(crate) mod ts_owners;
 pub(crate) mod tsconfig;
 pub(crate) mod type_text;
 use crate::analyzer::store::LimitedQueryRows;

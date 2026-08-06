@@ -1,11 +1,10 @@
+use crate::analyzer::js_ts::providers::JsTsAnalyzerHost;
 use crate::analyzer::js_ts::syntax::JsTsImportBinder;
 use crate::analyzer::js_ts::tsconfig::AliasResolver;
 use crate::analyzer::js_ts::type_text::{jsts_type_space_candidates, jsts_value_space_candidates};
 use crate::analyzer::usages::ImportKind;
-use crate::analyzer::usages::js_ts_graph::cached_jsts_index;
-use crate::analyzer::{
-    BoundedDefinitionLookup, CodeUnit, IAnalyzer, ImportInfo, Language, ProjectFile,
-};
+use crate::analyzer::usages::js_ts_graph::cached_jsts_index_for_host;
+use crate::analyzer::{BoundedDefinitionLookup, CodeUnit, ImportInfo, Language, ProjectFile};
 use brokk_bifrost_core::analyzer::definition_lookup::sort_units;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -510,7 +509,7 @@ pub(crate) fn extract_js_ts_call_receiver(reference: &str) -> Option<String> {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_js_ts_module_binding_candidates(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     language: Language,
     file: &ProjectFile,
@@ -524,24 +523,17 @@ pub(crate) fn resolve_js_ts_module_binding_candidates(
         return Vec::new();
     }
 
-    let mut candidates = jsts_module_export_candidates(
-        analyzer,
-        support,
-        language,
-        &files,
-        exported_name,
-        value_position,
-    );
+    let mut candidates =
+        jsts_module_export_candidates(host, support, &files, exported_name, value_position);
     if value_position {
-        candidates = jsts_value_space_candidates(analyzer, candidates);
+        candidates = jsts_value_space_candidates(host, candidates);
     } else {
-        candidates = jsts_type_space_candidates(analyzer, candidates);
+        candidates = jsts_type_space_candidates(host, candidates);
     }
     if candidates.is_empty() && exported_name == "default" {
         for file in &files {
             candidates.extend(
-                analyzer
-                    .declarations(file)
+                host.declarations(file)
                     .into_iter()
                     .filter(|unit| unit.identifier() == "default"),
             );
@@ -549,9 +541,9 @@ pub(crate) fn resolve_js_ts_module_binding_candidates(
         sort_units(&mut candidates);
         candidates.dedup();
         if value_position {
-            candidates = jsts_value_space_candidates(analyzer, candidates);
+            candidates = jsts_value_space_candidates(host, candidates);
         } else {
-            candidates = jsts_type_space_candidates(analyzer, candidates);
+            candidates = jsts_type_space_candidates(host, candidates);
         }
     }
     candidates
@@ -559,7 +551,7 @@ pub(crate) fn resolve_js_ts_module_binding_candidates(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_js_ts_direct_import_candidates(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     language: Language,
     file: &ProjectFile,
@@ -578,7 +570,7 @@ pub(crate) fn resolve_js_ts_direct_import_candidates(
             _ => unreachable!("direct bindings contain only named/default imports"),
         };
         candidates.extend(resolve_js_ts_module_binding_candidates(
-            analyzer,
+            host,
             support,
             language,
             file,
@@ -597,14 +589,13 @@ pub(crate) fn resolve_js_ts_direct_import_candidates(
 }
 
 fn jsts_module_export_candidates(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
-    language: Language,
     files: &[ProjectFile],
     exported_name: &str,
     value_position: bool,
 ) -> Vec<CodeUnit> {
-    let Some(index) = cached_jsts_index(analyzer, language, None) else {
+    let Some(index) = cached_jsts_index_for_host(host, None) else {
         return Vec::new();
     };
 
@@ -616,9 +607,9 @@ fn jsts_module_export_candidates(
     }
 
     if value_position {
-        jsts_value_space_candidates(analyzer, candidates)
+        jsts_value_space_candidates(host, candidates)
     } else {
-        jsts_type_space_candidates(analyzer, candidates)
+        jsts_type_space_candidates(host, candidates)
     }
 }
 

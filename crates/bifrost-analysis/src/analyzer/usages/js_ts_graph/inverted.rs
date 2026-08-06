@@ -23,6 +23,7 @@ use super::resolver::{
     JsTsUsageIndex, browser_global_property_shape, collect_jsts_files, tree_sitter_language_for,
     unbound_browser_global_property,
 };
+use crate::analyzer::js_ts::providers::resolve_js_ts_host;
 use crate::analyzer::js_ts::syntax::{
     JsTsLexicalBindingIndex, compute_import_binder, is_declaration_identifier,
     is_lexically_nested_type_declaration, is_object_in_member_expression,
@@ -62,6 +63,11 @@ where
         return Output::default();
     }
     let _index = super::cached_jsts_index(analyzer, language, None);
+    // Resolved once for the whole scan; the per-file receiver provider is on the
+    // JS/TS host. No analyzer for `language` means no JS/TS files to scan either.
+    let Some(host) = resolve_js_ts_host(analyzer, language) else {
+        return Output::default();
+    };
     let files = collect_jsts_files(analyzer, language);
     build_edge_output(&files, keep_file, |file| {
         // The non-scoped scan needs only the file's own tree for its main binder +
@@ -102,7 +108,7 @@ where
             let mut ctx = TsScan {
                 source,
                 receiver_provider: JsTsReceiverFactProvider::new(
-                    analyzer,
+                    host,
                     &definitions,
                     language,
                     file,
@@ -143,6 +149,13 @@ where
             node_status: BTreeMap::new(),
         };
     }
+    // Resolved once for the whole scan; see `build_jsts_edges` above.
+    let Some(host) = resolve_js_ts_host(analyzer, language) else {
+        return JsTsScopedUsageEdges {
+            edges: UsageEdgeWeights::default(),
+            node_status: BTreeMap::new(),
+        };
+    };
     let files = collect_jsts_files(analyzer, language);
     let declarations = scoped_declarations_by_file_and_name(analyzer);
     let node_status = scoped_node_status(index, nodes, &declarations);
@@ -170,7 +183,7 @@ where
                 let mut ctx = ScopedTsScan {
                     source: input.source,
                     receiver_provider: JsTsReceiverFactProvider::new(
-                        analyzer,
+                        host,
                         &definitions,
                         language,
                         file,

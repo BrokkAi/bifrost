@@ -41,7 +41,6 @@ use crate::analyzer::js_ts::{
 };
 use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 use crate::analyzer::usages::js_ts_graph::JsTsUsageIndex;
-use crate::cancellation::CancellationToken;
 
 mod semantic;
 
@@ -304,19 +303,6 @@ impl TypescriptAnalyzer {
             memo_caches: Arc::new(JsTsMemoCaches::new(memo_budget)),
             alias_resolver,
         }
-    }
-
-    /// Lazily-built, analyzer-cached JS/TS usage-resolution maps for this analyzer's
-    /// language. Built once and reused until `update`/`update_all` resets the cell.
-    pub(crate) fn jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {
-        providers::jsts_usage_index(self)
-    }
-
-    pub(crate) fn jsts_usage_index_with_cancellation(
-        &self,
-        cancellation: &CancellationToken,
-    ) -> Option<Arc<JsTsUsageIndex>> {
-        providers::jsts_usage_index_with_cancellation(self, cancellation)
     }
 
     pub(crate) fn prewarm_jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {

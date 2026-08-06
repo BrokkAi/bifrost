@@ -3,66 +3,33 @@ use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::js_ts::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
 };
+use crate::analyzer::js_ts::providers::{JsTsAnalyzerHost, resolve_js_ts_host};
 use crate::analyzer::js_ts::syntax::parse_js_ts_tree;
 use crate::analyzer::js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, MAX_STATIC_IMPORT_BINDINGS_PER_NAME,
     direct_property_definitions, is_declaration_identifier, is_explicit_object_literal_key, slice,
 };
+/// The receiver-owner / type-text cluster this route drives now lives beside the
+/// rest of the JS/TS language logic, so the usage graph can call it without
+/// importing the definition route. The route imports it back, the mirror of what
+/// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
+use crate::analyzer::js_ts::ts_owners::{
+    TsReceiverResolution, jsts_constructor_owner_candidates, jsts_enclosing_function_scope,
+    jsts_identifier_candidates, jsts_member_candidates, node_text_matches, root_node,
+    ts_call_expression_callees, ts_direct_object_literal_value,
+    ts_expand_call_return_property_owners, ts_nodes_for_code_unit, ts_parameter_name_node,
+    ts_receiver_owner_candidates_at_byte, ts_resolve_type_text_to_property_owners,
+    ts_unwrap_expression,
+};
 use crate::analyzer::js_ts::type_text::{
     jsts_type_space_candidates, jsts_unit_is_type_only, jsts_value_space_candidates,
-    ts_clean_type_text, ts_type_annotation_text,
+    ts_type_annotation_text,
 };
 use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::typescript::ts_is_global_internal_module;
 use crate::analyzer::usages::js_ts_graph::{
     browser_global_property_shape, unbound_browser_global_property,
 };
-use std::cell::{Cell, RefCell};
-
-const MAX_TS_RECEIVER_RESOLUTION_DEPTH: usize = 64;
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct TsReceiverResolutionKey {
-    scope_id: usize,
-    receiver: String,
-    byte: usize,
-}
-
-#[derive(Default)]
-struct TsReceiverResolution {
-    active: RefCell<HashSet<TsReceiverResolutionKey>>,
-    depth: Cell<usize>,
-}
-
-struct TsReceiverResolutionGuard<'a> {
-    resolution: &'a TsReceiverResolution,
-    key: TsReceiverResolutionKey,
-}
-
-impl TsReceiverResolution {
-    fn enter(&self, key: TsReceiverResolutionKey) -> Option<TsReceiverResolutionGuard<'_>> {
-        let depth = self.depth.get();
-        if depth >= MAX_TS_RECEIVER_RESOLUTION_DEPTH
-            || !self.active.borrow_mut().insert(key.clone())
-        {
-            return None;
-        }
-        self.depth.set(depth + 1);
-        Some(TsReceiverResolutionGuard {
-            resolution: self,
-            key,
-        })
-    }
-}
-
-impl Drop for TsReceiverResolutionGuard<'_> {
-    fn drop(&mut self) {
-        self.resolution.active.borrow_mut().remove(&self.key);
-        self.resolution
-            .depth
-            .set(self.resolution.depth.get().saturating_sub(1));
-    }
-}
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct JsTsAliasCandidateKey {
@@ -120,6 +87,17 @@ pub(super) fn resolve_js_ts(
     let Some(tree) = tree else {
         return no_definition("jsts_parse_failed", "JS/TS source could not be parsed");
     };
+    // The one downcast for the whole route: the JS/TS candidate logic is
+    // parameterized on `JsTsAnalyzerHost`, and `host` is threaded from here
+    // rather than re-derived at each call. Without the matching analyzer there
+    // is no JS/TS declaration index either, so every candidate this route could
+    // produce would be empty anyway.
+    let Some(host) = resolve_js_ts_host(analyzer, language) else {
+        return no_definition(
+            "jsts_analyzer_unavailable",
+            "no JavaScript/TypeScript analyzer is registered for this workspace",
+        );
+    };
     let batch = context.js_ts_context(file, language, source, tree);
     let support = context.bounded_support();
     let reference = site.text.as_str();
@@ -148,7 +126,7 @@ pub(super) fn resolve_js_ts(
 
     if let Some(targets) = focused.and_then(|node| {
         JsTsReceiverFactProvider::new_with_batch_data(
-            analyzer,
+            host,
             support,
             language,
             file,
@@ -172,7 +150,7 @@ pub(super) fn resolve_js_ts(
 
     if language == Language::TypeScript {
         let contextual_members = ts_contextual_object_literal_key_candidates(
-            analyzer, support, file, source, tree, site, imports, aliases,
+            analyzer, host, support, file, source, tree, site, imports, aliases,
         );
         if !contextual_members.is_empty() {
             return js_ts_candidates_outcome(analyzer, contextual_members);
@@ -207,9 +185,9 @@ pub(super) fn resolve_js_ts(
 
     // AST path for an inline construction receiver `new Foo().member` — the
     // text-split path below cannot express `new Foo()` as a qualifier.
-    if let Some(members) =
-        jsts_construction_receiver_members(analyzer, support, file, language, source, tree, site)
-    {
+    if let Some(members) = jsts_construction_receiver_members(
+        analyzer, host, support, file, language, source, tree, site,
+    ) {
         return js_ts_candidates_outcome(analyzer, members);
     }
 
@@ -236,6 +214,7 @@ pub(super) fn resolve_js_ts(
                     &binding.module_specifier,
                     name,
                     analyzer,
+                    host,
                     support,
                     Some(aliases),
                     value_position,
@@ -257,7 +236,7 @@ pub(super) fn resolve_js_ts(
                 .is_some();
         let receiver_candidates = if imported_receiver_binding {
             resolve_js_ts_direct_import_candidates(
-                analyzer,
+                host,
                 support,
                 language,
                 file,
@@ -270,25 +249,32 @@ pub(super) fn resolve_js_ts(
         } else {
             let mut same_file = support.file_identifier(file, qualifier);
             if value_position {
-                same_file = jsts_value_space_candidates(analyzer, same_file);
+                same_file = jsts_value_space_candidates(host, same_file);
             } else {
-                same_file = jsts_type_space_candidates(analyzer, same_file);
+                same_file = jsts_type_space_candidates(host, same_file);
             }
             same_file
         };
         let generic_member_candidates =
             if language == Language::JavaScript && imported_receiver_binding {
                 jsts_file_scoped_member_candidates(
-                    analyzer,
+                    host,
                     support,
                     receiver_candidates,
                     name,
                     value_position,
                 )
             } else if language == Language::TypeScript {
-                ts_member_candidates(analyzer, support, receiver_candidates, name, value_position)
+                ts_member_candidates(
+                    analyzer,
+                    host,
+                    support,
+                    receiver_candidates,
+                    name,
+                    value_position,
+                )
             } else {
-                jsts_member_candidates(analyzer, support, receiver_candidates, name, value_position)
+                jsts_member_candidates(host, support, receiver_candidates, name, value_position)
             };
         let program_binding = lexical_bindings.is_program_binding_at(
             qualifier,
@@ -297,6 +283,7 @@ pub(super) fn resolve_js_ts(
         );
         let dotted_lookup = JstsDottedLookup {
             analyzer,
+            host,
             support,
             file,
             root: tree.root_node(),
@@ -329,17 +316,17 @@ pub(super) fn resolve_js_ts(
             return js_ts_candidates_outcome(analyzer, generic_member_candidates);
         }
         match jsts_receiver_provider_member_candidates(
-            analyzer, support, file, language, source, tree, site, name, &batch,
+            host, support, file, language, source, tree, site, name, &batch,
         ) {
             ReceiverAnalysisOutcome::Precise(candidates) if !candidates.is_empty() => {
                 let candidates = if language == Language::TypeScript {
                     if value_position {
-                        jsts_value_space_candidates(analyzer, candidates)
+                        jsts_value_space_candidates(host, candidates)
                     } else {
-                        jsts_type_space_candidates(analyzer, candidates)
+                        jsts_type_space_candidates(host, candidates)
                     }
                 } else {
-                    jsts_value_space_candidates(analyzer, candidates)
+                    jsts_value_space_candidates(host, candidates)
                 };
                 if language == Language::JavaScript
                     && !imported_receiver_binding
@@ -374,6 +361,7 @@ pub(super) fn resolve_js_ts(
         }
         let new_receiver_candidates = jsts_local_new_receiver_owner_candidates(
             analyzer,
+            host,
             support,
             file,
             language,
@@ -388,19 +376,14 @@ pub(super) fn resolve_js_ts(
         let new_receiver_member_candidates = if language == Language::TypeScript {
             ts_member_candidates(
                 analyzer,
+                host,
                 support,
                 new_receiver_candidates,
                 name,
                 value_position,
             )
         } else {
-            jsts_member_candidates(
-                analyzer,
-                support,
-                new_receiver_candidates,
-                name,
-                value_position,
-            )
+            jsts_member_candidates(host, support, new_receiver_candidates, name, value_position)
         };
         if !new_receiver_member_candidates.is_empty() {
             return js_ts_candidates_outcome(analyzer, new_receiver_member_candidates);
@@ -414,18 +397,24 @@ pub(super) fn resolve_js_ts(
         }
         if language == Language::TypeScript {
             let inferred_receivers = ts_local_receiver_owner_candidates(
-                analyzer, support, file, source, tree, site, imports, aliases, qualifier,
+                host, support, file, source, tree, site, imports, aliases, qualifier,
             );
-            let inferred_member_candidates =
-                ts_member_candidates(analyzer, support, inferred_receivers, name, value_position);
+            let inferred_member_candidates = ts_member_candidates(
+                analyzer,
+                host,
+                support,
+                inferred_receivers,
+                name,
+                value_position,
+            );
             if !inferred_member_candidates.is_empty() {
                 return js_ts_candidates_outcome(analyzer, inferred_member_candidates);
             }
             let inferred_receivers = ts_local_receiver_owner_candidates(
-                analyzer, support, file, source, tree, site, imports, aliases, qualifier,
+                host, support, file, source, tree, site, imports, aliases, qualifier,
             );
             let inferred_member_candidates = jsts_file_scoped_member_candidates(
-                analyzer,
+                host,
                 support,
                 inferred_receivers,
                 name,
@@ -438,24 +427,41 @@ pub(super) fn resolve_js_ts(
                 let global_receivers = support
                     .fqn(receiver_type)
                     .into_iter()
-                    .filter(|unit| jsts_unit_is_type_only(analyzer, unit))
+                    .filter(|unit| jsts_unit_is_type_only(host, unit))
                     .collect();
-                let global_member_candidates =
-                    ts_member_candidates(analyzer, support, global_receivers, name, value_position);
+                let global_member_candidates = ts_member_candidates(
+                    analyzer,
+                    host,
+                    support,
+                    global_receivers,
+                    name,
+                    value_position,
+                );
                 if !global_member_candidates.is_empty() {
                     return js_ts_candidates_outcome(analyzer, global_member_candidates);
                 }
             }
         }
         if language == Language::TypeScript {
-            let exact_global =
-                ts_exact_global_dotted_candidates(analyzer, support, reference, value_position);
+            let exact_global = ts_exact_global_dotted_candidates(
+                analyzer,
+                host,
+                support,
+                reference,
+                value_position,
+            );
             if !exact_global.is_empty() {
                 return js_ts_candidates_outcome(analyzer, exact_global);
             }
         } else {
-            let exact_project =
-                jsts_exact_dotted_candidates(analyzer, support, file, reference, value_position);
+            let exact_project = jsts_exact_dotted_candidates(
+                analyzer,
+                host,
+                support,
+                file,
+                reference,
+                value_position,
+            );
             if !exact_project.is_empty() {
                 return js_ts_candidates_outcome(analyzer, exact_project);
             }
@@ -479,6 +485,7 @@ pub(super) fn resolve_js_ts(
         language,
         reference,
         analyzer,
+        host,
         support,
         Some(aliases),
         value_position,
@@ -502,9 +509,9 @@ pub(super) fn resolve_js_ts(
         );
     }
     if value_position {
-        same_file = jsts_value_space_candidates(analyzer, same_file);
+        same_file = jsts_value_space_candidates(host, same_file);
     } else {
-        same_file = jsts_type_space_candidates(analyzer, same_file);
+        same_file = jsts_type_space_candidates(host, same_file);
     }
     if !same_file.is_empty() {
         return js_ts_candidates_outcome(analyzer, same_file);
@@ -524,6 +531,7 @@ fn resolve_js_ts_visible_module_bindings(
     language: Language,
     reference: &str,
     analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     aliases: Option<&AliasResolver>,
     value_position: bool,
@@ -542,6 +550,7 @@ fn resolve_js_ts_visible_module_bindings(
                 &binding.module_specifier,
                 exported_name,
                 analyzer,
+                host,
                 support,
                 aliases,
                 value_position,
@@ -704,6 +713,7 @@ fn jsts_is_commonjs_host_export_assignment_object(node: Node<'_>, source: &str) 
 #[allow(clippy::too_many_arguments)]
 fn ts_contextual_object_literal_key_candidates(
     analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -725,10 +735,9 @@ fn ts_contextual_object_literal_key_candidates(
     {
         return Vec::new();
     }
-    let owners = ts_contextual_object_literal_owners(
-        analyzer, support, file, source, imports, aliases, object,
-    );
-    ts_member_candidates(analyzer, support, owners, &name, true)
+    let owners =
+        ts_contextual_object_literal_owners(host, support, file, source, imports, aliases, object);
+    ts_member_candidates(analyzer, host, support, owners, &name, true)
 }
 
 fn ts_object_literal_property_at_key<'tree>(
@@ -757,7 +766,7 @@ fn ts_object_literal_property_at_key<'tree>(
 
 #[allow(clippy::too_many_arguments)]
 fn ts_contextual_object_literal_owners(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -774,7 +783,7 @@ fn ts_contextual_object_literal_owners(
         && let Some(type_node) = variable.child_by_field_name("type")
     {
         return ts_resolve_type_text_to_property_owners(
-            analyzer,
+            host,
             support,
             file,
             source,
@@ -806,7 +815,7 @@ fn ts_contextual_object_literal_owners(
         return Vec::new();
     };
     ts_resolve_type_text_to_property_owners(
-        analyzer,
+        host,
         support,
         file,
         source,
@@ -831,6 +840,7 @@ fn resolve_js_ts_module_binding(
     module: &str,
     exported_name: &str,
     analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     aliases: Option<&AliasResolver>,
     value_position: bool,
@@ -852,7 +862,7 @@ fn resolve_js_ts_module_binding(
     }
 
     let candidates = resolve_js_ts_module_binding_candidates(
-        analyzer,
+        host,
         support,
         language,
         file,
@@ -883,7 +893,7 @@ fn resolve_js_ts_module_binding(
 /// Resolve a dotted FQN within one exact declaration file. JS/TS FQNs omit module
 /// paths, so callers that have already resolved a receiver must retain this scope.
 fn jsts_file_scoped_dotted_candidates(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     reference: &str,
@@ -895,9 +905,9 @@ fn jsts_file_scoped_dotted_candidates(
         .filter(|unit| unit.source() == file)
         .collect();
     if value_position {
-        candidates = jsts_value_space_candidates(analyzer, candidates);
+        candidates = jsts_value_space_candidates(host, candidates);
     } else {
-        candidates = jsts_type_space_candidates(analyzer, candidates);
+        candidates = jsts_type_space_candidates(host, candidates);
     }
     candidates
 }
@@ -989,6 +999,7 @@ fn jsts_nearest_reference_fallback_scope(node: Node<'_>) -> Option<JstsReceiverB
 #[derive(Clone, Copy)]
 struct JstsDottedLookup<'a, 'tree> {
     analyzer: &'a dyn IAnalyzer,
+    host: &'a dyn JsTsAnalyzerHost,
     support: &'a dyn BoundedDefinitionLookup,
     file: &'a ProjectFile,
     root: Node<'tree>,
@@ -1002,7 +1013,7 @@ struct JstsDottedLookup<'a, 'tree> {
 impl JstsDottedLookup<'_, '_> {
     fn same_file_candidates(self) -> Vec<CodeUnit> {
         jsts_file_scoped_dotted_candidates(
-            self.analyzer,
+            self.host,
             self.support,
             self.file,
             self.reference,
@@ -1126,6 +1137,7 @@ fn jsts_focused_reference_receiver_property<'tree>(
 
 fn jsts_exact_dotted_candidates(
     analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     reference: &str,
@@ -1153,9 +1165,9 @@ fn jsts_exact_dotted_candidates(
         });
     }
     if value_position {
-        candidates = jsts_value_space_candidates(analyzer, candidates);
+        candidates = jsts_value_space_candidates(host, candidates);
     } else {
-        candidates = jsts_type_space_candidates(analyzer, candidates);
+        candidates = jsts_type_space_candidates(host, candidates);
     }
     candidates
 }
@@ -1220,6 +1232,7 @@ fn jsts_static_member_root(mut node: Node<'_>) -> Option<Node<'_>> {
 
 fn ts_exact_global_dotted_candidates(
     analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     reference: &str,
     value_position: bool,
@@ -1230,9 +1243,9 @@ fn ts_exact_global_dotted_candidates(
         .filter(|candidate| ts_unit_is_global_declaration(analyzer, candidate))
         .collect();
     if value_position {
-        candidates = jsts_value_space_candidates(analyzer, candidates);
+        candidates = jsts_value_space_candidates(host, candidates);
     } else {
-        candidates = jsts_type_space_candidates(analyzer, candidates);
+        candidates = jsts_type_space_candidates(host, candidates);
     }
     candidates
 }
@@ -1628,8 +1641,10 @@ fn jsts_reference_prefix_for_focus(site: &ResolvedReferenceSite) -> Option<Strin
 /// Resolve `new Foo().member` by typing the receiver as the constructed class.
 /// Returns the member candidates when the caret is on the property of a
 /// member-expression whose object is a `new_expression`.
+#[allow(clippy::too_many_arguments)]
 fn jsts_construction_receiver_members(
     analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
@@ -1663,18 +1678,18 @@ fn jsts_construction_receiver_members(
     let class_name = &source[constructor.start_byte()..constructor.end_byte()];
     let member = &source[property.start_byte()..property.end_byte()];
     let receiver_candidates =
-        jsts_value_space_candidates(analyzer, support.file_identifier(file, class_name));
+        jsts_value_space_candidates(host, support.file_identifier(file, class_name));
     let members = if language == Language::TypeScript {
-        ts_member_candidates(analyzer, support, receiver_candidates, member, true)
+        ts_member_candidates(analyzer, host, support, receiver_candidates, member, true)
     } else {
-        jsts_member_candidates(analyzer, support, receiver_candidates, member, true)
+        jsts_member_candidates(host, support, receiver_candidates, member, true)
     };
     (!members.is_empty()).then_some(members)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn jsts_receiver_provider_member_candidates(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
@@ -1690,7 +1705,7 @@ fn jsts_receiver_provider_member_candidates(
         return ReceiverAnalysisOutcome::Unknown;
     };
     let provider = JsTsReceiverFactProvider::new_with_batch_data(
-        analyzer,
+        host,
         support,
         language,
         file,
@@ -1715,26 +1730,8 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     crate::analyzer::common::node_source_text(node, source)
 }
 
-fn jsts_member_candidates(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    receiver_candidates: Vec<CodeUnit>,
-    member: &str,
-    value_position: bool,
-) -> Vec<CodeUnit> {
-    let mut candidates = Vec::new();
-    for receiver in receiver_candidates {
-        candidates.extend(support.fqn(&format!("{}.{}", receiver.fq_name(), member)));
-    }
-    if value_position {
-        jsts_value_space_candidates(analyzer, candidates)
-    } else {
-        jsts_type_space_candidates(analyzer, candidates)
-    }
-}
-
 fn jsts_file_scoped_member_candidates(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     receiver_candidates: Vec<CodeUnit>,
     member: &str,
@@ -1743,7 +1740,7 @@ fn jsts_file_scoped_member_candidates(
     let mut candidates = Vec::new();
     for receiver in receiver_candidates {
         candidates.extend(jsts_file_scoped_dotted_candidates(
-            analyzer,
+            host,
             support,
             receiver.source(),
             &format!("{}.{}", receiver.fq_name(), member),
@@ -1755,6 +1752,7 @@ fn jsts_file_scoped_member_candidates(
 
 fn ts_member_candidates(
     analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     receiver_candidates: Vec<CodeUnit>,
     member: &str,
@@ -1767,7 +1765,7 @@ fn ts_member_candidates(
         let static_access = value_position && receiver.is_class();
 
         let mut members = jsts_file_scoped_dotted_candidates(
-            analyzer,
+            host,
             support,
             receiver.source(),
             &plain_fqn,
@@ -1775,7 +1773,7 @@ fn ts_member_candidates(
         );
         if static_access {
             let static_members = jsts_file_scoped_dotted_candidates(
-                analyzer,
+                host,
                 support,
                 receiver.source(),
                 &static_fqn,
@@ -1786,7 +1784,7 @@ fn ts_member_candidates(
             }
         } else if members.is_empty() {
             members = jsts_file_scoped_dotted_candidates(
-                analyzer,
+                host,
                 support,
                 receiver.source(),
                 &static_fqn,
@@ -1796,9 +1794,9 @@ fn ts_member_candidates(
 
         let has_synthetic = members.iter().any(CodeUnit::is_synthetic);
         if has_synthetic
-            && !jsts_unit_is_type_only(analyzer, &receiver)
+            && !jsts_unit_is_type_only(host, &receiver)
             && !ts_synthetic_member_is_supported_by_receiver_initializer(
-                analyzer, support, &receiver, member,
+                analyzer, host, support, &receiver, member,
             )
         {
             candidates.extend(members.into_iter().filter(|member| !member.is_synthetic()));
@@ -1811,6 +1809,7 @@ fn ts_member_candidates(
 
 fn ts_synthetic_member_is_supported_by_receiver_initializer(
     analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     receiver: &CodeUnit,
     member: &str,
@@ -1845,6 +1844,7 @@ fn ts_synthetic_member_is_supported_by_receiver_initializer(
         };
         if ts_call_preserves_argument_shape(
             analyzer,
+            host,
             support,
             receiver.source(),
             &source,
@@ -1899,30 +1899,6 @@ fn ts_call_direct_object_argument_index_with_member(
         })
 }
 
-fn ts_direct_object_literal_value(node: Node<'_>) -> Option<Node<'_>> {
-    let node = ts_unwrap_expression(node)?;
-    (node.kind() == "object").then_some(node)
-}
-
-fn ts_unwrap_expression(node: Node<'_>) -> Option<Node<'_>> {
-    match node.kind() {
-        "as_expression"
-        | "satisfies_expression"
-        | "type_assertion"
-        | "parenthesized_expression" => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .find(|child| {
-                    child.kind() != "type_annotation"
-                        && child.kind() != "type_identifier"
-                        && child.kind() != "predefined_type"
-                })
-                .and_then(ts_unwrap_expression)
-        }
-        _ => Some(node),
-    }
-}
-
 fn ts_object_literal_has_member(object: Node<'_>, source: &str, member: &str) -> bool {
     let mut cursor = object.walk();
     object
@@ -1936,6 +1912,7 @@ fn ts_object_literal_has_member(object: Node<'_>, source: &str, member: &str) ->
 #[allow(clippy::too_many_arguments)]
 fn ts_call_preserves_argument_shape(
     analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -1948,7 +1925,7 @@ fn ts_call_preserves_argument_shape(
         return false;
     };
     ts_call_expression_callees(
-        analyzer,
+        host,
         support,
         file,
         source,
@@ -2074,7 +2051,7 @@ fn ts_expression_preserves_parameter_shape(
 
 #[allow(clippy::too_many_arguments)]
 fn ts_local_receiver_owner_candidates(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -2085,7 +2062,7 @@ fn ts_local_receiver_owner_candidates(
     receiver: &str,
 ) -> Vec<CodeUnit> {
     ts_receiver_owner_candidates_at_byte(
-        analyzer,
+        host,
         support,
         file,
         source,
@@ -2095,101 +2072,6 @@ fn ts_local_receiver_owner_candidates(
         receiver,
         site.focus_start_byte,
     )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn ts_receiver_owner_candidates_at_byte(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    receiver: &str,
-    byte: usize,
-) -> Vec<CodeUnit> {
-    ts_receiver_owner_candidates_at_byte_with_resolution(
-        analyzer,
-        support,
-        file,
-        source,
-        root,
-        imports,
-        aliases,
-        receiver,
-        byte,
-        &TsReceiverResolution::default(),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ts_receiver_owner_candidates_at_byte_with_resolution(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    receiver: &str,
-    byte: usize,
-    resolution: &TsReceiverResolution,
-) -> Vec<CodeUnit> {
-    if receiver == "this"
-        && let Some(owner) = jsts_enclosing_class(analyzer, file, byte)
-    {
-        return vec![owner];
-    }
-    let Some(scope) = jsts_enclosing_function_scope(root, byte) else {
-        return Vec::new();
-    };
-    let key = TsReceiverResolutionKey {
-        scope_id: scope.id(),
-        receiver: receiver.to_string(),
-        byte,
-    };
-    let Some(_guard) = resolution.enter(key) else {
-        return Vec::new();
-    };
-
-    let mut candidates = ts_receiver_owners_from_parameters(
-        analyzer, support, file, source, imports, aliases, scope, receiver,
-    );
-    if candidates.is_empty() {
-        candidates.extend(ts_receiver_owners_from_contextual_callback(
-            analyzer, support, file, source, imports, aliases, scope, receiver, resolution,
-        ));
-    }
-    candidates.extend(ts_receiver_owners_from_local_bindings(
-        analyzer, support, file, source, imports, aliases, scope, receiver, byte, 0, resolution,
-    ));
-    sort_units(&mut candidates);
-    candidates.dedup();
-    candidates
-}
-
-fn jsts_enclosing_class(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    byte: usize,
-) -> Option<CodeUnit> {
-    ClassRangeIndex::build(analyzer, file)
-        .enclosing_unit(byte)
-        .cloned()
-}
-
-fn jsts_enclosing_function_scope(root: Node<'_>, byte: usize) -> Option<Node<'_>> {
-    let mut current = smallest_named_node_covering(root, byte, byte)?;
-    loop {
-        if matches!(
-            current.kind(),
-            "function_declaration" | "function_expression" | "arrow_function" | "method_definition"
-        ) {
-            return Some(current);
-        }
-        current = current.parent()?;
-    }
 }
 
 fn jsts_enclosing_function_or_program_scope(root: Node<'_>, byte: usize) -> Option<Node<'_>> {
@@ -2210,537 +2092,9 @@ fn jsts_enclosing_function_or_program_scope(root: Node<'_>, byte: usize) -> Opti
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ts_receiver_owners_from_parameters(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    scope: Node<'_>,
-    receiver: &str,
-) -> Vec<CodeUnit> {
-    let Some(parameters) = scope
-        .child_by_field_name("parameters")
-        .or_else(|| scope.child_by_field_name("parameter"))
-    else {
-        return Vec::new();
-    };
-    let mut owners = Vec::new();
-    let mut cursor = parameters.walk();
-    for parameter in parameters.named_children(&mut cursor) {
-        if !matches!(
-            parameter.kind(),
-            "required_parameter" | "optional_parameter"
-        ) {
-            continue;
-        }
-        let Some(type_node) = parameter.child_by_field_name("type") else {
-            continue;
-        };
-        if parameter
-            .child_by_field_name("name")
-            .is_some_and(|name| node_text_matches(name, source, receiver))
-        {
-            owners.extend(ts_resolve_type_text_to_property_owners(
-                analyzer,
-                support,
-                file,
-                source,
-                imports,
-                aliases,
-                ts_type_annotation_text(type_node, source).as_str(),
-                0,
-            ));
-            continue;
-        }
-        if parameter
-            .child_by_field_name("pattern")
-            .is_some_and(|pattern| ts_object_pattern_binds(pattern, source, receiver))
-        {
-            let container_owners = ts_resolve_type_text_to_property_owners(
-                analyzer,
-                support,
-                file,
-                source,
-                imports,
-                aliases,
-                ts_type_annotation_text(type_node, source).as_str(),
-                0,
-            );
-            let fields =
-                jsts_member_candidates(analyzer, support, container_owners, receiver, true);
-            for field in fields {
-                owners.extend(ts_field_signature_type_owners(
-                    analyzer, support, file, source, imports, aliases, &field, 0,
-                ));
-            }
-        }
-    }
-    owners
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ts_receiver_owners_from_contextual_callback(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    scope: Node<'_>,
-    receiver: &str,
-    resolution: &TsReceiverResolution,
-) -> Vec<CodeUnit> {
-    let Some(callback_parameter_index) = ts_callback_parameter_index(scope, source, receiver)
-    else {
-        return Vec::new();
-    };
-    let Some((call, argument_index)) = ts_callback_argument_context(scope) else {
-        return Vec::new();
-    };
-    let Some(function) = call.child_by_field_name("function") else {
-        return Vec::new();
-    };
-    let callees = ts_call_expression_callees(
-        analyzer, support, file, source, imports, aliases, function, 0, resolution,
-    );
-
-    let mut owners = Vec::new();
-    for callee in callees {
-        owners.extend(ts_callback_parameter_owners_from_callee(
-            analyzer,
-            support,
-            &callee,
-            argument_index,
-            callback_parameter_index,
-            0,
-        ));
-    }
-    owners
-}
-
-fn ts_callback_parameter_index(scope: Node<'_>, source: &str, receiver: &str) -> Option<usize> {
-    let parameters = scope
-        .child_by_field_name("parameters")
-        .or_else(|| scope.child_by_field_name("parameter"))?;
-    if parameters.kind() == "identifier" {
-        return node_text_matches(parameters, source, receiver).then_some(0);
-    }
-    let mut cursor = parameters.walk();
-    parameters
-        .named_children(&mut cursor)
-        .filter_map(|parameter| ts_parameter_name_node(parameter))
-        .position(|name| node_text_matches(name, source, receiver))
-}
-
-fn ts_parameter_name_node(parameter: Node<'_>) -> Option<Node<'_>> {
-    match parameter.kind() {
-        "identifier" | "shorthand_property_identifier_pattern" => Some(parameter),
-        "required_parameter" | "optional_parameter" => parameter
-            .child_by_field_name("pattern")
-            .or_else(|| parameter.child_by_field_name("name")),
-        _ => None,
-    }
-}
-
-fn ts_callback_argument_context(scope: Node<'_>) -> Option<(Node<'_>, usize)> {
-    let mut current = scope;
-    while let Some(parent) = current.parent() {
-        if parent.kind() == "arguments" {
-            let mut cursor = parent.walk();
-            let argument_index = parent
-                .named_children(&mut cursor)
-                .position(|child| child.id() == current.id())?;
-            let call = parent
-                .parent()
-                .filter(|node| node.kind() == "call_expression")?;
-            return Some((call, argument_index));
-        }
-        current = parent;
-    }
-    None
-}
-
-fn ts_callback_parameter_owners_from_callee(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    callee: &CodeUnit,
-    argument_index: usize,
-    callback_parameter_index: usize,
-    depth: usize,
-) -> Vec<CodeUnit> {
-    if depth > 8 {
-        return Vec::new();
-    }
-    let Ok(source) = callee.source().read_to_string() else {
-        return Vec::new();
-    };
-    let Some(tree) = parse_js_ts_tree(callee.source(), &source, Language::TypeScript) else {
-        return Vec::new();
-    };
-    let imports = compute_jsts_import_binder(&source, &tree);
-    let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
-    let mut owners = Vec::new();
-    for node in ts_nodes_for_code_unit(analyzer, callee, tree.root_node()) {
-        let Some(callback_type) = ts_function_parameter_type_text(node, &source, argument_index)
-        else {
-            continue;
-        };
-        let Some(parameter_type) =
-            ts_callback_parameter_type_text(&callback_type, callback_parameter_index)
-        else {
-            continue;
-        };
-        owners.extend(ts_resolve_type_text_to_property_owners(
-            analyzer,
-            support,
-            callee.source(),
-            &source,
-            &imports,
-            &aliases,
-            &parameter_type,
-            depth + 1,
-        ));
-    }
-    owners
-}
-
-fn ts_function_parameter_type_text(
-    function: Node<'_>,
-    source: &str,
-    parameter_index: usize,
-) -> Option<String> {
-    let parameters = function.child_by_field_name("parameters")?;
-    let mut cursor = parameters.walk();
-    parameters
-        .named_children(&mut cursor)
-        .filter(|parameter| {
-            matches!(
-                parameter.kind(),
-                "required_parameter" | "optional_parameter"
-            )
-        })
-        .nth(parameter_index)
-        .and_then(|parameter| parameter.child_by_field_name("type"))
-        .map(|type_node| ts_type_annotation_text(type_node, source))
-}
-
-fn ts_callback_parameter_type_text(callback_type: &str, parameter_index: usize) -> Option<String> {
-    let callback_type = callback_type.trim();
-    let open = callback_type.find('(')?;
-    let close = ts_matching_close_delimiter(callback_type, open, '(', ')')?;
-    let parameters = callback_type.get(open + 1..close)?;
-    let parameter = ts_split_top_level_commas(parameters)
-        .into_iter()
-        .nth(parameter_index)?;
-    let (_, type_text) = parameter.split_once(':')?;
-    Some(ts_clean_type_text(type_text))
-}
-
-fn ts_matching_close_delimiter(
-    text: &str,
-    open_byte: usize,
-    open_char: char,
-    close_char: char,
-) -> Option<usize> {
-    let mut depth = 0usize;
-    for (index, ch) in text
-        .char_indices()
-        .skip_while(|(index, _)| *index < open_byte)
-    {
-        if ch == open_char {
-            depth += 1;
-        } else if ch == close_char {
-            depth = depth.checked_sub(1)?;
-            if depth == 0 {
-                return Some(index);
-            }
-        }
-    }
-    None
-}
-
-fn ts_split_top_level_commas(text: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut paren_depth = 0usize;
-    let mut angle_depth = 0usize;
-    let mut brace_depth = 0usize;
-    let mut bracket_depth = 0usize;
-    for (index, ch) in text.char_indices() {
-        match ch {
-            '(' => paren_depth += 1,
-            ')' => paren_depth = paren_depth.saturating_sub(1),
-            '<' => angle_depth += 1,
-            '>' => angle_depth = angle_depth.saturating_sub(1),
-            '{' => brace_depth += 1,
-            '}' => brace_depth = brace_depth.saturating_sub(1),
-            '[' => bracket_depth += 1,
-            ']' => bracket_depth = bracket_depth.saturating_sub(1),
-            ',' if paren_depth == 0
-                && angle_depth == 0
-                && brace_depth == 0
-                && bracket_depth == 0 =>
-            {
-                parts.push(text[start..index].trim());
-                start = index + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    parts.push(text[start..].trim());
-    parts
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ts_receiver_owners_from_local_bindings(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    scope: Node<'_>,
-    receiver: &str,
-    before_byte: usize,
-    depth: usize,
-    resolution: &TsReceiverResolution,
-) -> Vec<CodeUnit> {
-    if depth > 8 {
-        return Vec::new();
-    }
-    let mut owners = Vec::new();
-    ts_collect_receiver_owners_from_bindings(
-        analyzer,
-        support,
-        file,
-        source,
-        imports,
-        aliases,
-        scope,
-        scope.id(),
-        receiver,
-        before_byte,
-        depth,
-        &mut owners,
-        resolution,
-    );
-    owners
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ts_collect_receiver_owners_from_bindings(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    node: Node<'_>,
-    root_id: usize,
-    receiver: &str,
-    before_byte: usize,
-    depth: usize,
-    out: &mut Vec<CodeUnit>,
-    resolution: &TsReceiverResolution,
-) {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.start_byte() >= before_byte {
-            continue;
-        }
-        if node.id() != root_id
-            && matches!(
-                node.kind(),
-                "function_declaration"
-                    | "function_expression"
-                    | "arrow_function"
-                    | "method_definition"
-                    | "class_declaration"
-                    | "abstract_class_declaration"
-                    | "interface_declaration"
-            )
-        {
-            continue;
-        }
-
-        if node.kind() == "variable_declarator"
-            && let Some(name) = node.child_by_field_name("name")
-            && node_text_matches(name, source, receiver)
-        {
-            let mut latest = Vec::new();
-            if let Some(type_node) = node.child_by_field_name("type") {
-                latest.extend(ts_resolve_type_text_to_property_owners(
-                    analyzer,
-                    support,
-                    file,
-                    source,
-                    imports,
-                    aliases,
-                    ts_type_annotation_text(type_node, source).as_str(),
-                    depth + 1,
-                ));
-            }
-            if let Some(value) = node.child_by_field_name("value") {
-                latest.extend(ts_expression_property_owners(
-                    analyzer,
-                    support,
-                    file,
-                    source,
-                    imports,
-                    aliases,
-                    value,
-                    depth + 1,
-                    resolution,
-                ));
-            }
-            out.clear();
-            out.extend(latest);
-        }
-
-        if node.kind() == "assignment_expression"
-            && let Some(left) = node.child_by_field_name("left")
-            && matches!(left.kind(), "identifier" | "type_identifier")
-            && node_text_matches(left, source, receiver)
-        {
-            let latest = node
-                .child_by_field_name("right")
-                .map(|value| {
-                    ts_expression_property_owners(
-                        analyzer,
-                        support,
-                        file,
-                        source,
-                        imports,
-                        aliases,
-                        value,
-                        depth + 1,
-                        resolution,
-                    )
-                })
-                .unwrap_or_default();
-            out.clear();
-            out.extend(latest);
-        }
-
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        stack.extend(children.into_iter().rev());
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ts_expression_property_owners(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    expression: Node<'_>,
-    depth: usize,
-    resolution: &TsReceiverResolution,
-) -> Vec<CodeUnit> {
-    if depth > 8 {
-        return Vec::new();
-    }
-    match expression.kind() {
-        "call_expression" => expression
-            .child_by_field_name("function")
-            .map(|function| {
-                let callees = ts_call_expression_callees(
-                    analyzer,
-                    support,
-                    file,
-                    source,
-                    imports,
-                    aliases,
-                    function,
-                    depth + 1,
-                    resolution,
-                );
-                ts_expand_call_return_property_owners(analyzer, support, callees, depth + 1)
-            })
-            .unwrap_or_default(),
-        "await_expression" => {
-            let mut cursor = expression.walk();
-            expression
-                .named_children(&mut cursor)
-                .next()
-                .map(|child| {
-                    ts_expression_property_owners(
-                        analyzer,
-                        support,
-                        file,
-                        source,
-                        imports,
-                        aliases,
-                        child,
-                        depth + 1,
-                        resolution,
-                    )
-                })
-                .unwrap_or_default()
-        }
-        "new_expression" => expression
-            .child_by_field_name("constructor")
-            .map(|constructor| {
-                jsts_constructor_owner_candidates(
-                    analyzer,
-                    support,
-                    file,
-                    Language::TypeScript,
-                    source,
-                    imports,
-                    aliases,
-                    constructor,
-                    false,
-                )
-            })
-            .unwrap_or_default(),
-        "as_expression" | "satisfies_expression" | "type_assertion" => expression
-            .child_by_field_name("type")
-            .or_else(|| ts_assertion_type_child(expression))
-            .map(|type_node| {
-                ts_resolve_type_text_to_property_owners(
-                    analyzer,
-                    support,
-                    file,
-                    source,
-                    imports,
-                    aliases,
-                    ts_type_annotation_text(type_node, source).as_str(),
-                    depth + 1,
-                )
-            })
-            .unwrap_or_else(|| {
-                let mut cursor = expression.walk();
-                expression
-                    .named_children(&mut cursor)
-                    .find(|child| child.kind() != "type_annotation")
-                    .map(|child| {
-                        ts_expression_property_owners(
-                            analyzer,
-                            support,
-                            file,
-                            source,
-                            imports,
-                            aliases,
-                            child,
-                            depth + 1,
-                            resolution,
-                        )
-                    })
-                    .unwrap_or_default()
-            }),
-        _ => Vec::new(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn jsts_local_new_receiver_owner_candidates(
     analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
@@ -2761,6 +2115,7 @@ fn jsts_local_new_receiver_owner_candidates(
     let mut state = None;
     jsts_collect_local_new_receiver_owner_candidates(
         analyzer,
+        host,
         support,
         file,
         language,
@@ -2780,6 +2135,7 @@ fn jsts_local_new_receiver_owner_candidates(
 #[allow(clippy::too_many_arguments)]
 fn jsts_collect_local_new_receiver_owner_candidates(
     analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
@@ -2823,6 +2179,7 @@ fn jsts_collect_local_new_receiver_owner_candidates(
                 .map(|value| {
                     jsts_local_receiver_value_owner_candidates(
                         analyzer,
+                        host,
                         support,
                         file,
                         language,
@@ -2849,6 +2206,7 @@ fn jsts_collect_local_new_receiver_owner_candidates(
                 .map(|value| {
                     jsts_local_receiver_value_owner_candidates(
                         analyzer,
+                        host,
                         support,
                         file,
                         language,
@@ -2874,6 +2232,7 @@ fn jsts_collect_local_new_receiver_owner_candidates(
 #[allow(clippy::too_many_arguments)]
 fn jsts_local_receiver_value_owner_candidates(
     analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
@@ -2893,7 +2252,7 @@ fn jsts_local_receiver_value_owner_candidates(
             .child_by_field_name("constructor")
             .map(|constructor| {
                 jsts_constructor_owner_candidates(
-                    analyzer,
+                    host,
                     support,
                     file,
                     language,
@@ -2909,9 +2268,9 @@ fn jsts_local_receiver_value_owner_candidates(
             .child_by_field_name("function")
             .map(|function| {
                 let callees = jsts_call_expression_callees(
-                    analyzer, support, file, language, source, imports, aliases, function,
+                    host, support, file, language, source, imports, aliases, function,
                 );
-                ts_expand_call_return_property_owners(analyzer, support, callees, depth + 1)
+                ts_expand_call_return_property_owners(host, support, callees, depth + 1)
             })
             .unwrap_or_default(),
         "identifier" | "type_identifier" => source
@@ -2921,6 +2280,7 @@ fn jsts_local_receiver_value_owner_candidates(
             .map(|alias| {
                 jsts_local_new_receiver_owner_candidates(
                     analyzer,
+                    host,
                     support,
                     file,
                     language,
@@ -2940,7 +2300,7 @@ fn jsts_local_receiver_value_owner_candidates(
 
 #[allow(clippy::too_many_arguments)]
 fn jsts_call_expression_callees(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
@@ -2956,794 +2316,12 @@ fn jsts_call_expression_callees(
             .filter(|name| !name.is_empty())
             .map(|name| {
                 jsts_identifier_candidates(
-                    analyzer, support, language, file, source, imports, aliases, name, true,
+                    host, support, language, file, source, imports, aliases, name, true,
                 )
             })
             .unwrap_or_default(),
         _ => Vec::new(),
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn jsts_constructor_owner_candidates(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    language: Language,
-    source: &str,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    constructor: Node<'_>,
-    value_position: bool,
-) -> Vec<CodeUnit> {
-    let Some(name) = jsts_constructor_name(constructor, source) else {
-        return Vec::new();
-    };
-    let mut candidates = resolve_js_ts_direct_import_candidates(
-        analyzer,
-        support,
-        language,
-        file,
-        imports,
-        name,
-        Some(aliases),
-        value_position,
-    )
-    .unwrap_or_else(|| {
-        if imports.binding(name).is_some() {
-            Vec::new()
-        } else {
-            support.file_identifier(file, name)
-        }
-    });
-    candidates.retain(|unit| unit.is_class());
-    sort_units(&mut candidates);
-    candidates.dedup();
-    candidates
-}
-
-fn jsts_constructor_name<'a>(constructor: Node<'_>, source: &'a str) -> Option<&'a str> {
-    match constructor.kind() {
-        "identifier" | "type_identifier" => source
-            .get(constructor.start_byte()..constructor.end_byte())
-            .map(str::trim)
-            .filter(|name| !name.is_empty()),
-        _ => None,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ts_call_expression_callees(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    function: Node<'_>,
-    depth: usize,
-    resolution: &TsReceiverResolution,
-) -> Vec<CodeUnit> {
-    if depth > 8 {
-        return Vec::new();
-    }
-    if function.kind() == "member_expression" {
-        let Some(object) = function.child_by_field_name("object") else {
-            return Vec::new();
-        };
-        let Some(property) = function
-            .child_by_field_name("property")
-            .and_then(|property| ts_call_reference_name(property, source))
-        else {
-            return Vec::new();
-        };
-        if let Some(namespace) = source
-            .get(object.start_byte()..object.end_byte())
-            .map(str::trim)
-            .filter(|namespace| !namespace.is_empty())
-            && let Some(binding) = imports.binding(namespace)
-            && matches!(
-                binding.kind,
-                ImportKind::Namespace | ImportKind::CommonJsRequire
-            )
-        {
-            return resolve_js_ts_module_binding_candidates(
-                analyzer,
-                support,
-                Language::TypeScript,
-                file,
-                &binding.module_specifier,
-                &property,
-                Some(aliases),
-                true,
-            );
-        }
-        let receiver_owners = ts_expression_receiver_owners(
-            analyzer,
-            support,
-            file,
-            source,
-            imports,
-            aliases,
-            object,
-            depth + 1,
-            resolution,
-        );
-        let callees = jsts_member_candidates(analyzer, support, receiver_owners, &property, true);
-        if !callees.is_empty() {
-            return callees;
-        }
-        return Vec::new();
-    }
-
-    ts_call_reference_name(function, source)
-        .map(|name| {
-            ts_identifier_candidates(
-                analyzer, support, file, source, imports, aliases, &name, true,
-            )
-        })
-        .unwrap_or_default()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ts_expression_receiver_owners(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    expression: Node<'_>,
-    depth: usize,
-    resolution: &TsReceiverResolution,
-) -> Vec<CodeUnit> {
-    if depth > 8 {
-        return Vec::new();
-    }
-    match expression.kind() {
-        "identifier" | "property_identifier" | "this" => {
-            let Some(receiver) = source
-                .get(expression.start_byte()..expression.end_byte())
-                .map(str::trim)
-            else {
-                return Vec::new();
-            };
-            ts_receiver_owner_candidates_at_byte_with_resolution(
-                analyzer,
-                support,
-                file,
-                source,
-                root_node(expression),
-                imports,
-                aliases,
-                receiver,
-                expression.start_byte(),
-                resolution,
-            )
-        }
-        _ => ts_expression_property_owners(
-            analyzer,
-            support,
-            file,
-            source,
-            imports,
-            aliases,
-            expression,
-            depth + 1,
-            resolution,
-        ),
-    }
-}
-
-fn root_node(mut node: Node<'_>) -> Node<'_> {
-    while let Some(parent) = node.parent() {
-        node = parent;
-    }
-    node
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ts_identifier_candidates(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    name: &str,
-    value_position: bool,
-) -> Vec<CodeUnit> {
-    jsts_identifier_candidates(
-        analyzer,
-        support,
-        Language::TypeScript,
-        file,
-        source,
-        imports,
-        aliases,
-        name,
-        value_position,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn jsts_identifier_candidates(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    language: Language,
-    file: &ProjectFile,
-    _source: &str,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    name: &str,
-    value_position: bool,
-) -> Vec<CodeUnit> {
-    let mut candidates = resolve_js_ts_direct_import_candidates(
-        analyzer,
-        support,
-        language,
-        file,
-        imports,
-        name,
-        Some(aliases),
-        value_position,
-    )
-    .unwrap_or_else(|| {
-        if imports.binding(name).is_some() {
-            Vec::new()
-        } else {
-            support.file_identifier(file, name)
-        }
-    });
-    if value_position {
-        candidates = jsts_value_space_candidates(analyzer, candidates);
-    } else {
-        candidates = jsts_type_space_candidates(analyzer, candidates);
-    }
-    candidates
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn ts_resolve_type_text_to_property_owners(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    type_text: &str,
-    depth: usize,
-) -> Vec<CodeUnit> {
-    if depth > 8 {
-        return Vec::new();
-    }
-    let type_text = ts_clean_type_text(type_text);
-    if type_text.is_empty() {
-        return Vec::new();
-    }
-
-    if let Some(name) = ts_typeof_target(&type_text) {
-        let candidates = ts_identifier_candidates(
-            analyzer, support, file, source, imports, aliases, name, true,
-        );
-        return ts_expand_property_owners(analyzer, support, candidates, depth + 1);
-    }
-
-    if let Some(inner) = ts_generic_type_argument(&type_text, "ReturnType") {
-        return ts_resolve_type_text_to_property_owners(
-            analyzer,
-            support,
-            file,
-            source,
-            imports,
-            aliases,
-            inner,
-            depth + 1,
-        );
-    }
-
-    if let Some(inner) = ts_generic_type_argument(&type_text, "Promise") {
-        return ts_resolve_type_text_to_property_owners(
-            analyzer,
-            support,
-            file,
-            source,
-            imports,
-            aliases,
-            inner,
-            depth + 1,
-        );
-    }
-
-    if let Some(inner) = ts_schema_infer_argument(&type_text) {
-        return ts_resolve_type_text_to_property_owners(
-            analyzer,
-            support,
-            file,
-            source,
-            imports,
-            aliases,
-            inner,
-            depth + 1,
-        );
-    }
-
-    let Some(name) = ts_leading_type_identifier(&type_text) else {
-        return Vec::new();
-    };
-    let candidates = ts_identifier_candidates(
-        analyzer, support, file, source, imports, aliases, name, false,
-    );
-    ts_expand_property_owners(analyzer, support, candidates, depth + 1)
-}
-
-fn ts_expand_property_owners(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    candidates: Vec<CodeUnit>,
-    depth: usize,
-) -> Vec<CodeUnit> {
-    if depth > 8 {
-        return Vec::new();
-    }
-    let mut owners = Vec::new();
-    for candidate in candidates {
-        if jsts_unit_is_type_only(analyzer, &candidate) {
-            let signatures = analyzer.signatures(&candidate);
-            let expanded = signatures
-                .iter()
-                .flat_map(|signature| {
-                    ts_alias_rhs(signature)
-                        .map(|rhs| {
-                            ts_resolve_type_from_unit_context(
-                                analyzer,
-                                support,
-                                &candidate,
-                                rhs,
-                                depth + 1,
-                            )
-                        })
-                        .unwrap_or_default()
-                })
-                .collect::<Vec<_>>();
-            if expanded.is_empty() {
-                owners.push(candidate);
-            } else {
-                owners.extend(expanded);
-            }
-        } else if candidate.is_function() {
-            owners.push(candidate.clone());
-            owners.extend(ts_function_return_property_owners(
-                analyzer,
-                support,
-                &candidate,
-                depth + 1,
-            ));
-        } else {
-            owners.push(candidate);
-        }
-    }
-    sort_units(&mut owners);
-    owners.dedup();
-    owners
-}
-
-fn ts_expand_call_return_property_owners(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    callees: Vec<CodeUnit>,
-    depth: usize,
-) -> Vec<CodeUnit> {
-    if depth > 8 {
-        return Vec::new();
-    }
-    let mut owners = Vec::new();
-    for callee in callees.into_iter().filter(|callee| callee.is_function()) {
-        if jsts_function_returns_direct_object_literal(analyzer, &callee) {
-            owners.push(callee.clone());
-        }
-        owners.extend(ts_function_return_property_owners(
-            analyzer,
-            support,
-            &callee,
-            depth + 1,
-        ));
-    }
-    sort_units(&mut owners);
-    owners.dedup();
-    owners
-}
-
-fn jsts_function_returns_direct_object_literal(
-    analyzer: &dyn IAnalyzer,
-    function: &CodeUnit,
-) -> bool {
-    let Ok(source) = function.source().read_to_string() else {
-        return false;
-    };
-    let language = crate::analyzer::common::language_for_file(function.source());
-    let Some(tree) = parse_js_ts_tree(function.source(), &source, language) else {
-        return false;
-    };
-    for indexed_node in ts_nodes_for_code_unit(analyzer, function, tree.root_node()) {
-        let function_node = jsts_indexed_callable_node(indexed_node).unwrap_or(indexed_node);
-        if function_node.kind() == "arrow_function"
-            && function_node
-                .child_by_field_name("body")
-                .and_then(ts_direct_object_literal_value)
-                .is_some()
-        {
-            return true;
-        }
-        let mut stack = vec![function_node];
-        while let Some(node) = stack.pop() {
-            if node.id() != function_node.id()
-                && matches!(
-                    node.kind(),
-                    "function_declaration"
-                        | "function_expression"
-                        | "arrow_function"
-                        | "method_definition"
-                        | "class_declaration"
-                        | "abstract_class_declaration"
-                        | "interface_declaration"
-                )
-            {
-                continue;
-            }
-            if node.kind() == "return_statement" {
-                let mut cursor = node.walk();
-                if node
-                    .named_children(&mut cursor)
-                    .next()
-                    .and_then(ts_direct_object_literal_value)
-                    .is_some()
-                {
-                    return true;
-                }
-                continue;
-            }
-            for index in (0..node.named_child_count()).rev() {
-                if let Some(child) = node.named_child(index) {
-                    stack.push(child);
-                }
-            }
-        }
-    }
-    false
-}
-
-fn jsts_indexed_callable_node(mut node: Node<'_>) -> Option<Node<'_>> {
-    loop {
-        if matches!(
-            node.kind(),
-            "function_declaration" | "function_expression" | "arrow_function" | "method_definition"
-        ) {
-            return Some(node);
-        }
-        node = match node.kind() {
-            "export_statement" => node.child_by_field_name("declaration")?,
-            "lexical_declaration" | "variable_declaration" => {
-                let mut cursor = node.walk();
-                node.named_children(&mut cursor)
-                    .find(|child| child.kind() == "variable_declarator")?
-            }
-            "variable_declarator" => node.child_by_field_name("value")?,
-            _ => return None,
-        };
-    }
-}
-
-fn ts_resolve_type_from_unit_context(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    unit: &CodeUnit,
-    type_text: &str,
-    depth: usize,
-) -> Vec<CodeUnit> {
-    let Ok(source) = unit.source().read_to_string() else {
-        return Vec::new();
-    };
-    let Some(tree) = parse_js_ts_tree(unit.source(), &source, Language::TypeScript) else {
-        return Vec::new();
-    };
-    let imports = compute_jsts_import_binder(&source, &tree);
-    let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
-    ts_resolve_type_text_to_property_owners(
-        analyzer,
-        support,
-        unit.source(),
-        &source,
-        &imports,
-        &aliases,
-        type_text,
-        depth + 1,
-    )
-}
-
-pub(crate) fn ts_function_return_property_owners(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    function: &CodeUnit,
-    depth: usize,
-) -> Vec<CodeUnit> {
-    if depth > 8 {
-        return Vec::new();
-    }
-    let Ok(source) = function.source().read_to_string() else {
-        return Vec::new();
-    };
-    let Some(tree) = parse_js_ts_tree(function.source(), &source, Language::TypeScript) else {
-        return Vec::new();
-    };
-    let imports = compute_jsts_import_binder(&source, &tree);
-    let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
-    let mut owners = Vec::new();
-    for node in ts_nodes_for_code_unit(analyzer, function, tree.root_node()) {
-        if let Some(type_text) = ts_function_return_type_text(node, &source) {
-            owners.extend(ts_resolve_type_text_to_property_owners(
-                analyzer,
-                support,
-                function.source(),
-                &source,
-                &imports,
-                &aliases,
-                &type_text,
-                depth + 1,
-            ));
-        }
-        ts_collect_return_property_owners(
-            analyzer,
-            support,
-            function.source(),
-            &source,
-            &imports,
-            &aliases,
-            node,
-            node.id(),
-            depth + 1,
-            &mut owners,
-        );
-    }
-    sort_units(&mut owners);
-    owners.dedup();
-    owners
-}
-
-fn ts_function_return_type_text(function: Node<'_>, source: &str) -> Option<String> {
-    function
-        .child_by_field_name("return_type")
-        .map(|type_node| ts_type_annotation_text(type_node, source))
-        .filter(|text| !text.is_empty())
-}
-
-fn ts_nodes_for_code_unit<'tree>(
-    analyzer: &dyn IAnalyzer,
-    unit: &CodeUnit,
-    root: Node<'tree>,
-) -> Vec<Node<'tree>> {
-    let ranges = analyzer.ranges(unit);
-    let mut nodes = Vec::new();
-    for range in ranges {
-        if let Some(node) = smallest_named_node_covering(root, range.start_byte, range.end_byte) {
-            nodes.push(
-                node.child_by_field_name("declaration")
-                    .filter(|_| node.kind() == "export_statement")
-                    .unwrap_or(node),
-            );
-        }
-    }
-    nodes
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ts_collect_return_property_owners(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    node: Node<'_>,
-    root_id: usize,
-    depth: usize,
-    out: &mut Vec<CodeUnit>,
-) {
-    if depth > 8 {
-        return;
-    }
-    let resolution = TsReceiverResolution::default();
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.id() != root_id
-            && matches!(
-                node.kind(),
-                "function_declaration"
-                    | "function_expression"
-                    | "arrow_function"
-                    | "method_definition"
-                    | "class_declaration"
-                    | "abstract_class_declaration"
-                    | "interface_declaration"
-            )
-        {
-            continue;
-        }
-        if node.kind() == "return_statement" {
-            let mut cursor = node.walk();
-            if let Some(expression) = node.named_children(&mut cursor).next() {
-                out.extend(ts_expression_property_owners(
-                    analyzer,
-                    support,
-                    file,
-                    source,
-                    imports,
-                    aliases,
-                    expression,
-                    depth + 1,
-                    &resolution,
-                ));
-            }
-            continue;
-        }
-
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        stack.extend(children.into_iter().rev());
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ts_field_signature_type_owners(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    field: &CodeUnit,
-    depth: usize,
-) -> Vec<CodeUnit> {
-    let mut owners = Vec::new();
-    for signature in analyzer.signatures(field) {
-        if let Some(type_text) = ts_field_type_text(&signature) {
-            owners.extend(ts_resolve_type_text_to_property_owners(
-                analyzer,
-                support,
-                file,
-                source,
-                imports,
-                aliases,
-                type_text,
-                depth + 1,
-            ));
-        }
-    }
-    owners
-}
-
-fn ts_object_pattern_binds(pattern: Node<'_>, source: &str, receiver: &str) -> bool {
-    if pattern.kind() != "object_pattern" {
-        return false;
-    }
-    let mut cursor = pattern.walk();
-    pattern
-        .named_children(&mut cursor)
-        .any(|child| match child.kind() {
-            "shorthand_property_identifier_pattern" => node_text_matches(child, source, receiver),
-            "pair_pattern" => child
-                .child_by_field_name("value")
-                .is_some_and(|value| ts_pattern_binds_name(value, source, receiver)),
-            _ => false,
-        })
-}
-
-fn ts_pattern_binds_name(pattern: Node<'_>, source: &str, receiver: &str) -> bool {
-    let mut current = Some(pattern);
-    while let Some(pattern) = current {
-        match pattern.kind() {
-            "identifier" | "shorthand_property_identifier_pattern" => {
-                return node_text_matches(pattern, source, receiver);
-            }
-            "assignment_pattern" => current = pattern.child_by_field_name("left"),
-            _ => return false,
-        }
-    }
-    false
-}
-
-fn node_text_matches(node: Node<'_>, source: &str, expected: &str) -> bool {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .is_some_and(|text| text.trim() == expected)
-}
-
-fn ts_field_type_text(signature: &str) -> Option<&str> {
-    let (_, rhs) = signature.split_once(':')?;
-    Some(
-        rhs.split(['=', ','])
-            .next()
-            .unwrap_or(rhs)
-            .trim()
-            .trim_end_matches(';')
-            .trim(),
-    )
-}
-
-fn ts_alias_rhs(signature: &str) -> Option<&str> {
-    let (_, rhs) = signature.split_once('=')?;
-    Some(rhs.trim().trim_end_matches(';').trim())
-}
-
-fn ts_typeof_target(text: &str) -> Option<&str> {
-    text.trim().strip_prefix("typeof").map(str::trim)
-}
-
-fn ts_generic_type_argument<'a>(text: &'a str, generic: &str) -> Option<&'a str> {
-    let text = text.trim();
-    let rest = text.strip_prefix(generic)?;
-    let rest = rest.trim_start();
-    let inner = rest.strip_prefix('<')?.strip_suffix('>')?;
-    Some(inner.trim())
-}
-
-/// Recognizes a schema library's type-inference helper applied to a value, e.g. zod's
-/// `z.infer<typeof Schema>` (and the `Infer` alias other libraries expose), so navigation can
-/// follow the wrapped argument to the schema's shape. Matches the qualified `.infer`/`.Infer`
-/// member-name convention regardless of the namespace alias, rather than the literal `z.infer`.
-fn ts_schema_infer_argument(text: &str) -> Option<&str> {
-    let text = text.trim();
-    let open = text.find('<')?;
-    let head = text[..open].trim();
-    // `head` is a type-annotation qualifier chain (already sliced before any
-    // generic argument list), so re-tokenizing it with the shared structured
-    // splitter and taking the last segment reproduces `rsplit('.').next()`'s
-    // terminal split exactly (TS/JS have no per-segment normalization
-    // quirks, unlike Go/Rust/Cpp).
-    let last = crate::analyzer::symbol_lookup::parse_symbol_path(Language::TypeScript, head)
-        .pop()
-        .unwrap_or_default();
-    if !head.contains('.') || !(last == "infer" || last == "Infer") {
-        return None;
-    }
-    let inner = text[open..].strip_prefix('<')?.strip_suffix('>')?;
-    Some(inner.trim())
-}
-
-fn ts_leading_type_identifier(text: &str) -> Option<&str> {
-    let text = text.trim();
-    let end = text
-        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'))
-        .unwrap_or(text.len());
-    (end > 0).then_some(&text[..end])
-}
-
-fn ts_call_reference_name(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "identifier" | "property_identifier" => source
-            .get(node.start_byte()..node.end_byte())
-            .map(|text| text.trim().to_string()),
-        "member_expression" => node
-            .child_by_field_name("property")
-            .and_then(|property| ts_call_reference_name(property, source)),
-        _ => None,
-    }
-}
-
-fn ts_assertion_type_child(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).find(|child| {
-        matches!(
-            child.kind(),
-            "type_identifier"
-                | "generic_type"
-                | "type_arguments"
-                | "object_type"
-                | "predefined_type"
-                | "union_type"
-                | "intersection_type"
-        )
-    })
 }
 
 fn jsts_reference_is_value_position(tree: &Tree, site: &ResolvedReferenceSite) -> bool {

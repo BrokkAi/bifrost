@@ -52,6 +52,9 @@ pub(in crate::analyzer::usages) use resolver::{
     browser_global_property_shape, unbound_browser_global_property,
 };
 
+use crate::analyzer::js_ts::providers::{
+    JsTsAnalyzerHost, jsts_usage_index, jsts_usage_index_with_cancellation, resolve_js_ts_host,
+};
 use crate::analyzer::js_ts::syntax::{direct_property_definitions, slice};
 use crate::analyzer::usages::common::analyzed_files_for_language;
 use crate::analyzer::usages::js_ts_graph::extractor::scan_files_for_seeds;
@@ -105,28 +108,29 @@ where
 /// Borrow the analyzer-cached [`JsTsUsageIndex`] for `language` off the concrete TS/JS
 /// analyzer behind `analyzer`, building it on first use. `None` when the analyzer does
 /// not expose the matching JS/TS analyzer.
+///
+/// The downcasting half of the pair: framework callers that hold only a
+/// `&dyn IAnalyzer` (the definition trace, the dead-code pass, the edge builders)
+/// come through here. Everything already holding a [`JsTsAnalyzerHost`] calls
+/// [`cached_jsts_index_for_host`] directly.
 pub(crate) fn cached_jsts_index(
     analyzer: &dyn IAnalyzer,
     language: Language,
     cancellation: Option<&CancellationToken>,
 ) -> Option<Arc<JsTsUsageIndex>> {
-    match language {
-        Language::TypeScript => cancellation.map_or_else(
-            || Some(resolve_analyzer::<TypescriptAnalyzer>(analyzer)?.jsts_usage_index()),
-            |token| {
-                resolve_analyzer::<TypescriptAnalyzer>(analyzer)?
-                    .jsts_usage_index_with_cancellation(token)
-            },
-        ),
-        Language::JavaScript => cancellation.map_or_else(
-            || Some(resolve_analyzer::<JavascriptAnalyzer>(analyzer)?.jsts_usage_index()),
-            |token| {
-                resolve_analyzer::<JavascriptAnalyzer>(analyzer)?
-                    .jsts_usage_index_with_cancellation(token)
-            },
-        ),
-        _ => None,
-    }
+    cached_jsts_index_for_host(resolve_js_ts_host(analyzer, language)?, cancellation)
+}
+
+/// The index for the host's own language, built on first use. `None` only when a
+/// cancellation token fires mid-build.
+pub(crate) fn cached_jsts_index_for_host(
+    host: &dyn JsTsAnalyzerHost,
+    cancellation: Option<&CancellationToken>,
+) -> Option<Arc<JsTsUsageIndex>> {
+    cancellation.map_or_else(
+        || Some(jsts_usage_index(host)),
+        |token| jsts_usage_index_with_cancellation(host, token),
+    )
 }
 
 pub(in crate::analyzer::usages) fn prewarm_cached_jsts_index(

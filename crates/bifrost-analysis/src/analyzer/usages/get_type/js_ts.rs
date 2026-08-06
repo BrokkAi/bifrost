@@ -5,12 +5,13 @@ use super::{
 use crate::analyzer::js_ts::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
 };
+use crate::analyzer::js_ts::providers::{JsTsAnalyzerHost, resolve_js_ts_host};
 use crate::analyzer::js_ts::syntax::JsTsImportBinder;
-use crate::analyzer::js_ts::type_text::{jsts_type_space_candidates, ts_type_annotation_text};
-use crate::analyzer::usages::get_definition::js_ts::{
+use crate::analyzer::js_ts::ts_owners::{
     ts_function_return_property_owners, ts_receiver_owner_candidates_at_byte,
     ts_resolve_type_text_to_property_owners,
 };
+use crate::analyzer::js_ts::type_text::{jsts_type_space_candidates, ts_type_annotation_text};
 use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
 use crate::analyzer::usages::model::ImportKind;
 use crate::analyzer::usages::reference_site::{
@@ -40,6 +41,13 @@ pub(crate) fn resolve_js_ts_type(
             "JavaScript type lookup only supports structured TypeScript declarations",
         );
     }
+    // The one downcast for this route; see `get_definition::js_ts::resolve_js_ts`.
+    let Some(host) = resolve_js_ts_host(analyzer, language) else {
+        return no_type(
+            "jsts_analyzer_unavailable",
+            "no TypeScript analyzer is registered for this workspace",
+        );
+    };
 
     let Some(node) =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)
@@ -66,13 +74,13 @@ pub(crate) fn resolve_js_ts_type(
         && let Some(type_name) = type_reference_name(type_node, source)
     {
         return resolve_declared_type_name(
-            analyzer, support, file, language, &imports, &aliases, type_name,
+            host, support, file, language, &imports, &aliases, type_name,
         );
     }
 
     if let Some(type_node) = declaration_type_node_for_reference(node, source, site) {
         return resolve_declared_type_text(
-            analyzer,
+            host,
             support,
             file,
             source,
@@ -88,7 +96,7 @@ pub(crate) fn resolve_js_ts_type(
         && let Some(callee_name) = call_expression_name(expression, source)
     {
         let candidates = identifier_candidates(
-            analyzer,
+            host,
             support,
             file,
             language,
@@ -100,7 +108,7 @@ pub(crate) fn resolve_js_ts_type(
         let mut owners = Vec::new();
         for candidate in candidates {
             owners.extend(ts_function_return_property_owners(
-                analyzer, support, &candidate, 0,
+                host, support, &candidate, 0,
             ));
         }
         if !owners.is_empty() {
@@ -112,7 +120,7 @@ pub(crate) fn resolve_js_ts_type(
         .or_else(|| call_member_receiver(expression, source, site))
     {
         let owners = ts_receiver_owner_candidates_at_byte(
-            analyzer,
+            host,
             support,
             file,
             source,
@@ -131,7 +139,7 @@ pub(crate) fn resolve_js_ts_type(
             )
         {
             return resolve_declared_type_text(
-                analyzer,
+                host,
                 support,
                 file,
                 source,
@@ -151,7 +159,7 @@ pub(crate) fn resolve_js_ts_type(
             local_binding_type_node_before(tree.root_node(), source, name, site.focus_start_byte)
     {
         return resolve_declared_type_text(
-            analyzer,
+            host,
             support,
             file,
             source,
@@ -173,7 +181,7 @@ pub(crate) fn resolve_js_ts_type(
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_declared_type_text(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -183,15 +191,15 @@ fn resolve_declared_type_text(
     target_kind: TypeLookupTargetKind,
 ) -> TypeLookupOutcome {
     let type_text = ts_type_annotation_text(type_node, source);
-    if let Some((type_name, candidates)) = qualified_imported_type_candidates(
-        analyzer, support, file, type_node, source, imports, aliases,
-    ) {
+    if let Some((type_name, candidates)) =
+        qualified_imported_type_candidates(host, support, file, type_node, source, imports, aliases)
+    {
         return candidates_outcome_with_target_kind(type_name, candidates, target_kind);
     }
 
     if let Some(type_name) = leading_type_identifier(&type_text) {
         let candidates = identifier_candidates(
-            analyzer,
+            host,
             support,
             file,
             Language::TypeScript,
@@ -210,7 +218,7 @@ fn resolve_declared_type_text(
     }
 
     let owners = ts_resolve_type_text_to_property_owners(
-        analyzer, support, file, source, imports, aliases, &type_text, 0,
+        host, support, file, source, imports, aliases, &type_text, 0,
     );
     let owners = prefer_type_definitions(owners);
     if !owners.is_empty() {
@@ -228,7 +236,7 @@ fn resolve_declared_type_text(
 }
 
 fn resolve_declared_type_name(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
@@ -237,7 +245,7 @@ fn resolve_declared_type_name(
     type_name: &str,
 ) -> TypeLookupOutcome {
     let candidates = identifier_candidates(
-        analyzer, support, file, language, imports, aliases, type_name, false,
+        host, support, file, language, imports, aliases, type_name, false,
     );
     if candidates.is_empty() {
         return no_type(
@@ -250,7 +258,7 @@ fn resolve_declared_type_name(
 
 #[allow(clippy::too_many_arguments)]
 fn identifier_candidates(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
@@ -260,7 +268,7 @@ fn identifier_candidates(
     value_position: bool,
 ) -> Vec<CodeUnit> {
     let mut candidates = resolve_js_ts_direct_import_candidates(
-        analyzer,
+        host,
         support,
         language,
         file,
@@ -277,7 +285,7 @@ fn identifier_candidates(
         }
     });
     if !value_position {
-        candidates = jsts_type_space_candidates(analyzer, candidates);
+        candidates = jsts_type_space_candidates(host, candidates);
     }
     candidates
 }
@@ -637,7 +645,7 @@ fn leading_type_identifier(text: &str) -> Option<&str> {
 
 #[allow(clippy::too_many_arguments)]
 fn qualified_imported_type_candidates(
-    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     type_node: Node<'_>,
@@ -659,7 +667,7 @@ fn qualified_imported_type_candidates(
         return None;
     }
     let candidates = resolve_js_ts_module_binding_candidates(
-        analyzer,
+        host,
         support,
         Language::TypeScript,
         file,

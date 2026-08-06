@@ -1,12 +1,13 @@
 use crate::analyzer::js_ts::imports::require_call_module_specifier;
+use crate::analyzer::js_ts::providers::{JsTsAnalyzerHost, resolve_js_ts_host};
 use crate::analyzer::js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, JsTsLexicalBindingScope,
     direct_property_definitions, is_commonjs_require_declarator, is_declaration_identifier,
     is_lexically_nested_type_declaration, is_object_in_member_expression,
     is_property_key_in_member, nested_type_identifier_parts, slice, static_member_receiver,
 };
+use crate::analyzer::js_ts::ts_owners::ts_resolve_type_text_to_property_owners;
 use crate::analyzer::js_ts::type_text::ts_type_annotation_text;
-use crate::analyzer::usages::get_definition::js_ts::ts_resolve_type_text_to_property_owners;
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::js_ts_graph::JsTsReceiverFactProvider;
 use crate::analyzer::usages::js_ts_graph::hits::{
@@ -45,6 +46,12 @@ pub(super) fn scan_files_for_seeds(
     exported_local_property_root: Option<&str>,
     cancellation: Option<&CancellationToken>,
 ) -> BTreeSet<UsageHit> {
+    // The receiver-facts provider and the type-text owner resolution below are on
+    // `JsTsAnalyzerHost`; the downcast happens once here rather than per scanned file.
+    // Without the analyzer for `language` this scan has no seeds to resolve either.
+    let Some(host) = resolve_js_ts_host(analyzer, language) else {
+        return BTreeSet::new();
+    };
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let unproven_collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let browser_global_shape = (language == Language::JavaScript)
@@ -160,7 +167,7 @@ pub(super) fn scan_files_for_seeds(
         });
         let definitions = analyzer.global_usage_definition_index();
         let receiver_facts = JsTsReceiverFactProvider::new(
-            analyzer,
+            host,
             &definitions,
             language,
             file,
@@ -173,6 +180,7 @@ pub(super) fn scan_files_for_seeds(
             source: source_str,
             line_starts: &line_starts,
             analyzer,
+            host,
             target,
             target_short: &target_short,
             target_member: target_member.as_deref(),
@@ -263,6 +271,9 @@ pub(super) struct ScanCtx<'a> {
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
     pub(super) analyzer: &'a dyn IAnalyzer,
+    /// The JS/TS host for `language`, resolved once by `scan_files_for_seeds`, for the
+    /// parts of the scan that call the host-parameterized owner resolution.
+    host: &'a dyn JsTsAnalyzerHost,
     target: &'a CodeUnit,
     /// Top-level identifier (the class/function/field's own name component).
     target_short: &'a str,
@@ -1236,7 +1247,7 @@ fn contextual_object_literal_owners(node: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Co
         && let Some(type_node) = variable.child_by_field_name("type")
     {
         return ts_resolve_type_text_to_property_owners(
-            ctx.analyzer,
+            ctx.host,
             &ctx.analyzer.global_usage_definition_index(),
             ctx.file,
             ctx.source,
@@ -1268,7 +1279,7 @@ fn contextual_object_literal_owners(node: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Co
         return Vec::new();
     };
     ts_resolve_type_text_to_property_owners(
-        ctx.analyzer,
+        ctx.host,
         &ctx.analyzer.global_usage_definition_index(),
         ctx.file,
         ctx.source,

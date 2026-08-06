@@ -9,15 +9,16 @@ use crate::analyzer::js_ts::imports::require_call_module_specifier;
 use crate::analyzer::js_ts::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
 };
+use crate::analyzer::js_ts::providers::{JsTsAnalyzerHost, resolve_js_ts_host};
 use crate::analyzer::js_ts::syntax::parse_js_ts_tree;
 use crate::analyzer::js_ts::syntax::{JsTsImportBinder, slice};
+use crate::analyzer::js_ts::ts_owners::ts_resolve_type_text_to_property_owners;
 use crate::analyzer::js_ts::type_text::ts_type_annotation_text;
 use crate::analyzer::languages::{ReceiverFactContext, ReceiverFactsFactory};
 use crate::analyzer::tree_sitter_analyzer::{
     BoundedNamedTreeWalk, walk_named_tree_preorder_bounded,
 };
 use crate::analyzer::tree_walk::subtree_contains;
-use crate::analyzer::usages::get_definition::js_ts::ts_resolve_type_text_to_property_owners;
 use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
 use crate::analyzer::usages::model::ImportKind;
 use crate::analyzer::usages::receiver_analysis::{
@@ -28,7 +29,7 @@ use crate::analyzer::usages::receiver_analysis::{
 };
 use crate::analyzer::usages::reference_site::{node_range, smallest_named_node_covering};
 use crate::analyzer::{
-    AliasResolver, BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile,
+    AliasResolver, BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, Language, ProjectFile,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -92,8 +93,16 @@ impl ReceiverFactsFactory for JsTsReceiverFacts {
         ctx: ReceiverFactContext<'a, 'tree>,
     ) -> Box<dyn ReceiverFacts<'tree> + 'a> {
         let facts = ctx.facts.downcast::<JsTsReceiverFileFacts>();
+        // The SPI hands the framework's `&dyn IAnalyzer`; everything below the
+        // factory is on `JsTsAnalyzerHost`, so the downcast happens once, here.
+        // `ReceiverFactsFactory` has no error channel and only the JavaScript and
+        // TypeScript language modules register this factory, so a miss is a
+        // registration bug rather than a runtime condition.
+        let host = resolve_js_ts_host(ctx.analyzer, ctx.language).expect(
+            "JsTsReceiverFacts is registered only by the JavaScript and TypeScript language modules",
+        );
         Box::new(JsTsReceiverFactProvider::new_with_syntax_index(
-            ctx.analyzer,
+            host,
             ctx.definitions,
             ctx.language,
             ctx.file,
@@ -106,7 +115,7 @@ impl ReceiverFactsFactory for JsTsReceiverFacts {
 }
 
 pub(crate) struct JsTsReceiverFactProvider<'tree, 'a> {
-    analyzer: &'a dyn IAnalyzer,
+    host: &'a dyn JsTsAnalyzerHost,
     support: &'a dyn BoundedDefinitionLookup,
     language: Language,
     file: &'a ProjectFile,
@@ -145,7 +154,7 @@ pub(in crate::analyzer::usages) enum JsTsReceiverSyntaxIndexBuild {
 
 impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
     pub(crate) fn new(
-        analyzer: &'a dyn IAnalyzer,
+        host: &'a dyn JsTsAnalyzerHost,
         support: &'a dyn BoundedDefinitionLookup,
         language: Language,
         file: &'a ProjectFile,
@@ -156,7 +165,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         let (syntax_index, _) =
             build_js_ts_receiver_syntax_index(root, source, None).expect("uncancelled index build");
         Self::new_with_syntax_index(
-            analyzer,
+            host,
             support,
             language,
             file,
@@ -169,7 +178,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub(in crate::analyzer::usages) fn new_with_syntax_index(
-        analyzer: &'a dyn IAnalyzer,
+        host: &'a dyn JsTsAnalyzerHost,
         support: &'a dyn BoundedDefinitionLookup,
         language: Language,
         file: &'a ProjectFile,
@@ -179,21 +188,21 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         syntax_index: Arc<JsTsReceiverSyntaxIndex>,
     ) -> Self {
         Self::new_with_batch_data(
-            analyzer,
+            host,
             support,
             language,
             file,
             source,
             root,
             imports,
-            Arc::new(AliasResolver::new(analyzer.project().root().to_path_buf())),
+            Arc::new(AliasResolver::new(host.project().root().to_path_buf())),
             syntax_index,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(in crate::analyzer::usages) fn new_with_batch_data(
-        analyzer: &'a dyn IAnalyzer,
+        host: &'a dyn JsTsAnalyzerHost,
         support: &'a dyn BoundedDefinitionLookup,
         language: Language,
         file: &'a ProjectFile,
@@ -204,7 +213,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         syntax_index: Arc<JsTsReceiverSyntaxIndex>,
     ) -> Self {
         Self {
-            analyzer,
+            host,
             support,
             language,
             file,
@@ -418,7 +427,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
 
     fn jsx_component_candidates(&self, name: &str) -> Vec<CodeUnit> {
         let mut candidates = resolve_js_ts_direct_import_candidates(
-            self.analyzer,
+            self.host,
             self.support,
             self.language,
             self.file,
@@ -452,13 +461,13 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             return Vec::new();
         };
         let imports = compute_jsts_import_binder(&source, &tree);
-        let aliases = AliasResolver::new(self.analyzer.project().root().to_path_buf());
-        let mut owners = nodes_for_code_unit(self.analyzer, component, tree.root_node())
+        let aliases = AliasResolver::new(self.host.project().root().to_path_buf());
+        let mut owners = nodes_for_code_unit(self.host, component, tree.root_node())
             .into_iter()
             .filter_map(|node| jsx_component_props_type(node, component.identifier(), &source))
             .flat_map(|type_node| {
                 ts_resolve_type_text_to_property_owners(
-                    self.analyzer,
+                    self.host,
                     self.support,
                     component.source(),
                     &source,
@@ -787,7 +796,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         budget: ReceiverAnalysisBudget,
     ) -> Vec<ReceiverValue> {
         ts_resolve_type_text_to_property_owners(
-            self.analyzer,
+            self.host,
             self.support,
             self.file,
             self.source,
@@ -945,7 +954,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             return None;
         }
         let functions = resolve_js_ts_direct_import_candidates(
-            self.analyzer,
+            self.host,
             self.support,
             self.language,
             self.file,
@@ -981,7 +990,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             };
             let imports = compute_jsts_import_binder(&source, &tree);
             let provider = JsTsReceiverFactProvider::new(
-                self.analyzer,
+                self.host,
                 self.support,
                 self.language,
                 function.source(),
@@ -989,7 +998,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 tree.root_node(),
                 imports,
             );
-            for node in nodes_for_code_unit(self.analyzer, &function, tree.root_node()) {
+            for node in nodes_for_code_unit(self.host, &function, tree.root_node()) {
                 outcomes.push(wrap_factory_outcome(
                     provider.summarize_function_body(node, depth + 1, budget, tracker),
                     &function,
@@ -1022,7 +1031,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 .then(|| binding.module_specifier.clone())
             })?;
         let functions = resolve_js_ts_module_binding_candidates(
-            self.analyzer,
+            self.host,
             self.support,
             self.language,
             self.file,
@@ -1068,7 +1077,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         for value in values {
             for factory in self.member_targets_for_value(&value, member) {
                 methods.extend(
-                    nodes_for_code_unit(self.analyzer, &factory, self.root)
+                    nodes_for_code_unit(self.host, &factory, self.root)
                         .into_iter()
                         .map(|node| (node, factory.clone())),
                 );
@@ -1131,7 +1140,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             return Vec::new();
         }
         let mut units = self
-            .analyzer
+            .host
             .declarations(self.file)
             .into_iter()
             .filter(|unit| {
@@ -1148,7 +1157,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
     fn member_targets(&self, owner: &CodeUnit, member: &str) -> Vec<CodeUnit> {
         let fqn = format!("{}.{}", owner.fq_name(), member);
         let mut units = self
-            .analyzer
+            .host
             .definitions(&fqn)
             .filter(|unit| unit.source() == owner.source())
             .filter(|unit| unit.is_function() || unit.is_field())
@@ -1203,7 +1212,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             .filter(|unit| unit.source() == self.file && unit.is_function())
             .filter_map(|unit| {
                 let associated_syntax = self
-                    .analyzer
+                    .host
                     .ranges(&unit)
                     .into_iter()
                     .flat_map(|declaration_range| {
@@ -1666,11 +1675,11 @@ fn is_nonlinear_control_boundary(kind: &str) -> bool {
 }
 
 fn nodes_for_code_unit<'tree>(
-    analyzer: &dyn IAnalyzer,
+    unit_index: &dyn CodeUnitIndex,
     unit: &CodeUnit,
     root: Node<'tree>,
 ) -> Vec<Node<'tree>> {
-    analyzer
+    unit_index
         .ranges(unit)
         .iter()
         .filter_map(|range| smallest_named_node_covering(root, range.start_byte, range.end_byte))
@@ -1844,7 +1853,9 @@ fn dedup_units(mut units: Vec<CodeUnit>, limit: usize) -> Vec<CodeUnit> {
 mod tests {
     use super::*;
     use crate::analyzer::usages::receiver_analysis::DEFAULT_RECEIVER_MAX_TARGETS;
-    use crate::analyzer::{AnalyzerDefinitionLookup, ProjectFile, TestProject, TypescriptAnalyzer};
+    use crate::analyzer::{
+        AnalyzerDefinitionLookup, IAnalyzer, ProjectFile, TestProject, TypescriptAnalyzer,
+    };
     use std::path::PathBuf;
     use tree_sitter::Parser;
 

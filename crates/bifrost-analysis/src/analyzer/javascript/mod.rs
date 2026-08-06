@@ -37,7 +37,6 @@ use crate::analyzer::{
     ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
 };
-use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
 use std::collections::BTreeSet;
@@ -263,19 +262,6 @@ impl JavascriptAnalyzer {
 
     pub fn new(project: Arc<dyn Project>) -> Self {
         Self::new_with_config(project, AnalyzerConfig::default())
-    }
-
-    /// Lazily-built, analyzer-cached JS/TS usage-resolution maps for this analyzer's
-    /// language. Built once and reused until `update`/`update_all` rebuilds the cache bucket.
-    pub(crate) fn jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {
-        providers::jsts_usage_index(self)
-    }
-
-    pub(crate) fn jsts_usage_index_with_cancellation(
-        &self,
-        cancellation: &CancellationToken,
-    ) -> Option<Arc<JsTsUsageIndex>> {
-        providers::jsts_usage_index_with_cancellation(self, cancellation)
     }
 
     pub(crate) fn prewarm_jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {
