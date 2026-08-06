@@ -186,6 +186,86 @@ fn a_receiver_outcome_expansion_executes_and_covers_every_member_site() {
     );
 }
 
+/// The #1477 member-selection invariant: every member occurrence selects
+/// exactly one member. The plan binds sites, expands them into the mandatory
+/// selection summary via the production resolver trace, and asserts on the
+/// summary's selected cardinality.
+const EXACTLY_ONE_SELECTED_MEMBER: &str = r#"(policy
+  :id "test.relational.one-selected-member"
+  :name "Every member access selects exactly one member"
+  :message "a member access must resolve to exactly one selected member"
+  :severity error
+  :analysis (analysis
+    :type assertion
+    (bind :name site :query (rql (occurrences :role [member_position])))
+    (bind :name selection :from site :step member-selection)
+    (join :left site :right selection :on ((ast_id site_ast_id)))
+    (group :name by-site :by (site.ast_id)
+      (aggregate :name winners :op min :value selection.selected_count))
+    (assert :group by-site :value winners :cardinality (exactly 1))))"#;
+
+/// Clean: a typed receiver selects its owner's member and nothing else.
+#[test]
+fn member_selection_invariant_is_clean_on_the_resolving_fixture() {
+    let (_project, analyzer) = typescript(
+        "class Service {\n  run(): number {\n    return 1;\n  }\n}\n\nexport function caller(service: Service) {\n  return service.run();\n}\n",
+    );
+    let run = evaluate(
+        EXACTLY_ONE_SELECTED_MEMBER,
+        &analyzer,
+        &mut PolicyBudget::default(),
+    );
+    assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+    assert!(run.findings().is_empty(), "{:?}", run.findings());
+}
+
+/// Finding: an unresolvable member access has a mandatory summary row with a
+/// zero selected count, and the invariant reports it at the exact site.
+#[test]
+fn member_selection_invariant_reports_the_unresolved_site() {
+    let (_project, analyzer) = typescript(
+        "class Service {\n  run(): number {\n    return 1;\n  }\n}\n\nexport function caller(service) {\n  return service.run();\n}\n",
+    );
+    let run = evaluate(
+        EXACTLY_ONE_SELECTED_MEMBER,
+        &analyzer,
+        &mut PolicyBudget::default(),
+    );
+    assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+    assert_eq!(run.findings().len(), 1, "{:?}", run.findings());
+    let finding = &run.findings()[0];
+    assert_eq!(finding.primary().path(), "widget.ts");
+    let PolicyFindingEvidence::Assertion { evidence } = finding.evidence() else {
+        panic!("relational assertion policies produce assertion evidence");
+    };
+    assert_eq!(evidence.expectation(), "(exactly 1)");
+    assert_eq!(evidence.actual_count(), 0);
+}
+
+/// Unreliable: a truncated site binding makes the invariant inconclusive,
+/// never clean.
+#[test]
+fn member_selection_invariant_is_unreliable_on_a_truncated_binding() {
+    let (_project, analyzer) = typescript(
+        "class Service {\n  run(): number {\n    return 1;\n  }\n  stop(): number {\n    return 2;\n  }\n}\n\nexport function caller(service: Service) {\n  return service.run() + service.stop();\n}\n",
+    );
+    let mut budget = PolicyBudget::builder()
+        .with_query_limits(CodeQueryExecutionLimits {
+            max_pipeline_rows: 1,
+            ..CodeQueryExecutionLimits::default()
+        })
+        .expect("query limits")
+        .build()
+        .expect("budget");
+    let run = evaluate(EXACTLY_ONE_SELECTED_MEMBER, &analyzer, &mut budget);
+    assert!(
+        matches!(run.completion(), PolicyRunCompletion::Inconclusive { .. }),
+        "{:?}",
+        run.completion()
+    );
+    assert!(run.findings().is_empty());
+}
+
 /// A truncated binding row set is never a verdict: the relational plan reports
 /// the run inconclusive instead of concluding over a proper subset.
 #[test]

@@ -486,6 +486,7 @@ impl DetailedCodeQueryDomain {
                 CodeQueryRowField::required("trace_completeness", Scalar::ConstrainedEnum),
                 CodeQueryRowField::required("candidate_kind", Scalar::ConstrainedEnum),
                 CodeQueryRowField::optional("candidate_id", Scalar::DeclarationIdentity),
+                CodeQueryRowField::optional("canonical_member_id", Scalar::StableId),
             ],
             Self::GenerationSite => code_query_row_fields![
                 CodeQueryRowField::required("id", Scalar::StableId),
@@ -1023,6 +1024,9 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::ResolutionCandidate { value }, "candidate_kind") => {
             Some(Scalar::ConstrainedEnum(value.candidate.label()))
+        }
+        (CodeQueryResultValue::ResolutionCandidate { value }, "canonical_member_id") => {
+            value.canonical_member_id.as_deref().map(Scalar::StableId)
         }
         (CodeQueryResultValue::ResolutionCandidate { value }, "candidate_id") => {
             match &value.candidate {

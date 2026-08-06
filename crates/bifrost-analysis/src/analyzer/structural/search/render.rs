@@ -593,7 +593,23 @@ pub(super) fn render_resolution_candidate(
             CodeQueryCandidateRef::ExternalRoute { name: name.clone() }
         }
     };
-    environment::public_candidate(value, range, candidate)
+    let canonical_member_id = environment::candidate_unit(&value.candidate.candidate)
+        .map(|unit| canonical_member_digest(analyzer, unit));
+    environment::public_candidate(value, range, candidate, canonical_member_id)
+}
+
+/// A stable, domain-separated digest of one declaration's #1475 canonical
+/// identity. The digest input is the structured identity (kind-tagged
+/// segments, namespace, language, recorded generic arity), never a rendered
+/// FQN or signature string, so same-spelling decoys with different segment
+/// kinds hash apart and aliases/partial types canonicalized by the analyzer
+/// hash together.
+fn canonical_member_digest(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> String {
+    let identity = crate::analyzer::structural::canonical_identity_of(analyzer, unit);
+    let mut hasher = Sha256::new();
+    hasher.update(b"bifrost.canonical_member_id.v1");
+    hasher.update(serde_json::to_vec(&identity).expect("canonical identity serializes"));
+    format!("{:x}", hasher.finalize())
 }
 
 pub(super) fn render_generation_site_ref(
