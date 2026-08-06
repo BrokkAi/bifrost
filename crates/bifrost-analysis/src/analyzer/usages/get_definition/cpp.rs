@@ -18,6 +18,41 @@ use brokk_bifrost_cpp::call_match::{
 };
 
 pub(crate) const CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC: &str = "unproven_cpp_link_unit";
+
+/// The user-facing explanation for a failed C++ template resolution. Each
+/// failure mode gets an honest message; the ambiguous case names every
+/// contender.
+fn cpp_template_resolution_message(text: &str, error: &CppTemplateResolutionError) -> String {
+    match error {
+        CppTemplateResolutionError::AliasCycle { alias } => format!(
+            "`{text}` expands through a recursive C++ template alias chain that revisits `{}`",
+            alias.fq_name()
+        ),
+        CppTemplateResolutionError::ArgumentBinding => format!(
+            "the template arguments of `{text}` do not bind to the declared C++ template parameters"
+        ),
+        CppTemplateResolutionError::Substitution => format!(
+            "the template arguments of `{text}` do not substitute into its C++ template alias target"
+        ),
+        CppTemplateResolutionError::PrimarySelection => format!(
+            "`{text}` has no visible C++ primary template declaration that reconciles with its specializations"
+        ),
+        CppTemplateResolutionError::AmbiguousSpecialization { candidates } => {
+            let contenders = candidates
+                .iter()
+                .map(|unit| {
+                    let declaration = unit
+                        .signature()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| unit.fq_name());
+                    format!("`{declaration}` ({})", unit.source())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("`{text}` is ambiguous between C++ template specializations: {contenders}")
+        }
+    }
+}
 const CPP_BOUNDED_AUXILIARY_MAX_SOURCE_BYTES: usize =
     crate::analyzer::usages::receiver_analysis::DEFAULT_RECEIVER_MAX_SCOPE_NODES * 256;
 
@@ -2378,9 +2413,9 @@ fn resolve_cpp_type(
                                         unit,
                                     ));
                                 }
-                                Err(()) => {
-                                    return ambiguous_definition(format!(
-                                        "`{text}` has an ambiguous C++ template specialization"
+                                Err(error) => {
+                                    return ambiguous_definition(cpp_template_resolution_message(
+                                        &text, &error,
                                     ));
                                 }
                             }
@@ -2419,10 +2454,8 @@ fn resolve_cpp_type(
                     unit,
                 ));
             }
-            Err(()) => {
-                return ambiguous_definition(format!(
-                    "`{text}` has an ambiguous C++ template specialization"
-                ));
+            Err(error) => {
+                return ambiguous_definition(cpp_template_resolution_message(&text, &error));
             }
             Ok(Some(_)) | Ok(None) => {}
         }
@@ -2750,7 +2783,7 @@ fn resolve_cpp_type_without_focused_qualifier(
                     || cpp_unit_matches_kind(analyzer, support, candidate, CppTargetKind::Type)
             })
             .collect::<Vec<_>>();
-            let mut specialization_ambiguous = false;
+            let mut specialization_failure = None;
             let candidates = match cpp_template_reference_arguments(node, source) {
                 Some(arguments) if declaration_type_context => candidates
                     .into_iter()
@@ -2759,8 +2792,8 @@ fn resolve_cpp_type_without_focused_qualifier(
                             Ok(resolved) => cpp_type_definition_candidates(
                                 analyzer, visibility, file, support, resolved,
                             ),
-                            Err(()) => {
-                                specialization_ambiguous = true;
+                            Err(error) => {
+                                specialization_failure = Some(error);
                                 Vec::new()
                             }
                         }
@@ -2771,10 +2804,8 @@ fn resolve_cpp_type_without_focused_qualifier(
             if !candidates.is_empty() {
                 return candidates_outcome(candidates);
             }
-            if specialization_ambiguous {
-                return ambiguous_definition(format!(
-                    "`{text}` has an ambiguous C++ template specialization"
-                ));
+            if let Some(error) = specialization_failure {
+                return ambiguous_definition(cpp_template_resolution_message(text, &error));
             }
         } else {
             // A template type parameter names no indexed type but is
@@ -2833,7 +2864,7 @@ fn resolve_cpp_type_without_focused_qualifier(
             .map(|components| components.join("::"))
             .unwrap_or_else(|| text.to_string());
         let template_arguments = cpp_template_reference_arguments(node, source);
-        let mut specialization_ambiguous = false;
+        let mut specialization_failure = None;
         let candidates = cpp_visible_name_candidates(
             analyzer,
             visibility,
@@ -2854,8 +2885,8 @@ fn resolve_cpp_type_without_focused_qualifier(
                 Some(arguments) => {
                     match visibility.resolve_template_arguments(file, unit, arguments) {
                         Ok(unit) => Some(unit),
-                        Err(()) => {
-                            specialization_ambiguous = true;
+                        Err(error) => {
+                            specialization_failure = Some(error);
                             None
                         }
                     }
@@ -2870,10 +2901,8 @@ fn resolve_cpp_type_without_focused_qualifier(
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
-        if specialization_ambiguous {
-            return ambiguous_definition(format!(
-                "`{text}` has an ambiguous C++ template specialization"
-            ));
+        if let Some(error) = specialization_failure {
+            return ambiguous_definition(cpp_template_resolution_message(text, &error));
         }
         // #1163 (was pinned at cpp.rs:2402): a `::`-qualified/scoped identifier
         // whose qualifier names a *sibling* nested namespace now resolves through
@@ -6666,7 +6695,7 @@ fn cpp_seed_binding(
                 .map(|node| visibility.resolve_type_node_result(file, node, source))
             {
                 Some(Ok(Some(unit))) => Some(unit),
-                Some(Err(())) => None,
+                Some(Err(_)) => None,
                 Some(Ok(None)) | None => cpp_resolve_type_unit_in_namespace(
                     analyzer,
                     visibility,

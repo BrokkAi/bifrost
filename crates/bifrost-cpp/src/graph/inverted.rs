@@ -36,17 +36,17 @@ use crate::graph::extractor::{
     resolve_using_enum_declaration_owner, using_enum_declaration_type_node,
 };
 use crate::graph::resolver::{
-    DesignatedInitializerOwner, EnclosingMemberOwnerResolution, LexicalCallableValueResolution,
-    LexicalTypeResolution, OrdinaryTypeImportCell, TargetKind, VisibilityIndex,
-    VisibleMemberResolution, canonical_cpp_scope_components, constructor_style_local_declaration,
-    cpp_callable_arity, cpp_template_reference_arguments, cpp_type_name_components,
-    declarator_name_node, designated_initializer_owner, extract_variable_name, first_type_child,
-    function_terminal_node, infer_cpp_initializer_binding, infer_cpp_initializer_type,
-    is_declaration_name, is_declarator_node, is_globally_qualified_cpp_name, is_nested_type_node,
-    normalize_type_text, out_of_line_destructor_type_reference,
-    out_of_line_member_definition_owner, parameter_belongs_to_callable_scope,
-    recovered_macro_decorated_type_node, resolve_declaring_member_owner, same_visible_symbol,
-    type_reference_hit_node,
+    CppTemplateResolutionError, DesignatedInitializerOwner, EnclosingMemberOwnerResolution,
+    LexicalCallableValueResolution, LexicalTypeResolution, OrdinaryTypeImportCell, TargetKind,
+    VisibilityIndex, VisibleMemberResolution, canonical_cpp_scope_components,
+    constructor_style_local_declaration, cpp_callable_arity, cpp_template_reference_arguments,
+    cpp_type_name_components, declarator_name_node, designated_initializer_owner,
+    extract_variable_name, first_type_child, function_terminal_node, infer_cpp_initializer_binding,
+    infer_cpp_initializer_type, is_declaration_name, is_declarator_node,
+    is_globally_qualified_cpp_name, is_nested_type_node, normalize_type_text,
+    out_of_line_destructor_type_reference, out_of_line_member_definition_owner,
+    parameter_belongs_to_callable_scope, recovered_macro_decorated_type_node,
+    resolve_declaring_member_owner, same_visible_symbol, type_reference_hit_node,
 };
 use crate::graph::syntax::explicit_qualified_callable_value;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
@@ -116,7 +116,7 @@ impl CppScan<'_> {
     fn resolve_type_node_result(
         &self,
         node: Node<'_>,
-    ) -> std::result::Result<Option<CodeUnit>, ()> {
+    ) -> std::result::Result<Option<CodeUnit>, CppTemplateResolutionError> {
         self.visibility
             .resolve_type_node_result(self.file, node, self.source)
     }
@@ -1133,7 +1133,7 @@ fn seed_binding(
             match ctx.resolve_type_node_result(node) {
                 Ok(Some(unit)) => Some(unit),
                 Ok(None) => ctx.resolve_type(node_text(node, ctx.source)),
-                Err(()) => None,
+                Err(_) => None,
             }
         }),
         None => value.and_then(|value| infer_type_from_value(value, ctx)),

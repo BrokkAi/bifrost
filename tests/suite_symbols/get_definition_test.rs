@@ -356,6 +356,46 @@ bool ValueFlow::isLifetimeBorrowed() {
 }
 
 #[test]
+fn cpp_incomparable_partial_specializations_report_each_contender() {
+    // `<T*, U>` and `<T, int>` are incomparable for `<int*, int>`: neither
+    // pattern is strictly more specialized, so resolution must report an
+    // ambiguity that names both contenders rather than a bare "ambiguous".
+    let header = r#"#pragma once
+template <typename T, typename U> struct Holder {};
+template <typename T, typename U> struct Holder<T*, U> { int by_pointer; };
+template <typename T> struct Holder<T, int> { int by_int; };
+"#;
+    let source = r#"#include "holder.h"
+void consume() {
+    Holder<int*, int> value;
+    (void)value;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("holder.h", header)
+        .file("consumer.cc", source)
+        .build();
+    let reference = source
+        .find("Holder<int*, int>")
+        .expect("declaration type reference");
+    let value = lookup(
+        project.root(),
+        &location_reference("consumer.cc", source, reference),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    let message = result["diagnostics"][0]["message"]
+        .as_str()
+        .expect("diagnostic message");
+    assert!(
+        message.contains("ambiguous between C++ template specializations"),
+        "{value}"
+    );
+    let contenders = message.split(':').next_back().expect("contender list");
+    assert_eq!(contenders.matches("holder.h").count(), 2, "{value}");
+}
+
+#[test]
 fn cpp_fragmented_export_class_member_resolves_to_real_field() {
     let header = r#"
 #pragma once

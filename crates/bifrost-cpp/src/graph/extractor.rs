@@ -559,7 +559,7 @@ fn seed_binding_from_type_or_value(
                             .visibility
                             .canonical_type_for_reference(ctx.file, &name)
                             .or_else(|| ctx.visibility.resolve_type(ctx.file, &name)),
-                        Err(()) => None,
+                        Err(_) => None,
                     }
                 });
             CppScanBinding::from_type_name(name.clone(), unit, cpp_type_text_pointer_depth(text))
@@ -5766,7 +5766,7 @@ fn receiver_type_name_unit(node: Node<'_>, type_name: &str, ctx: &ScanCtx<'_>) -
             .resolve_type_node_result(ctx.file, alias_type, ctx.source)
         {
             Ok(Some(unit)) => return Some(unit),
-            Err(()) => return None,
+            Err(_) => return None,
             Ok(None) => {}
         }
         if let Some(unit) = resolve_receiver_type_node_lexically(alias_type, ctx) {
@@ -7024,7 +7024,7 @@ pub fn resolve_type_node_lexically_for_target(
                         candidates,
                     })
                 }
-                Err(()) => LexicalTypeResolution::Ambiguous,
+                Err(_) => LexicalTypeResolution::Ambiguous,
             },
             LexicalTypeResolution::Missing => {
                 let target_preserving = if let Some(recovered_scope) = recovered_scope {

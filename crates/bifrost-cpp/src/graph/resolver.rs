@@ -911,6 +911,40 @@ struct CppAlias {
 
 type ReceiverResolver<'a> = dyn for<'tree> Fn(Node<'tree>, &str) -> Vec<CodeUnit> + 'a;
 
+/// Why template-argument resolution failed. Definition diagnostics render
+/// each mode differently; graph scans only care that the resolution is
+/// unproven and match `Err(_)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CppTemplateResolutionError {
+    /// A template alias expansion revisited `alias`.
+    AliasCycle { alias: CodeUnit },
+    /// The explicit arguments do not bind to the declared template parameters.
+    ArgumentBinding,
+    /// Bound arguments do not substitute into the alias target's arguments.
+    Substitution,
+    /// No visible primary template declaration could be selected and
+    /// reconciled for the specialization family.
+    PrimarySelection,
+    /// More than one applicable specialization remains and none is strictly
+    /// more specialized than every other candidate.
+    AmbiguousSpecialization { candidates: Vec<CodeUnit> },
+}
+
+/// The ambiguity candidates, deduplicated to one representative per visible
+/// symbol so a diagnostic lists each contender once.
+fn distinct_visible_symbols<'u>(units: impl Iterator<Item = &'u CodeUnit>) -> Vec<CodeUnit> {
+    let mut distinct: Vec<CodeUnit> = Vec::new();
+    for unit in units {
+        if !distinct
+            .iter()
+            .any(|existing| same_visible_symbol(existing, unit))
+        {
+            distinct.push(unit.clone());
+        }
+    }
+    distinct
+}
+
 impl<'a> VisibilityIndex<'a> {
     pub fn cpp(&self) -> &'a dyn CppAnalysisSource {
         self.cpp
@@ -2792,16 +2826,12 @@ impl<'a> VisibilityIndex<'a> {
             .cloned()
     }
 
-    // `Err(())` means "ambiguous", and every caller matches on it that way.
-    // Pre-existing shape, now visible to clippy because the graph is a
-    // published module; introducing an error type here would be a rewrite.
-    #[allow(clippy::result_unit_err)]
     pub fn resolve_type_node_result(
         &self,
         file: &ProjectFile,
         node: Node<'_>,
         source: &str,
-    ) -> std::result::Result<Option<CodeUnit>, ()> {
+    ) -> std::result::Result<Option<CodeUnit>, CppTemplateResolutionError> {
         let Some(primary) = self.resolve_type_node_primary(file, node, source) else {
             return Ok(None);
         };
@@ -2822,16 +2852,12 @@ impl<'a> VisibilityIndex<'a> {
         self.resolve_type(file, &components.join("::"))
     }
 
-    // `Err(())` means "ambiguous", and every caller matches on it that way.
-    // Pre-existing shape, now visible to clippy because the graph is a
-    // published module; introducing an error type here would be a rewrite.
-    #[allow(clippy::result_unit_err)]
     pub fn resolve_template_arguments(
         &self,
         file: &ProjectFile,
         primary: CodeUnit,
         arguments: &[CppTemplateExpression],
-    ) -> std::result::Result<CodeUnit, ()> {
+    ) -> std::result::Result<CodeUnit, CppTemplateResolutionError> {
         self.resolve_template_arguments_inner(file, primary, arguments, &mut HashSet::default())
     }
 
@@ -2841,15 +2867,15 @@ impl<'a> VisibilityIndex<'a> {
         primary: CodeUnit,
         arguments: &[CppTemplateExpression],
         seen_aliases: &mut HashSet<CodeUnit>,
-    ) -> std::result::Result<CodeUnit, ()> {
+    ) -> std::result::Result<CodeUnit, CppTemplateResolutionError> {
         if let Some(metadata) = self.cpp_template_metadata.get(&primary)
             && let Some(alias_target) = &metadata.alias_target
         {
             if !seen_aliases.insert(primary.clone()) {
-                return Err(());
+                return Err(CppTemplateResolutionError::AliasCycle { alias: primary });
             }
-            let (_, bindings) =
-                cpp_bind_template_arguments(&metadata.parameters, arguments).ok_or(())?;
+            let (_, bindings) = cpp_bind_template_arguments(&metadata.parameters, arguments)
+                .ok_or(CppTemplateResolutionError::ArgumentBinding)?;
             let target_name = alias_target.components.join("::");
             let target_primary = if alias_target.global {
                 unique_logical_type_candidate(self.type_candidates(file, &target_name))
@@ -2865,8 +2891,8 @@ impl<'a> VisibilityIndex<'a> {
             let Some(target_arguments) = &alias_target.arguments else {
                 return Ok(target_primary);
             };
-            let target_arguments =
-                cpp_substitute_template_arguments(target_arguments, &bindings).ok_or(())?;
+            let target_arguments = cpp_substitute_template_arguments(target_arguments, &bindings)
+                .ok_or(CppTemplateResolutionError::Substitution)?;
             return self.resolve_template_arguments_inner(
                 file,
                 target_primary,
@@ -2888,7 +2914,6 @@ impl<'a> VisibilityIndex<'a> {
             return Ok(primary);
         }
         self.select_template_specialization(file, &primary, arguments)
-            .ok_or(())
     }
 
     fn select_template_specialization(
@@ -2896,13 +2921,16 @@ impl<'a> VisibilityIndex<'a> {
         file: &ProjectFile,
         resolved: &CodeUnit,
         explicit_arguments: &[CppTemplateExpression],
-    ) -> Option<CodeUnit> {
+    ) -> std::result::Result<CodeUnit, CppTemplateResolutionError> {
         let primary_fq_name = self
             .cpp_template_metadata
             .get(resolved)
             .map(|metadata| metadata.primary_fq_name.clone())
             .unwrap_or_else(|| resolved.fq_name());
-        let family = self.cpp_template_families.get(&primary_fq_name)?;
+        let family = self
+            .cpp_template_families
+            .get(&primary_fq_name)
+            .ok_or(CppTemplateResolutionError::PrimarySelection)?;
         let primary_candidates = family
             .iter()
             .filter_map(|unit| {
@@ -2924,10 +2952,13 @@ impl<'a> VisibilityIndex<'a> {
                             unit.signature().unwrap_or_default(),
                         )
                     })
-            })?;
+            })
+            .ok_or(CppTemplateResolutionError::PrimarySelection)?;
         let primary_parameters =
-            cpp_reconcile_primary_template_parameters(&primary_candidates, primary_unit)?;
-        let (expanded, _) = cpp_bind_template_arguments(&primary_parameters, explicit_arguments)?;
+            cpp_reconcile_primary_template_parameters(&primary_candidates, primary_unit)
+                .ok_or(CppTemplateResolutionError::PrimarySelection)?;
+        let (expanded, _) = cpp_bind_template_arguments(&primary_parameters, explicit_arguments)
+            .ok_or(CppTemplateResolutionError::ArgumentBinding)?;
 
         let mut applicable = Vec::new();
         for unit in family {
@@ -2943,24 +2974,39 @@ impl<'a> VisibilityIndex<'a> {
             applicable.push((unit, metadata));
         }
         if applicable.is_empty() {
-            return Some(primary_unit.clone());
+            return Ok(primary_unit.clone());
         }
 
         // A scalar constraint count cannot represent C++ partial ordering:
         // e.g. `<T*, U>` and `<T, int>` are incomparable for `<int*, int>`.
         // Select only a logical candidate whose structural pattern is strictly
         // more specialized than every other distinct applicable candidate.
-        let mut winners = applicable.iter().filter(|(candidate, candidate_metadata)| {
-            applicable.iter().all(|(other, other_metadata)| {
-                same_visible_symbol(candidate, other)
-                    || cpp_specialization_more_specialized(candidate_metadata, other_metadata)
+        let winners = applicable
+            .iter()
+            .filter(|(candidate, candidate_metadata)| {
+                applicable.iter().all(|(other, other_metadata)| {
+                    same_visible_symbol(candidate, other)
+                        || cpp_specialization_more_specialized(candidate_metadata, other_metadata)
+                })
             })
-        });
-        let selected = winners.next()?.0;
-        if winners.any(|(unit, _)| !same_visible_symbol(unit, selected)) {
-            return None;
+            .copied()
+            .collect::<Vec<_>>();
+        let Some((selected, _)) = winners.first() else {
+            // Mutually incomparable applicable candidates: every one of them
+            // is a live contender.
+            return Err(CppTemplateResolutionError::AmbiguousSpecialization {
+                candidates: distinct_visible_symbols(applicable.iter().map(|(unit, _)| *unit)),
+            });
+        };
+        if winners
+            .iter()
+            .any(|(unit, _)| !same_visible_symbol(unit, selected))
+        {
+            return Err(CppTemplateResolutionError::AmbiguousSpecialization {
+                candidates: distinct_visible_symbols(winners.iter().map(|(unit, _)| *unit)),
+            });
         }
-        Some(selected.clone())
+        Ok((*selected).clone())
     }
 
     pub fn resolve_type_components_lexically(

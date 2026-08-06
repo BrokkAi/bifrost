@@ -42,7 +42,8 @@ pub(in crate::analyzer::usages) use brokk_bifrost_cpp::graph::extractor::{
     resolve_bare_call_target as cpp_resolve_bare_call_target,
 };
 pub(in crate::analyzer::usages) use brokk_bifrost_cpp::graph::resolver::{
-    CallArityEvidence, DesignatedInitializerOwner as CppDesignatedInitializerOwner,
+    CallArityEvidence, CppTemplateResolutionError,
+    DesignatedInitializerOwner as CppDesignatedInitializerOwner,
     LexicalTypeResolution as CppLexicalTypeResolution, TargetKind as CppTargetKind,
     VisibilityIndex as CppVisibilityIndex, argument_children as cpp_argument_children,
     canonical_cpp_scope_components, constructor_type_node as cpp_constructor_type_node,
