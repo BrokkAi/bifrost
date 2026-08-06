@@ -139,7 +139,7 @@ fn marked_normalized_fragments_match_checked_golds() {
 }
 
 #[test]
-fn documented_match_policy_executes_and_future_analysis_boundary_is_explicit() {
+fn documented_match_policy_executes_and_semantic_analysis_boundary_is_explicit() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let docs = read(root.join(POLICY_DOC));
     let examples = marked_examples(root.join(POLICY_DOC).as_path(), &docs);
@@ -177,12 +177,11 @@ fn documented_match_policy_executes_and_future_analysis_boundary_is_explicit() {
 
     assert_policy_cli_human(workspace.root(), "policies/dynamic-eval.rqlp", human);
 
-    let unsupported_sentence = "evaluation reports `unsupported` until [#824](https://github.com/BrokkAi/bifrost/issues/824)";
-    assert_eq!(
-        docs.matches(unsupported_sentence).count(),
-        1,
-        "only the taint row should retain the #824 unsupported boundary"
-    );
+    assert!(docs.contains(
+        "Executes the production compiler, compatible batch planner, solver, retained report, and human/JSON/SARIF projection."
+    ));
+    assert!(!docs.contains("evaluation reports `unsupported` until"));
+    assert!(!docs.contains("#824 completes the flow adapter"));
     assert!(docs.contains(
         "Executes query-local semantic bindings and emits production findings with stable identity"
     ));

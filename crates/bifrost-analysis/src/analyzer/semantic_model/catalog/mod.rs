@@ -86,7 +86,8 @@ pub struct SessionPackSource {
     pub source_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CatalogPackSourceKind {
     Installed,
     Generated,

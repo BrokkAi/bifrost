@@ -119,6 +119,7 @@ export default defineConfig({
           label: 'Code Querying',
           items: [
             { label: 'Overview', slug: 'code-querying' },
+            { label: 'Data Flow and Typestate', slug: 'data-flow-and-typestate' },
             { label: 'Build a Rule', slug: 'build-static-analysis-rule' },
             { label: 'Static-Analysis Policies', slug: 'static-analysis-policies' },
             { label: 'Semantic-Model Packs', slug: 'semantic-model-packs' },

@@ -537,7 +537,7 @@ fn finish_boundary(
     }
 }
 
-fn boundary_evidence(
+pub(in crate::analyzer::usages) fn boundary_evidence(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     name: &str,

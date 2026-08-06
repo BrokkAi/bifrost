@@ -95,7 +95,7 @@ fn meilisearch_error_owner_resolves_to_local_enum_not_import_boundary() {
         0,
         "Error",
     );
-    assert_resolved(&v, "error.Error", "meilisearch Error owner");
+    assert_resolved(&v, "app.error.Error", "meilisearch Error owner");
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +112,7 @@ fn nushell_sqlite_variant_resolves_to_local_variant_not_import_boundary() {
         .file("src/lib.rs", "pub mod values;\n")
         .file("src/values.rs", src)
         .build();
-    let want = "values.SqliteOrShellError.SqliteError";
+    let want = "app.values.SqliteOrShellError.SqliteError";
     // tuple-variant construction (reads as a call)
     let v1 = loc(
         project.root(),
@@ -174,7 +174,7 @@ fn diesel_expression_variant_and_trait_bound_both_resolve() {
     );
     assert_resolved(
         &bound,
-        "expression.Expression",
+        "diesel.expression.Expression",
         "diesel trait bound Expression",
     );
     // variant use must resolve to the variant, not draw a boundary
@@ -188,7 +188,7 @@ fn diesel_expression_variant_and_trait_bound_both_resolve() {
     );
     assert_resolved(
         &variant,
-        "insertable.DefaultableColumnInsertValue.Expression",
+        "diesel.insertable.DefaultableColumnInsertValue.Expression",
         "diesel Self::Expression",
     );
     // variant declaration itself
@@ -202,7 +202,7 @@ fn diesel_expression_variant_and_trait_bound_both_resolve() {
     );
     assert_resolved(
         &decl,
-        "insertable.DefaultableColumnInsertValue.Expression",
+        "diesel.insertable.DefaultableColumnInsertValue.Expression",
         "diesel variant declaration",
     );
 }
@@ -238,7 +238,7 @@ fn diesel_transaction_manager_associated_type_resolves_not_import_boundary() {
     );
     assert_resolved(
         &v,
-        "connection.Connection.TransactionManager",
+        "diesel.connection.Connection.TransactionManager",
         "diesel Self::TransactionManager",
     );
 }
@@ -346,7 +346,7 @@ fn same_file_reexport_shadow_still_resolves_to_local_trait() {
     );
     assert_resolved(
         &v,
-        "expression.AsExpression",
+        "diesel.expression.AsExpression",
         "#1125 same-file re-export shadow",
     );
 }

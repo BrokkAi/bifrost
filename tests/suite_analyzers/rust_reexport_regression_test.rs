@@ -73,7 +73,7 @@ fn inverse_rust_usages_follow_reexports_inside_workspace_crates() {
             "use crate::de::Error;\n\npub fn convert() -> Result<(), Error> { Ok(()) }\n",
         ),
     ]);
-    let hits = usages(&analyzer, "crates.model.src.de.error.Error");
+    let hits = usages(&analyzer, "model.de.error.Error");
 
     assert!(
         hits.iter().any(|hit| {
@@ -169,7 +169,7 @@ fn inverse_rust_usages_match_self_crate_name_namespace_path() {
             "use demo::options as package;\n\nfn run() { let _ = package::Options::default(); }\n",
         ),
     ]);
-    let hits = usages(&analyzer, "options.Options");
+    let hits = usages(&analyzer, "demo.options.Options");
 
     assert!(
         hits.iter().any(|hit| {
