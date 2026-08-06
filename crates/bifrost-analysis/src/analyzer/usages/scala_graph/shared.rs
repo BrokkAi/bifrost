@@ -1,7 +1,7 @@
 use super::inverted::{
-    self, ProjectTypes, ScalaReferenceRole, ScalaReferenceSink, ScalaResolvedReference,
+    ProjectTypes, ScalaReferenceRole, ScalaReferenceSink, ScalaResolvedReference,
     callable_alternative_contradicts_literal_arguments, callable_alternative_is_candidate,
-    callable_alternative_matches, scan_scala_query_file, single_overload_family,
+    callable_alternative_matches, scan_edge_file, scan_scala_query_file, single_overload_family,
 };
 use super::resolver::{
     TargetKind, TargetSpec, import_candidate_fq_names, member_matches_target_kind,
@@ -13,7 +13,9 @@ use crate::analyzer::scala::{scala_import_path, scala_nested_type_candidates};
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::common::usage_hit;
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, UsageEdgeWeights, UsageEdges, UsageReferenceKind,
+    ClassRangeIndex, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, UsageReferenceKind,
+    build_edge_output, build_file_declarations_from_declaration_ranges,
+    class_range_index_from_declaration_ranges, parse_source_and_collect_with_declarations,
 };
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitKind};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
@@ -26,10 +28,48 @@ use crate::hash::HashMap;
 use crate::hash::HashSet;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 pub(super) struct ScalaEdgeGraph {
     pub(super) files: Vec<ProjectFile>,
-    pub(super) types: ProjectTypes,
+    pub(super) types: Arc<ProjectTypes>,
+}
+
+/// Drive a whole-workspace inverted Scala edge build over the resolver-owned
+/// file set.
+///
+/// The fan-out stays on this side of the seam, as it does for C++:
+/// `build_edge_output` and `parse_source_and_collect_with_declarations` are the
+/// shared, language-agnostic driver, and only the per-file Scala walk crossed.
+/// Both per-file inputs the driver needs -- the declaration spans and the class
+/// ranges -- come out of the same `ScalaFileFacts` the walk reads, so they are
+/// built once here and the class-range index is handed on.
+fn build_scala_edges<Output, F>(
+    scala: &ScalaAnalyzer,
+    graph: &ScalaEdgeGraph,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Output
+where
+    Output: UsageEdgeBuildOutput<String>,
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let language = brokk_bifrost_jvm::scala::language::LANGUAGE.into();
+    build_edge_output(&graph.files, keep_file, |file| {
+        let state = graph.types.bulk_file_state(file)?;
+        let declarations =
+            build_file_declarations_from_declaration_ranges(&state.declarations, &state.ranges);
+        let class_ranges =
+            class_range_index_from_declaration_ranges(&state.declarations, &state.ranges);
+        parse_source_and_collect_with_declarations(
+            graph.types.source_for_file(scala, file)?,
+            file,
+            nodes,
+            &language,
+            declarations,
+            |input| scan_edge_file(scala, &graph.types, file, state, class_ranges, input),
+        )
+    })
 }
 
 pub(crate) struct ScalaQueryResolver<'a> {
@@ -1066,7 +1106,9 @@ impl<'a> ScalaEdgeResolver<'a> {
             .into_iter()
             .collect();
         let file_states = scala.bulk_file_states(files.clone(), BulkFileStateSource::Include);
-        let types = ProjectTypes::build_from_file_states(file_states);
+        let types = Arc::new(crate::analyzer::scala::build_scala_project_types(
+            file_states,
+        ));
 
         Some(Self {
             scala,
@@ -1083,7 +1125,7 @@ impl<'a> ScalaEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_scala_edges(self.scala, &self.graph, nodes, keep_file)
+        build_scala_edges(self.scala, &self.graph, nodes, keep_file)
     }
 
     pub(crate) fn build_edge_weights<F>(
@@ -1095,6 +1137,6 @@ impl<'a> ScalaEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_scala_edges(self.scala, &self.graph, nodes, keep_file)
+        build_scala_edges(self.scala, &self.graph, nodes, keep_file)
     }
 }

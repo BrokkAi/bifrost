@@ -1,26 +1,25 @@
-mod inverted;
-mod resolver;
 pub(crate) mod shared;
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
-/// Scala's pure graph syntax -- the node predicates, the lexical
-/// type-namespace walk and the local-binding seeds -- now lives in
+/// Scala's usage-graph language knowledge -- the node predicates, the lexical
+/// type-namespace walk, the local-binding seeds, the project type index, the
+/// per-file scans and the find-references target-shape analysis -- now lives in
 /// [`brokk_bifrost_jvm::scala::graph`]. Re-exporting the modules under their
 /// historical names keeps every `scala_graph::…` path in this crate pointing
 /// at the same items.
-pub(crate) use brokk_bifrost_jvm::scala::graph::{local, namespace, syntax};
+pub(crate) use brokk_bifrost_jvm::scala::graph::{inverted, local, namespace, resolver, syntax};
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::scala_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::scala_graph::shared::{ScalaEdgeResolver, ScalaQueryResolver};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, ProjectFile, ScalaAnalyzer, resolve_analyzer,
 };
 use crate::hash::HashSet;
+use resolver::{TargetKind, TargetSpec};
 use std::sync::Arc;
 
 pub(crate) use inverted::{NameResolver as ScalaNameResolver, ProjectTypes as ScalaProjectTypes};

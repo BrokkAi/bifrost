@@ -61,14 +61,18 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
+pub(crate) use crate::analyzer::usages::scala_graph::ScalaProjectTypes;
 pub(crate) use crate::analyzer::{ScalaExportInfo, ScalaExportSelector};
 pub(crate) use adapter::ScalaAdapter;
-pub(crate) use brokk_bifrost_jvm::scala::graph_support::{ScalaSource, ScalaTypeKnownness};
+pub(crate) use brokk_bifrost_jvm::scala::graph_support::{
+    ScalaCallableFactsIndex, ScalaDefinitionIndex, ScalaFileFacts, ScalaForwardOwnerFacts,
+    ScalaSource, ScalaTypeKnownness,
+};
 pub(crate) use brokk_bifrost_jvm::scala::imports::{
     scala_lexical_scope_path_at, scala_lexical_scope_path_checked,
 };
 pub(crate) use brokk_bifrost_jvm::scala::supertypes::{
-    ScalaSupertypeLookupPath, scala_supertype_lookup_nodes, scala_type_lookup_segments,
+    ScalaSupertypeLookupPath, scala_type_lookup_segments,
 };
 use brokk_bifrost_jvm::scala::test_detection::detect_scala_test_assertion_smells;
 /// Scala's pure name, signature and delimiter helpers. They read and produce
@@ -77,10 +81,8 @@ pub(crate) use brokk_bifrost_jvm::scala::{
     scala_nested_type_candidates, scala_normalize_full_name, scala_simple_type_name,
 };
 use clones::build_scala_clone_candidate_data;
-pub(crate) use declarations::scala_class_parameter_field_keyword;
 pub(crate) use wildcard_imports::{
-    ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaWildcardImportEnvironment,
-    ScalaWildcardOwnerFacts, resolve_scala_explicit_import_tier,
+    ScalaWildcardImportEnvironment, ScalaWildcardOwnerFacts,
     resolve_scala_wildcard_import_environment, scala_enclosing_package_root_candidates,
     scala_import_path, scala_import_path_candidates, scala_import_visible_at,
     scala_package_prefixes_at, scala_package_prefixes_at_checked,
@@ -127,11 +129,78 @@ pub(crate) fn scala_enclosing_template_owner_fq_names(
     owners
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ScalaForwardOwnerFacts {
-    pub(crate) supertype_lookup_paths: Vec<ScalaSupertypeLookupPath>,
-    pub(crate) signatures: Vec<String>,
-    pub(crate) is_trait: bool,
+/// Decode one persisted [`FileState`] into the thirteen per-file facts the
+/// Scala graph reads.
+///
+/// The state's own fields are moved out rather than cloned: this is the one
+/// caller, and it owns the map. Everything left behind is another language's
+/// column or store bookkeeping.
+fn scala_file_facts(state: FileState) -> ScalaFileFacts {
+    ScalaFileFacts {
+        source: state.source,
+        package_name: state.package_name,
+        declarations: state.declarations,
+        definition_lookup_units: state.definition_lookup_units,
+        imports: state.imports,
+        scala_exports: state.scala_exports,
+        supertype_lookup_paths: state.supertype_lookup_paths,
+        signatures: state.signatures,
+        signature_metadata: state.signature_metadata,
+        ranges: state.ranges,
+        children: state.children,
+        scala_traits: state.scala_traits,
+        type_aliases: state.type_aliases,
+    }
+}
+
+/// Build the crate-side [`ScalaProjectTypes`] out of a bulk file-state read.
+///
+/// The two indexes it stands on are analysis products --
+/// `GlobalUsageDefinitionIndex::from_declarations`,
+/// `UsageFactsIndex::build_from_declarations` over a `DefinitionIndexHandle`
+/// and [`ScalaAdapter`] -- so their construction stays here and the finished
+/// pair crosses as `Arc<dyn ..>`. Which declarations enter is Scala's decision
+/// and answers from the crate.
+pub(crate) fn build_scala_project_types(
+    file_states: HashMap<ProjectFile, FileState>,
+) -> ScalaProjectTypes {
+    let file_states: HashMap<ProjectFile, ScalaFileFacts> = file_states
+        .into_iter()
+        .map(|(file, state)| (file, scala_file_facts(state)))
+        .collect();
+    let declarations = ScalaProjectTypes::indexable_declarations(&file_states);
+    let index = Arc::new(
+        crate::analyzer::GlobalUsageDefinitionIndex::from_declarations(
+            declarations.iter(),
+            scala_normalize_full_name,
+            scala_simple_type_name,
+        ),
+    );
+    let definitions = crate::analyzer::DefinitionIndexHandle::Single(&index);
+    let facts = Arc::new(UsageFactsIndex::build_from_declarations(
+        &definitions,
+        declarations.iter(),
+        |unit| {
+            file_states
+                .get(unit.source())
+                .and_then(|state| state.signatures.get(unit).and_then(|values| values.first()))
+                .cloned()
+                .or_else(|| unit.signature().map(str::to_string))
+        },
+        |unit| {
+            file_states
+                .get(unit.source())
+                .and_then(|state| {
+                    state
+                        .signature_metadata
+                        .get(unit)
+                        .and_then(|values| values.first())
+                })
+                .cloned()
+        },
+        &ScalaAdapter,
+    ));
+    ScalaProjectTypes::from_parts(index, facts, file_states)
 }
 
 #[derive(Clone)]
@@ -155,7 +224,9 @@ pub struct ScalaAnalyzer {
     full_usage_edges:
         Cache<Arc<[String]>, Arc<crate::analyzer::usages::inverted_edges::UsageEdges>>,
     project_types_build_count: Arc<AtomicUsize>,
+    #[cfg(any(test, feature = "test-support"))]
     scala_query_parse_count: Arc<AtomicUsize>,
+    #[cfg(any(test, feature = "test-support"))]
     scala_query_walk_count: Arc<AtomicUsize>,
     #[allow(dead_code)]
     type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
@@ -345,8 +416,11 @@ impl ScalaAnalyzer {
         clone.full_usage_edges =
             build_weighted_cache(self.memo_budget / 8, weight_scala_usage_edges);
         clone.project_types_build_count = Arc::new(AtomicUsize::new(0));
-        clone.scala_query_parse_count = Arc::new(AtomicUsize::new(0));
-        clone.scala_query_walk_count = Arc::new(AtomicUsize::new(0));
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            clone.scala_query_parse_count = Arc::new(AtomicUsize::new(0));
+            clone.scala_query_walk_count = Arc::new(AtomicUsize::new(0));
+        }
         clone
     }
 
@@ -382,7 +456,9 @@ impl ScalaAnalyzer {
             project_types: Arc::new(OnceLock::new()),
             full_usage_edges: build_weighted_cache(memo_budget / 8, weight_scala_usage_edges),
             project_types_build_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
             scala_query_parse_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
             scala_query_walk_count: Arc::new(AtomicUsize::new(0)),
             type_relations: Arc::new(OnceLock::new()),
         }
@@ -402,9 +478,7 @@ impl ScalaAnalyzer {
         self.inner.usage_facts_index_shared()
     }
 
-    pub(crate) fn project_types(
-        &self,
-    ) -> Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes> {
+    pub(crate) fn project_types(&self) -> Arc<ScalaProjectTypes> {
         self.initialize_project_types(|| {
             self.bulk_file_states(self.analyzed_files(), BulkFileStateSource::Omit)
         })
@@ -427,10 +501,14 @@ impl ScalaAnalyzer {
         self.full_usage_edges.get_with(key, || Arc::new(build()))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_query_parse(&self) {
         self.scala_query_parse_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_query_walk(&self) {
         self.scala_query_walk_count.fetch_add(1, Ordering::Relaxed);
     }
@@ -438,14 +516,11 @@ impl ScalaAnalyzer {
     fn project_types_from_file_states(
         &self,
         file_states: HashMap<ProjectFile, FileState>,
-    ) -> Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes> {
+    ) -> Arc<ScalaProjectTypes> {
         self.initialize_project_types(|| file_states)
     }
 
-    fn initialize_project_types<F>(
-        &self,
-        file_states: F,
-    ) -> Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes>
+    fn initialize_project_types<F>(&self, file_states: F) -> Arc<ScalaProjectTypes>
     where
         F: FnOnce() -> HashMap<ProjectFile, FileState>,
     {
@@ -453,11 +528,7 @@ impl ScalaAnalyzer {
             .get_or_init(|| {
                 self.project_types_build_count
                     .fetch_add(1, Ordering::Relaxed);
-                Arc::new(
-                    crate::analyzer::usages::scala_graph::ScalaProjectTypes::build_from_file_states(
-                        file_states(),
-                    ),
-                )
+                Arc::new(build_scala_project_types(file_states()))
             })
             .clone()
     }
@@ -691,6 +762,118 @@ impl ScalaSource for ScalaAnalyzer {
             .external_declaration_index()
             .resolve_same_package(&package_name, name)
             .is_some()
+    }
+
+    fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        ScalaAnalyzer::structural_parent_of(self, code_unit)
+    }
+
+    fn export_infos_for_owner(&self, owner: &CodeUnit) -> Vec<ScalaExportInfo> {
+        ScalaAnalyzer::export_infos_for_owner(self, owner)
+    }
+
+    fn forward_owner_facts(&self, code_unit: &CodeUnit) -> Option<ScalaForwardOwnerFacts> {
+        ScalaAnalyzer::forward_owner_facts(self, code_unit)
+    }
+
+    fn is_scala_trait_declaration(&self, code_unit: &CodeUnit) -> bool {
+        ScalaAnalyzer::is_scala_trait_declaration(self, code_unit)
+    }
+
+    fn definitions_by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
+        self.global_usage_definition_index()
+            .by_normalized_fqn(normalized)
+    }
+
+    fn types_in_package(&self, package: &str, simple: &str) -> Vec<CodeUnit> {
+        self.global_usage_definition_index()
+            .types_in_package(package, simple)
+    }
+
+    fn project_types(&self) -> Arc<ScalaProjectTypes> {
+        ScalaAnalyzer::project_types(self)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_query_parse(&self) {
+        ScalaAnalyzer::record_query_parse(self);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_query_walk(&self) {
+        ScalaAnalyzer::record_query_walk(self);
+    }
+}
+
+/// The declaration-index questions the Scala graph asks, answered by the
+/// analyzer's own workspace index. Nothing narrows or reorders: each member is
+/// the identically named inherent accessor or `BoundedDefinitionLookup` method.
+impl ScalaDefinitionIndex for crate::analyzer::GlobalUsageDefinitionIndex {
+    fn by_fqn(&self, fqn: &str) -> &[CodeUnit] {
+        crate::analyzer::GlobalUsageDefinitionIndex::by_fqn(self, fqn)
+    }
+
+    fn by_normalized_fqn(&self, normalized: &str) -> &[CodeUnit] {
+        crate::analyzer::GlobalUsageDefinitionIndex::by_normalized_fqn(self, normalized)
+    }
+
+    fn types_in_package(&self, package: &str, simple: &str) -> &[CodeUnit] {
+        crate::analyzer::GlobalUsageDefinitionIndex::types_in_package(self, package, simple)
+    }
+
+    fn identifier(&self, ident: &str) -> &[CodeUnit] {
+        crate::analyzer::GlobalUsageDefinitionIndex::identifier(self, ident)
+    }
+
+    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
+        crate::analyzer::GlobalUsageDefinitionIndex::fqn_direct_children(self, fqn)
+    }
+
+    fn fqn_exists(&self, fqn: &str) -> bool {
+        crate::analyzer::GlobalUsageDefinitionIndex::fqn_exists(self, fqn)
+    }
+
+    fn package_exists(&self, package: &str) -> bool {
+        crate::analyzer::GlobalUsageDefinitionIndex::package_exists(self, package)
+    }
+
+    fn package_container_exists(&self, package: &str) -> bool {
+        crate::analyzer::GlobalUsageDefinitionIndex::package_container_exists(self, package)
+    }
+
+    fn child_packages(&self, package: &str) -> Vec<String> {
+        crate::analyzer::GlobalUsageDefinitionIndex::child_packages(self, package)
+    }
+
+    fn members_for_owner_name<'a>(
+        &'a self,
+        owner_fqn: &str,
+        normalized_owner_fqn: &str,
+        name: &str,
+    ) -> Vec<&'a CodeUnit> {
+        crate::analyzer::GlobalUsageDefinitionIndex::members_for_owner_name(
+            self,
+            owner_fqn,
+            normalized_owner_fqn,
+            name,
+        )
+    }
+
+    fn package_types(
+        &self,
+    ) -> brokk_bifrost_jvm::scala::graph_support::ScalaPackageTypeEntries<'_> {
+        Box::new(crate::analyzer::GlobalUsageDefinitionIndex::package_types(
+            self,
+        ))
+    }
+}
+
+impl ScalaCallableFactsIndex for UsageFactsIndex {
+    fn fact_for_declaration(
+        &self,
+        declaration: &CodeUnit,
+    ) -> Option<&crate::analyzer::CallableFacts> {
+        UsageFactsIndex::fact_for_declaration(self, declaration)
     }
 }
 

@@ -35,7 +35,6 @@ use super::resolver::{
     preferred_scala_type, scala_builtin_type_name, scala_extension_receiver_matches_resolved,
     scala_literal_type_name, scala_normalized_fq_name,
 };
-use super::shared::{ScalaEdgeGraph, scala_short_name_terminal_segment};
 use super::syntax::{
     ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole, ScalaCallableSiteRole,
     ScalaCallableUsePolicy, ScalaFunctionParameterShape, ScalaGenericOwnerSourceFacts,
@@ -57,37 +56,41 @@ use super::syntax::{
     stable_identifier_reference, stable_type_prefix_reference, template_direct_term_member_named,
     template_self_type, terminal_invocation_owner_name,
 };
-use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::scala::imports::scala_import_infos_from_node;
-use crate::analyzer::scala::{
-    ScalaAdapter, ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaExportSelector,
-    ScalaSupertypeLookupPath, ScalaWildcardOwnerFacts, resolve_scala_explicit_import_tier,
-    resolve_scala_wildcard_import_environment, scala_class_parameter_field_keyword,
+use crate::scala::declarations::scala_class_parameter_field_keyword;
+use crate::scala::graph_support::{
+    ScalaCallableFactsIndex, ScalaDefinitionIndex, ScalaFileFacts, ScalaSource,
+};
+use crate::scala::imports::scala_import_infos_from_node;
+use crate::scala::supertypes::{
+    ScalaSupertypeLookupPath, scala_supertype_lookup_nodes, scala_type_lookup_segments,
+};
+use crate::scala::wildcard_imports::{
+    ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaWildcardOwnerFacts,
+    resolve_scala_explicit_import_tier, resolve_scala_wildcard_import_environment,
     scala_enclosing_package_root_candidates, scala_import_path, scala_import_path_candidates,
-    scala_nested_type_candidates, scala_normalize_full_name, scala_simple_type_name,
-    scala_supertype_lookup_nodes, scala_type_lookup_segments,
 };
-use crate::analyzer::tree_sitter_analyzer::FileState;
-use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, UsageReferenceKind,
-    build_edge_output, build_file_declarations_from_state, class_range_index_from_state,
-    classify_reference_node, parse_source_and_collect_with_declarations,
+use crate::scala::{
+    scala_nested_type_candidates, scala_short_name_terminal_segment, scala_simple_type_name,
 };
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::model::UsageHitKind;
-use crate::analyzer::usages::same_owner::route_same_owner;
-use crate::analyzer::{
-    CallableArity, CallableFacts, CodeUnit, GlobalUsageDefinitionIndex, Range, UsageFactsIndex,
+use brokk_bifrost_core::analyzer::model::{
+    CallableArity, CallableFacts, ImportInfo, ScalaExportInfo, ScalaExportSelector,
+    SignatureMetadata,
 };
-use crate::analyzer::{
-    IAnalyzer, ImportAnalysisProvider, ProjectFile, ScalaAnalyzer, TypeHierarchyProvider,
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageReferenceKind, classify_reference_node,
 };
-use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
+};
+use brokk_bifrost_core::analyzer::usages::model::UsageHitKind;
+use brokk_bifrost_core::analyzer::usages::same_owner::route_same_owner;
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile, Range};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum ScalaReferenceRole {
+pub enum ScalaReferenceRole {
     Type,
     Callable,
     CompanionApplication,
@@ -99,7 +102,7 @@ pub(super) enum ScalaReferenceRole {
 }
 
 #[derive(Clone, Debug)]
-pub(super) enum ScalaResolvedReference {
+pub enum ScalaResolvedReference {
     Exact(CodeUnit),
     Logical(String),
 }
@@ -119,12 +122,12 @@ pub(super) enum ScalaResolvedReference {
 /// same-owner reference to *unproven* inbound rather than a proven edge, so a
 /// method reachable only through same-owner calls reads INCONCLUSIVE — uniform
 /// with the other ten languages.
-pub(super) trait ScalaReferenceSink {
+pub trait ScalaReferenceSink {
     fn may_match_name(&self, _name: &str) -> bool {
         true
     }
 
-    fn register_imports(&mut self, _imports: &[crate::analyzer::ImportInfo]) {}
+    fn register_imports(&mut self, _imports: &[ImportInfo]) {}
 
     fn record(
         &mut self,
@@ -169,7 +172,7 @@ pub(super) trait ScalaReferenceSink {
 
     fn record_import_name(
         &mut self,
-        _imports: &[crate::analyzer::ImportInfo],
+        _imports: &[ImportInfo],
         _active_package: &str,
         _name: &str,
         _start: usize,
@@ -198,7 +201,7 @@ pub(super) trait ScalaReferenceSink {
 type PackageTypeEntries = Arc<Vec<(String, CodeUnit)>>;
 type CachedScalaSourceFacts = Arc<ScalaSourceFacts>;
 type ScalaSourceFactsCell = Arc<OnceLock<CachedScalaSourceFacts>>;
-pub(crate) type CachedCallableAlternatives = Arc<Vec<CallableAlternative>>;
+pub type CachedCallableAlternatives = Arc<Vec<CallableAlternative>>;
 type CallableAlternativesCell = Arc<OnceLock<CachedCallableAlternatives>>;
 type ExtensionOwnerMemberKey = (String, String);
 type ExtensionMethodEntries = Arc<Vec<ExtensionMethod>>;
@@ -213,44 +216,44 @@ struct ScalaExportEdge {
 
 type ExportedMemberBindings = HashMap<String, HashSet<String>>;
 
-pub(super) enum MemberReturnResolution {
+pub enum MemberReturnResolution {
     NoMatch,
     Unresolved,
     Resolved(String),
 }
 
-pub(super) enum BareMemberResolution {
+pub enum BareMemberResolution {
     NoMatch,
     Unresolved,
     Resolved(Vec<CodeUnit>),
 }
 
-pub(super) enum FieldResolution {
+pub enum FieldResolution {
     NoMatch,
     Unresolved,
     Resolved(ResolvedField),
 }
 
-pub(super) struct ResolvedField {
-    pub(super) declaration: CodeUnit,
-    pub(super) declared_type: Option<String>,
+pub struct ResolvedField {
+    pub declaration: CodeUnit,
+    pub declared_type: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum TypeApplicationRole {
+pub enum TypeApplicationRole {
     ExplicitConstructor,
     BareApplication,
     Extractor,
 }
 
-pub(super) struct TypeApplicationResolution {
-    pub(super) type_target: Option<CodeUnit>,
-    pub(super) callable_targets: Vec<CodeUnit>,
-    pub(super) value_result: Option<ScalaValueOwner>,
+pub struct TypeApplicationResolution {
+    pub type_target: Option<CodeUnit>,
+    pub callable_targets: Vec<CodeUnit>,
+    pub value_result: Option<ScalaValueOwner>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum ScalaValueOwner {
+pub enum ScalaValueOwner {
     Exact(CodeUnit),
     Logical(String),
 }
@@ -273,10 +276,10 @@ enum ScalaApplyValueResolution {
 
 /// Every type-namespace declaration the project exposes, indexed for the
 /// per-file name->fqn rebuild. Built once and shared across all files' scans.
-pub(crate) struct ProjectTypes {
-    index: Arc<GlobalUsageDefinitionIndex>,
+pub struct ProjectTypes {
+    index: Arc<dyn ScalaDefinitionIndex>,
     type_aliases: Arc<HashSet<CodeUnit>>,
-    facts: Arc<UsageFactsIndex>,
+    facts: Arc<dyn ScalaCallableFactsIndex>,
     direct_ancestors_by_owner: Option<HashMap<String, Vec<CodeUnit>>>,
     direct_ancestors_by_unit: Option<HashMap<CodeUnit, Vec<CodeUnit>>>,
     ambiguous_direct_ancestor_owners: Option<HashSet<CodeUnit>>,
@@ -287,7 +290,7 @@ pub(crate) struct ProjectTypes {
     nested_types_by_owner: Mutex<HashMap<String, PackageTypeEntries>>,
     nested_objects_by_owner: Mutex<HashMap<String, PackageTypeEntries>>,
     source_facts_by_file: Mutex<HashMap<ProjectFile, ScalaSourceFactsCell>>,
-    bulk_file_states: Option<HashMap<ProjectFile, FileState>>,
+    bulk_file_states: Option<HashMap<ProjectFile, ScalaFileFacts>>,
     callable_alternatives_by_unit: Mutex<HashMap<CodeUnit, CallableAlternativesCell>>,
     effective_callable_alternatives_by_unit: Mutex<HashMap<CodeUnit, CallableAlternativesCell>>,
     extension_methods_by_owner_member:
@@ -323,7 +326,7 @@ fn sorted_unique_units(mut units: Vec<CodeUnit>) -> Vec<CodeUnit> {
 /// mean "unique modulo signature", so they must treat a same-file overload
 /// family as a single physical declaration and leave overload selection to the
 /// call-shape machinery downstream.
-pub(crate) fn same_overload_family(left: &CodeUnit, right: &CodeUnit) -> bool {
+pub fn same_overload_family(left: &CodeUnit, right: &CodeUnit) -> bool {
     left.source() == right.source()
         && left.kind() == right.kind()
         && left.package_name() == right.package_name()
@@ -333,7 +336,7 @@ pub(crate) fn same_overload_family(left: &CodeUnit, right: &CodeUnit) -> bool {
 
 /// True when every unit in the set belongs to one overload family (see
 /// [`same_overload_family`]). Empty sets are vacuously a single family.
-pub(crate) fn single_overload_family<'a>(mut units: impl Iterator<Item = &'a CodeUnit>) -> bool {
+pub fn single_overload_family<'a>(mut units: impl Iterator<Item = &'a CodeUnit>) -> bool {
     let Some(first) = units.next() else {
         return true;
     };
@@ -341,7 +344,20 @@ pub(crate) fn single_overload_family<'a>(mut units: impl Iterator<Item = &'a Cod
 }
 
 impl ProjectTypes {
-    pub(crate) fn build_from_file_states(file_states: HashMap<ProjectFile, FileState>) -> Self {
+    /// The declarations a bulk file-state read contributes to the workspace
+    /// declaration index, in the index's insertion order.
+    ///
+    /// Split out of the builder because building the index itself is
+    /// analysis-side work: `GlobalUsageDefinitionIndex::from_declarations`,
+    /// `UsageFactsIndex::build_from_declarations`, `DefinitionIndexHandle` and
+    /// `ScalaAdapter` are all products of `brokk-bifrost-analysis`, and this
+    /// crate receives them already finished through [`Self::from_parts`]. What
+    /// stays here is the decision about *which* units enter, which is Scala's:
+    /// the definition-lookup units and the declarations, file scopes excluded,
+    /// deduplicated in that order.
+    pub fn indexable_declarations(
+        file_states: &HashMap<ProjectFile, ScalaFileFacts>,
+    ) -> Vec<CodeUnit> {
         let mut declarations = Vec::new();
         let mut seen = HashSet::default();
         for state in file_states.values() {
@@ -355,41 +371,23 @@ impl ProjectTypes {
                 }
             }
         }
-        let index = Arc::new(GlobalUsageDefinitionIndex::from_declarations(
-            declarations.iter(),
-            scala_normalize_full_name,
-            scala_simple_type_name,
-        ));
+        declarations
+    }
+
+    /// Assemble the project type index from a bulk file-state read plus the two
+    /// finished analysis-side indexes built over
+    /// [`Self::indexable_declarations`].
+    pub fn from_parts(
+        index: Arc<dyn ScalaDefinitionIndex>,
+        facts: Arc<dyn ScalaCallableFactsIndex>,
+        file_states: HashMap<ProjectFile, ScalaFileFacts>,
+    ) -> Self {
         let type_aliases = Arc::new(
             file_states
                 .values()
                 .flat_map(|state| state.type_aliases.iter().cloned())
                 .collect(),
         );
-        let definitions = crate::analyzer::DefinitionIndexHandle::Single(&index);
-        let facts = Arc::new(UsageFactsIndex::build_from_declarations(
-            &definitions,
-            declarations.iter(),
-            |unit| {
-                file_states
-                    .get(unit.source())
-                    .and_then(|state| state.signatures.get(unit).and_then(|values| values.first()))
-                    .cloned()
-                    .or_else(|| unit.signature().map(str::to_string))
-            },
-            |unit| {
-                file_states
-                    .get(unit.source())
-                    .and_then(|state| {
-                        state
-                            .signature_metadata
-                            .get(unit)
-                            .and_then(|values| values.first())
-                    })
-                    .cloned()
-            },
-            &ScalaAdapter,
-        ));
         let structural_parent_by_unit = file_states
             .values()
             .flat_map(|state| {
@@ -444,17 +442,15 @@ impl ProjectTypes {
         types
     }
 
-    pub(crate) fn exact_direct_ancestors_snapshot(
-        &self,
-    ) -> Option<&HashMap<CodeUnit, Vec<CodeUnit>>> {
+    pub fn exact_direct_ancestors_snapshot(&self) -> Option<&HashMap<CodeUnit, Vec<CodeUnit>>> {
         self.direct_ancestors_by_unit.as_ref()
     }
 
-    fn bulk_file_state(&self, file: &ProjectFile) -> Option<&FileState> {
+    pub fn bulk_file_state(&self, file: &ProjectFile) -> Option<&ScalaFileFacts> {
         self.bulk_file_states.as_ref()?.get(file)
     }
 
-    fn is_type_alias(&self, _scala: &ScalaAnalyzer, unit: &CodeUnit) -> bool {
+    fn is_type_alias(&self, _scala: &dyn ScalaSource, unit: &CodeUnit) -> bool {
         self.type_aliases.contains(unit)
     }
 
@@ -462,7 +458,7 @@ impl ProjectTypes {
     /// declaration. Scala permits a type alias and a `val` with the same name
     /// in one owner; the analyzer intentionally coalesces those declarations
     /// into one CodeUnit while retaining both parser-recorded signatures.
-    pub(super) fn has_term_field_declaration(&self, unit: &CodeUnit) -> bool {
+    pub fn has_term_field_declaration(&self, unit: &CodeUnit) -> bool {
         unit.is_field()
             && (!self.type_aliases.contains(unit)
                 || self
@@ -490,7 +486,7 @@ impl ProjectTypes {
 
     fn is_exact_structural_child(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         unit: &CodeUnit,
     ) -> bool {
@@ -500,14 +496,18 @@ impl ProjectTypes {
         }
     }
 
-    fn exact_structural_parent(&self, scala: &ScalaAnalyzer, unit: &CodeUnit) -> Option<CodeUnit> {
+    fn exact_structural_parent(
+        &self,
+        scala: &dyn ScalaSource,
+        unit: &CodeUnit,
+    ) -> Option<CodeUnit> {
         match &self.structural_parent_by_unit {
             Some(parents) => parents.get(unit).cloned(),
             None => scala.structural_parent_of(unit),
         }
     }
 
-    fn declaration_parent(&self, scala: &ScalaAnalyzer, unit: &CodeUnit) -> Option<CodeUnit> {
+    fn declaration_parent(&self, scala: &dyn ScalaSource, unit: &CodeUnit) -> Option<CodeUnit> {
         match &self.structural_parent_by_unit {
             Some(parents) => parents.get(unit).cloned(),
             None => scala
@@ -516,7 +516,7 @@ impl ProjectTypes {
         }
     }
 
-    pub(crate) fn exact_type_declaration_for_owner_context(
+    pub fn exact_type_declaration_for_owner_context(
         &self,
         fqn: &str,
         owner: &CodeUnit,
@@ -575,9 +575,9 @@ impl ProjectTypes {
 
     fn export_infos_for_owner(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
-    ) -> Vec<crate::analyzer::scala::ScalaExportInfo> {
+    ) -> Vec<ScalaExportInfo> {
         match &self.bulk_file_states {
             Some(states) => states
                 .get(owner.source())
@@ -590,9 +590,9 @@ impl ProjectTypes {
 
     fn imports_for_export_owner(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
-    ) -> Vec<crate::analyzer::ImportInfo> {
+    ) -> Vec<ImportInfo> {
         match &self.bulk_file_states {
             Some(states) => states
                 .get(owner.source())
@@ -604,7 +604,7 @@ impl ProjectTypes {
 
     fn physical_callable_targets(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         targets: Vec<CodeUnit>,
     ) -> PhysicalCallableTargets {
         if targets.is_empty() {
@@ -621,7 +621,11 @@ impl ProjectTypes {
         }
     }
 
-    fn fallback_callable_role(&self, scala: &ScalaAnalyzer, unit: &CodeUnit) -> ScalaCallableRole {
+    fn fallback_callable_role(
+        &self,
+        scala: &dyn ScalaSource,
+        unit: &CodeUnit,
+    ) -> ScalaCallableRole {
         if unit.is_synthetic() {
             ScalaCallableRole::PrimaryConstructor
         } else if self
@@ -655,9 +659,9 @@ impl ProjectTypes {
     /// parser-recorded export facts instead. Discovery is iterative and the
     /// propagation is a finite monotonic fixed point, so malformed export
     /// cycles terminate without losing valid aliases on another path.
-    pub(crate) fn exported_member_bindings(
+    pub fn exported_member_bindings(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         exporter: &CodeUnit,
     ) -> Vec<(String, String)> {
         let exporter_fqn = exporter.fq_name();
@@ -823,9 +827,9 @@ impl ProjectTypes {
         result
     }
 
-    pub(crate) fn resolve_direct_ancestors_from_file_states(
+    pub fn resolve_direct_ancestors_from_file_states(
         &self,
-        file_states: &HashMap<ProjectFile, FileState>,
+        file_states: &HashMap<ProjectFile, ScalaFileFacts>,
     ) -> (HashMap<CodeUnit, Vec<CodeUnit>>, HashSet<CodeUnit>) {
         let mut ancestors_by_owner = HashMap::default();
         let mut ambiguous_owners = HashSet::default();
@@ -922,9 +926,9 @@ impl ProjectTypes {
         (ancestors_by_owner, ambiguous_owners)
     }
 
-    pub(super) fn direct_ancestors_for_owner(
+    pub fn direct_ancestors_for_owner(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner_fqn: &str,
     ) -> Vec<CodeUnit> {
         if let Some(ancestors_by_owner) = &self.direct_ancestors_by_owner {
@@ -942,7 +946,7 @@ impl ProjectTypes {
 
     fn direct_ancestors_for_declaration(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
     ) -> Vec<CodeUnit> {
         if let Some(ancestors_by_unit) = &self.direct_ancestors_by_unit {
@@ -951,9 +955,9 @@ impl ProjectTypes {
         scala.get_direct_ancestors(owner)
     }
 
-    pub(super) fn exact_owner_inherits(
+    pub fn exact_owner_inherits(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         target: &CodeUnit,
     ) -> bool {
@@ -980,9 +984,9 @@ impl ProjectTypes {
         false
     }
 
-    pub(crate) fn exact_direct_ancestor_resolution(
+    pub fn exact_direct_ancestor_resolution(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
     ) -> ScalaDirectAncestorResolution {
         if self
@@ -1022,9 +1026,9 @@ impl ProjectTypes {
         ScalaDirectAncestorResolution::Resolved(ancestors)
     }
 
-    pub(super) fn exact_lexical_type_namespace(
+    pub fn exact_lexical_type_namespace(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owners_nearest_first: impl IntoIterator<Item = CodeUnit>,
         name: &str,
         authoritative_local_barrier: bool,
@@ -1049,7 +1053,7 @@ impl ProjectTypes {
 
     fn direct_field_ancestors_for_owner(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner_fqn: &str,
     ) -> Vec<CodeUnit> {
         if let Some(ancestors_by_owner) = &self.direct_ancestors_by_owner {
@@ -1065,9 +1069,9 @@ impl ProjectTypes {
             .unwrap_or_default()
     }
 
-    pub(super) fn field_for_owner_member(
+    pub fn field_for_owner_member(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner_fqn: &str,
         member: &str,
     ) -> FieldResolution {
@@ -1110,9 +1114,9 @@ impl ProjectTypes {
         FieldResolution::NoMatch
     }
 
-    pub(super) fn field_for_owner_unit(
+    pub fn field_for_owner_unit(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         member: &str,
     ) -> FieldResolution {
@@ -1165,9 +1169,9 @@ impl ProjectTypes {
         FieldResolution::NoMatch
     }
 
-    pub(super) fn stable_type_member_for_owner_unit(
+    pub fn stable_type_member_for_owner_unit(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         member: &str,
     ) -> FieldResolution {
@@ -1268,7 +1272,11 @@ impl ProjectTypes {
         FieldResolution::NoMatch
     }
 
-    fn field_declared_type(&self, scala: &ScalaAnalyzer, declaration: &CodeUnit) -> Option<String> {
+    fn field_declared_type(
+        &self,
+        scala: &dyn ScalaSource,
+        declaration: &CodeUnit,
+    ) -> Option<String> {
         let source_facts = self.source_facts_for_file(scala, declaration.source());
         let resolver = NameResolver::for_file_types(scala, declaration, self);
         let mut resolved = HashSet::default();
@@ -1296,7 +1304,7 @@ impl ProjectTypes {
 
     fn canonical_receiver_type(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         receiver_type: &str,
     ) -> Option<String> {
         let mut current = receiver_type.to_string();
@@ -1330,7 +1338,7 @@ impl ProjectTypes {
 
     fn type_alias_underlying_type(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         alias: &CodeUnit,
     ) -> Option<String> {
         let source_facts = self.source_facts_for_file(scala, alias.source());
@@ -1352,9 +1360,9 @@ impl ProjectTypes {
             .flatten()
     }
 
-    pub(super) fn is_scala_trait_declaration(
+    pub fn is_scala_trait_declaration(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         code_unit: &CodeUnit,
     ) -> bool {
         if let Some(traits) = &self.scala_trait_fqns {
@@ -1365,7 +1373,7 @@ impl ProjectTypes {
 
     fn method_declarations_for_members(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         members: &[&CodeUnit],
         call_arities: Option<&[usize]>,
     ) -> Vec<CodeUnit> {
@@ -1379,7 +1387,7 @@ impl ProjectTypes {
 
     fn method_declarations_for_members_with_shape(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         members: &[&CodeUnit],
         call_shape: &ScalaCallSiteShape,
     ) -> Vec<CodeUnit> {
@@ -1393,7 +1401,7 @@ impl ProjectTypes {
 
     fn callable_declarations_for_members_with_shape(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         members: &[&CodeUnit],
         call_shape: &ScalaCallSiteShape,
         site_role: ScalaCallableSiteRole,
@@ -1408,7 +1416,7 @@ impl ProjectTypes {
 
     fn callable_declarations_for_members(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         members: &[&CodeUnit],
         call_shape: Option<&ScalaCallSiteShape>,
         site_role: ScalaCallableSiteRole,
@@ -1428,7 +1436,7 @@ impl ProjectTypes {
 
     fn method_declarations_for_members_matching(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         members: &[&CodeUnit],
         call: ScalaCallMatch<'_>,
         site_role: ScalaCallableSiteRole,
@@ -1538,7 +1546,7 @@ impl ProjectTypes {
 
     fn imported_member_targets_with_shape(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         member_fqn: &str,
         call_shape: &ScalaCallSiteShape,
     ) -> Vec<CodeUnit> {
@@ -1551,9 +1559,9 @@ impl ProjectTypes {
         self.method_declarations_for_members_with_shape(scala, &members, call_shape)
     }
 
-    pub(super) fn bare_member_declarations_for_owner(
+    pub fn bare_member_declarations_for_owner(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         member: &str,
         call_arities: Option<&[usize]>,
@@ -1568,7 +1576,7 @@ impl ProjectTypes {
 
     fn exact_method_value_declaration_for_owner(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         member: &str,
     ) -> BareMemberResolution {
@@ -1627,7 +1635,7 @@ impl ProjectTypes {
 
     fn bare_member_declarations_for_owner_matching(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         member: &str,
         call: ScalaCallMatch<'_>,
@@ -1690,9 +1698,9 @@ impl ProjectTypes {
     /// handling.  Each breadth level is one semantic tier: fields, trait
     /// declarations, or methods from multiple class owners make that tier
     /// unresolved instead of allowing traversal order to choose a target.
-    pub(super) fn ordinary_class_member_declarations_for_owner(
+    pub fn ordinary_class_member_declarations_for_owner(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         member: &str,
         call_arities: Option<&[usize]>,
@@ -1707,7 +1715,7 @@ impl ProjectTypes {
 
     fn ordinary_class_member_declarations_for_owner_matching(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         member: &str,
         call: ScalaCallMatch<'_>,
@@ -1723,9 +1731,9 @@ impl ProjectTypes {
         )
     }
 
-    pub(super) fn ordinary_class_member_declarations_for_owners(
+    pub fn ordinary_class_member_declarations_for_owners(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         direct_owners: &[CodeUnit],
         member: &str,
         call_arities: Option<&[usize]>,
@@ -1740,7 +1748,7 @@ impl ProjectTypes {
 
     fn ordinary_class_member_declarations_for_owners_matching(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         direct_owners: &[CodeUnit],
         member: &str,
         call: ScalaCallMatch<'_>,
@@ -1815,11 +1823,7 @@ impl ProjectTypes {
         BareMemberResolution::NoMatch
     }
 
-    pub(super) fn is_abstract_scala_method(
-        &self,
-        scala: &ScalaAnalyzer,
-        method: &CodeUnit,
-    ) -> bool {
+    pub fn is_abstract_scala_method(&self, scala: &dyn ScalaSource, method: &CodeUnit) -> bool {
         let ranges = self.declaration_ranges_for(scala, method);
         !ranges.is_empty()
             && ranges.iter().all(|range| {
@@ -1829,14 +1833,14 @@ impl ProjectTypes {
             })
     }
 
-    fn member_blocks_callable_lookup(&self, scala: &ScalaAnalyzer, member: &CodeUnit) -> bool {
+    fn member_blocks_callable_lookup(&self, scala: &dyn ScalaSource, member: &CodeUnit) -> bool {
         self.has_term_field_declaration(member)
             || member.is_class() && self.type_is_stable_owner(scala, member)
     }
 
-    pub(crate) fn callable_parameter_function_shape(
+    pub fn callable_parameter_function_shape(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         method: &CodeUnit,
         call_arities: &[usize],
         parameter_list: usize,
@@ -1870,7 +1874,7 @@ impl ProjectTypes {
     /// implementation.
     fn effective_method_declarations_for_owner(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner_fqn: &str,
         member: &str,
         call_arities: Option<&[usize]>,
@@ -1885,7 +1889,7 @@ impl ProjectTypes {
 
     fn effective_method_declarations_for_owner_with_shape(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner_fqn: &str,
         member: &str,
         call_shape: &ScalaCallSiteShape,
@@ -1900,7 +1904,7 @@ impl ProjectTypes {
 
     fn effective_method_declarations_for_owner_matching(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner_fqn: &str,
         member: &str,
         call: ScalaCallMatch<'_>,
@@ -1922,7 +1926,7 @@ impl ProjectTypes {
 
     fn effective_method_declarations_for_exact_owner_with_shape(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         member: &str,
         call_shape: &ScalaCallSiteShape,
@@ -1937,7 +1941,7 @@ impl ProjectTypes {
 
     fn effective_method_declarations_for_exact_owner(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         member: &str,
         call_arities: Option<&[usize]>,
@@ -1952,7 +1956,7 @@ impl ProjectTypes {
 
     fn effective_method_declarations_for_exact_owner_matching(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         member: &str,
         call: ScalaCallMatch<'_>,
@@ -2042,7 +2046,7 @@ impl ProjectTypes {
 
     fn owner_supports_ordinary_member_lookup(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
     ) -> bool {
         owner.is_class()
@@ -2054,7 +2058,7 @@ impl ProjectTypes {
     /// recursion. For `C extends L with R`, the parent suffix is
     /// `L(R) ⊕ L(L)`: identities repeated by the later/left linearization are
     /// removed from the earlier/right one before the lists are joined.
-    fn linearized_owners(&self, scala: &ScalaAnalyzer, root: &CodeUnit) -> Vec<CodeUnit> {
+    fn linearized_owners(&self, scala: &dyn ScalaSource, root: &CodeUnit) -> Vec<CodeUnit> {
         let mut completed = HashMap::<CodeUnit, Vec<CodeUnit>>::default();
         let mut visiting = HashSet::default();
         let mut stack = vec![(root.clone(), false)];
@@ -2102,7 +2106,7 @@ impl ProjectTypes {
 
     fn generic_owner_source_facts(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
     ) -> Option<ScalaGenericOwnerSourceFacts> {
         let source_facts = self.source_facts_for_file(scala, owner.source());
@@ -2121,7 +2125,7 @@ impl ProjectTypes {
 
     fn concrete_type_expression_owner(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         declaration: &CodeUnit,
         expression: &ScalaTypeExpressionPath,
     ) -> Option<CodeUnit> {
@@ -2142,7 +2146,7 @@ impl ProjectTypes {
 
     fn generic_environments_for_linearization(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         root: &CodeUnit,
     ) -> Option<HashMap<CodeUnit, HashMap<String, CodeUnit>>> {
         let mut environments = HashMap::<CodeUnit, HashMap<String, CodeUnit>>::default();
@@ -2211,7 +2215,7 @@ impl ProjectTypes {
 
     fn callable_return_value_from_path(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         method: &CodeUnit,
         declaring_owner: &CodeUnit,
         environment: &HashMap<String, CodeUnit>,
@@ -2248,7 +2252,7 @@ impl ProjectTypes {
 
     fn callable_value_resolution_for_members(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         declaring_owner: &CodeUnit,
         members: &[&CodeUnit],
         call_shape: Option<&ScalaCallSiteShape>,
@@ -2346,7 +2350,7 @@ impl ProjectTypes {
 
     fn inherited_apply_value_resolution(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         root: &CodeUnit,
         call_shape: Option<&ScalaCallSiteShape>,
     ) -> ScalaApplyValueResolution {
@@ -2407,9 +2411,9 @@ impl ProjectTypes {
         }
     }
 
-    pub(crate) fn member_return_type(
+    pub fn member_return_type(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         member_fqn: &str,
     ) -> Option<String> {
@@ -2458,9 +2462,9 @@ impl ProjectTypes {
         matched.then_some(resolved_return).flatten()
     }
 
-    pub(super) fn member_return_type_for_owner_member(
+    pub fn member_return_type_for_owner_member(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         owner_fqn: &str,
         member: &str,
@@ -2470,9 +2474,9 @@ impl ProjectTypes {
         self.member_return_type_for_members(scala, resolver, &members, call_arities)
     }
 
-    pub(super) fn member_return_type_for_fqn_call(
+    pub fn member_return_type_for_fqn_call(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         member_fqn: &str,
         call_arities: Option<&[usize]>,
@@ -2483,7 +2487,7 @@ impl ProjectTypes {
 
     fn member_return_type_for_members(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         members: &[&CodeUnit],
         call_arities: Option<&[usize]>,
@@ -2499,7 +2503,7 @@ impl ProjectTypes {
 
     fn member_return_type_for_members_with_shape(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         members: &[&CodeUnit],
         call_shape: Option<&ScalaCallSiteShape>,
@@ -2599,9 +2603,9 @@ impl ProjectTypes {
         matched.then_some(resolved_return).flatten()
     }
 
-    pub(super) fn unqualified_member_return_type(
+    pub fn unqualified_member_return_type(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         owner: &CodeUnit,
         member: &str,
@@ -2619,9 +2623,9 @@ impl ProjectTypes {
         )
     }
 
-    pub(super) fn unqualified_member_return_type_for_owners(
+    pub fn unqualified_member_return_type_for_owners(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         direct_owners: &[CodeUnit],
         member: &str,
@@ -2708,7 +2712,7 @@ impl ProjectTypes {
 
     fn members_for_exact_owner_unit<'a>(
         &'a self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         member: &str,
     ) -> Vec<&'a CodeUnit> {
@@ -2719,9 +2723,9 @@ impl ProjectTypes {
             .collect()
     }
 
-    pub(crate) fn exact_member_declarations(
+    pub fn exact_member_declarations(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         member: &str,
     ) -> Vec<CodeUnit> {
@@ -2802,7 +2806,7 @@ impl ProjectTypes {
 
     fn object_by_normalized_fqn(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         normalized_fqn: &str,
     ) -> Option<&CodeUnit> {
         let units = self.index.by_normalized_fqn(normalized_fqn);
@@ -2870,7 +2874,7 @@ impl ProjectTypes {
 
     fn unique_object_by_normalized_fqn(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         normalized_fqn: &str,
     ) -> Option<&CodeUnit> {
         let units = self.index.by_normalized_fqn(normalized_fqn);
@@ -2936,9 +2940,9 @@ impl ProjectTypes {
         (type_declarations, object_declarations)
     }
 
-    pub(super) fn exact_nested_object(
+    pub fn exact_nested_object(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner_fqn: &str,
         member: &str,
     ) -> Option<String> {
@@ -2948,7 +2952,7 @@ impl ProjectTypes {
 
     fn exact_nested_object_unit(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner_fqn: &str,
         member: &str,
     ) -> Option<CodeUnit> {
@@ -2962,9 +2966,9 @@ impl ProjectTypes {
         matches.next().is_none().then_some(resolved)
     }
 
-    pub(super) fn exact_nested_object_for_owner(
+    pub fn exact_nested_object_for_owner(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         member: &str,
     ) -> Option<CodeUnit> {
@@ -2977,7 +2981,7 @@ impl ProjectTypes {
 
     fn exact_nested_objects_for_owner(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         member: &str,
     ) -> Vec<CodeUnit> {
@@ -2993,7 +2997,7 @@ impl ProjectTypes {
         )
     }
 
-    pub(super) fn exact_nested_type(&self, owner_fqn: &str, member: &str) -> Option<String> {
+    pub fn exact_nested_type(&self, owner_fqn: &str, member: &str) -> Option<String> {
         let candidate = format!("{owner_fqn}.{member}");
         let mut matches = self
             .index
@@ -3006,7 +3010,7 @@ impl ProjectTypes {
 
     fn exact_nested_types_for_owner(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner: &CodeUnit,
         member: &str,
     ) -> Vec<CodeUnit> {
@@ -3117,9 +3121,9 @@ impl ProjectTypes {
             })
     }
 
-    pub(crate) fn resolve_type_in_declaration_context(
+    pub fn resolve_type_in_declaration_context(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         segments: &[String],
     ) -> Option<String> {
@@ -3132,9 +3136,9 @@ impl ProjectTypes {
         )
     }
 
-    pub(crate) fn resolve_type_in_hierarchy_context(
+    pub fn resolve_type_in_hierarchy_context(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         segments: &[String],
     ) -> Option<String> {
@@ -3270,9 +3274,9 @@ impl ProjectTypes {
         }
     }
 
-    pub(super) fn resolve_qualified_stable_type_at(
+    pub fn resolve_qualified_stable_type_at(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         segments: &[String],
         terminal_object: bool,
@@ -3288,9 +3292,9 @@ impl ProjectTypes {
         .map(|unit| unit.fq_name())
     }
 
-    pub(super) fn resolve_qualified_stable_type_unit_at(
+    pub fn resolve_qualified_stable_type_unit_at(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         segments: &[String],
         terminal_object: bool,
@@ -3305,9 +3309,9 @@ impl ProjectTypes {
         )
     }
 
-    pub(super) fn resolve_qualified_stable_type_unit_at_with_lexical_roots(
+    pub fn resolve_qualified_stable_type_unit_at_with_lexical_roots(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         segments: &[String],
         terminal_object: bool,
@@ -3431,7 +3435,7 @@ impl ProjectTypes {
 
     fn resolve_type_in_callable_declaration_context(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         declaration: &CodeUnit,
         segments: &[String],
@@ -3479,7 +3483,7 @@ impl ProjectTypes {
         resolver: &NameResolver,
         segments: &[String],
         owner: &CodeUnit,
-        state: &FileState,
+        state: &ScalaFileFacts,
         parent_by_child: &HashMap<&CodeUnit, &CodeUnit>,
         projected_parent_by_unit: &HashMap<CodeUnit, CodeUnit>,
     ) -> Option<String> {
@@ -3589,7 +3593,7 @@ impl ProjectTypes {
         (1..segments.len()).any(|end| self.index.package_exists(&segments[..end].join(".")))
     }
 
-    fn package_objects_in(&self, scala: &ScalaAnalyzer, package: &str) -> PackageTypeEntries {
+    fn package_objects_in(&self, scala: &dyn ScalaSource, package: &str) -> PackageTypeEntries {
         if let Some(objects) = self
             .package_objects_by_package
             .lock()
@@ -3635,7 +3639,11 @@ impl ProjectTypes {
         values
     }
 
-    fn nested_types_in(&self, scala: &ScalaAnalyzer, normalized_owner: &str) -> PackageTypeEntries {
+    fn nested_types_in(
+        &self,
+        scala: &dyn ScalaSource,
+        normalized_owner: &str,
+    ) -> PackageTypeEntries {
         if let Some(types) = self
             .nested_types_by_owner
             .lock()
@@ -3693,7 +3701,7 @@ impl ProjectTypes {
 
     fn nested_objects_in(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         normalized_owner: &str,
     ) -> PackageTypeEntries {
         if let Some(types) = self
@@ -3731,7 +3739,7 @@ impl ProjectTypes {
 
     fn importable_members_by_normalized_fqn(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         normalized_fqn: &str,
         source_file: Option<&ProjectFile>,
     ) -> Vec<&CodeUnit> {
@@ -3778,7 +3786,7 @@ impl ProjectTypes {
 
     fn exact_field(
         &self,
-        _scala: &ScalaAnalyzer,
+        _scala: &dyn ScalaSource,
         owner_fqn: &str,
         member: &str,
     ) -> Option<CodeUnit> {
@@ -3792,9 +3800,9 @@ impl ProjectTypes {
         (fields.len() == 1).then(|| fields[0].clone())
     }
 
-    pub(crate) fn constructor_target_matches(
+    pub fn constructor_target_matches(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         target: &CodeUnit,
         call_shape: Option<&ScalaCallSiteShape>,
         site_role: ScalaCallableSiteRole,
@@ -3822,9 +3830,9 @@ impl ProjectTypes {
         })
     }
 
-    pub(crate) fn callable_alternatives_for(
+    pub fn callable_alternatives_for(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         target: &CodeUnit,
     ) -> CachedCallableAlternatives {
         let cell = self
@@ -4021,9 +4029,9 @@ impl ProjectTypes {
     /// target, but merge defaults only when every parameter position has an
     /// exact, source-backed type identity and the hierarchy itself is
     /// unambiguous.
-    pub(crate) fn effective_callable_alternatives_for(
+    pub fn effective_callable_alternatives_for(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         target: &CodeUnit,
     ) -> CachedCallableAlternatives {
         let cell = self
@@ -4074,7 +4082,7 @@ impl ProjectTypes {
         .clone()
     }
 
-    fn hierarchy_is_unambiguous(&self, scala: &ScalaAnalyzer, root: &CodeUnit) -> bool {
+    fn hierarchy_is_unambiguous(&self, scala: &dyn ScalaSource, root: &CodeUnit) -> bool {
         let mut pending = vec![root.clone()];
         let mut seen = HashSet::default();
         while let Some(owner) = pending.pop() {
@@ -4091,7 +4099,7 @@ impl ProjectTypes {
 
     fn inherited_default_mask_for_alternative(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         ancestors: &[CodeUnit],
         member: &str,
         declared: &CallableAlternative,
@@ -4151,7 +4159,7 @@ impl ProjectTypes {
 
     fn resolve_callable_parameter_type_identity(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         declaration: &CodeUnit,
         path: &[String],
@@ -4196,7 +4204,7 @@ impl ProjectTypes {
 
     fn resolve_callable_parameter_type_unit(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         declaration: &CodeUnit,
         path: &[String],
@@ -4288,9 +4296,9 @@ impl ProjectTypes {
         self.resolve_qualified_stable_type_unit_at(scala, resolver, path, false, None)
     }
 
-    pub(crate) fn exact_case_class_for_companion_apply(
+    pub fn exact_case_class_for_companion_apply(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         target: &CodeUnit,
     ) -> Option<CodeUnit> {
         if !target.is_function()
@@ -4318,11 +4326,7 @@ impl ProjectTypes {
         candidates.next().is_none().then_some(candidate)
     }
 
-    pub(super) fn type_accepts_object_roles(
-        &self,
-        scala: &ScalaAnalyzer,
-        target: &CodeUnit,
-    ) -> bool {
+    pub fn type_accepts_object_roles(&self, scala: &dyn ScalaSource, target: &CodeUnit) -> bool {
         if self.type_is_stable_owner(scala, target) {
             return true;
         }
@@ -4336,7 +4340,7 @@ impl ProjectTypes {
             })
     }
 
-    pub(super) fn type_is_stable_owner(&self, scala: &ScalaAnalyzer, target: &CodeUnit) -> bool {
+    pub fn type_is_stable_owner(&self, scala: &dyn ScalaSource, target: &CodeUnit) -> bool {
         if target.short_name().ends_with('$') {
             return true;
         }
@@ -4350,9 +4354,9 @@ impl ProjectTypes {
             })
     }
 
-    pub(super) fn stable_roots_for_resolved_type_name(
+    pub fn stable_roots_for_resolved_type_name(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         name: &str,
     ) -> Vec<CodeUnit> {
@@ -4380,9 +4384,9 @@ impl ProjectTypes {
         roots
     }
 
-    pub(super) fn exact_companion_objects(
+    pub fn exact_companion_objects(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         target: &CodeUnit,
     ) -> Vec<CodeUnit> {
         let target_parent = self.exact_structural_parent(scala, target);
@@ -4400,9 +4404,9 @@ impl ProjectTypes {
             .collect()
     }
 
-    pub(super) fn exact_companion_classes(
+    pub fn exact_companion_classes(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         target: &CodeUnit,
     ) -> Vec<CodeUnit> {
         let target_parent = self.exact_structural_parent(scala, target);
@@ -4420,11 +4424,7 @@ impl ProjectTypes {
             .collect()
     }
 
-    pub(super) fn class_accepts_extractor_role(
-        &self,
-        scala: &ScalaAnalyzer,
-        target: &CodeUnit,
-    ) -> bool {
+    pub fn class_accepts_extractor_role(&self, scala: &dyn ScalaSource, target: &CodeUnit) -> bool {
         self.is_case_class(scala, target)
             || self
                 .exact_companion_objects(scala, target)
@@ -4440,7 +4440,7 @@ impl ProjectTypes {
 
     fn class_application_matches_with_shape(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         target: &CodeUnit,
         call_shape: Option<&ScalaCallSiteShape>,
@@ -4480,9 +4480,9 @@ impl ProjectTypes {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn resolve_type_application(
+    pub fn resolve_type_application(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         class_fqn: Option<&str>,
         object_fqn: Option<&str>,
@@ -4778,15 +4778,13 @@ impl ProjectTypes {
 
     fn unresolved_inherited_companion_apply_fallback(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         type_target: &CodeUnit,
         companion: &CodeUnit,
         call_shape: Option<&ScalaCallSiteShape>,
     ) -> Option<CodeUnit> {
         let normalized_owner = scala_normalized_fq_name(&type_target.fq_name());
-        let normalized_owners = scala
-            .global_usage_definition_index()
-            .by_normalized_fqn(&normalized_owner);
+        let normalized_owners = scala.definitions_by_normalized_fqn(&normalized_owner);
         let mut physical_companions = normalized_owners.iter().filter(|candidate| {
             candidate.is_class()
                 && *candidate != type_target
@@ -4817,11 +4815,7 @@ impl ProjectTypes {
         }
     }
 
-    pub(super) fn class_accepts_apply_role(
-        &self,
-        scala: &ScalaAnalyzer,
-        target: &CodeUnit,
-    ) -> bool {
+    pub fn class_accepts_apply_role(&self, scala: &dyn ScalaSource, target: &CodeUnit) -> bool {
         self.is_case_class(scala, target)
             || self
                 .exact_companion_objects(scala, target)
@@ -4835,7 +4829,7 @@ impl ProjectTypes {
 
     fn class_companion_apply_call_matches_with_shape(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         target: &CodeUnit,
         call_shape: Option<&ScalaCallSiteShape>,
@@ -4870,9 +4864,9 @@ impl ProjectTypes {
             })
     }
 
-    pub(super) fn class_companion_apply_method_value_matches(
+    pub fn class_companion_apply_method_value_matches(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         target: &CodeUnit,
         contextual_arities: Option<&[usize]>,
     ) -> bool {
@@ -4926,7 +4920,7 @@ impl ProjectTypes {
 
     fn unique_companion_apply_method_value_target(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         resolver: &NameResolver,
         name: &str,
         contextual_arities: Option<&[usize]>,
@@ -4946,7 +4940,7 @@ impl ProjectTypes {
         Some(target)
     }
 
-    pub(super) fn is_case_class(&self, scala: &ScalaAnalyzer, target: &CodeUnit) -> bool {
+    pub fn is_case_class(&self, scala: &dyn ScalaSource, target: &CodeUnit) -> bool {
         let source_facts = self.source_facts_for_file(scala, target.source());
         self.declaration_ranges_for(scala, target)
             .iter()
@@ -4957,7 +4951,7 @@ impl ProjectTypes {
             })
     }
 
-    pub(crate) fn is_enum(&self, scala: &ScalaAnalyzer, target: &CodeUnit) -> bool {
+    pub fn is_enum(&self, scala: &dyn ScalaSource, target: &CodeUnit) -> bool {
         let source_facts = self.source_facts_for_file(scala, target.source());
         self.declaration_ranges_for(scala, target)
             .iter()
@@ -4968,7 +4962,7 @@ impl ProjectTypes {
             })
     }
 
-    fn declaration_ranges_for(&self, scala: &ScalaAnalyzer, target: &CodeUnit) -> Vec<Range> {
+    fn declaration_ranges_for(&self, scala: &dyn ScalaSource, target: &CodeUnit) -> Vec<Range> {
         match &self.bulk_file_states {
             Some(states) => states
                 .get(target.source())
@@ -4981,9 +4975,9 @@ impl ProjectTypes {
 
     fn signature_metadata_for(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         target: &CodeUnit,
-    ) -> Vec<crate::analyzer::SignatureMetadata> {
+    ) -> Vec<SignatureMetadata> {
         match &self.bulk_file_states {
             Some(states) => states
                 .get(target.source())
@@ -4996,7 +4990,7 @@ impl ProjectTypes {
 
     fn source_facts_for_file(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         file: &ProjectFile,
     ) -> CachedScalaSourceFacts {
         let cell = self
@@ -5016,7 +5010,7 @@ impl ProjectTypes {
         .clone()
     }
 
-    fn source_for_file(&self, scala: &ScalaAnalyzer, file: &ProjectFile) -> Option<String> {
+    pub fn source_for_file(&self, scala: &dyn ScalaSource, file: &ProjectFile) -> Option<String> {
         match &self.bulk_file_states {
             Some(states) => states
                 .get(file)
@@ -5030,7 +5024,7 @@ impl ProjectTypes {
 
     fn direct_extension_method(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         normalized_fqn: &str,
     ) -> Vec<ExtensionMethod> {
         self.index
@@ -5043,7 +5037,7 @@ impl ProjectTypes {
 
     fn extension_methods_for_owner_member(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         normalized_owner_fqn: &str,
         member: &str,
     ) -> ExtensionMethodEntries {
@@ -5077,7 +5071,7 @@ impl ProjectTypes {
 
     fn extension_method_for_unit(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         unit: &CodeUnit,
     ) -> Option<ExtensionMethod> {
         let alternatives = self.callable_alternatives_for(scala, unit);
@@ -5096,7 +5090,7 @@ impl ProjectTypes {
 
     fn override_targets_for_method(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         owner_fqn: &str,
         method_fqn: &str,
         method_name: &str,
@@ -5163,14 +5157,14 @@ impl ProjectTypes {
 }
 
 #[derive(Clone)]
-pub(crate) struct CallableAlternative {
-    pub(crate) role: ScalaCallableRole,
-    pub(crate) shape: Vec<ScalaCallableParameterList>,
-    pub(crate) parameter_defaults: Vec<Vec<bool>>,
-    pub(crate) parameter_types: Vec<Vec<Option<ScalaParameterTypeIdentity>>>,
-    pub(crate) parameter_function_shapes: Vec<Vec<Option<ScalaFunctionParameterShape>>>,
-    pub(crate) extension_receiver_type: Option<String>,
-    pub(crate) return_type: Option<String>,
+pub struct CallableAlternative {
+    pub role: ScalaCallableRole,
+    pub shape: Vec<ScalaCallableParameterList>,
+    pub parameter_defaults: Vec<Vec<bool>>,
+    pub parameter_types: Vec<Vec<Option<ScalaParameterTypeIdentity>>>,
+    pub parameter_function_shapes: Vec<Vec<Option<ScalaFunctionParameterShape>>>,
+    pub extension_receiver_type: Option<String>,
+    pub return_type: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5264,7 +5258,7 @@ fn apply_parameter_defaults_to_shape(alternative: &mut CallableAlternative) {
     }
 }
 
-pub(crate) fn callable_alternative_is_candidate(
+pub fn callable_alternative_is_candidate(
     alternative: &CallableAlternative,
     actual: &ScalaCallSiteShape,
     site_role: ScalaCallableSiteRole,
@@ -5273,7 +5267,7 @@ pub(crate) fn callable_alternative_is_candidate(
         && method_value_parameter_types_match(alternative, actual)
 }
 
-pub(crate) fn callable_alternative_matches(
+pub fn callable_alternative_matches(
     alternative: &CallableAlternative,
     actual: Option<&ScalaCallSiteShape>,
     site_role: ScalaCallableSiteRole,
@@ -5361,7 +5355,7 @@ fn parameter_type_identities_match(
 /// numeric-widening family. Everything uncertain (non-literal arguments,
 /// named arguments, defaults, arity mismatch, non-builtin parameter types)
 /// answers `false` - a wrong absence is worse than a union (#1327).
-pub(crate) fn callable_alternative_contradicts_literal_arguments(
+pub fn callable_alternative_contradicts_literal_arguments(
     alternative: &CallableAlternative,
     call_shape: &ScalaCallSiteShape,
 ) -> bool {
@@ -5428,14 +5422,14 @@ fn next_explicit_parameter_list_index(
 }
 
 #[derive(Clone)]
-pub(crate) struct ExtensionMethod {
-    pub(crate) declaration: CodeUnit,
+pub struct ExtensionMethod {
+    pub declaration: CodeUnit,
     alternatives: CachedCallableAlternatives,
 }
 
 /// Per-file map from a source-visible type/object name to the analyzer's fqn,
 /// mirroring the forward scanner's visibility rules.
-pub(crate) struct NameResolver {
+pub struct NameResolver {
     names: VisibleNameBindings,
     object_names: VisibleNameBindings,
     package_names: VisibleNameBindings,
@@ -5634,15 +5628,15 @@ fn scala_default_namespace_is_source_backed(name: &str) -> bool {
 }
 
 impl NameResolver {
-    pub(super) fn resolve_unit(&self, name: &str) -> Option<CodeUnit> {
+    pub fn resolve_unit(&self, name: &str) -> Option<CodeUnit> {
         self.names.resolve_exact(name)
     }
 
-    pub(super) fn resolve_object_unit(&self, name: &str) -> Option<CodeUnit> {
+    pub fn resolve_object_unit(&self, name: &str) -> Option<CodeUnit> {
         self.object_names.resolve_exact(name)
     }
 
-    pub(super) fn resolve_member_unit(&self, name: &str) -> Option<CodeUnit> {
+    pub fn resolve_member_unit(&self, name: &str) -> Option<CodeUnit> {
         self.member_names.resolve_exact(name)
     }
 
@@ -5659,22 +5653,22 @@ impl NameResolver {
         self.member_names.resolve_exact_candidates(name)
     }
 
-    pub(crate) fn for_file_with_facts(
-        scala: &ScalaAnalyzer,
+    pub fn for_file_with_facts(
+        scala: &dyn ScalaSource,
         source_file: Option<&ProjectFile>,
         package: Option<&str>,
-        imports: &[crate::analyzer::ImportInfo],
+        imports: &[ImportInfo],
         types: &ProjectTypes,
     ) -> Self {
         let package_prefixes = package.into_iter().map(str::to_string).collect::<Vec<_>>();
         Self::for_file_with_package_context(scala, source_file, &package_prefixes, imports, types)
     }
 
-    pub(crate) fn for_file_with_package_context(
-        scala: &ScalaAnalyzer,
+    pub fn for_file_with_package_context(
+        scala: &dyn ScalaSource,
         source_file: Option<&ProjectFile>,
         package_prefixes: &[String],
-        imports: &[crate::analyzer::ImportInfo],
+        imports: &[ImportInfo],
         types: &ProjectTypes,
     ) -> Self {
         Self::for_file_with_package_context_and_owner_scopes(
@@ -5688,10 +5682,10 @@ impl NameResolver {
     }
 
     fn for_file_with_package_context_and_owner_scopes(
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         source_file: Option<&ProjectFile>,
         package_prefixes: &[String],
-        imports: &[crate::analyzer::ImportInfo],
+        imports: &[ImportInfo],
         types: &ProjectTypes,
         import_owner_scopes: &HashMap<usize, Vec<String>>,
     ) -> Self {
@@ -5709,7 +5703,7 @@ impl NameResolver {
     fn for_type_hierarchy_file(
         source_file: Option<&ProjectFile>,
         package: Option<&str>,
-        imports: &[crate::analyzer::ImportInfo],
+        imports: &[ImportInfo],
         types: &ProjectTypes,
         required_names: &HashSet<String>,
     ) -> Self {
@@ -5886,8 +5880,8 @@ impl NameResolver {
         }
     }
 
-    pub(crate) fn for_file_types(
-        scala: &ScalaAnalyzer,
+    pub fn for_file_types(
+        scala: &dyn ScalaSource,
         target: &CodeUnit,
         types: &ProjectTypes,
     ) -> Self {
@@ -5945,10 +5939,10 @@ impl NameResolver {
     }
 
     fn for_file_with_facts_impl(
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         source_file: Option<&ProjectFile>,
         package_prefixes: &[String],
-        imports: &[crate::analyzer::ImportInfo],
+        imports: &[ImportInfo],
         types: &ProjectTypes,
         include_members: bool,
         import_owner_scopes: &HashMap<usize, Vec<String>>,
@@ -6318,7 +6312,7 @@ impl NameResolver {
     }
 
     /// Resolve a type/object source name (stripping generics) to its fqn.
-    pub(crate) fn resolve(&self, raw: &str) -> Option<String> {
+    pub fn resolve(&self, raw: &str) -> Option<String> {
         let simple = simple_type_name(raw)?;
         if self.import_collision_blocks(simple, self.names.priority(simple)) {
             return None;
@@ -6359,7 +6353,7 @@ impl NameResolver {
         simple_type_name(raw).is_some_and(|simple| self.logical_type_names.contains(simple))
     }
 
-    pub(crate) fn type_binding_is_ambiguous(&self, raw: &str) -> bool {
+    pub fn type_binding_is_ambiguous(&self, raw: &str) -> bool {
         let Some(simple) = simple_type_name(raw) else {
             return false;
         };
@@ -6367,7 +6361,7 @@ impl NameResolver {
             || self.names.is_ambiguous(simple)
     }
 
-    pub(crate) fn object_binding_is_ambiguous(&self, raw: &str) -> bool {
+    pub fn object_binding_is_ambiguous(&self, raw: &str) -> bool {
         let Some(simple) = simple_type_name(raw) else {
             return false;
         };
@@ -6375,7 +6369,7 @@ impl NameResolver {
             || self.object_names.is_ambiguous(simple)
     }
 
-    pub(crate) fn resolve_object(&self, raw: &str) -> Option<String> {
+    pub fn resolve_object(&self, raw: &str) -> Option<String> {
         let simple = simple_type_name(raw)?;
         if self.import_collision_blocks(simple, self.object_names.priority(simple)) {
             return None;
@@ -6453,7 +6447,7 @@ impl NameResolver {
     }
 
     /// Resolve a source-visible member name imported directly from an owner.
-    pub(crate) fn resolve_member(&self, raw: &str) -> Option<String> {
+    pub fn resolve_member(&self, raw: &str) -> Option<String> {
         let simple = simple_type_name(raw)?;
         if self.import_collision_blocks(simple, None) {
             return None;
@@ -6461,9 +6455,9 @@ impl NameResolver {
         self.member_names.resolve(simple)
     }
 
-    pub(crate) fn visible_extension_methods(
+    pub fn visible_extension_methods(
         &self,
-        scala: &ScalaAnalyzer,
+        scala: &dyn ScalaSource,
         types: &ProjectTypes,
         member: &str,
     ) -> Vec<ExtensionMethod> {
@@ -6506,9 +6500,9 @@ impl NameResolver {
 }
 
 fn visible_imports_at_byte(
-    imports: &[crate::analyzer::ImportInfo],
+    imports: &[ImportInfo],
     reference_byte: Option<usize>,
-) -> Vec<crate::analyzer::ImportInfo> {
+) -> Vec<ImportInfo> {
     let Some(reference_byte) = reference_byte else {
         return imports.to_vec();
     };
@@ -6525,7 +6519,7 @@ fn visible_imports_at_byte(
 /// package re-qualification (this function's old body did exactly that
 /// reconstruction by hand).
 fn owner_fqn(unit: &CodeUnit) -> Option<String> {
-    crate::analyzer::default_parent_fq_name(unit)
+    brokk_bifrost_core::analyzer::default_parent_fq_name(unit)
 }
 
 enum PhysicalCallableTargets {
@@ -6543,7 +6537,7 @@ impl PhysicalCallableTargets {
     }
 }
 
-pub(super) fn is_package_level_type(unit: &CodeUnit) -> bool {
+pub fn is_package_level_type(unit: &CodeUnit) -> bool {
     !unit.short_name().contains('.')
 }
 
@@ -6564,7 +6558,7 @@ fn callable_call_shape_matches(
     if alternatives.is_empty() {
         fallback_shape = facts
             .callable_arity
-            .or_else(|| facts.arity.map(crate::analyzer::CallableArity::exact))
+            .or_else(|| facts.arity.map(CallableArity::exact))
             .map(|arity| vec![ScalaCallableParameterList::explicit(arity)])
             .unwrap_or_default();
         return scala_callable_alternative_matches(
@@ -6622,7 +6616,7 @@ fn simple_type_name(type_text: &str) -> Option<&str> {
 struct ScalaEdgeSink<'a> {
     input: &'a FileEdgeScanInput<'a>,
     edges: PerFileEdges,
-    scala: &'a ScalaAnalyzer,
+    scala: &'a dyn ScalaSource,
     types: &'a ProjectTypes,
 }
 
@@ -6719,7 +6713,7 @@ impl ScalaReferenceSink for ScalaEdgeSink<'_> {
 
     fn record_import_name(
         &mut self,
-        imports: &[crate::analyzer::ImportInfo],
+        imports: &[ImportInfo],
         active_package: &str,
         name: &str,
         start: usize,
@@ -6770,85 +6764,73 @@ impl ScalaReferenceSink for ScalaEdgeSink<'_> {
     }
 }
 
-pub(super) fn build_scala_edges<Output, F>(
-    scala: &ScalaAnalyzer,
-    graph: &ScalaEdgeGraph,
-    nodes: &HashSet<String>,
-    keep_file: F,
-) -> Output
-where
-    Output: UsageEdgeBuildOutput<String>,
-    F: Fn(&ProjectFile) -> bool + Sync,
-{
-    let language = crate::analyzer::scala::language::LANGUAGE.into();
-    build_edge_output(&graph.files, keep_file, |file| {
-        let state = graph.types.bulk_file_state(file)?;
-        let declarations = build_file_declarations_from_state(state);
-        let class_ranges = class_range_index_from_state(state);
-        parse_source_and_collect_with_declarations(
-            graph.types.source_for_file(scala, file)?,
-            file,
-            nodes,
-            &language,
-            declarations,
-            |input| {
-                let mut sink = ScalaEdgeSink {
-                    input,
-                    edges: PerFileEdges::default(),
-                    scala,
-                    types: &graph.types,
-                };
-                let resolver = Arc::new(NameResolver::for_file_with_facts(
-                    scala,
-                    Some(file),
-                    Some(&state.package_name),
-                    &[],
-                    &graph.types,
-                ));
-                let import_owner_scopes =
-                    scala_import_owner_scopes(&state.imports, &class_ranges, scala, &graph.types);
-                let mut ctx = ScalaScan {
-                    scala,
-                    source: input.source,
-                    source_file: file,
-                    imports: &state.imports,
-                    active_package: state.package_name.clone(),
-                    import_contexts: ScalaImportContextIndex::new(
-                        &state.imports,
-                        input.root().end_byte(),
-                    ),
-                    import_context_cursor: 0,
-                    package_contexts: ScalaPackageContextIndex::new(input.root(), input.source),
-                    package_context_cursor: 0,
-                    resolver,
-                    active_resolver_key: None,
-                    resolver_contexts: HashMap::default(),
-                    import_owner_scopes,
-                    types: &graph.types,
-                    class_ranges,
-                    sink: &mut sink,
-                    cancellation: None,
-                };
-                let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-                walk(input.root(), &mut ctx, &mut bindings);
-                sink.edges
-            },
-        )
-    })
+/// Walk one already-parsed Scala file for the whole-workspace inverted build.
+///
+/// The fan-out around this stays in `brokk-bifrost-analysis`:
+/// `build_edge_output` and `parse_source_and_collect_with_declarations` are the
+/// shared, language-agnostic driver, and only this per-file walk is Scala's.
+/// The caller supplies the file's `ScalaFileFacts` (the same record
+/// [`ProjectTypes`] holds) and the class-range index it built from them, both
+/// of which the driver needs anyway to build the file's declarations.
+pub fn scan_edge_file(
+    scala: &dyn ScalaSource,
+    types: &ProjectTypes,
+    file: &ProjectFile,
+    state: &ScalaFileFacts,
+    class_ranges: ClassRangeIndex,
+    input: &FileEdgeScanInput<'_>,
+) -> PerFileEdges {
+    let mut sink = ScalaEdgeSink {
+        input,
+        edges: PerFileEdges::default(),
+        scala,
+        types,
+    };
+    let resolver = Arc::new(NameResolver::for_file_with_facts(
+        scala,
+        Some(file),
+        Some(&state.package_name),
+        &[],
+        types,
+    ));
+    let import_owner_scopes =
+        scala_import_owner_scopes(&state.imports, &class_ranges, scala, types);
+    let mut ctx = ScalaScan {
+        scala,
+        source: input.source,
+        source_file: file,
+        imports: &state.imports,
+        active_package: state.package_name.clone(),
+        import_contexts: ScalaImportContextIndex::new(&state.imports, input.root().end_byte()),
+        import_context_cursor: 0,
+        package_contexts: ScalaPackageContextIndex::new(input.root(), input.source),
+        package_context_cursor: 0,
+        resolver,
+        active_resolver_key: None,
+        resolver_contexts: HashMap::default(),
+        import_owner_scopes,
+        types,
+        class_ranges,
+        sink: &mut sink,
+        cancellation: None,
+    };
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    walk(input.root(), &mut ctx, &mut bindings);
+    sink.edges
 }
 
 /// Scan one caller-supplied Scala file through the same structured resolver used
 /// by the whole-workspace graph, without constructing or hydrating that graph.
 /// The caller supplies the exact-target sink and owns file eligibility.
-pub(super) fn scan_scala_query_file(
-    scala: &ScalaAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn scan_scala_query_file(
+    scala: &dyn ScalaSource,
+    analyzer: &dyn CodeUnitIndex,
     file: &ProjectFile,
     source: &str,
     sink: &mut dyn ScalaReferenceSink,
-    cancellation: Option<&crate::cancellation::CancellationToken>,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
 ) -> bool {
-    if cancellation.is_some_and(crate::cancellation::CancellationToken::is_cancelled) {
+    if cancellation.is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled) {
         return false;
     }
     if source.is_empty() {
@@ -6856,7 +6838,7 @@ pub(super) fn scan_scala_query_file(
     }
     let mut parser = Parser::new();
     if parser
-        .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
+        .set_language(&crate::scala::language::LANGUAGE.into())
         .is_err()
     {
         return false;
@@ -6864,6 +6846,7 @@ pub(super) fn scan_scala_query_file(
     let Some(tree) = parser.parse(source, None) else {
         return false;
     };
+    #[cfg(any(test, feature = "test-support"))]
     scala.record_query_parse();
     let types = scala.project_types();
     let package = super::resolver::package_name_of(scala, file).unwrap_or_default();
@@ -6898,16 +6881,17 @@ pub(super) fn scan_scala_query_file(
         cancellation,
     };
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    #[cfg(any(test, feature = "test-support"))]
     scala.record_query_walk();
     walk(tree.root_node(), &mut ctx, &mut bindings);
     true
 }
 
 struct ScalaScan<'a, 'b> {
-    scala: &'a ScalaAnalyzer,
+    scala: &'a dyn ScalaSource,
     source: &'a str,
     source_file: &'a ProjectFile,
-    imports: &'a [crate::analyzer::ImportInfo],
+    imports: &'a [ImportInfo],
     active_package: String,
     import_contexts: ScalaImportContextIndex,
     import_context_cursor: usize,
@@ -6920,7 +6904,7 @@ struct ScalaScan<'a, 'b> {
     types: &'a ProjectTypes,
     class_ranges: ClassRangeIndex,
     sink: &'a mut dyn ScalaReferenceSink,
-    cancellation: Option<&'b crate::cancellation::CancellationToken>,
+    cancellation: Option<&'b brokk_bifrost_core::cancellation::CancellationToken>,
 }
 
 impl ScalaScan<'_, '_> {
@@ -7525,9 +7509,9 @@ impl ScalaScan<'_, '_> {
 }
 
 fn scala_import_owner_scopes(
-    imports: &[crate::analyzer::ImportInfo],
+    imports: &[ImportInfo],
     class_ranges: &ClassRangeIndex,
-    scala: &ScalaAnalyzer,
+    scala: &dyn ScalaSource,
     types: &ProjectTypes,
 ) -> HashMap<usize, Vec<String>> {
     let mut scopes = HashMap::default();
@@ -7586,7 +7570,7 @@ fn walk(
         if ctx.sink.should_stop()
             || ctx
                 .cancellation
-                .is_some_and(crate::cancellation::CancellationToken::is_cancelled)
+                .is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled)
         {
             break;
         }

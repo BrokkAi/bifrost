@@ -37,7 +37,7 @@ use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::parsed_tree::{
     ParsedTreeFile, parse_tree_sitter_file, parse_tree_sitter_source,
 };
-use crate::analyzer::{IAnalyzer, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
@@ -46,20 +46,25 @@ use tree_sitter::Language as TreeSitterLanguage;
 /// [`ClassRangeIndex`] over a persisted file state, for scans that already
 /// hydrated one and would otherwise pay the declaration/range queries twice.
 pub(crate) fn class_range_index_from_state(state: &FileState) -> ClassRangeIndex {
-    ClassRangeIndex::from_class_spans(
-        state
-            .declarations
-            .iter()
-            .filter(|unit| unit.is_class())
-            .flat_map(|unit| {
-                state
-                    .ranges
-                    .get(unit)
-                    .into_iter()
-                    .flatten()
-                    .map(move |range| (unit.clone(), *range))
-            }),
-    )
+    class_range_index_from_declaration_ranges(&state.declarations, &state.ranges)
+}
+
+/// [`class_range_index_from_state`] over the two maps it actually reads, for a
+/// scan whose per-file record is a language crate's decode of the state rather
+/// than the state itself.
+pub(crate) fn class_range_index_from_declaration_ranges(
+    declarations: &HashSet<CodeUnit>,
+    ranges: &HashMap<CodeUnit, Vec<Range>>,
+) -> ClassRangeIndex {
+    ClassRangeIndex::from_class_spans(declarations.iter().filter(|unit| unit.is_class()).flat_map(
+        |unit| {
+            ranges
+                .get(unit)
+                .into_iter()
+                .flatten()
+                .map(move |range| (unit.clone(), *range))
+        },
+    ))
 }
 
 /// A callee with more distinct call sites than this is reported as truncated and
@@ -109,15 +114,20 @@ pub(crate) fn build_file_declarations<K: NodeKey>(
 pub(crate) fn build_file_declarations_from_state<K: NodeKey>(
     state: &FileState,
 ) -> FileDeclarations<K> {
+    build_file_declarations_from_declaration_ranges(&state.declarations, &state.ranges)
+}
+
+/// [`build_file_declarations_from_state`] over the two maps it actually reads;
+/// see [`class_range_index_from_declaration_ranges`].
+pub(crate) fn build_file_declarations_from_declaration_ranges<K: NodeKey>(
+    declarations: &HashSet<CodeUnit>,
+    ranges: &HashMap<CodeUnit, Vec<Range>>,
+) -> FileDeclarations<K> {
     let mut enclosers = Vec::new();
     let mut definitions: HashMap<K, Vec<(usize, usize)>> = HashMap::default();
-    for unit in state
-        .declarations
-        .iter()
-        .filter(|unit| !unit.is_file_scope())
-    {
+    for unit in declarations.iter().filter(|unit| !unit.is_file_scope()) {
         let key = K::from_unit(unit);
-        for unit_range in state.ranges.get(unit).into_iter().flatten() {
+        for unit_range in ranges.get(unit).into_iter().flatten() {
             let span = (unit_range.start_byte, unit_range.end_byte);
             enclosers.push((span.0, span.1, key.clone()));
             definitions.entry(key.clone()).or_default().push(span);
