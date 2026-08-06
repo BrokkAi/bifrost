@@ -63,10 +63,31 @@ impl DeclarationNameRangeContext {
     }
 
     pub fn name_ranges(&self, analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Range> {
+        self.name_ranges_from_ranges(analyzer.ranges_of(code_unit), code_unit)
+    }
+
+    pub fn location_name_ranges(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        code_unit: &CodeUnit,
+    ) -> Vec<Range> {
+        self.name_ranges_from_ranges(analyzer.location_ranges(code_unit), code_unit)
+    }
+
+    fn name_ranges_from_ranges(
+        &self,
+        declaration_ranges: Vec<Range>,
+        code_unit: &CodeUnit,
+    ) -> Vec<Range> {
         let Some(root) = self.root_node() else {
             return Vec::new();
         };
-        code_unit_declaration_name_ranges_in_tree(analyzer, &self.content, root, code_unit)
+        code_unit_declaration_name_ranges_in_tree(
+            &self.content,
+            root,
+            code_unit,
+            declaration_ranges,
+        )
     }
 }
 
@@ -87,18 +108,22 @@ fn code_unit_declaration_name_range_in_tree(
     root: Node<'_>,
     code_unit: &CodeUnit,
 ) -> Option<Range> {
-    code_unit_declaration_name_ranges_in_tree(analyzer, content, root, code_unit)
-        .into_iter()
-        .next()
+    code_unit_declaration_name_ranges_in_tree(
+        content,
+        root,
+        code_unit,
+        analyzer.ranges_of(code_unit),
+    )
+    .into_iter()
+    .next()
 }
 
 fn code_unit_declaration_name_ranges_in_tree(
-    analyzer: &dyn IAnalyzer,
     content: &str,
     root: Node<'_>,
     code_unit: &CodeUnit,
+    mut declaration_ranges: Vec<Range>,
 ) -> Vec<Range> {
-    let mut declaration_ranges = analyzer.ranges(code_unit).to_vec();
     declaration_ranges.sort_unstable();
     declaration_ranges.dedup();
 
@@ -116,13 +141,17 @@ pub(crate) fn code_unit_declaration_name_range_for_range(
     code_unit: &CodeUnit,
     declaration_range: Range,
 ) -> Option<Range> {
-    let declaration_node = node_for_exact_range(root, &declaration_range)
-        .or_else(|| node_for_smallest_containing_range(root, &declaration_range))?;
-    let name_node = declaration_name_node(
-        declaration_node,
-        declaration_source_identifier(code_unit),
-        content,
-    )?;
+    let identifier = declaration_source_identifier(code_unit);
+    let name_node = node_for_exact_range(root, &declaration_range)
+        .or_else(|| node_for_smallest_containing_range(root, &declaration_range))
+        .and_then(|declaration_node| declaration_name_node(declaration_node, identifier, content))
+        .or_else(|| {
+            // Persisted ranges can have byte offsets from a different line
+            // ending representation than the current source. Line spans are
+            // stable across LF and CRLF, so use the current AST to recover the
+            // declaration name when byte containment cannot do so.
+            declaration_name_node_for_line_range(root, &declaration_range, identifier, content)
+        })?;
     Some(if language_for_target(code_unit) == Language::Ruby {
         crate::analyzer::ruby::ruby_semantic_identifier_range(name_node, content)
     } else {
@@ -189,7 +218,60 @@ fn node_for_smallest_containing_range<'tree>(
     best
 }
 
-fn declaration_name_node<'tree>(
+fn declaration_name_node_for_line_range<'tree>(
+    root: Node<'tree>,
+    range: &Range,
+    identifier: &str,
+    content: &str,
+) -> Option<Node<'tree>> {
+    let mut best: Option<(usize, usize, usize, Node<'tree>)> = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if let Some(name_node) = declaration_name_node_from_fields(node, identifier, content) {
+            let line_distance = declaration_line_distance(node, range);
+            let span = node.end_byte().saturating_sub(node.start_byte());
+            let start_byte = node.start_byte();
+            let candidate = (line_distance, span, start_byte, name_node);
+            if best.is_none_or(|current| {
+                (candidate.0, candidate.1, candidate.2) < (current.0, current.1, current.2)
+            }) {
+                best = Some(candidate);
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    best.map(|(_, _, _, name_node)| name_node)
+}
+
+fn declaration_line_distance(node: Node<'_>, range: &Range) -> usize {
+    let start = node.start_position().row;
+    let end = node.end_position().row;
+    [
+        line_interval_distance(start, end, range.start_line, range.end_line),
+        line_interval_distance(start + 1, end + 1, range.start_line, range.end_line),
+    ]
+    .into_iter()
+    .min()
+    .expect("line distance candidates are non-empty")
+}
+
+fn line_interval_distance(
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> usize {
+    if left_end < right_start {
+        right_start.saturating_sub(left_end)
+    } else if right_end < left_start {
+        left_start.saturating_sub(right_end)
+    } else {
+        0
+    }
+}
+
+fn declaration_name_node_from_fields<'tree>(
     declaration_node: Node<'tree>,
     identifier: &str,
     content: &str,
@@ -209,16 +291,25 @@ fn declaration_name_node<'tree>(
                 stack.push(child);
             }
         }
-        // Some grammars wrap an assignment declaration in a fieldless statement
-        // node. Descend through that unambiguous wrapper so the assignment's
-        // structured `left` field wins over the whole-node text fallback.
+        // Some grammars wrap an assignment declaration in a fieldless
+        // statement node. Descend through that unambiguous wrapper so the
+        // assignment's structured `left` field wins over text matching.
         if node.named_child_count() == 1
             && let Some(child) = node.named_child(0)
         {
             stack.push(child);
         }
     }
-    matching_identifier_node(declaration_node, identifier, content)
+    None
+}
+
+fn declaration_name_node<'tree>(
+    declaration_node: Node<'tree>,
+    identifier: &str,
+    content: &str,
+) -> Option<Node<'tree>> {
+    declaration_name_node_from_fields(declaration_node, identifier, content)
+        .or_else(|| matching_identifier_node(declaration_node, identifier, content))
 }
 
 fn matching_identifier_node<'tree>(
@@ -300,5 +391,35 @@ mod tests {
 
             assert_eq!(name.start_byte(), source.find(identifier).unwrap());
         }
+    }
+
+    #[test]
+    fn declaration_name_recovers_when_persisted_bytes_use_lf() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, "A.java");
+        let lf_source =
+            "public class A {\n    String method2() {\n        return \"ok\";\n    }\n}\n";
+        let source = lf_source.replace('\n', "\r\n");
+        let tree = parse_tree_for_language(&file, Language::Java, &source).expect("java tree");
+        let unit = CodeUnit::new(file, crate::analyzer::CodeUnitType::Function, "", "method2");
+        let start_byte = lf_source.find("String method2").expect("method start");
+        let end_byte = lf_source.find("}\n}\n").expect("method end") + 2;
+        let name = code_unit_declaration_name_range_for_range(
+            &source,
+            tree.root_node(),
+            &unit,
+            Range {
+                // Model a persisted range whose byte offsets no longer fit
+                // the current source representation.
+                start_byte: source.len() + start_byte,
+                end_byte: source.len() + end_byte,
+                start_line: 2,
+                end_line: 4,
+            },
+        )
+        .expect("declaration name");
+
+        assert_eq!(&source[name.start_byte..name.end_byte], "method2");
     }
 }

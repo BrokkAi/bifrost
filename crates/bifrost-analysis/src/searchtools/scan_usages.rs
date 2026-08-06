@@ -1184,23 +1184,24 @@ pub(super) fn resolve_scan_usages_target(
         }
     };
 
-    // The byte offset computed below from `target.line`/`target.column` is
-    // matched against `analyzer.ranges_of(&unit)` further down, which is
-    // itself keyed to the analyzer's indexed snapshot — so the line/column
-    // must be interpreted against that same snapshot, not a fresh disk read,
-    // or the two coordinate systems could disagree on a just-edited file.
-    let source = match analyzer.indexed_source(&file) {
-        Some(source) => source,
-        None => {
-            return location_selector_failure(
-                &target,
-                "read_failed",
-                format!(
-                    "failed to read `{}`: not indexed by analyzer",
-                    rel_path_string(&file)
-                ),
-            );
-        }
+    // Location ranges use the current source projection. Read the same
+    // working-tree source for line and column conversion, then fall back to
+    // the indexed snapshot when the file is not readable.
+    let source = match analyzer.project().read_source(&file) {
+        Ok(source) => source,
+        Err(_) => match analyzer.indexed_source(&file) {
+            Some(source) => source,
+            None => {
+                return location_selector_failure(
+                    &target,
+                    "read_failed",
+                    format!(
+                        "failed to read `{}`: not indexed by analyzer",
+                        rel_path_string(&file)
+                    ),
+                );
+            }
+        },
     };
 
     if target.column == Some(0) {
@@ -1365,9 +1366,9 @@ pub(super) fn resolve_scan_usages_target(
                     let selector_matches =
                         selector_arg.is_some_and(|symbol| matches_selector(&unit, symbol));
                     let ranges = if selector_matches && unit.is_module() {
-                        analyzer.ranges_of(&unit)
+                        analyzer.location_ranges(&unit)
                     } else if selector_matches || selector_arg.is_none() {
-                        range_context.name_ranges(analyzer, &unit)
+                        range_context.location_name_ranges(analyzer, &unit)
                     } else {
                         return None;
                     };
@@ -1422,7 +1423,7 @@ pub(super) fn resolve_scan_usages_target(
     if matching_units.is_empty()
         && let Some(symbol) = selector
     {
-        let declarations = analyzer.declarations(&file);
+        let declarations = analyzer.location_declarations(&file);
         let lookup = AnalyzerDefinitionLookup::new(analyzer, language_for_file(&file));
         let lookup_only_candidates: Vec<CodeUnit> = lookup
             .fqn(symbol)
@@ -1569,7 +1570,7 @@ pub(super) fn scan_usages_location_diagnostic(
 
 pub(super) fn declarations_in_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Vec<CodeUnit> {
     let mut declarations: Vec<CodeUnit> = analyzer
-        .get_declarations(file)
+        .location_declarations(file)
         .into_iter()
         .filter(|unit| unit.source() == file)
         .collect();
