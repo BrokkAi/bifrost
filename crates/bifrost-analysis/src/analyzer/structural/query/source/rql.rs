@@ -651,6 +651,9 @@ fn validate_wrapper(
         | RqlForm::SegmentTarget
         | RqlForm::ReceiverOutcome
         | RqlForm::ReceiverEvidence
+        | RqlForm::CallShape
+        | RqlForm::CallArgumentGroups
+        | RqlForm::CallArguments
         | RqlForm::MemberSelection => {
             if args.len() != 1 {
                 analysis.error(

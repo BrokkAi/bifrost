@@ -152,6 +152,28 @@ pub enum CodeQueryResultRef {
         range: CodeQueryRange,
         evidence_kind: &'static str,
     },
+    CallShape {
+        id: String,
+        site_id: String,
+        path: String,
+        range: CodeQueryRange,
+        call_kind: &'static str,
+        coverage: &'static str,
+    },
+    CallArgumentGroup {
+        id: String,
+        site_id: String,
+        path: String,
+        range: CodeQueryRange,
+        kind: &'static str,
+    },
+    CallArgument {
+        id: String,
+        group_id: String,
+        path: String,
+        range: CodeQueryRange,
+        argument_index: usize,
+    },
     MemberSelection {
         id: String,
         site_ast_id: String,

@@ -426,6 +426,67 @@ service.run();
 }
 
 #[test]
+fn call_shape_rows_expose_ordered_groups_and_arguments() {
+    let source = r#"class Service { run(a: number, b: number) {} }
+export function caller(service: Service) { service.run(1, 2); }
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
+    file.write(source).expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let query = |steps: &[&str]| {
+        CodeQuery::from_json(&json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": steps.iter().map(|op| json!({ "op": op })).collect::<Vec<_>>(),
+            "result_detail": "full"
+        }))
+        .expect("call shape query")
+    };
+
+    let shape = execute(&analyzer, &query(&["call_shape"]));
+    let CodeQueryResultValue::CallShape { value: shape_row } = &shape.results[0].value else {
+        panic!("expected call shape row: {}", shape.render_text())
+    };
+    assert_eq!(shape_row.call_kind, "method");
+    assert_eq!(shape_row.coverage, "exact");
+    assert_eq!(shape_row.group_count, 1);
+    assert_eq!(shape_row.id, shape_row.site_id);
+    assert!(!shape_row.site_ast_id.is_empty());
+    assert!(shape_row.callee_range.is_some());
+
+    let groups = execute(&analyzer, &query(&["call_shape", "call_argument_groups"]));
+    let CodeQueryResultValue::CallArgumentGroup { value: group } = &groups.results[0].value else {
+        panic!("expected argument group row: {}", groups.render_text())
+    };
+    assert_eq!(group.site_id, shape_row.site_id);
+    assert_eq!(group.group_index, 0);
+    assert_eq!(group.kind, "ordinary");
+    assert_eq!(group.argument_count, 2);
+
+    let arguments = execute(
+        &analyzer,
+        &query(&["call_shape", "call_argument_groups", "call_arguments"]),
+    );
+    assert_eq!(arguments.results.len(), 2, "{}", arguments.render_text());
+    for (index, item) in arguments.results.iter().enumerate() {
+        let CodeQueryResultValue::CallArgument { value: argument } = &item.value else {
+            panic!("expected argument row: {}", arguments.render_text())
+        };
+        assert_eq!(argument.group_id, group.id);
+        assert_eq!(argument.site_id, shape_row.site_id);
+        assert_eq!(argument.argument_index, index);
+        assert!(!argument.spread);
+    }
+
+    let file_result = execute(&analyzer, &query(&["call_shape", "file_of"]));
+    assert!(matches!(
+        file_result.results[0].value,
+        CodeQueryResultValue::File { ref value } if value.path == "app.ts"
+    ));
+}
+
+#[test]
 fn receiver_evidence_rows_join_to_their_mandatory_outcome() {
     let source = r#"class Service { run() {} }
 export function caller(service: Service) { service.run(); }
