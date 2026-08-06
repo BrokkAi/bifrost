@@ -12,6 +12,7 @@
 pub mod extractor;
 pub mod hits;
 pub mod inverted;
+pub mod jvm_scala;
 pub mod resolver;
 pub mod return_type;
 

@@ -1,25 +1,27 @@
-use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, language_for_file, usage_hit};
-use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::usages::scala_graph::syntax::{
+use brokk_bifrost_core::analyzer::common::language_for_file;
+use brokk_bifrost_core::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
+use brokk_bifrost_core::analyzer::usages::model::UsageHit;
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile, Range};
+use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::hash::HashSet;
+use brokk_bifrost_core::text_utils::{
+    compute_line_starts, find_line_index_for_offset, snippet_around_line,
+};
+use std::collections::BTreeSet;
+use tree_sitter::{Node, Parser};
+
+use crate::java::graph::extractor::ScanState;
+use crate::java::graph::resolver::{TargetKind, TargetSpec};
+use crate::scala::graph::syntax::{
     call_site_shape_for_reference, has_ancestor_kind, is_identifier_node, is_type_like_reference,
     member_qualifier, member_qualifier_node, node_text, scala_import_path,
     scala_pattern_binder_names, stable_type_qualifier,
 };
-use crate::analyzer::{
-    CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile, Range, ScalaAnalyzer,
-    resolve_analyzer,
-};
-use crate::cancellation::CancellationToken;
-use crate::hash::HashSet;
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset, snippet_around_line};
-use brokk_bifrost_jvm::java::graph::extractor::ScanState;
-use brokk_bifrost_jvm::java::graph::resolver::{TargetKind, TargetSpec};
-use std::collections::BTreeSet;
-use tree_sitter::{Node, Parser};
+use crate::scala::graph_support::ScalaSource;
 
-pub(super) fn scan_scala_files_for_java_target(
-    analyzer: &dyn IAnalyzer,
+pub fn scan_scala_files_for_java_target(
+    owners: &dyn CodeUnitIndex,
+    scala: &dyn ScalaSource,
     candidate_files: &HashSet<ProjectFile>,
     spec: &TargetSpec,
     state: &mut ScanState<'_>,
@@ -28,9 +30,6 @@ pub(super) fn scan_scala_files_for_java_target(
     if *state.limit_exceeded || matches!(spec.kind, TargetKind::Constructor) {
         return;
     }
-    let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
-        return;
-    };
 
     for file in candidate_files
         .iter()
@@ -39,7 +38,7 @@ pub(super) fn scan_scala_files_for_java_target(
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             break;
         }
-        scan_scala_file(analyzer, scala, file, spec, state);
+        scan_scala_file(owners, scala, file, spec, state);
         if *state.limit_exceeded || cancellation.is_some_and(CancellationToken::is_cancelled) {
             break;
         }
@@ -47,8 +46,8 @@ pub(super) fn scan_scala_files_for_java_target(
 }
 
 fn scan_scala_file(
-    analyzer: &dyn IAnalyzer,
-    scala: &ScalaAnalyzer,
+    owners: &dyn CodeUnitIndex,
+    scala: &dyn ScalaSource,
     file: &ProjectFile,
     spec: &TargetSpec,
     state: &mut ScanState<'_>,
@@ -74,7 +73,7 @@ fn scan_scala_file(
 
     let mut parser = Parser::new();
     if parser
-        .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
+        .set_language(&crate::scala::language::LANGUAGE.into())
         .is_err()
     {
         return;
@@ -86,7 +85,7 @@ fn scan_scala_file(
     let line_starts = compute_line_starts(&source);
     let visibility = Visibility::for_file(scala, file, spec);
     let mut ctx = ScalaJavaScanCtx {
-        analyzer,
+        owners,
         scala,
         file,
         source: &source,
@@ -108,7 +107,7 @@ struct Visibility {
 }
 
 impl Visibility {
-    fn for_file(scala: &ScalaAnalyzer, file: &ProjectFile, spec: &TargetSpec) -> Self {
+    fn for_file(scala: &dyn ScalaSource, file: &ProjectFile, spec: &TargetSpec) -> Self {
         let target_package = spec.owner.package_name();
         let target_name = spec.owner.identifier();
         let target_fq_name = spec.owner.fq_name();
@@ -150,8 +149,8 @@ impl Visibility {
 }
 
 struct ScalaJavaScanCtx<'a, 'state> {
-    analyzer: &'a dyn IAnalyzer,
-    scala: &'a ScalaAnalyzer,
+    owners: &'a dyn CodeUnitIndex,
+    scala: &'a dyn ScalaSource,
     file: &'a ProjectFile,
     source: &'a str,
     line_starts: &'a [usize],
@@ -370,7 +369,7 @@ fn push_scala_hit(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
         end_line: find_line_index_for_offset(ctx.line_starts, node.end_byte()),
     };
     let Some(enclosing) = ctx
-        .analyzer
+        .owners
         .enclosing_code_unit(ctx.file, &range)
         .or_else(|| nearest_scala_declaration(ctx.scala, ctx.file))
     else {
@@ -386,16 +385,18 @@ fn push_scala_hit(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
         enclosing,
         snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
     ));
-    if crate::analyzer::usages::common::external_usage_hit_count(ctx.hits) > ctx.max_usages {
+    if brokk_bifrost_core::analyzer::usages::common::external_usage_hit_count(ctx.hits)
+        > ctx.max_usages
+    {
         *ctx.limit_exceeded = true;
     }
 }
 
-fn nearest_scala_declaration(scala: &ScalaAnalyzer, file: &ProjectFile) -> Option<CodeUnit> {
+fn nearest_scala_declaration(scala: &dyn ScalaSource, file: &ProjectFile) -> Option<CodeUnit> {
     scala.declarations(file).into_iter().next()
 }
 
-fn scala_file_package(scala: &ScalaAnalyzer, file: &ProjectFile) -> Option<String> {
+fn scala_file_package(scala: &dyn ScalaSource, file: &ProjectFile) -> Option<String> {
     scala
         .declarations(file)
         .into_iter()
