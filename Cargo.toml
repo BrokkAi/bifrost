@@ -194,7 +194,8 @@ default = []
 # Enabling this pulls in the brokk-bifrost-nlp crate. It deliberately does NOT
 # touch brokk-bifrost-analysis, so toggling semantic search never invalidates
 # the analysis crate's fingerprint.
-nlp = ["dep:brokk-bifrost-nlp", "brokk-bifrost-mcp/nlp"]
+# `brokk-bifrost-nlp/tokenizers` supplies the re-export that `embed_seq_probe` needs.
+nlp = ["dep:brokk-bifrost-nlp", "brokk-bifrost-nlp/tokenizers", "brokk-bifrost-mcp/nlp"]
 # Enables the pyo3-backed Python extension module (`bifrost_searchtools._native`).
 # Maturin turns this on automatically via pyproject.toml; the `bifrost` CLI
 # binary builds without it on every platform.
