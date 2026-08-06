@@ -13,8 +13,8 @@ use tree_sitter::{Node, Tree};
 
 use crate::imports::csharp_import_info_from_using_directive;
 use crate::syntax::{
-    csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver,
-    csharp_type_node_identity, csharp_type_reference_root,
+    csharp_attribute_type_names, csharp_constant_pattern_type_candidate,
+    csharp_member_access_type_receiver, csharp_type_node_identity, csharp_type_reference_root,
 };
 
 /// Whether `kind` is tree-sitter-c-sharp's identifier leaf kind. C# spells its
@@ -657,7 +657,7 @@ fn csharp_signature_metadata(
     source: &str,
     lexical_scope: &[String],
 ) -> SignatureMetadata {
-    let callable_arity = csharp_callable_arity(node);
+    let callable_arity = csharp_callable_arity(node, source);
     let type_parameters = csharp_method_type_parameters(node, source);
     let return_type = csharp_declared_type_node(node);
     let return_type_text = return_type
@@ -1032,7 +1032,7 @@ fn csharp_join_namespace(prefix: &str, path: &[String]) -> String {
     }
 }
 
-fn csharp_callable_arity(node: Node<'_>) -> CallableArity {
+fn csharp_callable_arity(node: Node<'_>, source: &str) -> CallableArity {
     let Some(parameters) = node.child_by_field_name("parameters") else {
         return CallableArity::exact(0);
     };
@@ -1047,7 +1047,8 @@ fn csharp_callable_arity(node: Node<'_>) -> CallableArity {
         let mut parameter_cursor = parameter.walk();
         let optional = parameter
             .children(&mut parameter_cursor)
-            .any(|child| child.kind() == "=");
+            .any(|child| child.kind() == "=")
+            || csharp_parameter_has_optional_attribute(parameter, source);
         if !optional {
             required += 1;
         }
@@ -1057,6 +1058,34 @@ fn csharp_callable_arity(node: Node<'_>) -> CallableArity {
         total += 1;
     }
     CallableArity::new(required, total, repeated)
+}
+
+fn csharp_parameter_has_optional_attribute(parameter: Node<'_>, source: &str) -> bool {
+    let mut stack = vec![parameter];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "attribute"
+            && let Some(name) = node.child_by_field_name("name")
+            && csharp_attribute_type_names(name, source)
+                .into_iter()
+                .any(|candidate| {
+                    let candidate = candidate.strip_prefix("global::").unwrap_or(&candidate);
+                    matches!(
+                        candidate,
+                        "Optional"
+                            | "OptionalAttribute"
+                            | "System.Runtime.InteropServices.Optional"
+                            | "System.Runtime.InteropServices.OptionalAttribute"
+                    )
+                })
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    false
 }
 
 fn csharp_parameter_list_has_params(parameters: Node<'_>) -> bool {
