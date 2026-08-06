@@ -4,11 +4,13 @@ use brokk_bifrost::{CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, Language, Pr
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+type LineColumnSet = BTreeSet<(usize, usize)>;
+
 fn usage_ranges(
     analyzer: &CppAnalyzer,
     target: &CodeUnit,
     caller: &ProjectFile,
-) -> (BTreeSet<(usize, usize)>, BTreeSet<(usize, usize)>) {
+) -> (LineColumnSet, LineColumnSet) {
     let provider =
         ExplicitCandidateProvider::new(Arc::new(std::iter::once(caller.clone()).collect()));
     let query = UsageFinder::new()
