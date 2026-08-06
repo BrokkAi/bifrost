@@ -2056,6 +2056,27 @@ impl AnalyzerStore {
         Ok(result)
     }
 
+    /// Read persisted declarations whose ranges enclose `range` in one file.
+    /// This is sufficient for owner lookup and avoids hydrating the file's
+    /// source and unrelated analyzer facts.
+    pub(crate) fn enclosing_declarations_for_range<A: LanguageAdapter>(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        adapter: &A,
+        file: &ProjectFile,
+        range: &Range,
+    ) -> Result<Option<Vec<(CodeUnit, Range)>>> {
+        let _scope = crate::profiling::scope("AnalyzerStore::enclosing_declarations_for_range");
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result = enclosing_declarations_for_range_conn(&tx, oid, lang, adapter, file, range)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// Read at most `limit` signature-metadata rows for one persisted code
     /// unit without hydrating the owning file state.
     ///
@@ -5288,6 +5309,76 @@ fn type_aliases_for_file_conn<A: LanguageAdapter>(
         ));
     }
     Ok(Some(aliases))
+}
+
+fn enclosing_declarations_for_range_conn<A: LanguageAdapter>(
+    conn: &Connection,
+    oid: Oid,
+    lang: &str,
+    adapter: &A,
+    file: &ProjectFile,
+    range: &Range,
+) -> Result<Option<Vec<(CodeUnit, Range)>>> {
+    if read_summary_projection_meta(conn, &oid.to_string(), lang)?.is_none() {
+        return Ok(None);
+    }
+    let sql = format!(
+        "SELECT units.unit_key, units.kind, units.content_qualifier, units.signature, units.synthetic,
+                units.fq_segments,
+                ranges.start_byte, ranges.end_byte, ranges.start_line, ranges.end_line
+         FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+         JOIN unit_ranges AS ranges
+           ON ranges.blob_oid = units.blob_oid
+          AND ranges.lang = units.lang
+          AND ranges.unit_key = units.unit_key
+         WHERE units.blob_oid = ?1 AND units.lang = ?2 AND units.in_declarations = 1
+           AND ranges.start_byte <= ?3 AND ranges.end_byte >= ?4
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+         ORDER BY units.unit_key, ranges.ordinal"
+    );
+    let oid = oid.to_string();
+    let start_byte = i64::try_from(range.start_byte)
+        .map_err(|_| StoreError::new("range start byte exceeds SQLite integer range"))?;
+    let end_byte = i64::try_from(range.end_byte)
+        .map_err(|_| StoreError::new("range end byte exceeds SQLite integer range"))?;
+    let mut statement = conn.prepare_cached(&sql)?;
+    let mut rows = statement.query(params![oid, lang, start_byte, end_byte])?;
+    let mut declarations = Vec::new();
+    let mut previous_unit_key = None;
+    while let Some(row) = rows.next()? {
+        let unit_key = row.get::<_, i64>(0)?;
+        if previous_unit_key == Some(unit_key) {
+            continue;
+        }
+        previous_unit_key = Some(unit_key);
+        let kind = code_unit_kind_from_i64(row.get(1)?)?;
+        let content_qualifier = row.get::<_, String>(2)?;
+        let signature = row.get::<_, Option<String>>(3)?;
+        let synthetic = row.get::<_, i64>(4)? != 0;
+        let fq_segments = row.get::<_, Option<Vec<u8>>>(5)?;
+        let range = Range {
+            start_byte: i64_to_usize(row.get(6)?)?,
+            end_byte: i64_to_usize(row.get(7)?)?,
+            start_line: i64_to_usize(row.get(8)?)?,
+            end_line: i64_to_usize(row.get(9)?)?,
+        };
+        let (fq_name, package_segment_count) =
+            hydrate_unit_fq(adapter, fq_segments.as_deref(), &content_qualifier, file)?;
+        declarations.push((
+            CodeUnit::from_fq(
+                file.clone(),
+                kind,
+                fq_name,
+                package_segment_count,
+                signature,
+                synthetic,
+            ),
+            range,
+        ));
+    }
+    Ok(Some(declarations))
 }
 
 fn hydrate_file_states_conn<A: LanguageAdapter>(

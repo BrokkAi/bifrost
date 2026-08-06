@@ -21,6 +21,7 @@ C++ navigation must render a canonical selector without loading every stored fac
 - [x] Reuse same-name function range groups while rendering broad source results.
 - [x] Skip C++ field-linkage checks for sources already in a root's include closure.
 - [x] Read C++ type-alias facts without hydrating a complete FileState.
+- [x] Read enclosing declaration facts without hydrating a complete FileState.
 - [ ] Run the required policy check after MCP tool registration is repaired.
 
 ## Surprises & Discoveries
@@ -61,6 +62,10 @@ C++ navigation must render a canonical selector without loading every stored fac
   Evidence: The post-change sample attributes 522 samples to `TreeSitterAnalyzer::is_type_alias`, through `fetch_file_state` and `AnalyzerStore::hydrate_file_state_with_source`.
 - Observation: A persisted alias-unit projection removes that hydration path.
   Evidence: The new test checks 1,025 C++ aliases, one above the source-snapshot capacity, with zero full hydrations.
+- Observation: The next slow definition probe hydrates FileState values to find each enclosing lexical owner.
+  Evidence: The post-alias sample attributes 719 `fetch_file_state_for_key_with_source` calls to `enclosing_code_unit` through `resolve_cpp_type_without_focused_qualifier`.
+- Observation: A direct declaration-range projection removes this owner lookup hydration.
+  Evidence: The new test checks 1,025 C++ methods, one above the source-snapshot capacity, and returns each exact owner with zero full hydrations.
 
 ## Decision Log
 
@@ -70,18 +75,21 @@ C++ navigation must render a canonical selector without loading every stored fac
 - Decision: Retain only persisted type-alias units, keyed by content OID and path.
   Rationale: Alias checks need a small fact set. A byte-bounded projection avoids source and side-table retention while keeping warm requests fast.
   Date/Author: 2026-08-06 / Codex
+- Decision: Query stored declaration ranges before full state hydration for owner lookup.
+  Rationale: Persisted declarations include the identity and ordered ranges needed for the existing smallest-enclosing selection. Empty or unavailable projections retain the full-state fallback for file scope and incomplete storage.
+  Date/Author: 2026-08-06 / Codex
 
 ## Outcomes & Retrospective
 
 The selector path no longer needs full FileState hydration when persisted rows are complete. The dedicated test proves this behavior. Persisted global-field linkage also prevents a visibility-build parse. C++ include reachability now retains bounded answers across visibility indexes. Request-local metadata reads reuse the FileState already hydrated by the visibility build. The Phalcon navigation part now completes before `get_symbol_sources`. Broad source lookup now stops at the response limit and reuses same-name range groups. This cuts the rejected `PHP_METHOD` source probes from about 40 seconds to about 6.5 seconds.
 
-Focused validation passed: `cargo fmt --check`, the persisted selector test, the six issue-1092 C++ identity tests, the global-field linkage regression, and `cargo clippy -p brokk-bifrost-analysis --all-targets -- -D warnings`. The policy skill is installed, but `list_policies` and `run_policy` are not registered in this task. The required policy result is therefore unavailable.
+Focused validation passed: `cargo fmt --check`, the persisted selector and alias tests, the enclosing-owner projection test, the six issue-1092 C++ identity tests, the global-field linkage regression, and `cargo clippy -p brokk-bifrost-analysis -p brokk-bifrost-cpp --all-targets -- -D warnings`. The policy skill is installed, but `list_policies` and `run_policy` are not registered in this task. The required policy result is therefore unavailable.
 
 ## Context and Orientation
 
 `crates/bifrost-analysis/src/searchtools/selectors.rs` builds the selectors that navigation tools return. C++ callables need a signature label, a declaration or definition role, linkage, a primary range, and include evidence. The old path reads these values through `IAnalyzer`. A persisted C++ file can then load its complete `FileState`.
 
-`crates/bifrost-analysis/src/analyzer/tree_sitter_analyzer.rs` has bounded direct reads for signature metadata and ranges. `crates/bifrost-analysis/src/analyzer/cpp/identity.rs` reads a source file's include lines when it checks a header and implementation pair.
+`crates/bifrost-analysis/src/analyzer/tree_sitter_analyzer.rs` has bounded direct reads for signature metadata and ranges. It now uses stored declarations and ordered ranges for a smallest-enclosing owner query. `crates/bifrost-analysis/src/analyzer/cpp/identity.rs` reads a source file's include lines when it checks a header and implementation pair.
 
 ## Plan of Work
 

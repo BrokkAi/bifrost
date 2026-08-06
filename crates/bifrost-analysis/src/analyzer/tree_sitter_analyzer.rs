@@ -7794,28 +7794,43 @@ where
             return None;
         }
 
-        self.fetch_file_state(file)?
-            .declarations
-            .iter()
-            .cloned()
-            .filter_map(|code_unit| {
-                let best_range = self
-                    .ranges(&code_unit)
+        let oid = self.resolve_live_oid_for_file(file)?;
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.state.dirty_file_state(&key) {
+            return enclosing_code_unit_from_state(&state, range);
+        }
+        if let Some(state) = self.source_snapshot_file_state(file) {
+            return enclosing_code_unit_from_state(&state, range);
+        }
+        if let Some(state) = self.query_file_state_snapshot(&key) {
+            return enclosing_code_unit_from_state(&state, range);
+        }
+
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        if let Some(candidates) = self
+            .store_query_or_record(
+                self.store_context.store.enclosing_declarations_for_range(
+                    oid,
+                    &storage_key,
+                    self.store_context.generations[&storage_key],
+                    self.adapter.as_ref(),
+                    file,
+                    range,
+                ),
+                format!("querying enclosing declarations for `{file}`"),
+            )
+            .flatten()
+            .filter(|candidates| !candidates.is_empty())
+        {
+            return select_enclosing_code_unit(
+                candidates
                     .into_iter()
-                    .find(|candidate| candidate.contains(range))?;
-                Some((best_range.end_byte - best_range.start_byte, code_unit))
-            })
-            .min_by(|(left_span, left), (right_span, right)| {
-                left_span
-                    .cmp(right_span)
-                    .then_with(|| {
-                        enclosing_code_unit_rank(left).cmp(&enclosing_code_unit_rank(right))
-                    })
-                    .then_with(|| left.fq_name().cmp(&right.fq_name()))
-                    .then_with(|| left.kind().cmp(&right.kind()))
-                    .then_with(|| left.source().rel_path().cmp(right.source().rel_path()))
-            })
-            .map(|(_, code_unit)| code_unit)
+                    .map(|(code_unit, candidate_range)| (candidate_range, code_unit)),
+            );
+        }
+
+        self.fetch_file_state(file)
+            .and_then(|state| enclosing_code_unit_from_state(&state, range))
     }
 
     fn enclosing_code_unit_for_lines(
@@ -8529,6 +8544,35 @@ fn literal_ascii_search_substring(pattern: &str) -> Option<&str> {
 
 fn enclosing_code_unit_rank(code_unit: &CodeUnit) -> usize {
     if code_unit.is_file_scope() { 1 } else { 0 }
+}
+
+fn select_enclosing_code_unit(
+    candidates: impl IntoIterator<Item = (Range, CodeUnit)>,
+) -> Option<CodeUnit> {
+    candidates
+        .into_iter()
+        .min_by(|(left_range, left), (right_range, right)| {
+            (left_range.end_byte - left_range.start_byte)
+                .cmp(&(right_range.end_byte - right_range.start_byte))
+                .then_with(|| enclosing_code_unit_rank(left).cmp(&enclosing_code_unit_rank(right)))
+                .then_with(|| left.fq_name().cmp(&right.fq_name()))
+                .then_with(|| left.kind().cmp(&right.kind()))
+                .then_with(|| left.source().rel_path().cmp(right.source().rel_path()))
+        })
+        .map(|(_, code_unit)| code_unit)
+}
+
+fn enclosing_code_unit_from_state(state: &FileState, range: &Range) -> Option<CodeUnit> {
+    select_enclosing_code_unit(state.declarations.iter().cloned().filter_map(|code_unit| {
+        let best_range = state
+            .ranges
+            .get(&code_unit)
+            .into_iter()
+            .flatten()
+            .copied()
+            .find(|candidate| candidate.contains(range))?;
+        Some((best_range, code_unit))
+    }))
 }
 
 #[cfg(test)]
@@ -9947,6 +9991,50 @@ mod tests {
             analyzer.full_hydration_count_for_test(),
             0,
             "persisted type-alias checks must not hydrate a FileState"
+        );
+    }
+
+    #[test]
+    fn enclosing_declaration_projection_avoids_full_file_hydration() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        for index in 0..=SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY {
+            std::fs::write(
+                root.join(format!("src/Owner{index}.cpp")),
+                format!(
+                    "namespace demo {{ struct Owner{index} {{ int method{index}() {{ return {index}; }} }}; }}\n"
+                ),
+            )
+            .expect("write C++ source");
+        }
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let analyzer = TreeSitterAnalyzer::new(project, CppAdapter);
+        let methods = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .filter(|unit| unit.identifier().starts_with("method"))
+            .collect::<Vec<_>>();
+        assert_eq!(methods.len(), SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY + 1);
+
+        analyzer.reset_full_hydration_count_for_test();
+        for method in methods {
+            let file = method.source().clone();
+            let source = std::fs::read_to_string(file.abs_path()).expect("C++ source");
+            let start_byte = source.find("return").expect("return statement");
+            let range = Range {
+                start_byte,
+                end_byte: start_byte + "return".len(),
+                start_line: 0,
+                end_line: 0,
+            };
+            assert_eq!(analyzer.enclosing_code_unit(&file, &range), Some(method));
+        }
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            0,
+            "persisted owner lookup must not hydrate a FileState"
         );
     }
 
