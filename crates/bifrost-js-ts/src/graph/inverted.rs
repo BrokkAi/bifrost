@@ -20,194 +20,203 @@
 use super::extractor::rightmost_jsx_identifier;
 use super::receiver_analysis::JsTsReceiverFactProvider;
 use super::resolver::{
-    JsTsUsageIndex, browser_global_property_shape, collect_jsts_files, tree_sitter_language_for,
-    unbound_browser_global_property,
+    JsTsUsageIndex, browser_global_property_shape, unbound_browser_global_property,
 };
-use crate::analyzer::js_ts::providers::resolve_js_ts_host;
-use crate::analyzer::js_ts::syntax::{
+use crate::providers::JsTsAnalyzerHost;
+use crate::syntax::{
     JsTsLexicalBindingIndex, compute_import_binder, is_declaration_identifier,
     is_lexically_nested_type_declaration, is_object_in_member_expression,
     is_property_key_in_member, nested_type_identifier_parts, slice,
 };
-use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
-use crate::analyzer::usages::inverted_edges::{
-    FileEdgeScanInput, JsTsScopedNodeStatus, JsTsScopedUsageEdges, PerFileEdges,
-    UsageEdgeBuildOutput, UsageEdgeWeights, UsageNodeKey, build_edge_output, build_edge_weights,
-    classify_reference_node, collect_file_edges, parse_and_collect,
+use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    FileEdgeScanInput, JsTsScopedNodeStatus, PerFileEdges, UsageNodeKey, classify_reference_node,
 };
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::model::{ExportEntry, ImportKind};
-use crate::analyzer::usages::parsed_tree::{
-    js_ts_tree_sitter_language_for_file, parse_tree_sitter_file,
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
 };
-use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
-use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ImportKind};
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
+    ReceiverAnalysisBudget, ReceiverAnalysisOutcome,
+};
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
 
 /// Build every JS/TS `caller -> callee` edge in one parse-on-demand pass over the
 /// workspace files, using the shared [`build_edges`] driver for all the
 /// language-agnostic accounting.
-pub(super) fn build_jsts_edges<Output, F>(
-    analyzer: &dyn IAnalyzer,
+/// The per-file half of the non-scoped inverted scan.
+///
+/// The parallel fan-out over files -- `build_edge_output` / `parse_and_collect`
+/// and the per-callee cap, dedup and merge behind them -- stays in
+/// `brokk-bifrost-analysis`, which drives this per file. `declarations_index` is
+/// the *dispatching* analyzer (a `MultiAnalyzer` in a mixed workspace) so the
+/// file's declaration set is the same one the pre-extraction scan read; `host`
+/// is the JS/TS analyzer for `language`.
+pub fn scan_file(
+    host: &dyn JsTsAnalyzerHost,
+    declarations_index: &dyn CodeUnitIndex,
     language: Language,
+    file: &ProjectFile,
     nodes: &HashSet<String>,
-    keep_file: F,
-) -> Output
-where
-    Output: UsageEdgeBuildOutput<String> + Default,
-    F: Fn(&ProjectFile) -> bool + Sync,
-{
-    if tree_sitter_language_for(language).is_none() {
-        return Output::default();
-    }
-    let _index = super::cached_jsts_index(analyzer, language, None);
-    // Resolved once for the whole scan; the per-file receiver provider is on the
-    // JS/TS host. No analyzer for `language` means no JS/TS files to scan either.
-    let Some(host) = resolve_js_ts_host(analyzer, language) else {
-        return Output::default();
-    };
-    let files = collect_jsts_files(analyzer, language);
-    build_edge_output(&files, keep_file, |file| {
-        // The non-scoped scan needs only the file's own tree for its main binder +
-        // declaration pass. Receiver analysis can consult the analyzer-cached
-        // resolution index, so it is pre-materialized before this parallel scan.
-        let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
-        parse_and_collect(analyzer, file, nodes, &parser_language, |input| {
-            let source = input.source;
+    input: &FileEdgeScanInput<'_>,
+) -> PerFileEdges {
+    let source = input.source;
 
-            // Per-file resolution context: which bare names resolve to which
-            // exported name, and which locals are namespace imports.
-            let binder = compute_import_binder(source, input.tree);
-            let mut named_imports: HashMap<String, String> = HashMap::default();
-            let mut namespace_locals: HashSet<String> = HashSet::default();
-            for (local, binding) in binder.all_bindings() {
-                match binding.kind {
-                    ImportKind::Named => {
-                        named_imports.insert(
-                            local.to_string(),
-                            binding
-                                .imported_name
-                                .clone()
-                                .unwrap_or_else(|| local.to_string()),
-                        );
-                    }
-                    ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => {
-                        namespace_locals.insert(local.to_string());
-                    }
-                    // Default imports need the target module's default-export name.
-                    ImportKind::Default => {}
-                }
+    // Per-file resolution context: which bare names resolve to which
+    // exported name, and which locals are namespace imports.
+    let binder = compute_import_binder(source, input.tree);
+    let mut named_imports: HashMap<String, String> = HashMap::default();
+    let mut namespace_locals: HashSet<String> = HashSet::default();
+    for (local, binding) in binder.all_bindings() {
+        match binding.kind {
+            ImportKind::Named => {
+                named_imports.insert(
+                    local.to_string(),
+                    binding
+                        .imported_name
+                        .clone()
+                        .unwrap_or_else(|| local.to_string()),
+                );
             }
-            let declarations = analyzer.declarations(file);
-            let (same_file, browser_globals, lexical_bindings) =
-                file_declaration_names(analyzer, language, &declarations, input.root(), source);
+            ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => {
+                namespace_locals.insert(local.to_string());
+            }
+            // Default imports need the target module's default-export name.
+            ImportKind::Default => {}
+        }
+    }
+    let declarations = declarations_index.declarations(file);
+    let (same_file, browser_globals, lexical_bindings) = file_declaration_names(
+        declarations_index,
+        language,
+        &declarations,
+        input.root(),
+        source,
+    );
 
-            let definitions = analyzer.global_usage_definition_index();
-            let mut ctx = TsScan {
-                source,
-                receiver_provider: JsTsReceiverFactProvider::new(
-                    host,
-                    &definitions,
-                    language,
-                    file,
-                    source,
-                    input.root(),
-                    binder.clone(),
-                ),
-                named_imports,
-                namespace_locals,
-                same_file,
-                browser_globals,
-                lexical_bindings,
-                type_shadow_scopes: vec![HashSet::default()],
-                nodes,
-                input,
-                edges: PerFileEdges::default(),
-            };
-            let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            scan_node(input.root(), &mut ctx, &mut locals);
-            ctx.edges
-        })
-    })
+    let mut ctx = TsScan {
+        source,
+        receiver_provider: JsTsReceiverFactProvider::new(
+            host,
+            host.usage_definitions(),
+            language,
+            file,
+            source,
+            input.root(),
+            binder.clone(),
+        ),
+        named_imports,
+        namespace_locals,
+        same_file,
+        browser_globals,
+        lexical_bindings,
+        type_shadow_scopes: vec![HashSet::default()],
+        nodes,
+        input,
+        edges: PerFileEdges::default(),
+    };
+    let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    scan_node(input.root(), &mut ctx, &mut locals);
+    ctx.edges
 }
 
-pub(super) fn build_jsts_scoped_edges<F>(
-    analyzer: &dyn IAnalyzer,
+/// The workspace-wide state a scoped scan resolves through, built once before
+/// the per-file fan-out.
+pub struct ScopedScanPrep {
+    declarations: HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
+    imports_by_file: HashMap<ProjectFile, ScopedImportBindings>,
+    /// Whether each requested node is resolvable, ambiguous, or unseedable.
+    pub node_status: BTreeMap<UsageNodeKey, JsTsScopedNodeStatus>,
+}
+
+/// Build the scoped scan's workspace state: the file+name declaration map, each
+/// requested node's status, and the per-file scoped import bindings.
+///
+/// `declarations_index` must span both dialects -- a scoped edge set merges
+/// TypeScript and JavaScript, and a JS file can import a name a TS file
+/// declares.
+pub fn prepare_scoped_scan(
+    declarations_index: &dyn CodeUnitIndex,
     index: &JsTsUsageIndex,
-    language: Language,
     nodes: &HashSet<UsageNodeKey>,
-    keep_file: F,
-) -> JsTsScopedUsageEdges
-where
-    F: Fn(&ProjectFile) -> bool + Sync,
-{
-    if tree_sitter_language_for(language).is_none() {
-        return JsTsScopedUsageEdges {
-            edges: UsageEdgeWeights::default(),
-            node_status: BTreeMap::new(),
-        };
-    }
-    // Resolved once for the whole scan; see `build_jsts_edges` above.
-    let Some(host) = resolve_js_ts_host(analyzer, language) else {
-        return JsTsScopedUsageEdges {
-            edges: UsageEdgeWeights::default(),
-            node_status: BTreeMap::new(),
-        };
-    };
-    let files = collect_jsts_files(analyzer, language);
-    let declarations = scoped_declarations_by_file_and_name(analyzer);
+) -> ScopedScanPrep {
+    let declarations = scoped_declarations_by_file_and_name(declarations_index);
     let node_status = scoped_node_status(index, nodes, &declarations);
     let imports_by_file = scoped_import_bindings_by_file(index, &declarations);
-    let edges = build_edge_weights(&files, keep_file, |file| {
-        // Parse on demand and drop the tree when this closure returns; cross-file
-        // resolution comes from the analyzer-cached `index`, not retained trees.
-        let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
-        let parsed = parse_tree_sitter_file(file, &parser_language)?;
-        let imports = imports_by_file.get(file).cloned().unwrap_or_default();
-        let (same_file, browser_globals, lexical_bindings) = scoped_same_file_declarations(
-            analyzer,
-            file,
+    ScopedScanPrep {
+        declarations,
+        imports_by_file,
+        node_status,
+    }
+}
+
+/// The per-file state a scoped scan needs, derived from the file's own tree.
+pub struct ScopedFilePrep {
+    imports: ScopedImportBindings,
+    same_file: HashMap<String, UsageNodeKey>,
+    browser_globals: HashMap<String, UsageNodeKey>,
+    lexical_bindings: Option<JsTsLexicalBindingIndex>,
+}
+
+/// Derive the per-file scoped scan state for `file` from its parsed tree.
+pub fn prepare_scoped_file(
+    prep: &ScopedScanPrep,
+    declarations_index: &dyn CodeUnitIndex,
+    file: &ProjectFile,
+    language: Language,
+    root: Node<'_>,
+    source: &str,
+) -> ScopedFilePrep {
+    let imports = prep.imports_by_file.get(file).cloned().unwrap_or_default();
+    let (same_file, browser_globals, lexical_bindings) =
+        scoped_same_file_declarations(declarations_index, file, language, root, source);
+    ScopedFilePrep {
+        imports,
+        same_file,
+        browser_globals,
+        lexical_bindings,
+    }
+}
+
+/// The per-file half of the scoped inverted scan. As with [`scan_file`], the
+/// fan-out stays on the analysis side.
+#[allow(clippy::too_many_arguments)]
+pub fn scan_scoped_file(
+    host: &dyn JsTsAnalyzerHost,
+    index: &JsTsUsageIndex,
+    prep: &ScopedScanPrep,
+    file_prep: ScopedFilePrep,
+    language: Language,
+    file: &ProjectFile,
+    input: &FileEdgeScanInput<'_, UsageNodeKey>,
+) -> PerFileEdges<UsageNodeKey> {
+    let mut ctx = ScopedTsScan {
+        source: input.source,
+        receiver_provider: JsTsReceiverFactProvider::new(
+            host,
+            host.usage_definitions(),
             language,
-            parsed.tree.root_node(),
-            parsed.source.as_str(),
-        );
-        Some(collect_file_edges(
-            analyzer,
             file,
-            nodes,
-            &parsed,
-            |input| {
-                let definitions = analyzer.global_usage_definition_index();
-                let mut ctx = ScopedTsScan {
-                    source: input.source,
-                    receiver_provider: JsTsReceiverFactProvider::new(
-                        host,
-                        &definitions,
-                        language,
-                        file,
-                        input.source,
-                        input.root(),
-                        compute_import_binder(input.source, input.tree),
-                    ),
-                    index,
-                    declarations: &declarations,
-                    imports,
-                    same_file,
-                    browser_globals,
-                    lexical_bindings,
-                    type_shadow_scopes: vec![HashSet::default()],
-                    input,
-                    edges: PerFileEdges::default(),
-                };
-                let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
-                scan_scoped_node(input.root(), &mut ctx, &mut locals);
-                ctx.edges
-            },
-        ))
-    });
-    JsTsScopedUsageEdges { edges, node_status }
+            input.source,
+            input.root(),
+            compute_import_binder(input.source, input.tree),
+        ),
+        index,
+        declarations: &prep.declarations,
+        imports: file_prep.imports,
+        same_file: file_prep.same_file,
+        browser_globals: file_prep.browser_globals,
+        lexical_bindings: file_prep.lexical_bindings,
+        type_shadow_scopes: vec![HashSet::default()],
+        input,
+        edges: PerFileEdges::default(),
+    };
+    let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    scan_scoped_node(input.root(), &mut ctx, &mut locals);
+    ctx.edges
 }
 
 #[derive(Clone, Default)]
@@ -374,12 +383,12 @@ impl TsScan<'_> {
 }
 
 fn scoped_declarations_by_file_and_name(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
 ) -> HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>> {
     let mut out: HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>> = HashMap::default();
     for declaration in analyzer.all_declarations().filter(|unit| {
         matches!(
-            crate::analyzer::common::language_for_file(unit.source()),
+            brokk_bifrost_core::analyzer::common::language_for_file(unit.source()),
             Language::JavaScript | Language::TypeScript
         )
     }) {
@@ -397,7 +406,7 @@ fn scoped_declarations_by_file_and_name(
 }
 
 fn scoped_same_file_declarations(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     file: &ProjectFile,
     language: Language,
     root: Node<'_>,
@@ -410,7 +419,9 @@ fn scoped_same_file_declarations(
     let declarations: BTreeSet<_> = analyzer
         .declarations(file)
         .into_iter()
-        .filter(|unit| crate::analyzer::common::language_for_file(unit.source()) == language)
+        .filter(|unit| {
+            brokk_bifrost_core::analyzer::common::language_for_file(unit.source()) == language
+        })
         .collect();
     let mut grouped: HashMap<String, BTreeSet<UsageNodeKey>> = HashMap::default();
     for declaration in &declarations {
@@ -434,7 +445,7 @@ fn scoped_same_file_declarations(
 }
 
 fn file_declaration_names(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     language: Language,
     declarations: &BTreeSet<CodeUnit>,
     root: Node<'_>,
@@ -454,7 +465,7 @@ fn file_declaration_names(
 }
 
 fn browser_global_declarations(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     language: Language,
     declarations: &BTreeSet<CodeUnit>,
     root: Node<'_>,
@@ -510,7 +521,7 @@ fn scoped_import_bindings_by_file(
     for edges in index.importer_reverse.values() {
         for edge in edges {
             match &edge.kind {
-                crate::analyzer::usages::ImportEdgeKind::Named(name) => {
+                brokk_bifrost_core::analyzer::usages::ImportEdgeKind::Named(name) => {
                     let keys = canonical_export_keys(index, declarations, &edge.target_file, name);
                     grouped_named
                         .entry(edge.importer.clone())
@@ -519,7 +530,7 @@ fn scoped_import_bindings_by_file(
                         .or_default()
                         .extend(keys);
                 }
-                crate::analyzer::usages::ImportEdgeKind::Default => {
+                brokk_bifrost_core::analyzer::usages::ImportEdgeKind::Default => {
                     let keys =
                         canonical_export_keys(index, declarations, &edge.target_file, "default");
                     grouped_named
@@ -529,8 +540,8 @@ fn scoped_import_bindings_by_file(
                         .or_default()
                         .extend(keys);
                 }
-                crate::analyzer::usages::ImportEdgeKind::Namespace
-                | crate::analyzer::usages::ImportEdgeKind::CommonJsRequire(_) => {
+                brokk_bifrost_core::analyzer::usages::ImportEdgeKind::Namespace
+                | brokk_bifrost_core::analyzer::usages::ImportEdgeKind::CommonJsRequire(_) => {
                     grouped_namespace
                         .entry(edge.importer.clone())
                         .or_default()

@@ -16,9 +16,9 @@
 //! `baseUrl` is absent), longest matching prefix wins, and a pattern may map to several
 //! roots tried in order.
 
-use crate::analyzer::ProjectFile;
-use crate::hash::HashMap;
-use crate::path_normalization::NormalizePath;
+use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::hash::HashMap;
+use brokk_bifrost_core::path_normalization::NormalizePath;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -38,7 +38,7 @@ const MAX_CONFIG_READS: u32 = 256;
 /// Resolves alias specifiers for one repository root, caching parsed configs so the
 /// hot import-resolution loop parses each `tsconfig.json` at most once. Cheap to
 /// construct (`new` just stores the root); all filesystem work is lazy.
-pub(crate) struct AliasResolver {
+pub struct AliasResolver {
     root: PathBuf,
     /// Symlink-resolved `root`, used to contain `extends` targets to the repo. Falls back
     /// to `root` when canonicalization fails (e.g. the root was deleted out from under us).
@@ -78,7 +78,7 @@ enum Pattern {
 }
 
 impl AliasResolver {
-    pub(crate) fn new(root: impl Into<PathBuf>) -> Self {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
         Self {
@@ -93,11 +93,7 @@ impl AliasResolver {
     /// `specifier` imported from `source_file`, in TS precedence order. Empty when the
     /// specifier matches no alias. Extension/index resolution is left to the caller so a
     /// single source of truth (`collect_candidate_paths`) decides what exists on disk.
-    pub(crate) fn candidate_bases(
-        &self,
-        source_file: &ProjectFile,
-        specifier: &str,
-    ) -> Vec<PathBuf> {
+    pub fn candidate_bases(&self, source_file: &ProjectFile, specifier: &str) -> Vec<PathBuf> {
         let Some(config_path) = self.nearest_config(source_file) else {
             return Vec::new();
         };

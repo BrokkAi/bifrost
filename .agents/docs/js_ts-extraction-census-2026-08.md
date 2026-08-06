@@ -428,3 +428,55 @@ js_ts sits in the fleet's low band — a third of C++'s and half the JVM's. Four
 Two facts shape the schedule. First, **the hottest files are the two declaration walks, which are also the cleanest (a)-class movers** — 3,527 LOC of free functions with no analyzer coupling, so they can be lifted in a single low-risk pass but must not be held across days. The brief's note that upstream nlp-ft work touches js_ts semantic actively is consistent with `js_ts/semantic/control.rs` (2 commits, 2026-08-01) sitting in the parked band, where it never has to be held at all. Second, the graph band (6,743 LOC, 10 commits in four weeks across five files) is a single body that must move together and is gated on three independent lowerings (§3.1, §3.3, §3.5); those are cheap in LOC but sequential.
 
 Lowest-churn seam files, safe to move first: `js_ts_graph.rs` (1 commit, 2026-07-29), `js_ts/providers.rs` (1, 2026-07-29), `js_ts/cache.rs` (1, 2026-07-29), `js_ts/{clones,identifiers}.rs` (0 in four weeks), `js_ts_graph/hits.rs`, `js_ts/hierarchy.rs` (2), `js_ts/tsconfig.rs` (2), `js_ts/imports.rs` (2).
+
+---
+
+## Executed 2026-08-06 by Js-2
+
+`crates/bifrost-js-ts` (package `brokk-bifrost-js-ts`) exists and holds both
+dialects. Actual numbers against the projection in section 6:
+
+| Band | Projected | Actual |
+|---|---:|---:|
+| Moved (crate `src/`, prod + travelling tests) | ~15,186 + ~1,063 | **17,179** |
+| Analysis production shim (`js_ts/` non-parked + both analyzer mods + `js_ts_graph.rs`) | ~1,970 | **2,306** |
+| Parked, unchanged | 11,132 | `external.rs` 1,996 + `semantic/` 4,322 + the two 7-LOC stubs + `get_definition/js_ts.rs` 2,373 + `get_type/js_ts.rs` 771 |
+| `.scm` assets | 440 | 440, now `crates/bifrost-js-ts/resources/` |
+
+The shim floor came in ~17 % above projection for three reasons the census did
+not price, each a *correction* to a projected move rather than new code:
+
+1. **`js_ts/providers.rs` split rather than moved.** The census read
+   `JsTsAnalyzerHost` as ready to cross whole, but `memo_caches() -> &JsTsMemoCaches`
+   names the moka bucket, and moka is deliberately not a crate dependency. The
+   landed Go/Java/C# shape applies: the get-then-insert wrappers stay
+   (`analyzer/js_ts/providers.rs`, 264 LOC over a new `JsTsMemoHost` supertrait)
+   and call the crate for the uncached work. The trait therefore exposes
+   *products*: `js_ts_usage_index` replaced `memo_caches`, and `usage_definitions`
+   landed as planned.
+2. **`js_ts_graph/inverted.rs`'s two drivers stayed.** `build_edge_output`,
+   `build_edge_weights`, `parse_and_collect` and `collect_file_edges` are
+   analysis-owned (`usages/inverted_edges.rs`), so the fan-out stays and the crate
+   exposes `scan_file` / `scan_scoped_file` per file -- the `cpp_graph/shared.rs`
+   shape exactly.
+3. **Two analyzer-bound in-file test modules came back**, as C++'s and Python's
+   did: `js_ts/structural.rs` (183, the grammar-conformance and occurrence-role
+   assertions, which run through the analysis-owned `structural::adapter_helpers`)
+   and `js_ts/receiver_analysis_tests.rs` (229, which build a concrete
+   `TypescriptAnalyzer`).
+
+Three census predictions held exactly: `EMBEDDED_QUERIES` is now empty and
+`crates/bifrost-analysis/resources/` is gone; `usages/parsed_tree.rs`'s
+`js_ts_tree_sitter_language_for_file` had no framework caller left and was
+deleted in favour of the crate's 15-LOC `parse.rs` over core's
+`LanguageDialect::for_path`; and the R1 mass really was tiny (`module_import_skeleton`,
+`ts_type_alias_skeleton` and `build_clone_candidate_data` were already free
+functions after Js-1).
+
+One shape the census did not name was needed: `graph::JsTsHosts`, the
+`JvmSourceRealm` view. The whole-workspace edge builders walk both dialects in
+one pass, so a single host is not enough; `brokk-bifrost-analysis` does the two
+downcasts and hands the list across.
+
+Both epoch salts gained `;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08`.
+The reach-in gate needed no allowlist change in either direction.

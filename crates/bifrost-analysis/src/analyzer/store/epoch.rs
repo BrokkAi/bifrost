@@ -86,6 +86,7 @@ fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str
         .chain(brokk_bifrost_cpp::queries::CPP_QUERY_ASSETS)
         .chain(brokk_bifrost_csharp::queries::CSHARP_QUERY_ASSETS)
         .chain(brokk_bifrost_go::queries::GO_QUERY_ASSETS)
+        .chain(brokk_bifrost_js_ts::queries::JS_TS_QUERY_ASSETS)
         .chain(brokk_bifrost_jvm::queries::JVM_QUERY_ASSETS)
         .chain(brokk_bifrost_php::queries::PHP_QUERY_ASSETS)
         .chain(brokk_bifrost_python::queries::PYTHON_QUERY_ASSETS)
@@ -160,47 +161,22 @@ fn hash_grammar(hasher: &mut Sha256, lang: &TsLanguage) {
 /// contents)`. Adding/removing or editing a query file rebuilds the crate and
 /// changes the per-language epoch.
 ///
-/// C++'s, C#'s, Go's, Java's, PHP's, Python's, Ruby's, Rust's and Scala's
-/// assets live in `brokk-bifrost-cpp`, `brokk-bifrost-csharp`,
-/// `brokk-bifrost-go`, `brokk-bifrost-jvm`, `brokk-bifrost-php`,
-/// `brokk-bifrost-python`, `brokk-bifrost-ruby` and `brokk-bifrost-rust` (they
-/// moved with their language knowledge) and are chained in above under the same
-/// `treesitter/cpp/`, `treesitter/c_sharp/`, `treesitter/go/`,
-/// `treesitter/java/`, `treesitter/php/`, `treesitter/python/`,
-/// `treesitter/ruby/`, `treesitter/rust/` and `treesitter/scala/` prefixes, so
-/// the per-language filter stays one rule.
+/// This table is now empty: every language's assets moved with its language
+/// knowledge into its own crate, and they are chained in above under the same
+/// `treesitter/<lang>/` prefixes they had here, so the per-language filter stays
+/// one rule. JavaScript's and TypeScript's were the last two, and their
+/// departure also removed `brokk-bifrost-analysis/resources/` entirely.
+///
+/// The table and the loader stay so that a future analysis-resident asset has a
+/// home; the comment stubs record where each language's went.
 const EMBEDDED_QUERIES: &[(&str, &str)] = &[
-    // JavaScript
-    (
-        "treesitter/javascript/definitions.scm",
-        include_str!("../../../resources/treesitter/javascript/definitions.scm"),
-    ),
-    (
-        "treesitter/javascript/imports.scm",
-        include_str!("../../../resources/treesitter/javascript/imports.scm"),
-    ),
-    (
-        "treesitter/javascript/identifiers.scm",
-        include_str!("../../../resources/treesitter/javascript/identifiers.scm"),
-    ),
-    // TypeScript
-    (
-        "treesitter/typescript/definitions.scm",
-        include_str!("../../../resources/treesitter/typescript/definitions.scm"),
-    ),
-    (
-        "treesitter/typescript/imports.scm",
-        include_str!("../../../resources/treesitter/typescript/imports.scm"),
-    ),
-    (
-        "treesitter/typescript/identifiers.scm",
-        include_str!("../../../resources/treesitter/typescript/identifiers.scm"),
-    ),
     // C++
     // C#
     // Java
+    // JavaScript
     // PHP
     // Scala
+    // TypeScript
 ];
 
 macro_rules! lang_epoch {
@@ -386,11 +362,15 @@ mod query_content_tests {
 // shape-preserving field indexing, same as TS already did - previously such
 // locals materialized no child fields at all. Changes the persisted unit set
 // for files with local schema-builder bindings.
+// Salt bumped again (#1548 stage 3 fleet): the JavaScript `.scm` query assets
+// moved from this crate's `resources/treesitter/javascript/` into
+// `brokk-bifrost-js-ts`, so the salted content now comes from a different
+// crate's `include_str!`.
 lang_epoch!(
     JavaScript,
     "javascript",
     "treesitter/javascript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08"
 );
 // TS salt bumped again (#1167): `is_simple_ts_initializer` now includes
 // `regex` (a regex-initialized binding renders its initializer inline in the
@@ -399,11 +379,14 @@ lang_epoch!(
 // Field (matching JS's `arrow_function | function_expression` check).
 // The classification change alters CodeUnitType, short_name/fq shape, and
 // signature rendering for every such binding.
+// Salt bumped again (#1548 stage 3 fleet): the TypeScript `.scm` query assets
+// moved from this crate's `resources/treesitter/typescript/` into
+// `brokk-bifrost-js-ts` alongside JavaScript's -- one crate holds both dialects.
 lang_epoch!(
     TypeScript,
     "typescript",
     "treesitter/typescript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the Python `.scm` query assets moved from
 // this crate's `resources/treesitter/python/` into `brokk-bifrost-python`, so

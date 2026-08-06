@@ -46,7 +46,7 @@ pub(crate) mod workspace_graph_cache;
 // module keeps the visibility its `mod` declaration had here, except where every
 // item it holds was already crate-private, in which case the alias narrows to
 // `pub(crate)` rather than re-publishing core's promoted `pub` items.
-use brokk_bifrost_core::analyzer::usages::{graph_core, local_inference, model, reexport_seeds};
+use brokk_bifrost_core::analyzer::usages::{local_inference, model};
 pub(crate) use brokk_bifrost_core::analyzer::usages::{outcome, receiver_analysis, reference_site};
 
 #[cfg(test)]
@@ -67,7 +67,6 @@ pub use finder::{
     DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, QueryResult, UsageFinder, UsageQueryCompletion,
 };
 pub use go_graph::GoUsageGraphStrategy;
-pub(crate) use graph_core::{ImportEdge, ImportEdgeKind};
 pub use java_graph::JavaUsageGraphStrategy;
 pub use js_ts_graph::JsTsExportUsageGraphStrategy;
 pub use kotlin_graph::KotlinUsageGraphStrategy;

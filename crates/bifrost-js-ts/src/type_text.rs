@@ -7,15 +7,15 @@
 //! name them without importing the definition route, which the route then
 //! imports back (issue: the js_ts crate extraction, Js-1).
 
-use crate::analyzer::CodeUnit;
-use crate::analyzer::js_ts::providers::JsTsAnalyzerHost;
+use crate::providers::JsTsAnalyzerHost;
+use brokk_bifrost_core::analyzer::CodeUnit;
 use tree_sitter::Node;
 
-pub(crate) fn ts_type_annotation_text(node: Node<'_>, source: &str) -> String {
+pub fn ts_type_annotation_text(node: Node<'_>, source: &str) -> String {
     ts_clean_type_text(source.get(node.start_byte()..node.end_byte()).unwrap_or(""))
 }
 
-pub(crate) fn ts_clean_type_text(text: &str) -> String {
+pub fn ts_clean_type_text(text: &str) -> String {
     text.trim()
         .trim_start_matches(':')
         .trim()
@@ -24,7 +24,7 @@ pub(crate) fn ts_clean_type_text(text: &str) -> String {
         .to_string()
 }
 
-pub(crate) fn jsts_value_space_candidates(
+pub fn jsts_value_space_candidates(
     host: &dyn JsTsAnalyzerHost,
     candidates: Vec<CodeUnit>,
 ) -> Vec<CodeUnit> {
@@ -40,7 +40,7 @@ pub(crate) fn jsts_value_space_candidates(
     }
 }
 
-pub(crate) fn jsts_type_space_candidates(
+pub fn jsts_type_space_candidates(
     host: &dyn JsTsAnalyzerHost,
     candidates: Vec<CodeUnit>,
 ) -> Vec<CodeUnit> {
@@ -61,7 +61,7 @@ pub(crate) fn jsts_type_space_candidates(
 /// TypeScript declaration index for a TypeScript unit, and both answer `false`
 /// for a JavaScript one (JavaScript has no `TypeAliasProvider`), but only the
 /// host spelling keeps this file off `IAnalyzer`.
-pub(crate) fn jsts_unit_is_type_only(host: &dyn JsTsAnalyzerHost, unit: &CodeUnit) -> bool {
+pub fn jsts_unit_is_type_only(host: &dyn JsTsAnalyzerHost, unit: &CodeUnit) -> bool {
     if host.js_ts_is_type_alias(unit) {
         return true;
     }

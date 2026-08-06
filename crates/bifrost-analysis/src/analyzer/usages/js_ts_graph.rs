@@ -1,93 +1,85 @@
-//! JS/TS export-usage reference graph (Phase 7 of the usages port).
+//! The analysis-side half of the JS/TS export-usage reference graph.
 //!
-//! Mirrors brokk's `JsTsExportUsageReferenceGraph` and `JsTsExportUsageExtractor`. Where
-//! brokk's pipeline drives the JDT/LLM disambiguator, bifrost is tree-sitter only — the
-//! graph here resolves on syntax + import binders alone, and reports an internal
-//! fallback-safe outcome when it cannot infer a seed.
+//! The scan itself -- the per-file forward walk, the resolution index, the
+//! receiver-facts index and the per-file inverted walks -- moved to
+//! [`brokk_bifrost_js_ts::graph`]. What stays here is everything that needs an
+//! analyzer handle:
 //!
-//! Pipeline overview:
-//! 1. Per-file [`ExportIndex`]: tree-sitter walk that captures local exports, named
-//!    re-exports, star re-exports, default exports, and structured CommonJS export
-//!    assignments.
-//! 2. Per-file [`ImportBinder`]: extracts default/named/namespace import bindings from
-//!    ESM `import` statements and structured CommonJS `require(...)` declarations.
-//! 3. Project indices, rebuilt per query so file edits are picked up immediately:
-//!    - reverse re-export index: `(target_file, exported_name) -> {(reexporting_file, alias)}`
-//!    - reverse export-seed index: `(short_name) -> {(file, exported_name)}` for fast seed
-//!      inference from a target's identifier.
-//! 4. Reference traversal: for the target's seed exports, walk the import-reverse index to
-//!    find files that bind a local name to the export, then AST-scan those files for
-//!    identifier / member / type / heritage references that resolve back to the target.
+//! - the two `resolve_analyzer::<{Typescript,Javascript}Analyzer>` downcasts
+//!   ([`cached_jsts_index`], [`prewarm_cached_jsts_index`]) and the `JsTsHosts`
+//!   view the whole-workspace builders are handed;
+//! - the inverted pass's fan-out -- `build_edge_output`, `build_edge_weights`,
+//!   `parse_and_collect` and `collect_file_edges`, which are analysis-owned --
+//!   driving the crate's per-file scans;
+//! - the SPI surface: `UsageQueryResolver`, `GraphUsageAnalyzer` and
+//!   `UsageAnalyzer` on [`JsTsExportUsageGraphStrategy`].
 //!
-//! Scope notes:
-//! - **Structured local modules only.** Static relative ESM specifiers and CommonJS
-//!   `require(...)` calls are walked, plus non-relative specifiers that match a
-//!   `tsconfig.json`/`jsconfig.json` path alias (`@/...`, resolved via `AliasResolver`).
-//!   Dynamic requires, bare package specifiers, and `package.json` `exports` remain
-//!   outside this graph.
-//! - **Per-call indices.** No cross-call cache: each query rebuilds the graph for the
-//!   target's language. This keeps results consistent after file edits at the cost of
-//!   re-parsing JS/TS files on every query. Hosts with stable file sets that need lower
-//!   latency (e.g. an LSP server) should layer their own cache around the strategy.
+//! Both dialects run through one strategy and one `EdgePassId`: the builders
+//! below walk TypeScript and JavaScript in one pass and merge, which is why they
+//! take the host view rather than a single host.
 
-mod extractor;
-mod hits;
-mod inverted;
-pub(in crate::analyzer::usages) mod receiver_analysis;
-mod resolver;
-
-/// The registry-facing half: the factory `JavascriptSupport`/`TypescriptSupport` hand to
-/// the receiver query, which never names anything else in here.
-use crate::analyzer::usages::traits::GraphUsageAnalyzer;
-pub(crate) use receiver_analysis::JsTsReceiverFacts;
-/// The cacheable JS/TS resolution index and its tree-free builder, exposed so the
-/// TypeScript and JavaScript analyzers can cache one per language.
-pub(in crate::analyzer::usages) use receiver_analysis::{
+/// The receiver-facts factory the registry hands the receiver query, and the
+/// resolution/receiver indices, re-exported at the paths their framework callers
+/// already use.
+pub(crate) use crate::analyzer::js_ts::receiver_facts::JsTsReceiverFacts;
+pub(in crate::analyzer::usages) use brokk_bifrost_js_ts::graph::receiver_analysis::{
     JsTsReceiverFactProvider, JsTsReceiverSyntaxIndex, build_js_ts_receiver_syntax_index,
 };
-pub(crate) use resolver::{
-    JsTsUsageIndex, build_jsts_usage_index, build_jsts_usage_index_with_cancellation,
-};
-pub(in crate::analyzer::usages) use resolver::{
+pub(crate) use brokk_bifrost_js_ts::graph::resolver::JsTsUsageIndex;
+pub(in crate::analyzer::usages) use brokk_bifrost_js_ts::graph::resolver::{
     browser_global_property_shape, unbound_browser_global_property,
 };
+pub(in crate::analyzer::usages) use brokk_bifrost_js_ts::syntax::compute_import_binder as compute_jsts_import_binder;
 
-use crate::analyzer::js_ts::providers::{
-    JsTsAnalyzerHost, jsts_usage_index, jsts_usage_index_with_cancellation, resolve_js_ts_host,
-};
-use crate::analyzer::js_ts::syntax::{direct_property_definitions, slice};
+use crate::analyzer::js_ts::providers::resolve_js_ts_host;
 use crate::analyzer::usages::common::analyzed_files_for_language;
-use crate::analyzer::usages::js_ts_graph::extractor::scan_files_for_seeds;
-use crate::analyzer::usages::js_ts_graph::resolver::{
-    combine_jsts_usage_indices, is_static_member, member_name, target_language,
+use crate::analyzer::usages::inverted_edges::{
+    CallSite, JsTsScopedNodeStatus, JsTsScopedUsageEdges, UsageEdgeBuildOutput, UsageEdgeWeights,
+    UsageEdges, UsageNodeKey, build_edge_output, build_edge_weights, collect_file_edges,
+    parse_and_collect,
 };
-use crate::analyzer::usages::model::{
-    ExportEntry, FuzzyResult, UsageHit, UsageHitSurface, UsageProof,
-};
+use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file;
-use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
+use crate::analyzer::usages::traits::{
+    GraphUsageAnalyzer, UsageAnalyzer, UsageQueryResolver, UsageScanScope,
+};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, JavascriptAnalyzer, Language, ProjectFile, TypescriptAnalyzer,
     resolve_analyzer,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
-use std::collections::BTreeSet;
+use brokk_bifrost_js_ts::graph::resolver::{combine_jsts_usage_indices, target_language};
+use brokk_bifrost_js_ts::graph::{JsTsHosts, inverted};
+use brokk_bifrost_js_ts::parse::{js_ts_tree_sitter_language_for_file, tree_sitter_language_for};
+use brokk_bifrost_js_ts::providers::JsTsAnalyzerHost;
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use tree_sitter::Parser;
 
-pub(in crate::analyzer::usages) use crate::analyzer::js_ts::syntax::compute_import_binder as compute_jsts_import_binder;
-use crate::analyzer::usages::inverted_edges::CallSite;
-use crate::analyzer::usages::inverted_edges::UsageEdges;
-use crate::analyzer::usages::inverted_edges::UsageNodeKey;
-use crate::analyzer::usages::inverted_edges::{JsTsScopedNodeStatus, JsTsScopedUsageEdges};
-use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageReferenceCounts};
+/// The two dialects, in the order every whole-workspace pass walks them.
+const JS_TS_LANGUAGES: [Language; 2] = [Language::TypeScript, Language::JavaScript];
+
+/// Resolve both dialects' analyzers once for a whole-workspace pass.
+///
+/// The crate cannot name `JavascriptAnalyzer` or `TypescriptAnalyzer`, so the
+/// downcasts happen here and the resulting view crosses -- the `JvmSourceRealm`
+/// shape.
+fn js_ts_hosts(analyzer: &dyn IAnalyzer) -> JsTsHosts<'_> {
+    JsTsHosts::new(
+        JS_TS_LANGUAGES
+            .into_iter()
+            .filter_map(|language| {
+                resolve_js_ts_host(analyzer, language)
+                    .map(|host| (language, host as &dyn JsTsAnalyzerHost))
+            })
+            .collect(),
+    )
+}
 
 /// Build the whole JS/TS `caller -> callee` edge set in a single inverted pass per
 /// language present, merging TypeScript and JavaScript. Returns `None` when the
-/// workspace has no JS/TS files. `nodes`/`keep_file` mirror the Go builder; see
-/// [`inverted`].
+/// workspace has no JS/TS files. `nodes`/`keep_file` mirror the Go builder.
 pub(crate) fn build_jsts_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
     nodes: &HashSet<String>,
@@ -97,7 +89,7 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = JsTsEdgeResolver::try_new(analyzer)?;
-    for language in [Language::TypeScript, Language::JavaScript] {
+    for language in JS_TS_LANGUAGES {
         if !analyzed_files_for_language(analyzer, language).is_empty() {
             let _ = prewarm_cached_jsts_index(analyzer, language);
         }
@@ -107,30 +99,18 @@ where
 
 /// Borrow the analyzer-cached [`JsTsUsageIndex`] for `language` off the concrete TS/JS
 /// analyzer behind `analyzer`, building it on first use. `None` when the analyzer does
-/// not expose the matching JS/TS analyzer.
+/// not expose the matching JS/TS analyzer, or when a cancellation token fires mid-build.
 ///
 /// The downcasting half of the pair: framework callers that hold only a
 /// `&dyn IAnalyzer` (the definition trace, the dead-code pass, the edge builders)
-/// come through here. Everything already holding a [`JsTsAnalyzerHost`] calls
-/// [`cached_jsts_index_for_host`] directly.
+/// come through here. Everything already holding a `JsTsAnalyzerHost` calls
+/// `JsTsAnalyzerHost::js_ts_usage_index` directly.
 pub(crate) fn cached_jsts_index(
     analyzer: &dyn IAnalyzer,
     language: Language,
     cancellation: Option<&CancellationToken>,
 ) -> Option<Arc<JsTsUsageIndex>> {
-    cached_jsts_index_for_host(resolve_js_ts_host(analyzer, language)?, cancellation)
-}
-
-/// The index for the host's own language, built on first use. `None` only when a
-/// cancellation token fires mid-build.
-pub(crate) fn cached_jsts_index_for_host(
-    host: &dyn JsTsAnalyzerHost,
-    cancellation: Option<&CancellationToken>,
-) -> Option<Arc<JsTsUsageIndex>> {
-    cancellation.map_or_else(
-        || Some(jsts_usage_index(host)),
-        |token| jsts_usage_index_with_cancellation(host, token),
-    )
+    resolve_js_ts_host(analyzer, language)?.js_ts_usage_index(cancellation)
 }
 
 pub(in crate::analyzer::usages) fn prewarm_cached_jsts_index(
@@ -178,7 +158,11 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
         }
 
         let cancellation = scan_scope.cancellation();
-        let Some(index) = cached_jsts_index(analyzer, language, cancellation) else {
+        let index = resolve_js_ts_host(analyzer, language).and_then(|host| {
+            host.js_ts_usage_index(cancellation)
+                .map(|index| (host, index))
+        });
+        let Some((host, index)) = index else {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
             }
@@ -190,91 +174,15 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                 "JsTsExportUsageGraphStrategy",
             );
         };
-        let target_seed = target_seed_identifier(analyzer, target);
-        let owner_seed_allowed = is_static_member(target)
-            || !target.short_name().contains('.')
-            || analyzer.parent_of(target).is_some();
-        let exported_local_property =
-            exported_local_property_binding(analyzer, index.as_ref(), target, language);
-        let mut seeds = index.seeds_for_target(
-            target.source(),
-            &target_seed,
-            target.short_name(),
-            owner_seed_allowed,
-        );
-        if let Some(binding) = &exported_local_property {
-            seeds.extend(
-                binding
-                    .exported_names
-                    .iter()
-                    .cloned()
-                    .map(|name| (target.source().clone(), name)),
-            );
-        }
-        let scan_hits = if seeds.is_empty() {
-            let mut scan_files: HashSet<ProjectFile> =
-                scan_scope.candidate_files().iter().cloned().collect();
-            if scan_scope.allows(target.source()) {
-                scan_files.insert(target.source().clone());
-            }
-
-            scan_files_for_seeds(
-                analyzer,
-                index.as_ref(),
-                &scan_files,
-                target,
-                &BTreeSet::new(),
-                language,
-                exported_local_property
-                    .as_ref()
-                    .map(|binding| binding.receiver_root.as_str()),
-                scan_scope.cancellation(),
-            )
-        } else {
-            let candidate_files = scan_scope.candidate_files();
-            let importers = index.importers_of_seeds(&seeds);
-            let mut scan_files: HashSet<ProjectFile> = candidate_files.iter().cloned().collect();
-            scan_files.extend(importers.into_iter().filter(|file| scan_scope.allows(file)));
-            if scan_scope.allows(target.source()) {
-                scan_files.insert(target.source().clone());
-            }
-
-            scan_files_for_seeds(
-                analyzer,
-                index.as_ref(),
-                &scan_files,
-                target,
-                &seeds,
-                language,
-                exported_local_property
-                    .as_ref()
-                    .map(|binding| binding.receiver_root.as_str()),
-                scan_scope.cancellation(),
-            )
-        };
-        let (hits, unproven_hits): (BTreeSet<UsageHit>, BTreeSet<UsageHit>) = scan_hits
-            .into_iter()
-            .filter(|hit| &hit.enclosing != target)
-            .partition(|hit| hit.proof == UsageProof::Proven);
-
-        let external_hit_count = hits
-            .iter()
-            .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
-            .count();
-        if external_hit_count > max_usages {
-            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-                short_name: target.short_name().to_string(),
-                total_callsites: external_hit_count,
-                limit: max_usages,
-                sample_hits: hits,
-            });
-        }
-
-        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
-            target.clone(),
-            hits,
-            unproven_hits,
-        ))
+        brokk_bifrost_js_ts::graph::find_js_ts_usages(
+            host,
+            analyzer,
+            index.as_ref(),
+            target,
+            scan_scope,
+            language,
+            max_usages,
+        )
     }
 }
 
@@ -282,11 +190,11 @@ pub(crate) struct JsTsEdgeResolver;
 
 /// The whole-workspace `caller -> callee` scan behind this language's
 /// [`LanguageEdgePass`](crate::analyzer::languages::LanguageEdgePass): borrow the concrete
-/// analyzer once, then walk every file once and finalize into either site-bearing edges or
+/// analyzers once, then walk every file once and finalize into either site-bearing edges or
 /// reference-kind weights.
 impl JsTsEdgeResolver {
     pub(crate) fn try_new(analyzer: &dyn IAnalyzer) -> Option<Self> {
-        let has_jsts = [Language::TypeScript, Language::JavaScript]
+        let has_jsts = JS_TS_LANGUAGES
             .iter()
             .any(|language| !analyzed_files_for_language(analyzer, *language).is_empty());
         has_jsts.then_some(Self)
@@ -301,19 +209,17 @@ impl JsTsEdgeResolver {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        let mut edges: std::collections::BTreeMap<(String, String), Vec<CallSite>> =
-            std::collections::BTreeMap::new();
-        let mut truncated: std::collections::BTreeMap<String, usize> =
-            std::collections::BTreeMap::new();
-        let mut unproven_inbound: std::collections::BTreeMap<String, usize> =
-            std::collections::BTreeMap::new();
+        let hosts = js_ts_hosts(analyzer);
+        let mut edges: BTreeMap<(String, String), Vec<CallSite>> = BTreeMap::new();
+        let mut truncated: BTreeMap<String, usize> = BTreeMap::new();
+        let mut unproven_inbound: BTreeMap<String, usize> = BTreeMap::new();
 
-        for language in [Language::TypeScript, Language::JavaScript] {
+        for language in JS_TS_LANGUAGES {
             if analyzed_files_for_language(analyzer, language).is_empty() {
                 continue;
             }
             let result: UsageEdges =
-                inverted::build_jsts_edges(analyzer, language, nodes, &keep_file);
+                build_jsts_edges(analyzer, &hosts, language, nodes, &keep_file);
             for (key, sites) in result.edges {
                 edges.entry(key).or_default().extend(sites);
             }
@@ -339,6 +245,40 @@ impl JsTsEdgeResolver {
     }
 }
 
+/// The non-scoped inverted pass for one dialect: the analysis-owned parallel
+/// fan-out over files, driving [`inverted::scan_file`] per file.
+fn build_jsts_edges<Output, F>(
+    analyzer: &dyn IAnalyzer,
+    hosts: &JsTsHosts<'_>,
+    language: Language,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Output
+where
+    Output: UsageEdgeBuildOutput<String> + Default,
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    if tree_sitter_language_for(language).is_none() {
+        return Output::default();
+    }
+    let _index = cached_jsts_index(analyzer, language, None);
+    // Resolved once for the whole scan; the per-file receiver provider is on the
+    // JS/TS host. No analyzer for `language` means no JS/TS files to scan either.
+    let Some(host) = hosts.get(language) else {
+        return Output::default();
+    };
+    let files = analyzed_files_for_language(analyzer, language);
+    build_edge_output(&files, keep_file, |file| {
+        // The non-scoped scan needs only the file's own tree for its main binder +
+        // declaration pass. Receiver analysis can consult the analyzer-cached
+        // resolution index, so it is pre-materialized before this parallel scan.
+        let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
+        parse_and_collect(analyzer, file, nodes, &parser_language, |input| {
+            inverted::scan_file(host, analyzer, language, file, nodes, input)
+        })
+    })
+}
+
 /// Build the whole JS/TS `caller -> callee` edge set using file-scoped node
 /// identity, so same-name exports in different files do not cross-match.
 pub(crate) fn build_jsts_scoped_usage_edges<F>(
@@ -349,18 +289,15 @@ pub(crate) fn build_jsts_scoped_usage_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync + Copy,
 {
-    let mut edges: std::collections::BTreeMap<(UsageNodeKey, UsageNodeKey), UsageReferenceCounts> =
-        std::collections::BTreeMap::new();
-    let mut truncated: std::collections::BTreeMap<UsageNodeKey, usize> =
-        std::collections::BTreeMap::new();
-    let mut unproven_inbound: std::collections::BTreeMap<UsageNodeKey, usize> =
-        std::collections::BTreeMap::new();
-    let mut node_status: std::collections::BTreeMap<UsageNodeKey, JsTsScopedNodeStatus> =
-        std::collections::BTreeMap::new();
+    let hosts = js_ts_hosts(analyzer);
+    let mut edges = BTreeMap::new();
+    let mut truncated: BTreeMap<UsageNodeKey, usize> = BTreeMap::new();
+    let mut unproven_inbound: BTreeMap<UsageNodeKey, usize> = BTreeMap::new();
+    let mut node_status: BTreeMap<UsageNodeKey, JsTsScopedNodeStatus> = BTreeMap::new();
     let mut any = false;
 
     let mut cached_indices = Vec::new();
-    for language in [Language::TypeScript, Language::JavaScript] {
+    for language in JS_TS_LANGUAGES {
         if let Some(index) = cached_jsts_index(analyzer, language, None) {
             cached_indices.push(index);
         }
@@ -370,7 +307,7 @@ where
         cached_indices.iter().map(std::convert::AsRef::as_ref),
     );
 
-    for language in [Language::TypeScript, Language::JavaScript] {
+    for language in JS_TS_LANGUAGES {
         if analyzed_files_for_language(analyzer, language).is_empty() {
             continue;
         }
@@ -378,8 +315,9 @@ where
         if nodes.is_empty() {
             continue;
         }
-        let result = inverted::build_jsts_scoped_edges(
+        let result = build_jsts_scoped_edges(
             analyzer,
+            &hosts,
             &combined_index,
             language,
             nodes,
@@ -405,6 +343,62 @@ where
         },
         node_status,
     })
+}
+
+/// The scoped inverted pass for one dialect, with the fan-out on this side.
+fn build_jsts_scoped_edges<F>(
+    analyzer: &dyn IAnalyzer,
+    hosts: &JsTsHosts<'_>,
+    index: &JsTsUsageIndex,
+    language: Language,
+    nodes: &HashSet<UsageNodeKey>,
+    keep_file: F,
+) -> JsTsScopedUsageEdges
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let empty = || JsTsScopedUsageEdges {
+        edges: UsageEdgeWeights::default(),
+        node_status: BTreeMap::new(),
+    };
+    if tree_sitter_language_for(language).is_none() {
+        return empty();
+    }
+    // Resolved once for the whole scan; see `build_jsts_edges` above.
+    let Some(host) = hosts.get(language) else {
+        return empty();
+    };
+    let files = analyzed_files_for_language(analyzer, language);
+    // The declaration map spans both dialects: a scoped edge set merges TypeScript
+    // and JavaScript, and a JS file can import a name a TS file declares.
+    let prep = inverted::prepare_scoped_scan(analyzer, index, nodes);
+    let edges = build_edge_weights(&files, keep_file, |file| {
+        // Parse on demand and drop the tree when this closure returns; cross-file
+        // resolution comes from the analyzer-cached `index`, not retained trees.
+        let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
+        let parsed = parse_tree_sitter_file(file, &parser_language)?;
+        let file_prep = inverted::prepare_scoped_file(
+            &prep,
+            analyzer,
+            file,
+            language,
+            parsed.tree.root_node(),
+            parsed.source.as_str(),
+        );
+        Some(collect_file_edges(
+            analyzer,
+            file,
+            nodes,
+            &parsed,
+            |input| {
+                inverted::scan_scoped_file(host, index, &prep, file_prep, language, file, input)
+            },
+        ))
+    });
+    JsTsScopedUsageEdges {
+        edges,
+        node_status: prep.node_status,
+    }
 }
 
 /// JS/TS export-graph usage analyzer. Resolves usages of a JavaScript or TypeScript
@@ -446,80 +440,6 @@ impl GraphUsageAnalyzer for JsTsExportUsageGraphStrategy {
         };
         resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
     }
-}
-
-fn target_seed_identifier(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> String {
-    if let Some(parent) = analyzer.parent_of(target)
-        && !parent.is_module()
-        && !parent.is_file_scope()
-    {
-        return parent.identifier().trim_end_matches("$static").to_string();
-    }
-    if is_static_member(target)
-        && let Some((owner, _)) = target.short_name().rsplit_once('.') // fqname-M4: package-less short_name owner; fq.parent() would render the package-qualified owner, changing this string comparison
-        && let Some(owner_name) = owner.rsplit('.').next()
-    {
-        return owner_name.to_string();
-    }
-    target.identifier().trim_end_matches("$static").to_string()
-}
-
-struct ExportedLocalPropertyBinding {
-    receiver_root: String,
-    exported_names: BTreeSet<String>,
-}
-
-fn exported_local_property_binding(
-    analyzer: &dyn IAnalyzer,
-    index: &JsTsUsageIndex,
-    target: &CodeUnit,
-    language: Language,
-) -> Option<ExportedLocalPropertyBinding> {
-    if language != Language::JavaScript || !target.is_field() {
-        return None;
-    }
-    let target_member = member_name(target)?;
-    let source = target.source().read_to_string().ok()?;
-    let mut parser = Parser::new();
-    let parser_language = js_ts_tree_sitter_language_for_file(target.source(), language)?;
-    parser.set_language(&parser_language).ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
-    let receiver_root = direct_property_definitions(
-        tree.root_node(),
-        source.as_str(),
-        &analyzer.ranges(target),
-        &target_member,
-    )
-    .into_iter()
-    .find_map(|definition| {
-        definition
-            .receiver
-            .members
-            .is_empty()
-            .then(|| slice(definition.receiver.root, source.as_str()).to_string())
-    })?;
-
-    let exported_names = index
-        .exports_by_file
-        .get(target.source())?
-        .exports_by_name
-        .iter()
-        .filter_map(|(exported_name, entry)| match entry {
-            ExportEntry::Local { local_name } if local_name == &receiver_root => {
-                Some(exported_name.clone())
-            }
-            ExportEntry::Default {
-                local_name: Some(local_name),
-            } if local_name == &receiver_root => Some(exported_name.clone()),
-            ExportEntry::Local { .. }
-            | ExportEntry::Default { .. }
-            | ExportEntry::ReexportedNamed { .. } => None,
-        })
-        .collect::<BTreeSet<_>>();
-    (!exported_names.is_empty()).then_some(ExportedLocalPropertyBinding {
-        receiver_root,
-        exported_names,
-    })
 }
 
 impl UsageAnalyzer for JsTsExportUsageGraphStrategy {

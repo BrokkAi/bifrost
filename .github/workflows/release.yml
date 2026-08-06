@@ -513,6 +513,19 @@ jobs:
       contents: read
       id-token: write
 
+  publish-crate-js-ts:
+    name: publish js-ts language crate after core
+    needs: [release-context, promotion-evidence, publish-crate-core]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-js-ts
+    permissions:
+      contents: read
+      id-token: write
+
   publish-crate-jvm:
     name: publish jvm language crate after core
     needs: [release-context, promotion-evidence, publish-crate-core]
@@ -592,8 +605,8 @@ jobs:
       id-token: write
 
   publish-crate-analysis:
-    name: publish analysis crate after core, cpp, csharp, go, jvm, php, python, ruby and rust
-    needs: [release-context, promotion-evidence, publish-crate-core, publish-crate-cpp, publish-crate-csharp, publish-crate-go, publish-crate-jvm, publish-crate-php, publish-crate-python, publish-crate-ruby, publish-crate-rust]
+    name: publish analysis crate after core, cpp, csharp, go, js-ts, jvm, php, python, ruby and rust
+    needs: [release-context, promotion-evidence, publish-crate-core, publish-crate-cpp, publish-crate-csharp, publish-crate-go, publish-crate-js-ts, publish-crate-jvm, publish-crate-php, publish-crate-python, publish-crate-ruby, publish-crate-rust]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}

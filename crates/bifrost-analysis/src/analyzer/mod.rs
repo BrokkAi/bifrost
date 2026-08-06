@@ -62,9 +62,7 @@ use brokk_bifrost_core::analyzer::{
     capabilities, code_unit_index, config, definition_lookup, model, pool_memo, project,
     source_content,
 };
-pub(crate) use brokk_bifrost_core::analyzer::{
-    dense_id, fq_name, semantic_diagnostics, type_relations,
-};
+pub(crate) use brokk_bifrost_core::analyzer::{dense_id, fq_name, type_relations};
 pub use code_unit_index::CodeUnitIndex;
 pub(crate) use code_unit_index::default_parent_fq_name;
 pub(crate) use definition_lookup::{BoundedDefinitionLookup, sort_units};

@@ -30,7 +30,7 @@
 pub(crate) use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     CallSite, ClassRangeIndex, FileDeclarations, FileEdgeScanInput, JsTsScopedNodeStatus,
     JsTsScopedUsageEdges, NodeKey, PerFileEdges, UsageEdgeWeights, UsageEdges, UsageNodeKey,
-    UsageReferenceCounts, classify_reference_node, first_precise,
+    UsageReferenceCounts, first_precise,
 };
 
 use crate::analyzer::tree_sitter_analyzer::FileState;
@@ -403,6 +403,7 @@ mod tests {
     use super::*;
     use crate::text_utils::find_line_index_for_offset;
     use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageReferenceKind;
+    use brokk_bifrost_core::analyzer::usages::inverted_edges::classify_reference_node;
     use tree_sitter::Node;
 
     fn find_node<'tree>(root: Node<'tree>, source: &str, kind: &str, text: &str) -> Node<'tree> {

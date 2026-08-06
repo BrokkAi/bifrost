@@ -1,5 +1,4 @@
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::js_ts::syntax::JsTsImportBinder;
 use crate::analyzer::lexical_definitions::{
     LexicalBindingResolution, LexicalDefinition, resolve_lexical_binding,
 };
@@ -56,6 +55,7 @@ pub(crate) use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site_with_line_starts,
     smallest_named_node_covering,
 };
+use brokk_bifrost_js_ts::syntax::JsTsImportBinder;
 // The Ruby definition route is parked on `ResolutionSession`'s siblings while
 // `ruby_graph/*` has moved into `brokk-bifrost-ruby`, so this block -- the
 // fleet's largest reach-in into a language's graph module -- inverts through the

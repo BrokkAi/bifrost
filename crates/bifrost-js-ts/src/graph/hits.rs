@@ -1,11 +1,11 @@
-use crate::analyzer::Range;
-use crate::analyzer::usages::UsageHit;
-use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
-use crate::analyzer::usages::js_ts_graph::extractor::ScanCtx;
-use crate::text_utils::{find_line_index_for_offset, trimmed_snippet_around_line};
+use crate::graph::extractor::ScanCtx;
+use brokk_bifrost_core::analyzer::Range;
+use brokk_bifrost_core::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
+use brokk_bifrost_core::analyzer::usages::model::UsageHit;
+use brokk_bifrost_core::text_utils::{find_line_index_for_offset, trimmed_snippet_around_line};
 use tree_sitter::Node;
 
-pub(super) fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if let Some(hit) = build_hit(node, ctx) {
         ctx.hits.insert(hit);
     }
@@ -14,7 +14,7 @@ pub(super) fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// Record `node` as an `Import`-binding hit (the token that brings the symbol
 /// into this file). The IDE find-references surface includes these; the
 /// call-graph / relevance surfaces filter them out.
-pub(super) fn record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if let Some(hit) = build_hit(node, ctx) {
         ctx.hits.insert(hit.into_import());
     }
@@ -23,7 +23,7 @@ pub(super) fn record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// Record `node` as a binding-only re-export. The token is useful to IDE
 /// find-references and rename operations, but is omitted from the quieter
 /// agent/search usage surface.
-pub(super) fn record_reexport_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn record_reexport_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if let Some(hit) = build_hit(node, ctx) {
         ctx.hits.insert(hit.into_reexport());
     }
@@ -31,13 +31,13 @@ pub(super) fn record_reexport_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 /// Record `node` as a self/this receiver hit. IDE references include these; the
 /// call-graph / relevance surfaces filter them out.
-pub(super) fn record_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn record_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if let Some(hit) = build_hit(node, ctx) {
         ctx.hits.insert(hit.into_self_receiver());
     }
 }
 
-pub(super) fn record_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn record_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if let Some(hit) = build_hit(node, ctx) {
         ctx.unproven_hits.insert(hit.into_unproven());
     }

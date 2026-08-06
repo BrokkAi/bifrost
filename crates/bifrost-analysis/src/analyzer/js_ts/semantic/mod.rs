@@ -2,9 +2,6 @@
 
 use tree_sitter::Node;
 
-use crate::analyzer::js_ts::syntax::{
-    JsTsImportBinder, JsTsLexicalBindingIndex, compute_import_binder,
-};
 use crate::analyzer::lexical_definitions::formal_parameter_slots;
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
@@ -17,6 +14,9 @@ use crate::analyzer::tree_sitter_analyzer::{
 };
 use crate::analyzer::{Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_js_ts::syntax::{
+    JsTsImportBinder, JsTsLexicalBindingIndex, compute_import_binder,
+};
 
 const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v8";
 const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v9";

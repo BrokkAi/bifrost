@@ -1,21 +1,23 @@
-use crate::analyzer::common::node_source_text;
-use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
-use crate::analyzer::structural::materialization::{ExportForm, MaterializationRecord};
-use crate::analyzer::tree_sitter_analyzer::{
-    ParsedFile, WalkControl, node_range, walk_named_tree_preorder,
+use brokk_bifrost_core::analyzer::common::node_source_text;
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::model::CodeUnitType;
+use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::structural::materialization::{
+    ExportForm, MaterializationRecord,
 };
-use crate::analyzer::{CodeUnit, CodeUnitType, ProjectFile};
+use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, node_range, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use tree_sitter::Node;
 
-pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text(node, source)
+pub fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
 /// Intern one qualified-name segment in the process-global interner. Shared by
 /// the JavaScript and TypeScript adapters (both build `FqName`s the same way:
 /// `package_name` is always empty, so every chain starts fresh from either a
 /// parent's own `fq` or one of the synthetic file-scope prefixes below).
-pub(crate) fn js_ts_segment(text: &str, kind: SegmentKind) -> SegmentId {
+pub fn js_ts_segment(text: &str, kind: SegmentKind) -> SegmentId {
     segment_interner().intern(text, kind)
 }
 
@@ -34,11 +36,11 @@ fn file_name_path_segment(file: &ProjectFile) -> SegmentId {
     js_ts_segment(name, SegmentKind::Path)
 }
 
-pub(crate) fn module_code_unit(file: &ProjectFile) -> CodeUnit {
+pub fn module_code_unit(file: &ProjectFile) -> CodeUnit {
     let fq = FqName::new().with_pushed(file_name_path_segment(file));
     CodeUnit::new_fq(
         file.clone(),
-        crate::analyzer::CodeUnitType::Module,
+        brokk_bifrost_core::analyzer::model::CodeUnitType::Module,
         "",
         file.rel_path()
             .file_name()
@@ -48,7 +50,7 @@ pub(crate) fn module_code_unit(file: &ProjectFile) -> CodeUnit {
     )
 }
 
-pub(crate) fn trim_statement(text: &str) -> String {
+pub fn trim_statement(text: &str) -> String {
     text.trim().trim_end_matches(';').trim().to_string()
 }
 
@@ -62,7 +64,7 @@ pub(crate) fn trim_statement(text: &str) -> String {
 
 /// Adds a synthetic `default` CodeUnit for an anonymous `export default ...`
 /// declaration (function/class/object literal with no name of its own).
-pub(crate) fn add_default_export_unit(
+pub fn add_default_export_unit(
     file: &ProjectFile,
     source: &str,
     export: Node<'_>,
@@ -100,7 +102,7 @@ pub(crate) fn add_default_export_unit(
 /// the declaration keeps its own name, so the row states the form and name
 /// without re-deriving the declared unit. `is_default` is the dialect's own
 /// default-clause check.
-pub(crate) fn record_named_export(
+pub fn record_named_export(
     source: &str,
     export: Node<'_>,
     declaration: Node<'_>,
@@ -129,7 +131,7 @@ pub(crate) fn record_named_export(
 /// Records one export row per plainly named declarator of an exported
 /// `let`/`const`/`var` statement. Destructuring binders introduce names this
 /// walk does not enumerate; they get no row rather than a guessed one.
-pub(crate) fn record_named_declarator_exports(
+pub fn record_named_declarator_exports(
     source: &str,
     export: Node<'_>,
     declaration: Node<'_>,
@@ -159,7 +161,7 @@ pub(crate) fn record_named_declarator_exports(
 
 /// Records the `export default name` re-export row: it points at an existing
 /// binding, so it materializes no declaration but is still an export fact.
-pub(crate) fn record_default_reexport(export: Node<'_>, parsed: &mut ParsedFile) {
+pub fn record_default_reexport(export: Node<'_>, parsed: &mut ParsedFile) {
     parsed.record_materialization(MaterializationRecord::Export {
         range: node_range(export),
         form: ExportForm::DefaultNamed,
@@ -171,7 +173,7 @@ pub(crate) fn record_default_reexport(export: Node<'_>, parsed: &mut ParsedFile)
 /// If `node` is a `this.<property>` member expression with a nameable
 /// property, returns the property node (used to detect constructor-assigned
 /// instance fields).
-pub(crate) fn this_member_property<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+pub fn this_member_property<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
     if node.kind() != "member_expression" {
         return None;
     }
@@ -187,7 +189,7 @@ pub(crate) fn this_member_property<'tree>(node: Node<'tree>, source: &str) -> Op
 
 /// Renders a property-name-shaped node (bare identifier or quoted string key)
 /// to its text, or `None` if the node doesn't denote a nameable property.
-pub(crate) fn property_name_text(node: Node<'_>, source: &str) -> Option<String> {
+pub fn property_name_text(node: Node<'_>, source: &str) -> Option<String> {
     match node.kind() {
         "identifier"
         | "property_identifier"
@@ -209,7 +211,7 @@ pub(crate) fn property_name_text(node: Node<'_>, source: &str) -> Option<String>
 
 /// Renders the `<keyword> <left-hand-side>` header of a variable declarator
 /// (e.g. `const foo`), stripping any `= value` initializer text.
-pub(crate) fn variable_header(
+pub fn variable_header(
     statement: Node<'_>,
     declarator: Node<'_>,
     source: &str,
@@ -231,7 +233,7 @@ pub(crate) fn variable_header(
 
 /// Qualifies a module-scope field's short name with its file's base name
 /// (`<file>.<name>`), used when a top-level binding has no enclosing class.
-pub(crate) fn file_scoped_field_name(file: &ProjectFile, name: &str) -> String {
+pub fn file_scoped_field_name(file: &ProjectFile, name: &str) -> String {
     format!(
         "{}.{}",
         file.rel_path()
@@ -244,7 +246,7 @@ pub(crate) fn file_scoped_field_name(file: &ProjectFile, name: &str) -> String {
 
 /// Structured counterpart to [`file_scoped_field_name`]: the same file-name
 /// `Path` prefix followed by the field's own `Member` segment.
-pub(crate) fn file_scoped_field_fq(file: &ProjectFile, name: &str) -> FqName {
+pub fn file_scoped_field_fq(file: &ProjectFile, name: &str) -> FqName {
     FqName::new()
         .with_pushed(file_name_path_segment(file))
         .with_pushed(js_ts_segment(name, SegmentKind::Member))
@@ -255,7 +257,7 @@ pub(crate) fn file_scoped_field_fq(file: &ProjectFile, name: &str) -> FqName {
 /// Field code unit. Without this, the whole pattern would become a single unit
 /// literally named after the pattern text, and the individual binders could
 /// never be resolution targets (#1568).
-pub(crate) fn add_destructured_binder_units(
+pub fn add_destructured_binder_units(
     file: &ProjectFile,
     source: &str,
     pattern: Node<'_>,
@@ -264,7 +266,7 @@ pub(crate) fn add_destructured_binder_units(
     signature: &str,
     parsed: &mut ParsedFile,
 ) {
-    for binder in crate::analyzer::js_ts::syntax::pattern_binder_identifiers(pattern) {
+    for binder in crate::syntax::pattern_binder_identifiers(pattern) {
         let name = node_text(binder, source).trim();
         if name.is_empty() {
             continue;
@@ -298,7 +300,7 @@ pub(crate) fn add_destructured_binder_units(
 /// Whether `code_unit` is a module-scope field whose short name was qualified
 /// by `file_scoped_field_name` (and therefore needs the file-scope parent
 /// fallback in `parent_of`, rather than the ordinary structural parent).
-pub(crate) fn module_scoped_field_uses_file_name(code_unit: &CodeUnit) -> bool {
+pub fn module_scoped_field_uses_file_name(code_unit: &CodeUnit) -> bool {
     if !code_unit.is_field() {
         return false;
     }
@@ -314,7 +316,7 @@ pub(crate) fn module_scoped_field_uses_file_name(code_unit: &CodeUnit) -> bool {
 }
 
 /// Walks up to the outermost ancestor of `node` (the parse tree root).
-pub(crate) fn root_node(mut node: Node<'_>) -> Node<'_> {
+pub fn root_node(mut node: Node<'_>) -> Node<'_> {
     while let Some(parent) = node.parent() {
         node = parent;
     }
@@ -324,7 +326,7 @@ pub(crate) fn root_node(mut node: Node<'_>) -> Node<'_> {
 /// Collects every function-declaration or function-valued variable-declarator
 /// named `function_name` reachable from `node`, without descending into a
 /// matched function's own body (each match is a separate candidate source).
-pub(crate) fn collect_function_nodes<'tree>(
+pub fn collect_function_nodes<'tree>(
     node: Node<'tree>,
     source: &str,
     function_name: &str,
@@ -355,7 +357,7 @@ pub(crate) fn collect_function_nodes<'tree>(
 
 /// The callee's bare or member-property name, if the call target is a simple
 /// identifier or `a.b(...)`-shaped member access (not a computed/dynamic call).
-pub(crate) fn call_identifier_name(call: Node<'_>, source: &str) -> Option<String> {
+pub fn call_identifier_name(call: Node<'_>, source: &str) -> Option<String> {
     let function = call.child_by_field_name("function")?;
     matches!(function.kind(), "identifier" | "property_identifier")
         .then(|| node_text(function, source).trim().to_string())
@@ -366,7 +368,7 @@ pub(crate) fn call_identifier_name(call: Node<'_>, source: &str) -> Option<Strin
 /// used to construct a shape-preserving object (`define(...)`, `defineX(...)`,
 /// `object(...)`)? Used only as a last-resort fallback when the call's actual
 /// source function couldn't be found to check its return shape directly.
-pub(crate) fn call_has_likely_surface_factory_name(call: Node<'_>, source: &str) -> bool {
+pub fn call_has_likely_surface_factory_name(call: Node<'_>, source: &str) -> bool {
     let Some(function) = call.child_by_field_name("function") else {
         return false;
     };
@@ -388,7 +390,7 @@ pub(crate) fn call_has_likely_surface_factory_name(call: Node<'_>, source: &str)
 /// conventional name and breaks under `import * as zod` or aliased imports. Shared by both
 /// dialects (see issue #1167): this is pure tree-sitter node-shape matching with no
 /// language-specific grammar involved.
-pub(crate) fn call_is_schema_object_builder(call: Node<'_>, source: &str) -> bool {
+pub fn call_is_schema_object_builder(call: Node<'_>, source: &str) -> bool {
     let Some(function) = call.child_by_field_name("function") else {
         return false;
     };

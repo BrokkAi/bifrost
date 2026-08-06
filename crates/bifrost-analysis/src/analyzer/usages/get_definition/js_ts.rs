@@ -1,11 +1,16 @@
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
-use crate::analyzer::js_ts::imports::{
+use crate::analyzer::js_ts::providers::resolve_js_ts_host;
+use crate::analyzer::tree_walk::subtree_contains;
+use crate::analyzer::usages::js_ts_graph::{
+    browser_global_property_shape, unbound_browser_global_property,
+};
+use brokk_bifrost_js_ts::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
 };
-use crate::analyzer::js_ts::providers::{JsTsAnalyzerHost, resolve_js_ts_host};
-use crate::analyzer::js_ts::syntax::parse_js_ts_tree;
-use crate::analyzer::js_ts::syntax::{
+use brokk_bifrost_js_ts::providers::JsTsAnalyzerHost;
+use brokk_bifrost_js_ts::syntax::parse_js_ts_tree;
+use brokk_bifrost_js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, MAX_STATIC_IMPORT_BINDINGS_PER_NAME,
     direct_property_definitions, is_declaration_identifier, is_explicit_object_literal_key, slice,
 };
@@ -13,7 +18,7 @@ use crate::analyzer::js_ts::syntax::{
 /// rest of the JS/TS language logic, so the usage graph can call it without
 /// importing the definition route. The route imports it back, the mirror of what
 /// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
-use crate::analyzer::js_ts::ts_owners::{
+use brokk_bifrost_js_ts::ts_owners::{
     TsReceiverResolution, jsts_constructor_owner_candidates, jsts_enclosing_function_scope,
     jsts_identifier_candidates, jsts_member_candidates, node_text_matches, root_node,
     ts_call_expression_callees, ts_direct_object_literal_value,
@@ -21,15 +26,11 @@ use crate::analyzer::js_ts::ts_owners::{
     ts_receiver_owner_candidates_at_byte, ts_resolve_type_text_to_property_owners,
     ts_unwrap_expression,
 };
-use crate::analyzer::js_ts::type_text::{
+use brokk_bifrost_js_ts::type_text::{
     jsts_type_space_candidates, jsts_unit_is_type_only, jsts_value_space_candidates,
     ts_type_annotation_text,
 };
-use crate::analyzer::tree_walk::subtree_contains;
-use crate::analyzer::typescript::ts_is_global_internal_module;
-use crate::analyzer::usages::js_ts_graph::{
-    browser_global_property_shape, unbound_browser_global_property,
-};
+use brokk_bifrost_js_ts::typescript::ts_is_global_internal_module;
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct JsTsAliasCandidateKey {
@@ -760,7 +761,7 @@ fn ts_object_literal_property_at_key<'tree>(
     let object = property
         .parent()
         .filter(|parent| parent.kind() == "object")?;
-    let name = crate::analyzer::typescript::ts_object_literal_property_name(property, source)?;
+    let name = brokk_bifrost_js_ts::typescript::ts_object_literal_property_name(property, source)?;
     Some((property, object, name))
 }
 
@@ -1119,7 +1120,7 @@ fn jsts_focused_reference_receiver_property<'tree>(
     focused: Node<'tree>,
     source: &str,
 ) -> Option<(
-    crate::analyzer::js_ts::syntax::JsTsStaticMemberReceiver<'tree>,
+    brokk_bifrost_js_ts::syntax::JsTsStaticMemberReceiver<'tree>,
     Node<'tree>,
 )> {
     let member_expression = match focused.kind() {
@@ -1131,7 +1132,7 @@ fn jsts_focused_reference_receiver_property<'tree>(
     };
     let object = member_expression.child_by_field_name("object")?;
     let property = member_expression.child_by_field_name("property")?;
-    let receiver = crate::analyzer::js_ts::syntax::static_member_receiver(object, source)?;
+    let receiver = brokk_bifrost_js_ts::syntax::static_member_receiver(object, source)?;
     Some((receiver, property))
 }
 
@@ -1904,7 +1905,7 @@ fn ts_object_literal_has_member(object: Node<'_>, source: &str, member: &str) ->
     object
         .named_children(&mut cursor)
         .filter_map(|child| {
-            crate::analyzer::typescript::ts_object_literal_property_name(child, source)
+            brokk_bifrost_js_ts::typescript::ts_object_literal_property_name(child, source)
         })
         .any(|name| name == member)
 }

@@ -1,31 +1,35 @@
+//! The JS/TS shim.
+//!
+//! The language knowledge moved to `brokk-bifrost-js-ts`. What stays is what
+//! needs an analyzer: the moka memo bucket ([`cache`]), the memoizing provider
+//! wrappers and the one downcast ([`providers`]), the two analyzer-guarded
+//! diagnostic entry points ([`diagnostics`]), the `ReceiverFactsFactory`
+//! boundary adapter ([`receiver_facts`]), the clone-candidate entry point
+//! ([`clones`]), the two `LanguageSupport` registrations below, and the bands
+//! parked on `analyzer::semantic` ([`semantic`]) and `semantic_model`
+//! ([`external`]).
+
 pub(crate) mod cache;
 pub(crate) mod clones;
 pub(crate) mod diagnostics;
 pub(crate) mod external;
-pub(crate) mod hierarchy;
-pub(crate) mod identifiers;
-pub(crate) mod imports;
-pub(crate) mod model;
 pub(crate) mod providers;
+#[cfg(test)]
+mod receiver_analysis_tests;
+pub(crate) mod receiver_facts;
 pub(crate) mod semantic;
-pub(crate) mod structural;
-pub(crate) mod syntax;
-pub(crate) mod tests;
-pub(crate) mod ts_owners;
-pub(crate) mod tsconfig;
-pub(crate) mod type_text;
+mod structural;
 use crate::analyzer::store::LimitedQueryRows;
 
+pub(crate) use brokk_bifrost_js_ts::imports::resolve_js_ts_module_specifier;
+pub(crate) use brokk_bifrost_js_ts::tsconfig::AliasResolver;
 pub use external::{
     JsTsDependencyPackAdapter, TypeScriptDeclarationPackProducer,
     resolve_js_ts_semantic_pack_dependencies,
 };
-pub(crate) use imports::resolve_js_ts_module_specifier;
-pub(crate) use tsconfig::AliasResolver;
 
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::common::language_for_target;
-use crate::analyzer::js_ts::model::module_code_unit;
 use crate::analyzer::languages::{
     DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport,
     EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites,
@@ -48,6 +52,7 @@ use crate::analyzer::{
 };
 use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
+use brokk_bifrost_js_ts::model::module_code_unit;
 use std::sync::LazyLock;
 
 static JS_TS_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
@@ -168,7 +173,7 @@ impl LanguageSupport for JavascriptSupport {
     }
 
     fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
-        &structural::JAVASCRIPT_STRUCTURAL_SPEC
+        &brokk_bifrost_js_ts::structural::JAVASCRIPT_STRUCTURAL_SPEC
     }
 
     fn highlight_query(&self) -> Option<&'static str> {
@@ -247,7 +252,7 @@ impl LanguageSupport for TypescriptSupport {
     }
 
     fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
-        &structural::TYPESCRIPT_STRUCTURAL_SPEC
+        &brokk_bifrost_js_ts::structural::TYPESCRIPT_STRUCTURAL_SPEC
     }
 
     fn highlight_query(&self) -> Option<&'static str> {

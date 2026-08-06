@@ -18,24 +18,25 @@
 //! that only read declaration ranges take `&dyn CodeUnitIndex` instead, so their
 //! framework callers need no downcast at all.
 
-use crate::analyzer::js_ts::imports::{
+use crate::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
 };
-use crate::analyzer::js_ts::providers::JsTsAnalyzerHost;
-use crate::analyzer::js_ts::syntax::compute_import_binder as compute_jsts_import_binder;
-use crate::analyzer::js_ts::syntax::{JsTsImportBinder, parse_js_ts_tree};
-use crate::analyzer::js_ts::type_text::{
+use crate::providers::JsTsAnalyzerHost;
+use crate::syntax::compute_import_binder as compute_jsts_import_binder;
+use crate::syntax::{JsTsImportBinder, parse_js_ts_tree};
+use crate::tsconfig::AliasResolver;
+use crate::type_text::{
     jsts_type_space_candidates, jsts_unit_is_type_only, jsts_value_space_candidates,
     ts_clean_type_text, ts_type_annotation_text,
 };
-use crate::analyzer::usages::ImportKind;
-use crate::analyzer::{
-    AliasResolver, BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, Language, ProjectFile,
-};
-use crate::hash::HashSet;
 use brokk_bifrost_core::analyzer::definition_lookup::sort_units;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
+use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 use brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering;
+use brokk_bifrost_core::analyzer::{
+    BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, Language, ProjectFile,
+};
+use brokk_bifrost_core::hash::HashSet;
 use std::cell::{Cell, RefCell};
 use tree_sitter::Node;
 
@@ -49,7 +50,7 @@ struct TsReceiverResolutionKey {
 }
 
 #[derive(Default)]
-pub(crate) struct TsReceiverResolution {
+pub struct TsReceiverResolution {
     active: RefCell<HashSet<TsReceiverResolutionKey>>,
     depth: Cell<usize>,
 }
@@ -84,7 +85,7 @@ impl Drop for TsReceiverResolutionGuard<'_> {
     }
 }
 
-pub(crate) fn jsts_member_candidates(
+pub fn jsts_member_candidates(
     host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     receiver_candidates: Vec<CodeUnit>,
@@ -102,12 +103,12 @@ pub(crate) fn jsts_member_candidates(
     }
 }
 
-pub(crate) fn ts_direct_object_literal_value(node: Node<'_>) -> Option<Node<'_>> {
+pub fn ts_direct_object_literal_value(node: Node<'_>) -> Option<Node<'_>> {
     let node = ts_unwrap_expression(node)?;
     (node.kind() == "object").then_some(node)
 }
 
-pub(crate) fn ts_unwrap_expression(node: Node<'_>) -> Option<Node<'_>> {
+pub fn ts_unwrap_expression(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "as_expression"
         | "satisfies_expression"
@@ -127,7 +128,7 @@ pub(crate) fn ts_unwrap_expression(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn ts_receiver_owner_candidates_at_byte(
+pub fn ts_receiver_owner_candidates_at_byte(
     host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
@@ -208,7 +209,7 @@ fn jsts_enclosing_class(
         .cloned()
 }
 
-pub(crate) fn jsts_enclosing_function_scope(root: Node<'_>, byte: usize) -> Option<Node<'_>> {
+pub fn jsts_enclosing_function_scope(root: Node<'_>, byte: usize) -> Option<Node<'_>> {
     let mut current = smallest_named_node_covering(root, byte, byte)?;
     loop {
         if matches!(
@@ -345,7 +346,7 @@ fn ts_callback_parameter_index(scope: Node<'_>, source: &str, receiver: &str) ->
         .position(|name| node_text_matches(name, source, receiver))
 }
 
-pub(crate) fn ts_parameter_name_node(parameter: Node<'_>) -> Option<Node<'_>> {
+pub fn ts_parameter_name_node(parameter: Node<'_>) -> Option<Node<'_>> {
     match parameter.kind() {
         "identifier" | "shorthand_property_identifier_pattern" => Some(parameter),
         "required_parameter" | "optional_parameter" => parameter
@@ -750,7 +751,7 @@ fn ts_expression_property_owners(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn jsts_constructor_owner_candidates(
+pub fn jsts_constructor_owner_candidates(
     host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
@@ -798,7 +799,7 @@ fn jsts_constructor_name<'a>(constructor: Node<'_>, source: &'a str) -> Option<&
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn ts_call_expression_callees(
+pub fn ts_call_expression_callees(
     host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
@@ -918,7 +919,7 @@ fn ts_expression_receiver_owners(
     }
 }
 
-pub(crate) fn root_node(mut node: Node<'_>) -> Node<'_> {
+pub fn root_node(mut node: Node<'_>) -> Node<'_> {
     while let Some(parent) = node.parent() {
         node = parent;
     }
@@ -950,7 +951,7 @@ fn ts_identifier_candidates(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn jsts_identifier_candidates(
+pub fn jsts_identifier_candidates(
     host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     language: Language,
@@ -987,7 +988,7 @@ pub(crate) fn jsts_identifier_candidates(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn ts_resolve_type_text_to_property_owners(
+pub fn ts_resolve_type_text_to_property_owners(
     host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
@@ -1109,7 +1110,7 @@ fn ts_expand_property_owners(
     owners
 }
 
-pub(crate) fn ts_expand_call_return_property_owners(
+pub fn ts_expand_call_return_property_owners(
     host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     callees: Vec<CodeUnit>,
@@ -1142,7 +1143,7 @@ fn jsts_function_returns_direct_object_literal(
     let Ok(source) = function.source().read_to_string() else {
         return false;
     };
-    let language = crate::analyzer::common::language_for_file(function.source());
+    let language = brokk_bifrost_core::analyzer::common::language_for_file(function.source());
     let Some(tree) = parse_js_ts_tree(function.source(), &source, language) else {
         return false;
     };
@@ -1242,7 +1243,7 @@ fn ts_resolve_type_from_unit_context(
     )
 }
 
-pub(crate) fn ts_function_return_property_owners(
+pub fn ts_function_return_property_owners(
     host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     function: &CodeUnit,
@@ -1298,7 +1299,7 @@ fn ts_function_return_type_text(function: Node<'_>, source: &str) -> Option<Stri
         .filter(|text| !text.is_empty())
 }
 
-pub(crate) fn ts_nodes_for_code_unit<'tree>(
+pub fn ts_nodes_for_code_unit<'tree>(
     unit_index: &dyn CodeUnitIndex,
     unit: &CodeUnit,
     root: Node<'tree>,
@@ -1433,7 +1434,7 @@ fn ts_pattern_binds_name(pattern: Node<'_>, source: &str, receiver: &str) -> boo
     false
 }
 
-pub(crate) fn node_text_matches(node: Node<'_>, source: &str, expected: &str) -> bool {
+pub fn node_text_matches(node: Node<'_>, source: &str, expected: &str) -> bool {
     source
         .get(node.start_byte()..node.end_byte())
         .is_some_and(|text| text.trim() == expected)
@@ -1481,9 +1482,10 @@ fn ts_schema_infer_argument(text: &str) -> Option<&str> {
     // splitter and taking the last segment reproduces `rsplit('.').next()`'s
     // terminal split exactly (TS/JS have no per-segment normalization
     // quirks, unlike Go/Rust/Cpp).
-    let last = crate::analyzer::symbol_lookup::parse_symbol_path(Language::TypeScript, head)
-        .pop()
-        .unwrap_or_default();
+    let last =
+        brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(Language::TypeScript, head)
+            .pop()
+            .unwrap_or_default();
     if !head.contains('.') || !(last == "infer" || last == "Infer") {
         return None;
     }

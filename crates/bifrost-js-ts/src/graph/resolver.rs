@@ -1,17 +1,17 @@
-use crate::analyzer::js_ts::syntax::{
-    JsTsImportBinder, JsTsLexicalBindingIndex, compute_import_binder, slice,
+use crate::graph::common::{analyzed_files_for_language, language_for_target_filtered};
+use crate::graph::extractor::compute_export_index;
+use crate::imports::resolve_js_ts_module_specifier;
+use crate::parse::js_ts_tree_sitter_language_for_file;
+use crate::syntax::{JsTsImportBinder, JsTsLexicalBindingIndex, compute_import_binder, slice};
+use crate::tsconfig::AliasResolver;
+use brokk_bifrost_core::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
+use brokk_bifrost_core::analyzer::usages::model::{
+    ExportEntry, ExportIndex, ImportBinding, ImportKind,
 };
-use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_target_filtered};
-use crate::analyzer::usages::js_ts_graph::extractor::compute_export_index;
-use crate::analyzer::usages::model::{ExportEntry, ExportIndex, ImportBinding, ImportKind};
-use crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file;
-use crate::analyzer::usages::reexport_seeds;
-use crate::analyzer::usages::{ImportEdge, ImportEdgeKind};
-use crate::analyzer::{
-    AliasResolver, CodeUnit, CodeUnitIndex, Language, ProjectFile, resolve_js_ts_module_specifier,
-};
-use crate::cancellation::CancellationToken;
-use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
+use brokk_bifrost_core::analyzer::usages::reexport_seeds;
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile};
+use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use rayon::prelude::*;
 use std::collections::{BTreeSet, VecDeque};
 use tree_sitter::{Node, Parser};
@@ -22,21 +22,21 @@ use tree_sitter::{Node, Parser};
 /// seeds + importer edges without a cross-file graph. Plain data (no syntax trees), so it
 /// can be cached on the analyzer and reused across queries.
 #[derive(Default, Clone)]
-pub(crate) struct JsTsUsageIndex {
-    pub(super) exports_by_file: HashMap<ProjectFile, ExportIndex>,
-    pub(super) binders_by_file: HashMap<ProjectFile, JsTsImportBinder>,
-    pub(super) reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
-    pub(super) direct_reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
-    pub(super) star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
-    pub(super) direct_star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
-    pub(super) importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
+pub struct JsTsUsageIndex {
+    pub exports_by_file: HashMap<ProjectFile, ExportIndex>,
+    pub binders_by_file: HashMap<ProjectFile, JsTsImportBinder>,
+    pub reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
+    pub direct_reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
+    pub star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
+    pub direct_star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
+    pub importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
 }
 
 /// Build the cacheable [`JsTsUsageIndex`] for one language: parse every file once to
 /// derive its export/import indices, then build the re-export + importer maps — dropping
 /// the syntax trees as soon as the per-file indices are computed (the maps are the only
 /// thing the analyzer caches; the scan phase re-parses its candidate files on demand).
-pub(crate) fn build_jsts_usage_index(
+pub fn build_jsts_usage_index(
     analyzer: &dyn CodeUnitIndex,
     language: Language,
     parallel: bool,
@@ -44,7 +44,7 @@ pub(crate) fn build_jsts_usage_index(
     build_jsts_usage_index_with_cancellation(analyzer, language, parallel, None).unwrap_or_default()
 }
 
-pub(crate) fn build_jsts_usage_index_with_cancellation(
+pub fn build_jsts_usage_index_with_cancellation(
     analyzer: &dyn CodeUnitIndex,
     language: Language,
     parallel: bool,
@@ -132,7 +132,7 @@ fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
 impl JsTsUsageIndex {
     /// Resolve `exported_name` as exported by `module_files` to concrete local
     /// declarations, following named re-export chains and `export *` barrels.
-    pub(crate) fn local_bindings_for_exported_name(
+    pub fn local_bindings_for_exported_name(
         &self,
         module_files: &[ProjectFile],
         exported_name: &str,
@@ -195,7 +195,7 @@ impl JsTsUsageIndex {
     /// specifier that cannot be resolved inside the index. This distinguishes an
     /// external re-export boundary from a workspace module that simply does not
     /// export the requested name.
-    pub(crate) fn unresolved_reexport_boundary(
+    pub fn unresolved_reexport_boundary(
         &self,
         module_files: &[ProjectFile],
         exported_name: &str,
@@ -262,7 +262,7 @@ impl JsTsUsageIndex {
         None
     }
 
-    pub(crate) fn import_bindings<'a>(
+    pub fn import_bindings<'a>(
         &'a self,
         importer: &ProjectFile,
         local_name: &'a str,
@@ -276,7 +276,7 @@ impl JsTsUsageIndex {
     /// Export seeds for `target_short`/`target_name` in `target_file`, following named
     /// and star re-export chains across files. Member targets only match the owner
     /// export when the analyzer reports that owner as the declaration parent.
-    pub(super) fn seeds_for_target(
+    pub fn seeds_for_target(
         &self,
         target_file: &ProjectFile,
         target_short: &str,
@@ -296,7 +296,7 @@ impl JsTsUsageIndex {
 
     /// Files that import one of the `seeds` (plus the seed files themselves) — the
     /// candidate set the forward scan narrows to.
-    pub(super) fn importers_of_seeds(
+    pub fn importers_of_seeds(
         &self,
         seeds: &BTreeSet<(ProjectFile, String)>,
     ) -> HashSet<ProjectFile> {
@@ -313,7 +313,7 @@ impl JsTsUsageIndex {
     }
 
     /// The import edges in `importer` that bind one of the `seeds`.
-    pub(super) fn matching_edges_for_importer(
+    pub fn matching_edges_for_importer(
         &self,
         importer: &ProjectFile,
         seeds: &BTreeSet<(ProjectFile, String)>,
@@ -322,7 +322,7 @@ impl JsTsUsageIndex {
     }
 }
 
-pub(super) fn combine_jsts_usage_indices<'a>(
+pub fn combine_jsts_usage_indices<'a>(
     analyzer: &dyn CodeUnitIndex,
     indices: impl Iterator<Item = &'a JsTsUsageIndex>,
 ) -> JsTsUsageIndex {
@@ -670,10 +670,7 @@ fn export_names_for_file(
     names
 }
 
-pub(super) fn collect_jsts_files(
-    analyzer: &dyn CodeUnitIndex,
-    language: Language,
-) -> Vec<ProjectFile> {
+pub fn collect_jsts_files(analyzer: &dyn CodeUnitIndex, language: Language) -> Vec<ProjectFile> {
     let mut result = analyzed_files_for_language(analyzer, language);
     result.sort();
     result.dedup();
@@ -681,7 +678,7 @@ pub(super) fn collect_jsts_files(
 }
 
 /// The default tree-sitter grammar for a JS/TS language, or `None` for anything else.
-pub(super) fn tree_sitter_language_for(language: Language) -> Option<tree_sitter::Language> {
+pub fn tree_sitter_language_for(language: Language) -> Option<tree_sitter::Language> {
     match language {
         Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
         Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
@@ -689,13 +686,13 @@ pub(super) fn tree_sitter_language_for(language: Language) -> Option<tree_sitter
     }
 }
 
-pub(super) fn target_language(target: &CodeUnit) -> Language {
+pub fn target_language(target: &CodeUnit) -> Language {
     language_for_target_filtered(target, |lang| {
         matches!(lang, Language::JavaScript | Language::TypeScript)
     })
 }
 
-pub(super) fn member_name(target: &CodeUnit) -> Option<String> {
+pub fn member_name(target: &CodeUnit) -> Option<String> {
     // Anything past the first dot is treated as the member chain. We strip TS-specific
     // `$static` suffix to align with the original syntactic name.
     let parts: Vec<&str> = target.short_name().split('.').collect(); // fqname-M4: enumerates the package-less short_name segments; fq segments include the package prefix, changing this JS/TS member walk
@@ -706,9 +703,7 @@ pub(super) fn member_name(target: &CodeUnit) -> Option<String> {
     Some(last.trim_end_matches("$static").to_string())
 }
 
-pub(in crate::analyzer::usages) fn browser_global_property_shape(
-    target: &CodeUnit,
-) -> Option<(&str, &str)> {
+pub fn browser_global_property_shape(target: &CodeUnit) -> Option<(&str, &str)> {
     if !target.is_field() && !target.is_function() {
         return None;
     }
@@ -717,7 +712,7 @@ pub(in crate::analyzer::usages) fn browser_global_property_shape(
         .then_some((object, property))
 }
 
-pub(in crate::analyzer::usages) fn unbound_browser_global_property<'a>(
+pub fn unbound_browser_global_property<'a>(
     analyzer: &dyn CodeUnitIndex,
     target: &'a CodeUnit,
     root: Node<'_>,
@@ -765,6 +760,6 @@ pub(in crate::analyzer::usages) fn unbound_browser_global_property<'a>(
     found.then_some((object_name, property_name))
 }
 
-pub(super) fn is_static_member(target: &CodeUnit) -> bool {
+pub fn is_static_member(target: &CodeUnit) -> bool {
     target.short_name().ends_with("$static")
 }

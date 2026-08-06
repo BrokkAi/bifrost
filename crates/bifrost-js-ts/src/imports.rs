@@ -1,16 +1,16 @@
-use crate::analyzer::js_ts::providers::JsTsAnalyzerHost;
-use crate::analyzer::js_ts::syntax::JsTsImportBinder;
-use crate::analyzer::js_ts::tsconfig::AliasResolver;
-use crate::analyzer::js_ts::type_text::{jsts_type_space_candidates, jsts_value_space_candidates};
-use crate::analyzer::usages::ImportKind;
-use crate::analyzer::usages::js_ts_graph::cached_jsts_index_for_host;
-use crate::analyzer::{BoundedDefinitionLookup, CodeUnit, ImportInfo, Language, ProjectFile};
+use crate::providers::JsTsAnalyzerHost;
+use crate::syntax::JsTsImportBinder;
+use crate::tsconfig::AliasResolver;
+use crate::type_text::{jsts_type_space_candidates, jsts_value_space_candidates};
 use brokk_bifrost_core::analyzer::definition_lookup::sort_units;
+use brokk_bifrost_core::analyzer::model::ImportInfo;
+use brokk_bifrost_core::analyzer::usages::model::ImportKind;
+use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, Language, ProjectFile};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tree_sitter::Node;
 
-pub(crate) fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
+pub fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
     if node.kind() != "import_statement" {
         return Vec::new();
     }
@@ -46,7 +46,7 @@ pub(crate) fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> V
                         identifier: Some(identifier.to_string()),
                         alias: None,
                         path: None,
-                        binder_span: Some(crate::analyzer::common::node_span(child)),
+                        binder_span: Some(brokk_bifrost_core::analyzer::common::node_span(child)),
                     });
                 }
             }
@@ -61,7 +61,9 @@ pub(crate) fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> V
                             alias: Some(alias),
                             path: None,
                             // A namespace import binds one name: its alias token.
-                            binder_span: Some(crate::analyzer::common::node_span(alias_node)),
+                            binder_span: Some(brokk_bifrost_core::analyzer::common::node_span(
+                                alias_node,
+                            )),
                         });
                     }
                 }
@@ -73,7 +75,7 @@ pub(crate) fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> V
     imports
 }
 
-pub(crate) fn parse_commonjs_require_import_infos_from_node(
+pub fn parse_commonjs_require_import_infos_from_node(
     node: Node<'_>,
     source: &str,
 ) -> Vec<ImportInfo> {
@@ -110,22 +112,22 @@ pub(crate) fn parse_commonjs_require_import_infos_from_node(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CommonJsRequireBinding {
-    pub(crate) raw_snippet: String,
-    pub(crate) module_specifier: String,
-    pub(crate) local_name: String,
-    pub(crate) imported_name: String,
-    pub(crate) alias: Option<String>,
-    pub(crate) kind: CommonJsRequireBindingKind,
+pub struct CommonJsRequireBinding {
+    pub raw_snippet: String,
+    pub module_specifier: String,
+    pub local_name: String,
+    pub imported_name: String,
+    pub alias: Option<String>,
+    pub kind: CommonJsRequireBindingKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CommonJsRequireBindingKind {
+pub enum CommonJsRequireBindingKind {
     ModuleObject,
     Named,
 }
 
-pub(crate) fn parse_commonjs_require_bindings_from_node(
+pub fn parse_commonjs_require_bindings_from_node(
     node: Node<'_>,
     source: &str,
 ) -> Vec<CommonJsRequireBinding> {
@@ -236,7 +238,7 @@ fn commonjs_require_bindings_from_name(
     }
 }
 
-pub(crate) fn commonjs_require_module_specifier_from_declarator(
+pub fn commonjs_require_module_specifier_from_declarator(
     declarator: Node<'_>,
     source: &str,
 ) -> Option<String> {
@@ -244,7 +246,7 @@ pub(crate) fn commonjs_require_module_specifier_from_declarator(
     require_call_module_specifier(value, source)
 }
 
-pub(crate) fn require_call_module_specifier(node: Node<'_>, source: &str) -> Option<String> {
+pub fn require_call_module_specifier(node: Node<'_>, source: &str) -> Option<String> {
     if node.kind() != "call_expression" {
         return None;
     }
@@ -314,7 +316,7 @@ fn collect_named_es_imports(
         let binder_span = alias_node
             .filter(|_| alias.as_deref().is_some_and(|alias| !alias.is_empty()))
             .or(name_node)
-            .map(crate::analyzer::common::node_span);
+            .map(brokk_bifrost_core::analyzer::common::node_span);
         imports.push(ImportInfo {
             raw_snippet: raw.to_string(),
             is_wildcard: false,
@@ -339,7 +341,7 @@ fn first_identifier_child_node(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text(node, source)
+    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
 fn unquote(text: &str) -> String {
@@ -355,7 +357,7 @@ fn unquote(text: &str) -> String {
     stripped.unwrap_or(trimmed).to_string()
 }
 
-pub(crate) fn resolve_js_ts_import_paths(
+pub fn resolve_js_ts_import_paths(
     source_file: &ProjectFile,
     raw_import: &str,
     language: Language,
@@ -373,7 +375,7 @@ pub(crate) fn resolve_js_ts_import_paths(
 /// `aliases` (when supplied). Bare package specifiers that match no alias are still
 /// ignored — `package.json` `exports`/`main` resolution remains out of scope. Shared with
 /// the JS/TS export-usage graph so both resolvers stay in lock-step.
-pub(crate) fn resolve_js_ts_module_specifier(
+pub fn resolve_js_ts_module_specifier(
     source_file: &ProjectFile,
     module_specifier: &str,
     language: Language,
@@ -486,7 +488,7 @@ fn ts_source_extensions_for_runtime_specifier(
     }
 }
 
-pub(crate) fn import_info_tokens(import: &ImportInfo) -> BTreeSet<String> {
+pub fn import_info_tokens(import: &ImportInfo) -> BTreeSet<String> {
     import
         .local_name()
         .map(str::to_string)
@@ -494,7 +496,7 @@ pub(crate) fn import_info_tokens(import: &ImportInfo) -> BTreeSet<String> {
         .collect()
 }
 
-pub(crate) fn extract_js_ts_call_receiver(reference: &str) -> Option<String> {
+pub fn extract_js_ts_call_receiver(reference: &str) -> Option<String> {
     let trimmed = reference.trim();
     let before_args = trimmed
         .split_once('(')
@@ -508,7 +510,7 @@ pub(crate) fn extract_js_ts_call_receiver(reference: &str) -> Option<String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve_js_ts_module_binding_candidates(
+pub fn resolve_js_ts_module_binding_candidates(
     host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     language: Language,
@@ -518,7 +520,7 @@ pub(crate) fn resolve_js_ts_module_binding_candidates(
     aliases: Option<&AliasResolver>,
     value_position: bool,
 ) -> Vec<CodeUnit> {
-    let files = crate::analyzer::resolve_js_ts_module_specifier(file, module, language, aliases);
+    let files = crate::imports::resolve_js_ts_module_specifier(file, module, language, aliases);
     if files.is_empty() {
         return Vec::new();
     }
@@ -550,7 +552,7 @@ pub(crate) fn resolve_js_ts_module_binding_candidates(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve_js_ts_direct_import_candidates(
+pub fn resolve_js_ts_direct_import_candidates(
     host: &dyn JsTsAnalyzerHost,
     support: &dyn BoundedDefinitionLookup,
     language: Language,
@@ -595,7 +597,7 @@ fn jsts_module_export_candidates(
     exported_name: &str,
     value_position: bool,
 ) -> Vec<CodeUnit> {
-    let Some(index) = cached_jsts_index_for_host(host, None) else {
+    let Some(index) = host.js_ts_usage_index(None) else {
         return Vec::new();
     };
 
@@ -618,7 +620,9 @@ mod tests {
     use super::parse_es_import_infos_from_node;
     use tree_sitter::Parser;
 
-    fn parse_typescript_import_infos(source: &str) -> Vec<crate::analyzer::ImportInfo> {
+    fn parse_typescript_import_infos(
+        source: &str,
+    ) -> Vec<brokk_bifrost_core::analyzer::model::ImportInfo> {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())

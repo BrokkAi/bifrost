@@ -8,7 +8,6 @@ use serde_json::Value;
 use tree_sitter::{Node, Parser};
 
 use crate::CancellationToken;
-use crate::analyzer::js_ts::model::node_text;
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
@@ -24,6 +23,7 @@ use crate::analyzer::semantic_model::{
 };
 use crate::analyzer::{JsTsDependencyDiscoveryConfig, Project};
 use crate::hash::HashMap;
+use brokk_bifrost_js_ts::model::node_text;
 
 #[derive(Debug)]
 struct NpmDiagnostic {

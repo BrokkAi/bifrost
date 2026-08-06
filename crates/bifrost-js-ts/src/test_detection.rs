@@ -1,5 +1,6 @@
 use super::model::node_text;
-use crate::analyzer::{ProjectFile, TestAssertionSmell, TestAssertionWeights};
+use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
 use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::{Language as TsLanguage, Node, Parser};
@@ -57,7 +58,7 @@ struct JsTsAssertionSignal {
     start_byte: usize,
 }
 
-pub(crate) fn detect_js_ts_test_assertion_smells(
+pub fn detect_js_ts_test_assertion_smells(
     file: &ProjectFile,
     source: &str,
     parser_language: TsLanguage,

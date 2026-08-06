@@ -1,13 +1,9 @@
 use super::model::node_text;
-use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::Node;
 
-pub(crate) fn collect_js_ts_identifiers(
-    node: Node<'_>,
-    source: &str,
-    identifiers: &mut HashSet<String>,
-) {
+pub fn collect_js_ts_identifiers(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
     walk_named_tree_preorder(node, true, |node| {
         match node.kind() {
             "identifier" | "type_identifier" | "property_identifier" => {

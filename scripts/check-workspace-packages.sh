@@ -7,6 +7,7 @@ readonly packages=(
   brokk-bifrost-cpp
   brokk-bifrost-csharp
   brokk-bifrost-go
+  brokk-bifrost-js-ts
   brokk-bifrost-jvm
   brokk-bifrost-php
   brokk-bifrost-python
@@ -38,6 +39,7 @@ readonly cargo_patch_args=(
   --config 'patch.crates-io.brokk-bifrost-cpp.path="crates/bifrost-cpp"'
   --config 'patch.crates-io.brokk-bifrost-csharp.path="crates/bifrost-csharp"'
   --config 'patch.crates-io.brokk-bifrost-go.path="crates/bifrost-go"'
+  --config 'patch.crates-io.brokk-bifrost-js-ts.path="crates/bifrost-js-ts"'
   --config 'patch.crates-io.brokk-bifrost-jvm.path="crates/bifrost-jvm"'
   --config 'patch.crates-io.brokk-bifrost-php.path="crates/bifrost-php"'
   --config 'patch.crates-io.brokk-bifrost-python.path="crates/bifrost-python"'
@@ -130,6 +132,12 @@ require_archive_file brokk-bifrost-csharp resources/treesitter/c_sharp/imports.s
 require_archive_file brokk-bifrost-go resources/treesitter/go/definitions.scm
 require_archive_file brokk-bifrost-go resources/treesitter/go/identifiers.scm
 require_archive_file brokk-bifrost-go resources/treesitter/go/imports.scm
+require_archive_file brokk-bifrost-js-ts resources/treesitter/javascript/definitions.scm
+require_archive_file brokk-bifrost-js-ts resources/treesitter/javascript/identifiers.scm
+require_archive_file brokk-bifrost-js-ts resources/treesitter/javascript/imports.scm
+require_archive_file brokk-bifrost-js-ts resources/treesitter/typescript/definitions.scm
+require_archive_file brokk-bifrost-js-ts resources/treesitter/typescript/identifiers.scm
+require_archive_file brokk-bifrost-js-ts resources/treesitter/typescript/imports.scm
 require_archive_file brokk-bifrost-jvm resources/treesitter/java/definitions.scm
 require_archive_file brokk-bifrost-jvm resources/treesitter/java/identifiers.scm
 require_archive_file brokk-bifrost-jvm resources/treesitter/java/imports.scm
@@ -249,6 +257,7 @@ brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
 brokk-bifrost-cpp = { path = "$unpacked/brokk-bifrost-cpp-$version" }
 brokk-bifrost-csharp = { path = "$unpacked/brokk-bifrost-csharp-$version" }
 brokk-bifrost-go = { path = "$unpacked/brokk-bifrost-go-$version" }
+brokk-bifrost-js-ts = { path = "$unpacked/brokk-bifrost-js-ts-$version" }
 brokk-bifrost-jvm = { path = "$unpacked/brokk-bifrost-jvm-$version" }
 brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
 brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }
@@ -289,6 +298,7 @@ brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
 brokk-bifrost-cpp = { path = "$unpacked/brokk-bifrost-cpp-$version" }
 brokk-bifrost-csharp = { path = "$unpacked/brokk-bifrost-csharp-$version" }
 brokk-bifrost-go = { path = "$unpacked/brokk-bifrost-go-$version" }
+brokk-bifrost-js-ts = { path = "$unpacked/brokk-bifrost-js-ts-$version" }
 brokk-bifrost-jvm = { path = "$unpacked/brokk-bifrost-jvm-$version" }
 brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
 brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }

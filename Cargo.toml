@@ -5,6 +5,7 @@ members = [
     "crates/bifrost-cpp",
     "crates/bifrost-csharp",
     "crates/bifrost-go",
+    "crates/bifrost-js-ts",
     "crates/bifrost-jvm",
     "crates/bifrost-lsp",
     "crates/bifrost-mcp",

@@ -10,12 +10,6 @@
 //! [`super::extract`], which is the engine this crate owns; keeping its two
 //! companions beside it keeps adapter test support in one place.
 
-pub(crate) use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    field_name_in_parent, first_named_child, linear_chain_tokens, nearest_ancestor, node_range,
-    qualified_chain_root, spelled_generic_arity,
-};
-
 #[cfg(test)]
 use super::kinds::NormalizedKind;
 

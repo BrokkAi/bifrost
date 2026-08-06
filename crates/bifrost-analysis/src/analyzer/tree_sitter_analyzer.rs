@@ -6,9 +6,8 @@
 // everything built on `FileState`.
 pub use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
 pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{
-    BoundedNamedTreeWalk, WalkControl, expanded_comment_start, node_range,
-    try_walk_named_tree_preorder, walk_named_tree_preorder, walk_named_tree_preorder_bounded,
-    walk_tree_preorder,
+    BoundedNamedTreeWalk, WalkControl, expanded_comment_start, try_walk_named_tree_preorder,
+    walk_named_tree_preorder, walk_named_tree_preorder_bounded, walk_tree_preorder,
 };
 
 // `PreparedSyntaxTree` and its source backing hold model data plus a live

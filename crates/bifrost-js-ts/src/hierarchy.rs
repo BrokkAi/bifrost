@@ -1,14 +1,14 @@
-use crate::analyzer::js_ts::AliasResolver;
-use crate::analyzer::js_ts::model::node_text;
-use crate::analyzer::usages::{ImportKind, js_ts_graph::JsTsUsageIndex};
-use crate::analyzer::{
-    CodeUnit, CodeUnitIndex, DirectDescendantIndex, Language, ProjectFile, TypeHierarchyProvider,
-    resolve_js_ts_module_specifier,
-};
-use crate::hash::{HashMap, HashSet};
+use crate::graph::resolver::JsTsUsageIndex;
+use crate::imports::resolve_js_ts_module_specifier;
+use crate::model::node_text;
+use crate::tsconfig::AliasResolver;
+use brokk_bifrost_core::analyzer::capabilities::{DirectDescendantIndex, TypeHierarchyProvider};
+use brokk_bifrost_core::analyzer::usages::model::ImportKind;
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
-pub(crate) fn extract_js_supertypes(declaration: Node<'_>, source: &str) -> Vec<String> {
+pub fn extract_js_supertypes(declaration: Node<'_>, source: &str) -> Vec<String> {
     if let Some(superclass) = declaration.child_by_field_name("superclass")
         && let Some(text) = type_reference_text(superclass, source)
     {
@@ -35,7 +35,7 @@ pub(crate) fn extract_js_supertypes(declaration: Node<'_>, source: &str) -> Vec<
     Vec::new()
 }
 
-pub(crate) fn extract_ts_supertypes(declaration: Node<'_>, source: &str) -> Vec<String> {
+pub fn extract_ts_supertypes(declaration: Node<'_>, source: &str) -> Vec<String> {
     let mut raw = Vec::new();
     let mut seen = HashSet::default();
     collect_ts_heritage_types(declaration, source, &mut raw, &mut seen);
@@ -64,7 +64,7 @@ fn collect_ts_heritage_types(
     }
 }
 
-pub(crate) fn resolve_direct_ancestors(
+pub fn resolve_direct_ancestors(
     analyzer: &dyn CodeUnitIndex,
     index: &JsTsUsageIndex,
     language: Language,
@@ -96,7 +96,7 @@ pub(crate) fn resolve_direct_ancestors(
     ancestors
 }
 
-pub(crate) fn build_direct_descendant_index_by_unit<P>(
+pub fn build_direct_descendant_index_by_unit<P>(
     analyzer: &dyn CodeUnitIndex,
     provider: &P,
 ) -> DirectDescendantIndex

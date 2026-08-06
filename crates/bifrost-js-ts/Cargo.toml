@@ -1,0 +1,44 @@
+[package]
+name = "brokk-bifrost-js-ts"
+version.workspace = true
+edition.workspace = true
+description = "JavaScript and TypeScript language knowledge for brokk-bifrost: declarations, ESM/CommonJS imports and tsconfig path aliases, receiver facts, and usage-graph resolution"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[lib]
+name = "brokk_bifrost_js_ts"
+
+[dependencies]
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22" }
+# `scan_files_for_seeds` and the usage-index builder walk the workspace file set
+# in parallel; these are the seam's only two rayon sites and both moved here.
+rayon = "1.10.0"
+# The seven assertion-family patterns behind JS/TS test-smell detection.
+regex = "1.12.2"
+# `tsconfig.json`/`jsconfig.json` are JSONC, which `tsconfig::AliasResolver`
+# strips and then parses for its `paths` map.
+serde_json = "1.0.145"
+tree-sitter = "0.25.10"
+tree-sitter-javascript = "0.25.0"
+# tree-sitter-typescript is a grammar generation behind the fleet's 0.25 line,
+# in the same class as tree-sitter-c-sharp 0.23.1, tree-sitter-cpp 0.23.4 and
+# tree-sitter-ruby 0.23.1. It is versioned independently of
+# tree-sitter-javascript even though one module drives both dialects, and it is
+# the only fleet grammar exporting a second parser constant (`LANGUAGE_TSX`),
+# which is why `ParserFlavor` exists on the analysis side.
+tree-sitter-typescript = "0.23.2"
+
+[features]
+default = []
+# Mirrors `brokk-bifrost-analysis`'s feature of the same name, chained exactly
+# like `brokk-bifrost-core`'s. Nothing here records a production-path counter,
+# so this is the chain alone -- it exists so a `test-support` build of the
+# workspace resolves one consistent core feature set.
+test-support = ["brokk-bifrost-core/test-support"]
+
+[dev-dependencies]
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22", features = ["test-support"] }
+tempfile = "3.23.0"

@@ -5,116 +5,44 @@
 //! factory calls that return constructed values, and class factory methods whose body
 //! returns a constructed value.
 
-use crate::analyzer::js_ts::imports::require_call_module_specifier;
-use crate::analyzer::js_ts::imports::{
+use crate::imports::require_call_module_specifier;
+use crate::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
 };
-use crate::analyzer::js_ts::providers::{JsTsAnalyzerHost, resolve_js_ts_host};
-use crate::analyzer::js_ts::syntax::parse_js_ts_tree;
-use crate::analyzer::js_ts::syntax::{JsTsImportBinder, slice};
-use crate::analyzer::js_ts::ts_owners::ts_resolve_type_text_to_property_owners;
-use crate::analyzer::js_ts::type_text::ts_type_annotation_text;
-use crate::analyzer::languages::{ReceiverFactContext, ReceiverFactsFactory};
-use crate::analyzer::tree_sitter_analyzer::{
+use crate::providers::JsTsAnalyzerHost;
+use crate::syntax::compute_import_binder as compute_jsts_import_binder;
+use crate::syntax::parse_js_ts_tree;
+use crate::syntax::{JsTsImportBinder, slice};
+use crate::ts_owners::ts_resolve_type_text_to_property_owners;
+use crate::tsconfig::AliasResolver;
+use crate::type_text::ts_type_annotation_text;
+use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
+use brokk_bifrost_core::analyzer::tree_walk::{
     BoundedNamedTreeWalk, walk_named_tree_preorder_bounded,
 };
-use crate::analyzer::tree_walk::subtree_contains;
-use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
-use crate::analyzer::usages::model::ImportKind;
-use crate::analyzer::usages::receiver_analysis::{
+use brokk_bifrost_core::analyzer::usages::model::ImportKind;
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisBudgetTracker, ReceiverAnalysisCacheKey,
     ReceiverAnalysisOutcome, ReceiverAnalysisQuery, ReceiverAnalysisReport, ReceiverContext,
-    ReceiverFactProvider, ReceiverFacts, ReceiverFileCtx, ReceiverFileFacts, ReceiverFileSetup,
-    ReceiverMemberTargetReport, ReceiverSummaryQuery, ReceiverValue,
+    ReceiverFactProvider, ReceiverFacts, ReceiverMemberTargetReport, ReceiverSummaryQuery,
+    ReceiverValue,
 };
-use crate::analyzer::usages::reference_site::{node_range, smallest_named_node_covering};
-use crate::analyzer::{
-    AliasResolver, BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, Language, ProjectFile,
+use brokk_bifrost_core::analyzer::usages::reference_site::{
+    node_range, smallest_named_node_covering,
 };
-use crate::cancellation::CancellationToken;
-use crate::hash::{HashMap, HashSet};
-use crate::profiling;
+use brokk_bifrost_core::analyzer::{
+    BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, Language, ProjectFile,
+};
+use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
+use brokk_bifrost_core::profiling;
 use std::cell::RefCell;
 use std::sync::Arc;
 use tree_sitter::Node;
 
 const MAX_JSTS_RECEIVER_RECURSION: usize = 8;
 
-/// One factory for both dialects: the syntax index, import binder and provider are
-/// dialect-blind once the grammar has been chosen, and the grammar is chosen by
-/// `parse_js_ts_tree` from the file.
-pub(crate) struct JsTsReceiverFacts;
-
-/// The per-file state a JS/TS receiver query reuses. Both halves cost a full tree walk,
-/// which is why they are built once per file and cloned into each query's provider rather
-/// than recomputed per query (the binder's per-request retention, #1451).
-struct JsTsReceiverFileFacts {
-    imports: JsTsImportBinder,
-    syntax_index: Arc<JsTsReceiverSyntaxIndex>,
-}
-
-impl ReceiverFactsFactory for JsTsReceiverFacts {
-    fn prepare_file(&self, ctx: &ReceiverFileCtx<'_>) -> ReceiverFileSetup {
-        let Some(tree) = parse_js_ts_tree(ctx.file, ctx.source, ctx.language) else {
-            return ReceiverFileSetup::ParseFailed;
-        };
-        if ctx
-            .cancellation
-            .is_some_and(crate::cancellation::CancellationToken::is_cancelled)
-        {
-            return ReceiverFileSetup::Cancelled;
-        }
-        match build_js_ts_receiver_syntax_index_bounded(
-            tree.root_node(),
-            ctx.source,
-            ctx.cancellation,
-            ctx.max_scope_nodes,
-        ) {
-            JsTsReceiverSyntaxIndexBuild::Complete { index, visited } => {
-                let facts = ReceiverFileFacts::new(JsTsReceiverFileFacts {
-                    imports: compute_jsts_import_binder(ctx.source, &tree),
-                    syntax_index: index,
-                });
-                ReceiverFileSetup::Ready {
-                    tree,
-                    facts,
-                    visited,
-                }
-            }
-            JsTsReceiverSyntaxIndexBuild::ExceededScope { visited } => {
-                ReceiverFileSetup::ExceededScope { visited }
-            }
-            JsTsReceiverSyntaxIndexBuild::Cancelled => ReceiverFileSetup::Cancelled,
-        }
-    }
-
-    fn make_receiver_facts<'a, 'tree: 'a>(
-        &self,
-        ctx: ReceiverFactContext<'a, 'tree>,
-    ) -> Box<dyn ReceiverFacts<'tree> + 'a> {
-        let facts = ctx.facts.downcast::<JsTsReceiverFileFacts>();
-        // The SPI hands the framework's `&dyn IAnalyzer`; everything below the
-        // factory is on `JsTsAnalyzerHost`, so the downcast happens once, here.
-        // `ReceiverFactsFactory` has no error channel and only the JavaScript and
-        // TypeScript language modules register this factory, so a miss is a
-        // registration bug rather than a runtime condition.
-        let host = resolve_js_ts_host(ctx.analyzer, ctx.language).expect(
-            "JsTsReceiverFacts is registered only by the JavaScript and TypeScript language modules",
-        );
-        Box::new(JsTsReceiverFactProvider::new_with_syntax_index(
-            host,
-            ctx.definitions,
-            ctx.language,
-            ctx.file,
-            ctx.source,
-            ctx.root,
-            facts.imports.clone(),
-            Arc::clone(&facts.syntax_index),
-        ))
-    }
-}
-
-pub(crate) struct JsTsReceiverFactProvider<'tree, 'a> {
+pub struct JsTsReceiverFactProvider<'tree, 'a> {
     host: &'a dyn JsTsAnalyzerHost,
     support: &'a dyn BoundedDefinitionLookup,
     language: Language,
@@ -136,12 +64,12 @@ struct IndexedNodeRange {
 }
 
 #[derive(Debug, Default)]
-pub(in crate::analyzer::usages) struct JsTsReceiverSyntaxIndex {
+pub struct JsTsReceiverSyntaxIndex {
     function_declarations_by_name: HashMap<String, Vec<IndexedNodeRange>>,
     class_declarations_by_name: HashMap<String, Vec<IndexedNodeRange>>,
 }
 
-pub(in crate::analyzer::usages) enum JsTsReceiverSyntaxIndexBuild {
+pub enum JsTsReceiverSyntaxIndexBuild {
     Complete {
         index: Arc<JsTsReceiverSyntaxIndex>,
         visited: usize,
@@ -153,7 +81,7 @@ pub(in crate::analyzer::usages) enum JsTsReceiverSyntaxIndexBuild {
 }
 
 impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
-    pub(crate) fn new(
+    pub fn new(
         host: &'a dyn JsTsAnalyzerHost,
         support: &'a dyn BoundedDefinitionLookup,
         language: Language,
@@ -177,7 +105,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::analyzer::usages) fn new_with_syntax_index(
+    pub fn new_with_syntax_index(
         host: &'a dyn JsTsAnalyzerHost,
         support: &'a dyn BoundedDefinitionLookup,
         language: Language,
@@ -201,7 +129,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::analyzer::usages) fn new_with_batch_data(
+    pub fn new_with_batch_data(
         host: &'a dyn JsTsAnalyzerHost,
         support: &'a dyn BoundedDefinitionLookup,
         language: Language,
@@ -227,7 +155,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         }
     }
 
-    pub(crate) fn resolve_receiver_node(
+    pub fn resolve_receiver_node(
         &self,
         node: Node<'tree>,
         budget: ReceiverAnalysisBudget,
@@ -235,7 +163,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         self.resolve_receiver_node_report(node, budget).outcome
     }
 
-    pub(crate) fn resolve_receiver_node_report(
+    pub fn resolve_receiver_node_report(
         &self,
         node: Node<'tree>,
         budget: ReceiverAnalysisBudget,
@@ -246,7 +174,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         tracker.report(outcome)
     }
 
-    pub(crate) fn resolve_iterable_element(
+    pub fn resolve_iterable_element(
         &self,
         node: Node<'tree>,
         budget: ReceiverAnalysisBudget,
@@ -275,7 +203,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         ReceiverAnalysisOutcome::Unknown
     }
 
-    pub(crate) fn resolve_member_targets(
+    pub fn resolve_member_targets(
         &self,
         receiver: Node<'tree>,
         member: &str,
@@ -286,7 +214,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             .outcome
     }
 
-    pub(crate) fn resolve_member_targets_report(
+    pub fn resolve_member_targets_report(
         &self,
         receiver: Node<'tree>,
         member: &str,
@@ -341,7 +269,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         tracker.report(outcome)
     }
 
-    pub(crate) fn resolve_member_targets_at_site(
+    pub fn resolve_member_targets_at_site(
         &self,
         site: Node<'tree>,
         expected_member: Option<&str>,
@@ -368,7 +296,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         })
     }
 
-    pub(crate) fn resolve_contextual_object_literal_key_targets(
+    pub fn resolve_contextual_object_literal_key_targets(
         &self,
         key: Node<'tree>,
         budget: ReceiverAnalysisBudget,
@@ -397,7 +325,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
     /// Resolves a JSX attribute name through the element's component declaration to
     /// the exact field on its props type. `None` means `node` is not an attribute
     /// name; `Some([])` is a recognized attribute whose owner cannot be proven.
-    pub(crate) fn resolve_jsx_attribute_targets(
+    pub fn resolve_jsx_attribute_targets(
         &self,
         node: Node<'tree>,
         budget: ReceiverAnalysisBudget,
@@ -1146,7 +1074,8 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             .filter(|unit| {
                 unit.is_class()
                     && unit.identifier() == name
-                    && crate::analyzer::common::language_for_file(unit.source()) == self.language
+                    && brokk_bifrost_core::analyzer::common::language_for_file(unit.source())
+                        == self.language
             })
             .collect::<Vec<_>>();
         sort_units(&mut units);
@@ -1200,7 +1129,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             .unwrap_or_default()
     }
 
-    fn function_unit_for_node(&self, name: &str, node: Node<'_>) -> Option<CodeUnit> {
+    pub fn function_unit_for_node(&self, name: &str, node: Node<'_>) -> Option<CodeUnit> {
         let target = IndexedNodeRange {
             start_byte: node.start_byte(),
             end_byte: node.end_byte(),
@@ -1593,7 +1522,7 @@ fn object_literal_property_at_key<'tree>(
     let object = property
         .parent()
         .filter(|parent| parent.kind() == "object")?;
-    let member = crate::analyzer::typescript::ts_object_literal_property_name(property, source)?;
+    let member = crate::typescript::ts_object_literal_property_name(property, source)?;
     Some((property, object, member))
 }
 
@@ -1719,7 +1648,7 @@ fn is_summary_boundary(kind: &str) -> bool {
     )
 }
 
-pub(in crate::analyzer::usages) fn build_js_ts_receiver_syntax_index<'tree>(
+pub fn build_js_ts_receiver_syntax_index<'tree>(
     root: Node<'tree>,
     source: &str,
     cancellation: Option<&CancellationToken>,
@@ -1733,7 +1662,7 @@ pub(in crate::analyzer::usages) fn build_js_ts_receiver_syntax_index<'tree>(
     }
 }
 
-pub(in crate::analyzer::usages) fn build_js_ts_receiver_syntax_index_bounded<'tree>(
+pub fn build_js_ts_receiver_syntax_index_bounded<'tree>(
     root: Node<'tree>,
     source: &str,
     cancellation: Option<&CancellationToken>,
@@ -1816,9 +1745,7 @@ fn wrap_factory_outcome(
     }
 }
 
-pub(in crate::analyzer::usages) fn member_expression_at_site(
-    mut node: Node<'_>,
-) -> Option<Node<'_>> {
+pub fn member_expression_at_site(mut node: Node<'_>) -> Option<Node<'_>> {
     for _ in 0..4 {
         if node.kind() == "member_expression" {
             return Some(node);
@@ -1847,222 +1774,4 @@ fn dedup_units(mut units: Vec<CodeUnit>, limit: usize) -> Vec<CodeUnit> {
     units.dedup();
     units.truncate(limit.saturating_add(1));
     units
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::analyzer::usages::receiver_analysis::DEFAULT_RECEIVER_MAX_TARGETS;
-    use crate::analyzer::{
-        AnalyzerDefinitionLookup, IAnalyzer, ProjectFile, TestProject, TypescriptAnalyzer,
-    };
-    use std::path::PathBuf;
-    use tree_sitter::Parser;
-
-    fn test_project(source: &str) -> (tempfile::TempDir, ProjectFile, TypescriptAnalyzer) {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let file = ProjectFile::new(root.clone(), PathBuf::from("src/app.ts"));
-        file.write(source).expect("write source");
-        let analyzer =
-            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
-        (temp, file, analyzer)
-    }
-
-    fn parse(source: &str) -> tree_sitter::Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .expect("typescript parser");
-        parser.parse(source, None).expect("parse source")
-    }
-
-    fn receiver_node<'tree>(
-        root: Node<'tree>,
-        source: &str,
-        marker: &str,
-        receiver: &str,
-    ) -> Node<'tree> {
-        let marker_start = source.find(marker).expect("marker");
-        let receiver_start = source[marker_start..]
-            .find(receiver)
-            .map(|offset| marker_start + offset)
-            .expect("receiver");
-        smallest_named_node_covering(root, receiver_start, receiver_start + receiver.len())
-            .expect("receiver node")
-    }
-
-    #[test]
-    fn tiny_scope_budget_exits_without_precise_targets() {
-        let source = r#"
-class Service { run() {} }
-function makeService() { return new Service(); }
-export function caller() {
-  const service = makeService();
-  service.run();
-}
-"#;
-        let (_temp, file, analyzer) = test_project(source);
-        let tree = parse(source);
-        let definitions = analyzer.global_usage_definition_index();
-        let provider = JsTsReceiverFactProvider::new(
-            &analyzer,
-            &definitions,
-            Language::TypeScript,
-            &file,
-            source,
-            tree.root_node(),
-            JsTsImportBinder::empty(),
-        );
-        let receiver = receiver_node(tree.root_node(), source, "service.run", "service");
-
-        let report = provider.resolve_member_targets_report(
-            receiver,
-            "run",
-            receiver.start_byte(),
-            ReceiverAnalysisBudget::tiny(),
-        );
-
-        assert_eq!(
-            report.outcome,
-            ReceiverAnalysisOutcome::ExceededBudget {
-                limit: "scope_nodes"
-            }
-        );
-        assert!(report.outcome.is_terminal_for_graph());
-        assert_eq!(report.work.scope_nodes, 2);
-        assert!(!report.candidates_truncated);
-    }
-
-    #[test]
-    fn scope_node_budget_is_per_receiver_query() {
-        let source = r#"
-class Service { run() {} }
-function makeService() { return new Service(); }
-export function first() {
-  const a0 = 0; const a1 = 1; const a2 = 2; const a3 = 3; const a4 = 4;
-  const a5 = 5; const a6 = 6; const a7 = 7; const a8 = 8; const a9 = 9;
-  const service = makeService();
-  // first call
-  service.run();
-}
-export function second() {
-  const b0 = 0; const b1 = 1; const b2 = 2; const b3 = 3; const b4 = 4;
-  const b5 = 5; const b6 = 6; const b7 = 7; const b8 = 8; const b9 = 9;
-  const service = makeService();
-  // second call
-  service.run();
-}
-"#;
-        let (_temp, file, analyzer) = test_project(source);
-        let tree = parse(source);
-        let definitions = analyzer.global_usage_definition_index();
-        let provider = JsTsReceiverFactProvider::new(
-            &analyzer,
-            &definitions,
-            Language::TypeScript,
-            &file,
-            source,
-            tree.root_node(),
-            JsTsImportBinder::empty(),
-        );
-        let first = receiver_node(tree.root_node(), source, "first call", "service");
-        let second = receiver_node(tree.root_node(), source, "second call", "service");
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 80,
-            ..ReceiverAnalysisBudget::default()
-        };
-
-        for receiver in [first, second] {
-            let outcome =
-                provider.resolve_member_targets(receiver, "run", receiver.start_byte(), budget);
-            assert!(
-                matches!(outcome, ReceiverAnalysisOutcome::Precise(ref targets) if targets.len() == 1),
-                "expected each lookup to stay within its own budget, got {outcome:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn fanout_over_default_target_cap_is_ambiguous() {
-        let source = r#"
-class A { run() {} }
-class B { run() {} }
-class C { run() {} }
-class D { run() {} }
-class E { run() {} }
-function make(which: number) {
-  if (which === 0) return new A();
-  if (which === 1) return new B();
-  if (which === 2) return new C();
-  if (which === 3) return new D();
-  return new E();
-}
-export function caller(which: number) {
-  const service = make(which);
-  service.run();
-}
-"#;
-        let (_temp, file, analyzer) = test_project(source);
-        let tree = parse(source);
-        let definitions = analyzer.global_usage_definition_index();
-        let provider = JsTsReceiverFactProvider::new(
-            &analyzer,
-            &definitions,
-            Language::TypeScript,
-            &file,
-            source,
-            tree.root_node(),
-            JsTsImportBinder::empty(),
-        );
-        let receiver = receiver_node(tree.root_node(), source, "service.run", "service");
-
-        let report = provider.resolve_member_targets_report(
-            receiver,
-            "run",
-            receiver.start_byte(),
-            ReceiverAnalysisBudget::default(),
-        );
-
-        assert!(
-            matches!(report.outcome, ReceiverAnalysisOutcome::Ambiguous(ref targets) if targets.len() == DEFAULT_RECEIVER_MAX_TARGETS),
-            "expected fanout to become ambiguous, got {:?}",
-            report.outcome
-        );
-        assert!(report.outcome.is_terminal_for_graph());
-        assert!(report.candidates_truncated);
-        assert!(report.work.summary_expansions > 0);
-    }
-
-    #[test]
-    fn nested_same_name_factory_does_not_reuse_the_enclosing_declaration() {
-        let source = r#"
-class Outer {}
-class Inner {}
-function make() {
-  function make() { return new Inner(); }
-  return make();
-}
-"#;
-        let (_temp, file, analyzer) = test_project(source);
-        let tree = parse(source);
-        let definitions = AnalyzerDefinitionLookup::new(&analyzer, Language::TypeScript);
-        let provider = JsTsReceiverFactProvider::new(
-            &analyzer,
-            &definitions,
-            Language::TypeScript,
-            &file,
-            source,
-            tree.root_node(),
-            JsTsImportBinder::empty(),
-        );
-        let inner_start = source.rfind("function make").expect("inner factory");
-        let inner = smallest_named_node_covering(
-            tree.root_node(),
-            inner_start,
-            inner_start + "function make".len(),
-        )
-        .expect("inner function node");
-        assert_eq!(provider.function_unit_for_node("make", inner), None);
-    }
 }

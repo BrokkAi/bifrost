@@ -2,16 +2,7 @@ use super::{
     TypeLookupOutcome, candidates_outcome, candidates_outcome_with_target_kind, no_type,
     type_reference_outcome,
 };
-use crate::analyzer::js_ts::imports::{
-    resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
-};
-use crate::analyzer::js_ts::providers::{JsTsAnalyzerHost, resolve_js_ts_host};
-use crate::analyzer::js_ts::syntax::JsTsImportBinder;
-use crate::analyzer::js_ts::ts_owners::{
-    ts_function_return_property_owners, ts_receiver_owner_candidates_at_byte,
-    ts_resolve_type_text_to_property_owners,
-};
-use crate::analyzer::js_ts::type_text::{jsts_type_space_candidates, ts_type_annotation_text};
+use crate::analyzer::js_ts::providers::resolve_js_ts_host;
 use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
 use crate::analyzer::usages::model::ImportKind;
 use crate::analyzer::usages::reference_site::{
@@ -21,6 +12,16 @@ use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
     AliasResolver, BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile,
 };
+use brokk_bifrost_js_ts::imports::{
+    resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
+};
+use brokk_bifrost_js_ts::providers::JsTsAnalyzerHost;
+use brokk_bifrost_js_ts::syntax::JsTsImportBinder;
+use brokk_bifrost_js_ts::ts_owners::{
+    ts_function_return_property_owners, ts_receiver_owner_candidates_at_byte,
+    ts_resolve_type_text_to_property_owners,
+};
+use brokk_bifrost_js_ts::type_text::{jsts_type_space_candidates, ts_type_annotation_text};
 use tree_sitter::{Node, Tree};
 
 pub(crate) fn resolve_js_ts_type(

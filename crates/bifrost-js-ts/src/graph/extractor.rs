@@ -1,31 +1,36 @@
-use crate::analyzer::js_ts::imports::require_call_module_specifier;
-use crate::analyzer::js_ts::providers::{JsTsAnalyzerHost, resolve_js_ts_host};
-use crate::analyzer::js_ts::syntax::{
+use crate::graph::hits::{
+    record_hit, record_import_hit, record_reexport_hit, record_self_receiver_hit,
+    record_unproven_hit,
+};
+use crate::graph::receiver_analysis::JsTsReceiverFactProvider;
+use crate::graph::resolver::{
+    JsTsUsageIndex, browser_global_property_shape, is_static_member, member_name,
+    unbound_browser_global_property,
+};
+use crate::imports::require_call_module_specifier;
+use crate::parse::js_ts_tree_sitter_language_for_file;
+use crate::providers::JsTsAnalyzerHost;
+use crate::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, JsTsLexicalBindingScope,
     direct_property_definitions, is_commonjs_require_declarator, is_declaration_identifier,
     is_lexically_nested_type_declaration, is_object_in_member_expression,
     is_property_key_in_member, nested_type_identifier_parts, slice, static_member_receiver,
 };
-use crate::analyzer::js_ts::ts_owners::ts_resolve_type_text_to_property_owners;
-use crate::analyzer::js_ts::type_text::ts_type_annotation_text;
-use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
-use crate::analyzer::usages::js_ts_graph::JsTsReceiverFactProvider;
-use crate::analyzer::usages::js_ts_graph::hits::{
-    record_hit, record_import_hit, record_reexport_hit, record_self_receiver_hit,
-    record_unproven_hit,
+use crate::ts_owners::ts_resolve_type_text_to_property_owners;
+use crate::tsconfig::AliasResolver;
+use crate::type_text::ts_type_annotation_text;
+use brokk_bifrost_core::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
 };
-use crate::analyzer::usages::js_ts_graph::resolver::{
-    JsTsUsageIndex, browser_global_property_shape, is_static_member, member_name,
-    unbound_browser_global_property,
+use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ExportIndex, UsageHit};
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
+    ReceiverAnalysisBudget, ReceiverAnalysisOutcome,
 };
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::model::{ExportEntry, ExportIndex, UsageHit};
-use crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file;
-use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
-use crate::analyzer::{AliasResolver, CodeUnit, IAnalyzer, Language, ProjectFile, Range};
-use crate::cancellation::CancellationToken;
-use crate::hash::{HashMap, HashSet};
-use crate::text_utils::compute_line_starts;
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile, Range};
+use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
+use brokk_bifrost_core::text_utils::compute_line_starts;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
@@ -36,8 +41,9 @@ const TARGET_VALUE_BINDING: &str = "__target_value__";
 const TARGET_OBJECT_BINDING: &str = "__target_object__";
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn scan_files_for_seeds(
-    analyzer: &dyn IAnalyzer,
+pub fn scan_files_for_seeds(
+    host: &dyn JsTsAnalyzerHost,
+    analyzer: &dyn CodeUnitIndex,
     index: &JsTsUsageIndex,
     files: &HashSet<ProjectFile>,
     target: &CodeUnit,
@@ -46,12 +52,9 @@ pub(super) fn scan_files_for_seeds(
     exported_local_property_root: Option<&str>,
     cancellation: Option<&CancellationToken>,
 ) -> BTreeSet<UsageHit> {
-    // The receiver-facts provider and the type-text owner resolution below are on
-    // `JsTsAnalyzerHost`; the downcast happens once here rather than per scanned file.
-    // Without the analyzer for `language` this scan has no seeds to resolve either.
-    let Some(host) = resolve_js_ts_host(analyzer, language) else {
-        return BTreeSet::new();
-    };
+    // `host` is the JS/TS analyzer for `language`, resolved by the caller's one
+    // downcast; `analyzer` is the dispatching analyzer, which in a mixed workspace
+    // spans every language and is what the declaration and range reads must go to.
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let unproven_collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let browser_global_shape = (language == Language::JavaScript)
@@ -165,10 +168,10 @@ pub(super) fn scan_files_for_seeds(
             );
             (!definitions.is_empty()).then_some(definitions)
         });
-        let definitions = analyzer.global_usage_definition_index();
+        let definitions = host.usage_definitions();
         let receiver_facts = JsTsReceiverFactProvider::new(
             host,
-            &definitions,
+            definitions,
             language,
             file,
             source_str,
@@ -230,7 +233,7 @@ pub(super) fn scan_files_for_seeds(
 }
 
 fn function_target_has_non_program_local_receiver(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     target: &CodeUnit,
     language: Language,
 ) -> bool {
@@ -266,11 +269,11 @@ fn function_target_has_non_program_local_receiver(
         })
 }
 
-pub(super) struct ScanCtx<'a> {
-    pub(super) file: &'a ProjectFile,
-    pub(super) source: &'a str,
-    pub(super) line_starts: &'a [usize],
-    pub(super) analyzer: &'a dyn IAnalyzer,
+pub struct ScanCtx<'a> {
+    pub file: &'a ProjectFile,
+    pub source: &'a str,
+    pub line_starts: &'a [usize],
+    pub analyzer: &'a dyn CodeUnitIndex,
     /// The JS/TS host for `language`, resolved once by `scan_files_for_seeds`, for the
     /// parts of the scan that call the host-parameterized owner resolution.
     host: &'a dyn JsTsAnalyzerHost,
@@ -302,8 +305,8 @@ pub(super) struct ScanCtx<'a> {
     scope_stack: Vec<HashMap<String, LocalBinding>>,
     binding_engine: LocalInferenceEngine<&'static str>,
     type_binding_engine: LocalInferenceEngine<()>,
-    pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
+    pub hits: &'a mut BTreeSet<UsageHit>,
+    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1223,8 +1226,7 @@ fn handle_contextual_object_literal(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        let Some(name) =
-            crate::analyzer::typescript::ts_object_literal_property_name(child, ctx.source)
+        let Some(name) = crate::typescript::ts_object_literal_property_name(child, ctx.source)
         else {
             continue;
         };
@@ -1248,7 +1250,7 @@ fn contextual_object_literal_owners(node: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Co
     {
         return ts_resolve_type_text_to_property_owners(
             ctx.host,
-            &ctx.analyzer.global_usage_definition_index(),
+            ctx.host.usage_definitions(),
             ctx.file,
             ctx.source,
             &ctx.imports,
@@ -1280,7 +1282,7 @@ fn contextual_object_literal_owners(node: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Co
     };
     ts_resolve_type_text_to_property_owners(
         ctx.host,
-        &ctx.analyzer.global_usage_definition_index(),
+        ctx.host.usage_definitions(),
         ctx.file,
         ctx.source,
         &ctx.imports,
@@ -1324,8 +1326,10 @@ fn commonjs_nested_member_matches(
     // shared structured splitter's "everything but the last segment" rejoin
     // reproduces `rsplit_once('.')`'s (export_object, export_member) split
     // exactly.
-    let segments =
-        crate::analyzer::symbol_lookup::parse_symbol_path(Language::JavaScript, export_name);
+    let segments = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+        Language::JavaScript,
+        export_name,
+    );
     let Some((export_member, export_object_parts)) = segments.split_last() else {
         return false;
     };
@@ -1383,7 +1387,7 @@ fn handle_jsx_element(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 /// Walks a JSX element name (identifier or member_expression) and returns the rightmost
 /// identifier node together with its text. For `<Foo.Bar />` the leaf is `Bar`.
-pub(super) fn rightmost_jsx_identifier<'a>(
+pub fn rightmost_jsx_identifier<'a>(
     node: Node<'a>,
     source: &'a str,
 ) -> Option<(Node<'a>, &'a str)> {
@@ -1528,7 +1532,7 @@ fn this_receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         .is_some_and(|parent| &parent == owner)
 }
 
-pub(super) fn simple_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+pub fn simple_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
     match node.kind() {
         "identifier" | "type_identifier" => {
             let text = slice(node, source);
@@ -1702,7 +1706,7 @@ fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>>
 // ExportIndex extraction
 // ===================================================================================
 
-pub(super) fn compute_export_index(source: &str, tree: &Tree) -> ExportIndex {
+pub fn compute_export_index(source: &str, tree: &Tree) -> ExportIndex {
     let mut index = ExportIndex::empty();
     let root = tree.root_node();
     let module_object_exports = collect_module_object_exports(root, source);
@@ -1887,7 +1891,7 @@ fn register_module_exports_assignment(right: Node<'_>, source: &str, index: &mut
     if let Some(module_specifier) = require_call_module_specifier(right, source) {
         index
             .reexport_stars
-            .push(crate::analyzer::usages::model::ReexportStar { module_specifier });
+            .push(brokk_bifrost_core::analyzer::usages::model::ReexportStar { module_specifier });
         return;
     }
 
@@ -2023,7 +2027,9 @@ fn visit_export_statement(node: Node<'_>, source: &str, index: &mut ExportIndex)
             // No clause => `export * from "..."`.
             index
                 .reexport_stars
-                .push(crate::analyzer::usages::model::ReexportStar { module_specifier });
+                .push(brokk_bifrost_core::analyzer::usages::model::ReexportStar {
+                    module_specifier,
+                });
         }
         return;
     }
@@ -2146,8 +2152,8 @@ fn unquote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::js_ts::syntax::compute_import_binder;
-    use crate::analyzer::usages::ImportKind;
+    use crate::syntax::compute_import_binder;
+    use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 
     fn parse_js(source: &str) -> Tree {
         let mut parser = Parser::new();

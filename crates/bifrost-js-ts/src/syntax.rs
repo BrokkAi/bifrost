@@ -1,13 +1,13 @@
-use crate::analyzer::js_ts::imports::{
+use crate::imports::{
     CommonJsRequireBindingKind, commonjs_require_module_specifier_from_declarator,
     parse_commonjs_require_bindings_from_node,
 };
-use crate::analyzer::usages::{ImportBinding, ImportKind};
-use crate::analyzer::{Language, ProjectFile, Range};
-use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::usages::model::{ImportBinding, ImportKind};
+use brokk_bifrost_core::analyzer::{Language, ProjectFile, Range};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Parser, Tree};
 
-pub(crate) const MAX_STATIC_IMPORT_BINDINGS_PER_NAME: usize = 64;
+pub const MAX_STATIC_IMPORT_BINDINGS_PER_NAME: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct JsTsImportBinding {
@@ -21,13 +21,13 @@ struct JsTsImportBinding {
 /// CommonJS declarations retain the historical last-declaration-wins model;
 /// source-position-sensitive CommonJS assignment flow is a separate concern.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct JsTsImportBinder {
+pub struct JsTsImportBinder {
     bindings: HashMap<String, Vec<JsTsImportBinding>>,
     truncated_names: HashSet<String>,
 }
 
 impl JsTsImportBinder {
-    pub(crate) fn empty() -> Self {
+    pub fn empty() -> Self {
         Self::default()
     }
 
@@ -59,21 +59,18 @@ impl JsTsImportBinder {
         );
     }
 
-    pub(crate) fn binding(&self, local_name: &str) -> Option<&ImportBinding> {
+    pub fn binding(&self, local_name: &str) -> Option<&ImportBinding> {
         Some(&self.bindings.get(local_name)?.last()?.binding)
     }
 
-    pub(crate) fn bindings_for(&self, local_name: &str) -> impl Iterator<Item = &ImportBinding> {
+    pub fn bindings_for(&self, local_name: &str) -> impl Iterator<Item = &ImportBinding> {
         self.bindings
             .get(local_name)
             .into_iter()
             .flat_map(|bindings| bindings.iter().map(|binding| &binding.binding))
     }
 
-    pub(crate) fn direct_bindings_for(
-        &self,
-        local_name: &str,
-    ) -> impl Iterator<Item = &ImportBinding> {
+    pub fn direct_bindings_for(&self, local_name: &str) -> impl Iterator<Item = &ImportBinding> {
         self.bindings
             .get(local_name)
             .into_iter()
@@ -88,7 +85,7 @@ impl JsTsImportBinder {
             .map(|binding| &binding.binding)
     }
 
-    pub(crate) fn resolvable_direct_bindings_for(
+    pub fn resolvable_direct_bindings_for(
         &self,
         local_name: &str,
     ) -> impl Iterator<Item = &ImportBinding> {
@@ -96,19 +93,19 @@ impl JsTsImportBinder {
             .filter(|binding| matches!(binding.kind, ImportKind::Named | ImportKind::Default))
     }
 
-    pub(crate) fn has_competing_direct_imports(&self, local_name: &str) -> bool {
+    pub fn has_competing_direct_imports(&self, local_name: &str) -> bool {
         self.direct_bindings_for(local_name).nth(1).is_some()
     }
 
-    pub(crate) fn was_truncated(&self, local_name: &str) -> bool {
+    pub fn was_truncated(&self, local_name: &str) -> bool {
         self.truncated_names.contains(local_name)
     }
 
-    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+    pub fn names(&self) -> impl Iterator<Item = &str> {
         self.bindings.keys().map(String::as_str)
     }
 
-    pub(crate) fn all_bindings(&self) -> impl Iterator<Item = (&str, &ImportBinding)> {
+    pub fn all_bindings(&self) -> impl Iterator<Item = (&str, &ImportBinding)> {
         self.bindings.iter().flat_map(|(local_name, bindings)| {
             bindings
                 .iter()
@@ -118,7 +115,7 @@ impl JsTsImportBinder {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct JsTsLexicalBindingScope {
+pub struct JsTsLexicalBindingScope {
     start_byte: usize,
     end_byte: usize,
 }
@@ -127,24 +124,24 @@ pub(crate) struct JsTsLexicalBindingScope {
 /// each name shadows an outer/global binding. Declaration order is deliberately
 /// irrelevant: `var` is hoisted and lexical declarations are in the TDZ for
 /// their entire scope.
-pub(crate) struct JsTsLexicalBindingIndex {
+pub struct JsTsLexicalBindingIndex {
     scopes_by_name: HashMap<String, Vec<JsTsLexicalBindingScope>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct JsTsDirectPropertyDefinition<'tree> {
-    pub(crate) receiver: JsTsStaticMemberReceiver<'tree>,
-    pub(crate) property_range: Range,
+pub struct JsTsDirectPropertyDefinition<'tree> {
+    pub receiver: JsTsStaticMemberReceiver<'tree>,
+    pub property_range: Range,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct JsTsStaticMemberReceiver<'tree> {
-    pub(crate) root: Node<'tree>,
-    pub(crate) members: Vec<Node<'tree>>,
+pub struct JsTsStaticMemberReceiver<'tree> {
+    pub root: Node<'tree>,
+    pub members: Vec<Node<'tree>>,
 }
 
 impl JsTsLexicalBindingIndex {
-    pub(crate) fn build(root: Node<'_>, source: &str) -> Self {
+    pub fn build(root: Node<'_>, source: &str) -> Self {
         let mut index = Self {
             scopes_by_name: HashMap::default(),
         };
@@ -220,15 +217,11 @@ impl JsTsLexicalBindingIndex {
         index
     }
 
-    pub(crate) fn is_bound_at(&self, name: &str, byte: usize) -> bool {
+    pub fn is_bound_at(&self, name: &str, byte: usize) -> bool {
         self.binding_scope_at(name, byte).is_some()
     }
 
-    pub(crate) fn binding_scope_at(
-        &self,
-        name: &str,
-        byte: usize,
-    ) -> Option<JsTsLexicalBindingScope> {
+    pub fn binding_scope_at(&self, name: &str, byte: usize) -> Option<JsTsLexicalBindingScope> {
         self.scopes_by_name
             .get(name)?
             .iter()
@@ -237,7 +230,7 @@ impl JsTsLexicalBindingIndex {
             .min_by_key(|scope| scope.end_byte - scope.start_byte)
     }
 
-    pub(crate) fn is_program_binding_at(&self, name: &str, byte: usize, root: Node<'_>) -> bool {
+    pub fn is_program_binding_at(&self, name: &str, byte: usize, root: Node<'_>) -> bool {
         self.binding_scope_at(name, byte) == Some(node_scope(root))
     }
 
@@ -271,7 +264,7 @@ impl JsTsLexicalBindingIndex {
 /// Collects the binder identifier nodes of a binding pattern in source order:
 /// plain identifiers, object/array destructuring (including renamed
 /// `pair_pattern` values, defaults, and rest binders), and parameter wrappers.
-pub(crate) fn pattern_binder_identifiers(pattern: Node<'_>) -> Vec<Node<'_>> {
+pub fn pattern_binder_identifiers(pattern: Node<'_>) -> Vec<Node<'_>> {
     let mut binders = Vec::new();
     let mut stack = vec![pattern];
     while let Some(node) = stack.pop() {
@@ -306,7 +299,7 @@ pub(crate) fn pattern_binder_identifiers(pattern: Node<'_>) -> Vec<Node<'_>> {
     binders
 }
 
-pub(crate) fn direct_property_definitions<'tree>(
+pub fn direct_property_definitions<'tree>(
     root: Node<'tree>,
     source: &str,
     target_ranges: &[Range],
@@ -387,7 +380,7 @@ fn direct_object_pair_receiver<'tree>(
     receiver.members.is_empty().then_some((receiver, property))
 }
 
-pub(crate) fn static_member_receiver<'tree>(
+pub fn static_member_receiver<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<JsTsStaticMemberReceiver<'tree>> {
@@ -494,11 +487,11 @@ fn enclosing_lexical_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
     None
 }
 
-pub(crate) fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text(node, source)
+pub fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
-pub(crate) fn nested_type_identifier_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+pub fn nested_type_identifier_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     (node.kind() == "nested_type_identifier").then_some(())?;
     Some((
         node.child_by_field_name("module")?,
@@ -506,7 +499,7 @@ pub(crate) fn nested_type_identifier_parts(node: Node<'_>) -> Option<(Node<'_>, 
     ))
 }
 
-pub(crate) fn is_lexically_nested_type_declaration(node: Node<'_>) -> bool {
+pub fn is_lexically_nested_type_declaration(node: Node<'_>) -> bool {
     if !matches!(
         node.kind(),
         "class_declaration"
@@ -539,7 +532,7 @@ pub(crate) fn is_lexically_nested_type_declaration(node: Node<'_>) -> bool {
     false
 }
 
-pub(crate) fn is_declaration_identifier(node: Node<'_>) -> bool {
+pub fn is_declaration_identifier(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -599,7 +592,7 @@ pub(crate) fn is_declaration_identifier(node: Node<'_>) -> bool {
     false
 }
 
-pub(crate) fn is_explicit_object_literal_key(node: Node<'_>) -> bool {
+pub fn is_explicit_object_literal_key(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -609,7 +602,7 @@ pub(crate) fn is_explicit_object_literal_key(node: Node<'_>) -> bool {
             .is_some_and(|key| key.id() == node.id())
 }
 
-pub(crate) fn is_property_key_in_member(node: Node<'_>) -> bool {
+pub fn is_property_key_in_member(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -622,7 +615,7 @@ pub(crate) fn is_property_key_in_member(node: Node<'_>) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn is_object_in_member_expression(node: Node<'_>) -> bool {
+pub fn is_object_in_member_expression(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -635,7 +628,7 @@ pub(crate) fn is_object_in_member_expression(node: Node<'_>) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn compute_import_binder(source: &str, tree: &Tree) -> JsTsImportBinder {
+pub fn compute_import_binder(source: &str, tree: &Tree) -> JsTsImportBinder {
     let mut binder = JsTsImportBinder::empty();
     let root = tree.root_node();
 
@@ -670,7 +663,7 @@ fn visit_commonjs_require_statement(node: Node<'_>, source: &str, binder: &mut J
     }
 }
 
-pub(crate) fn is_commonjs_require_declarator(node: Node<'_>, source: &str) -> bool {
+pub fn is_commonjs_require_declarator(node: Node<'_>, source: &str) -> bool {
     node.kind() == "variable_declarator"
         && commonjs_require_module_specifier_from_declarator(node, source).is_some()
 }
@@ -775,14 +768,9 @@ fn unquote(text: &str) -> String {
     stripped.unwrap_or(trimmed).to_string()
 }
 
-pub(crate) fn parse_js_ts_tree(
-    file: &ProjectFile,
-    source: &str,
-    language: Language,
-) -> Option<Tree> {
+pub fn parse_js_ts_tree(file: &ProjectFile, source: &str, language: Language) -> Option<Tree> {
     let mut parser = Parser::new();
-    let tree_sitter_language =
-        crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file(file, language)?;
+    let tree_sitter_language = crate::parse::js_ts_tree_sitter_language_for_file(file, language)?;
     parser.set_language(&tree_sitter_language).ok()?;
     parser.parse(source, None)
 }

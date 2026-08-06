@@ -208,7 +208,17 @@ test("promotion evidence covers validation before every external publisher", () 
 
   // Each language crate publishes straight after core; analysis waits for all
   // of them, because it names every one with an exact `=` requirement.
-  const languageCrates = ["cpp", "csharp", "go", "jvm", "php", "python", "ruby", "rust"];
+  const languageCrates = [
+    "cpp",
+    "csharp",
+    "go",
+    "js-ts",
+    "jvm",
+    "php",
+    "python",
+    "ruby",
+    "rust",
+  ];
   for (const language of languageCrates) {
     assert.match(
       jobBlock(release, `publish-crate-${language}`),

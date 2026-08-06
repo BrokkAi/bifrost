@@ -266,6 +266,7 @@ dependencies = [
  "brokk-bifrost-cpp",
  "brokk-bifrost-csharp",
  "brokk-bifrost-go",
+ "brokk-bifrost-js-ts",
  "brokk-bifrost-jvm",
  "brokk-bifrost-php",
  "brokk-bifrost-python",
@@ -385,6 +386,20 @@ dependencies = [
  "regex",
  "tree-sitter",
  "tree-sitter-go",
+]
+
+[[package]]
+name = "brokk-bifrost-js-ts"
+version = "0.8.22"
+dependencies = [
+ "brokk-bifrost-core",
+ "rayon",
+ "regex",
+ "serde_json",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-javascript",
+ "tree-sitter-typescript",
 ]
 
 [[package]]
