@@ -2853,7 +2853,11 @@ impl AnalyzerStore {
         // Pattern matching is performed after language-specific FQN hydration.
         // One request may carry several patterns, so the storage projection
         // intentionally supplies one complete declaration candidate set for
-        // the batch while avoiding per-candidate file-state hydration.
+        // the batch while avoiding per-candidate file-state hydration. Keep
+        // all languages in one SQL statement: the active-blob join is the
+        // dominant cost on large workspaces, and repeating it once per
+        // language turned a broad Firefox search into a serial multi-minute
+        // scan.
         let mut conn = {
             let _scope = crate::profiling::scope("store.symbol_names.open_reader");
             self.active_read_conn()?
@@ -2867,36 +2871,20 @@ impl AnalyzerStore {
             let _scope = crate::profiling::scope("store.symbol_names.sync_active_oids");
             sync_active_blob_oids(&tx, active_oids)?;
         }
-        let mut out = Vec::new();
-        let mut inspected = 0usize;
-        let mut complete = true;
-        for (lang_index, lang) in langs.iter().enumerate() {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                complete = false;
-                break;
-            }
-            let rows = {
-                let _scope = crate::profiling::scope(format!("store.symbol_names.query[{lang}]"));
-                search_candidate_name_rows_by_lang_conn_cancellable(
-                    &tx,
-                    lang_index,
-                    lang,
-                    literal_substrings,
-                    cancellation,
-                )?
-            };
-            inspected = inspected.saturating_add(rows.inspected);
-            out.extend(rows.rows);
-            if !rows.complete {
-                complete = false;
-                break;
-            }
-        }
+        let rows = {
+            let _scope = crate::profiling::scope("store.symbol_names.query_all_languages");
+            search_candidate_name_rows_for_langs_conn_cancellable(
+                &tx,
+                langs,
+                literal_substrings,
+                cancellation,
+            )?
+        };
         tx.commit()?;
-        if complete && !cancellation.is_some_and(CancellationToken::is_cancelled) {
-            Ok(LimitedQueryRows::complete(out, inspected))
+        if rows.complete && !cancellation.is_some_and(CancellationToken::is_cancelled) {
+            Ok(LimitedQueryRows::complete(rows.rows, rows.inspected))
         } else {
-            Ok(LimitedQueryRows::incomplete(out, inspected))
+            Ok(LimitedQueryRows::incomplete(rows.rows, rows.inspected))
         }
     }
 
@@ -6249,48 +6237,27 @@ fn search_candidate_rows_by_lang_conn(
     Ok(rows)
 }
 
-fn search_candidate_name_rows_by_lang_conn_cancellable(
+fn search_candidate_name_rows_for_langs_conn_cancellable(
     conn: &Connection,
-    lang_index: usize,
-    lang: &str,
+    langs: &[String],
     literal_substrings: Option<&[&str]>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<LimitedQueryRows<SearchCandidateNameRow>> {
-    match cancellation {
-        Some(cancellation) => search_candidate_name_rows_by_lang_conn_while(
-            conn,
-            lang_index,
-            lang,
-            literal_substrings,
-            || !cancellation.is_cancelled(),
-        ),
-        None => search_candidate_name_rows_by_lang_conn_while(
-            conn,
-            lang_index,
-            lang,
-            literal_substrings,
-            || true,
-        ),
+    if langs.is_empty() {
+        return Ok(LimitedQueryRows::complete(Vec::new(), 0));
     }
-}
 
-fn search_candidate_name_rows_by_lang_conn_while(
-    conn: &Connection,
-    lang_index: usize,
-    lang: &str,
-    literal_substrings: Option<&[&str]>,
-    mut continue_query: impl FnMut() -> bool,
-) -> Result<LimitedQueryRows<SearchCandidateNameRow>> {
     // No `ORDER BY`: candidates are deduplicated through an ordered map after
     // matching, so the storage order carries no meaning, while sorting the
     // whole declaration projection cost a temp B-tree over every workspace
     // declaration on every request (issue #1199).
+    let literal_parameter_offset = langs.len() + 1;
     let literal_predicate = literal_substrings
         .filter(|literals| !literals.is_empty())
         .map(|literals| {
             let predicates = (0..literals.len())
                 .map(|index| {
-                    let parameter = index + 2;
+                    let parameter = literal_parameter_offset + index;
                     format!(
                         "(instr(lower(units.short_name), lower(?{parameter})) > 0
                           OR instr(lower(units.content_qualifier), lower(?{parameter})) > 0
@@ -6303,41 +6270,57 @@ fn search_candidate_name_rows_by_lang_conn_while(
             format!(" AND ({predicates})")
         })
         .unwrap_or_default();
+    let language_parameters = (1..=langs.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>();
+    let language_cases = langs
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("WHEN ?{} THEN {index}", index + 1))
+        .collect::<Vec<_>>()
+        .join(" ");
     let sql = format!(
-        "SELECT units.blob_oid, units.unit_key, units.short_name, units.content_qualifier
+        "SELECT CASE units.lang {language_cases} END,
+                units.blob_oid, units.unit_key, units.short_name, units.content_qualifier
          FROM temp.active_blob_oids AS active
          CROSS JOIN code_units AS units
            ON units.blob_oid = active.blob_oid
          JOIN blob_meta AS meta
            ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
-         WHERE units.lang = ?1 AND units.in_declarations = 1
-           AND {PARSED_BLOB_COMPLETE_CONDITION}{literal_predicate}"
+         WHERE units.lang IN ({}) AND units.in_declarations = 1
+           AND {PARSED_BLOB_COMPLETE_CONDITION}{literal_predicate}",
+        language_parameters.join(", ")
     );
     let mut stmt = conn.prepare_cached(&sql)?;
-    let parameters = std::iter::once(lang)
+    let parameters = langs
+        .iter()
+        .map(String::as_str)
         .chain(literal_substrings.unwrap_or_default().iter().copied())
         .collect::<Vec<_>>();
     let mut query = stmt.query(rusqlite::params_from_iter(parameters))?;
     let mut rows = Vec::new();
     let mut inspected = 0usize;
     while let Some(row) = query.next()? {
-        if !continue_query() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Ok(LimitedQueryRows::incomplete(rows, inspected));
         }
         inspected = inspected.saturating_add(1);
-        let oid_text = row.get::<_, String>(0)?;
+        let lang_index = row.get::<_, i64>(0)?;
+        let lang_index = usize::try_from(lang_index)
+            .map_err(|_| StoreError::new(format!("invalid search language index {lang_index}")))?;
+        let oid_text = row.get::<_, String>(1)?;
         let blob_oid = Oid::from_str(&oid_text).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+            rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(err))
         })?;
         rows.push(SearchCandidateNameRow {
             lang_index,
             blob_oid,
-            unit_key: row.get(1)?,
-            short_name: row.get(2)?,
-            content_qualifier: row.get(3)?,
+            unit_key: row.get(2)?,
+            short_name: row.get(3)?,
+            content_qualifier: row.get(4)?,
         });
     }
-    if !continue_query() {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
         Ok(LimitedQueryRows::incomplete(rows, inspected))
     } else {
         Ok(LimitedQueryRows::complete(rows, inspected))
@@ -9392,6 +9375,55 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn active_symbol_candidate_scan_batches_languages() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let java_file = write_file(
+            temp.path(),
+            "java/Service.java",
+            "package java; class Service { void run() {} }\n",
+        );
+        let rust_file = write_file(temp.path(), "rust/service.rs", "pub fn run() {}\n");
+        let java_oid = oid_for(java_file.read_to_string().unwrap().as_bytes());
+        let rust_oid = oid_for(rust_file.read_to_string().unwrap().as_bytes());
+        let store = AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap();
+        store
+            .write_parsed_blob(
+                java_oid,
+                "java",
+                &JavaAdapter,
+                &parse_state(&JavaAdapter, &java_file),
+            )
+            .unwrap();
+        store
+            .write_parsed_blob(
+                rust_oid,
+                "rust",
+                &RustAdapter,
+                &parse_state(&RustAdapter, &rust_file),
+            )
+            .unwrap();
+
+        let languages = vec!["java".to_string(), "rust".to_string()];
+        let generations = HashMap::from_iter([
+            ("java".to_string(), GenerationId::BOOTSTRAP),
+            ("rust".to_string(), GenerationId::BOOTSTRAP),
+        ]);
+        let rows = store
+            .search_candidate_name_rows_for_langs(
+                &languages,
+                &generations,
+                &[java_oid, rust_oid],
+                Some(&["run", "Service"]),
+                None,
+            )
+            .unwrap();
+
+        assert!(rows.complete);
+        assert!(rows.rows.iter().any(|row| row.lang_index == 0));
+        assert!(rows.rows.iter().any(|row| row.lang_index == 1));
     }
 
     #[test]

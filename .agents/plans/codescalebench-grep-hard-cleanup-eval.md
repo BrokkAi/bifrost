@@ -38,9 +38,11 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - [x] (2026-08-06 05:28Z) Started a sequential host-only DW10 prewarm for the 18 unique source revisions used by the 20-task near-miss set. No evaluation container performs prewarm.
 - [x] (2026-08-06 09:05Z) Profiled the Java source timeout and added a complete-index miss fast path. Four concurrent Kafka source calls fell from an unbounded 90-second SQLite scan to 6.3 seconds total.
 - [x] (2026-08-06 09:34Z) Committed the complete-index owner recovery fix as `1c2e90b9` with a regression test.
-- [ ] (2026-08-06 09:35Z) Started a new sequential host-only DW10 prewarm for the exact 14-task shovel-ready set. The live external session is `25924`; no evaluation container performs prewarm.
-- [ ] Complete the replacement prewarm and restart the corrected symbol arm.
-- [ ] (2026-08-05 23:25Z) Run the selected tasks with symbol tools. The first 20-task arm stopped after a linked-worktree fault and a false cache-readiness assumption.
+- [x] (2026-08-06 09:35Z) Completed a new sequential host-only DW10 prewarm for the exact 14-task shovel-ready set. No evaluation container performs prewarm.
+- [x] (2026-08-06 17:15Z) Reprofiled Firefox with the corrected symbol arm. A 401,804-file tree exposed a serial per-language SQLite name scan. Bifrost now scans all requested languages in one active-set query. The name scans fell to 8.1-15.9 seconds in the single-task gate; the complete symbol call took 102.6 seconds.
+- [x] (2026-08-06 17:15Z) Stopped the Firefox gate after a separate `get_summaries` call over `js/src` took 127.0 seconds. The tool description now warns against repository-root and broad-tree targets in large repositories.
+- [x] (2026-08-06 11:25Z) Completed a corrected one-task symbol smoke with the external DW10 cache. The new CodeScale symbol arm exposed only symbol MCP tools plus artifact writing and planning; it made no usage-graph or generic workspace calls.
+- [ ] Run the selected tasks with symbol tools. The first 20-task arm stopped after a linked-worktree fault and a false cache-readiness assumption.
 - [ ] Run the same tasks with symbol and NLP tools.
 - [ ] Add synthetic semantic step zero if natural semantic use is too low.
 - [ ] Produce a paired report and complete the requirement audit.
@@ -275,3 +277,5 @@ Revision note: Brokkbench readiness record version 5 includes the profiler diges
 Revision note: The six completed symbol tasks used runtime r18. One task reached an analyzer-capacity timeout while Chromium was writing the shared cache. A direct warm profile returned concurrent symbol calls in 3.4-11.6 seconds. Brokkbench now gives symbol and symbols-plus-NLP requests a 1,200-second benchmark budget; commit `3e29b4d1c2d`.
 
 Revision note: The interrupted task rerun selected `usage_graph` on the large Kubernetes workspace. The graph stayed CPU-active for more than 18 minutes and read more than 150 GB. It produced no Bifrost error before the run stopped without a result record. The host-only Chromium prewarm remains the single cache writer and has processed about 69,800 of 164,966 files.
+
+Revision note: The first replacement smoke still exposed generic workspace tools through Brokkbench's agent allowlist, even though Bifrost used the symbol server. The CodeScale `symbols` and `symbols-nlp` arms now allow only `write_file`, `update_plan`, and the no-line-number symbol tools. The follow-up smoke completed without generic or graph calls.
