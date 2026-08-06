@@ -67,4 +67,3 @@ test-support = ["brokk-bifrost-core/test-support"]
 # crate's test targets, which is what makes core's test-support surface exist
 # while this crate's unit tests are built.
 brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.23", features = ["test-support"] }
-tempfile = "3.23.0"

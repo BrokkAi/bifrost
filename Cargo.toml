@@ -116,31 +116,16 @@ brokk-bifrost-policy = { path = "crates/bifrost-policy", version = "=0.8.23" }
 brokk-bifrost-runtime = { path = "crates/bifrost-runtime", version = "=0.8.23" }
 brokk-bifrost-semantic-packs = { path = "crates/bifrost-semantic-packs", version = "=0.8.23" }
 bincode = "1.3.3"
-cap-std = { version = "4.0.2", default-features = false }
-cap-fs-ext = { version = "4.0.2", default-features = false, features = ["std"] }
 # The NLP / semantic_search stack (hf-hub, tokenizers, fastrq, and the embedder
 # itself) lives in brokk-bifrost-nlp; see that crate's manifest. The PyTorch SDPA
 # sidecar script it drives is `scripts/voyage_sidecar.py`, which this package
 # still ships because the binary resolves it relative to the facade.
-# Scalable Bloom filter for GC reachability: a few MB even for a monorepo's full object
-# set, and sized proportionally (~KB for a small repo). Grows to hold an unknown number
-# of OIDs while holding the target false-positive rate.
-growable-bloom-filter = "2.1"
 chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
 csv = "1.3.1"
-# cvss 2.2.0's public MetricType currently references v3 even when only the
-# v4 module is enabled, so v3 is required to compile the v4 API.
-cvss = { version = "2.2.0", default-features = false, features = ["std", "v3", "v4"] }
 git2 = { version = "0.20.2", default-features = false }
-goblin = "0.10.7"
 glob = "0.3.3"
-ignore = "0.4.24"
-indicatif = "0.18.0"
 lsp-types = "0.97"
-moka = { version = "0.12.11", features = ["sync"] }
-notify = "6.1.1"
 nu-ansi-term = "0.50"
-once_cell = "1.21.3"
 pyo3 = { version = "0.23.5", features = ["abi3-py312"], optional = true }
 rayon = "1.10.0"
 reedline = "0.49"
@@ -149,16 +134,11 @@ rusqlite = { version = "0.32.1", features = ["bundled"] }
 rustc-hash = "2"
 rustdoc-types = { version = "=0.60.0", default-features = false }
 semver = "1.0.28"
-smallvec = "1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-strsim = "0.11.1"
-json-spanned-value = "0.2.2"
 sha2 = "0.10.8"
-shlex = "2.0.1"
 toml = "0.8.23"
 tempfile = "3.23.0"
-uuid = { version = "1.23.0", features = ["v4"] }
 url = { version = "2.5.8", default-features = false, features = ["std"] }
 
 # Tree-sitter policy:
@@ -169,30 +149,11 @@ url = { version = "2.5.8", default-features = false, features = ["std"] }
 tree-sitter = "0.25.10"
 
 # Grammars already on the current 0.25 line.
-tree-sitter-go = "0.25.0"
-tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
-# Scala and Kotlin generated parsers are compiled from vendor/. Scala carries
-# Bifrost fixes not available together in a published crate; Kotlin's active
-# upstream source is ahead of its published crate. Their provenance files name
-# exact revisions and regeneration commands.
-tree-sitter-language = "0.1"
 
 # Grammars that still need older published releases for this port.
-tree-sitter-c-sharp = "0.23.1"
 tree-sitter-cpp = "0.23.4"
-tree-sitter-java = "0.23.5"
-tree-sitter-php = "0.23.11"
-tree-sitter-ruby = "0.23.1"
-tree-sitter-rust = "0.24.0"
-tree-sitter-typescript = "0.23.2"
 walkdir = "2.5.0"
-quick-xml = "0.40"
-jaq-core = "3.0"
-jaq-std = "3.0"
-jaq-json = "2.0"
-xot = "0.31"
-jclassfile = "0.6.0"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 
 [features]
@@ -241,7 +202,6 @@ pretty_assertions = "1.4.1"
 # lets it report the offending file and line rather than just a filename.
 proc-macro2 = { version = "1", features = ["span-locations"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
-rusqlite_migration = "=1.3.1"
 syn = { version = "2", features = ["extra-traits", "full", "visit"] }
 tar = { version = "0.4.44", default-features = false }
 # Proves Bifrost's private native symbols coexist with the published grammar.
@@ -250,17 +210,6 @@ tree-sitter-scala = "=0.25.1"
 # Unix: process-group kill for the embedding sidecar (and the peak-RSS bench).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-# Windows: formatter processes are born suspended, assigned to a Job Object,
-# then resumed so descendants cannot escape cancellation or timeout cleanup.
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_JobObjects",
-    "Win32_System_Threading",
-] }
 
 # Full debuginfo made every dev test binary ~600 MB, so target/ grew by
 # terabytes; line tables keep file/line backtraces at a fraction of the size.

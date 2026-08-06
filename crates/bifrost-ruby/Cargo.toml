@@ -27,6 +27,3 @@ tree-sitter = "0.25.10"
 # tree-sitter-ruby is a grammar generation behind the fleet's 0.25 line, in the
 # same class as tree-sitter-php 0.23.11 and tree-sitter-c-sharp 0.23.1.
 tree-sitter-ruby = "0.23.1"
-
-[dev-dependencies]
-tempfile = "3.23.0"

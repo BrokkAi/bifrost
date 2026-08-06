@@ -25,6 +25,3 @@ tree-sitter = "0.25.10"
 # exporting two language constants; every site here names `LANGUAGE_PHP` (the
 # HTML-embedding dialect), never `LANGUAGE_PHP_ONLY`.
 tree-sitter-php = "0.23.11"
-
-[dev-dependencies]
-tempfile = "3.23.0"

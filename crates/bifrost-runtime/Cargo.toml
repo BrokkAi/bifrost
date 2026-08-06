@@ -18,4 +18,7 @@ brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.8.23" }
 
 [dev-dependencies]
 serde_json = "1.0.145"
+# Used by tests/code_intelligence_runtime.rs through its #[path] include of the
+# shared harness ../../../tests/common/inline_project.rs, which lives outside
+# this crate's directory.
 tempfile = "3.23.0"

@@ -23,8 +23,16 @@ Run the core Rust checks before submitting a change:
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
+cargo machete
 uv run --python 3.12 -- cargo test --features nlp,python
 ```
+
+`cargo machete` is the unused-dependency gate that CI's lint job runs; install
+it with `cargo install --locked cargo-machete --version 0.9.2`. If it flags a
+dependency that is genuinely used (macro-only, feature-gated, or build-script
+use it cannot see), add the dependency to that crate's
+`[package.metadata.cargo-machete] ignored` list with a comment explaining why
+it is real; otherwise remove the dependency.
 
 Bifrost's default feature set is empty. Include the `nlp` and `python` features
 when running the full test suite; a featureless `cargo test` skips the

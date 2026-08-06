@@ -125,6 +125,15 @@ jobs:
       - name: Cargo clippy
         run: node scripts/ci-timing.mjs --label lint-all-features -- cargo clippy --all-targets --all-features -- -D warnings
 
+      # Unused-dependency gate (#1733). cargo-machete is a manifest + source
+      # scan, so it needs no compilation; the rust-cache step above keeps the
+      # installed binary, making the install a no-op on warm caches.
+      - name: Install pinned cargo-machete
+        run: node scripts/ci-timing.mjs --label lint-machete-install -- cargo install --locked cargo-machete --version 0.9.2
+
+      - name: Check unused dependencies
+        run: node scripts/ci-timing.mjs --label lint-unused-dependencies -- cargo machete
+
   pinned-jvm-semantic-packs:
     name: pinned JVM semantic-pack bundle
     needs: [ci-impact, quick-policy, lint]
