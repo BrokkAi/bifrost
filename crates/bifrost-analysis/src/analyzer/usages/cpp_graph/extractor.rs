@@ -3700,8 +3700,10 @@ fn local_alias_scope_contains_node(alias: Node<'_>, node: Node<'_>) -> bool {
                 && node.end_byte() <= parent.end_byte();
         }
         if matches!(parent.kind(), "function_definition" | "lambda_expression") {
-            return parent.start_byte() <= node.start_byte()
-                && node.end_byte() <= parent.end_byte();
+            let Some(body) = parent.child_by_field_name("body") else {
+                return false;
+            };
+            return node_is_within(body, alias) && node_is_within(body, node);
         }
         current = parent.parent();
     }
