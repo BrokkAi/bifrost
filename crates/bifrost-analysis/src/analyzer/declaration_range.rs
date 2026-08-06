@@ -63,10 +63,31 @@ impl DeclarationNameRangeContext {
     }
 
     pub fn name_ranges(&self, analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Range> {
+        self.name_ranges_from_ranges(analyzer.ranges_of(code_unit), code_unit)
+    }
+
+    pub fn location_name_ranges(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        code_unit: &CodeUnit,
+    ) -> Vec<Range> {
+        self.name_ranges_from_ranges(analyzer.location_ranges(code_unit), code_unit)
+    }
+
+    fn name_ranges_from_ranges(
+        &self,
+        declaration_ranges: Vec<Range>,
+        code_unit: &CodeUnit,
+    ) -> Vec<Range> {
         let Some(root) = self.root_node() else {
             return Vec::new();
         };
-        code_unit_declaration_name_ranges_in_tree(analyzer, &self.content, root, code_unit)
+        code_unit_declaration_name_ranges_in_tree(
+            &self.content,
+            root,
+            code_unit,
+            declaration_ranges,
+        )
     }
 }
 
@@ -87,18 +108,22 @@ fn code_unit_declaration_name_range_in_tree(
     root: Node<'_>,
     code_unit: &CodeUnit,
 ) -> Option<Range> {
-    code_unit_declaration_name_ranges_in_tree(analyzer, content, root, code_unit)
-        .into_iter()
-        .next()
+    code_unit_declaration_name_ranges_in_tree(
+        content,
+        root,
+        code_unit,
+        analyzer.ranges_of(code_unit),
+    )
+    .into_iter()
+    .next()
 }
 
 fn code_unit_declaration_name_ranges_in_tree(
-    analyzer: &dyn IAnalyzer,
     content: &str,
     root: Node<'_>,
     code_unit: &CodeUnit,
+    mut declaration_ranges: Vec<Range>,
 ) -> Vec<Range> {
-    let mut declaration_ranges = analyzer.location_ranges(code_unit);
     declaration_ranges.sort_unstable();
     declaration_ranges.dedup();
 

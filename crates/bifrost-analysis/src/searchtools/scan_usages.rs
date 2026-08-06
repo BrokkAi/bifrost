@@ -1367,7 +1367,7 @@ pub(super) fn resolve_scan_usages_target(
                     let ranges = if selector_matches && unit.is_module() {
                         analyzer.location_ranges(&unit)
                     } else if selector_matches || selector_arg.is_none() {
-                        range_context.name_ranges(analyzer, &unit)
+                        range_context.location_name_ranges(analyzer, &unit)
                     } else {
                         return None;
                     };
@@ -3125,8 +3125,8 @@ pub(super) fn external_usage_definition_ranges(
     let Some(source) = analyzer.indexed_source(target.source()) else {
         return ranges;
     };
-    let exact_ranges =
-        DeclarationNameRangeContext::new(target.source(), source).name_ranges(analyzer, target);
+    let exact_ranges = DeclarationNameRangeContext::new(target.source(), source)
+        .location_name_ranges(analyzer, target);
     if exact_ranges.is_empty() {
         ranges
     } else {
