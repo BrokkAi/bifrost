@@ -407,8 +407,9 @@ pub fn search_symbols_with_cancellation(
         .flatten()
         .map(|candidate| candidate.code_unit.fq_name())
         .collect();
-    let (model_symbols, total_model_symbols) = analyzer
-        .semantic_model_overlay()
+    let semantic_model_overlay = analyzer.semantic_model_overlay();
+    let (model_symbols, total_model_symbols) = semantic_model_overlay
+        .as_deref()
         .map(|overlay| {
             let (matched, total, model_complete) = overlay.search_with_limit_filter(
                 &pattern_batch,
@@ -473,6 +474,10 @@ pub fn search_symbols_with_cancellation(
             }
             let render_context = load_declaration_name_context(analyzer, &file);
             let render_context = render_context.as_ref();
+            let type_aliases = analyzer
+                .type_alias_provider()
+                .and_then(|provider| provider.type_aliases_in_file(&file));
+            let type_aliases = type_aliases.as_ref();
             files.push(SearchSymbolsFile {
                 path: rel_path_string(&file),
                 loc: render_context
@@ -483,25 +488,39 @@ pub fn search_symbols_with_cancellation(
                     &code_units,
                     CodeUnitType::Class,
                     render_context,
+                    semantic_model_overlay.as_deref(),
+                    type_aliases,
                 ),
-                functions: collect_callable_kind_names(analyzer, &code_units, render_context),
+                functions: collect_callable_kind_names(
+                    analyzer,
+                    &code_units,
+                    render_context,
+                    semantic_model_overlay.as_deref(),
+                    type_aliases,
+                ),
                 fields: collect_ranked_kind_names(
                     analyzer,
                     &code_units,
                     CodeUnitType::Field,
                     render_context,
+                    semantic_model_overlay.as_deref(),
+                    type_aliases,
                 ),
                 modules: collect_ranked_kind_names(
                     analyzer,
                     &code_units,
                     CodeUnitType::Module,
                     render_context,
+                    semantic_model_overlay.as_deref(),
+                    type_aliases,
                 ),
                 macros: collect_ranked_kind_names(
                     analyzer,
                     &code_units,
                     CodeUnitType::Macro,
                     render_context,
+                    semantic_model_overlay.as_deref(),
+                    type_aliases,
                 ),
             });
         }
@@ -2453,39 +2472,62 @@ pub(super) fn collect_ranked_kind_names(
     code_units: &[RankedSearchCandidate],
     kind: CodeUnitType,
     render_context: Option<&DeclarationNameRangeContext>,
+    semantic_model_overlay: Option<&crate::analyzer::semantic_model::SemanticModelOverlay>,
+    type_aliases: Option<&HashSet<CodeUnit>>,
 ) -> Vec<SearchSymbolHit> {
-    collect_ranked_names_by(analyzer, code_units, render_context, |unit| {
-        unit.kind() == kind
-    })
+    collect_ranked_names_by(
+        analyzer,
+        code_units,
+        render_context,
+        semantic_model_overlay,
+        type_aliases,
+        |unit| unit.kind() == kind,
+    )
 }
 
 pub(super) fn collect_callable_kind_names(
     analyzer: &dyn IAnalyzer,
     code_units: &[RankedSearchCandidate],
     render_context: Option<&DeclarationNameRangeContext>,
+    semantic_model_overlay: Option<&crate::analyzer::semantic_model::SemanticModelOverlay>,
+    type_aliases: Option<&HashSet<CodeUnit>>,
 ) -> Vec<SearchSymbolHit> {
-    collect_ranked_names_by(analyzer, code_units, render_context, CodeUnit::is_callable)
+    collect_ranked_names_by(
+        analyzer,
+        code_units,
+        render_context,
+        semantic_model_overlay,
+        type_aliases,
+        CodeUnit::is_callable,
+    )
 }
 
 pub(super) fn collect_ranked_names_by(
     analyzer: &dyn IAnalyzer,
     code_units: &[RankedSearchCandidate],
     render_context: Option<&DeclarationNameRangeContext>,
+    semantic_model_overlay: Option<&crate::analyzer::semantic_model::SemanticModelOverlay>,
+    type_aliases: Option<&HashSet<CodeUnit>>,
     matches_kind: impl Fn(&CodeUnit) -> bool,
 ) -> Vec<SearchSymbolHit> {
     let mut hits: Vec<_> = code_units
         .iter()
         .filter(|candidate| matches_kind(&candidate.code_unit))
         .flat_map(|candidate| {
-            let semantic_model = analyzer.semantic_model_overlay().and_then(|overlay| {
+            let semantic_model = semantic_model_overlay.and_then(|overlay| {
                 let matched = overlay.symbols_named(&candidate.code_unit.fq_name());
                 (matched.disposition
                     == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
                     .then(|| matched.records[0].provenance.clone())
             });
-            let is_type_alias = analyzer
-                .type_alias_provider()
-                .is_some_and(|provider| provider.is_type_alias(&candidate.code_unit));
+            let is_type_alias = type_aliases.map_or_else(
+                || {
+                    analyzer
+                        .type_alias_provider()
+                        .is_some_and(|provider| provider.is_type_alias(&candidate.code_unit))
+                },
+                |aliases| aliases.contains(&candidate.code_unit),
+            );
             display_signatures(analyzer, &candidate.code_unit)
                 .into_iter()
                 .map(move |signature| SearchSymbolHit {

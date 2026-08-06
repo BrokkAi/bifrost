@@ -7254,6 +7254,12 @@ where
             .unwrap_or(false)
     }
 
+    pub(crate) fn type_aliases_in_file(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+        self.fetch_file_state(file)
+            .map(|state| state.type_aliases.clone())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn signatures_vec_of(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.fetch_file_state(code_unit.source())
             .and_then(|state| state.signatures.get(code_unit).cloned())

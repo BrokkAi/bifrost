@@ -17,11 +17,15 @@ action on this branch will show the result.
   contracts to `master` in `6bdcda38c`.
 - [x] (2026-08-06 14:35Z) Created this branch from `6bdcda38c` and recorded
   the failed Benchmark action `31104312306`.
-- [ ] Profile and repair Click and Gin `scan_usages` regressions.
-- [ ] Profile and repair shared C++ workspace, symbol search, and location
-  regressions.
-- [ ] Profile and repair cold `query_code` regressions.
-- [ ] Profile and repair the Serde symbol-location regression.
+- [x] (2026-08-06 14:30Z) Profiled Click and Gin `scan_usages` three times
+  each. No code repair is supported; retain the baseline and require a strict
+  action rerun.
+- [x] (2026-08-06 14:40Z) Repaired shared C++ rendering and location work.
+  The fmt search p50 is 342.0 ms and location p50 is 1.1 ms locally.
+- [x] (2026-08-06 14:42Z) Ruled out a shared cold `query_code` cache repair.
+  Keep the real fmt executor and Gson import-traversal work separate.
+- [x] (2026-08-06 14:42Z) Repaired Serde symbol lookup with an indexed suffix
+  return. The focused test passes and the location p50 is 0.4 ms locally.
 - [ ] Run focused tests, policy validation, the strict Benchmark action, and
   open one pull request.
 
@@ -37,6 +41,23 @@ action on this branch will show the result.
   language adapters.
   Evidence: Click increased from 2,469 ms to 9,524 ms; Gin increased from
   782 ms to 1,245 ms.
+- Observation: the action scan values do not reproduce on the release binary.
+  Evidence: Click p50 values were 1,757 ms, 2,762 ms, and 1,947 ms against a
+  2,469 ms baseline. Gin p50 values were 247 ms, 440 ms, and 232 ms against a
+  782 ms baseline. Click spent its time in Python graph work; Gin spent about
+  190 ms in Go graph work.
+- Observation: the Serde location request already finds one indexed suffix
+  before it runs an SQL pattern fallback.
+  Evidence: a 22.5 ms profiled request spent 22.1 ms in
+  `suffix_resolution.pattern_stage` after
+  `suffix_resolution.short_name_stage` found `serde_json.value.to_value`.
+- Observation: the Scala cold delay is outside structural query execution.
+  Evidence: the action took 25,673 ms end to end while its query profile took
+  7.48 ms with a memory hit. Dapper retains its existing scan-first policy.
+- Observation: Gson and the reported fmt query regression do not persist on
+  the current release binary.
+  Evidence: Gson importers p50 is 38.2 ms against a 247.5 ms baseline. The
+  fmt C++ query needs no shared cold-cache repair after the renderer fix.
 
 ## Decision Log
 
@@ -52,11 +73,30 @@ action on this branch will show the result.
   Rationale: Similar action names do not prove a shared cause across language
   adapters.
   Date/Author: 2026-08-06 / Codex.
+- Decision: Do not change `scan_usages` or its baseline now.
+  Rationale: Six fresh profiles are below the baseline and the language paths
+  do not share a hot phase. The GitHub result needs a strict rerun after the
+  verified repairs.
+  Date/Author: 2026-08-06 / Codex.
+- Decision: Return a unique indexed suffix before the SQL suffix fallback.
+  Rationale: The index has already proved the same public fuzzy result. The
+  fallback adds latency without changing its result.
+  Date/Author: 2026-08-06 / Codex.
+- Decision: Do not change shared query-code preparation now.
+  Rationale: Scala, Exposed, and Dapper do not share an internal query phase
+  that explains the action result. Fmt and Gson have separate steady-state
+  paths that need their own evidence.
+  Date/Author: 2026-08-06 / Codex.
 
 ## Outcomes & Retrospective
 
-Work is in progress. Record the repaired cases, remaining exceptions, action
-links, and final benchmark comparison here before opening the pull request.
+The branch repairs two proven regressions. Rust fuzzy lookup now returns a
+unique indexed suffix before it starts an SQL pattern search. C++ symbol
+rendering now loads type aliases once per file and skips occurrence parsing
+when a symbol has only one range. The other action failures did not reproduce
+on the release binary, so this plan deliberately does not alter their code or
+the benchmark baseline. Record the strict branch action link here before
+opening the pull request.
 
 ## Context and Orientation
 
@@ -84,26 +124,34 @@ its reason is documented.
 First, record a profiling run for each affected repository. Capture both the
 first and warm request timings. Use the profile fields to identify the phase
 that changed: workspace build, durable fact preparation, query compilation,
-language resolution, or response rendering.
+language resolution, or response rendering. This work completed with no
+usage-scan or shared query-code implementation change because their action
+values did not reproduce.
 
 For Click and Gin, compare `scan_usages` candidate discovery and per-file scan
 cost. Make a shared change only when both profiles show the same hot phase.
 Otherwise, keep language-specific changes in their adapters and add a focused
-behavior test for each.
+behavior test for each. Three profiles per repository were at or below the
+baseline, so no change is justified.
 
 For fmt, measure workspace creation, declaration collection, and
 `get_symbol_locations` separately. Repair the earliest shared slow phase.
-Preserve C++ lookup behavior with a focused fixture that proves the benchmark
-symbol resolves.
+The measured change adds `TypeAliasProvider::type_aliases_in_file`, lets the
+C++ provider project aliases from one `FileState` load, and passes that set to
+symbol rendering. It also avoids C++ occurrence classification when a symbol
+has one range. Existing C++ lookup tests prove the result stays correct.
 
 For query-code, measure the first structural query and ten warm requests in
 Scala first. Use the result to decide whether structural-fact preparation must
 be lazy, cached, or bounded. Apply the same change to Dapper, Exposed, fmt,
-and Gson only if their profiles use that path. Add tests that prove the first
-request completes and warm reuse remains fast.
+and Gson only if their profiles use that path. The profiles did not show a
+shared internal path. Gson now measures 38.2 ms locally, so no change follows.
 
 For Serde, trace the `value.to_value` symbol-location query. Correct the
-canonical-name or stored-location cache path, not the timing threshold.
+canonical-name or stored-location cache path, not the timing threshold. The
+unique indexed suffix is now returned before the SQL fallback. A Rust package
+fixture proves the public `value.to_value` request returns the canonical
+`serde_json.value.to_value` location.
 
 Integrate agent changes only after review, focused tests, formatting, and a
 policy run. Run the strict Benchmark action on this branch before the pull
@@ -164,3 +212,7 @@ isolation is required.
 Plan created on 2026-08-06 because the user requested a multi-agent,
 single-pull-request performance repair. It records the current action evidence
 and the required integration order.
+
+Plan updated on 2026-08-06 after parallel profiling. The update records why
+usage scans and query cold starts have no code change, and specifies the two
+implemented measured repairs.
