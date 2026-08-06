@@ -1,6 +1,5 @@
 mod adapter;
 mod clones;
-mod diagnostics;
 mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
@@ -64,6 +63,7 @@ use std::sync::{Arc, OnceLock};
 
 pub(crate) use crate::analyzer::{ScalaExportInfo, ScalaExportSelector};
 pub(crate) use adapter::ScalaAdapter;
+pub(crate) use brokk_bifrost_jvm::scala::graph_support::{ScalaSource, ScalaTypeKnownness};
 pub(crate) use brokk_bifrost_jvm::scala::imports::{
     scala_lexical_scope_path_at, scala_lexical_scope_path_checked,
 };
@@ -170,13 +170,6 @@ pub struct ScalaAnalyzer {
     scala_query_walk_count: Arc<AtomicUsize>,
     #[allow(dead_code)]
     type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScalaTypeKnownness {
-    Known,
-    Absent,
-    Uncertain,
 }
 
 crate::analyzer::impl_forward_query_provider!(ScalaAnalyzer);
@@ -434,79 +427,6 @@ impl ScalaAnalyzer {
         })
     }
 
-    pub(crate) fn simple_type_knownness(
-        &self,
-        file: &ProjectFile,
-        name: &str,
-    ) -> ScalaTypeKnownness {
-        if name.is_empty() || scala_default_type_name(name) {
-            return ScalaTypeKnownness::Known;
-        }
-
-        let package_name = self.inner.package_name_of(file).unwrap_or_default();
-        if self.inner.all_declarations().any(|declaration| {
-            declaration.is_class()
-                && declaration.short_name().trim_end_matches('$') == name
-                && (declaration.source() == file || declaration.package_name() == package_name)
-        }) {
-            return ScalaTypeKnownness::Known;
-        }
-
-        let imports = self.inner.import_info_of(file);
-        let imported = self.imported_code_units_of(file);
-        let external = self.external_declaration_index();
-        if external.resolve_java_lang(name).is_some() {
-            return ScalaTypeKnownness::Known;
-        }
-        for import in &imports {
-            let Some(path) = scala_import_path(import) else {
-                return ScalaTypeKnownness::Uncertain;
-            };
-            if import.is_wildcard {
-                if imported.iter().any(|declaration| {
-                    declaration.is_class() && declaration.short_name().trim_end_matches('$') == name
-                }) || external
-                    .resolve_wildcard_import(&path, name, &package_name)
-                    .is_some()
-                {
-                    return ScalaTypeKnownness::Known;
-                }
-                return ScalaTypeKnownness::Uncertain;
-            }
-
-            if import.local_name() != Some(name) {
-                continue;
-            }
-            if imported.iter().any(|declaration| {
-                declaration.is_class() && declaration.short_name().trim_end_matches('$') == name
-            }) || external
-                .resolve_explicit_import(&path, &package_name)
-                .is_some()
-            {
-                return ScalaTypeKnownness::Known;
-            }
-            return ScalaTypeKnownness::Uncertain;
-        }
-
-        if external.resolve_same_package(&package_name, name).is_some() {
-            ScalaTypeKnownness::Known
-        } else {
-            ScalaTypeKnownness::Absent
-        }
-    }
-
-    pub(crate) fn is_known_simple_term(&self, file: &ProjectFile, name: &str) -> bool {
-        let package_name = self.inner.package_name_of(file).unwrap_or_default();
-        self.inner.all_declarations().any(|declaration| {
-            declaration.is_class()
-                && declaration.short_name().trim_end_matches('$') == name
-                && (declaration.source() == file || declaration.package_name() == package_name)
-        }) || self
-            .external_declaration_index()
-            .resolve_same_package(&package_name, name)
-            .is_some()
-    }
-
     pub(crate) fn full_usage_edges(
         &self,
         nodes: &HashSet<String>,
@@ -712,6 +632,77 @@ fn weight_scala_usage_edges(
         .map(|name| size_of::<String>() + name.len() + size_of::<usize>())
         .sum::<usize>();
     (key_bytes + edge_bytes + summary_bytes).clamp(1, u32::MAX as usize) as u32
+}
+
+impl ScalaSource for ScalaAnalyzer {
+    fn simple_type_knownness(&self, file: &ProjectFile, name: &str) -> ScalaTypeKnownness {
+        if name.is_empty() || scala_default_type_name(name) {
+            return ScalaTypeKnownness::Known;
+        }
+
+        let package_name = self.inner.package_name_of(file).unwrap_or_default();
+        if self.inner.all_declarations().any(|declaration| {
+            declaration.is_class()
+                && declaration.short_name().trim_end_matches('$') == name
+                && (declaration.source() == file || declaration.package_name() == package_name)
+        }) {
+            return ScalaTypeKnownness::Known;
+        }
+
+        let imports = self.inner.import_info_of(file);
+        let imported = self.imported_code_units_of(file);
+        let external = self.external_declaration_index();
+        if external.resolve_java_lang(name).is_some() {
+            return ScalaTypeKnownness::Known;
+        }
+        for import in &imports {
+            let Some(path) = scala_import_path(import) else {
+                return ScalaTypeKnownness::Uncertain;
+            };
+            if import.is_wildcard {
+                if imported.iter().any(|declaration| {
+                    declaration.is_class() && declaration.short_name().trim_end_matches('$') == name
+                }) || external
+                    .resolve_wildcard_import(&path, name, &package_name)
+                    .is_some()
+                {
+                    return ScalaTypeKnownness::Known;
+                }
+                return ScalaTypeKnownness::Uncertain;
+            }
+
+            if import.local_name() != Some(name) {
+                continue;
+            }
+            if imported.iter().any(|declaration| {
+                declaration.is_class() && declaration.short_name().trim_end_matches('$') == name
+            }) || external
+                .resolve_explicit_import(&path, &package_name)
+                .is_some()
+            {
+                return ScalaTypeKnownness::Known;
+            }
+            return ScalaTypeKnownness::Uncertain;
+        }
+
+        if external.resolve_same_package(&package_name, name).is_some() {
+            ScalaTypeKnownness::Known
+        } else {
+            ScalaTypeKnownness::Absent
+        }
+    }
+
+    fn is_known_simple_term(&self, file: &ProjectFile, name: &str) -> bool {
+        let package_name = self.inner.package_name_of(file).unwrap_or_default();
+        self.inner.all_declarations().any(|declaration| {
+            declaration.is_class()
+                && declaration.short_name().trim_end_matches('$') == name
+                && (declaration.source() == file || declaration.package_name() == package_name)
+        }) || self
+            .external_declaration_index()
+            .resolve_same_package(&package_name, name)
+            .is_some()
+    }
 }
 
 impl TestDetectionProvider for ScalaAnalyzer {}
@@ -953,7 +944,10 @@ impl IAnalyzer for ScalaAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
-        let diagnostics = diagnostics::collect_scala_semantic_diagnostics(self, file, source)
+        let diagnostics =
+            brokk_bifrost_jvm::scala::diagnostics::collect_scala_semantic_diagnostics(
+                self, file, source,
+            )
             .into_iter()
             .map(Into::into)
             .collect();

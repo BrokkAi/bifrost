@@ -1,24 +1,32 @@
-use crate::analyzer::scala::ScalaTypeKnownness;
-use crate::analyzer::semantic_diagnostics::{node_range, node_text};
-use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
-use crate::analyzer::{
-    IAnalyzer, ImportAnalysisProvider, ProjectFile, Range, ScalaAnalyzer, SemanticDiagnostic,
-    resolve_analyzer,
-};
-use crate::hash::HashSet;
-use crate::text_utils::compute_line_starts;
+//! Scala's semantic diagnostics: conservative unrecognized-symbol reporting.
+//!
+//! The pass only reports a name when the workspace can prove it is absent. A
+//! wildcard or aliased import that this analyzer cannot follow answers
+//! [`ScalaTypeKnownness::Uncertain`], and an uncertain name is never reported.
+//!
+//! `analyzer/scala/diagnostics.rs` keeps nothing: the
+//! `SemanticDiagnosticReport` wrapper `IAnalyzer::semantic_diagnostics`
+//! returns stays on the analyzer, which calls this directly.
+
+use crate::scala::graph_support::{ScalaSource, ScalaTypeKnownness};
+use brokk_bifrost_core::analyzer::model::SemanticDiagnostic;
+use brokk_bifrost_core::analyzer::semantic_diagnostics::{node_range, node_text};
+use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
+use brokk_bifrost_core::analyzer::{ProjectFile, Range};
+use brokk_bifrost_core::hash::HashSet;
+use brokk_bifrost_core::text_utils::compute_line_starts;
 use tree_sitter::{Node, Parser, Tree};
 
-pub(crate) const SCALA_UNRECOGNIZED_SYMBOL: &str = "scala_unrecognized_symbol";
-pub(crate) const SCALA_SEMANTIC_DIAGNOSTIC_SOURCE: &str = "bifrost-scala";
+pub const SCALA_UNRECOGNIZED_SYMBOL: &str = "scala_unrecognized_symbol";
+pub const SCALA_SEMANTIC_DIAGNOSTIC_SOURCE: &str = "bifrost-scala";
 const MAX_SCALA_SEMANTIC_DIAGNOSTIC_BYTES: usize = 512 * 1024;
 const MAX_SCALA_SEMANTIC_DIAGNOSTICS: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ScalaSemanticDiagnostic {
-    pub(crate) range: Range,
-    pub(crate) kind: &'static str,
-    pub(crate) message: String,
+pub struct ScalaSemanticDiagnostic {
+    pub range: Range,
+    pub kind: &'static str,
+    pub message: String,
 }
 
 impl From<ScalaSemanticDiagnostic> for SemanticDiagnostic {
@@ -32,14 +40,11 @@ impl From<ScalaSemanticDiagnostic> for SemanticDiagnostic {
     }
 }
 
-pub(crate) fn collect_scala_semantic_diagnostics(
-    analyzer: &dyn IAnalyzer,
+pub fn collect_scala_semantic_diagnostics(
+    scala: &dyn ScalaSource,
     file: &ProjectFile,
     source: &str,
 ) -> Vec<ScalaSemanticDiagnostic> {
-    let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
-        return Vec::new();
-    };
     if source.len() > MAX_SCALA_SEMANTIC_DIAGNOSTIC_BYTES {
         return Vec::new();
     }
@@ -71,13 +76,13 @@ pub(crate) fn collect_scala_semantic_diagnostics(
 fn parse_scala_tree(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser
-        .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
+        .set_language(&crate::scala::language::LANGUAGE.into())
         .ok()?;
     parser.parse(source, None)
 }
 
 struct ScalaDiagnosticCollector<'a> {
-    scala: &'a ScalaAnalyzer,
+    scala: &'a dyn ScalaSource,
     file: &'a ProjectFile,
     source: &'a str,
     line_starts: &'a [usize],
