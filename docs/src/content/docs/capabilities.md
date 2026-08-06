@@ -11,6 +11,11 @@ Bifrost supports the same broad analysis categories across its languages, but la
 
 Named arguments refer to call-site syntax represented by the normalized `kwargs` role. Import-file edges are direct, project-local file relationships used by `imports_of` and `importers_of`; matching an `import` node structurally is a separate, broader capability. Hierarchy means indexed direct `supertypes` and `subtypes`, not compiler-complete effective-member lookup. **Bounded receiver provenance** means the `receiver_targets`, `points_to`, and `member_targets` query steps return explicit analysis outcomes and bounded candidates; it is separate from ordinary call/reference receiver resolution.
 
+**Direct value-flow baseline** means the production semantic adapter has a
+source-backed helper-flow case that agrees across the direct solver, JSON
+CodeQuery, and RQL. It proves the shared adapter contract for that fixture, not
+complete precision for every language construct.
+
 ## Language Matrix
 
 | Language | Structural | Exact references and calls | Call and receiver precision | Named arguments | Direct import-file edges | Indexed hierarchy |
@@ -37,6 +42,21 @@ Receiver availability is not defined by a static language allowlist. The selecte
 
 The executable [language tutorials](/code-query-tutorials/) prove structural vocabulary against fixtures. [Reference Traversal](/code-query-tutorials/reference-traversal/#cross-language-support) exercises inbound and outbound graph pipelines across every graph-backed adapter, [Import Traversal](/code-query-tutorials/import-traversal/#direct-import-forms-by-language) records direct-edge support and the PHP diagnostic boundary, and [Receiver Traversal](/code-query-tutorials/receiver-traversal/) locks the shared outcome and provenance contract.
 
+### Bounded Data Flow And Typestate
+
+Every language in the matrix has the direct value-flow baseline described
+above; C and C++ share the C-family semantic adapter. Advanced field,
+receiver, exceptional-flow, dynamic-dispatch, and external-model precision
+still varies by adapter and source shape.
+
+The public query vocabulary exposes procedure-local CFG inspection plus
+host-registered value-flow, typestate, and retained taint projections. `.rqlp`
+taint policies use the production compiler, set-oriented batch planner, solver,
+retained report, and human/JSON/SARIF projection. Typestate policies execute
+finite-state protocols over the bounded semantic graph. See [Data Flow, Taint,
+and Typestate](/data-flow-and-typestate/) for the execution and registration
+boundaries.
+
 ## Precision And Completeness
 
 Structural matching is syntax-precise: Bifrost matches normalized Tree-sitter nodes and roles rather than regex or substring approximations. It does not make a structural call match equivalent to a resolved callee identity. Use reference and call traversal when identity matters.
@@ -53,14 +73,15 @@ Hierarchy traversal returns indexed direct type relationships. Repeating a bound
 
 External package imports can be matched structurally, and source references to library code may be visible. External declarations appear as query targets only when their source is genuinely inside the indexed workspace and has a renderable declaration range. Bifrost does not synthesize external declarations from import names, installed package metadata, or runtime objects.
 
-## Analyses Not Currently Provided
+## Remaining Analysis Boundaries
 
-Bifrost does not currently provide:
+Bifrost does not currently claim:
 
-- control-flow graphs or path feasibility;
+- SMT-backed or otherwise path-sensitive feasibility;
 - whole-program points-to or complete allocation-site analysis (the receiver-query implementations are bounded and demand-driven);
 - general alias sets or receiver provenance beyond the structured facts published by each bounded adapter;
-- general interprocedural data-flow or taint tracking; or
+- an arbitrary unregistered data-flow query assembled from structural matches,
+  or an unbounded public ICFG traversal;
 - compiler-complete external dependency indexing.
 
-`call_input` can project the expression written at a resolved call site, and the selected adapter's `points_to` step can analyze that exact expression under a bounded receiver budget. Neither operation is a general value-flow engine. Structural `inside` and `has` constraints prove syntax-tree containment, not runtime control or data flow. Choose another analysis engine when the required claim depends on one of these unsupported guarantees.
+`call_input` can project the expression written at a resolved call site, and the selected adapter's `points_to` step can analyze that exact expression under a bounded receiver budget. Neither operation by itself invokes the data-flow engine. Structural `inside` and `has` constraints prove syntax-tree containment, not runtime control or data flow. Use a registered value-flow plan, a taint policy, or a typestate protocol when the required claim is supported by those bounded analyses; choose another analysis engine when it depends on one of the remaining boundaries above.

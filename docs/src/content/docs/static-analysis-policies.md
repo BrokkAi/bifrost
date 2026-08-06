@@ -1,6 +1,6 @@
 ---
 title: Static-Analysis Policies
-description: Author reusable RQLP rules and endpoints, run match policies, and interpret complete human, JSON, or SARIF reports.
+description: Author reusable RQLP rules and endpoints, run structural and semantic policies, and interpret complete human, JSON, or SARIF reports.
 ---
 
 Bifrost static-analysis policies are human-readable S-expressions stored in
@@ -9,10 +9,11 @@ and completeness semantics around native [Rune Query Language
 (RQL)](/rune-query-language/) selectors. JSON is available as a normalized or
 reporting form, but it is not an alternate RQLP authoring syntax.
 
-> **Current execution boundary:** Bifrost executes match-, typestate-, and
-> assertion-analysis policies. Taint-analysis policies can be authored, parsed,
-> validated, and composed, but their evaluator is not implemented yet. Running
-> taint reports an `unsupported` completion and exits with status 2.
+> **Current execution boundary:** Bifrost executes match-, taint-, typestate-,
+> and assertion-analysis policies. Taint resolves typed source and sink
+> bindings, compiles compatible demand, runs bounded set-oriented propagation,
+> and renders retained findings. Unsupported or incomplete semantic boundaries
+> remain non-clean completion states rather than empty successful results.
 
 > **Important:** An RQL selector returns analysis candidates. An endpoint
 > selector match is diagnostic-neutral. Neither an endpoint match nor the
@@ -237,7 +238,7 @@ source/sink leaves should normally use endpoint documents.
 | Type | Public authoring model | Evaluation in this release |
 | --- | --- | --- |
 | `match` | One inline or file-backed RQL selector returning supported, location-bearing terminal results. | Executable. |
-| `taint` | Set-oriented sources, sinks, sanitizers, transforms, external models, and optional finding combinations. | Parses, validates, and composes; evaluation reports `unsupported` until [#824](https://github.com/BrokkAi/bifrost/issues/824). |
+| `taint` | Set-oriented sources, sinks, sanitizers, transforms, external models, and optional finding combinations. | Executes the production compiler, compatible batch planner, solver, retained report, and human/JSON/SARIF projection. |
 | `typestate` | Tracked subjects, typed events, deterministic transitions, uncertainty rules, and terminal expectations. | Executes query-local semantic bindings and emits production findings with stable identity, primary/related locations, bounded witnesses, and completeness metadata. |
 | `assertion` | A subject selector that captures identifier tokens, plus one or more `assert`, `assert-resolution`, `assert-reaching`, `assert-boundary`, `assert-canonical`, `assert-route`, or `assert-round-trip` invariants about the [occurrence](/rune-query-language/) each captured token carries and about how it resolved. | Executes. Correlates captures to occurrence, candidate, and binding rows by AST identity and emits one multi-location finding per violated invariant. |
 
@@ -290,7 +291,7 @@ specific combination supplies more actionable wording:
 
 </details>
 
-A generated message is emitted only after the future taint analysis reports an
+A generated message is emitted only after the taint analysis reports an
 actual compatible source/sink meeting. Merely matching both endpoint selectors
 does **not** license “can reach.” For one actual pair, an applicable explicit
 combination replaces the generated default. If multiple explicit combinations
@@ -298,7 +299,7 @@ apply, `:supersedes` must leave one unique winner; it never creates a second
 solver run or duplicate finding.
 
 Categories, display phrases, and finding messages select and present this
-composition. They do not become propagation keys or change the future solver's
+composition. They do not become propagation keys or change the solver's
 set-oriented run identity.
 
 ### Assertion: what the parser must say about a token
@@ -922,11 +923,13 @@ from that set. The CLI does not guess paths or scan ambient directories.
 `--fail-on` accepts `never`, `finding`, `note`, `warning` (the default), or
 `error`; `finding` includes unrated findings. It changes only the complete-run
 finding threshold. It cannot turn an invalid, incomplete, cancelled, or
-unsupported run into status 0. Today, running a taint policy emits a retained
-report with an `unsupported` completion and exits 2 until #824 completes the
-flow adapter. Typestate policies execute; cancellation, budgets, incomplete
-selector discovery, semantic uncertainty, and witness truncation remain visible
-in run/finding completeness instead of becoming clean zero-results.
+unsupported run into status 0. Taint and typestate policies execute through the
+production semantic engine; cancellation, budgets, incomplete selector
+discovery, semantic uncertainty, unmodeled call boundaries, and witness
+truncation remain visible in run/finding completeness instead of becoming clean
+zero-results. Source-backed taint works without external models. An embedding
+must explicitly supply and activate a semantic-model catalog when external
+procedure summaries are required.
 
 See [CLI](/cli/#static-analysis-policies) for option interactions and
 [Reproduce an Analysis](/reproduce-analysis/) for the artifacts to preserve.

@@ -13,9 +13,11 @@ Bifrost has several interfaces because editor navigation, agent tools, structura
 | “Which code has this syntactic shape?” | [`query_code`](/code-querying/) | It matches normalized calls, declarations, assignments, imports, literals, containment, and typed graph steps across languages. |
 | “Which declarations call, use, inherit from, or import this result?” | A `query_code` typed pipeline | Start with a structural match, then traverse exact indexed declarations, reference/call edges, hierarchy, ownership, or project-file imports. |
 | “What value can this receiver denote, or which exact member does it select?” | [`receiver_targets`, `points_to`, or `member_targets`](/code-query-tutorials/receiver-traversal/) | Returns a bounded `receiver_analysis` row with explicit precision, ambiguity, unsupported, and budget outcomes for each input. |
+| “Can selected untrusted values reach selected sensitive operations?” | A [taint `.rqlp` policy](/data-flow-and-typestate/#set-oriented-taint) | Compiles typed source and sink sets into compatible shared solves, then reports actual meetings with bounded witnesses and explicit completeness. |
+| “Can this resource or API reach an invalid lifecycle state?” | A [typestate policy or registered typestate query](/data-flow-and-typestate/) | Runs a finite-state protocol over the bounded interprocedural semantic graph and preserves uncertainty and terminal obligations. |
 | “Which code is conceptually about this topic?” | [`semantic_search`](/semantic-search/) | This optional feature retrieves by meaning when names and shapes are not known in advance. |
 | “Where does this literal string occur?” | A text-search tool | Text search is the honest choice when the question is textual rather than structural or semantic. |
-| “Can Bifrost prove path-sensitive control flow, whole-program points-to, general aliasing, taint, or general data flow?” | Do not use the current query engine for that proof | The bounded receiver-query implementations are not a substitute for those analyses. |
+| “Can Bifrost prove path feasibility, complete whole-program points-to, or general unbounded aliasing?” | Do not use the current engine for that proof | Bounded value-flow, taint, and typestate results do not imply those stronger guarantees. |
 
 When a question begins with a known declaration, prefer symbol and usage tools. When it begins with a language-neutral shape, prefer `query_code`. A common workflow is to find candidates structurally and then use exact locations or declarations for semantic follow-up.
 
@@ -53,7 +55,7 @@ Begin with [Build a Static-Analysis Rule](/build-static-analysis-rule/), use RQL
 
 ## Check Suitability Before Installation
 
-Bifrost is a good fit when the answer can be grounded in parsed source structure, indexed declarations, exact source references, resolved call edges, direct project-file imports, indexed type relationships, bounded receiver provenance, or source-backed procedure-local CFG edges reported by the selected adapter. Its CFG surface does not cross call boundaries or perform path-sensitive analysis; it is not an ICFG, whole-program points-to, general alias, taint, or whole-program data-flow engine. Read the [capability matrix](/capabilities/) and inspect runtime diagnostics before relying on a zero-result or completeness claim.
+Bifrost is a good fit when the answer can be grounded in parsed source structure, indexed declarations, exact source references, resolved call edges, direct project-file imports, indexed type relationships, bounded receiver provenance, source-backed procedure-local CFG edges, or a configured value-flow, taint, or typestate analysis. The public CFG inspection surface does not cross call boundaries, while the registered and policy analyses use a bounded interprocedural graph internally. None of those surfaces claims path feasibility, complete whole-program points-to, or general unbounded aliasing. Read the [capability matrix](/capabilities/) and inspect runtime diagnostics before relying on a zero-result or completeness claim.
 
 Once you have chosen an interface, read [License and Use Cases](/license-use-cases/)
 for the practical differences between running Bifrost as a subprocess, linking
