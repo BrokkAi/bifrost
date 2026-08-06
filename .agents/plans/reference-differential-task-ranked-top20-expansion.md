@@ -668,6 +668,24 @@ the focus.
       regression passed again after that fast-forward.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
+  - [x] (2026-08-06) Completed C# rank eleven `NLog__NLog` at pinned head
+    `a342b92b`. Its starting 10,000-site envelope had two missing rows. Issue
+    #1735 now records `OptionalAttribute` parameters as omittable and advances
+    the C# analysis epoch so persisted caches rebuild the changed callable
+    metadata. Issue #1736 keeps constructor fallback on the exact structured
+    generic owner and returns that owner for its implicit zero-argument
+    constructor. Both issues were assigned only to `jbellis`, fixed, pushed,
+    and closed. The final clean persisted replay at Bifrost `6f998f39` audited
+    494/494 files, 88,765 candidates, 10,000 sites, and all 1,135 inverse
+    targets. It reported 2,274 consistent, 277 editor-only, 14 honestly
+    unproven, 7,435 inconclusive, and zero missing rows. It had no file errors,
+    candidate exclusions, skips, or truncation. Its JSONL SHA-256 is
+    `a897f68c5a3296fdeab3771c4859076829dc69c4dcd0c3647905c26fb98b5e81`.
+    Final exact #1735 and #1736 probes are each 1/1 consistent. Their SHA-256
+    values are
+    `2bc031af7a7ed1dad89abdc40a3d0d57a428785714287b04d16cbac144887f5f`
+    and
+    `e3ba2d02573db0160b935a247357eeee26c18b7ce3cf5a2ccd6b0392932b3e1f`.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Java ranks eleven through twenty and publish its evidence and
@@ -849,6 +867,14 @@ the focus.
   kept the grouping useful without combining two different root causes in one
   ticket.
 
+- Observation: an ephemeral exact probe can pass while a persisted repository
+  replay still reads stale declaration metadata. NLog's #1735 exact probe was
+  consistent after the extractor fix, but the warm full replay retained the
+  old exact arity and reproduced one missing row. Advancing the C# analysis
+  epoch forced a fresh extraction; the next persisted replay was clean across
+  all 1,135 targets. Declaration-metadata fixes therefore require an epoch
+  review before repository acceptance.
+
 ## Decision Log
 
 - Decision: Treat this as a new ranks-eleven-through-twenty expansion rather
@@ -901,12 +927,10 @@ the focus.
 ## Outcomes & Retrospective
 
 The expansion is in progress. The exact 110-repository scope comes from the
-live filtered selector. C ranks eleven through twenty are complete and have a
-published language manifest. C++ ranks eleven and thirteen are clean again
-through closed issues #1697 and #1699, rank twelve stayed clean, and rank
-twenty remains clean with its two issues closed on `origin/master`. The
-campaign is processing the remaining fresh-epoch regressions from rank
-fourteen forward before it starts C#.
+live filtered selector. C and C++ ranks eleven through twenty are complete and
+have published language manifests. C# rank eleven NLog is complete through
+closed issues #1735 and #1736. Its final persisted envelope is clean at the
+pushed Bifrost head. The campaign continues with C# rank twelve.
 
 ## Context and Orientation
 
