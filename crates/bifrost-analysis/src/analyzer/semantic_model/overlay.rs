@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -1890,26 +1891,18 @@ struct GeneratedOverlayFacts {
     relations: Vec<SemanticModelRelation>,
 }
 
+struct GeneratedFileFacts {
+    symbols: Vec<SemanticModelSymbol>,
+    relations: Vec<SemanticModelRelation>,
+    aliases: Vec<(String, String)>,
+}
+
 fn generated_overlay_facts(
     analyzer: &dyn IAnalyzer,
     active: &ResolvedActiveSemanticModels,
     cancellation: &crate::CancellationToken,
 ) -> Result<GeneratedOverlayFacts, SemanticModelOverlayBuildError> {
-    let mut rule_ids = active
-        .shards()
-        .iter()
-        .flat_map(|shard| {
-            shard
-                .shard
-                .payload()
-                .generator_rules()
-                .into_iter()
-                .flatten()
-                .map(|rule| rule.id.clone())
-        })
-        .collect::<Vec<_>>();
-    rule_ids.sort_unstable();
-    rule_ids.dedup();
+    let active_rules = unique_active_rules(active);
 
     let provider_files = analyzer
         .structural_search_providers()
@@ -1925,24 +1918,35 @@ fn generated_overlay_facts(
     let mut symbols = Vec::new();
     let mut relations = Vec::new();
     let mut aliases = Vec::new();
-    for rule_id in rule_ids {
+    for (provider, files) in &provider_files {
         if cancellation.is_cancelled() {
             return Err(SemanticModelOverlayBuildError::Cancelled);
         }
-        let matched = active.rules_with_id(&rule_id);
-        if matched.disposition != SemanticModelMatchDisposition::Unique {
+        let rules = active_rules
+            .iter()
+            .copied()
+            .filter(|(shard, _)| {
+                shard.manifest.language == provider.structural_language().config_label()
+            })
+            .collect::<Vec<_>>();
+        if rules.is_empty() {
             continue;
         }
-        let activated = &matched.records[0];
-        for (provider, files) in provider_files.iter().filter(|(provider, _)| {
-            provider.structural_language().config_label() == activated.shard.manifest.language
-        }) {
-            for file in files {
+        // A large workspace can exceed the per-file hydration cache. Keep the
+        // file outside the rule loop so each file state is loaded only once.
+        let generated_files = files
+            .par_iter()
+            .map(|file| {
                 if cancellation.is_cancelled() {
                     return Err(SemanticModelOverlayBuildError::Cancelled);
                 }
+                let mut generated = GeneratedFileFacts {
+                    symbols: Vec::new(),
+                    relations: Vec::new(),
+                    aliases: Vec::new(),
+                };
                 let Some(facts) = provider.structural_facts(file) else {
-                    continue;
+                    return Ok(generated);
                 };
                 for (node_index, node) in facts.nodes().iter().enumerate() {
                     if cancellation.is_cancelled() {
@@ -1950,30 +1954,52 @@ fn generated_overlay_facts(
                     }
                     let node_id = u32::try_from(node_index)
                         .expect("structural fact IDs are bounded to u32 by FileFacts");
-                    let enclosing = analyzer.enclosing_code_unit(file, &node.range);
-                    let Ok(captures) = evaluate_rule_at_node(
-                        analyzer,
-                        activated.record,
-                        &facts,
-                        node_id,
-                        file,
-                        enclosing.as_ref(),
-                    ) else {
+                    let matching_rules = rules
+                        .iter()
+                        .copied()
+                        .filter(|(_, rule)| {
+                            rule_trigger_matches(analyzer, file, &rule.trigger, &facts, node_id)
+                        })
+                        .collect::<Vec<_>>();
+                    if matching_rules.is_empty() {
                         continue;
-                    };
-                    for captures in &captures {
-                        emit_rule_match(
-                            active,
-                            activated.shard,
-                            activated.record,
-                            captures,
-                            &mut symbols,
-                            &mut relations,
-                            &mut aliases,
-                        );
+                    }
+                    // Enclosing-symbol lookup can hydrate source ranges. Do it
+                    // only after a cheap trigger match, and share it across rules.
+                    let enclosing = analyzer.enclosing_code_unit(file, &node.range);
+                    for (shard, rule) in matching_rules {
+                        let Ok(captures) = rule_capture_values(
+                            analyzer,
+                            rule,
+                            &facts,
+                            node_id,
+                            file,
+                            enclosing.as_ref(),
+                        ) else {
+                            continue;
+                        };
+                        for captures in &captures {
+                            emit_rule_match(
+                                active,
+                                shard,
+                                rule,
+                                captures,
+                                &mut generated.symbols,
+                                &mut generated.relations,
+                                &mut generated.aliases,
+                            );
+                        }
                     }
                 }
-            }
+                Ok(generated)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // Indexed Rayon collection preserves file order, so fact ordering is
+        // identical to the former sequential traversal.
+        for generated in generated_files {
+            symbols.extend(generated.symbols);
+            relations.extend(generated.relations);
+            aliases.extend(generated.aliases);
         }
     }
     for (alias, target) in aliases {

@@ -22,6 +22,10 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - [x] (2026-08-05 22:43Z) Fixed Bifrost MCP workspace arguments and proved symbol calls in one end-to-end task.
 - [x] (2026-08-06 00:31Z) Replaced the false 20-task cache set with 11 valid baseline failures and prewarmed all 11 against schema 15.
 - [x] (2026-08-06 00:31Z) Fixed persistent prewarm, ordered active membership, one-pass active chunk loading, and canonical container workspace paths.
+- [x] (2026-08-06 01:03Z) Stopped the first corrected symbol arm after a warm Kafka symbol call waited 71 seconds.
+- [x] (2026-08-06 01:20Z) Grouped generator rules by language, moved trigger tests before enclosing-symbol lookup, and evaluated files in parallel.
+- [x] (2026-08-06 01:22Z) Added shipped semantic-model activation to the CodeScale prewarm profiler.
+- [ ] Build a new runtime bundle, refresh structural prewarm state, and restart the corrected symbol arm.
 - [ ] (2026-08-05 23:25Z) Run the selected tasks with symbol tools. The first 20-task arm stopped after a linked-worktree fault and a false cache-readiness assumption.
 - [ ] Run the same tasks with symbol and NLP tools.
 - [ ] Add synthetic semantic step zero if natural semantic use is too low.
@@ -67,6 +71,14 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Evidence: Django had 2,887 Python files, but Bifrost reported zero analyzed files at `/opt/work/analysis`. The canonical self-bind reports 2,997 analyzed files and reaches semantic readiness in 11.5 seconds.
 - Observation: Ordinary clones did not have a full source self-bind at their canonical path.
   Evidence: Kafka exposed only `.git` there. The harness now self-binds every full prepared source tree. All 11 selected tasks completed prewarm.
+- Observation: Warm analyzer construction is no longer the symbol-arm startup problem.
+  Evidence: A direct Kafka profile built the complete analyzer in 0.83 seconds. Built-in semantic-pack activation did not finish within 20 seconds.
+- Observation: Generator-rule overlay creation traverses every structural file once for each rule and computes an enclosing code unit before it tests the rule trigger.
+  Evidence: A 20-second CPU profile spent most samples in path hashing, live-source resolution, file-state hydration, and range lookup below `generated_overlay_facts`. The active built-in pack contained only six records.
+- Observation: The existing CodeScale prewarm did not activate shipped semantic models.
+  Evidence: It built the persisted analyzer and semantic vector index directly. The first symbol request had to create Scala structural snapshots for the shipped case-class model.
+- Observation: Parallel, grouped activation meets the warm interactive limit after structural snapshots exist.
+  Evidence: On Kafka with six Rayon threads, the analyzer took 0.75 seconds, semantic-pack activation took 2.15 seconds, and `search_symbols` took 0.44 seconds. Total first-call latency was 3.55 seconds.
 
 ## Decision Log
 
@@ -103,6 +115,15 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - Decision: Run sequential prewarm with all 60 workstation cores, then use six cores per task at concurrency 10.
   Rationale: Initial cache hydration is parallel and persistent. The paired evaluation must share the workstation without forcing each large repository onto one core.
   Date/Author: 2026-08-06 / Codex
+- Decision: Group active generator rules by language and traverse each structural file once.
+  Rationale: The current rule-first loop reloads a large workspace for each rule. Trigger checks can reject most nodes before the code computes an enclosing symbol.
+  Date/Author: 2026-08-06 / Codex
+- Decision: Evaluate independent structural files through the existing Rayon pool and preserve their sorted collection order.
+  Rationale: Structural extraction and snapshot hydration are file-local. Each task gives Bifrost six cores, and indexed Rayon collection keeps deterministic output.
+  Date/Author: 2026-08-06 / Codex
+- Decision: Make the NLP prewarm profiler activate shipped semantic models before it starts vector indexing.
+  Rationale: A readiness record must cover all persistent state required by the first symbol call, not only analyzer rows and vectors.
+  Date/Author: 2026-08-06 / Codex
 
 ## Outcomes & Retrospective
 
@@ -128,6 +149,8 @@ After baseline selection, fix `run_task.sh`. Generate the Bifrost MCP argument a
 
 Run one selected task with symbols. Inspect stderr, the first LLM tool schema, Bifrost startup timing, and at least one tool result. If Bifrost fails or exceeds 120 seconds, stop the batch. Profile and correct the exact path. Repeat the one-task gate until it passes. Then run the complete shovel-ready hard subset with symbols.
 
+The corrected symbol smoke exposed a separate warm-path defect. In `crates/bifrost-analysis/src/analyzer/semantic_model/overlay.rs`, change `generated_overlay_facts` from a rule-first traversal to a provider-first traversal. Select all unique rules for the provider language. Load each file's structural facts once. Test rule triggers before computing the enclosing code unit. Compute that enclosing unit once for a node with one or more matching rules. Preserve rule conflict handling and emitted fact order. Reprofile Kafka with the same six-record built-in pack before the symbol arm restarts.
+
 Run the same task set with symbols plus NLP. Count tasks and calls for `semantic_search`. Include semantic reranker requests in utility tokens, time, and cost. If natural semantic use is too sparse for comparison, add the existing CIM-style query generation and synthetic step zero only to this evaluation mode. Limit queries by necessity, not a fixed count. Deduplicate redundant queries and keep query-model turns out of Luna's history.
 
 ## Concrete Steps
@@ -151,6 +174,8 @@ The fresh bare run must contain 64 result records. The hard-set manifest must ex
 
 The symbol smoke test must prove Bifrost startup and one completed symbol call. The full symbol arm must have no MCP-start error. The NLP arm must use the identical task manifest and runtime, except for NLP enablement. Its report must include symbol calls, semantic calls, main and utility tokens, request time, cost, and paired composite scores.
 
+Warm Kafka analyzer construction plus semantic-pack activation must complete in seconds. It must not repeat one complete structural-file pass per active generator rule. A normal `search_symbols` call must complete below the five-second product regression limit when the cache and operating-system page cache are warm.
+
 If synthetic semantic injection is required, its trace must show the synthetic results before Luna's first turn. It must not include the query model's turn in Luna's conversation history.
 
 ## Idempotence and Recovery
@@ -172,3 +197,7 @@ Revision note: Created after the invalid Bifrost run. It expands the work to the
 Revision note: The complete audit found three invalid candidates. The execution count is now 64, while the audit still covers all 67 rows.
 
 Revision note: The paired set now contains 11 cache-ready baseline failures. Canonical path and semantic startup faults were fixed before either paired arm.
+
+Revision note: The corrected symbol arm exposed rule-first semantic-pack activation. The run stopped after four tasks so Bifrost can remove repeated workspace traversal before restart.
+
+Revision note: The grouped and parallel traversal reduced warm Kafka first-call latency to 3.55 seconds. The prewarm profiler now creates the required structural snapshots before an evaluation.

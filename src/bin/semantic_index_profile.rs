@@ -26,6 +26,7 @@ fn main() -> Result<(), String> {
     use brokk_bifrost::{
         AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
         nlp::indexer::SemanticIndexer, nlp::store::semantic_db_path,
+        searchtools_service::prewarm_configured_semantic_models,
     };
 
     fn rss_kb() -> u64 {
@@ -68,6 +69,8 @@ fn main() -> Result<(), String> {
         WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
             .map_err(|err| err.to_string())?,
     );
+    brokk_bifrost::install_bifrost_semantic_model_packs()?;
+    prewarm_configured_semantic_models(snapshot.analyzer().project().root(), &snapshot)?;
     let analyzed_files = snapshot.analyzer().analyzed_files().len();
     let build_secs = start.elapsed().as_secs_f64();
     eprintln!(

@@ -320,6 +320,20 @@ fn activate_configured_semantic_models(
     }
 }
 
+/// Activate shipped and configured semantic models against an already-built
+/// workspace. Batch prewarm tools use this to materialize the same structural
+/// snapshots that normal MCP startup needs before an evaluation begins.
+pub fn prewarm_configured_semantic_models(
+    workspace_root: &Path,
+    workspace: &WorkspaceAnalyzer,
+) -> Result<(), String> {
+    activate_configured_semantic_models(
+        workspace_root,
+        workspace,
+        configured_semantic_models()?,
+    )
+}
+
 fn intrinsic_language_evidence(
     workspace: &WorkspaceAnalyzer,
 ) -> Vec<SemanticModelActivationEvidence> {
@@ -2421,11 +2435,7 @@ impl SearchToolsService {
                         AnalyzerConfig::default(),
                     )
                     .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
-                    activate_configured_semantic_models(
-                        project.root(),
-                        &workspace,
-                        configured_semantic_models()?,
-                    )?;
+                    prewarm_configured_semantic_models(project.root(), &workspace)?;
                     let session = assemble_session(
                         project,
                         workspace,
@@ -3725,14 +3735,13 @@ fn build_persisted_workspace(
     listing: Option<Arc<WorkspaceFileListingCache>>,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
     let _scope = profiling::scope("mcp_cold.analyzer_construction");
-    let configured_semantic_models = configured_semantic_models()?;
     let project = build_project(root, listing)?;
     let workspace = WorkspaceAnalyzer::build_persisted_for_service(
         Arc::clone(&project),
         AnalyzerConfig::default(),
     )
     .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
-    activate_configured_semantic_models(project.root(), &workspace, configured_semantic_models)?;
+    prewarm_configured_semantic_models(project.root(), &workspace)?;
     Ok((project, workspace))
 }
 
@@ -3740,11 +3749,10 @@ fn build_transient_workspace(
     root: PathBuf,
     listing: Option<Arc<WorkspaceFileListingCache>>,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
-    let configured_semantic_models = configured_semantic_models()?;
     let project = build_project(root, listing)?;
     let workspace =
         WorkspaceAnalyzer::build_for_service(Arc::clone(&project), AnalyzerConfig::default());
-    activate_configured_semantic_models(project.root(), &workspace, configured_semantic_models)?;
+    prewarm_configured_semantic_models(project.root(), &workspace)?;
     Ok((project, workspace))
 }
 
