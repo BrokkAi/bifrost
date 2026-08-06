@@ -28,11 +28,7 @@ fn cargo_crate(
     manifest: toml::Value,
     manifests: &HashMap<PathBuf, toml::Value>,
 ) -> Option<CargoCrate> {
-    let package_name = manifest
-        .get("package")?
-        .get("name")?
-        .as_str()
-        .map(str::to_owned)?;
+    let package_name = cargo_manifest_package_name(&manifest)?;
     let edition = cargo_package_edition(root, &directory, &manifest, manifests);
     let explicit_library = manifest.get("lib");
     let library = if explicit_library.is_some()
@@ -42,10 +38,7 @@ fn cargo_crate(
             Some(library) => Some(library.as_table()?),
             None => None,
         };
-        let library_name = library_table
-            .and_then(|library| library.get("name"))
-            .and_then(toml::Value::as_str)
-            .map(normalize_crate_name)
+        let library_name = cargo_manifest_library_name(&manifest)
             .unwrap_or_else(|| normalize_crate_name(&package_name));
         let library_path = library_table
             .and_then(|library| library.get("path"))
@@ -2339,8 +2332,30 @@ fn canonical_workspace_relative_path(root: &Path, target: &Path) -> Option<PathB
         .map(Path::to_path_buf)
 }
 
-fn normalize_crate_name(name: &str) -> String {
+pub(super) fn normalize_crate_name(name: &str) -> String {
     name.replace('-', "_")
+}
+
+/// `[package].name`, verbatim. Pure over parsed TOML, so `crate_naming` can
+/// share it without reaching the route index.
+pub(super) fn cargo_manifest_package_name(manifest: &toml::Value) -> Option<String> {
+    manifest
+        .get("package")?
+        .get("name")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Normalized `[lib].name`, when the manifest declares one. An implicit lib
+/// (`src/lib.rs` autodiscovery) is unnamed and inherits the package name, so
+/// `None` here does not mean "no lib target".
+pub(super) fn cargo_manifest_library_name(manifest: &toml::Value) -> Option<String> {
+    manifest
+        .get("lib")?
+        .as_table()?
+        .get("name")?
+        .as_str()
+        .map(normalize_crate_name)
 }
 
 fn append_module_package(mut package: String, nested: Option<&str>) -> String {
