@@ -1,6 +1,10 @@
 use crate::common::InlineTestProject;
-use brokk_bifrost::usages::{ExplicitCandidateProvider, FuzzyResult, UsageFinder};
-use brokk_bifrost::{CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, Language, ProjectFile};
+use brokk_bifrost::usages::{
+    ExplicitCandidateProvider, FuzzyResult, UsageFinder, cpp_graph::CppAuthoritativeUsageBatch,
+};
+use brokk_bifrost::{
+    AnalyzerConfig, CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, Language, ProjectFile,
+};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -387,6 +391,11 @@ fn behaviortree_primary_alias_does_not_collapse_partial_specialization_identity(
         .file(
             "contrib/expected.hpp",
             r#"namespace expected_lite {
+namespace detail {
+template<typename F, typename E>
+struct invoke_result_nocvref_t {};
+}
+
 template<typename T, typename E>
 class expected {
 public:
@@ -395,6 +404,13 @@ public:
     template<typename F>
     expected<T, error_type> transform(F&&) const {
         return expected<T, error_type>();
+    }
+
+    template<typename F>
+    void or_else(F&& f) {
+        return has_value()
+            ? detail::invoke_result_nocvref_t<F, error_type&&>(std::move(value()))
+            : detail::invoke_result_nocvref_t<F, error_type&&>(detail::invoke(std::forward<F>(f), std::move(error())));
     }
 };
 
@@ -462,6 +478,16 @@ public:
             "        return expected<T, error_type>();",
             "error_type",
         ),
+        token_range(
+            source.as_str(),
+            "            ? detail::invoke_result_nocvref_t<F, error_type&&>(std::move(value()))",
+            "error_type",
+        ),
+        token_range(
+            source.as_str(),
+            "            : detail::invoke_result_nocvref_t<F, error_type&&>(detail::invoke(std::forward<F>(f), std::move(error())));",
+            "error_type",
+        ),
     ]);
     let forward_reference = partial_references
         .iter()
@@ -503,5 +529,32 @@ public:
         authoritative_exact_ranges(&analyzer, &primary, &file),
         primary_references,
         "primary alias must retain compatible redeclaration uses without absorbing partial specialization uses"
+    );
+
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let workspace_analyzer = workspace.analyzer();
+    let workspace_primary = workspace_analyzer
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "expected_lite.expected$error_type"
+                && !unit.is_synthetic()
+        })
+        .expect("workspace primary error_type alias");
+    let roots = std::iter::once(file.clone()).collect();
+    let batch = CppAuthoritativeUsageBatch::new(workspace_analyzer, &roots)
+        .expect("workspace C++ authoritative batch");
+    let batch_ranges = batch
+        .find_usages(std::slice::from_ref(&workspace_primary), &roots, 1000)
+        .into_fuzzy_result()
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == file)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        batch_ranges, primary_references,
+        "the authoritative batch must retain the same primary alias references"
     );
 }

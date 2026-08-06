@@ -239,15 +239,23 @@ impl CppQueryResolver<'_> {
                     file,
                     prepared_file.prepared.as_ref(),
                 );
-                let class_ranges = spec
-                    .type_scan_key()
-                    .filter(|_| !prepared_file.recovered_sentinel_classes.is_empty())
-                    .map(|_| {
+                let class_ranges = spec.type_scan_key().and_then(|_| {
+                    // The authoritative batch already built this index. Use it
+                    // for every type scan, including malformed class bodies
+                    // that do not produce a sentinel recovery record.
+                    if let Some(class_ranges) = prepared_file.class_ranges.get() {
+                        return Some(class_ranges.as_ref());
+                    }
+                    if prepared_file.recovered_sentinel_classes.is_empty() {
+                        return None;
+                    }
+                    Some(
                         prepared_file
                             .class_ranges
                             .get_or_init(|| Arc::new(ClassRangeIndex::build(analyzer, file)))
-                            .as_ref()
-                    });
+                            .as_ref(),
+                    )
+                });
                 scan_prepared_file(
                     analyzer,
                     visibility,
