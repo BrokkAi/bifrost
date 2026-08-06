@@ -12,7 +12,7 @@
       :type match
       :selector
         (rql
-          :schema-version 5
+          :schema-version 1
           (union
             (language python
               (inside-decl (loop) (call :receiver (name "json") :callee (name "loads"))))

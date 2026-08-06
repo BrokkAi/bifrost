@@ -265,6 +265,8 @@ Also update the conservative TextMate grammar in `editors/vscode/syntaxes/bifros
 
 Do not include ordinary JSON documents in the RQL editor integration. Recognize JSON-shaped CodeQuery source only after the host identifies the document as `bifrost-rql`.
 
+Do not mint a new RQL schema version for an additive or compatible vocabulary change. Keep the current version. Add a new version only when an existing query stops parsing or changes meaning. Apply the same rule to the policy document schema.
+
 # Review findings as RQL regressions
 
 When a code review identifies a recurring smell that tools can detect, first reduce the smell to a structured RQL query.

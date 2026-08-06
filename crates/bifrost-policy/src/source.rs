@@ -5831,7 +5831,7 @@ mod tests {
             r#"(policy :id "p" :name "P" :message "M" :severity warning
                 :analysis
                   (analysis :type match :selector
-                    (rql-file :schema-version 2 :path "queries/eval.rql")))"#,
+                    (rql-file :schema-version 1 :path "queries/eval.rql")))"#,
         )
         .unwrap();
         assert_eq!(parsed.unresolved_file_selectors.len(), 1);
@@ -6123,12 +6123,12 @@ mod tests {
         assert!(help.description.contains("source-only validation"));
 
         let pinned_inline =
-            r#"(policy :analysis (analysis :selector (rql :schema-version 2 (call))))"#;
+            r#"(policy :analysis (analysis :selector (rql :schema-version 1 (call))))"#;
         let rql_offset = pinned_inline.find("(rql").unwrap() + 1;
         let help = rqlp_source_help_at(pinned_inline, rql_offset).expect("pinned RQL help");
         assert!(
             help.description
-                .contains("explicitly pins RQL schema version `2`")
+                .contains("explicitly pins RQL schema version `1`")
         );
     }
 

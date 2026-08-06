@@ -39,7 +39,7 @@ Run `:json` in the RQL prompt. Save the resulting canonical model under the anal
 <!-- code-query-test:json:rule-eval -->
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 1,
   "languages": ["python"],
   "match": {
     "kind": "call",
@@ -68,7 +68,7 @@ one policy document instead of writing a reporting adapter:
     (analysis
       :type match
       :selector
-        (rql :schema-version 2
+        (rql :schema-version 1
           (language python
             (call :callee (name "eval"))))))
 ```
@@ -134,7 +134,7 @@ use std::path::PathBuf;
 fn run_rule(root: PathBuf) -> Result<CodeQueryResult, String> {
     let service = SearchToolsService::new_without_semantic_index(root)?;
     let result = service.query_code_result(json!({
-        "schema_version": 2,
+        "schema_version": 1,
         "languages": ["python"],
         "match": {"kind": "call", "callee": {"name": "eval"}},
         "limit": 1000,

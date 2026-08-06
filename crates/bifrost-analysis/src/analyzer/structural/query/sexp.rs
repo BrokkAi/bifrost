@@ -1906,18 +1906,6 @@ mod tests {
     }
 
     #[test]
-    fn version_three_cfg_forms_reject_version_two_at_the_authored_operation() {
-        let source = "(procedure-of (function))";
-        let expr = parse_query_expr(source).unwrap();
-        let schema = resolve_rql_schema_version(Some(2)).unwrap();
-        let error = code_query_from_expr(&expr, schema).unwrap_err();
-
-        assert_eq!(error.path, "steps[0].op");
-        assert_eq!(&source[error.range], "procedure-of");
-        assert!(error.message.contains("requires schema version 3"));
-    }
-
-    #[test]
     fn nested_set_semantic_error_retains_canonical_path_and_absolute_leaf_range() {
         let invalid_name = "x".repeat(super::super::MAX_STRING_PREDICATE_LENGTH + 1);
         let source = format!(

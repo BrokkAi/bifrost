@@ -3,7 +3,7 @@ title: Go
 description: Query Go selector calls, multi-value assignments, imports, methods, and capability diagnostics with query_code.
 ---
 
-> Last verified end to end: 2026-07-18 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-18 (`query_code` schema version 1).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
 
