@@ -327,11 +327,7 @@ pub fn prewarm_configured_semantic_models(
     workspace_root: &Path,
     workspace: &WorkspaceAnalyzer,
 ) -> Result<(), String> {
-    activate_configured_semantic_models(
-        workspace_root,
-        workspace,
-        configured_semantic_models()?,
-    )
+    activate_configured_semantic_models(workspace_root, workspace, configured_semantic_models()?)
 }
 
 fn intrinsic_language_evidence(

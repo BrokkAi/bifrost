@@ -25,7 +25,10 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - [x] (2026-08-06 01:03Z) Stopped the first corrected symbol arm after a warm Kafka symbol call waited 71 seconds.
 - [x] (2026-08-06 01:20Z) Grouped generator rules by language, moved trigger tests before enclosing-symbol lookup, and evaluated files in parallel.
 - [x] (2026-08-06 01:22Z) Added shipped semantic-model activation to the CodeScale prewarm profiler.
-- [ ] Build a new runtime bundle, refresh structural prewarm state, and restart the corrected symbol arm.
+- [x] (2026-08-06 01:47Z) Refreshed all 11 paired tasks with schema-3 readiness records for the current profiler.
+- [x] (2026-08-06 01:55Z) Stopped the second symbol arm after one source call took 92 seconds and three exceeded two minutes.
+- [x] (2026-08-06 02:05Z) Routed structured suffix lookup through the indexed terminal identifier before its table-scan fallback.
+- [ ] Build a new runtime bundle and restart the corrected symbol arm.
 - [ ] (2026-08-05 23:25Z) Run the selected tasks with symbol tools. The first 20-task arm stopped after a linked-worktree fault and a false cache-readiness assumption.
 - [ ] Run the same tasks with symbol and NLP tools.
 - [ ] Add synthetic semantic step zero if natural semantic use is too low.
@@ -79,6 +82,10 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Evidence: It built the persisted analyzer and semantic vector index directly. The first symbol request had to create Scala structural snapshots for the shipped case-class model.
 - Observation: Parallel, grouped activation meets the warm interactive limit after structural snapshots exist.
   Evidence: On Kafka with six Rayon threads, the analyzer took 0.75 seconds, semantic-pack activation took 2.15 seconds, and `search_symbols` took 0.44 seconds. Total first-call latency was 3.55 seconds.
+- Observation: A near-canonical Go receiver selector entered a full-table substring scan.
+  Evidence: `get_symbol_sources` took 92.0 seconds for one call. Timing showed `suffix_resolution.pattern_stage`, and a CPU profile stayed inside SQLite. The persisted row had short name `Replica.handleRaftReady` and indexed identifier `handleRaftReady`.
+- Observation: The indexed terminal lookup removes the pathological fallback.
+  Evidence: The exact three-symbol CockroachDB reproduction fell from more than 90 seconds to 4.55 seconds, including 0.96 seconds of process startup.
 
 ## Decision Log
 
@@ -123,6 +130,9 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Date/Author: 2026-08-06 / Codex
 - Decision: Make the NLP prewarm profiler activate shipped semantic models before it starts vector indexing.
   Rationale: A readiness record must cover all persistent state required by the first symbol call, not only analyzer rows and vectors.
+  Date/Author: 2026-08-06 / Codex
+- Decision: Add terminal-identifier candidates to structured suffix resolution before substring search.
+  Rationale: The terminal is already a parsed symbol segment and has a persistent index. The existing alias matcher remains the final authority, so the faster candidate source does not change accepted matches.
   Date/Author: 2026-08-06 / Codex
 
 ## Outcomes & Retrospective
@@ -201,3 +211,5 @@ Revision note: The paired set now contains 11 cache-ready baseline failures. Can
 Revision note: The corrected symbol arm exposed rule-first semantic-pack activation. The run stopped after four tasks so Bifrost can remove repeated workspace traversal before restart.
 
 Revision note: The grouped and parallel traversal reduced warm Kafka first-call latency to 3.55 seconds. The prewarm profiler now creates the required structural snapshots before an evaluation.
+
+Revision note: The second symbol arm stopped after issue #1688 exposed a full `code_units` substring scan for near-canonical Go receiver selectors. Indexed terminal lookup reduced the exact reproduction to 4.55 seconds including startup.

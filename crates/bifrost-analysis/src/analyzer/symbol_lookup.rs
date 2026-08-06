@@ -322,7 +322,21 @@ fn suffix_resolution_from_index(
         .into_iter()
         .map(|language| (language, query_symbol_interpretations(language, symbol)))
         .collect();
-    for candidate in analyzer.lookup_candidates_by_short_name(symbol) {
+    let terminal_identifiers: BTreeSet<_> = query_paths_by_language
+        .values()
+        .flat_map(|paths| paths.iter().filter_map(|path| path.last().cloned()))
+        .collect();
+    let mut indexed_candidates = analyzer.lookup_candidates_by_short_name(symbol);
+    // A client can use another accepted separator at an owner boundary. For
+    // example, CodeScale used `kvserver/Replica.handleRaftReady` where the Go
+    // index renders `kvserver.Replica.handleRaftReady`. The persisted short
+    // name includes the receiver, so that spelling misses its short-name key.
+    // Use the indexed terminal identifier before the substring fallback. On a
+    // large shared cache, that fallback otherwise scans all code_units (#1688).
+    for terminal in terminal_identifiers {
+        indexed_candidates.extend(analyzer.lookup_candidates_by_identifier(&terminal));
+    }
+    for candidate in indexed_candidates {
         let language = code_unit_language(&candidate);
         let Some(query_paths) = query_paths_by_language.get(&language) else {
             continue;

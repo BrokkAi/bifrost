@@ -1727,6 +1727,42 @@ var (
 }
 
 #[test]
+fn go_receiver_lookup_accepts_package_slash_before_receiver() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module github.com/example/server\n")
+        .file(
+            "pkg/raft.go",
+            r#"package pkg
+
+type Replica struct{}
+
+func (r *Replica) handleRaftReady() int {
+    return 1
+}
+"#,
+        )
+        .build();
+
+    // Agents can use a slash at the package/receiver boundary. The terminal
+    // identifier index must resolve this accepted structured spelling before
+    // the declaration-table substring fallback (#1688).
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["github.com/example/server/pkg/Replica.handleRaftReady"]}"#,
+    );
+    assert_eq!(0, result["not_found"].as_array().unwrap().len(), "{result}");
+    assert_eq!(1, result["sources"].as_array().unwrap().len(), "{result}");
+    assert!(
+        result["sources"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("func (r *Replica) handleRaftReady() int"),
+        "{result}"
+    );
+}
+
+#[test]
 fn go_module_prefixed_file_paths_resolve_from_nested_module_root() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("lib/go.mod", "module github.com/eko/gocache/lib/v4\n")
