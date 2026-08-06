@@ -267,3 +267,9 @@ windows-sys = { version = "0.61.2", features = [
 # Bump back to `debug = true` locally when a real debugger session is needed.
 [profile.dev]
 debug = "line-tables-only"
+
+# The workspace split ended same-crate inlining for the small leaf helpers the
+# language crates call per AST node (there is no #[inline] in the fleet).
+# Thin LTO restores cross-crate inlining in release builds.
+[profile.release]
+lto = "thin"
