@@ -1080,6 +1080,27 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         .child_by_field_name("name")
                         .filter(|name| name.kind() == "type_identifier")
                         .unwrap_or(hit_node)
+                } else if ctx
+                    .analyzer
+                    .type_alias_provider()
+                    .is_some_and(|provider| provider.is_type_alias(&ctx.spec.target))
+                    && ctx
+                        .analyzer
+                        .parent_of(&ctx.spec.target)
+                        .is_some_and(|owner| owner.is_class())
+                    && ctx
+                        .visibility
+                        .is_exhaustive_same_fqn_type_declaration_family(
+                            ctx.analyzer,
+                            ctx.file,
+                            &ctx.spec.target,
+                        )
+                    && matches!(
+                        hit_node.kind(),
+                        "qualified_identifier" | "scoped_type_identifier"
+                    )
+                {
+                    hit_node.child_by_field_name("name").unwrap_or(hit_node)
                 } else if qualified_type_scope_contains_template(hit_node) {
                     function_terminal_node(hit_node)
                 } else {
@@ -2449,17 +2470,28 @@ fn type_candidate_visible_at_reference(
             .parent_of(candidate)
             .is_some_and(|owner| owner.is_class());
     if class_owned_alias {
-        return (qualified_reference_selects_type_candidate(candidate, reference, ctx)
+        let conditional_family = ctx
+            .visibility
+            .is_exhaustive_same_fqn_type_declaration_family(ctx.analyzer, ctx.file, candidate);
+        let owner_match = qualified_reference_selects_type_candidate(candidate, reference, ctx)
             || unqualified_reference_selects_inherited_alias(candidate, reference, ctx)
-            || member_alias_owner_matches_reference_for(candidate, reference, ctx))
-            && ctx
-                .visibility
-                .external_type_candidate_guard_compatible_in_context(
-                    ctx.analyzer,
-                    ctx.file,
-                    candidate,
-                    reference,
-                );
+            || member_alias_owner_matches_reference_for(candidate, reference, ctx);
+        let guard_match = ctx
+            .visibility
+            .external_type_candidate_guard_compatible_in_context(
+                ctx.analyzer,
+                ctx.file,
+                candidate,
+                reference,
+            );
+        let general_match = conditional_family
+            && ctx.visibility.external_type_candidate_visible_in_context(
+                ctx.analyzer,
+                ctx.file,
+                candidate,
+                reference,
+            );
+        return owner_match && (guard_match || general_match);
     }
     ctx.visibility.external_type_candidate_visible_in_context(
         ctx.analyzer,
@@ -2909,8 +2941,25 @@ fn target_guided_qualifier_type_scopes<'tree>(
             [candidate] if same_visible_symbol(candidate, target)
         );
         if direct_alias_target || unique_target || canonical_alias_target_matches {
-            let matched =
-                qualified_type_component_hit_node(qualified.nodes[component_count - 1], node);
+            let matched = if ctx
+                .analyzer
+                .type_alias_provider()
+                .is_some_and(|provider| provider.is_type_alias(target))
+                && ctx
+                    .analyzer
+                    .parent_of(target)
+                    .is_some_and(|owner| owner.is_class())
+                && ctx
+                    .visibility
+                    .is_exhaustive_same_fqn_type_declaration_family(ctx.analyzer, ctx.file, target)
+            {
+                // The alias declaration owns the terminal component. Keep
+                // the inverse range narrow so `MathLib::bigint` records the
+                // `bigint` token, not the complete qualified owner path.
+                qualified.nodes[component_count - 1]
+            } else {
+                qualified_type_component_hit_node(qualified.nodes[component_count - 1], node)
+            };
             if template_type_component_preserves_target(matched, &candidates, ctx) {
                 matches.push(matched);
             }
