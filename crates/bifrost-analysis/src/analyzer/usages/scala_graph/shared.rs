@@ -487,20 +487,7 @@ fn companion_query_surface_name(spec: &TargetSpec) -> Option<String> {
     Some(owner.trim_end_matches('$').to_string())
 }
 
-/// The final `.`-joined segment of a Scala `short_name` (a package-less name
-/// that may still carry an owner-chain prefix, e.g. `Outer.inner`). Scala
-/// identifiers never contain a literal `.`, so re-tokenizing with the shared
-/// structured splitter and taking the last segment reproduces
-/// `short_name.rsplit('.').next()`'s terminal-segment split exactly, for any
-/// unit kind (function, field, type, or type alias) — unlike `identifier()`,
-/// this never additionally trims a `$` nesting marker. `pub(crate)` (not
-/// `pub(super)`): also reused by `scala_simple_type_name` in
-/// `src/analyzer/scala/mod.rs`, outside `usages::scala_graph`.
-pub(crate) fn scala_short_name_terminal_segment(short_name: &str) -> String {
-    crate::analyzer::symbol_lookup::parse_symbol_path(Language::Scala, short_name)
-        .pop()
-        .unwrap_or_else(|| short_name.to_string())
-}
+pub(crate) use brokk_bifrost_jvm::scala::scala_short_name_terminal_segment;
 
 fn exact_descendants_including_self(
     direct_descendants: &HashMap<CodeUnit, Vec<CodeUnit>>,

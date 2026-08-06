@@ -74,7 +74,7 @@ use brokk_bifrost_jvm::scala::test_detection::detect_scala_test_assertion_smells
 /// Scala's pure name, signature and delimiter helpers. They read and produce
 /// strings only, so they moved with the language knowledge they serve.
 pub(crate) use brokk_bifrost_jvm::scala::{
-    scala_nested_type_candidates, scala_normalize_full_name,
+    scala_nested_type_candidates, scala_normalize_full_name, scala_simple_type_name,
 };
 use clones::build_scala_clone_candidate_data;
 pub(crate) use declarations::scala_class_parameter_field_keyword;
@@ -125,17 +125,6 @@ pub(crate) fn scala_enclosing_template_owner_fq_names(
         }
     }
     owners
-}
-
-pub(crate) fn scala_simple_type_name(unit: &CodeUnit) -> String {
-    // Reuses the shared terminal-segment splitter (see its doc comment):
-    // Scala identifiers never contain a literal `.`, so this reproduces
-    // `short_name.rsplit('.').next()`'s terminal split exactly.
-    crate::analyzer::usages::scala_graph::shared::scala_short_name_terminal_segment(
-        unit.short_name(),
-    )
-    .trim_end_matches('$')
-    .to_string()
 }
 
 #[derive(Debug, Clone)]

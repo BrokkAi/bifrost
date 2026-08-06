@@ -13,6 +13,8 @@ pub mod supertypes;
 pub mod test_detection;
 pub mod wildcard_imports;
 
+use brokk_bifrost_core::analyzer::{CodeUnit, Language};
+
 /// Strip the `$` companion-object spelling out of a Scala fully qualified name.
 pub fn scala_normalize_full_name(fq_name: &str) -> String {
     fq_name.replace("$.", ".").trim_end_matches('$').to_string()
@@ -59,6 +61,30 @@ pub fn scala_nested_type_candidates(
     } else {
         vec![direct, singleton_qualified]
     }
+}
+
+/// The final `.`-joined segment of a Scala `short_name` (a package-less name
+/// that may still carry an owner-chain prefix, e.g. `Outer.inner`). Scala
+/// identifiers never contain a literal `.`, so re-tokenizing with the shared
+/// structured splitter and taking the last segment reproduces
+/// `short_name.rsplit('.').next()`'s terminal-segment split exactly, for any
+/// unit kind (function, field, type, or type alias) -- unlike `identifier()`,
+/// this never additionally trims a `$` nesting marker.
+pub fn scala_short_name_terminal_segment(short_name: &str) -> String {
+    brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(Language::Scala, short_name)
+        .pop()
+        .unwrap_or_else(|| short_name.to_string())
+}
+
+/// The bare type name a declaration is spelled with, `$` companion marker
+/// trimmed.
+pub fn scala_simple_type_name(unit: &CodeUnit) -> String {
+    // Reuses the shared terminal-segment splitter (see its doc comment):
+    // Scala identifiers never contain a literal `.`, so this reproduces
+    // `short_name.rsplit('.').next()`'s terminal split exactly.
+    scala_short_name_terminal_segment(unit.short_name())
+        .trim_end_matches('$')
+        .to_string()
 }
 
 /// The declared return type of a Scala member signature, if it spells one.

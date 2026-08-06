@@ -1,8 +1,7 @@
 //! The `LanguageAdapter` forwarding shell for Scala.
 //!
-//! Every answer below that knows Scala comes from [`brokk_bifrost_jvm`];
-//! `simple_type_name` is the one exception, because its terminal-segment
-//! splitter still lives beside the usage graph in this crate.
+//! Every answer below comes from [`brokk_bifrost_jvm`]; nothing Scala-specific
+//! is left here but the trait impl itself.
 
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile, SignatureMetadata};
@@ -15,12 +14,11 @@ use brokk_bifrost_jvm::scala::declarations::parse_scala_file;
 use brokk_bifrost_jvm::scala::test_detection::scala_contains_tests;
 use brokk_bifrost_jvm::scala::{
     scala_member_signature_arity, scala_normalize_full_name, scala_signature_return_type,
+    scala_simple_type_name,
 };
 use tree_sitter::Tree;
 
 use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
-
-use super::scala_simple_type_name;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ScalaAdapter;
