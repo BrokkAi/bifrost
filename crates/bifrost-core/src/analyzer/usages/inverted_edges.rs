@@ -354,6 +354,14 @@ impl NodeKey for UsageNodeKey {
 }
 
 /// Aggregated result of an inverted edge build, keyed by node-key type `K`.
+///
+/// `BTreeMap` rather than `HashMap`, deliberately: the maps are consumed at
+/// ordered boundaries -- the scan_usages tool renders edges directly into its
+/// response, the workspace-graph builders fold them into further keyed
+/// products, and diagnostics format the complete key set -- so map order is
+/// output order. One ordered insert per edge at build time buys stable output
+/// at every one of those boundaries without per-consumer sorts; no profile
+/// has shown the build-side inserts on a hot path (#1732).
 #[derive(Clone)]
 pub struct UsageEdges<K = String> {
     /// `(caller, callee) -> call sites`. The site count is the edge weight
@@ -391,6 +399,8 @@ impl<K: NodeKey> UsageEdges<K> {
 }
 
 /// Aggregated edge weights for callers that do not need per-site locations.
+///
+/// `BTreeMap` for the same ordered-boundary reasons as [`UsageEdges`].
 pub struct UsageEdgeWeights<K = String> {
     /// `(caller, callee) -> reference-kind counts`, with each distinct
     /// `(file, line, caller)` site assigned to exactly one kind.
