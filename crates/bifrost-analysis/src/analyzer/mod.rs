@@ -70,8 +70,7 @@ pub(crate) use code_unit_index::default_parent_fq_name;
 pub(crate) use definition_lookup::{BoundedDefinitionLookup, sort_units};
 
 pub(crate) use brokk_bifrost_cpp::imports::{
-    IncludeTargetIndex, include_paths as cpp_include_paths, resolve_include_targets,
-    resolve_include_targets_with_index,
+    include_paths as cpp_include_paths, resolve_include_targets, resolve_include_targets_with_index,
 };
 pub use capabilities::{
     CapabilityProvider, ImportAnalysisProvider, TestDetectionProvider, TypeAliasProvider,
@@ -95,8 +94,7 @@ pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
     CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole,
     cpp_callable_definitions_share_identity_evidence, cpp_callable_unit_role,
-    cpp_indexed_callable_linkage, cpp_template_term, node_text as cpp_node_text,
-    normalize_cpp_whitespace, recovered_exported_class_has_body,
+    cpp_indexed_callable_linkage, node_text as cpp_node_text,
 };
 pub use csharp::CSharpAnalyzer;
 pub use csharp::external::{
@@ -162,10 +160,7 @@ pub use model::{
     StructuredTypeName, SummaryFileProjection, TestAssertionAnalysis, TestAssertionSmell,
     TestAssertionWeights, metrics_from_declarations,
 };
-pub(crate) use model::{
-    CallableLinkage, CppTemplateExpression, CppTemplateMetadata, CppTemplateParameterMetadata,
-    CppTemplateTerm,
-};
+pub(crate) use model::{CallableLinkage, CppTemplateMetadata};
 pub use multi_analyzer::resolve_analyzer;
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
 pub use php::{

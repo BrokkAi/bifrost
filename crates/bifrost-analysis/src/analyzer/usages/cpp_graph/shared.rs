@@ -1,15 +1,17 @@
-use super::extractor::{ScanState, prepare_file, scan_prepared_file};
-use super::inverted;
-use super::resolver::{TargetSpec, TypeScanKey, VisibilityIndex};
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::cpp::cpp_sentinel_recovered_classes;
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
-use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
+use crate::analyzer::usages::cpp_graph::CppDispatch;
+use crate::analyzer::usages::inverted_edges::{
+    UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output, parse_and_collect,
+};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, CppAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
+use brokk_bifrost_cpp::graph::extractor::{ScanState, prepare_file, scan_prepared_file};
+use brokk_bifrost_cpp::graph::resolver::{TargetSpec, TypeScanKey, VisibilityIndex};
 use std::collections::BTreeSet;
 
 fn scan_file_major<F, S, P, I, C, Prepare, Scan>(
@@ -85,7 +87,8 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
         resolver
             .cpp
             .record_authoritative_visibility_build_for_test();
-        let visibility = VisibilityIndex::build(resolver.cpp, analyzer, roots);
+        let dispatch = CppDispatch::new(analyzer);
+        let visibility = VisibilityIndex::build(resolver.cpp, dispatch.source(), roots);
         Some(Self {
             analyzer,
             resolver,
@@ -137,9 +140,10 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
         let files = self.scan_files(overloads, scan_scope);
         #[cfg(any(test, feature = "test-support"))]
         self.cpp.record_authoritative_visibility_build_for_test();
+        let dispatch = CppDispatch::new(analyzer);
         let visibility = VisibilityIndex::build_with_cancellation(
             self.cpp,
-            analyzer,
+            dispatch.source(),
             &files,
             scan_scope.cancellation(),
         );
@@ -159,10 +163,12 @@ impl CppQueryResolver<'_> {
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
+        let dispatch = CppDispatch::new(analyzer);
+        let source = dispatch.source();
         let mut specs = Vec::with_capacity(overloads.len());
         let mut seen_type_specs = HashSet::default();
         for overload in overloads {
-            let Some(spec) = TargetSpec::from_target(analyzer, overload) else {
+            let Some(spec) = TargetSpec::from_target(source, overload) else {
                 return GraphUsageOutcome::fallback_safe(
                     overload.fq_name(),
                     GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
@@ -205,9 +211,9 @@ impl CppQueryResolver<'_> {
                 #[cfg(any(test, feature = "test-support"))]
                 self.cpp.record_target_spec_scan_for_test();
                 let spec = spec
-                    .with_visible_callable_arities(analyzer, self.cpp, visibility, file, prepared);
+                    .with_visible_callable_arities(source, self.cpp, visibility, file, prepared);
                 scan_prepared_file(
-                    analyzer,
+                    source,
                     visibility,
                     file,
                     prepared,
@@ -260,6 +266,37 @@ impl CppQueryResolver<'_> {
     }
 }
 
+/// Build the whole C++ `caller -> callee` edge set in a single inverted pass
+/// over the resolver-owned file set. `nodes`/`keep_file` mirror the Go builder.
+///
+/// The fan-out stays on this side of the seam: `build_edge_output` and
+/// `parse_and_collect` are the shared, language-agnostic driver, and only the
+/// per-file C++ walk crossed.
+pub(super) fn build_cpp_edges<Output, F>(
+    analyzer: &dyn IAnalyzer,
+    files: &[ProjectFile],
+    visibility: &VisibilityIndex<'_>,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Output
+where
+    Output: UsageEdgeBuildOutput<String>,
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let language = tree_sitter_cpp::LANGUAGE.into();
+    let dispatch = CppDispatch::new(analyzer);
+    build_edge_output(files, keep_file, |file| {
+        parse_and_collect(analyzer, file, nodes, &language, |input| {
+            brokk_bifrost_cpp::graph::inverted::scan_file(
+                dispatch.source(),
+                visibility,
+                file,
+                input,
+            )
+        })
+    })
+}
+
 pub(crate) struct CppEdgeResolver<'a> {
     cpp: &'a CppAnalyzer,
     files: Vec<ProjectFile>,
@@ -295,8 +332,9 @@ impl<'a> CppEdgeResolver<'a> {
             .filter(|file| keep_file(file))
             .cloned()
             .collect();
-        let visibility = VisibilityIndex::build(self.cpp, analyzer, &roots);
-        inverted::build_cpp_edges(analyzer, &self.files, &visibility, nodes, keep_file)
+        let dispatch = CppDispatch::new(analyzer);
+        let visibility = VisibilityIndex::build(self.cpp, dispatch.source(), &roots);
+        build_cpp_edges(analyzer, &self.files, &visibility, nodes, keep_file)
     }
 
     pub(crate) fn build_edge_weights<F>(
@@ -314,8 +352,9 @@ impl<'a> CppEdgeResolver<'a> {
             .filter(|file| keep_file(file))
             .cloned()
             .collect();
-        let visibility = VisibilityIndex::build(self.cpp, analyzer, &roots);
-        inverted::build_cpp_edges(analyzer, &self.files, &visibility, nodes, keep_file)
+        let dispatch = CppDispatch::new(analyzer);
+        let visibility = VisibilityIndex::build(self.cpp, dispatch.source(), &roots);
+        build_cpp_edges(analyzer, &self.files, &visibility, nodes, keep_file)
     }
 }
 
@@ -324,9 +363,9 @@ mod tests {
     use std::cell::Cell;
 
     use super::{retain_scan_spec, scan_file_major};
-    use crate::analyzer::usages::cpp_graph::resolver::{TargetKind, TargetSpec};
     use crate::analyzer::{CallableArity, CodeUnit, CodeUnitType, ProjectFile};
     use crate::hash::HashSet;
+    use brokk_bifrost_cpp::graph::resolver::{TargetKind, TargetSpec};
 
     #[test]
     fn identical_method_redeclarations_remain_physically_distinct_scan_specs() {

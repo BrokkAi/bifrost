@@ -7,7 +7,7 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
-use crate::analyzer::{CppAnalyzer, IAnalyzer, ProjectFile};
+use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::cancellation::CancellationToken;
 use tree_sitter::Tree;
 
@@ -21,7 +21,7 @@ pub(crate) fn resolve_cpp_type_bounded(
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<TypeLookupOutcome> {
     let session = ResolutionSession::bounded(budget, cancellation);
-    if !CppAnalyzer::receiver_query_supported(file) {
+    if !brokk_bifrost_cpp::imports::receiver_query_supported(file) {
         return session.finish(TypeLookupOutcome {
             status: TypeLookupStatus::UnsupportedLanguage,
             reference: None,

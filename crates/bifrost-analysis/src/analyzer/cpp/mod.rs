@@ -1,6 +1,7 @@
 mod adapter;
 mod cache;
 mod clones;
+#[cfg(test)]
 mod diagnostics;
 mod hierarchy;
 mod identity;
@@ -42,13 +43,13 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
-use regex::Regex;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::CppAdapter;
 use brokk_bifrost_cpp::clones::cpp_clone_parser;
 use brokk_bifrost_cpp::compile_context::{CppCompileContext, CppCompileContexts};
+use brokk_bifrost_cpp::graph::CppWorkspaceSource;
 use brokk_bifrost_cpp::graph_support::CppAnalysisSource;
 use brokk_bifrost_cpp::identity::{CppReconciledDefinitionIndex, cpp_reconciled_definitions};
 use brokk_bifrost_cpp::imports::IncludeTargetIndex;
@@ -57,11 +58,7 @@ use cache::{weight_code_unit_set_by_file, weight_code_unit_vec_by_file, weight_p
 use clones::build_clone_candidate_data;
 
 pub(crate) use brokk_bifrost_cpp::declarations::{
-    CppSentinelRecoveredClass, cpp_export_macro_token, cpp_sentinel_recovered_classes,
-    cpp_sentinel_recovered_scope_for_node, cpp_template_term,
-    is_direct_recovered_exported_class_field_declaration, is_recovered_exported_class_container,
-    node_text, normalize_cpp_whitespace, recovered_exported_class_has_body,
-    recovered_macro_return_type_node,
+    cpp_sentinel_recovered_classes, is_direct_recovered_exported_class_field_declaration, node_text,
 };
 pub(crate) use brokk_bifrost_cpp::identity::{
     CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole, cpp_callable_unit_role,
@@ -258,13 +255,6 @@ impl CppAnalyzer {
             .bulk_file_states_for_query(files, BulkFileStateSource::Include);
     }
 
-    pub(crate) fn receiver_query_supported(file: &ProjectFile) -> bool {
-        file.rel_path()
-            .extension()
-            .and_then(|extension| extension.to_str())
-            != Some("c")
-    }
-
     pub(crate) fn declaration_candidates_by_identifier_limited(
         &self,
         identifier: &str,
@@ -439,23 +429,6 @@ impl CppAnalyzer {
         self.inner.sql_definitions_query_count_for_test()
     }
 
-    pub fn extract_type_identifiers(&self, source: &str) -> BTreeSet<String> {
-        static IDENT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-        let regex =
-            IDENT_RE.get_or_init(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_:<>]*").expect("valid regex"));
-        regex
-            .find_iter(source)
-            .map(|m| m.as_str())
-            .filter(|token| {
-                token
-                    .chars()
-                    .next()
-                    .is_some_and(|ch| ch.is_ascii_uppercase())
-            })
-            .map(|token| token.trim_matches(':').to_string())
-            .collect()
-    }
-
     #[cfg(test)]
     pub(crate) fn reset_live_oid_validation_counts_for_test(&self) {
         self.inner.reset_live_oid_validation_counts_for_test();
@@ -504,6 +477,63 @@ impl CppAnalysisSource for CppAnalyzer {
 
     fn cpp_file_source(&self, file: &ProjectFile) -> Option<String> {
         self.inner.file_source(file)
+    }
+
+    fn prepared_syntax(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
+        CppAnalyzer::prepared_syntax(self, file)
+    }
+
+    fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        CppAnalyzer::structural_parent_of(self, code_unit)
+    }
+
+    fn template_metadata(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> Option<crate::analyzer::CppTemplateMetadata> {
+        CppAnalyzer::template_metadata(self, code_unit)
+    }
+
+    fn compile_context_for(&self, file: &ProjectFile) -> Option<&CppCompileContext> {
+        CppAnalyzer::compile_context_for(self, file)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_cpp_parent_resolution_for_test(&self) {
+        CppAnalyzer::record_cpp_parent_resolution_for_test(self);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_cpp_class_strength_parse_for_test(&self) {
+        CppAnalyzer::record_cpp_class_strength_parse_for_test(self);
+    }
+}
+
+/// The C++ analyzer standing in for the dispatching analyzer.
+///
+/// Four resolution paths in the graph reach the workspace through the C++
+/// analyzer they already hold rather than through the analyzer the query was
+/// issued against; before the extraction they passed `&CppAnalyzer` straight
+/// into a `&dyn IAnalyzer` parameter, so these three forwarders answer exactly
+/// what that coercion did.
+impl CppWorkspaceSource for CppAnalyzer {
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
+        self.inner.import_statements(file)
+    }
+
+    fn definitions_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        <Self as IAnalyzer>::global_usage_definition_index(self).fqn(fqn)
+    }
+
+    fn definition_peers_by_fqn(&self, fqn: &str) -> Vec<&CodeUnit> {
+        <Self as IAnalyzer>::global_usage_definition_index(self)
+            .into_shards()
+            .into_iter()
+            .flat_map(|shard| shard.by_fqn(fqn).iter())
+            .collect()
     }
 }
 
@@ -786,7 +816,7 @@ impl IAnalyzer for CppAnalyzer {
     ) -> crate::analyzer::SemanticDiagnosticReport {
         crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(
             file,
-            diagnostics::collect_cpp_semantic_diagnostics(self, file, source),
+            brokk_bifrost_cpp::diagnostics::collect_cpp_semantic_diagnostics(self, file, source),
         )
     }
 

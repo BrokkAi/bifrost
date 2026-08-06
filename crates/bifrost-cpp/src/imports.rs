@@ -8,7 +8,10 @@
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
+use regex::Regex;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Workspace-wide resolution table for `#include` targets: every analyzable file
 /// keyed both by its full workspace-relative path and by its bare file name.
@@ -237,6 +240,44 @@ pub fn include_paths(parsed: &[String]) -> Vec<String> {
         .iter()
         .filter_map(|line| parse_include_path(line))
         .collect()
+}
+
+/// The capitalized identifiers a C++ source mentions, used to decide which of a
+/// declaration's `#include` lines are relevant to it.
+///
+/// Deliberately lexical, and the only place in this crate that is: the input is
+/// a rendered source excerpt whose enclosing translation unit is not available
+/// to parse, and the output feeds a *filter* over already-resolved includes, so
+/// an over-broad token set costs recall on the filter rather than inventing a
+/// declaration. Every fleet language has this same shape
+/// (`brokk_bifrost_python::graph_support::extract_type_identifiers` is the
+/// closest sibling).
+pub fn extract_type_identifiers(source: &str) -> BTreeSet<String> {
+    static IDENT_RE: OnceLock<Regex> = OnceLock::new();
+    let regex =
+        IDENT_RE.get_or_init(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_:<>]*").expect("valid regex"));
+    regex
+        .find_iter(source)
+        .map(|m| m.as_str())
+        .filter(|token| {
+            token
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase())
+        })
+        .map(|token| token.trim_matches(':').to_string())
+        .collect()
+}
+
+/// Whether the structural receiver queries apply to `file`.
+///
+/// `Language::Cpp` also covers plain `.c`, which has no member-call receivers
+/// for those queries to resolve, so the route is gated on the extension.
+pub fn receiver_query_supported(file: &ProjectFile) -> bool {
+    file.rel_path()
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("c")
 }
 
 fn lexical_project_relative_include_path(

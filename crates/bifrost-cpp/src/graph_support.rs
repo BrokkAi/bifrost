@@ -27,12 +27,18 @@
 //!   `TreeSitterAnalyzer::raw_supertypes_of`, whose rows are crate-private to
 //!   analysis; the analyzer hands the decoded base-specifier strings across.
 
+use crate::compile_context::CppCompileContext;
+use crate::graph::CppWorkspaceSource;
 use crate::imports::IncludeTargetIndex;
-use brokk_bifrost_core::analyzer::capabilities::TypeAliasProvider;
+use brokk_bifrost_core::analyzer::capabilities::{TypeAliasProvider, TypeHierarchyProvider};
+use brokk_bifrost_core::analyzer::model::CppTemplateMetadata;
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
 use std::sync::Arc;
 
-pub trait CppAnalysisSource: CodeUnitIndex + TypeAliasProvider {
+pub trait CppAnalysisSource:
+    CodeUnitIndex + TypeAliasProvider + TypeHierarchyProvider + CppWorkspaceSource
+{
     /// The workspace-wide `#include` resolution table, built once per analyzer
     /// generation from [`IncludeTargetIndex::build`].
     fn include_target_index(&self) -> &IncludeTargetIndex;
@@ -50,4 +56,46 @@ pub trait CppAnalysisSource: CodeUnitIndex + TypeAliasProvider {
 
     /// The indexed source of `file` (`TreeSitterAnalyzer::file_source`).
     fn cpp_file_source(&self, file: &ProjectFile) -> Option<String>;
+
+    /// The parsed tree and its source backing for `file`, from the analyzer's
+    /// query read cache.
+    ///
+    /// The single hottest member of this trait: the usage graph reaches it at
+    /// 27 call sites. The cache is *not* rebuilt per call -- `VisibilityIndex`
+    /// borrows the analyzer rather than cloning it precisely so this stays warm
+    /// across a scan (#1175), so an implementor must forward to the same
+    /// analyzer the query is running against.
+    fn prepared_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>>;
+
+    /// The declaration's syntactic owner, which unlike
+    /// [`CodeUnitIndex::parent_of`] never falls back to a definition-row lookup.
+    fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit>;
+
+    /// The persisted C++ template metadata side table's row for `code_unit`.
+    fn template_metadata(&self, code_unit: &CodeUnit) -> Option<CppTemplateMetadata>;
+
+    /// The `compile_commands.json` entry governing `file`, if the workspace has
+    /// a compile database that names it. The only analyzer-resident product
+    /// [`crate::diagnostics`] needs.
+    fn compile_context_for(&self, file: &ProjectFile) -> Option<&CppCompileContext>;
+
+    /// Count a precise-parent resolution against the analyzer's counter.
+    ///
+    /// Called from production code in [`crate::graph::resolver`], which is why
+    /// it is on the trait at all; the counter itself stays on the analyzer.
+    ///
+    /// The default is a no-op because the two gates are not the same gate:
+    /// Cargo turns this crate's `test-support` on for the whole build graph
+    /// whenever `brokk-bifrost-analysis`'s dev-dependencies are in play, while
+    /// the analyzer-side counter field is `#[cfg(any(test, feature =
+    /// "test-support"))]` on *that* crate. The implementor overrides this
+    /// exactly when it has a counter to record into -- which is the build the
+    /// tests reading the counter run in.
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_cpp_parent_resolution_for_test(&self) {}
+
+    /// Count a class-declaration-strength parse. See
+    /// [`Self::record_cpp_parent_resolution_for_test`].
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_cpp_class_strength_parse_for_test(&self) {}
 }

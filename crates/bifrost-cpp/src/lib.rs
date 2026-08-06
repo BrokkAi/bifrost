@@ -27,6 +27,7 @@ pub mod call_match;
 pub mod clones;
 pub mod compile_context;
 pub mod declarations;
+pub mod diagnostics;
 pub mod graph;
 pub mod graph_support;
 pub mod hierarchy;

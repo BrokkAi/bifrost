@@ -1,34 +1,39 @@
-use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
-use crate::analyzer::tree_walk::node_for_exact_range;
-use crate::analyzer::usages::common::same_node;
-use crate::analyzer::usages::cpp_graph::extractor::ScanCtx;
-use crate::analyzer::usages::local_inference::LocalInferenceEngine;
-use crate::analyzer::{
-    CallableArity, CodeUnit, CodeUnitType, CppAnalyzer, CppTemplateExpression, CppTemplateMetadata,
-    CppTemplateParameterMetadata, CppTemplateTerm, IAnalyzer, IncludeTargetIndex, ProjectFile,
-    Range, cpp_include_paths, cpp_node_text as node_text, cpp_template_term,
-    normalize_cpp_whitespace, recovered_exported_class_has_body, resolve_analyzer,
-    resolve_include_targets_with_index,
-};
-use crate::cancellation::CancellationToken;
-use crate::hash::{HashMap, HashSet};
-use brokk_bifrost_cpp::call_match::{
+use crate::call_match::{
     CppArgType, cpp_signature_param_types, cpp_split_top_level_commas, normalize_cpp_type_name,
 };
+use crate::declarations::{
+    cpp_template_term, node_text, normalize_cpp_whitespace, recovered_exported_class_has_body,
+};
+use crate::graph::CppGraphSource;
+use crate::graph::extractor::ScanCtx;
+use crate::graph_support::CppAnalysisSource;
+use crate::imports::{
+    IncludeTargetIndex, include_paths as cpp_include_paths, resolve_include_targets_with_index,
+};
+use brokk_bifrost_core::analyzer::model::{
+    CallableArity, CodeUnitType, CppTemplateExpression, CppTemplateMetadata,
+    CppTemplateParameterMetadata, CppTemplateTerm,
+};
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::tree_walk::node_for_exact_range;
+use brokk_bifrost_core::analyzer::usages::common::same_node;
+use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
+use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::borrow::Cow;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::hash::Hash;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::ThreadId;
 use tree_sitter::{Node, Parser, Tree};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(in crate::analyzer::usages) enum TargetKind {
+pub enum TargetKind {
     Type,
     Constructor,
     FreeFunction,
@@ -37,7 +42,7 @@ pub(in crate::analyzer::usages) enum TargetKind {
     MemberField,
 }
 
-pub(in crate::analyzer::usages) enum LexicalTypeResolution {
+pub enum LexicalTypeResolution {
     Resolved {
         unit: CodeUnit,
         components: Vec<String>,
@@ -54,27 +59,27 @@ enum TypeCandidateResolution<'a> {
     PreserveTarget(&'a CodeUnit),
 }
 
-pub(super) enum LexicalCallableValueResolution {
+pub enum LexicalCallableValueResolution {
     Type(CodeUnit),
     FreeFunction(CodeUnit),
     Ambiguous,
     Missing,
 }
 
-pub(super) enum UsingEnumMemberResolution {
+pub enum UsingEnumMemberResolution {
     Resolved { owner: CodeUnit, member: CodeUnit },
     Ambiguous,
     Missing,
 }
 
-pub(super) enum NamespaceValueResolution {
+pub enum NamespaceValueResolution {
     Resolved,
     Ambiguous,
     Missing,
 }
 
-pub(super) fn resolve_namespace_value(
-    analyzer: &dyn IAnalyzer,
+pub fn resolve_namespace_value(
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     namespace: &str,
@@ -107,7 +112,7 @@ pub(super) fn resolve_namespace_value(
         .unwrap_or(NamespaceValueResolution::Missing)
 }
 
-pub(super) struct ScopedUsingEnumOwners {
+pub struct ScopedUsingEnumOwners {
     scopes: Vec<Vec<CodeUnit>>,
 }
 
@@ -115,26 +120,30 @@ pub(super) struct ScopedUsingEnumOwners {
 /// Cross-file and inherited class imports are deliberately not inferred without persisted
 /// evidence; a missing imported enumerator therefore remains unproven rather than being
 /// misresolved.
-pub(super) struct SemanticUsingEnumOwners {
+pub struct SemanticUsingEnumOwners {
     class_imports: HashMap<CodeUnit, Vec<CodeUnit>>,
     namespace_imports: HashMap<Vec<String>, Vec<(usize, CodeUnit)>>,
 }
 
-pub(super) enum SemanticUsingEnumMemberResolution {
+pub enum SemanticUsingEnumMemberResolution {
     Class(UsingEnumMemberResolution),
     Namespace(UsingEnumMemberResolution),
     Missing,
 }
 
 impl SemanticUsingEnumOwners {
-    pub(super) fn new() -> Self {
+    // A constructor, not a default: the type is only ever built by the scan
+    // that owns it. It became visible to clippy when the graph crossed the
+    // crate line, not by changing shape.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
         Self {
             class_imports: HashMap::default(),
             namespace_imports: HashMap::default(),
         }
     }
 
-    pub(super) fn import_class(&mut self, class: CodeUnit, enum_owner: CodeUnit) {
+    pub fn import_class(&mut self, class: CodeUnit, enum_owner: CodeUnit) {
         let imports = self.class_imports.entry(class).or_default();
         if !imports
             .iter()
@@ -144,7 +153,7 @@ impl SemanticUsingEnumOwners {
         }
     }
 
-    pub(super) fn import_namespace(
+    pub fn import_namespace(
         &mut self,
         namespace: Vec<String>,
         declaration_byte: usize,
@@ -159,7 +168,7 @@ impl SemanticUsingEnumOwners {
         }
     }
 
-    pub(super) fn resolve_member(
+    pub fn resolve_member(
         &self,
         visibility: &VisibilityIndex<'_>,
         file: &ProjectFile,
@@ -228,23 +237,27 @@ fn resolve_using_enum_member_for_owners<'a>(
 }
 
 impl ScopedUsingEnumOwners {
-    pub(super) fn new() -> Self {
+    // A constructor, not a default: the type is only ever built by the scan
+    // that owns it. It became visible to clippy when the graph crossed the
+    // crate line, not by changing shape.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
         Self {
             scopes: vec![Vec::new()],
         }
     }
 
-    pub(super) fn enter_scope(&mut self) {
+    pub fn enter_scope(&mut self) {
         self.scopes.push(Vec::new());
     }
 
-    pub(super) fn exit_scope(&mut self) {
+    pub fn exit_scope(&mut self) {
         if self.scopes.len() > 1 {
             self.scopes.pop();
         }
     }
 
-    pub(super) fn import(&mut self, owner: CodeUnit) {
+    pub fn import(&mut self, owner: CodeUnit) {
         let scope = self
             .scopes
             .last_mut()
@@ -257,7 +270,7 @@ impl ScopedUsingEnumOwners {
         }
     }
 
-    pub(super) fn resolve_member(
+    pub fn resolve_member(
         &self,
         visibility: &VisibilityIndex<'_>,
         file: &ProjectFile,
@@ -275,26 +288,26 @@ impl ScopedUsingEnumOwners {
 }
 
 #[derive(Clone)]
-pub(super) struct TargetSpec {
-    pub(super) target: CodeUnit,
-    pub(super) kind: TargetKind,
-    pub(super) owner: Option<CodeUnit>,
-    pub(super) member_name: String,
-    pub(super) callable_arity: Option<CallableArity>,
-    activated_callable_arities: Vec<ActivatedCallableArity>,
-    pub(super) param_types: Option<Vec<String>>,
-    pub(super) enum_owner_kind: EnumOwnerKind,
-    pub(super) owner_is_forward_declaration: bool,
+pub struct TargetSpec {
+    pub target: CodeUnit,
+    pub kind: TargetKind,
+    pub owner: Option<CodeUnit>,
+    pub member_name: String,
+    pub callable_arity: Option<CallableArity>,
+    pub activated_callable_arities: Vec<ActivatedCallableArity>,
+    pub param_types: Option<Vec<String>>,
+    pub enum_owner_kind: EnumOwnerKind,
+    pub owner_is_forward_declaration: bool,
 }
 
 #[derive(Clone, Copy)]
-struct ActivatedCallableArity {
-    activation_byte: usize,
-    arity: CallableArity,
+pub struct ActivatedCallableArity {
+    pub activation_byte: usize,
+    pub arity: CallableArity,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub(super) struct TypeScanKey {
+pub struct TypeScanKey {
     target: LogicalSymbolKey,
     member_name: String,
 }
@@ -312,21 +325,21 @@ struct ResolvedTypeOwner {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum EnumOwnerKind {
+pub enum EnumOwnerKind {
     Scoped,
     Unscoped,
     NonEnum,
 }
 
 impl TargetSpec {
-    pub(super) fn type_scan_key(&self) -> Option<TypeScanKey> {
+    pub fn type_scan_key(&self) -> Option<TypeScanKey> {
         (self.kind == TargetKind::Type).then(|| TypeScanKey {
             target: logical_symbol_key(&self.target),
             member_name: self.member_name.clone(),
         })
     }
 
-    pub(super) fn from_target(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> Option<Self> {
+    pub fn from_target(analyzer: CppGraphSource<'_>, target: &CodeUnit) -> Option<Self> {
         if target.is_class() {
             return Some(Self::new(
                 target.clone(),
@@ -377,7 +390,8 @@ impl TargetSpec {
             let owner = owner_resolution.map(|owner| owner.unit);
             let kind = if owner.as_ref().is_some_and(|owner| {
                 target.identifier() == owner.identifier()
-                    || resolve_analyzer::<CppAnalyzer>(analyzer)
+                    || analyzer
+                        .cpp
                         .and_then(|cpp| cpp.template_metadata(owner))
                         .is_some_and(|metadata| metadata.primary_name == target.identifier())
             }) {
@@ -402,10 +416,10 @@ impl TargetSpec {
         None
     }
 
-    pub(super) fn with_visible_callable_arities<'a>(
+    pub fn with_visible_callable_arities<'a>(
         &'a self,
-        analyzer: &dyn IAnalyzer,
-        cpp: &CppAnalyzer,
+        analyzer: CppGraphSource<'_>,
+        cpp: &dyn CppAnalysisSource,
         visibility: &VisibilityIndex<'_>,
         file: &ProjectFile,
         prepared: &PreparedSyntaxTree,
@@ -425,7 +439,7 @@ impl TargetSpec {
         Cow::Owned(effective)
     }
 
-    pub(super) fn callable_arity_at(&self, byte: usize) -> Option<CallableArity> {
+    pub fn callable_arity_at(&self, byte: usize) -> Option<CallableArity> {
         let base = self.callable_arity?;
         Some(
             self.activated_callable_arities
@@ -437,7 +451,7 @@ impl TargetSpec {
         )
     }
 
-    pub(super) fn new(
+    pub fn new(
         target: CodeUnit,
         kind: TargetKind,
         owner: Option<CodeUnit>,
@@ -467,7 +481,7 @@ fn logical_symbol_key(unit: &CodeUnit) -> LogicalSymbolKey {
     }
 }
 
-fn classify_enum_owner(analyzer: &dyn IAnalyzer, owner: &CodeUnit) -> EnumOwnerKind {
+fn classify_enum_owner(analyzer: CppGraphSource<'_>, owner: &CodeUnit) -> EnumOwnerKind {
     let classify = |source: &str| {
         let source = source.trim_start();
         if source.starts_with("enum class ") || source.starts_with("enum struct ") {
@@ -491,14 +505,14 @@ fn classify_enum_owner(analyzer: &dyn IAnalyzer, owner: &CodeUnit) -> EnumOwnerK
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub(super) struct CppScanBinding {
-    pub(super) unit: Option<CodeUnit>,
-    pub(super) type_name: Option<String>,
-    pub(super) indirection: i32,
+pub struct CppScanBinding {
+    pub unit: Option<CodeUnit>,
+    pub type_name: Option<String>,
+    pub indirection: i32,
 }
 
 impl CppScanBinding {
-    pub(super) fn from_unit(unit: CodeUnit, indirection: i32) -> Self {
+    pub fn from_unit(unit: CodeUnit, indirection: i32) -> Self {
         Self {
             type_name: Some(cpp_name_for(&unit)),
             unit: Some(unit),
@@ -506,11 +520,7 @@ impl CppScanBinding {
         }
     }
 
-    pub(super) fn from_type_name(
-        type_name: String,
-        unit: Option<CodeUnit>,
-        indirection: i32,
-    ) -> Self {
+    pub fn from_type_name(type_name: String, unit: Option<CodeUnit>, indirection: i32) -> Self {
         Self {
             type_name: Some(type_name),
             unit,
@@ -518,7 +528,7 @@ impl CppScanBinding {
         }
     }
 
-    pub(super) fn as_arg_type(&self) -> Option<CppArgType> {
+    pub fn as_arg_type(&self) -> Option<CppArgType> {
         let name = self
             .type_name
             .clone()
@@ -534,14 +544,14 @@ impl CppScanBinding {
 
 type AliasCell = Arc<OnceLock<Box<[CppAlias]>>>;
 type VisibleParserAliasTargetNamesCell = Arc<OnceLock<HashMap<String, HashSet<String>>>>;
-pub(in crate::analyzer::usages) type OrdinaryTypeImportCell = Arc<EffectiveUsingIndex>;
-type MacroEventCell = Arc<OnceLock<Box<[MacroEvent]>>>;
+pub type OrdinaryTypeImportCell = Arc<EffectiveUsingIndex>;
+pub type MacroEventCell = Arc<OnceLock<Box<[MacroEvent]>>>;
 type MacroIncludeProtectionCell = Arc<OnceLock<MacroIncludeProtection>>;
-type MacroEnvironmentCursorCell = Arc<Mutex<MacroEnvironmentCursor>>;
+pub type MacroEnvironmentCursorCell = Arc<Mutex<MacroEnvironmentCursor>>;
 type MacroReplacementCache = HashMap<(ProjectFile, usize), Arc<ParsedMacroReplacement>>;
 
 #[derive(Clone, Default)]
-struct MacroEnvironment {
+pub struct MacroEnvironment {
     bindings: HashMap<String, MacroBinding>,
     unknown_names: bool,
     applied_pragma_once_files: HashSet<ProjectFile>,
@@ -549,7 +559,7 @@ struct MacroEnvironment {
 }
 
 #[derive(Default)]
-struct MacroEnvironmentCursor {
+pub struct MacroEnvironmentCursor {
     frontier: usize,
     environment: Arc<MacroEnvironment>,
 }
@@ -580,7 +590,7 @@ impl MacroEnvironment {
 }
 
 #[derive(Clone)]
-pub(super) enum EffectiveUsingTarget {
+pub enum EffectiveUsingTarget {
     Ordinary {
         name: String,
         target_components: Vec<String>,
@@ -593,41 +603,41 @@ pub(super) enum EffectiveUsingTarget {
 }
 
 #[derive(Clone)]
-pub(super) struct OrdinaryTypeImport {
-    pub(super) target: EffectiveUsingTarget,
-    pub(super) source: ProjectFile,
-    pub(super) declaration_byte: usize,
-    pub(super) scope_start: usize,
-    pub(super) scope_end: usize,
-    pub(super) scope_depth: usize,
-    pub(super) lexical_depth: usize,
-    pub(super) declaration_namespace: Vec<String>,
-    pub(super) namespace_scope: Option<Vec<String>>,
-    pub(super) resolved_target_components: Option<Vec<String>>,
-    pub(super) required_guards: HashSet<PreprocessorGuard>,
+pub struct OrdinaryTypeImport {
+    pub target: EffectiveUsingTarget,
+    pub source: ProjectFile,
+    pub declaration_byte: usize,
+    pub scope_start: usize,
+    pub scope_end: usize,
+    pub scope_depth: usize,
+    pub lexical_depth: usize,
+    pub declaration_namespace: Vec<String>,
+    pub namespace_scope: Option<Vec<String>>,
+    pub resolved_target_components: Option<Vec<String>>,
+    pub required_guards: HashSet<PreprocessorGuard>,
 }
 
 #[derive(Clone)]
-pub(super) struct ConditionalIncludeProjection {
-    pub(super) activation_byte: usize,
-    pub(super) required_guards: HashSet<PreprocessorGuard>,
+pub struct ConditionalIncludeProjection {
+    pub activation_byte: usize,
+    pub required_guards: HashSet<PreprocessorGuard>,
 }
 
 #[derive(Default)]
-pub(super) struct SourceUsingIndex {
-    pub(super) ordinary_by_name: HashMap<String, Vec<OrdinaryTypeImport>>,
-    pub(super) directives: Vec<OrdinaryTypeImport>,
+pub struct SourceUsingIndex {
+    pub ordinary_by_name: HashMap<String, Vec<OrdinaryTypeImport>>,
+    pub directives: Vec<OrdinaryTypeImport>,
 }
 
 #[derive(Default)]
-pub(super) struct ProjectUsingIndex {
-    pub(super) ordinary_by_name: HashMap<String, Vec<OrdinaryTypeImport>>,
-    pub(super) directives: Vec<OrdinaryTypeImport>,
+pub struct ProjectUsingIndex {
+    pub ordinary_by_name: HashMap<String, Vec<OrdinaryTypeImport>>,
+    pub directives: Vec<OrdinaryTypeImport>,
 }
 
 type EffectiveUsingProjectionCell = Arc<OnceLock<Arc<[OrdinaryTypeImport]>>>;
 
-pub(in crate::analyzer::usages) struct EffectiveUsingIndex {
+pub struct EffectiveUsingIndex {
     projected_by_name: Mutex<HashMap<String, EffectiveUsingProjectionCell>>,
 }
 
@@ -638,7 +648,7 @@ impl EffectiveUsingIndex {
         }
     }
 
-    pub(super) fn projection_cell(&self, name: &str) -> EffectiveUsingProjectionCell {
+    pub fn projection_cell(&self, name: &str) -> EffectiveUsingProjectionCell {
         self.projected_by_name
             .lock()
             .expect("C++ effective-using projection cache poisoned")
@@ -648,7 +658,7 @@ impl EffectiveUsingIndex {
     }
 }
 
-pub(super) enum OrdinaryTypeImportResolution {
+pub enum OrdinaryTypeImportResolution {
     Resolved {
         target: CodeUnit,
         target_components: Vec<String>,
@@ -678,9 +688,9 @@ type IndexedEnclosingOwnerScopeCache = HashMap<(ProjectFile, usize, usize), Opti
 /// the same source from the store once per candidate instead of once per query
 /// — the #1175 blow-up, where one scan re-parsed a 4.8 MB generated header
 /// tens of thousands of times.
-pub(in crate::analyzer::usages) struct VisibilityIndex<'a> {
-    cpp: &'a CppAnalyzer,
-    pub(super) visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
+pub struct VisibilityIndex<'a> {
+    cpp: &'a dyn CppAnalysisSource,
+    pub visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     visible_by_identifier: HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>>,
     global_field_internal_linkage: HashMap<CodeUnit, bool>,
     visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
@@ -694,23 +704,23 @@ pub(in crate::analyzer::usages) struct VisibilityIndex<'a> {
         Mutex<HashMap<(ProjectFile, LogicalSymbolKey), CallableReferenceSpecCell>>,
     include_activation_cells: Mutex<HashMap<(ProjectFile, ProjectFile), Option<usize>>>,
     conditional_include_projection_cells: Mutex<ConditionalIncludeProjectionCache>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     include_activation_build_count: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     using_donor_activation_count: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     using_namespace_lookup_count: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     using_name_candidate_inspection_count: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     using_source_index_walk_count: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     callable_reference_spec_build_count: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     alias_source_parse_counts: Mutex<HashMap<ProjectFile, usize>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     visible_parser_alias_name_set_build_count: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     visible_parser_alias_target_names_build_count: AtomicUsize,
     field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
     structured_alias_targets: Mutex<HashMap<CodeUnit, Option<StructuredAliasTarget>>>,
@@ -718,31 +728,32 @@ pub(in crate::analyzer::usages) struct VisibilityIndex<'a> {
     indexed_enclosing_owner_scopes: Mutex<IndexedEnclosingOwnerScopeCache>,
     precise_parent_cache: Mutex<HashMap<CodeUnit, Option<CodeUnit>>>,
     macro_event_cells: Mutex<HashMap<ProjectFile, MacroEventCell>>,
-    macro_include_protection_cells: Mutex<HashMap<ProjectFile, MacroIncludeProtectionCell>>,
+    pub macro_include_protection_cells: Mutex<HashMap<ProjectFile, MacroIncludeProtectionCell>>,
     // A forward cursor is useful only while its caller visits one source in byte order. The
     // authoritative differential shares this index across target workers, whose frontiers can
     // interleave arbitrarily, so sharing one cursor per file would serialize the include replay
     // and repeatedly reset it. Keep one bounded cursor per participating worker instead; the
     // immutable event and parse caches above remain shared.
-    macro_environment_cursors: Mutex<HashMap<(ProjectFile, ThreadId), MacroEnvironmentCursorCell>>,
+    pub macro_environment_cursors:
+        Mutex<HashMap<(ProjectFile, ThreadId), MacroEnvironmentCursorCell>>,
     macro_replacements: Mutex<MacroReplacementCache>,
     callable_parameter_macro_arities: Mutex<HashMap<(ProjectFile, String), Option<CallableArity>>>,
-    #[cfg(test)]
-    macro_replacement_parse_count: AtomicUsize,
-    #[cfg(test)]
-    macro_event_application_count: AtomicUsize,
-    #[cfg(test)]
-    macro_environment_copy_count: AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    pub macro_replacement_parse_count: AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    pub macro_event_application_count: AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    pub macro_environment_copy_count: AtomicUsize,
     cpp_template_metadata: HashMap<CodeUnit, CppTemplateMetadata>,
     cpp_template_families: HashMap<String, Vec<CodeUnit>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     qualified_candidate_inspections: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     target_preserving_type_resolution_count: AtomicUsize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) enum PreprocessorGuard {
+pub enum PreprocessorGuard {
     Defined(String),
     Undefined(String),
     Expression(String),
@@ -775,7 +786,7 @@ impl PreprocessorGuard {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-enum MacroDefinition {
+pub enum MacroDefinition {
     Object {
         replacement: String,
     },
@@ -787,7 +798,7 @@ enum MacroDefinition {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum MacroIncludeProtection {
+pub enum MacroIncludeProtection {
     MacroGuard(String),
     PragmaOnce,
     None,
@@ -799,7 +810,7 @@ enum ParsedMacroReplacement {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct MacroBinding {
+pub struct MacroBinding {
     source: ProjectFile,
     declaration_byte: usize,
     definition: MacroDefinition,
@@ -822,7 +833,7 @@ impl MacroBinding {
 }
 
 #[derive(Clone)]
-enum MacroEvent {
+pub enum MacroEvent {
     Define {
         name: String,
         binding: MacroBinding,
@@ -845,7 +856,7 @@ enum MacroEvent {
 }
 
 impl MacroEvent {
-    fn byte(&self) -> usize {
+    pub fn byte(&self) -> usize {
         match self {
             Self::Define { byte, .. }
             | Self::Undef { byte, .. }
@@ -856,20 +867,20 @@ impl MacroEvent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::analyzer::usages) enum CallArityEvidence {
+pub enum CallArityEvidence {
     Exact(usize),
     Unknown,
 }
 
 impl CallArityEvidence {
-    pub(in crate::analyzer::usages) fn exact(self) -> Option<usize> {
+    pub fn exact(self) -> Option<usize> {
         match self {
             Self::Exact(arity) => Some(arity),
             Self::Unknown => None,
         }
     }
 
-    pub(super) fn accepts(self, expected: CallableArity) -> Option<bool> {
+    pub fn accepts(self, expected: CallableArity) -> Option<bool> {
         self.exact().map(|arity| expected.accepts(arity))
     }
 }
@@ -900,21 +911,105 @@ struct CppAlias {
 type ReceiverResolver<'a> = dyn for<'tree> Fn(Node<'tree>, &str) -> Vec<CodeUnit> + 'a;
 
 impl<'a> VisibilityIndex<'a> {
-    pub(super) fn cpp(&self) -> &'a CppAnalyzer {
+    pub fn cpp(&self) -> &'a dyn CppAnalysisSource {
         self.cpp
     }
 
-    pub(in crate::analyzer::usages) fn build(
-        cpp: &'a CppAnalyzer,
-        analyzer: &dyn IAnalyzer,
+    /// A [`VisibilityIndex`] over a caller-supplied visible-declaration map,
+    /// bypassing the include-closure walk [`Self::build`] performs.
+    ///
+    /// The resolver's own unit tests drive the type-resolution paths against a
+    /// hand-written visibility table; they live in `brokk-bifrost-analysis`
+    /// because they need a real `CppAnalyzer`, so the struct literal they used
+    /// to write inline is here instead of thirty-three public fields.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_visible_files_for_test(
+        cpp: &'a dyn CppAnalysisSource,
+        visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
+    ) -> Self {
+        let visible_source_files_by_root = visible_by_file
+            .iter()
+            .map(|(file, visible)| {
+                (
+                    file.clone(),
+                    visible
+                        .iter()
+                        .map(|unit| unit.source().clone())
+                        .chain(std::iter::once(file.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+        let mut global_field_internal_linkage = HashMap::default();
+        Self {
+            cpp,
+            visible_by_identifier: build_visible_identifier_index(
+                CppGraphSource::from_source(cpp),
+                &visible_by_file,
+                &visible_source_files_by_root,
+                &mut global_field_internal_linkage,
+            ),
+            global_field_internal_linkage,
+            visible_by_file,
+            visible_source_files_by_root,
+            alias_cells: Mutex::new(HashMap::default()),
+            visible_parser_alias_name_sets: RwLock::new(HashMap::default()),
+            visible_parser_alias_target_names: Mutex::new(HashMap::default()),
+            ordinary_type_import_cells: Mutex::new(HashMap::default()),
+            project_using_index: OnceLock::new(),
+            callable_reference_specs: Mutex::new(HashMap::default()),
+            include_activation_cells: Mutex::new(HashMap::default()),
+            conditional_include_projection_cells: Mutex::new(HashMap::default()),
+            include_activation_build_count: AtomicUsize::new(0),
+            using_donor_activation_count: AtomicUsize::new(0),
+            using_namespace_lookup_count: AtomicUsize::new(0),
+            using_name_candidate_inspection_count: AtomicUsize::new(0),
+            using_source_index_walk_count: AtomicUsize::new(0),
+            callable_reference_spec_build_count: AtomicUsize::new(0),
+            alias_source_parse_counts: Mutex::new(HashMap::default()),
+            visible_parser_alias_name_set_build_count: AtomicUsize::new(0),
+            visible_parser_alias_target_names_build_count: AtomicUsize::new(0),
+            field_type_facts: Mutex::new(HashMap::default()),
+            structured_alias_targets: Mutex::new(HashMap::default()),
+            indexed_structural_class_scopes: Mutex::new(HashMap::default()),
+            indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
+            precise_parent_cache: Mutex::new(HashMap::default()),
+            macro_event_cells: Mutex::new(HashMap::default()),
+            macro_include_protection_cells: Mutex::new(HashMap::default()),
+            macro_environment_cursors: Mutex::new(HashMap::default()),
+            macro_replacements: Mutex::new(HashMap::default()),
+            callable_parameter_macro_arities: Mutex::new(HashMap::default()),
+            macro_replacement_parse_count: AtomicUsize::new(0),
+            macro_event_application_count: AtomicUsize::new(0),
+            macro_environment_copy_count: AtomicUsize::new(0),
+            cpp_template_metadata: HashMap::default(),
+            cpp_template_families: HashMap::default(),
+            qualified_candidate_inspections: AtomicUsize::new(0),
+            target_preserving_type_resolution_count: AtomicUsize::new(0),
+        }
+    }
+
+    /// The index's own C++ source, in the dispatching-analyzer shape.
+    ///
+    /// Four resolution paths reach the workspace through the C++ analyzer they
+    /// already hold rather than through the analyzer the query was issued
+    /// against; before the move they passed `&CppAnalyzer` straight into a
+    /// `&dyn IAnalyzer` parameter. See [`CppGraphSource::from_source`].
+    fn cpp_source(&self) -> CppGraphSource<'a> {
+        CppGraphSource::from_source(self.cpp)
+    }
+
+    pub fn build(
+        cpp: &'a dyn CppAnalysisSource,
+        analyzer: CppGraphSource<'_>,
         roots: &HashSet<ProjectFile>,
     ) -> Self {
         Self::build_with_cancellation(cpp, analyzer, roots, None)
     }
 
-    pub(in crate::analyzer::usages) fn build_with_cancellation(
-        cpp: &'a CppAnalyzer,
-        analyzer: &dyn IAnalyzer,
+    pub fn build_with_cancellation(
+        cpp: &'a dyn CppAnalysisSource,
+        analyzer: CppGraphSource<'_>,
         roots: &HashSet<ProjectFile>,
         cancellation: Option<&CancellationToken>,
     ) -> Self {
@@ -977,23 +1072,23 @@ impl<'a> VisibilityIndex<'a> {
             callable_reference_specs: Mutex::new(HashMap::default()),
             include_activation_cells: Mutex::new(HashMap::default()),
             conditional_include_projection_cells: Mutex::new(HashMap::default()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             include_activation_build_count: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             using_donor_activation_count: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             using_namespace_lookup_count: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             using_name_candidate_inspection_count: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             using_source_index_walk_count: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             callable_reference_spec_build_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             alias_source_parse_counts: Mutex::new(HashMap::default()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             visible_parser_alias_name_set_build_count: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             visible_parser_alias_target_names_build_count: AtomicUsize::new(0),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
@@ -1005,26 +1100,22 @@ impl<'a> VisibilityIndex<'a> {
             macro_environment_cursors: Mutex::new(HashMap::default()),
             macro_replacements: Mutex::new(HashMap::default()),
             callable_parameter_macro_arities: Mutex::new(HashMap::default()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             macro_replacement_parse_count: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             macro_event_application_count: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             macro_environment_copy_count: AtomicUsize::new(0),
             cpp_template_metadata,
             cpp_template_families,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             qualified_candidate_inspections: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             target_preserving_type_resolution_count: AtomicUsize::new(0),
         }
     }
 
-    pub(in crate::analyzer::usages) fn is_visible(
-        &self,
-        file: &ProjectFile,
-        target: &CodeUnit,
-    ) -> bool {
+    pub fn is_visible(&self, file: &ProjectFile, target: &CodeUnit) -> bool {
         if file == target.source() {
             return true;
         }
@@ -1043,10 +1134,10 @@ impl<'a> VisibilityIndex<'a> {
         self.global_field_internal_linkage
             .get(unit)
             .copied()
-            .unwrap_or_else(|| cpp_global_field_has_internal_linkage(self.cpp, unit))
+            .unwrap_or_else(|| cpp_global_field_has_internal_linkage(self.cpp_source(), unit))
     }
 
-    pub(in crate::analyzer::usages) fn call_arity_evidence(
+    pub fn call_arity_evidence(
         &self,
         file: &ProjectFile,
         call: Node<'_>,
@@ -1237,7 +1328,7 @@ impl<'a> VisibilityIndex<'a> {
         if let Some(parsed) = cache.get(&key) {
             return Arc::clone(parsed);
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.macro_replacement_parse_count
             .fetch_add(1, Ordering::Relaxed);
         let source =
@@ -1284,7 +1375,7 @@ impl<'a> VisibilityIndex<'a> {
         }
     }
 
-    fn macro_event_cell(&self, file: &ProjectFile) -> MacroEventCell {
+    pub fn macro_event_cell(&self, file: &ProjectFile) -> MacroEventCell {
         self.macro_event_cells
             .lock()
             .expect("C++ macro event cache poisoned")
@@ -1293,7 +1384,7 @@ impl<'a> VisibilityIndex<'a> {
             .clone()
     }
 
-    fn macro_environment_cursor_cell(&self, file: &ProjectFile) -> MacroEnvironmentCursorCell {
+    pub fn macro_environment_cursor_cell(&self, file: &ProjectFile) -> MacroEnvironmentCursorCell {
         let key = (file.clone(), std::thread::current().id());
         self.macro_environment_cursors
             .lock()
@@ -1303,7 +1394,11 @@ impl<'a> VisibilityIndex<'a> {
             .clone()
     }
 
-    fn macro_environment(&self, file: &ProjectFile, before_byte: usize) -> Arc<MacroEnvironment> {
+    pub fn macro_environment(
+        &self,
+        file: &ProjectFile,
+        before_byte: usize,
+    ) -> Arc<MacroEnvironment> {
         let cell = self.macro_event_cell(file);
         let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
         let frontier = events.partition_point(|event| event.byte() < before_byte);
@@ -1315,7 +1410,7 @@ impl<'a> VisibilityIndex<'a> {
             *cursor = MacroEnvironmentCursor::default();
         }
         if frontier > cursor.frontier {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if Arc::strong_count(&cursor.environment) > 1 {
                 self.macro_environment_copy_count
                     .fetch_add(1, Ordering::Relaxed);
@@ -1331,7 +1426,7 @@ impl<'a> VisibilityIndex<'a> {
         Arc::clone(&cursor.environment)
     }
 
-    pub(super) fn object_macro_replacement_at(
+    pub fn object_macro_replacement_at(
         &self,
         file: &ProjectFile,
         name: &str,
@@ -1440,7 +1535,7 @@ impl<'a> VisibilityIndex<'a> {
         environment: &mut MacroEnvironment,
         include_stack: &mut HashSet<ProjectFile>,
     ) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.macro_event_application_count
             .fetch_add(1, Ordering::Relaxed);
         match event {
@@ -1541,7 +1636,7 @@ impl<'a> VisibilityIndex<'a> {
         let cell = self.macro_event_cell(file);
         let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
         for event in events {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             self.macro_event_application_count
                 .fetch_add(1, Ordering::Relaxed);
             match event {
@@ -1583,7 +1678,7 @@ impl<'a> VisibilityIndex<'a> {
         }
     }
 
-    fn macro_include_protection(&self, file: &ProjectFile) -> MacroIncludeProtection {
+    pub fn macro_include_protection(&self, file: &ProjectFile) -> MacroIncludeProtection {
         let cell = self
             .macro_include_protection_cells
             .lock()
@@ -1698,7 +1793,7 @@ impl<'a> VisibilityIndex<'a> {
         events
     }
 
-    pub(super) fn ordinary_type_import_cell(&self, file: &ProjectFile) -> OrdinaryTypeImportCell {
+    pub fn ordinary_type_import_cell(&self, file: &ProjectFile) -> OrdinaryTypeImportCell {
         self.ordinary_type_import_cells
             .lock()
             .expect("C++ ordinary type import cache poisoned")
@@ -1707,14 +1802,14 @@ impl<'a> VisibilityIndex<'a> {
             .clone()
     }
 
-    pub(super) fn project_using_index(
+    pub fn project_using_index(
         &self,
         build: impl FnOnce() -> ProjectUsingIndex,
     ) -> &ProjectUsingIndex {
         self.project_using_index.get_or_init(build)
     }
 
-    pub(super) fn all_visible_source_files(&self) -> Vec<ProjectFile> {
+    pub fn all_visible_source_files(&self) -> Vec<ProjectFile> {
         let mut files = self
             .visible_source_files_by_root
             .values()
@@ -1727,7 +1822,7 @@ impl<'a> VisibilityIndex<'a> {
         files
     }
 
-    pub(super) fn source_is_visible(&self, root: &ProjectFile, source: &ProjectFile) -> bool {
+    pub fn source_is_visible(&self, root: &ProjectFile, source: &ProjectFile) -> bool {
         self.visible_source_files_by_root
             .get(root)
             .is_some_and(|files| files.contains(source))
@@ -1754,7 +1849,7 @@ impl<'a> VisibilityIndex<'a> {
             )
         };
         cell.get_or_init(|| {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             self.visible_parser_alias_name_set_build_count
                 .fetch_add(1, Ordering::Relaxed);
             let mut names = HashSet::default();
@@ -1813,7 +1908,7 @@ impl<'a> VisibilityIndex<'a> {
         };
         let target_name = cpp_name_for(target);
         cell.get_or_init(|| {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             self.visible_parser_alias_target_names_build_count
                 .fetch_add(1, Ordering::Relaxed);
             let visible_files = self
@@ -1863,8 +1958,8 @@ impl<'a> VisibilityIndex<'a> {
 
     fn callable_arities_for_target(
         &self,
-        analyzer: &dyn IAnalyzer,
-        cpp: &CppAnalyzer,
+        analyzer: CppGraphSource<'_>,
+        cpp: &dyn CppAnalysisSource,
         file: &ProjectFile,
         prepared: &PreparedSyntaxTree,
         spec: &TargetSpec,
@@ -1958,7 +2053,7 @@ impl<'a> VisibilityIndex<'a> {
         }
         let mut visible_files = HashSet::default();
         collect_include_closure(
-            self.cpp,
+            self.cpp_source(),
             self.cpp.include_target_index(),
             target.source(),
             &mut visible_files,
@@ -2009,9 +2104,9 @@ impl<'a> VisibilityIndex<'a> {
         resolved
     }
 
-    pub(super) fn include_activation_for_source(
+    pub fn include_activation_for_source(
         &self,
-        cpp: &CppAnalyzer,
+        cpp: &dyn CppAnalysisSource,
         file: &ProjectFile,
         prepared: &PreparedSyntaxTree,
         donor_source: &ProjectFile,
@@ -2026,7 +2121,7 @@ impl<'a> VisibilityIndex<'a> {
         {
             return cached;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.include_activation_build_count
             .fetch_add(1, Ordering::Relaxed);
         let activation = find_include_activation(cpp, file, prepared, donor_source);
@@ -2037,7 +2132,7 @@ impl<'a> VisibilityIndex<'a> {
         *cells.entry(key).or_insert(activation)
     }
 
-    pub(super) fn conditional_include_projections_for_source(
+    pub fn conditional_include_projections_for_source(
         &self,
         file: &ProjectFile,
         prepared: &PreparedSyntaxTree,
@@ -2063,49 +2158,49 @@ impl<'a> VisibilityIndex<'a> {
             .clone()
     }
 
-    #[cfg(test)]
-    fn include_activation_build_count_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn include_activation_build_count_for_test(&self) -> usize {
         self.include_activation_build_count.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
-    pub(super) fn note_using_donor_activation_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn note_using_donor_activation_for_test(&self) {
         self.using_donor_activation_count
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(not(test))]
-    pub(super) fn note_using_donor_activation_for_test(&self) {}
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub fn note_using_donor_activation_for_test(&self) {}
 
-    #[cfg(test)]
-    pub(super) fn note_using_namespace_lookup_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn note_using_namespace_lookup_for_test(&self) {
         self.using_namespace_lookup_count
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(not(test))]
-    pub(super) fn note_using_namespace_lookup_for_test(&self) {}
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub fn note_using_namespace_lookup_for_test(&self) {}
 
-    #[cfg(test)]
-    pub(super) fn note_using_name_candidate_inspection_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn note_using_name_candidate_inspection_for_test(&self) {
         self.using_name_candidate_inspection_count
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(not(test))]
-    pub(super) fn note_using_name_candidate_inspection_for_test(&self) {}
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub fn note_using_name_candidate_inspection_for_test(&self) {}
 
-    #[cfg(test)]
-    pub(super) fn note_using_source_index_walk_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn note_using_source_index_walk_for_test(&self) {
         self.using_source_index_walk_count
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(not(test))]
-    pub(super) fn note_using_source_index_walk_for_test(&self) {}
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub fn note_using_source_index_walk_for_test(&self) {}
 
-    #[cfg(test)]
-    pub(super) fn using_work_counts_for_test(&self) -> (usize, usize, usize, usize, usize) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn using_work_counts_for_test(&self) -> (usize, usize, usize, usize, usize) {
         (
             self.using_source_index_walk_count.load(Ordering::Relaxed),
             self.using_donor_activation_count.load(Ordering::Relaxed),
@@ -2117,11 +2212,7 @@ impl<'a> VisibilityIndex<'a> {
         )
     }
 
-    pub(in crate::analyzer::usages) fn is_physically_visible(
-        &self,
-        file: &ProjectFile,
-        target: &CodeUnit,
-    ) -> bool {
+    pub fn is_physically_visible(&self, file: &ProjectFile, target: &CodeUnit) -> bool {
         file == target.source()
             || self
                 .visible_by_file
@@ -2129,9 +2220,9 @@ impl<'a> VisibilityIndex<'a> {
                 .is_some_and(|visible| visible.contains(target))
     }
 
-    pub(in crate::analyzer::usages) fn declaration_visible_at(
+    pub fn declaration_visible_at(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         declaration: &CodeUnit,
         reference_byte: usize,
@@ -2153,9 +2244,9 @@ impl<'a> VisibilityIndex<'a> {
             })
     }
 
-    pub(super) fn callable_arity_at_reference(
+    pub fn callable_arity_at_reference(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         candidate: &CodeUnit,
         reference_byte: usize,
@@ -2174,7 +2265,7 @@ impl<'a> VisibilityIndex<'a> {
             let spec = spec
                 .with_visible_callable_arities(analyzer, self.cpp, self, file, prepared.as_ref())
                 .into_owned();
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             self.callable_reference_spec_build_count
                 .fetch_add(1, Ordering::Relaxed);
             Some(spec)
@@ -2184,7 +2275,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn physical_declaration_visible_at(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         declaration: &CodeUnit,
         reference_byte: usize,
@@ -2218,7 +2309,7 @@ impl<'a> VisibilityIndex<'a> {
             .is_some_and(|activation| activation < reference_byte)
     }
 
-    pub(in crate::analyzer::usages) fn external_type_candidate_visible_at(
+    pub fn external_type_candidate_visible_at(
         &self,
         file: &ProjectFile,
         candidate: &CodeUnit,
@@ -2245,7 +2336,7 @@ impl<'a> VisibilityIndex<'a> {
             })
     }
 
-    pub(in crate::analyzer::usages) fn external_type_declaration_visible_at(
+    pub fn external_type_declaration_visible_at(
         &self,
         file: &ProjectFile,
         candidate: &CodeUnit,
@@ -2261,9 +2352,9 @@ impl<'a> VisibilityIndex<'a> {
             .is_some_and(|activation| activation <= reference_byte)
     }
 
-    pub(in crate::analyzer::usages) fn external_type_candidate_visible_in_context(
+    pub fn external_type_candidate_visible_in_context(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         candidate: &CodeUnit,
         reference: Node<'_>,
@@ -2383,9 +2474,9 @@ impl<'a> VisibilityIndex<'a> {
     /// guard agreement with the parent declaration.  Only then may the
     /// parent's direct/complementary same-FQN visibility stand in for the
     /// nested terminal's active-branch check.
-    pub(in crate::analyzer::usages) fn dependent_member_pointer_alias_visible_in_context(
+    pub fn dependent_member_pointer_alias_visible_in_context(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         candidate: &CodeUnit,
         owner_components: &[String],
@@ -2405,7 +2496,8 @@ impl<'a> VisibilityIndex<'a> {
         {
             return false;
         }
-        let Some(expected_parent_fq_name) = crate::analyzer::default_parent_fq_name(candidate)
+        let Some(expected_parent_fq_name) =
+            brokk_bifrost_core::analyzer::default_parent_fq_name(candidate)
         else {
             return false;
         };
@@ -2503,9 +2595,9 @@ impl<'a> VisibilityIndex<'a> {
     /// reference is inside the candidate's indexed class owner; this helper
     /// only relaxes the byte-order predicate while retaining guard and include
     /// activation checks.
-    pub(in crate::analyzer::usages) fn external_type_candidate_guard_compatible_in_context(
+    pub fn external_type_candidate_guard_compatible_in_context(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         candidate: &CodeUnit,
         reference: Node<'_>,
@@ -2589,9 +2681,9 @@ impl<'a> VisibilityIndex<'a> {
             })
     }
 
-    pub(in crate::analyzer::usages) fn type_candidate_may_be_visible_before_reference(
+    pub fn type_candidate_may_be_visible_before_reference(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         candidate: &CodeUnit,
         reference_byte: usize,
@@ -2609,7 +2701,7 @@ impl<'a> VisibilityIndex<'a> {
         self.external_type_candidate_visible_in_context(analyzer, file, candidate, reference)
     }
 
-    pub(super) fn preprocessor_guards_stable_between(
+    pub fn preprocessor_guards_stable_between(
         &self,
         file: &ProjectFile,
         start_byte: usize,
@@ -2665,11 +2757,7 @@ impl<'a> VisibilityIndex<'a> {
             .any(|event| self.macro_event_may_mutate_guards(event, guards, visited))
     }
 
-    pub(in crate::analyzer::usages) fn resolve_type(
-        &self,
-        file: &ProjectFile,
-        raw_name: &str,
-    ) -> Option<CodeUnit> {
+    pub fn resolve_type(&self, file: &ProjectFile, raw_name: &str) -> Option<CodeUnit> {
         let normalized = normalize_reference_name(raw_name)?;
         self.type_candidates(file, &normalized)
             .into_iter()
@@ -2677,7 +2765,11 @@ impl<'a> VisibilityIndex<'a> {
             .cloned()
     }
 
-    pub(in crate::analyzer::usages) fn resolve_type_node_result(
+    // `Err(())` means "ambiguous", and every caller matches on it that way.
+    // Pre-existing shape, now visible to clippy because the graph is a
+    // published module; introducing an error type here would be a rewrite.
+    #[allow(clippy::result_unit_err)]
+    pub fn resolve_type_node_result(
         &self,
         file: &ProjectFile,
         node: Node<'_>,
@@ -2693,7 +2785,7 @@ impl<'a> VisibilityIndex<'a> {
             .map(Some)
     }
 
-    pub(in crate::analyzer::usages) fn resolve_type_node_primary(
+    pub fn resolve_type_node_primary(
         &self,
         file: &ProjectFile,
         node: Node<'_>,
@@ -2703,7 +2795,11 @@ impl<'a> VisibilityIndex<'a> {
         self.resolve_type(file, &components.join("::"))
     }
 
-    pub(in crate::analyzer::usages) fn resolve_template_arguments(
+    // `Err(())` means "ambiguous", and every caller matches on it that way.
+    // Pre-existing shape, now visible to clippy because the graph is a
+    // published module; introducing an error type here would be a rewrite.
+    #[allow(clippy::result_unit_err)]
+    pub fn resolve_template_arguments(
         &self,
         file: &ProjectFile,
         primary: CodeUnit,
@@ -2840,9 +2936,9 @@ impl<'a> VisibilityIndex<'a> {
         Some(selected.clone())
     }
 
-    pub(super) fn resolve_type_components_lexically(
+    pub fn resolve_type_components_lexically(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         components: &[String],
         global: bool,
@@ -2858,9 +2954,9 @@ impl<'a> VisibilityIndex<'a> {
         )
     }
 
-    pub(in crate::analyzer::usages) fn resolve_type_components_lexically_for_forward(
+    pub fn resolve_type_components_lexically_for_forward(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         components: &[String],
         global: bool,
@@ -2876,16 +2972,16 @@ impl<'a> VisibilityIndex<'a> {
         )
     }
 
-    pub(super) fn resolve_type_components_lexically_for_target(
+    pub fn resolve_type_components_lexically_for_target(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         components: &[String],
         global: bool,
         lexical_scope: &[String],
         target: &CodeUnit,
     ) -> LexicalTypeResolution {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.target_preserving_type_resolution_count
             .fetch_add(1, Ordering::Relaxed);
         self.resolve_type_components_lexically_inner(
@@ -2898,7 +2994,7 @@ impl<'a> VisibilityIndex<'a> {
         )
     }
 
-    pub(super) fn coarse_unqualified_type_reference_may_resolve(
+    pub fn coarse_unqualified_type_reference_may_resolve(
         &self,
         file: &ProjectFile,
         name: &str,
@@ -2912,9 +3008,9 @@ impl<'a> VisibilityIndex<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn structured_type_reference_may_resolve_to_target(
+    pub fn structured_type_reference_may_resolve_to_target(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         components: &[String],
         global: bool,
@@ -2974,9 +3070,9 @@ impl<'a> VisibilityIndex<'a> {
         !saw_shape_candidate
     }
 
-    pub(super) fn target_preserving_reference_namespace(
+    pub fn target_preserving_reference_namespace(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         identifier: &str,
         target: &CodeUnit,
@@ -3005,15 +3101,17 @@ impl<'a> VisibilityIndex<'a> {
             namespace = Some(candidate.package_name().to_string());
         }
         let namespace = namespace?;
-        Some(crate::analyzer::symbol_lookup::parse_symbol_path(
-            crate::analyzer::Language::Cpp,
-            &namespace,
-        ))
+        Some(
+            brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+                brokk_bifrost_core::analyzer::Language::Cpp,
+                &namespace,
+            ),
+        )
     }
 
-    pub(super) fn resolve_imported_type_candidate(
+    pub fn resolve_imported_type_candidate(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         target: &CodeUnit,
         target_components: &[String],
@@ -3042,7 +3140,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn resolve_type_components_lexically_inner(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         components: &[String],
         global: bool,
@@ -3118,7 +3216,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn resolve_injected_class_name(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         components: &[String],
         global: bool,
@@ -3188,7 +3286,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn resolve_inherited_type_for_lexical_scope(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         lexical_scope: &[String],
         name: &str,
@@ -3275,7 +3373,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn resolve_type_candidates(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         candidates: &[&CodeUnit],
         resolution: TypeCandidateResolution<'_>,
@@ -3293,9 +3391,9 @@ impl<'a> VisibilityIndex<'a> {
         }
     }
 
-    pub(super) fn resolve_callable_value_components_lexically(
+    pub fn resolve_callable_value_components_lexically(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         owner_components: &[String],
         member_name: &str,
@@ -3373,7 +3471,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn resolve_unique_canonical_type_for_declaration(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         visible_from: &ProjectFile,
         declaration: &CodeUnit,
         raw_name: &str,
@@ -3395,9 +3493,9 @@ impl<'a> VisibilityIndex<'a> {
         }
     }
 
-    pub(super) fn canonical_type_unit(
+    pub fn canonical_type_unit(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         visible_from: &ProjectFile,
         unit: &CodeUnit,
     ) -> Option<CodeUnit> {
@@ -3417,9 +3515,9 @@ impl<'a> VisibilityIndex<'a> {
         }
     }
 
-    pub(super) fn canonical_visible_full_type_unit(
+    pub fn canonical_visible_full_type_unit(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         visible_from: &ProjectFile,
         unit: &CodeUnit,
     ) -> Option<CodeUnit> {
@@ -3488,9 +3586,9 @@ impl<'a> VisibilityIndex<'a> {
         }
     }
 
-    pub(super) fn structured_alias_primary_preserves_target(
+    pub fn structured_alias_primary_preserves_target(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         visible_from: &ProjectFile,
         candidate: &CodeUnit,
         target: &CodeUnit,
@@ -3527,9 +3625,9 @@ impl<'a> VisibilityIndex<'a> {
         }
     }
 
-    pub(super) fn template_alias_arguments_preserve_target(
+    pub fn template_alias_arguments_preserve_target(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         visible_from: &ProjectFile,
         alias: &CodeUnit,
         arguments: &[CppTemplateExpression],
@@ -3546,13 +3644,13 @@ impl<'a> VisibilityIndex<'a> {
         self.structured_alias_primary_preserves_target(analyzer, visible_from, alias, target)
     }
 
-    pub(super) fn is_primary_template(&self, unit: &CodeUnit) -> bool {
+    pub fn is_primary_template(&self, unit: &CodeUnit) -> bool {
         self.cpp_template_metadata
             .get(unit)
             .is_some_and(|metadata| metadata.specialization_arguments.is_empty())
     }
 
-    pub(super) fn is_template_specialization(&self, unit: &CodeUnit) -> bool {
+    pub fn is_template_specialization(&self, unit: &CodeUnit) -> bool {
         self.cpp_template_metadata
             .get(unit)
             .is_some_and(|metadata| !metadata.specialization_arguments.is_empty())
@@ -3560,7 +3658,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn unique_canonical_type_candidate(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         visible_from: &ProjectFile,
         candidates: &[&CodeUnit],
     ) -> Option<CodeUnit> {
@@ -3581,9 +3679,9 @@ impl<'a> VisibilityIndex<'a> {
         canonical.pop()
     }
 
-    fn unique_type_candidate_preserving_target(
+    pub fn unique_type_candidate_preserving_target(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         visible_from: &ProjectFile,
         candidates: &[&CodeUnit],
         target: &CodeUnit,
@@ -3619,9 +3717,9 @@ impl<'a> VisibilityIndex<'a> {
         resolved_candidates.pop()
     }
 
-    fn alternate_same_fqn_type_declarations(
+    pub fn alternate_same_fqn_type_declarations(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         candidates: &[&CodeUnit],
         target: &CodeUnit,
     ) -> bool {
@@ -3665,9 +3763,9 @@ impl<'a> VisibilityIndex<'a> {
             })
     }
 
-    fn complementary_same_fqn_type_declarations(
+    pub fn complementary_same_fqn_type_declarations(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         candidates: &[&CodeUnit],
         target: &CodeUnit,
     ) -> bool {
@@ -3700,7 +3798,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn type_candidate_preserving_target(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         visible_from: &ProjectFile,
         candidate: &CodeUnit,
         target: &CodeUnit,
@@ -3775,7 +3873,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn alias_candidate_may_preserve_target(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         visible_from: &ProjectFile,
         candidate: &CodeUnit,
         target: &CodeUnit,
@@ -3839,9 +3937,9 @@ impl<'a> VisibilityIndex<'a> {
         unique_logical_type_candidate(self.type_candidates(visible_from, &normalized))
     }
 
-    pub(super) fn resolves_to_type(
+    pub fn resolves_to_type(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         raw_name: &str,
         target: &CodeUnit,
@@ -3861,7 +3959,7 @@ impl<'a> VisibilityIndex<'a> {
         same_symbol(&resolved, target) || same_visible_symbol(&resolved, target)
     }
 
-    pub(super) fn alias_target(&self, alias: &CodeUnit) -> Option<CodeUnit> {
+    pub fn alias_target(&self, alias: &CodeUnit) -> Option<CodeUnit> {
         let raw_target = type_alias_target_text(alias)?;
         let resolved = self.resolve_type_for_declaration(alias.source(), alias, raw_target)?;
         match resolved.kind() {
@@ -3871,7 +3969,7 @@ impl<'a> VisibilityIndex<'a> {
         }
     }
 
-    pub(super) fn canonical_type_for_reference(
+    pub fn canonical_type_for_reference(
         &self,
         file: &ProjectFile,
         raw_name: &str,
@@ -3880,9 +3978,9 @@ impl<'a> VisibilityIndex<'a> {
         self.alias_target(&resolved).or(Some(resolved))
     }
 
-    pub(super) fn parser_alias_resolves_to_type(
+    pub fn parser_alias_resolves_to_type(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         raw_name: &str,
         target: &CodeUnit,
@@ -3890,7 +3988,7 @@ impl<'a> VisibilityIndex<'a> {
         let Some(alias_name) = normalize_reference_name(raw_name) else {
             return false;
         };
-        let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
+        let Some(cpp) = analyzer.cpp else {
             return false;
         };
         let matches_file = |source_file: &ProjectFile| {
@@ -3904,7 +4002,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn file_alias_matches(
         &self,
-        cpp: &CppAnalyzer,
+        cpp: &dyn CppAnalysisSource,
         file: &ProjectFile,
         alias_name: &str,
         target: &CodeUnit,
@@ -3934,7 +4032,7 @@ impl<'a> VisibilityIndex<'a> {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(super) fn visible_source_files_for_test(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
+    pub fn visible_source_files_for_test(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         self.visible_source_files_by_root
             .get(file)
             .cloned()
@@ -3951,7 +4049,7 @@ impl<'a> VisibilityIndex<'a> {
             .unwrap_or(0)
     }
 
-    pub(in crate::analyzer::usages) fn resolve_named(
+    pub fn resolve_named(
         &self,
         file: &ProjectFile,
         raw_name: &str,
@@ -3964,7 +4062,7 @@ impl<'a> VisibilityIndex<'a> {
             .cloned()
     }
 
-    pub(super) fn contains_named_symbol(
+    pub fn contains_named_symbol(
         &self,
         file: &ProjectFile,
         raw_name: &str,
@@ -3983,7 +4081,7 @@ impl<'a> VisibilityIndex<'a> {
             })
     }
 
-    pub(super) fn named_candidates(
+    pub fn named_candidates(
         &self,
         file: &ProjectFile,
         raw_name: &str,
@@ -3998,7 +4096,7 @@ impl<'a> VisibilityIndex<'a> {
             .collect()
     }
 
-    pub(super) fn resolve_known_non_target(
+    pub fn resolve_known_non_target(
         &self,
         file: &ProjectFile,
         raw_name: &str,
@@ -4019,9 +4117,9 @@ impl<'a> VisibilityIndex<'a> {
                 })
     }
 
-    pub(super) fn resolve_call_return_binding(
+    pub fn resolve_call_return_binding(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         raw_name: &str,
         arity: usize,
@@ -4047,9 +4145,9 @@ impl<'a> VisibilityIndex<'a> {
         unanimous_return_binding(analyzer, self, file, &candidates)
     }
 
-    pub(super) fn resolve_call_return_binding_without_arity(
+    pub fn resolve_call_return_binding_without_arity(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         raw_name: &str,
         lexical_namespace: Option<&str>,
@@ -4079,7 +4177,7 @@ impl<'a> VisibilityIndex<'a> {
         )
     }
 
-    pub(in crate::analyzer::usages) fn visible_identifier_candidates<'b>(
+    pub fn visible_identifier_candidates<'b>(
         &'b self,
         file: &ProjectFile,
         identifier: &str,
@@ -4097,9 +4195,9 @@ impl<'a> VisibilityIndex<'a> {
     /// parser-only aliases are read through their per-file cells so this path
     /// never reparses a source that has already been inspected by the visibility
     /// index.
-    pub(super) fn visible_type_reference_component_names_for_target(
+    pub fn visible_type_reference_component_names_for_target(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         target: &CodeUnit,
     ) -> HashSet<String> {
@@ -4129,7 +4227,7 @@ impl<'a> VisibilityIndex<'a> {
         names
     }
 
-    pub(super) fn indexed_structural_class_scope(
+    pub fn indexed_structural_class_scope(
         &self,
         file: &ProjectFile,
         class: Node<'_>,
@@ -4182,7 +4280,7 @@ impl<'a> VisibilityIndex<'a> {
                 .filter(|candidate| {
                     candidate.source() == file
                         && candidate.is_class()
-                        && !declared_type_alias(self.cpp, candidate)
+                        && !declared_type_alias(self.cpp_source(), candidate)
                         && self.cpp.ranges(candidate).iter().any(|range| {
                             range.start_byte <= class.start_byte()
                                 && class.end_byte() <= range.end_byte
@@ -4191,7 +4289,7 @@ impl<'a> VisibilityIndex<'a> {
                 .collect::<Vec<_>>();
             let owner = if name.kind() == "template_type" {
                 let expected = normalize_cpp_whitespace(node_text(name, source));
-                let interner = crate::analyzer::fq_name::segment_interner();
+                let interner = brokk_bifrost_core::analyzer::fq_name::segment_interner();
                 let exact = candidates
                     .iter()
                     .copied()
@@ -4205,8 +4303,8 @@ impl<'a> VisibilityIndex<'a> {
                                 let (text, kind) = interner.resolve(segment);
                                 matches!(
                                     kind,
-                                    crate::analyzer::fq_name::SegmentKind::Type
-                                        | crate::analyzer::fq_name::SegmentKind::Nested
+                                    brokk_bifrost_core::analyzer::fq_name::SegmentKind::Type
+                                        | brokk_bifrost_core::analyzer::fq_name::SegmentKind::Nested
                                 )
                                 .then_some(text)
                             })
@@ -4227,9 +4325,9 @@ impl<'a> VisibilityIndex<'a> {
         resolved
     }
 
-    pub(super) fn indexed_enclosing_owner_scope(
+    pub fn indexed_enclosing_owner_scope(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         file: &ProjectFile,
         node: Node<'_>,
     ) -> Option<Vec<String>> {
@@ -4262,9 +4360,10 @@ impl<'a> VisibilityIndex<'a> {
                 end_line: node.end_position().row,
             };
             let start = analyzer.enclosing_code_unit(file, &range)?;
-            let owner = crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
-                self.cached_precise_parent_of(analyzer, unit)
-            })
+            let owner = brokk_bifrost_core::analyzer::usages::common::enclosing_owner_chain(
+                start,
+                |unit| self.cached_precise_parent_of(analyzer, unit),
+            )
             .find(|unit| {
                 unit.is_class()
                     && !analyzer
@@ -4282,7 +4381,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn cached_precise_parent_of(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         code_unit: &CodeUnit,
     ) -> Option<CodeUnit> {
         if let Some(cached) = self
@@ -4302,9 +4401,9 @@ impl<'a> VisibilityIndex<'a> {
         resolved
     }
 
-    pub(in crate::analyzer::usages) fn callable_is_constructor_declaration(
+    pub fn callable_is_constructor_declaration(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         candidate: &CodeUnit,
     ) -> bool {
         if !candidate.is_function() {
@@ -4358,7 +4457,7 @@ impl<'a> VisibilityIndex<'a> {
                 .all(|signature| signature.return_type_text().is_none())
     }
 
-    pub(in crate::analyzer::usages) fn type_name_candidates<'b>(
+    pub fn type_name_candidates<'b>(
         &'b self,
         file: &ProjectFile,
         normalized: &str,
@@ -4366,7 +4465,7 @@ impl<'a> VisibilityIndex<'a> {
         self.candidate_units(file, normalized, TargetKind::Type)
     }
 
-    pub(super) fn visible_members_for_owner_name<'b>(
+    pub fn visible_members_for_owner_name<'b>(
         &'b self,
         file: &ProjectFile,
         owner: &CodeUnit,
@@ -4377,13 +4476,13 @@ impl<'a> VisibilityIndex<'a> {
                 // Structured owner pop on the unit's own `fq()` (shared with
                 // `CodeUnitIndex::parent_of`), not a re-split of its rendered fqn
                 // string.
-                crate::analyzer::default_parent_fq_name(unit)
+                brokk_bifrost_core::analyzer::default_parent_fq_name(unit)
                     .is_some_and(|parent| parent == owner.fq_name())
             })
             .collect()
     }
 
-    pub(super) fn visible_member_for_owner_name(
+    pub fn visible_member_for_owner_name(
         &self,
         file: &ProjectFile,
         owner: &CodeUnit,
@@ -4409,7 +4508,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn field_declared_type_fact(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         field: &CodeUnit,
     ) -> Option<DeclaredFieldTypeFact> {
         if let Some(cached) = self
@@ -4431,7 +4530,7 @@ impl<'a> VisibilityIndex<'a> {
 
     fn structured_alias_target(
         &self,
-        analyzer: &dyn IAnalyzer,
+        analyzer: CppGraphSource<'_>,
         unit: &CodeUnit,
     ) -> Option<StructuredAliasTarget> {
         if let Some(cached) = self
@@ -4451,7 +4550,11 @@ impl<'a> VisibilityIndex<'a> {
         decoded
     }
 
-    fn type_candidates<'b>(&'b self, file: &ProjectFile, normalized: &str) -> Vec<&'b CodeUnit> {
+    pub fn type_candidates<'b>(
+        &'b self,
+        file: &ProjectFile,
+        normalized: &str,
+    ) -> Vec<&'b CodeUnit> {
         let mut candidates = self
             .candidate_units(file, normalized, TargetKind::Type)
             .into_iter()
@@ -4461,7 +4564,7 @@ impl<'a> VisibilityIndex<'a> {
         candidates
     }
 
-    fn named_candidates_for_normalized<'b>(
+    pub fn named_candidates_for_normalized<'b>(
         &'b self,
         file: &ProjectFile,
         normalized: &str,
@@ -4478,7 +4581,7 @@ impl<'a> VisibilityIndex<'a> {
         candidates
     }
 
-    fn candidate_units<'b>(
+    pub fn candidate_units<'b>(
         &'b self,
         file: &ProjectFile,
         normalized: &str,
@@ -4493,8 +4596,8 @@ impl<'a> VisibilityIndex<'a> {
             // the shared splitter. Re-tokenizing and taking the last segment
             // reproduces `rsplit("::").find(non-empty)`'s terminal-component
             // scan exactly.
-            let Some(identifier) = crate::analyzer::symbol_lookup::parse_symbol_path(
-                crate::analyzer::Language::Cpp,
+            let Some(identifier) = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+                brokk_bifrost_core::analyzer::Language::Cpp,
                 normalized,
             )
             .pop() else {
@@ -4504,7 +4607,7 @@ impl<'a> VisibilityIndex<'a> {
             return self
                 .visible_identifier_candidates(file, &identifier)
                 .filter(|unit| {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     self.qualified_candidate_inspections
                         .fetch_add(1, Ordering::Relaxed);
                     fqns.iter().any(|fqn| unit.fq_name() == *fqn)
@@ -4516,37 +4619,37 @@ impl<'a> VisibilityIndex<'a> {
             .collect()
     }
 
-    #[cfg(test)]
-    pub(super) fn reset_qualified_candidate_inspections(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reset_qualified_candidate_inspections(&self) {
         self.qualified_candidate_inspections
             .store(0, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
-    pub(super) fn qualified_candidate_inspections(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn qualified_candidate_inspections(&self) -> usize {
         self.qualified_candidate_inspections.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
-    pub(super) fn reset_target_preserving_type_resolution_count(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reset_target_preserving_type_resolution_count(&self) {
         self.target_preserving_type_resolution_count
             .store(0, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
-    pub(super) fn target_preserving_type_resolution_count(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn target_preserving_type_resolution_count(&self) -> usize {
         self.target_preserving_type_resolution_count
             .load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
-    pub(super) fn visible_parser_alias_name_set_build_count(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn visible_parser_alias_name_set_build_count(&self) -> usize {
         self.visible_parser_alias_name_set_build_count
             .load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
-    pub(super) fn visible_parser_alias_target_names_build_count(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn visible_parser_alias_target_names_build_count(&self) -> usize {
         self.visible_parser_alias_target_names_build_count
             .load(Ordering::Relaxed)
     }
@@ -4592,12 +4695,12 @@ impl IncludeGraph {
     }
 }
 
-struct VisibilityData {
-    visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
-    visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
+pub struct VisibilityData {
+    pub visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
+    pub visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
 }
 
-fn build_visibility_data<F, D>(
+pub fn build_visibility_data<F, D>(
     roots: &HashSet<ProjectFile>,
     cancellation: Option<&CancellationToken>,
     mut targets_for: F,
@@ -4644,7 +4747,7 @@ where
     }
 }
 
-pub(super) enum VisibleMemberResolution {
+pub enum VisibleMemberResolution {
     Callable(Vec<CodeUnit>),
     NonCallable,
     AmbiguousKind,
@@ -4652,14 +4755,14 @@ pub(super) enum VisibleMemberResolution {
 }
 
 #[derive(Clone)]
-pub(super) enum EnclosingMemberOwnerResolution {
+pub enum EnclosingMemberOwnerResolution {
     Owner(CodeUnit),
     Ambiguous,
     Missing,
 }
 
-pub(super) fn resolve_declaring_member_owner(
-    analyzer: &dyn IAnalyzer,
+pub fn resolve_declaring_member_owner(
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     receiver_owner: &CodeUnit,
@@ -4744,7 +4847,7 @@ pub(super) fn resolve_declaring_member_owner(
     }
 }
 
-pub(super) fn lexical_component_tiers<'a>(
+pub fn lexical_component_tiers<'a>(
     components: &'a [String],
     global: bool,
     lexical_scope: &'a [String],
@@ -4758,8 +4861,8 @@ pub(super) fn lexical_component_tiers<'a>(
     })
 }
 
-fn build_visible_identifier_index(
-    analyzer: &dyn IAnalyzer,
+pub fn build_visible_identifier_index(
+    analyzer: CppGraphSource<'_>,
     visible_by_file: &HashMap<ProjectFile, HashSet<CodeUnit>>,
     visible_source_files_by_root: &HashMap<ProjectFile, HashSet<ProjectFile>>,
     global_field_internal_linkage: &mut HashMap<CodeUnit, bool>,
@@ -4813,15 +4916,12 @@ fn dedup_unit_refs(units: &mut Vec<&CodeUnit>) {
     *units = deduped;
 }
 
-pub(in crate::analyzer::usages) fn cpp_reference_fqn_candidates(
-    reference: &str,
-    kind: TargetKind,
-) -> Vec<String> {
+pub fn cpp_reference_fqn_candidates(reference: &str, kind: TargetKind) -> Vec<String> {
     // Same domain as `candidate_units` above: `reference` is a plain
     // `::`-joined qualified-id with operator tokens kept intact by the shared
     // splitter's operator merge.
-    let parts = crate::analyzer::symbol_lookup::parse_symbol_path(
-        crate::analyzer::Language::Cpp,
+    let parts = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+        brokk_bifrost_core::analyzer::Language::Cpp,
         reference,
     );
     if parts.is_empty() {
@@ -4867,8 +4967,8 @@ fn push_cpp_fqn_candidate(out: &mut Vec<String>, package: &str, short: &str) {
     }
 }
 
-pub(in crate::analyzer::usages) fn infer_cpp_initializer_type(
-    analyzer: &dyn IAnalyzer,
+pub fn infer_cpp_initializer_type(
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -4878,8 +4978,8 @@ pub(in crate::analyzer::usages) fn infer_cpp_initializer_type(
         .and_then(|binding| binding.unit)
 }
 
-pub(super) fn infer_cpp_initializer_binding(
-    analyzer: &dyn IAnalyzer,
+pub fn infer_cpp_initializer_binding(
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -4973,7 +5073,7 @@ pub(super) fn infer_cpp_initializer_binding(
 }
 
 fn resolve_static_method_call_return_binding(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -4990,8 +5090,8 @@ fn resolve_static_method_call_return_binding(
     // structured splitter and peeling the terminal segment reproduces
     // `rsplit_once("::")`'s (owner, member) split exactly — same shape as
     // `cpp_out_of_line_function_owner`'s `qualified` split above.
-    let parts = crate::analyzer::symbol_lookup::parse_symbol_path(
-        crate::analyzer::Language::Cpp,
+    let parts = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+        brokk_bifrost_core::analyzer::Language::Cpp,
         &qualified,
     );
     let (owner_text, member_name) = match parts.split_last() {
@@ -5018,7 +5118,7 @@ fn resolve_static_method_call_return_binding(
 }
 
 fn resolve_field_method_call_return_binding(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -5052,7 +5152,7 @@ fn resolve_field_method_call_return_binding(
 }
 
 fn unanimous_return_binding(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     candidates: &[CodeUnit],
@@ -5069,8 +5169,7 @@ fn unanimous_return_binding(
                 .collect::<Option<Vec<_>>>()?
         };
         for return_text in return_types {
-            let indirection =
-                brokk_bifrost_cpp::call_match::cpp_type_text_pointer_depth(&return_text);
+            let indirection = crate::call_match::cpp_type_text_pointer_depth(&return_text);
             let name = normalize_cpp_type_name(&return_text);
             let binding = CppScanBinding::from_type_name(
                 name.clone(),
@@ -5094,7 +5193,7 @@ fn unanimous_return_binding(
     resolved_return
 }
 
-fn aliases_from_prepared_source(cpp: &CppAnalyzer, file: &ProjectFile) -> Vec<CppAlias> {
+fn aliases_from_prepared_source(cpp: &dyn CppAnalysisSource, file: &ProjectFile) -> Vec<CppAlias> {
     let Some(prepared) = cpp.prepared_syntax(file) else {
         return Vec::new();
     };
@@ -5200,8 +5299,8 @@ fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-pub(super) fn collect_include_closure(
-    analyzer: &dyn IAnalyzer,
+pub fn collect_include_closure(
+    analyzer: CppGraphSource<'_>,
     include_targets: &IncludeTargetIndex,
     file: &ProjectFile,
     out: &mut HashSet<ProjectFile>,
@@ -5247,7 +5346,7 @@ fn collect_visible_declarations(
     }
 }
 
-pub(in crate::analyzer::usages) fn signature_arity(signature: Option<&str>) -> usize {
+pub fn signature_arity(signature: Option<&str>) -> usize {
     let Some(signature) = signature else {
         return 0;
     };
@@ -5307,7 +5406,7 @@ fn parse_macro_parameter_list_arity(replacement: &str) -> Option<CallableArity> 
     Some(CallableArity::new(required, total, repeated))
 }
 
-pub(super) fn cpp_callable_arity(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> CallableArity {
+pub fn cpp_callable_arity(analyzer: CppGraphSource<'_>, unit: &CodeUnit) -> CallableArity {
     analyzer
         .signature_metadata(unit)
         .into_iter()
@@ -5330,7 +5429,7 @@ fn merge_compatible_callable_arities(
 }
 
 fn find_include_activation(
-    cpp: &CppAnalyzer,
+    cpp: &dyn CppAnalysisSource,
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
     donor_source: &ProjectFile,
@@ -5379,7 +5478,7 @@ fn find_include_activation(
 }
 
 fn find_conditional_include_projections(
-    cpp: &CppAnalyzer,
+    cpp: &dyn CppAnalysisSource,
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
     donor_source: &ProjectFile,
@@ -5436,7 +5535,7 @@ fn find_conditional_include_projections(
 }
 
 fn conditional_include_requirement_paths(
-    cpp: &CppAnalyzer,
+    cpp: &dyn CppAnalysisSource,
     first: &ProjectFile,
     donor_source: &ProjectFile,
     required_guards: HashSet<PreprocessorGuard>,
@@ -5499,7 +5598,7 @@ fn conditional_include_requirement_paths(
 }
 
 fn unconditional_include_reaches(
-    cpp: &CppAnalyzer,
+    cpp: &dyn CppAnalysisSource,
     include_targets: &IncludeTargetIndex,
     first: &ProjectFile,
     donor_source: &ProjectFile,
@@ -5555,8 +5654,8 @@ fn unconditional_include_reaches(
 }
 
 fn declaration_guard_requirements(
-    analyzer: &dyn IAnalyzer,
-    cpp: &CppAnalyzer,
+    analyzer: CppGraphSource<'_>,
+    cpp: &dyn CppAnalysisSource,
     candidate: &CodeUnit,
 ) -> Vec<(usize, HashSet<PreprocessorGuard>)> {
     let Some(prepared) = cpp.prepared_syntax(candidate.source()) else {
@@ -5584,7 +5683,7 @@ fn guard_requirements_hold_at_reference(
     reference.is_some_and(|active| required.is_subset(active))
 }
 
-pub(super) fn preprocessor_guard_environment(
+pub fn preprocessor_guard_environment(
     node: Node<'_>,
     source: &str,
 ) -> Option<HashSet<PreprocessorGuard>> {
@@ -5635,7 +5734,7 @@ fn preprocessor_guard_for_descendant(
     Some(guard)
 }
 
-pub(super) fn merge_preprocessor_guards(
+pub fn merge_preprocessor_guards(
     left: &HashSet<PreprocessorGuard>,
     right: &HashSet<PreprocessorGuard>,
 ) -> Option<HashSet<PreprocessorGuard>> {
@@ -5713,7 +5812,7 @@ fn unique_include_target(mut targets: Vec<ProjectFile>) -> Option<ProjectFile> {
 }
 
 fn callable_declaration_activation_in_file(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     prepared: &PreparedSyntaxTree,
     candidate: &CodeUnit,
     reference_file: &ProjectFile,
@@ -5740,7 +5839,7 @@ fn callable_declaration_activation_in_file(
                 // its declaration activation merely because the malformed
                 // wrapper looks callable.
                 if node.kind() == "function_definition"
-                    && crate::analyzer::cpp::is_recovered_exported_class_container(
+                    && crate::declarations::is_recovered_exported_class_container(
                         node,
                         prepared.source(),
                     )
@@ -5750,7 +5849,7 @@ fn callable_declaration_activation_in_file(
                 }
                 if node.kind() == "compound_statement"
                     && node.parent().is_some_and(|parent| {
-                        crate::analyzer::cpp::is_recovered_exported_class_container(
+                        crate::declarations::is_recovered_exported_class_container(
                             parent,
                             prepared.source(),
                         )
@@ -5818,8 +5917,8 @@ fn callable_preprocessor_context_is_visible_for_reference(
 }
 
 fn flattened_macro_namespace_declaration_matches(
-    analyzer: &dyn IAnalyzer,
-    cpp: &CppAnalyzer,
+    analyzer: CppGraphSource<'_>,
+    cpp: &dyn CppAnalysisSource,
     reference_file: &ProjectFile,
     visible_declaration: &CodeUnit,
     qualified_candidate: &CodeUnit,
@@ -5906,7 +6005,7 @@ fn direct_unmatched_closing_brace(node: Node<'_>) -> bool {
             .any(|index| node.child(index).is_some_and(|child| child.kind() == "}"))
 }
 
-pub(super) fn callable_preprocessor_context_is_visible(node: Node<'_>, source: &str) -> bool {
+pub fn callable_preprocessor_context_is_visible(node: Node<'_>, source: &str) -> bool {
     let mut ancestor = node.parent();
     while let Some(parent) = ancestor {
         if is_preprocessor_conditional(parent)
@@ -5981,7 +6080,7 @@ fn is_split_cpp_language_linkage_wrapper(
     closes_opening_branch && reopens_for_closing_brace
 }
 
-pub(in crate::analyzer::usages) fn call_arity(node: Node<'_>) -> usize {
+pub fn call_arity(node: Node<'_>) -> usize {
     node.child_by_field_name("arguments")
         .or_else(|| node.child_by_field_name("parameters"))
         .or_else(|| node.child_by_field_name("value"))
@@ -5991,9 +6090,7 @@ pub(in crate::analyzer::usages) fn call_arity(node: Node<'_>) -> usize {
         .unwrap_or(0)
 }
 
-pub(in crate::analyzer::usages) fn argument_children<'tree>(
-    node: Node<'tree>,
-) -> impl Iterator<Item = Node<'tree>> {
+pub fn argument_children<'tree>(node: Node<'tree>) -> impl Iterator<Item = Node<'tree>> {
     let recovered_block_arguments = recovered_block_literal_arguments(node);
     (0..node.child_count())
         .filter_map(move |index| node.child(index))
@@ -6051,7 +6148,7 @@ fn recovered_block_literal_arguments<'tree>(
     has_intervening_error.then_some((raw, left, right))
 }
 
-pub(in crate::analyzer::usages) fn constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
+pub fn constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "new_expression" => node
             .child_by_field_name("type")
@@ -6062,7 +6159,7 @@ pub(in crate::analyzer::usages) fn constructor_type_node(node: Node<'_>) -> Opti
     }
 }
 
-pub(super) fn field_initializer_constructs_target(
+pub fn field_initializer_constructs_target(
     node: Node<'_>,
     ctx: &ScanCtx<'_>,
     owner: &CodeUnit,
@@ -6146,8 +6243,8 @@ fn field_declares_type(unit: &CodeUnit, ctx: &ScanCtx<'_>, owner: &CodeUnit) -> 
             })
 }
 
-pub(super) fn field_declared_binding(
-    analyzer: &dyn IAnalyzer,
+pub fn field_declared_binding(
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     visible_from: &ProjectFile,
     field: &CodeUnit,
@@ -6198,7 +6295,7 @@ fn unique_logical_type_candidate(candidates: Vec<&CodeUnit>) -> Option<CodeUnit>
 }
 
 fn unique_type_candidate_preserving_alias(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     candidates: &[&CodeUnit],
 ) -> Option<CodeUnit> {
     let first = *candidates.first()?;
@@ -6220,15 +6317,15 @@ fn unique_type_candidate_preserving_alias(
         .then(|| first.clone())
 }
 
-fn declared_type_alias(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+fn declared_type_alias(analyzer: CppGraphSource<'_>, unit: &CodeUnit) -> bool {
     is_type_alias(unit)
         || analyzer
             .type_alias_provider()
             .is_some_and(|provider| provider.is_type_alias(unit))
 }
 
-pub(in crate::analyzer::usages) fn field_declared_type_binding(
-    analyzer: &dyn IAnalyzer,
+pub fn field_declared_type_binding(
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     visible_from: &ProjectFile,
     field: &CodeUnit,
@@ -6252,7 +6349,7 @@ pub(in crate::analyzer::usages) fn field_declared_type_binding(
 }
 
 fn decode_field_declared_type_fact(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     field: &CodeUnit,
 ) -> Option<DeclaredFieldTypeFact> {
     let declaration = analyzer.get_source(field, false)?;
@@ -6283,7 +6380,7 @@ fn decode_field_declared_type_fact(
 }
 
 fn decode_structured_alias_target(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     unit: &CodeUnit,
 ) -> Option<StructuredAliasTarget> {
     let declaration = analyzer.get_source(unit, false)?;
@@ -6490,11 +6587,7 @@ fn is_identifier_char(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphanumeric()
 }
 
-pub(super) fn declaration_mentions_type(
-    node: Node<'_>,
-    ctx: &ScanCtx<'_>,
-    owner: &CodeUnit,
-) -> bool {
+pub fn declaration_mentions_type(node: Node<'_>, ctx: &ScanCtx<'_>, owner: &CodeUnit) -> bool {
     let Some(type_node) = node.child_by_field_name("type") else {
         return false;
     };
@@ -6506,10 +6599,7 @@ pub(super) fn declaration_mentions_type(
     )
 }
 
-pub(super) fn declaration_is_object_construction_candidate(
-    node: Node<'_>,
-    ctx: &ScanCtx<'_>,
-) -> bool {
+pub fn declaration_is_object_construction_candidate(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     !ctx.analyzer
         .declarations(ctx.file)
         .into_iter()
@@ -6521,7 +6611,7 @@ pub(super) fn declaration_is_object_construction_candidate(
         })
 }
 
-pub(super) fn declaration_constructor_arity(node: Node<'_>, _ctx: &ScanCtx<'_>) -> usize {
+pub fn declaration_constructor_arity(node: Node<'_>, _ctx: &ScanCtx<'_>) -> usize {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "init_declarator" {
@@ -6807,10 +6897,7 @@ fn parse_preproc_identifier(argument: &str) -> Option<String> {
         .then(|| node_text(identifier, &sentinel).to_string())
 }
 
-pub(in crate::analyzer::usages) fn extract_variable_name(
-    node: Node<'_>,
-    source: &str,
-) -> Option<String> {
+pub fn extract_variable_name(node: Node<'_>, source: &str) -> Option<String> {
     match node.kind() {
         "identifier" | "field_identifier" => {
             let name = node_text(node, source).trim();
@@ -6833,7 +6920,7 @@ pub(in crate::analyzer::usages) fn extract_variable_name(
     }
 }
 
-pub(in crate::analyzer::usages) fn is_declarator_node(node: Node<'_>) -> bool {
+pub fn is_declarator_node(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
         "identifier"
@@ -6847,7 +6934,7 @@ pub(in crate::analyzer::usages) fn is_declarator_node(node: Node<'_>) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RecoveredDeclaratorTypeContext {
+pub enum RecoveredDeclaratorTypeContext {
     Declaration,
     FunctionDefinition,
 }
@@ -6863,7 +6950,7 @@ pub(super) enum RecoveredDeclaratorTypeContext {
 /// declaration's declarator chain, a separate nonempty type must occupy the
 /// normal type field, and the recovered name must unwrap to a real declarator
 /// name.
-pub(super) fn recovered_macro_decorated_declarator_type(
+pub fn recovered_macro_decorated_declarator_type(
     node: Node<'_>,
 ) -> Option<RecoveredDeclaratorTypeContext> {
     recovered_macro_decorated_type_node(node).map(|(_, context)| context)
@@ -6873,7 +6960,7 @@ pub(super) fn recovered_macro_decorated_declarator_type(
 /// qualified declarator, together with the enclosing declaration context.
 /// Callers use the macro scope only as structural admission evidence; the
 /// returned node is the real type reference to resolve and record.
-pub(super) fn recovered_macro_decorated_type_node(
+pub fn recovered_macro_decorated_type_node(
     node: Node<'_>,
 ) -> Option<(Node<'_>, RecoveredDeclaratorTypeContext)> {
     if node.kind() != "namespace_identifier" || node.is_missing() {
@@ -6971,7 +7058,7 @@ fn concrete_recovered_declarator_name(mut node: Node<'_>) -> bool {
 }
 
 /// Aggregate-owner proof for a structurally recognized designated initializer.
-pub(in crate::analyzer::usages) enum DesignatedInitializerOwner {
+pub enum DesignatedInitializerOwner {
     Resolved(CodeUnit),
     Unresolved,
 }
@@ -6986,7 +7073,7 @@ pub(in crate::analyzer::usages) enum DesignatedInitializerOwner {
 /// would require following the enclosing field's declared type. `None` means the
 /// node is not a designator at all; an unresolved designator remains classified so
 /// callers cannot fall through to unrelated global/member heuristics.
-pub(in crate::analyzer::usages) fn designated_initializer_owner(
+pub fn designated_initializer_owner(
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -7016,7 +7103,7 @@ pub(in crate::analyzer::usages) fn designated_initializer_owner(
 
     let init_declarator = node.parent()?;
     if init_declarator.child_by_field_name("declarator") != Some(node)
-        || !brokk_bifrost_cpp::structural::is_recovered_designator_init_declarator(init_declarator)
+        || !crate::structural::is_recovered_designator_init_declarator(init_declarator)
     {
         return None;
     }
@@ -7120,7 +7207,7 @@ fn contains_array_declarator(declarator: Node<'_>) -> bool {
     false
 }
 
-pub(in crate::analyzer::usages) fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {
+pub fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).find(|child| {
         matches!(
@@ -7136,7 +7223,7 @@ pub(in crate::analyzer::usages) fn first_type_child(node: Node<'_>) -> Option<No
     })
 }
 
-pub(in crate::analyzer::usages) fn constructor_style_local_declaration<T: Clone + Eq + Hash>(
+pub fn constructor_style_local_declaration<T: Clone + Eq + Hash>(
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -7191,7 +7278,7 @@ fn parameter_declaration_is_local_expression<T: Clone + Eq + Hash>(
         && bindings.is_shadowed(text)
 }
 
-pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
+pub fn is_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -7254,9 +7341,7 @@ pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
 /// `function_definition`. Merely finding any callable ancestor would then leak
 /// parameters from member prototypes into later member bodies. Require the
 /// parameter to be inside that definition's own declarator instead.
-pub(in crate::analyzer::usages) fn parameter_belongs_to_callable_scope(
-    parameter: Node<'_>,
-) -> bool {
+pub fn parameter_belongs_to_callable_scope(parameter: Node<'_>) -> bool {
     let mut current = parameter.parent();
     while let Some(ancestor) = current {
         if ancestor.kind() == "lambda_expression" {
@@ -7306,7 +7391,7 @@ fn cpp_tag_specifier_declares_name(specifier: Node<'_>) -> bool {
     false
 }
 
-pub(super) fn declarator_name_node(node: Node<'_>) -> Option<Node<'_>> {
+pub fn declarator_name_node(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "identifier"
         | "field_identifier"
@@ -7365,7 +7450,7 @@ fn declarator_name_leaf(node: Node<'_>, allow_type_identifier: bool) -> Option<N
 
 /// True when `node` is a component of a larger structured type node whose outer
 /// range is the single reference surfaced to callers.
-pub(super) fn is_nested_type_node(node: Node<'_>) -> bool {
+pub fn is_nested_type_node(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         matches!(
             parent.kind(),
@@ -7374,24 +7459,24 @@ pub(super) fn is_nested_type_node(node: Node<'_>) -> bool {
     })
 }
 
-pub(super) struct OutOfLineMemberDefinitionOwners<'tree> {
-    pub(super) owners: Vec<(Node<'tree>, CodeUnit)>,
+pub struct OutOfLineMemberDefinitionOwners<'tree> {
+    pub owners: Vec<(Node<'tree>, CodeUnit)>,
     innermost: Option<(Node<'tree>, CodeUnit)>,
 }
 
 impl OutOfLineMemberDefinitionOwners<'_> {
-    pub(super) fn innermost(&self) -> Option<(Node<'_>, &CodeUnit)> {
+    pub fn innermost(&self) -> Option<(Node<'_>, &CodeUnit)> {
         self.innermost.as_ref().map(|(node, owner)| (*node, owner))
     }
 }
 
-pub(super) struct QualifiedOwnerComponents<'tree> {
-    pub(super) nodes: Vec<Node<'tree>>,
-    pub(super) names: Vec<String>,
-    pub(super) global: bool,
+pub struct QualifiedOwnerComponents<'tree> {
+    pub nodes: Vec<Node<'tree>>,
+    pub names: Vec<String>,
+    pub global: bool,
 }
 
-pub(super) fn qualified_owner_components<'tree>(
+pub fn qualified_owner_components<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<QualifiedOwnerComponents<'tree>> {
@@ -7414,7 +7499,7 @@ pub(super) fn qualified_owner_components<'tree>(
 /// Return the terminal type-name occurrence in an out-of-line destructor
 /// declarator such as `endpoint::~endpoint`.  Unlike an ordinary terminal
 /// method name, this identifier is a second reference to the owner type.
-pub(super) fn out_of_line_destructor_type_reference(node: Node<'_>) -> Option<Node<'_>> {
+pub fn out_of_line_destructor_type_reference(node: Node<'_>) -> Option<Node<'_>> {
     if node.kind() != "qualified_identifier" {
         return None;
     }
@@ -7427,8 +7512,8 @@ pub(super) fn out_of_line_destructor_type_reference(node: Node<'_>) -> Option<No
         .find(|child| matches!(child.kind(), "identifier" | "type_identifier"))
 }
 
-pub(super) fn out_of_line_member_definition_owner<'tree>(
-    analyzer: &dyn IAnalyzer,
+pub fn out_of_line_member_definition_owner<'tree>(
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
@@ -7492,8 +7577,8 @@ pub(super) fn out_of_line_member_definition_owner<'tree>(
                     end_line: node.end_position().row,
                 };
                 let start = analyzer.enclosing_code_unit(file, &range)?;
-                let mut components = crate::analyzer::symbol_lookup::parse_symbol_path(
-                    crate::analyzer::Language::Cpp,
+                let mut components = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+                    brokk_bifrost_core::analyzer::Language::Cpp,
                     &cpp_name_for(&start),
                 );
                 components.pop();
@@ -7561,7 +7646,7 @@ fn is_function_declarator_name_root(node: Node<'_>) -> bool {
     false
 }
 
-pub(super) fn append_cpp_name_components(
+pub fn append_cpp_name_components(
     node: Node<'_>,
     source: &str,
     out: &mut Vec<String>,
@@ -7574,16 +7659,13 @@ pub(super) fn append_cpp_name_components(
     Some(())
 }
 
-pub(in crate::analyzer::usages) fn cpp_type_name_components(
-    node: Node<'_>,
-    source: &str,
-) -> Option<Vec<String>> {
+pub fn cpp_type_name_components(node: Node<'_>, source: &str) -> Option<Vec<String>> {
     let mut components = Vec::new();
     append_cpp_name_components(node, source, &mut components)?;
     Some(components)
 }
 
-pub(in crate::analyzer::usages) fn cpp_template_reference_arguments(
+pub fn cpp_template_reference_arguments(
     mut node: Node<'_>,
     source: &str,
 ) -> Option<Vec<CppTemplateExpression>> {
@@ -7674,7 +7756,7 @@ fn cpp_reconcile_primary_template_parameters(
     Some(merged)
 }
 
-fn cpp_bind_template_arguments(
+pub fn cpp_bind_template_arguments(
     parameters: &[CppTemplateParameterMetadata],
     explicit_arguments: &[CppTemplateExpression],
 ) -> Option<(Vec<CppTemplateExpression>, HashMap<String, CppTemplateTerm>)> {
@@ -7794,7 +7876,7 @@ fn cpp_specialization_pattern_accepts(
         })
 }
 
-fn cpp_substitute_template_term(
+pub fn cpp_substitute_template_term(
     term: &CppTemplateTerm,
     bindings: &HashMap<String, CppTemplateTerm>,
 ) -> Option<CppTemplateTerm> {
@@ -7832,7 +7914,7 @@ fn cpp_substitute_template_term(
     substituted.pop()
 }
 
-fn cpp_substitute_template_arguments(
+pub fn cpp_substitute_template_arguments(
     arguments: &[CppTemplateExpression],
     bindings: &HashMap<String, CppTemplateTerm>,
 ) -> Option<Vec<CppTemplateExpression>> {
@@ -7960,7 +8042,7 @@ fn cpp_clone_template_expression_iterative(
     }
 }
 
-fn cpp_unify_template_term(
+pub fn cpp_unify_template_term(
     pattern: &CppTemplateTerm,
     argument: &CppTemplateTerm,
     parameters: &HashSet<&str>,
@@ -8052,7 +8134,7 @@ fn cpp_template_terms_equal(left: &CppTemplateTerm, right: &CppTemplateTerm) -> 
     true
 }
 
-pub(super) fn cpp_name_component_nodes(node: Node<'_>) -> Option<Vec<Node<'_>>> {
+pub fn cpp_name_component_nodes(node: Node<'_>) -> Option<Vec<Node<'_>>> {
     let mut components = Vec::new();
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
@@ -8083,7 +8165,7 @@ pub(super) fn cpp_name_component_nodes(node: Node<'_>) -> Option<Vec<Node<'_>>> 
     Some(components)
 }
 
-pub(in crate::analyzer::usages) fn is_globally_qualified_cpp_name(node: Node<'_>) -> bool {
+pub fn is_globally_qualified_cpp_name(node: Node<'_>) -> bool {
     node.child_by_field_name("scope").is_none()
         && node.child(0).is_some_and(|child| child.kind() == "::")
 }
@@ -8126,7 +8208,7 @@ fn indexed_namespace_path_is_recoverable(
         .all(|component| indexed.any(|candidate| candidate == component))
 }
 
-pub(super) fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
+pub fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
     let mut current = node.parent();
     while let Some(parent) = current {
         if parent.kind() == kind {
@@ -8142,7 +8224,7 @@ pub(super) fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
 /// Qualified, scoped, template, and field wrappers are traversed through their
 /// grammar fields so both function calls and type constructions emit the token
 /// that names the referenced declaration.
-pub(super) fn function_terminal_node(mut node: Node<'_>) -> Node<'_> {
+pub fn function_terminal_node(mut node: Node<'_>) -> Node<'_> {
     loop {
         let next = match node.kind() {
             "qualified_identifier"
@@ -8161,7 +8243,7 @@ pub(super) fn function_terminal_node(mut node: Node<'_>) -> Node<'_> {
 
 /// Whether `node` is part of a call's callee expression, walking only through
 /// the grammar wrappers that can structurally contain that callee.
-pub(super) fn is_call_callee_node(mut node: Node<'_>) -> bool {
+pub fn is_call_callee_node(mut node: Node<'_>) -> bool {
     while let Some(parent) = node.parent() {
         match parent.kind() {
             "call_expression" => {
@@ -8181,7 +8263,7 @@ pub(super) fn is_call_callee_node(mut node: Node<'_>) -> bool {
     false
 }
 
-pub(super) fn type_reference_hit_node<'tree, T: Clone + Eq + Hash>(
+pub fn type_reference_hit_node<'tree, T: Clone + Eq + Hash>(
     node: Node<'tree>,
     file: &ProjectFile,
     source: &str,
@@ -8246,7 +8328,7 @@ pub(super) fn type_reference_hit_node<'tree, T: Clone + Eq + Hash>(
     }
 }
 
-pub(in crate::analyzer::usages) fn normalize_type_text(value: &str) -> String {
+pub fn normalize_type_text(value: &str) -> String {
     strip_tag_type_prefix(
         normalize_cpp_whitespace(value)
             .trim_start_matches("const ")
@@ -8267,12 +8349,12 @@ fn strip_tag_type_prefix(value: &str) -> &str {
         .trim()
 }
 
-pub(super) fn normalize_reference_name(value: &str) -> Option<String> {
+pub fn normalize_reference_name(value: &str) -> Option<String> {
     let normalized = normalize_cpp_reference_text(value);
     (!normalized.is_empty()).then_some(normalized)
 }
 
-pub(super) fn normalize_cpp_reference_text(value: &str) -> String {
+pub fn normalize_cpp_reference_text(value: &str) -> String {
     let mut text = normalize_cpp_whitespace(value)
         .trim_start_matches("new ")
         .trim()
@@ -8292,7 +8374,7 @@ pub(super) fn normalize_cpp_reference_text(value: &str) -> String {
     strip_tag_type_prefix(normalized).to_string()
 }
 
-pub(in crate::analyzer::usages) fn cpp_name_for(unit: &CodeUnit) -> String {
+pub fn cpp_name_for(unit: &CodeUnit) -> String {
     let short = unit.short_name().replace(['.', '$'], "::");
     if unit.package_name().is_empty() {
         short
@@ -8309,7 +8391,7 @@ fn canonical_cpp_name_from_fq(unit: &CodeUnit) -> Option<String> {
     if fq.is_empty() {
         return None;
     }
-    let interner = crate::analyzer::fq_name::segment_interner();
+    let interner = brokk_bifrost_core::analyzer::fq_name::segment_interner();
     Some(
         fq.segments()
             .iter()
@@ -8332,10 +8414,10 @@ fn canonical_cpp_name_matches(unit: &CodeUnit, expected: &str) -> bool {
 /// through `parse_symbol_path` would mistake those dots for component
 /// separators.  Cache-loaded/legacy units may still have an empty structured
 /// name, so retain the parser only as that explicit fallback.
-pub(in crate::analyzer::usages) fn canonical_cpp_scope_components(unit: &CodeUnit) -> Vec<String> {
+pub fn canonical_cpp_scope_components(unit: &CodeUnit) -> Vec<String> {
     let fq = unit.fq();
     if !fq.is_empty() {
-        let interner = crate::analyzer::fq_name::segment_interner();
+        let interner = brokk_bifrost_core::analyzer::fq_name::segment_interner();
         let scope = fq
             .segments()
             .iter()
@@ -8343,17 +8425,17 @@ pub(in crate::analyzer::usages) fn canonical_cpp_scope_components(unit: &CodeUni
                 let (text, kind) = interner.resolve(segment);
                 matches!(
                     kind,
-                    crate::analyzer::fq_name::SegmentKind::Package
-                        | crate::analyzer::fq_name::SegmentKind::Type
-                        | crate::analyzer::fq_name::SegmentKind::Nested
+                    brokk_bifrost_core::analyzer::fq_name::SegmentKind::Package
+                        | brokk_bifrost_core::analyzer::fq_name::SegmentKind::Type
+                        | brokk_bifrost_core::analyzer::fq_name::SegmentKind::Nested
                 )
                 .then(|| text.to_string())
             })
             .collect();
         return scope;
     }
-    crate::analyzer::symbol_lookup::parse_symbol_path(
-        crate::analyzer::Language::Cpp,
+    brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+        brokk_bifrost_core::analyzer::Language::Cpp,
         &cpp_name_for(unit),
     )
 }
@@ -8368,7 +8450,7 @@ pub(in crate::analyzer::usages) fn canonical_cpp_scope_components(unit: &CodeUni
 // (`operator-> must not be reduced with terminal_name-style punctuation
 // splitting`) asserts today's char-class behavior. Not equivalence-provable;
 // revisit alongside that pinned test if it is ever relaxed.
-pub(super) fn terminal_name(value: &str) -> &str {
+pub fn terminal_name(value: &str) -> &str {
     value
         .rsplit("::")
         .next()
@@ -8379,23 +8461,23 @@ pub(super) fn terminal_name(value: &str) -> &str {
         .trim()
 }
 
-pub(super) fn name_matches_terminal(value: &str, expected: &str) -> bool {
+pub fn name_matches_terminal(value: &str, expected: &str) -> bool {
     terminal_name(&normalize_cpp_reference_text(value)) == expected
 }
 
-pub(super) fn name_matches_callable(value: &str, expected: &str) -> bool {
+pub fn name_matches_callable(value: &str, expected: &str) -> bool {
     name_matches_terminal(value, expected)
         || expected.starts_with("operator")
             && terminal_name(&normalize_cpp_reference_text(value)) == "operator"
 }
 
-pub(super) fn name_mentions(value: &str, expected: &str) -> bool {
+pub fn name_mentions(value: &str, expected: &str) -> bool {
     normalize_cpp_reference_text(value)
         .split("::")
         .any(|part| part == expected)
 }
 
-pub(super) fn reference_matches_unit(reference: &str, unit: &CodeUnit) -> bool {
+pub fn reference_matches_unit(reference: &str, unit: &CodeUnit) -> bool {
     let cpp_name = cpp_name_for(unit);
     if reference.contains("::") {
         return reference == cpp_name;
@@ -8405,7 +8487,7 @@ pub(super) fn reference_matches_unit(reference: &str, unit: &CodeUnit) -> bool {
             && (unit.package_name().is_empty() || reference == unit.identifier())
 }
 
-pub(super) fn matches_kind_for_lookup(unit: &CodeUnit, kind: TargetKind) -> bool {
+pub fn matches_kind_for_lookup(unit: &CodeUnit, kind: TargetKind) -> bool {
     match kind {
         TargetKind::Type
         | TargetKind::Constructor
@@ -8416,7 +8498,7 @@ pub(super) fn matches_kind_for_lookup(unit: &CodeUnit, kind: TargetKind) -> bool
     }
 }
 
-pub(super) fn is_type_alias(unit: &CodeUnit) -> bool {
+pub fn is_type_alias(unit: &CodeUnit) -> bool {
     unit.kind() == CodeUnitType::Field
         && unit.signature().is_some_and(|signature| {
             signature.starts_with("typedef ") || signature.starts_with("using ")
@@ -8457,8 +8539,8 @@ fn parser_alias_target_names(alias: &CppAlias) -> Vec<String> {
 
 /// The declared return type text of a C++ function unit, with leading declaration specifiers
 /// stripped, e.g. `T*` for `T* operator->()`.
-pub(in crate::analyzer::usages) fn cpp_function_return_type_text(
-    analyzer: &dyn IAnalyzer,
+pub fn cpp_function_return_type_text(
+    analyzer: CppGraphSource<'_>,
     function: &CodeUnit,
 ) -> Option<String> {
     let metadata = analyzer.signature_metadata(function);
@@ -8473,7 +8555,10 @@ pub(in crate::analyzer::usages) fn cpp_function_return_type_text(
     cpp_function_return_type_text_from_signature(&signature)
 }
 
-fn cpp_function_signature_text(analyzer: &dyn IAnalyzer, function: &CodeUnit) -> Option<String> {
+fn cpp_function_signature_text(
+    analyzer: CppGraphSource<'_>,
+    function: &CodeUnit,
+) -> Option<String> {
     function
         .signature()
         .filter(|signature| signature.contains(function.identifier()))
@@ -8572,7 +8657,7 @@ fn cpp_strip_leading_template_clause(text: &str) -> &str {
     text
 }
 
-pub(super) fn cpp_namespace_for(unit: &CodeUnit) -> Option<String> {
+pub fn cpp_namespace_for(unit: &CodeUnit) -> Option<String> {
     // fqname-M4: `cpp_name_for` is a bespoke all-`::` rendering of the unit's
     // name (it replaces every `.`/`$` in `short_name` with `::`), which is NOT
     // the same string `default_parent_fq_name`/`fq().parent()` would render:
@@ -8596,8 +8681,8 @@ fn namespace_prefixes(namespace: &str) -> Vec<String> {
     // the shared structured splitter and progressively popping the last
     // component reproduces the `rsplit_once("::")` outward walk exactly (same
     // shape as `cpp_qualifier_lookup_tiers`'s namespace-chain walk).
-    let mut parts = crate::analyzer::symbol_lookup::parse_symbol_path(
-        crate::analyzer::Language::Cpp,
+    let mut parts = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+        brokk_bifrost_core::analyzer::Language::Cpp,
         namespace,
     );
     let mut prefixes = Vec::new();
@@ -8634,10 +8719,7 @@ fn nearest_namespace_candidates(
         .collect()
 }
 
-pub(in crate::analyzer::usages) fn enclosing_namespace_context(
-    node: Node<'_>,
-    source: &str,
-) -> Option<String> {
+pub fn enclosing_namespace_context(node: Node<'_>, source: &str) -> Option<String> {
     let mut namespaces = Vec::new();
     let mut current = node.parent();
     while let Some(parent) = current {
@@ -8662,12 +8744,12 @@ pub(in crate::analyzer::usages) fn enclosing_namespace_context(
 /// Like [`precise_parent_of`], but drops module (namespace) parents. A namespace is a scope, not a
 /// type or receiver, so namespace-scoped functions and constants resolve as free functions and
 /// globals rather than members.
-pub(super) fn type_owner_of(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<CodeUnit> {
+pub fn type_owner_of(analyzer: CppGraphSource<'_>, code_unit: &CodeUnit) -> Option<CodeUnit> {
     type_owner_resolution(analyzer, code_unit).map(|owner| owner.unit)
 }
 
 fn type_owner_resolution(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     code_unit: &CodeUnit,
 ) -> Option<ResolvedTypeOwner> {
     precise_parent_resolution(analyzer, code_unit).filter(|owner| !owner.unit.is_module())
@@ -8679,15 +8761,15 @@ fn type_owner_resolution(
 /// resolution must continue to prefer the callable definition rather than
 /// replacing it with the forward owner.
 fn target_forward_owner_resolution(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     code_unit: &CodeUnit,
 ) -> Option<ResolvedTypeOwner> {
     if !code_unit.is_function() {
         return None;
     }
-    let interner = crate::analyzer::fq_name::segment_interner();
+    let interner = brokk_bifrost_core::analyzer::fq_name::segment_interner();
     let owner_fqn = code_unit.fq().parent()?.display(interner);
-    let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
+    let cpp = analyzer.cpp?;
     let mut visible_files = HashSet::default();
     collect_include_closure(
         analyzer,
@@ -8718,8 +8800,8 @@ fn target_forward_owner_resolution(
     })
 }
 
-pub(super) fn precise_parent_of(
-    analyzer: &dyn IAnalyzer,
+pub fn precise_parent_of(
+    analyzer: CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     code_unit: &CodeUnit,
 ) -> Option<CodeUnit> {
@@ -8727,11 +8809,11 @@ pub(super) fn precise_parent_of(
 }
 
 fn precise_parent_resolution(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     code_unit: &CodeUnit,
 ) -> Option<ResolvedTypeOwner> {
     #[cfg(any(test, feature = "test-support"))]
-    if let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) {
+    if let Some(cpp) = analyzer.cpp {
         cpp.record_cpp_parent_resolution_for_test();
     }
     if let Some(unit) = exact_structural_type_parent(analyzer, code_unit) {
@@ -8818,14 +8900,14 @@ fn precise_parent_resolution(
 }
 
 fn exact_structural_type_parent(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     code_unit: &CodeUnit,
 ) -> Option<CodeUnit> {
     if !code_unit.is_function() && !code_unit.is_field() {
         return None;
     }
     let encoded_owner = code_unit.short_name().rsplit_once('.')?.0; // fqname-M4: package-less short_name owner used as an encoded key; fq.parent() would render the `::`-headed package-qualified owner
-    let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
+    let cpp = analyzer.cpp?;
     let parent = cpp.structural_parent_of(code_unit)?;
     (!parent.is_module()
         && parent.source() == code_unit.source()
@@ -8835,7 +8917,7 @@ fn exact_structural_type_parent(
 }
 
 fn same_source_owner(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     code_unit: &CodeUnit,
     owner_fqn: &str,
     owner_name: &str,
@@ -8855,12 +8937,12 @@ fn same_source_owner(
 }
 
 fn visible_full_cpp_owner(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     code_unit: &CodeUnit,
     owner_fqn: &str,
     owner_name: &str,
 ) -> FullOwnerResolution {
-    let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
+    let Some(cpp) = analyzer.cpp else {
         return FullOwnerResolution::None;
     };
     let mut visible_files = HashSet::default();
@@ -8896,7 +8978,7 @@ fn visible_full_cpp_owner(
     full_definition.map_or(FullOwnerResolution::None, FullOwnerResolution::Unique)
 }
 
-enum DirectOwnerResolution {
+pub enum DirectOwnerResolution {
     None,
     ForwardsOnly(Vec<CodeUnit>),
     UniqueFull(CodeUnit),
@@ -8910,19 +8992,19 @@ enum FullOwnerResolution {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum CppClassDeclarationStrength {
+pub enum CppClassDeclarationStrength {
     Full,
     Forward,
     Unknown,
 }
 
 fn directly_included_owner(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     code_unit: &CodeUnit,
     owner_fqn: &str,
     owner_name: &str,
 ) -> DirectOwnerResolution {
-    let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
+    let Some(cpp) = analyzer.cpp else {
         return DirectOwnerResolution::None;
     };
     let imports = analyzer.import_statements(code_unit.source());
@@ -8951,7 +9033,7 @@ fn directly_included_owner(
 }
 
 fn prefer_member_declaring_owners<'a>(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     member: &CodeUnit,
     candidates: Vec<&'a CodeUnit>,
 ) -> Vec<&'a CodeUnit> {
@@ -8967,7 +9049,11 @@ fn prefer_member_declaring_owners<'a>(
     }
 }
 
-fn owner_declares_member(analyzer: &dyn IAnalyzer, owner: &CodeUnit, member: &CodeUnit) -> bool {
+fn owner_declares_member(
+    analyzer: CppGraphSource<'_>,
+    owner: &CodeUnit,
+    member: &CodeUnit,
+) -> bool {
     analyzer.direct_children(owner).into_iter().any(|child| {
         child.kind() == member.kind()
             && child.identifier() == member.identifier()
@@ -8976,7 +9062,7 @@ fn owner_declares_member(analyzer: &dyn IAnalyzer, owner: &CodeUnit, member: &Co
 }
 
 fn classify_direct_owner_candidates<'a>(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     candidates: impl Iterator<Item = &'a CodeUnit>,
 ) -> DirectOwnerResolution {
     collapse_owner_candidates(candidates.map(|candidate| {
@@ -8987,7 +9073,7 @@ fn classify_direct_owner_candidates<'a>(
     }))
 }
 
-fn collapse_owner_candidates(
+pub fn collapse_owner_candidates(
     candidates: impl Iterator<Item = (CodeUnit, CppClassDeclarationStrength)>,
 ) -> DirectOwnerResolution {
     let mut full_definition = None;
@@ -9011,11 +9097,12 @@ fn collapse_owner_candidates(
     }
 }
 
-pub(super) fn cpp_class_declaration_strength(
-    analyzer: &dyn IAnalyzer,
+pub fn cpp_class_declaration_strength(
+    analyzer: CppGraphSource<'_>,
     candidate: &CodeUnit,
 ) -> CppClassDeclarationStrength {
-    if let Some(prepared) = resolve_analyzer::<CppAnalyzer>(analyzer)
+    if let Some(prepared) = analyzer
+        .cpp
         .and_then(|cpp| cpp.prepared_syntax(candidate.source()))
     {
         return cpp_class_declaration_strength_in_tree(
@@ -9029,7 +9116,7 @@ pub(super) fn cpp_class_declaration_strength(
         return CppClassDeclarationStrength::Unknown;
     };
     #[cfg(any(test, feature = "test-support"))]
-    if let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) {
+    if let Some(cpp) = analyzer.cpp {
         cpp.record_cpp_class_strength_parse_for_test();
     }
     let mut parser = Parser::new();
@@ -9046,7 +9133,7 @@ pub(super) fn cpp_class_declaration_strength(
 }
 
 fn cpp_class_declaration_strength_in_tree(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     candidate: &CodeUnit,
     source: &str,
     root: Node<'_>,
@@ -9100,10 +9187,7 @@ fn cpp_class_node_has_body(node: Node<'_>) -> bool {
     }
 }
 
-pub(super) fn visible_owner_from_member_name(
-    ctx: &ScanCtx<'_>,
-    code_unit: &CodeUnit,
-) -> Option<CodeUnit> {
+pub fn visible_owner_from_member_name(ctx: &ScanCtx<'_>, code_unit: &CodeUnit) -> Option<CodeUnit> {
     // fqname-M4: `owner_name` is used both bare and manually recombined with
     // `package_name()` below (same package-less short_name owner shape as
     // `precise_parent_resolution` above); `default_parent_fq_name` would
@@ -9130,19 +9214,19 @@ pub(super) fn visible_owner_from_member_name(
         .cloned()
 }
 
-pub(super) fn same_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
+pub fn same_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
     left.kind() == right.kind()
         && left.fq_name() == right.fq_name()
         && left.signature() == right.signature()
         && left.source() == right.source()
 }
 
-pub(super) fn same_visible_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
+pub fn same_visible_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
     same_symbol(left, right) || same_logical_symbol(left, right)
 }
 
-pub(super) fn same_visible_global_field_symbol(
-    analyzer: &dyn IAnalyzer,
+pub fn same_visible_global_field_symbol(
+    analyzer: CppGraphSource<'_>,
     internal_linkage_cache: &mut HashMap<CodeUnit, bool>,
     left: &CodeUnit,
     right: &CodeUnit,
@@ -9163,34 +9247,34 @@ pub(super) fn same_visible_global_field_symbol(
 }
 
 fn cpp_global_field_has_internal_linkage_cached(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     cache: &mut HashMap<CodeUnit, bool>,
     candidate: &CodeUnit,
 ) -> bool {
     if let Some(internal) = cache.get(candidate) {
         return *internal;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     note_cpp_global_field_internal_linkage_classification_for_test();
     let internal = cpp_global_field_has_internal_linkage(analyzer, candidate);
     cache.insert(candidate.clone(), internal);
     internal
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static CPP_GLOBAL_FIELD_INTERNAL_LINKAGE_CLASSIFICATIONS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn note_cpp_global_field_internal_linkage_classification_for_test() {
     CPP_GLOBAL_FIELD_INTERNAL_LINKAGE_CLASSIFICATIONS_FOR_TEST.with(|count| {
         count.set(count.get() + 1);
     });
 }
 
-#[cfg(test)]
-fn with_cpp_global_field_internal_linkage_classification_counter_for_test<T>(
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_cpp_global_field_internal_linkage_classification_counter_for_test<T>(
     body: impl FnOnce() -> T,
 ) -> (T, usize) {
     CPP_GLOBAL_FIELD_INTERNAL_LINKAGE_CLASSIFICATIONS_FOR_TEST.with(|count| {
@@ -9202,13 +9286,16 @@ fn with_cpp_global_field_internal_linkage_classification_counter_for_test<T>(
     })
 }
 
-pub(super) fn same_logical_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
+pub fn same_logical_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
     left.kind() == right.kind()
         && left.fq_name() == right.fq_name()
         && left.signature() == right.signature()
 }
 
-fn cpp_global_field_has_internal_linkage(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+pub fn cpp_global_field_has_internal_linkage(
+    analyzer: CppGraphSource<'_>,
+    candidate: &CodeUnit,
+) -> bool {
     if !candidate.is_field() || candidate.short_name().contains('.') {
         return false;
     }
@@ -9227,42 +9314,42 @@ fn cpp_global_field_has_internal_linkage(analyzer: &dyn IAnalyzer, candidate: &C
 }
 
 fn cpp_global_field_linkage_peers<'a>(
-    analyzer: &'a dyn IAnalyzer,
+    analyzer: CppGraphSource<'a>,
     candidate: &'a CodeUnit,
 ) -> impl Iterator<Item = &'a CodeUnit> + 'a {
-    // `into_shards` rather than a query on the handle: the peers are returned
-    // to the caller, so they must borrow the analyzer for `'a` rather than a
-    // handle that dies with this call.
+    // `peers` rather than `fqn` on the same index: the peers are returned to
+    // the caller, so they must borrow the analyzer for `'a` rather than a
+    // handle that dies with this call. Its implementation reads the shards
+    // directly for exactly that reason.
     let fq_name = candidate.fq_name();
     analyzer
         .global_usage_definition_index()
-        .into_shards()
+        .peers(&fq_name)
         .into_iter()
-        .flat_map(move |shard| shard.by_fqn(&fq_name).iter())
         .filter(move |peer| {
             if *peer == candidate {
                 return false;
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             note_cpp_global_field_linkage_peer_inspection_for_test();
             same_logical_symbol(peer, candidate)
         })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static CPP_GLOBAL_FIELD_LINKAGE_PEER_INSPECTIONS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn note_cpp_global_field_linkage_peer_inspection_for_test() {
     CPP_GLOBAL_FIELD_LINKAGE_PEER_INSPECTIONS_FOR_TEST.with(|count| {
         count.set(count.get() + 1);
     });
 }
 
-#[cfg(test)]
-fn with_cpp_global_field_linkage_peer_inspection_counter_for_test<T>(
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_cpp_global_field_linkage_peer_inspection_counter_for_test<T>(
     body: impl FnOnce() -> T,
 ) -> (T, usize) {
     CPP_GLOBAL_FIELD_LINKAGE_PEER_INSPECTIONS_FOR_TEST.with(|count| {
@@ -9275,10 +9362,10 @@ fn with_cpp_global_field_linkage_peer_inspection_counter_for_test<T>(
 }
 
 fn cpp_global_field_declaration_linkage(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     candidate: &CodeUnit,
 ) -> Option<CppFieldLinkage> {
-    let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
+    let cpp = analyzer.cpp?;
     if let Some(prepared) = cpp.prepared_syntax(candidate.source()) {
         return cpp_global_field_declaration_linkage_in_tree(
             analyzer,
@@ -9300,7 +9387,7 @@ fn cpp_global_field_declaration_linkage(
 }
 
 fn cpp_global_field_declaration_linkage_in_tree(
-    analyzer: &dyn IAnalyzer,
+    analyzer: CppGraphSource<'_>,
     candidate: &CodeUnit,
     source: &str,
     root: Node<'_>,
@@ -9394,1720 +9481,5 @@ fn cpp_field_declaration_linkage(source: &str, declaration: Node<'_>) -> CppFiel
         CppFieldLinkage::InternalUnlessExternalPeer
     } else {
         CppFieldLinkage::External
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
-    use crate::analyzer::usages::cpp_graph::shared::CppAuthoritativeUsageBatch;
-    use crate::analyzer::usages::model::FuzzyResult;
-    use brokk_bifrost_core::analyzer::model::CppTemplateParameterKind;
-    use std::fs;
-
-    fn structured_cpp_unit(
-        source: ProjectFile,
-        kind: CodeUnitType,
-        segments: &[(&str, SegmentKind)],
-        signature: Option<&str>,
-    ) -> CodeUnit {
-        let interner = segment_interner();
-        let mut fq = FqName::new();
-        for &(text, segment_kind) in segments {
-            fq.push(interner.intern(text, segment_kind));
-        }
-        CodeUnit::from_fq(source, kind, fq, 1, signature.map(str::to_string), false)
-    }
-
-    fn template_atom(text: &str) -> CppTemplateExpression {
-        CppTemplateExpression {
-            text: text.to_string(),
-            term: CppTemplateTerm::Atom {
-                kind: "type_identifier".to_string(),
-                text: text.to_string(),
-            },
-        }
-    }
-
-    fn template_parameter(
-        name: &str,
-        variadic: bool,
-        default: Option<&str>,
-    ) -> CppTemplateParameterMetadata {
-        CppTemplateParameterMetadata {
-            name: name.to_string(),
-            kind: CppTemplateParameterKind::Type,
-            variadic,
-            default: default.map(template_atom),
-        }
-    }
-
-    fn template_pack_expansion(name: &str) -> CppTemplateExpression {
-        CppTemplateExpression {
-            text: format!("{name}..."),
-            term: CppTemplateTerm::Node {
-                kind: "parameter_pack_expansion".to_string(),
-                children: vec![
-                    CppTemplateTerm::Parameter(name.to_string()),
-                    CppTemplateTerm::Atom {
-                        kind: "...".to_string(),
-                        text: "...".to_string(),
-                    },
-                ],
-            },
-        }
-    }
-
-    #[test]
-    fn template_argument_binding_supports_terminal_parameter_packs() {
-        let pack_only = [template_parameter("Args", true, None)];
-        for arguments in [
-            Vec::new(),
-            vec![template_atom("One")],
-            vec![template_atom("One"), template_atom("Two")],
-        ] {
-            let (expanded, bindings) = cpp_bind_template_arguments(&pack_only, &arguments)
-                .expect("terminal pack must consume every remaining argument");
-            assert_eq!(
-                expanded
-                    .iter()
-                    .map(|argument| argument.text.as_str())
-                    .collect::<Vec<_>>(),
-                arguments
-                    .iter()
-                    .map(|argument| argument.text.as_str())
-                    .collect::<Vec<_>>()
-            );
-            assert!(matches!(
-                bindings.get("Args"),
-                Some(CppTemplateTerm::Node { kind, children })
-                    if kind == "parameter_pack" && children.len() == arguments.len()
-            ));
-        }
-
-        let fixed_and_pack = [
-            template_parameter("Head", false, Some("Default")),
-            template_parameter("Tail", true, None),
-        ];
-        let (defaulted, _) = cpp_bind_template_arguments(&fixed_and_pack, &[])
-            .expect("the fixed default must precede an empty pack");
-        assert_eq!(defaulted[0].text, "Default");
-        let (many, bindings) = cpp_bind_template_arguments(
-            &fixed_and_pack,
-            &[
-                template_atom("Head"),
-                template_atom("One"),
-                template_atom("Two"),
-            ],
-        )
-        .expect("fixed parameter plus trailing pack");
-        assert_eq!(many.len(), 3);
-        assert!(matches!(
-            bindings.get("Tail"),
-            Some(CppTemplateTerm::Node { children, .. }) if children.len() == 2
-        ));
-
-        assert!(
-            cpp_bind_template_arguments(&[template_parameter("Only", false, None)], &[]).is_none(),
-            "a missing fixed argument without a default must fail"
-        );
-        assert!(
-            cpp_bind_template_arguments(
-                &[template_parameter("Only", false, None)],
-                &[template_atom("One"), template_atom("Extra")],
-            )
-            .is_none(),
-            "extra arguments without a pack must fail"
-        );
-        assert!(
-            cpp_bind_template_arguments(
-                &[
-                    template_parameter("Pack", true, None),
-                    template_parameter("Trailing", false, Some("Default")),
-                ],
-                &[template_atom("One")],
-            )
-            .is_none(),
-            "a non-terminal pack is ambiguous and must fail closed"
-        );
-    }
-
-    #[test]
-    fn template_alias_target_expands_bound_parameter_packs() {
-        let parameters = [
-            template_parameter("Head", false, None),
-            template_parameter("Tail", true, None),
-        ];
-        for arguments in [
-            vec![template_atom("Head")],
-            vec![template_atom("Head"), template_atom("One")],
-            vec![
-                template_atom("Head"),
-                template_atom("One"),
-                template_atom("Two"),
-            ],
-        ] {
-            let (_, bindings) = cpp_bind_template_arguments(&parameters, &arguments)
-                .expect("a fixed parameter and terminal pack must bind");
-            let expanded = cpp_substitute_template_arguments(
-                &[template_atom("Head"), template_pack_expansion("Tail")],
-                &bindings,
-            )
-            .expect("a root pack expansion must flatten into target arguments");
-            assert_eq!(
-                expanded
-                    .iter()
-                    .map(|argument| &argument.term)
-                    .collect::<Vec<_>>(),
-                arguments
-                    .iter()
-                    .map(|argument| &argument.term)
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
-
-    #[test]
-    fn type_target_spec_scan_keys_collapse_logical_redeclarations() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let logical_type = |path: &str| {
-            CodeUnit::with_signature(
-                ProjectFile::new(root.clone(), path),
-                CodeUnitType::Class,
-                "gfx",
-                "Size",
-                Some("class Size".to_string()),
-                false,
-            )
-        };
-        let first_type = logical_type("first.h");
-        let duplicate_type = logical_type("duplicate.h");
-        let first_type_spec = TargetSpec::new(
-            first_type.clone(),
-            TargetKind::Type,
-            Some(first_type),
-            "Size".to_string(),
-            None,
-            None,
-        );
-        let duplicate_type_spec = TargetSpec::new(
-            duplicate_type.clone(),
-            TargetKind::Type,
-            Some(duplicate_type),
-            "Size".to_string(),
-            None,
-            None,
-        );
-        assert_eq!(
-            first_type_spec.type_scan_key(),
-            duplicate_type_spec.type_scan_key()
-        );
-
-        let divergent_signature = CodeUnit::with_signature(
-            ProjectFile::new(root.clone(), "definition.h"),
-            CodeUnitType::Class,
-            "gfx",
-            "Size",
-            Some("<typename Value>".to_string()),
-            false,
-        );
-        let divergent_signature_spec = TargetSpec::new(
-            divergent_signature.clone(),
-            TargetKind::Type,
-            Some(divergent_signature),
-            "Size".to_string(),
-            None,
-            None,
-        );
-        assert_ne!(
-            first_type_spec.type_scan_key(),
-            divergent_signature_spec.type_scan_key(),
-            "#803 requires each divergent physical target spec to remain independently scanned"
-        );
-
-        let other_namespace = CodeUnit::with_signature(
-            ProjectFile::new(root, "other_namespace.h"),
-            CodeUnitType::Class,
-            "other",
-            "Size",
-            Some("class Size".to_string()),
-            false,
-        );
-        let other_namespace_spec = TargetSpec::new(
-            other_namespace.clone(),
-            TargetKind::Type,
-            Some(other_namespace),
-            "Size".to_string(),
-            None,
-            None,
-        );
-        assert_ne!(
-            first_type_spec.type_scan_key(),
-            other_namespace_spec.type_scan_key(),
-            "same-short-name Types with distinct FQNs must retain separate scans"
-        );
-    }
-
-    #[test]
-    fn alternate_same_fqn_type_candidates_require_one_source_file() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let source_location = root.join("source_location.h");
-        let consumer = root.join("consumer.cpp");
-        let other_header = root.join("other_source_location.h");
-        let other_namespace = root.join("other_namespace.h");
-        fs::write(
-            &source_location,
-            r#"#pragma once
-namespace absl {
-#if defined(ABSL_USES_STD_SOURCE_LOCATION) && defined(ABSL_HAVE_STD_SOURCE_LOCATION)
-ABSL_NAMESPACE_BEGIN
-using SourceLocation = std::source_location;
-ABSL_NAMESPACE_END
-#else
-ABSL_NAMESPACE_BEGIN
-class SourceLocation {};
-ABSL_NAMESPACE_END
-#endif
-}
-
-"#,
-        )
-        .expect("write source-location fixture");
-        fs::write(
-            &consumer,
-            "#include \"source_location.h\"\nvoid Use(absl::SourceLocation loc) {}\n",
-        )
-        .expect("write consumer fixture");
-        fs::write(
-            &other_header,
-            "namespace absl {\n#if defined(OTHER)\nclass SourceLocation {};\n#endif\n}\n",
-        )
-        .expect("write duplicate source fixture");
-        fs::write(
-            &other_namespace,
-            "namespace other {\n#if defined(OTHER)\nusing SourceLocation = int;\n#endif\n}\n",
-        )
-        .expect("write distinct-namespace fixture");
-        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
-            root.clone(),
-            crate::analyzer::Language::Cpp,
-        ));
-        let source_location = ProjectFile::new(root.clone(), "source_location.h");
-        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
-        let declarations = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .filter(|unit| {
-                unit.kind() == CodeUnitType::Class
-                    && unit.fq_name() == "absl.SourceLocation"
-                    && unit.source() == &source_location
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            declarations.len(),
-            2,
-            "conditional class/alias declarations"
-        );
-        let class_decl = declarations
-            .iter()
-            .find(|unit| unit.signature().is_none())
-            .expect("fallback class declaration");
-        let alias_decl = declarations
-            .iter()
-            .find(|unit| {
-                unit.signature()
-                    .is_some_and(|signature| signature.starts_with("using"))
-            })
-            .expect("standard-library alias declaration");
-        let roots = HashSet::from_iter([consumer.clone()]);
-        let visibility = VisibilityIndex::build(&analyzer, &analyzer, &roots);
-        assert_eq!(
-            visibility.unique_type_candidate_preserving_target(
-                &analyzer,
-                &consumer,
-                &[class_decl, alias_decl],
-                class_decl,
-            ),
-            Some((*class_decl).clone()),
-            "same-file conditional declarations preserve the selected target identity"
-        );
-        assert!(visibility.alternate_same_fqn_type_declarations(
-            &analyzer,
-            &[class_decl, alias_decl],
-            class_decl,
-        ));
-        assert!(visibility.complementary_same_fqn_type_declarations(
-            &analyzer,
-            &[class_decl, alias_decl],
-            class_decl,
-        ));
-        let unguarded_duplicate = CodeUnit::with_signature(
-            source_location.clone(),
-            CodeUnitType::Class,
-            "absl",
-            "SourceLocation",
-            Some("using SourceLocation = int;".to_string()),
-            false,
-        );
-        assert!(
-            !visibility.alternate_same_fqn_type_declarations(
-                &analyzer,
-                &[class_decl, alias_decl, &unguarded_duplicate],
-                class_decl,
-            ),
-            "every candidate pair must be mutually exclusive"
-        );
-
-        let duplicate = CodeUnit::with_signature(
-            ProjectFile::new(root.clone(), "other_source_location.h"),
-            CodeUnitType::Class,
-            "absl",
-            "SourceLocation",
-            Some("class SourceLocation".to_string()),
-            false,
-        );
-        assert!(!visibility.alternate_same_fqn_type_declarations(
-            &analyzer,
-            &[class_decl, &duplicate],
-            class_decl,
-        ));
-        let other_namespace_decl = CodeUnit::with_signature(
-            source_location.clone(),
-            CodeUnitType::Class,
-            "other",
-            "SourceLocation",
-            Some("using SourceLocation = std::source_location;".to_string()),
-            false,
-        );
-        assert!(!visibility.alternate_same_fqn_type_declarations(
-            &analyzer,
-            &[class_decl, &other_namespace_decl],
-            class_decl,
-        ));
-    }
-
-    #[test]
-    fn const_global_with_extern_peer_remains_external_with_exact_fqn_peer_bound() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let write = |path: &str, contents: &str| {
-            let full = root.join(path);
-            if let Some(parent) = full.parent() {
-                fs::create_dir_all(parent).expect("create parent directories");
-            }
-            fs::write(&full, contents).expect("write fixture");
-            ProjectFile::new(root.clone(), path)
-        };
-        let _header = write(
-            "shared.hpp",
-            "#pragma once\nextern const int shared_value;\n",
-        );
-        let definition = write(
-            "definition.cpp",
-            "#include \"shared.hpp\"\nconst int shared_value = 0;\n",
-        );
-        for index in 0..32 {
-            let path = format!("noise_{index}.cpp");
-            let source = format!("const int unrelated_{index} = {index};\n");
-            let _ = write(&path, &source);
-        }
-        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
-            root,
-            crate::analyzer::Language::Cpp,
-        ));
-        let target = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| {
-                unit.kind() == CodeUnitType::Field
-                    && unit.identifier() == "shared_value"
-                    && unit.source() == &definition
-            })
-            .expect("definition global field");
-        let (internal, inspected_peers) =
-            with_cpp_global_field_linkage_peer_inspection_counter_for_test(|| {
-                cpp_global_field_has_internal_linkage(&analyzer, &target)
-            });
-
-        assert!(
-            !internal,
-            "an extern peer in the exact-fqn bucket must keep the const definition externally visible"
-        );
-        assert_eq!(
-            inspected_peers, 1,
-            "exact-fqn peer lookup should inspect only the matching extern peer, not unrelated globals from the rest of the workspace"
-        );
-    }
-
-    #[test]
-    fn visibility_build_hydrates_overlapping_closures_once_and_preserves_root_visibility() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let left = ProjectFile::new(root.clone(), "left.cpp");
-        let right = ProjectFile::new(root.clone(), "right.cpp");
-        let shared = ProjectFile::new(root.clone(), "shared.h");
-        let leaf = ProjectFile::new(root.clone(), "leaf.h");
-        let right_only = ProjectFile::new(root, "right_only.h");
-
-        let adjacency = HashMap::from_iter([
-            (left.clone(), vec![shared.clone()]),
-            (right.clone(), vec![shared.clone(), right_only.clone()]),
-            (shared.clone(), vec![leaf.clone()]),
-            (leaf.clone(), Vec::new()),
-            (right_only.clone(), Vec::new()),
-        ]);
-        let declarations_by_file: HashMap<_, _> = [
-            (left.clone(), "Left"),
-            (right.clone(), "Right"),
-            (shared.clone(), "Shared"),
-            (leaf.clone(), "Leaf"),
-            (right_only.clone(), "RightOnly"),
-        ]
-        .into_iter()
-        .map(|(file, name)| {
-            let declaration = CodeUnit::new(file.clone(), CodeUnitType::Class, "", name);
-            (file, BTreeSet::from([declaration]))
-        })
-        .collect();
-
-        let roots = HashSet::from_iter([left.clone(), right.clone()]);
-        let mut include_discovery_counts = HashMap::<ProjectFile, usize>::default();
-        let VisibilityData {
-            visible_by_file, ..
-        } = build_visibility_data(
-            &roots,
-            None,
-            |file| {
-                *include_discovery_counts.entry(file.clone()).or_default() += 1;
-                adjacency.get(file).cloned().unwrap_or_default()
-            },
-            |file| declarations_by_file.get(file).cloned().unwrap_or_default(),
-        );
-
-        assert_eq!(include_discovery_counts.len(), adjacency.len());
-        assert!(
-            include_discovery_counts.values().all(|count| *count == 1),
-            "the complete visibility build must discover each union-closure file exactly once: \
-             {include_discovery_counts:#?}"
-        );
-        assert_eq!(include_discovery_counts.get(&shared), Some(&1));
-        assert_eq!(include_discovery_counts.get(&leaf), Some(&1));
-
-        let visible_names = |root: &ProjectFile| {
-            visible_by_file
-                .get(root)
-                .into_iter()
-                .flatten()
-                .map(|unit| unit.identifier().to_string())
-                .collect::<HashSet<_>>()
-        };
-
-        assert_eq!(
-            visible_names(&left),
-            HashSet::from_iter(["Left", "Shared", "Leaf"].map(str::to_string))
-        );
-        assert_eq!(
-            visible_names(&right),
-            HashSet::from_iter(["Right", "Shared", "Leaf", "RightOnly"].map(str::to_string))
-        );
-    }
-
-    #[test]
-    fn union_visibility_keeps_colliding_declarations_root_local() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let left = ProjectFile::new(root.clone(), "left.cpp");
-        let right = ProjectFile::new(root.clone(), "right.cpp");
-        let left_header = ProjectFile::new(root.clone(), "left/collision.h");
-        let right_header = ProjectFile::new(root, "right/collision.h");
-        let left_collision =
-            CodeUnit::new(left_header.clone(), CodeUnitType::Class, "", "Collision");
-        let right_collision =
-            CodeUnit::new(right_header.clone(), CodeUnitType::Class, "", "Collision");
-        let adjacency = HashMap::from_iter([
-            (left.clone(), vec![left_header.clone()]),
-            (right.clone(), vec![right_header.clone()]),
-            (left_header.clone(), Vec::new()),
-            (right_header.clone(), Vec::new()),
-        ]);
-        let declarations = HashMap::from_iter([
-            (left_header.clone(), BTreeSet::from([left_collision])),
-            (right_header.clone(), BTreeSet::from([right_collision])),
-        ]);
-        let roots = HashSet::from_iter([left.clone(), right.clone()]);
-        let VisibilityData {
-            visible_by_file, ..
-        } = build_visibility_data(
-            &roots,
-            None,
-            |file| adjacency.get(file).cloned().unwrap_or_default(),
-            |file| declarations.get(file).cloned().unwrap_or_default(),
-        );
-        let cpp = visibility_analyzer(&visible_by_file);
-        let visibility = visibility_index(&cpp, visible_by_file);
-        let candidate_sources = |file: &ProjectFile| {
-            visibility
-                .visible_identifier_candidates(file, "Collision")
-                .map(|candidate| candidate.source().clone())
-                .collect::<HashSet<_>>()
-        };
-
-        assert_eq!(candidate_sources(&left), HashSet::from_iter([left_header]));
-        assert_eq!(
-            candidate_sources(&right),
-            HashSet::from_iter([right_header])
-        );
-    }
-
-    #[test]
-    fn shared_authoritative_batch_keeps_same_named_anonymous_namespace_globals_root_local() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let left = ProjectFile::new(root.clone(), "left.cpp");
-        let right = ProjectFile::new(root.clone(), "right.cpp");
-        let left_source = "namespace {\nconstexpr int local_value = 1;\n}\nint read_left() { return local_value; }\n";
-        let right_source = "namespace {\nconstexpr int local_value = 2;\n}\nint read_right() { return local_value; }\n";
-        fs::write(root.join("left.cpp"), left_source).expect("write left fixture");
-        fs::write(root.join("right.cpp"), right_source).expect("write right fixture");
-        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
-            root.clone(),
-            crate::analyzer::Language::Cpp,
-        ));
-        let target_for = |source: &ProjectFile| {
-            cpp.get_all_declarations()
-                .into_iter()
-                .find(|unit| {
-                    unit.kind() == CodeUnitType::Field
-                        && unit.identifier() == "local_value"
-                        && unit.source() == source
-                })
-                .expect("fixture global field declaration")
-        };
-        let left_global = target_for(&left);
-        let right_global = target_for(&right);
-        let roots = HashSet::from_iter([left.clone(), right.clone()]);
-        let batch = CppAuthoritativeUsageBatch::new(&cpp, &roots).expect("shared cpp batch");
-        let candidate_files = HashSet::from_iter([left.clone(), right.clone()]);
-        let expected_hit = |file: &ProjectFile, source: &str| {
-            let start = source.rfind("local_value;").expect("usage marker");
-            (file.clone(), start, start + "local_value".len())
-        };
-        let hit_ranges = |result: FuzzyResult| match result {
-            FuzzyResult::Success {
-                hits_by_overload, ..
-            } => hits_by_overload
-                .into_values()
-                .flatten()
-                .map(|hit| (hit.file, hit.start_offset, hit.end_offset))
-                .collect::<HashSet<_>>(),
-            other => panic!("expected shared authoritative success, got {other:?}"),
-        };
-        let left_hits = hit_ranges(
-            batch
-                .find_usages(std::slice::from_ref(&left_global), &candidate_files, 1000)
-                .into_fuzzy_result(),
-        );
-        let right_hits = hit_ranges(
-            batch
-                .find_usages(std::slice::from_ref(&right_global), &candidate_files, 1000)
-                .into_fuzzy_result(),
-        );
-
-        assert_eq!(
-            left_hits,
-            HashSet::from_iter([expected_hit(&left, left_source)]),
-        );
-        assert_eq!(
-            right_hits,
-            HashSet::from_iter([expected_hit(&right, right_source)]),
-        );
-
-        let visibility = VisibilityIndex::build(&cpp, &cpp, &roots);
-        assert!(visibility.is_visible(&left, &left_global));
-        assert!(visibility.is_visible(&right, &right_global));
-        assert!(
-            !visibility.is_visible(&left, &right_global),
-            "shared authoritative visibility must not treat a sibling anonymous-namespace global as visible by logical name alone"
-        );
-        assert!(
-            !visibility.is_visible(&right, &left_global),
-            "shared authoritative visibility must not treat a sibling anonymous-namespace global as visible by logical name alone"
-        );
-    }
-
-    #[test]
-    fn visible_identifier_index_reuses_internal_linkage_classification_across_roots() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let left = ProjectFile::new(root.clone(), "left.cpp");
-        let right = ProjectFile::new(root.clone(), "right.cpp");
-        let shared = ProjectFile::new(root.clone(), "shared.h");
-        let local = CodeUnit::new(shared.clone(), CodeUnitType::Field, "", "local_value");
-        let external = CodeUnit::new(shared.clone(), CodeUnitType::Field, "", "shared_value");
-        let visible = HashSet::from_iter([local.clone(), external.clone()]);
-        let visible_by_file =
-            HashMap::from_iter([(left.clone(), visible.clone()), (right.clone(), visible)]);
-        let visible_source_files_by_root = HashMap::from_iter([
-            (
-                left.clone(),
-                HashSet::from_iter([left.clone(), local.source().clone()]),
-            ),
-            (
-                right.clone(),
-                HashSet::from_iter([right.clone(), local.source().clone()]),
-            ),
-        ]);
-        let cpp = visibility_analyzer(&visible_by_file);
-        let (by_identifier, classification_count) =
-            with_cpp_global_field_internal_linkage_classification_counter_for_test(|| {
-                build_visible_identifier_index(
-                    &cpp,
-                    &visible_by_file,
-                    &visible_source_files_by_root,
-                    &mut HashMap::default(),
-                )
-            });
-
-        assert_eq!(
-            classification_count, 2,
-            "one batch should classify each repeated global field once even when several roots share it"
-        );
-        // issue_1184 exercises the authoritative internal-linkage/root-isolation behavior.
-        // This fixture only guards that sharing the cache across roots preserves the buckets.
-        for root in [&left, &right] {
-            let bucket = by_identifier
-                .get(root)
-                .expect("visible identifier bucket for root");
-            assert_eq!(
-                bucket
-                    .get("local_value")
-                    .expect("shared field bucket")
-                    .len(),
-                1,
-                "sharing the classification cache must not change the per-root local_value bucket"
-            );
-            assert_eq!(
-                bucket
-                    .get("shared_value")
-                    .expect("shared field bucket")
-                    .len(),
-                1,
-                "sharing the classification cache must not change the per-root shared_value bucket"
-            );
-        }
-    }
-
-    /// Owns the analyzer the borrowed index points at; keep it alive for as
-    /// long as the returned index is used.
-    fn visibility_analyzer(
-        visible_by_file: &HashMap<ProjectFile, HashSet<CodeUnit>>,
-    ) -> CppAnalyzer {
-        let root = visible_by_file
-            .keys()
-            .next()
-            .expect("test visibility needs at least one file")
-            .root()
-            .to_path_buf();
-        CppAnalyzer::new(Arc::new(crate::analyzer::TestProject::new(
-            root,
-            crate::analyzer::Language::Cpp,
-        )))
-    }
-
-    fn visibility_index<'a>(
-        cpp: &'a CppAnalyzer,
-        visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
-    ) -> VisibilityIndex<'a> {
-        let visible_source_files_by_root = visible_by_file
-            .iter()
-            .map(|(file, visible)| {
-                (
-                    file.clone(),
-                    visible
-                        .iter()
-                        .map(|unit| unit.source().clone())
-                        .chain(std::iter::once(file.clone()))
-                        .collect(),
-                )
-            })
-            .collect();
-        let mut global_field_internal_linkage = HashMap::default();
-        VisibilityIndex {
-            cpp,
-            visible_by_identifier: build_visible_identifier_index(
-                cpp,
-                &visible_by_file,
-                &visible_source_files_by_root,
-                &mut global_field_internal_linkage,
-            ),
-            global_field_internal_linkage,
-            visible_by_file,
-            visible_source_files_by_root,
-            alias_cells: Mutex::new(HashMap::default()),
-            visible_parser_alias_name_sets: RwLock::new(HashMap::default()),
-            visible_parser_alias_target_names: Mutex::new(HashMap::default()),
-            ordinary_type_import_cells: Mutex::new(HashMap::default()),
-            project_using_index: OnceLock::new(),
-            callable_reference_specs: Mutex::new(HashMap::default()),
-            include_activation_cells: Mutex::new(HashMap::default()),
-            conditional_include_projection_cells: Mutex::new(HashMap::default()),
-            include_activation_build_count: AtomicUsize::new(0),
-            using_donor_activation_count: AtomicUsize::new(0),
-            using_namespace_lookup_count: AtomicUsize::new(0),
-            using_name_candidate_inspection_count: AtomicUsize::new(0),
-            using_source_index_walk_count: AtomicUsize::new(0),
-            callable_reference_spec_build_count: AtomicUsize::new(0),
-            alias_source_parse_counts: Mutex::new(HashMap::default()),
-            visible_parser_alias_name_set_build_count: AtomicUsize::new(0),
-            visible_parser_alias_target_names_build_count: AtomicUsize::new(0),
-            field_type_facts: Mutex::new(HashMap::default()),
-            structured_alias_targets: Mutex::new(HashMap::default()),
-            indexed_structural_class_scopes: Mutex::new(HashMap::default()),
-            indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
-            precise_parent_cache: Mutex::new(HashMap::default()),
-            macro_event_cells: Mutex::new(HashMap::default()),
-            macro_include_protection_cells: Mutex::new(HashMap::default()),
-            macro_environment_cursors: Mutex::new(HashMap::default()),
-            macro_replacements: Mutex::new(HashMap::default()),
-            callable_parameter_macro_arities: Mutex::new(HashMap::default()),
-            macro_replacement_parse_count: AtomicUsize::new(0),
-            macro_event_application_count: AtomicUsize::new(0),
-            macro_environment_copy_count: AtomicUsize::new(0),
-            cpp_template_metadata: HashMap::default(),
-            cpp_template_families: HashMap::default(),
-            qualified_candidate_inspections: AtomicUsize::new(0),
-            target_preserving_type_resolution_count: AtomicUsize::new(0),
-        }
-    }
-
-    #[test]
-    fn template_id_without_specialization_metadata_keeps_resolved_primary() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
-        let legacy = CodeUnit::new(
-            ProjectFile::new(root, "legacy.h"),
-            CodeUnitType::Class,
-            "",
-            "legacy",
-        );
-        let visible_by_file =
-            HashMap::from_iter([(consumer.clone(), HashSet::from_iter([legacy.clone()]))]);
-        let cpp = visibility_analyzer(&visible_by_file);
-        let visibility = visibility_index(&cpp, visible_by_file);
-        let source = "legacy<int> value;";
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .expect("set C++ grammar");
-        let tree = parser.parse(source, None).expect("parse template-id");
-        let mut stack = vec![tree.root_node()];
-        let mut type_node = None;
-        while let Some(node) = stack.pop() {
-            if node.kind() == "template_type" {
-                type_node = Some(node);
-                break;
-            }
-            let mut cursor = node.walk();
-            stack.extend(node.named_children(&mut cursor));
-        }
-        assert_eq!(
-            visibility.resolve_type_node_result(
-                &consumer,
-                type_node.expect("template type node"),
-                source,
-            ),
-            Ok(Some(legacy))
-        );
-    }
-
-    #[test]
-    fn deeply_nested_cpp_template_terms_use_stack_safe_matching_and_substitution() {
-        let mut pattern = CppTemplateTerm::Parameter("T".to_string());
-        let mut argument = CppTemplateTerm::Atom {
-            kind: "primitive_type".to_string(),
-            text: "int".to_string(),
-        };
-        for _ in 0..512 {
-            pattern = CppTemplateTerm::Node {
-                kind: "template_argument".to_string(),
-                children: vec![pattern],
-            };
-            argument = CppTemplateTerm::Node {
-                kind: "template_argument".to_string(),
-                children: vec![argument],
-            };
-        }
-
-        let parameters = std::iter::once("T").collect::<HashSet<_>>();
-        let mut bindings = HashMap::default();
-        assert!(cpp_unify_template_term(
-            &pattern,
-            &argument,
-            &parameters,
-            &mut bindings,
-        ));
-        let substituted =
-            cpp_substitute_template_term(&pattern, &bindings).expect("bound deep template term");
-        assert!(cpp_unify_template_term(
-            &substituted,
-            &argument,
-            &HashSet::default(),
-            &mut HashMap::default(),
-        ));
-    }
-
-    #[test]
-    fn qualified_type_lookup_inspects_only_exact_fqn_candidates() {
-        const UNRELATED_DECLARATIONS: usize = 256;
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
-        let target_a_file = ProjectFile::new(root.clone(), "include/target_a.h");
-        let target_b_file = ProjectFile::new(root.clone(), "include/target_b.h");
-        let target_a = CodeUnit::new(target_a_file, CodeUnitType::Class, "perf", "Exact");
-        let target_b = CodeUnit::new(target_b_file, CodeUnitType::Class, "perf", "Exact");
-        let same_fqn_function = CodeUnit::with_signature(
-            ProjectFile::new(root.clone(), "include/function.h"),
-            CodeUnitType::Function,
-            "perf",
-            "Exact",
-            Some("void Exact()".to_string()),
-            false,
-        );
-        let alias = CodeUnit::with_signature(
-            ProjectFile::new(root.clone(), "include/alias.h"),
-            CodeUnitType::Field,
-            "perf",
-            "Alias",
-            Some("using Alias = Exact;".to_string()),
-            false,
-        );
-        let global = CodeUnit::new(
-            ProjectFile::new(root.clone(), "include/global.h"),
-            CodeUnitType::Class,
-            "",
-            "Global",
-        );
-        let hidden_same_fqn = CodeUnit::new(
-            ProjectFile::new(root.clone(), "hidden/target.h"),
-            CodeUnitType::Class,
-            "perf",
-            "Exact",
-        );
-
-        let mut visible = HashSet::default();
-        for index in 0..UNRELATED_DECLARATIONS {
-            visible.insert(CodeUnit::new(
-                ProjectFile::new(root.clone(), format!("include/unrelated_{index}.h")),
-                CodeUnitType::Class,
-                format!("unrelated{index}"),
-                format!("Type{index}"),
-            ));
-        }
-        visible.extend([
-            target_a.clone(),
-            target_b.clone(),
-            same_fqn_function.clone(),
-            alias.clone(),
-            global.clone(),
-        ]);
-        let visible_by_file = HashMap::from_iter([
-            (consumer.clone(), visible.clone()),
-            (alias.source().clone(), visible),
-        ]);
-        let cpp = visibility_analyzer(&visible_by_file);
-        let visibility = visibility_index(&cpp, visible_by_file);
-
-        visibility.reset_qualified_candidate_inspections();
-        let candidates = visibility.type_candidates(&consumer, "perf::Exact");
-        let inspected = visibility.qualified_candidate_inspections();
-        assert_eq!(
-            candidates.len(),
-            2,
-            "qualified type candidates: {candidates:#?}"
-        );
-        assert!(candidates.contains(&&target_a));
-        assert!(candidates.contains(&&target_b));
-        assert!(!candidates.contains(&&hidden_same_fqn));
-        let raw_type_candidates = visibility.type_name_candidates(&consumer, "perf::Exact");
-        assert_eq!(raw_type_candidates.len(), 3);
-        assert!(raw_type_candidates.contains(&&same_fqn_function));
-        assert_eq!(
-            visibility.named_candidates_for_normalized(
-                &consumer,
-                "perf::Exact",
-                TargetKind::FreeFunction
-            ),
-            vec![&same_fqn_function],
-            "target-kind filtering must distinguish a same-FQN free function from types"
-        );
-        assert_eq!(
-            visibility.resolve_type(&consumer, "::Global"),
-            Some(global),
-            "a leading global qualifier must still resolve the visible global type"
-        );
-        assert_eq!(
-            visibility.resolve_type(&consumer, "perf::Alias"),
-            Some(alias.clone()),
-            "a namespace-qualified alias must remain a type candidate"
-        );
-        assert_eq!(
-            visibility.alias_target(&alias).map(|unit| unit.fq_name()),
-            Some("perf.Exact".to_string()),
-            "a qualified namespace alias must resolve its namespace-relative target"
-        );
-        assert_eq!(
-            inspected, 3,
-            "qualified lookup should inspect only the two visible type declarations and the same-FQN non-type declaration"
-        );
-    }
-
-    #[test]
-    fn qualified_lookup_uses_the_final_cpp_scope_component_verbatim() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
-        let header = ProjectFile::new(root, "include/types.h");
-        let nested = structured_cpp_unit(
-            header.clone(),
-            CodeUnitType::Class,
-            &[
-                ("ns", SegmentKind::Package),
-                ("Outer", SegmentKind::Type),
-                ("Inner", SegmentKind::Nested),
-            ],
-            None,
-        );
-        let constructor = structured_cpp_unit(
-            header.clone(),
-            CodeUnitType::Function,
-            &[
-                ("ns", SegmentKind::Package),
-                ("Widget", SegmentKind::Type),
-                ("Widget", SegmentKind::Member),
-            ],
-            Some("Widget()"),
-        );
-        let arrow = structured_cpp_unit(
-            header.clone(),
-            CodeUnitType::Function,
-            &[
-                ("ns", SegmentKind::Package),
-                ("Widget", SegmentKind::Type),
-                ("operator->", SegmentKind::Member),
-            ],
-            Some("Widget* operator->()"),
-        );
-        let destructor = structured_cpp_unit(
-            header,
-            CodeUnitType::Function,
-            &[
-                ("ns", SegmentKind::Package),
-                ("Widget", SegmentKind::Type),
-                ("~Widget", SegmentKind::Member),
-            ],
-            Some("~Widget()"),
-        );
-        let visible_by_file = HashMap::from_iter([(
-            consumer.clone(),
-            HashSet::from_iter([
-                nested.clone(),
-                constructor.clone(),
-                arrow.clone(),
-                destructor.clone(),
-            ]),
-        )]);
-        let cpp = visibility_analyzer(&visible_by_file);
-        let visibility = visibility_index(&cpp, visible_by_file);
-
-        assert_eq!(
-            visibility.candidate_units(&consumer, "ns::Outer::Inner", TargetKind::Type),
-            vec![&nested]
-        );
-        assert_eq!(
-            visibility.resolve_type(&consumer, "ns::Outer::Inner<int>"),
-            Some(nested),
-            "template arguments must be removed before selecting the final identifier bucket"
-        );
-        assert_eq!(
-            visibility.candidate_units(&consumer, "ns::Widget::Widget", TargetKind::Constructor),
-            vec![&constructor]
-        );
-        assert_eq!(
-            visibility.candidate_units(&consumer, "ns::Widget::operator->", TargetKind::Method),
-            vec![&arrow],
-            "operator-> must not be reduced with terminal_name-style punctuation splitting"
-        );
-        assert_eq!(
-            visibility.candidate_units(&consumer, "ns::Widget::~Widget", TargetKind::Method),
-            vec![&destructor]
-        );
-        assert!(
-            visibility
-                .candidate_units(&consumer, "::", TargetKind::Type)
-                .is_empty(),
-            "a degenerate qualified name must fail closed"
-        );
-    }
-
-    #[test]
-    fn owner_candidate_collapse_prefers_one_full_and_rejects_unknown_or_duplicate_full() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let forward = CodeUnit::new(
-            ProjectFile::new(root.clone(), "forward.h"),
-            CodeUnitType::Class,
-            "demo",
-            "Widget",
-        );
-        let full = CodeUnit::new(
-            ProjectFile::new(root.clone(), "full.h"),
-            CodeUnitType::Class,
-            "demo",
-            "Widget",
-        );
-        let duplicate = CodeUnit::new(
-            ProjectFile::new(root, "duplicate.h"),
-            CodeUnitType::Class,
-            "demo",
-            "Widget",
-        );
-
-        assert!(matches!(
-            collapse_owner_candidates(
-                [
-                    (forward, CppClassDeclarationStrength::Forward),
-                    (full.clone(), CppClassDeclarationStrength::Full),
-                ]
-                .into_iter()
-            ),
-            DirectOwnerResolution::UniqueFull(owner) if owner == full
-        ));
-        assert!(matches!(
-            collapse_owner_candidates(
-                [(full.clone(), CppClassDeclarationStrength::Unknown)].into_iter()
-            ),
-            DirectOwnerResolution::Ambiguous
-        ));
-        assert!(matches!(
-            collapse_owner_candidates(
-                [
-                    (full, CppClassDeclarationStrength::Full),
-                    (duplicate, CppClassDeclarationStrength::Full),
-                ]
-                .into_iter()
-            ),
-            DirectOwnerResolution::Ambiguous
-        ));
-    }
-
-    #[test]
-    fn class_strength_reuses_one_prepared_tree_for_qgis_sized_sibling_set() {
-        const SIBLING_COUNT: usize = 113;
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let file = ProjectFile::new(root.clone(), "siblings.h");
-        let mut source = String::from("#pragma once\nnamespace qgis {\n");
-        for index in 0..SIBLING_COUNT {
-            if index % 2 == 0 {
-                source.push_str(&format!("class Sibling{index};\n"));
-            } else {
-                source.push_str(&format!("struct Sibling{index} {{ int value; }};\n"));
-            }
-        }
-        source.push_str("}\n");
-        file.write(&source).expect("write sibling fixture");
-
-        let project = Arc::new(crate::analyzer::TestProject::new(
-            &root,
-            crate::analyzer::Language::Cpp,
-        ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build(
-            project,
-            crate::analyzer::AnalyzerConfig::default(),
-        );
-        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
-        let mut candidates = cpp
-            .get_all_declarations()
-            .into_iter()
-            .filter(|candidate| {
-                candidate.is_class()
-                    && candidate.package_name() == "qgis"
-                    && candidate.short_name().starts_with("Sibling")
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by_key(|candidate| {
-            candidate
-                .short_name()
-                .trim_start_matches("Sibling")
-                .parse::<usize>()
-                .expect("numeric sibling suffix")
-        });
-        assert_eq!(candidates.len(), SIBLING_COUNT, "physical siblings");
-        assert!(
-            candidates
-                .iter()
-                .all(|candidate| candidate.source() == &file),
-            "every candidate must share the same source: {candidates:#?}"
-        );
-
-        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
-        assert!(
-            cpp.prepared_syntax(&file).is_some(),
-            "prepare shared syntax"
-        );
-        cpp.reset_cpp_owner_resolution_counts_for_test();
-        let strengths = candidates
-            .iter()
-            .map(|candidate| cpp_class_declaration_strength(workspace.analyzer(), candidate))
-            .collect::<Vec<_>>();
-        for (index, strength) in strengths.into_iter().enumerate() {
-            let expected = if index % 2 == 0 {
-                CppClassDeclarationStrength::Forward
-            } else {
-                CppClassDeclarationStrength::Full
-            };
-            assert!(
-                strength == expected,
-                "Sibling{index} strength changed: expected {}, got {}",
-                if expected == CppClassDeclarationStrength::Forward {
-                    "forward"
-                } else {
-                    "full"
-                },
-                if strength == CppClassDeclarationStrength::Forward {
-                    "forward"
-                } else if strength == CppClassDeclarationStrength::Full {
-                    "full"
-                } else {
-                    "unknown"
-                }
-            );
-        }
-        assert_eq!(
-            cpp.cpp_class_strength_parse_count_for_test(),
-            0,
-            "class strength must not reparse an already-prepared source"
-        );
-        assert_eq!(
-            cpp.prepared_syntax_parse_count_for_test(&file),
-            1,
-            "all candidates must share the request-scoped prepared tree"
-        );
-    }
-
-    #[test]
-    fn macro_environment_cache_scales_with_event_frontiers_not_call_sites() {
-        const REPEATED_CALL_COUNT: usize = 1_000;
-        const EVENT_COUNT: usize = 1_000;
-        const INCLUDED_EVENT_COUNT: usize = 100;
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let file = ProjectFile::new(root.clone(), "many_calls.cpp");
-        let header = ProjectFile::new(root.clone(), "macro_bank.h");
-        let mut header_source = String::new();
-        for index in 0..INCLUDED_EVENT_COUNT {
-            header_source.push_str(&format!("#define BANK_{index} {index}\n"));
-        }
-        header.write(&header_source).expect("write macro bank");
-        let mut source = String::from(
-            "#include \"macro_bank.h\"\n#define PAIR(value) value, value\nint target(int left, int right);\nvoid use() {\n  int value = 0;\n",
-        );
-        source.push_str("  target(PAIR(0));\n  target(value, value);\n}\n");
-        for index in 0..EVENT_COUNT {
-            source.push_str(&format!("#define EVENT_{index} {index}\n"));
-        }
-        file.write(&source).expect("write macro fixture");
-
-        let project = Arc::new(crate::analyzer::TestProject::new(
-            &root,
-            crate::analyzer::Language::Cpp,
-        ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build(
-            project,
-            crate::analyzer::AnalyzerConfig::default(),
-        );
-        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
-        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
-        let roots = [file.clone()].into_iter().collect();
-        let visibility = VisibilityIndex::build(cpp, workspace.analyzer(), &roots);
-        let prepared = cpp.prepared_syntax(&file).expect("prepared macro fixture");
-        let mut stack = vec![prepared.tree().root_node()];
-        let mut calls = Vec::new();
-        while let Some(node) = stack.pop() {
-            if node.kind() == "call_expression"
-                && node
-                    .child_by_field_name("function")
-                    .is_some_and(|function| node_text(function, prepared.source()) == "target")
-            {
-                calls.push(node);
-            }
-            for index in (0..node.named_child_count()).rev() {
-                if let Some(child) = node.named_child(index) {
-                    stack.push(child);
-                }
-            }
-        }
-
-        calls.sort_by_key(Node::start_byte);
-        assert_eq!(calls.len(), 2);
-        for _ in 0..REPEATED_CALL_COUNT {
-            for call in &calls {
-                assert_eq!(
-                    visibility.call_arity_evidence(&file, *call, prepared.source()),
-                    CallArityEvidence::Exact(2)
-                );
-            }
-        }
-        let event_cell = visibility.macro_event_cell(&file);
-        let events = event_cell.get().expect("prepared macro events");
-        let event_frontiers = events
-            .iter()
-            .filter(|event| event.byte() > calls[1].end_byte())
-            .map(|event| event.byte() + 1)
-            .collect::<Vec<_>>();
-        assert_eq!(event_frontiers.len(), EVENT_COUNT);
-        for frontier in event_frontiers {
-            drop(visibility.macro_environment(&file, frontier));
-        }
-        assert_eq!(
-            visibility
-                .macro_environment_cursors
-                .lock()
-                .expect("C++ macro environment cursor cache poisoned")
-                .len(),
-            1,
-            "one worker must retain one bounded forward cursor, not one snapshot per frontier"
-        );
-        assert_eq!(
-            visibility
-                .macro_replacement_parse_count
-                .load(Ordering::Relaxed),
-            1,
-            "repeated uses of one macro binding must share one parsed replacement"
-        );
-        assert_eq!(
-            visibility
-                .macro_event_application_count
-                .load(Ordering::Relaxed),
-            INCLUDED_EVENT_COUNT + EVENT_COUNT + 2,
-            "the include closure must replay once and sequential frontiers once each"
-        );
-        assert_eq!(
-            visibility
-                .macro_environment_copy_count
-                .load(Ordering::Relaxed),
-            0,
-            "sequential calls must mutate the uniquely held cursor environment in place"
-        );
-    }
-
-    #[test]
-    fn concurrent_macro_arity_scans_do_not_share_a_locked_forward_cursor() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let file = ProjectFile::new(root.clone(), "consumer.cpp");
-        let exact_header = ProjectFile::new(root.clone(), "exact.h");
-        exact_header
-            .write("#pragma once\n#define PAIR(value) value, value\n")
-            .expect("write exact macro header");
-        let conditional_header = ProjectFile::new(root.clone(), "conditional.h");
-        conditional_header
-            .write("#pragma once\n#define MAYBE_PAIR(value) value, value\n")
-            .expect("write conditional macro header");
-        file.write(
-            "#include \"exact.h\"\n\
-             #if ENABLE_CONDITIONAL\n\
-             #include \"conditional.h\"\n\
-             #endif\n\
-             int target(int left, int right);\n\
-             void use() {\n\
-               target(PAIR(0));\n\
-               target(MAYBE_PAIR(0));\n\
-             }\n",
-        )
-        .expect("write macro consumer");
-
-        let project = Arc::new(crate::analyzer::TestProject::new(
-            &root,
-            crate::analyzer::Language::Cpp,
-        ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build(
-            project,
-            crate::analyzer::AnalyzerConfig::default(),
-        );
-        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
-        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
-        let roots = HashSet::from_iter([file.clone()]);
-        let visibility = VisibilityIndex::build(cpp, workspace.analyzer(), &roots);
-
-        // Hold this thread's cursor across the worker's complete macro/include replay. A
-        // file-global cursor blocks the worker here; a worker-local cursor lets it finish while
-        // all immutable syntax, macro-event, and include-protection cells remain shared.
-        let main_cursor = visibility.macro_environment_cursor_cell(&file);
-        let main_guard = main_cursor
-            .lock()
-            .expect("main macro environment cursor poisoned");
-        let (timely, eventual) = std::thread::scope(|scope| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-            let worker_file = &file;
-            let worker_visibility = &visibility;
-            let worker = scope.spawn(move || {
-                let prepared = cpp
-                    .prepared_syntax(worker_file)
-                    .expect("prepared macro consumer");
-                let mut stack = vec![prepared.tree().root_node()];
-                let mut calls = Vec::new();
-                while let Some(node) = stack.pop() {
-                    if node.kind() == "call_expression"
-                        && node
-                            .child_by_field_name("function")
-                            .is_some_and(|function| {
-                                node_text(function, prepared.source()) == "target"
-                            })
-                    {
-                        calls.push(node);
-                    }
-                    for index in (0..node.named_child_count()).rev() {
-                        if let Some(child) = node.named_child(index) {
-                            stack.push(child);
-                        }
-                    }
-                }
-                calls.sort_by_key(Node::start_byte);
-                ready_tx
-                    .send(())
-                    .expect("signal macro worker ready to resolve arity");
-                let evidence = calls
-                    .into_iter()
-                    .map(|call| {
-                        worker_visibility.call_arity_evidence(worker_file, call, prepared.source())
-                    })
-                    .collect::<Vec<_>>();
-                tx.send(evidence.clone()).expect("send macro evidence");
-                evidence
-            });
-            ready_rx.recv().expect("macro worker ready signal");
-            let timely = rx.recv_timeout(std::time::Duration::from_secs(5));
-            drop(main_guard);
-            let eventual = worker.join().expect("macro arity worker");
-            (timely, eventual)
-        });
-
-        let expected = vec![CallArityEvidence::Exact(2), CallArityEvidence::Unknown];
-        assert_eq!(
-            timely.as_ref().ok(),
-            Some(&expected),
-            "another target worker must not wait for this thread's forward cursor: {timely:?}"
-        );
-        assert_eq!(
-            eventual, expected,
-            "removing cross-worker serialization must preserve exact and fail-closed evidence"
-        );
-        assert_eq!(
-            cpp.prepared_syntax_parse_count_for_test(&file),
-            1,
-            "concurrent macro replay must retain the request-scoped prepared tree"
-        );
-        assert_eq!(
-            visibility
-                .macro_environment_cursors
-                .lock()
-                .expect("C++ macro environment cursor cache poisoned")
-                .len(),
-            2,
-            "the participating workers must retain independent bounded cursors"
-        );
-    }
-
-    #[test]
-    fn include_guard_cache_requires_one_outer_file_covering_guard() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let guarded = ProjectFile::new(root.clone(), "guarded.h");
-        guarded
-            .write("#pragma once\n#ifndef GUARDED_H\n#define GUARDED_H\n#define VALUE 1\n#endif\n")
-            .expect("write guarded header");
-        let macro_guarded = ProjectFile::new(root.clone(), "macro_guarded.h");
-        macro_guarded
-            .write(
-                "#ifndef MACRO_GUARDED_H\n// guard comment\n#define MACRO_GUARDED_H\n#define VALUE 1\n#endif\n",
-            )
-            .expect("write macro-guarded header");
-        let nested = ProjectFile::new(root.clone(), "nested.h");
-        nested
-            .write(
-                "#define BEFORE 1\n#ifndef FEATURE_H\n#define FEATURE_H\n#endif\n#define AFTER 2\n",
-            )
-            .expect("write nested guard header");
-        let pushed = ProjectFile::new(root.clone(), "pushed.h");
-        pushed
-            .write(
-                "#pragma push_macro(\"VALUE\")\n#ifndef PUSHED_H\n#define PUSHED_H\n#define VALUE 3\n#endif\n",
-            )
-            .expect("write push-macro header");
-        let non_once = ProjectFile::new(root.clone(), "non_once.h");
-        non_once
-            .write("#pragma GCC diagnostic push\n#define VALUE 4\n")
-            .expect("write non-once pragma header");
-
-        let project = Arc::new(crate::analyzer::TestProject::new(
-            &root,
-            crate::analyzer::Language::Cpp,
-        ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build(
-            project,
-            crate::analyzer::AnalyzerConfig::default(),
-        );
-        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
-        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
-        let roots = [
-            guarded.clone(),
-            macro_guarded.clone(),
-            nested.clone(),
-            pushed.clone(),
-            non_once.clone(),
-        ]
-        .into_iter()
-        .collect();
-        let visibility = VisibilityIndex::build(cpp, workspace.analyzer(), &roots);
-
-        for _ in 0..100 {
-            assert_eq!(
-                visibility.macro_include_protection(&guarded),
-                MacroIncludeProtection::PragmaOnce
-            );
-            assert_eq!(
-                visibility.macro_include_protection(&macro_guarded),
-                MacroIncludeProtection::MacroGuard("MACRO_GUARDED_H".to_string())
-            );
-            assert_eq!(
-                visibility.macro_include_protection(&nested),
-                MacroIncludeProtection::None
-            );
-            assert_eq!(
-                visibility.macro_include_protection(&pushed),
-                MacroIncludeProtection::None
-            );
-            assert_eq!(
-                visibility.macro_include_protection(&non_once),
-                MacroIncludeProtection::None
-            );
-        }
-        assert_eq!(
-            visibility
-                .macro_include_protection_cells
-                .lock()
-                .expect("C++ include protection cache poisoned")
-                .len(),
-            5,
-            "include protection classification must be cached once per file"
-        );
-    }
-
-    #[test]
-    fn callable_targets_without_differing_redeclarations_skip_include_activation_work() {
-        const TARGET_COUNT: usize = 128;
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let header = ProjectFile::new(root.clone(), "api.h");
-        let consumer = ProjectFile::new(root.clone(), "consumer.cc");
-        let mut declarations = String::from("#pragma once\n");
-        for index in 0..TARGET_COUNT {
-            declarations.push_str(&format!("int candidate_{index}(int value);\n"));
-        }
-        header.write(&declarations).expect("write declarations");
-        consumer
-            .write("#include \"api.h\"\nint consume() { return 0; }\n")
-            .expect("write consumer");
-
-        let project = Arc::new(crate::analyzer::TestProject::new(
-            &root,
-            crate::analyzer::Language::Cpp,
-        ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build(
-            project,
-            crate::analyzer::AnalyzerConfig::default(),
-        );
-        let analyzer = workspace.analyzer();
-        let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
-        let roots = HashSet::from_iter([consumer.clone()]);
-        let visibility = VisibilityIndex::build(cpp, analyzer, &roots);
-        let prepared = cpp.prepared_syntax(&consumer).expect("prepared consumer");
-        let targets = cpp
-            .get_all_declarations()
-            .into_iter()
-            .filter(|candidate| {
-                candidate.is_function()
-                    && candidate.source() == &header
-                    && candidate.short_name().starts_with("candidate_")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(targets.len(), TARGET_COUNT, "scale fixture targets");
-        for target in &targets {
-            let spec = TargetSpec::from_target(analyzer, target).expect("target spec");
-            assert!(matches!(
-                spec.with_visible_callable_arities(
-                    analyzer,
-                    cpp,
-                    &visibility,
-                    &consumer,
-                    prepared.as_ref(),
-                ),
-                Cow::Borrowed(_)
-            ));
-        }
-        assert_eq!(
-            visibility.include_activation_build_count_for_test(),
-            0,
-            "zero-donor targets must not inspect the include graph"
-        );
-    }
-
-    #[test]
-    fn callable_arity_keeps_compatible_defaults_independent_of_incompatible_donor_order() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let target = CodeUnit::with_signature(
-            ProjectFile::new(root, "target.cc"),
-            CodeUnitType::Function,
-            "demo",
-            "route",
-            Some("(int, int)".to_string()),
-            false,
-        );
-        for activated_callable_arities in [
-            vec![
-                ActivatedCallableArity {
-                    activation_byte: 1,
-                    arity: CallableArity::new(1, 2, false),
-                },
-                ActivatedCallableArity {
-                    activation_byte: 1,
-                    arity: CallableArity::new(1, 3, false),
-                },
-            ],
-            vec![
-                ActivatedCallableArity {
-                    activation_byte: 1,
-                    arity: CallableArity::new(1, 3, false),
-                },
-                ActivatedCallableArity {
-                    activation_byte: 1,
-                    arity: CallableArity::new(1, 2, false),
-                },
-            ],
-        ] {
-            let mut spec = TargetSpec::new(
-                target.clone(),
-                TargetKind::FreeFunction,
-                None,
-                "route".to_string(),
-                Some(CallableArity::exact(2)),
-                Some(vec!["int".to_string(), "int".to_string()]),
-            );
-            spec.activated_callable_arities = activated_callable_arities;
-            let arity = spec.callable_arity_at(1).expect("callable arity");
-            assert!(arity.accepts(1), "compatible default must remain active");
-            assert!(arity.accepts(2), "full arity must remain active");
-            assert!(!arity.accepts(0), "under-arity must remain rejected");
-            assert!(!arity.accepts(3), "incompatible donor must remain ignored");
-        }
-    }
-
-    #[test]
-    fn cpp_callable_arity_applies_defaulted_header_to_definition_target() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let definition_file = ProjectFile::new(root.clone(), "api.cpp");
-        let header_file = ProjectFile::new(root.clone(), "api.hpp");
-        fs::write(
-            header_file.abs_path(),
-            "#define API\n".to_string()
-                + "class XMLNode; class XMLElement;\n"
-                + "class API XMLElement : public XMLNode {\n"
-                + "public:\n"
-                + "  const char* Name() const { return Value(); }\n"
-                + "  const char* Attribute(const char* name, const char* value = 0) const;\n"
-                + "};\n}\n",
-        )
-        .expect("write declaration fixture");
-        fs::write(
-            root.join("api.cpp"),
-            "#include \"api.hpp\"\n".to_string()
-                + "const char* XMLElement::Attribute(const char* name, const char* value) const {\n"
-                + "  return value ? value : name;\n"
-                + "}\n",
-        )
-        .expect("write definition fixture");
-        let consumer_file = ProjectFile::new(root.clone(), "consumer.cpp");
-        fs::write(
-            consumer_file.abs_path(),
-            "#include \"api.hpp\"\n".to_string()
-                + "const char* consume(const XMLElement* element) {\n"
-                + "  return element->Attribute(\"name\");\n"
-                + "}\n",
-        )
-        .expect("write consumer fixture");
-        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
-            &root,
-            crate::analyzer::Language::Cpp,
-        ));
-        let target = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| {
-                unit.is_function()
-                    && unit.identifier() == "Attribute"
-                    && unit.source() == &definition_file
-            })
-            .expect("out-of-line definition");
-        let header_attribute = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|unit| {
-                unit.is_function()
-                    && unit.identifier() == "Attribute"
-                    && unit.source() == &header_file
-            })
-            .expect("header declaration");
-        assert_eq!(
-            header_attribute.fq_name(),
-            "XMLElement.Attribute",
-            "fragmented export-macro members keep their recovered class owner"
-        );
-        let roots = HashSet::from_iter([consumer_file.clone()]);
-        let visibility = VisibilityIndex::build(&analyzer, &analyzer, &roots);
-        let prepared = analyzer
-            .prepared_syntax(&consumer_file)
-            .expect("prepared consumer");
-        let spec = TargetSpec::from_target(&analyzer, &target)
-            .expect("target spec")
-            .with_visible_callable_arities(
-                &analyzer,
-                &analyzer,
-                &visibility,
-                &consumer_file,
-                prepared.as_ref(),
-            )
-            .into_owned();
-        let arity = spec.callable_arity_at(usize::MAX).expect("callable arity");
-        assert!(
-            arity.accepts(1),
-            "header default must remain callable: {arity:?}"
-        );
-        assert!(
-            arity.accepts(2),
-            "full parameter list must remain callable: {arity:?}"
-        );
-        assert!(
-            !arity.accepts(0),
-            "required parameter must remain enforced: {arity:?}"
-        );
     }
 }

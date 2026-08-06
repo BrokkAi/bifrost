@@ -73,8 +73,9 @@ impl ImportAnalysisProvider for CppAnalyzer {
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         let source = code_unit.source();
-        let identifiers = self
-            .extract_type_identifiers(&self.inner.get_source(code_unit, true).unwrap_or_default());
+        let identifiers = brokk_bifrost_cpp::imports::extract_type_identifiers(
+            &self.inner.get_source(code_unit, true).unwrap_or_default(),
+        );
         self.inner
             .import_statements(source)
             .iter()
