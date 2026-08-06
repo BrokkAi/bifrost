@@ -99,6 +99,7 @@ pub enum DetailedCodeQueryDomain {
     CallArgumentGroup,
     CallArgument,
     ReceiverEvidence,
+    MemberSelection,
     Occurrence,
     LexicalScope,
     Binding,
@@ -132,6 +133,7 @@ pub const ALL_DETAILED_CODE_QUERY_DOMAINS: &[DetailedCodeQueryDomain] = &[
     DetailedCodeQueryDomain::CallArgumentGroup,
     DetailedCodeQueryDomain::CallArgument,
     DetailedCodeQueryDomain::ReceiverEvidence,
+    DetailedCodeQueryDomain::MemberSelection,
     DetailedCodeQueryDomain::Occurrence,
     DetailedCodeQueryDomain::LexicalScope,
     DetailedCodeQueryDomain::Binding,
@@ -273,6 +275,7 @@ impl DetailedCodeQueryDomain {
             QueryValueKind::CallArgumentGroup => Self::CallArgumentGroup,
             QueryValueKind::CallArgument => Self::CallArgument,
             QueryValueKind::ReceiverEvidence => Self::ReceiverEvidence,
+            QueryValueKind::MemberSelection => Self::MemberSelection,
             QueryValueKind::Occurrence => Self::Occurrence,
             QueryValueKind::LexicalScope => Self::LexicalScope,
             QueryValueKind::Binding => Self::Binding,
@@ -309,6 +312,7 @@ impl DetailedCodeQueryDomain {
             Self::CallArgumentGroup => "call_argument_group",
             Self::CallArgument => "call_argument",
             Self::ReceiverEvidence => "receiver_evidence",
+            Self::MemberSelection => "member_selection",
             Self::Occurrence => "occurrence",
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
@@ -465,6 +469,17 @@ impl DetailedCodeQueryDomain {
                 CodeQueryRowField::optional("name", Scalar::String),
                 CodeQueryRowField::required("spread", Scalar::Boolean),
             ],
+            Self::MemberSelection => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                CodeQueryRowField::required("member", Scalar::String),
+                CodeQueryRowField::required("role", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("outcome", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("selected_count", Scalar::Integer),
+                CodeQueryRowField::required("candidate_count", Scalar::Integer),
+                CodeQueryRowField::required("trace_completeness", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
+            ],
             Self::Occurrence => code_query_row_fields![
                 CodeQueryRowField::required("id", Scalar::StableId),
                 CodeQueryRowField::required("ast_id", Scalar::StableId),
@@ -506,6 +521,7 @@ impl DetailedCodeQueryDomain {
                 CodeQueryRowField::required("trace_completeness", Scalar::ConstrainedEnum),
                 CodeQueryRowField::required("candidate_kind", Scalar::ConstrainedEnum),
                 CodeQueryRowField::optional("candidate_id", Scalar::DeclarationIdentity),
+                CodeQueryRowField::optional("canonical_member_id", Scalar::StableId),
             ],
             Self::GenerationSite => code_query_row_fields![
                 CodeQueryRowField::required("id", Scalar::StableId),
@@ -574,6 +590,44 @@ impl CodeQueryResultValue {
         CodeQueryRowRef { value: self }
     }
 
+    /// The exact display region of this row's own source anchor. `None` when
+    /// the row has no source region of its own (a file row, or an evidence row
+    /// whose location is its site's outcome row).
+    pub fn display_range(&self) -> Option<CodeQueryRange> {
+        match self {
+            Self::StructuralMatch { value } => value.node_range,
+            Self::Declaration { value } => value.node_range,
+            Self::Procedure { value } => Some(value.range),
+            Self::ProgramPoint { value } => Some(value.range),
+            Self::ControlEdge { value } => Some(value.range),
+            Self::TypestateFinding { value } => Some(value.range),
+            Self::TypestateWitness { value } => Some(value.range),
+            Self::FlowEndpoint { value } => Some(value.range),
+            Self::FlowWitness { value } => Some(value.range),
+            Self::TaintFinding { value } => Some(value.range),
+            Self::File { .. } | Self::ReceiverEvidence { .. } => None,
+            Self::ReferenceSite { value } => Some(value.range),
+            Self::CallSite { value } => Some(value.range),
+            Self::ExpressionSite { value } => Some(value.range),
+            Self::ReceiverAnalysis { value } => Some(value.range),
+            Self::ReceiverOutcome { value } => Some(value.range),
+            Self::MemberSelection { value } => Some(value.range),
+            Self::CallShape { value } => Some(value.range),
+            Self::CallArgumentGroup { value } => Some(value.range),
+            Self::CallArgument { value } => Some(value.range),
+            Self::Occurrence { value } => Some(value.range),
+            Self::LexicalScope { value } => Some(value.range),
+            Self::Binding { value } => Some(value.range),
+            Self::ResolutionCandidate { value } => Some(value.range),
+            Self::GenerationSite { value } => Some(value.range),
+            Self::Export { value } => Some(value.range),
+            Self::DeclarationState { value } => value.range,
+            Self::ReferenceEdge { value } => Some(value.range),
+            Self::QualifiedPath { value } => Some(value.range),
+            Self::PathSegment { value } => Some(value.range),
+        }
+    }
+
     pub const fn detailed_domain(&self) -> DetailedCodeQueryDomain {
         match self {
             Self::StructuralMatch { .. } => DetailedCodeQueryDomain::StructuralMatch,
@@ -596,6 +650,7 @@ impl CodeQueryResultValue {
             Self::CallShape { .. } => DetailedCodeQueryDomain::CallShape,
             Self::CallArgumentGroup { .. } => DetailedCodeQueryDomain::CallArgumentGroup,
             Self::CallArgument { .. } => DetailedCodeQueryDomain::CallArgument,
+            Self::MemberSelection { .. } => DetailedCodeQueryDomain::MemberSelection,
             Self::Occurrence { .. } => DetailedCodeQueryDomain::Occurrence,
             Self::LexicalScope { .. } => DetailedCodeQueryDomain::LexicalScope,
             Self::Binding { .. } => DetailedCodeQueryDomain::Binding,
@@ -926,6 +981,33 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::ReceiverEvidence { value }, "completeness") => {
             Some(Scalar::ConstrainedEnum(value.completeness))
         }
+        (CodeQueryResultValue::MemberSelection { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::MemberSelection { value }, "site_ast_id") => {
+            Some(Scalar::StableId(&value.site_ast_id))
+        }
+        (CodeQueryResultValue::MemberSelection { value }, "member") => {
+            Some(Scalar::String(&value.member))
+        }
+        (CodeQueryResultValue::MemberSelection { value }, "role") => {
+            Some(Scalar::ConstrainedEnum(value.role))
+        }
+        (CodeQueryResultValue::MemberSelection { value }, "outcome") => {
+            Some(Scalar::ConstrainedEnum(value.outcome))
+        }
+        (CodeQueryResultValue::MemberSelection { value }, "selected_count") => {
+            Some(Scalar::Integer(value.selected_count as u64))
+        }
+        (CodeQueryResultValue::MemberSelection { value }, "candidate_count") => {
+            Some(Scalar::Integer(value.candidate_count as u64))
+        }
+        (CodeQueryResultValue::MemberSelection { value }, "trace_completeness") => {
+            Some(Scalar::ConstrainedEnum(value.trace_completeness))
+        }
+        (CodeQueryResultValue::MemberSelection { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
         (CodeQueryResultValue::Occurrence { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::Occurrence { value }, "ast_id") => {
             Some(Scalar::StableId(&value.ast_id))
@@ -1030,6 +1112,9 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::ResolutionCandidate { value }, "candidate_kind") => {
             Some(Scalar::ConstrainedEnum(value.candidate.label()))
+        }
+        (CodeQueryResultValue::ResolutionCandidate { value }, "canonical_member_id") => {
+            value.canonical_member_id.as_deref().map(Scalar::StableId)
         }
         (CodeQueryResultValue::ResolutionCandidate { value }, "candidate_id") => {
             match &value.candidate {
@@ -1245,6 +1330,10 @@ pub enum DetailedCodeQueryKey {
         id: String,
         group_id: String,
     },
+    MemberSelection {
+        id: String,
+        site_ast_id: String,
+    },
     Occurrence {
         id: String,
         ast_id: String,
@@ -1400,6 +1489,10 @@ impl DetailedCodeQueryResult {
                         | (
                             DetailedCodeQueryDomain::CallArgument,
                             DetailedCodeQueryKey::CallArgument { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::MemberSelection,
+                            DetailedCodeQueryKey::MemberSelection { .. }
                         )
                         | (
                             DetailedCodeQueryDomain::Occurrence,
@@ -1567,6 +1660,7 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::CallShape { .. }
         | CodeQueryResultValue::CallArgumentGroup { .. }
         | CodeQueryResultValue::CallArgument { .. }
+        | CodeQueryResultValue::MemberSelection { .. }
         | CodeQueryResultValue::Occurrence { .. }
         | CodeQueryResultValue::LexicalScope { .. }
         | CodeQueryResultValue::Binding { .. }
@@ -1624,6 +1718,7 @@ fn assert_detailed_terminal_identities(
                 | DetailedCodeQueryDomain::CallShape
                 | DetailedCodeQueryDomain::CallArgumentGroup
                 | DetailedCodeQueryDomain::CallArgument
+                | DetailedCodeQueryDomain::MemberSelection
                 // An occurrence's identity is its own content-scoped digest,
                 // carried in the typed key rather than in a semantic-artifact
                 // identity candidate. The three lexical-environment domains
@@ -1680,6 +1775,7 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::CallShape { .. }
         | DetailedCodeQueryKey::CallArgumentGroup { .. }
         | DetailedCodeQueryKey::CallArgument { .. }
+        | DetailedCodeQueryKey::MemberSelection { .. }
         | DetailedCodeQueryKey::Occurrence { .. }
         | DetailedCodeQueryKey::LexicalScope { .. }
         | DetailedCodeQueryKey::Binding { .. }

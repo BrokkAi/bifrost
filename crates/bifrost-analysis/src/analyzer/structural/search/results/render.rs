@@ -25,6 +25,7 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::CallShape { .. }
                 | CodeQueryResultValue::CallArgumentGroup { .. }
                 | CodeQueryResultValue::CallArgument { .. }
+                | CodeQueryResultValue::MemberSelection { .. }
                 | CodeQueryResultValue::Occurrence { .. }
                 | CodeQueryResultValue::LexicalScope { .. }
                 | CodeQueryResultValue::Binding { .. }
@@ -303,6 +304,18 @@ impl CodeQueryResult {
                                 .unwrap_or_default(),
                             if value.spread { "; spread" } else { "" },
                             value.group_id
+                        ));
+                    }
+                    CodeQueryResultValue::MemberSelection { value } => {
+                        out.push_str(&format!(
+                            "[member selection; {}; {}; {}] `{}` selected={} candidates={} site_ast={}\n",
+                            value.outcome,
+                            value.trace_completeness,
+                            value.coverage,
+                            value.member,
+                            value.selected_count,
+                            value.candidate_count,
+                            value.site_ast_id
                         ));
                     }
                     CodeQueryResultValue::Occurrence { value } => {

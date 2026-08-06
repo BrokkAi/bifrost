@@ -11,7 +11,7 @@ Receiver-bearing structural sites can expose Bifrost's bounded, demand-driven re
 
 Every analyzed input produces a `receiver_analysis` row. Read its `outcome` before using its candidates: `precise`, `ambiguous`, `unknown`, `unsupported`, and `exceeded_budget` are distinct states. This is not whole-program points-to, general alias analysis, path-sensitive control flow, taint, or data-flow analysis.
 
-> Last verified end to end: 2026-07-23 (`query_code` schema version 1).
+> Last verified end to end: 2026-08-06 (`query_code` schema version 1).
 
 ## Fixture
 
@@ -179,6 +179,53 @@ The conditional initializer has two bounded candidates. The row remains `ambiguo
 <!-- code-query-case:call-input:expected -->
 ```json
 {"diagnostics":[{"code":"call_relation_candidates_omitted","impact":"incomplete","language":"typescript","message":"omitted 1 unresolved call candidate for consume"}],"results":[{"analysis_kind":"points_to","input_kind":"new_expression","language":"typescript","outcome":"ambiguous","path":"receiver.ts","provenance":[{"seed":{"end_line":15,"kind":"function","path":"receiver.ts","result_type":"structural_match","start_line":13},"steps":[{"op":"enclosing_decl","result":{"end_line":15,"fq_name":"consume","kind":"function","path":"receiver.ts","result_type":"declaration","start_line":13}},{"op":"call_sites_to","result":{"callee_fq_name":"consume","caller_fq_name":"caller","path":"receiver.ts","proof":"proven","range":{"end_column":25,"end_line":27,"start_column":3,"start_line":27},"result_type":"call_site"}},{"op":"call_input","result":{"input_kind":"parameter","parameter_index":0,"parameter_name":"value","path":"receiver.ts","range":{"end_column":24,"end_line":27,"start_column":11,"start_line":27},"result_type":"expression_site"}},{"op":"points_to","result":{"analysis_kind":"points_to","outcome":"ambiguous","path":"receiver.ts","range":{"end_column":24,"end_line":27,"start_column":11,"start_line":27},"result_type":"receiver_analysis"}}]}],"range":{"end_column":24,"end_line":27,"start_column":11,"start_line":27},"result_type":"receiver_analysis","site_ast_id":"01e2b18de6dd19bf52a4ebb0548414819c79c39c73fe7167079de6e921469833","site_id":"423d0e474a2c4b918970d404b5c661a7ac9c3637218eac76bcb27a18fa25b560","text":"new Service()","values":[{"allocation_site":{"path":"receiver.ts","range":{"end_column":24,"end_line":27,"start_column":11,"start_line":27}},"receiver_value_kind":"allocation_site","type_declaration":{"end_line":3,"fq_name":"Service","kind":"class","language":"typescript","path":"receiver.ts","signature":"class Service {","start_line":1}}]}],"truncated":false}
+```
+
+## Typed Receiver Rows
+
+The nested report above is the compatibility projection. Policy evaluation and relational assertions consume the same analysis as flat typed rows instead:
+
+- `receiver_outcome` projects the mandatory terminal row for each analyzed site. It always exists, even when the site is unknown, unsupported, or over budget, and it states `coverage` explicitly so an empty evidence set can never masquerade as a proven-empty value set.
+- `receiver_evidence` projects one row per retained receiver observation. Rows carry stable `site_id`/`id` keys, so a policy joins evidence to its outcome (and to occurrence rows via `site_ast_id`) by identity, never by range or spelling.
+
+<!-- code-query-case:receiver-outcome-row:rql -->
+```lisp
+(receiver-outcome
+  (points-to :capture receiver
+    (language typescript
+      (call :callee "run"
+        :receiver (identifier :name "direct" :capture "receiver")))))
+```
+
+<!-- code-query-case:receiver-outcome-row:json -->
+```json
+{"languages":["typescript"],"match":{"kind":"call","callee":{"name":"run"},"receiver":{"kind":"identifier","name":"direct","capture":"receiver"}},"steps":[{"op":"points_to","capture":"receiver"},{"op":"receiver_outcome"}]}
+```
+
+<!-- code-query-case:receiver-outcome-row:expected -->
+```json
+{"results":[{"analysis_kind":"points_to","candidate_count":1,"candidates_truncated":false,"coverage":"exhaustive","id":"747fe544c97ced0ee644792ffa6320d73c729fcc91886a218c6ca9e205d0971e","language":"typescript","outcome":"precise","path":"receiver.ts","provenance":[{"seed":{"end_line":19,"kind":"call","path":"receiver.ts","result_type":"structural_match","start_line":19},"steps":[{"op":"points_to","result":{"analysis_kind":"points_to","capture":"receiver","outcome":"precise","path":"receiver.ts","range":{"end_column":9,"end_line":19,"start_column":3,"start_line":19},"result_type":"receiver_analysis"}},{"op":"receiver_outcome","result":{"coverage":"exhaustive","id":"747fe544c97ced0ee644792ffa6320d73c729fcc91886a218c6ca9e205d0971e","outcome":"precise","path":"receiver.ts","range":{"end_column":9,"end_line":19,"start_column":3,"start_line":19},"result_type":"receiver_outcome","site_id":"747fe544c97ced0ee644792ffa6320d73c729fcc91886a218c6ca9e205d0971e"}}]}],"range":{"end_column":9,"end_line":19,"start_column":3,"start_line":19},"result_type":"receiver_outcome","scope_nodes":1866,"setup_nodes":94,"site_ast_id":"644d2e02537cb72d9210252f7c3248decccdd2c518598e843cf8dc1ec6b69da6","site_id":"747fe544c97ced0ee644792ffa6320d73c729fcc91886a218c6ca9e205d0971e","summary_expansions":15}],"truncated":false}
+```
+
+A factory receiver's evidence is a parent-linked chain: the `factory_return` row is hop zero, and the value it returned links back through `parent_evidence_id`.
+
+<!-- code-query-case:receiver-evidence-rows:rql -->
+```lisp
+(receiver-evidence
+  (points-to :capture receiver
+    (language typescript
+      (call :callee "run"
+        :receiver (identifier :name "factory" :capture "receiver")))))
+```
+
+<!-- code-query-case:receiver-evidence-rows:json -->
+```json
+{"languages":["typescript"],"match":{"kind":"call","callee":{"name":"run"},"receiver":{"kind":"identifier","name":"factory","capture":"receiver"}},"steps":[{"op":"points_to","capture":"receiver"},{"op":"receiver_evidence"}]}
+```
+
+<!-- code-query-case:receiver-evidence-rows:expected -->
+```json
+{"results":[{"chain_hop":0,"completeness":"exhaustive","evidence_kind":"factory_return","factory_id":"receiver.ts:function:makeService:58-108","id":"0ee4afdbb0b506ed500bbb6a68041b9fd849dd45f8f22ab13478f436dd4b3d81","ordinal":0,"path":"receiver.ts","proof":"precise","provenance":[{"seed":{"end_line":22,"kind":"call","path":"receiver.ts","result_type":"structural_match","start_line":22},"steps":[{"op":"points_to","result":{"analysis_kind":"points_to","capture":"receiver","outcome":"precise","path":"receiver.ts","range":{"end_column":10,"end_line":22,"start_column":3,"start_line":22},"result_type":"receiver_analysis"}},{"op":"receiver_evidence","result":{"evidence_kind":"factory_return","id":"0ee4afdbb0b506ed500bbb6a68041b9fd849dd45f8f22ab13478f436dd4b3d81","path":"receiver.ts","range":{"end_column":10,"end_line":22,"start_column":3,"start_line":22},"result_type":"receiver_evidence","site_id":"b11939a3de8d043c2258aae65e077776e6e04cd3668e54e74a9619a5dfd33f22"}}]}],"result_type":"receiver_evidence","site_ast_id":"57160e0d9392a6946802427b070c3b045d15b778b892a30c6b4e3cbab7a4606c","site_id":"b11939a3de8d043c2258aae65e077776e6e04cd3668e54e74a9619a5dfd33f22"},{"chain_hop":1,"completeness":"exhaustive","declaration_fq_name":"Service","declaration_id":"receiver.ts:class:Service:0-28","declaration_kind":"class","evidence_kind":"allocation_site","id":"9f86031ff1c1abb2afa89aea90aff62064dbe8e31ade74ab16d4bf76ebf3670b","ordinal":0,"parent_evidence_id":"0ee4afdbb0b506ed500bbb6a68041b9fd849dd45f8f22ab13478f436dd4b3d81","path":"receiver.ts","proof":"precise","provenance":[{"seed":{"end_line":22,"kind":"call","path":"receiver.ts","result_type":"structural_match","start_line":22},"steps":[{"op":"points_to","result":{"analysis_kind":"points_to","capture":"receiver","outcome":"precise","path":"receiver.ts","range":{"end_column":10,"end_line":22,"start_column":3,"start_line":22},"result_type":"receiver_analysis"}},{"op":"receiver_evidence","result":{"evidence_kind":"allocation_site","id":"9f86031ff1c1abb2afa89aea90aff62064dbe8e31ade74ab16d4bf76ebf3670b","path":"receiver.ts","range":{"end_column":10,"end_line":22,"start_column":3,"start_line":22},"result_type":"receiver_evidence","site_id":"b11939a3de8d043c2258aae65e077776e6e04cd3668e54e74a9619a5dfd33f22"}}]}],"result_type":"receiver_evidence","site_ast_id":"57160e0d9392a6946802427b070c3b045d15b778b892a30c6b4e3cbab7a4606c","site_id":"b11939a3de8d043c2258aae65e077776e6e04cd3668e54e74a9619a5dfd33f22"}],"truncated":false}
 ```
 
 ## Capability And Safety Boundary

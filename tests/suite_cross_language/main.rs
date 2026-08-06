@@ -18,6 +18,7 @@ mod code_query_docs;
 mod code_query_edge_conformance;
 mod code_query_lexical_environment;
 mod code_query_materialization;
+mod code_query_member_dispatch;
 mod code_query_occurrences;
 mod code_query_pipelines;
 mod code_query_public_api;

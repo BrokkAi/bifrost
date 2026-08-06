@@ -28,6 +28,41 @@ pub fn reference_candidate_ranges(
     .expect("non-cancellable collection cannot be cancelled")
 }
 
+/// Return whether a structured reference range must use a point lookup.
+///
+/// Some C++ names are composite grammar nodes that begin with the lexical
+/// token `operator`. Definition lookup must receive a point inside that token,
+/// while callers retain the complete structured range as the reference
+/// identity.
+pub fn reference_candidate_requires_point_lookup(
+    root: Node<'_>,
+    language: Language,
+    range: &Range,
+) -> bool {
+    if language != Language::Cpp {
+        return false;
+    }
+    let Some(mut node) = root.named_descendant_for_byte_range(range.start_byte, range.end_byte)
+    else {
+        return false;
+    };
+    loop {
+        if matches!(
+            node.kind(),
+            "operator_name" | "operator_cast" | "literal_operator_name"
+        ) {
+            return true;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if parent.start_byte() != range.start_byte || parent.end_byte() != range.end_byte {
+            return false;
+        }
+        node = parent;
+    }
+}
+
 pub(crate) fn reference_candidate_ranges_cancellable(
     root: Node<'_>,
     language: Language,

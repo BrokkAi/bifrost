@@ -66,6 +66,7 @@ pub enum QueryValueKind {
     CallShape,
     CallArgumentGroup,
     CallArgument,
+    MemberSelection,
     Occurrence,
     LexicalScope,
     Binding,
@@ -101,6 +102,7 @@ impl QueryValueKind {
             Self::CallShape => "call_shape",
             Self::CallArgumentGroup => "call_argument_group",
             Self::CallArgument => "call_argument",
+            Self::MemberSelection => "member_selection",
             Self::Occurrence => "occurrence",
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
@@ -265,6 +267,7 @@ pub enum QueryStep {
     CallShape,
     CallArgumentGroups,
     CallArguments,
+    MemberSelection,
     OccurrencesOf(OccurrenceFilter),
     OccurrencesIn(OccurrenceFilter),
     OccurrenceTarget,
@@ -746,6 +749,7 @@ impl QueryStep {
             Self::CallShape => QueryStepOp::CallShape,
             Self::CallArgumentGroups => QueryStepOp::CallArgumentGroups,
             Self::CallArguments => QueryStepOp::CallArguments,
+            Self::MemberSelection => QueryStepOp::MemberSelection,
             Self::OccurrencesOf(_) => QueryStepOp::OccurrencesOf,
             Self::OccurrencesIn(_) => QueryStepOp::OccurrencesIn,
             Self::OccurrenceTarget => QueryStepOp::OccurrenceTarget,
@@ -814,6 +818,7 @@ impl QueryStep {
             QueryStepOp::CallShape => Some(Self::CallShape),
             QueryStepOp::CallArgumentGroups => Some(Self::CallArgumentGroups),
             QueryStepOp::CallArguments => Some(Self::CallArguments),
+            QueryStepOp::MemberSelection => Some(Self::MemberSelection),
             QueryStepOp::OccurrencesOf => Some(Self::OccurrencesOf(OccurrenceFilter::default())),
             QueryStepOp::OccurrencesIn => Some(Self::OccurrencesIn(OccurrenceFilter::default())),
             QueryStepOp::OccurrenceTarget => Some(Self::OccurrenceTarget),
@@ -888,6 +893,7 @@ impl QueryStep {
                 | QueryValueKind::CallShape
                 | QueryValueKind::CallArgumentGroup
                 | QueryValueKind::CallArgument
+                | QueryValueKind::MemberSelection
                 | QueryValueKind::Occurrence
                 | QueryValueKind::LexicalScope
                 | QueryValueKind::Binding
@@ -952,6 +958,9 @@ impl QueryStep {
             }
             (Self::CallArguments, QueryValueKind::CallArgumentGroup) => {
                 Some(QueryValueKind::CallArgument)
+            }
+            (Self::MemberSelection, QueryValueKind::Occurrence) => {
+                Some(QueryValueKind::MemberSelection)
             }
             (Self::OccurrencesOf(_), QueryValueKind::Declaration) => {
                 Some(QueryValueKind::Occurrence)
@@ -1075,6 +1084,7 @@ pub(super) fn validate_query_steps(
             QueryStep::CallShape => "structural_match, call_site, or occurrence",
             QueryStep::CallArgumentGroups => "call_shape",
             QueryStep::CallArguments => "call_argument_group",
+            QueryStep::MemberSelection => "occurrence",
             QueryStep::OccurrencesOf(_) => "declaration",
             QueryStep::OccurrencesIn(_) => "structural_match or file",
             QueryStep::OccurrenceTarget => "occurrence",

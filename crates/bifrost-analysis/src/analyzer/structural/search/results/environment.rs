@@ -204,6 +204,12 @@ pub struct CodeQueryResolutionCandidate {
     pub candidate: CodeQueryCandidateRef,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_target: Option<String>,
+    /// The #1475 canonical identity digest of a unit-backed candidate:
+    /// domain-separated over the identity's kind-tagged segments, namespace,
+    /// language, and recorded generic arity -- never over a rendered FQN
+    /// string. `None` for candidates without a workspace declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_member_id: Option<String>,
 }
 
 /// One canonical reference edge (#1479).

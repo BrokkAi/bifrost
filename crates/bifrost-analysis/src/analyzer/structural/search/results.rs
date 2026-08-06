@@ -343,6 +343,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryCallShapeArgument>,
     },
+    MemberSelection {
+        #[serde(flatten)]
+        value: Box<CodeQueryMemberSelection>,
+    },
     Occurrence {
         #[serde(flatten)]
         value: Box<CodeQueryOccurrence>,

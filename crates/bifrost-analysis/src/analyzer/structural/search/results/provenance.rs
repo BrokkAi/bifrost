@@ -174,6 +174,14 @@ pub enum CodeQueryResultRef {
         range: CodeQueryRange,
         argument_index: usize,
     },
+    MemberSelection {
+        id: String,
+        site_ast_id: String,
+        path: String,
+        range: CodeQueryRange,
+        outcome: &'static str,
+        coverage: &'static str,
+    },
     Occurrence {
         id: String,
         ast_id: String,

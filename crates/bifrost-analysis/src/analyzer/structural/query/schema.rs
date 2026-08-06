@@ -429,6 +429,7 @@ query_step_ops! {
     CallShape { label: "call_shape", signature: "structural_match|call_site|occurrence -> call_shape", description: "Project the mandatory structured call-shape outcome row for each exact call site." }
     CallArgumentGroups { label: "call_argument_groups", signature: "call_shape -> call_argument_group", description: "Project the ordered argument-list group rows of each call shape." }
     CallArguments { label: "call_arguments", signature: "call_argument_group -> call_argument", description: "Project the ordered argument rows of each argument-list group." }
+    MemberSelection { label: "member_selection", signature: "occurrence -> member_selection", description: "Project the mandatory member-selection summary row for each reference occurrence, from the production resolver's own candidate trace." }
     OccurrencesOf { label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it." }
     OccurrencesIn { label: "occurrences_in", signature: "structural_match|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or file." }
     OccurrenceTarget { label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences." }
@@ -592,6 +593,7 @@ macro_rules! rql_forms {
                     | Self::CallShape
                     | Self::CallArgumentGroups
                     | Self::CallArguments
+                    | Self::MemberSelection
                     | Self::Occurrences
                     | Self::OccurrencesOf
                     | Self::OccurrencesIn
@@ -995,6 +997,14 @@ rql_forms! {
         signature: "(call-arguments query)",
         description: (QueryStepOp::CallArguments),
         step: CallArguments,
+    }
+    MemberSelection {
+        labels: ["member-selection", "member_selection"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(member-selection query)",
+        description: (QueryStepOp::MemberSelection),
+        step: MemberSelection,
     }
     Occurrences {
         labels: ["occurrences", "occurrence"],

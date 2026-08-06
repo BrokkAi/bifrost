@@ -538,6 +538,16 @@ pub(super) fn selected_site_quality(
                     )
                 },
             ),
+            CodeQueryResultValue::MemberSelection { value } => (
+                ProofStatus::Proven,
+                if value.coverage == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("member selection coverage is {}", value.coverage).into(),
+                    )
+                },
+            ),
             CodeQueryResultValue::StructuralMatch { .. }
             | CodeQueryResultValue::Declaration { .. }
             | CodeQueryResultValue::File { .. }

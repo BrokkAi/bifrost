@@ -2214,6 +2214,7 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::CallShape
             | QueryValueKind::CallArgumentGroup
             | QueryValueKind::CallArgument
+            | QueryValueKind::MemberSelection
             | QueryValueKind::Procedure
             | QueryValueKind::ProgramPoint
             | QueryValueKind::ControlEdge
@@ -2743,7 +2744,8 @@ fn terminal_presentation(
         | CodeQueryResultValue::ReceiverEvidence { .. }
         | CodeQueryResultValue::CallShape { .. }
         | CodeQueryResultValue::CallArgumentGroup { .. }
-        | CodeQueryResultValue::CallArgument { .. } => return Err(()),
+        | CodeQueryResultValue::CallArgument { .. }
+        | CodeQueryResultValue::MemberSelection { .. } => return Err(()),
         CodeQueryResultValue::Occurrence { value } => (
             DetailedCodeQueryDomain::Occurrence,
             value.path.as_str(),
@@ -3394,6 +3396,7 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::ExpressionSite { .. } => "expression_site",
         CodeQueryResultRef::ReceiverAnalysis { .. } => "receiver_analysis",
         CodeQueryResultRef::ReceiverOutcome { .. } => "receiver_outcome",
+        CodeQueryResultRef::MemberSelection { .. } => "member_selection",
         CodeQueryResultRef::ReceiverEvidence { .. } => "receiver_evidence",
         CodeQueryResultRef::CallShape { .. } => "call_shape",
         CodeQueryResultRef::CallArgumentGroup { .. } => "call_argument_group",
@@ -3433,6 +3436,7 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::CallShape { path, .. }
         | CodeQueryResultRef::CallArgumentGroup { path, .. }
         | CodeQueryResultRef::CallArgument { path, .. }
+        | CodeQueryResultRef::MemberSelection { path, .. }
         | CodeQueryResultRef::Occurrence { path, .. }
         | CodeQueryResultRef::LexicalScope { path, .. }
         | CodeQueryResultRef::Binding { path, .. }
@@ -3494,7 +3498,8 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::ReceiverEvidence
         | DetailedCodeQueryDomain::CallShape
         | DetailedCodeQueryDomain::CallArgumentGroup
-        | DetailedCodeQueryDomain::CallArgument => None,
+        | DetailedCodeQueryDomain::CallArgument
+        | DetailedCodeQueryDomain::MemberSelection => None,
     }
 }
 
@@ -3670,6 +3675,10 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, group_id.as_bytes());
         }
+        DetailedCodeQueryKey::MemberSelection { id, site_ast_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, site_ast_id.as_bytes());
+        }
     }
     let digest: [u8; 32] = hasher.finalize().into();
     let mut encoded = String::with_capacity(64);
@@ -3721,6 +3730,7 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::CallShape => "call_shape",
         DetailedCodeQueryDomain::CallArgumentGroup => "call_argument_group",
         DetailedCodeQueryDomain::CallArgument => "call_argument",
+        DetailedCodeQueryDomain::MemberSelection => "member_selection",
         DetailedCodeQueryDomain::Occurrence => "occurrence",
         DetailedCodeQueryDomain::ReferenceEdge => "reference_edge",
         DetailedCodeQueryDomain::LexicalScope => "lexical_scope",

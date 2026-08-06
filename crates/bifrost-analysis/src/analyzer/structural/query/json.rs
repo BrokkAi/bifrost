@@ -613,6 +613,7 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::CallShape
         | QueryStep::CallArgumentGroups
         | QueryStep::CallArguments => {}
+        QueryStep::MemberSelection => {}
         QueryStep::DeclarationStateOf(filter) => {
             object.extend(declaration_state_filter_to_json(filter));
         }

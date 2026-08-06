@@ -86,6 +86,9 @@ pub(super) fn render_pipeline_item(
         PipelineValue::CallArgument(value) => CodeQueryResultValue::CallArgument {
             value: Box::new(render_call_shape_argument(analyzer, &value, cache)),
         },
+        PipelineValue::MemberSelection(value) => CodeQueryResultValue::MemberSelection {
+            value: Box::new(render_member_selection(analyzer, &value, cache)),
+        },
         PipelineValue::Occurrence(value) => CodeQueryResultValue::Occurrence {
             value: Box::new(render_occurrence(analyzer, &value, detail, cache)),
         },
@@ -192,6 +195,9 @@ pub(super) fn render_provenance(
                             range: rendered.range,
                             argument_index: rendered.argument_index,
                         }
+                    }
+                    PipelineTraceValue::MemberSelection(value) => {
+                        render_member_selection_ref(analyzer, value, cache)
                     }
                     PipelineTraceValue::Occurrence(value) => {
                         render_occurrence_ref(analyzer, value, cache)
@@ -422,6 +428,58 @@ pub(super) fn render_edge_ref(
     }
 }
 
+/// The mandatory member-selection summary for one occurrence, computed from
+/// the production resolver's candidate trace. `untraced` states the language
+/// recorded no trace; it is never rendered as a proven-empty selection.
+pub(super) fn render_member_selection(
+    analyzer: &dyn IAnalyzer,
+    value: &MemberSelectionValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryMemberSelection {
+    use crate::analyzer::usages::get_definition::trace::TraceCompleteness;
+    let row = &value.occurrence;
+    let resolved = if value.selected > 0 {
+        "selected"
+    } else {
+        "unresolved"
+    };
+    let (outcome, trace_completeness, coverage) = match value.completeness {
+        Some(TraceCompleteness::Full) => (resolved, "full", "exhaustive"),
+        Some(TraceCompleteness::SelectionOnly) => (resolved, "selection_only", "open"),
+        None => ("untraced", "absent", "unsupported"),
+    };
+    CodeQueryMemberSelection {
+        id: value.stable_id(),
+        site_ast_id: row.ast_id(),
+        path: rel_path_string(&row.file),
+        language: crate::analyzer::common::language_for_file(&row.file).config_label(),
+        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        member: row.effective_spelling().to_string(),
+        role: row.role.label(),
+        outcome,
+        selected_count: value.selected,
+        candidate_count: value.candidates,
+        trace_completeness,
+        coverage,
+    }
+}
+
+pub(super) fn render_member_selection_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &MemberSelectionValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let rendered = render_member_selection(analyzer, value, cache);
+    CodeQueryResultRef::MemberSelection {
+        id: rendered.id,
+        site_ast_id: rendered.site_ast_id,
+        path: rendered.path,
+        range: rendered.range,
+        outcome: rendered.outcome,
+        coverage: rendered.coverage,
+    }
+}
+
 pub(super) fn render_occurrence(
     analyzer: &dyn IAnalyzer,
     value: &OccurrenceValue,
@@ -575,7 +633,23 @@ pub(super) fn render_resolution_candidate(
             CodeQueryCandidateRef::ExternalRoute { name: name.clone() }
         }
     };
-    environment::public_candidate(value, range, candidate)
+    let canonical_member_id = environment::candidate_unit(&value.candidate.candidate)
+        .map(|unit| canonical_member_digest(analyzer, unit));
+    environment::public_candidate(value, range, candidate, canonical_member_id)
+}
+
+/// A stable, domain-separated digest of one declaration's #1475 canonical
+/// identity. The digest input is the structured identity (kind-tagged
+/// segments, namespace, language, recorded generic arity), never a rendered
+/// FQN or signature string, so same-spelling decoys with different segment
+/// kinds hash apart and aliases/partial types canonicalized by the analyzer
+/// hash together.
+fn canonical_member_digest(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> String {
+    let identity = crate::analyzer::structural::canonical_identity_of(analyzer, unit);
+    let mut hasher = Sha256::new();
+    hasher.update(b"bifrost.canonical_member_id.v1");
+    hasher.update(serde_json::to_vec(&identity).expect("canonical identity serializes"));
+    format!("{:x}", hasher.finalize())
 }
 
 pub(super) fn render_generation_site_ref(
