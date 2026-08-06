@@ -470,6 +470,31 @@ the focus.
       and
       `63efc0366803e9bdbe3680f646bcad991ad9d99ab4c1e923b9c963ecde9b090e`.
       The next active triage repository is rank fourteen `google__wuffs`.
+    - [ ] (2026-08-06 10:18Z) Rank fourteen `google__wuffs` is in
+      depth-first repair at pinned head `46ac36bd`. A clean fresh-epoch
+      baseline had seven missing rows. The repeated-tag visibility correction
+      then changed 37 prior unproven source-fragment rows to missing because
+      those generated fragments omit local include envelopes. Jonathan-assigned
+      issue #1702 now retains these structured matches as unproven when no
+      queried target peer is physically visible. It still rejects a hidden-only
+      target group when a different same-logical peer is visible. The fix is
+      closed and pushed to `origin/master` through merge head `f1bb2c6f`.
+      Focused visibility, repeated-tag, and return-tag tests pass. The full
+      featureless gate passed all suites except one known timing-sensitive C#
+      truncation test under full load; that exact test passed alone in 0.75
+      seconds. The clean-head exact `MemOwner` witness is an exact unproven hit.
+      The clean-head full replay audited 36 files and 10,000 sites, then queried
+      all 606 targets. It reported 2,142 consistent, 17 editor-only, 75
+      honestly unproven, 7,759 inconclusive, and seven missing rows, with no
+      file errors, skips, or truncation. The exact report, full report, and
+      runner SHA-256 values are
+      `50d596748b4cb816f3f1728284bf021fd15de1ec676efc532291ec936469d1d0`,
+      `03a81d43dce5f3b9746767d8b0dd0dc511cc6b5d912ee108d2b576742340da67`,
+      and
+      `407306979b7168b49e71c0b61a070368496f48344729b3f427922896a2b8868b`.
+      The remaining seven rows are owned by assigned issues #1703, #1704,
+      and #1705. Wuffs remains the active repository until all three close and
+      a clean full replay reports zero missing rows.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
