@@ -686,6 +686,14 @@ the focus.
     `2bc031af7a7ed1dad89abdc40a3d0d57a428785714287b04d16cbac144887f5f`
     and
     `e3ba2d02573db0160b935a247357eeee26c18b7ce3cf5a2ccd6b0392932b3e1f`.
+  - [x] (2026-08-06) Completed C# rank twelve
+    `openbullet__OpenBullet2` at pinned head `6b244ac7`. The clean persisted
+    envelope audited 978/978 files, 137,240 candidates, 10,000 sites, and all
+    1,604 inverse targets. It reported 2,553 consistent, 267 editor-only, 38
+    honestly unproven, 7,142 inconclusive, and zero missing rows. It had no
+    file errors, candidate exclusions, skips, or truncation. An independent
+    review found no legitimate new issue. The final JSONL SHA-256 is
+    `becc998d68c02405d7062ffcaf851063321236d0bc214dd4af3426480f413754`.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Java ranks eleven through twenty and publish its evidence and
@@ -928,9 +936,10 @@ the focus.
 
 The expansion is in progress. The exact 110-repository scope comes from the
 live filtered selector. C and C++ ranks eleven through twenty are complete and
-have published language manifests. C# rank eleven NLog is complete through
-closed issues #1735 and #1736. Its final persisted envelope is clean at the
-pushed Bifrost head. The campaign continues with C# rank twelve.
+have published language manifests. C# ranks eleven and twelve are complete.
+NLog closed issues #1735 and #1736. OpenBullet2 needed no issue. Both final
+persisted envelopes are clean at the pushed Bifrost head. The campaign
+continues with C# rank thirteen.
 
 ## Context and Orientation
 
