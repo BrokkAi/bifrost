@@ -69,7 +69,8 @@ pub(crate) use brokk_bifrost_jvm::scala::graph_support::{
     ScalaSource, ScalaTypeKnownness,
 };
 pub(crate) use brokk_bifrost_jvm::scala::imports::{
-    scala_lexical_scope_path_at, scala_lexical_scope_path_checked,
+    scala_enclosing_template_owner_fq_names, scala_lexical_scope_path_at,
+    scala_lexical_scope_path_checked,
 };
 pub(crate) use brokk_bifrost_jvm::scala::supertypes::{
     ScalaSupertypeLookupPath, scala_type_lookup_segments,
@@ -78,7 +79,8 @@ use brokk_bifrost_jvm::scala::test_detection::detect_scala_test_assertion_smells
 /// Scala's pure name, signature and delimiter helpers. They read and produce
 /// strings only, so they moved with the language knowledge they serve.
 pub(crate) use brokk_bifrost_jvm::scala::{
-    scala_nested_type_candidates, scala_normalize_full_name, scala_simple_type_name,
+    scala_default_type_name, scala_nested_type_candidates, scala_normalize_full_name,
+    scala_simple_type_name,
 };
 use clones::build_scala_clone_candidate_data;
 pub(crate) use wildcard_imports::{
@@ -87,47 +89,6 @@ pub(crate) use wildcard_imports::{
     scala_import_path, scala_import_path_candidates, scala_import_visible_at,
     scala_package_prefixes_at, scala_package_prefixes_at_checked,
 };
-
-/// Object/class/trait declarations lexically enclosing a Scala byte
-/// position, innermost first.
-///
-/// A relative Scala import path — and any wildcard-imported member reached
-/// through it — resolves against these enclosing template scopes before the
-/// package (mirroring ordinary qualified-identifier lookup). This walks the
-/// same `ClassRangeIndex` byte-range lookup + `structural_parent_of` chain
-/// that call/type-namespace resolution already uses for "which singleton
-/// owns this site" (see `scala_exact_lexical_singleton_for_call` and
-/// `scala_type_namespace_resolution` in `usages::get_definition::scala`).
-///
-/// Lives here rather than in `usages::get_definition::scala` (where it was
-/// first written, for the import-token click fix) because
-/// `scala::wildcard_imports`'s `resolve_scala_wildcard_import_environment`
-/// needs the identical owner chain for the *usage* side of the same gap
-/// (resolving a member reached through a wildcard import), and
-/// `scala::imports`'s own `wildcard_import_environment` (workspace-wide
-/// import/usage-graph edges) needs it too. `wildcard_imports` is
-/// deliberately analyzer-free and closure-based for testability, so it does
-/// not call this directly; its callers (here, and in `scala::imports`)
-/// compute the owner chain and pass it in via a closure instead.
-pub(crate) fn scala_enclosing_template_owner_fq_names(
-    analyzer: &dyn IAnalyzer,
-    scala: &ScalaAnalyzer,
-    file: &ProjectFile,
-    byte: usize,
-) -> Vec<String> {
-    let mut owners = Vec::new();
-    let mut current =
-        crate::analyzer::usages::inverted_edges::ClassRangeIndex::build(analyzer, file)
-            .enclosing_unit(byte)
-            .cloned();
-    while let Some(owner) = current {
-        current = scala.structural_parent_of(&owner);
-        if owner.is_class() {
-            owners.push(owner.fq_name());
-        }
-    }
-    owners
-}
 
 /// Decode one persisted [`FileState`] into the thirteen per-file facts the
 /// Scala graph reads.
@@ -587,76 +548,6 @@ impl ScalaAnalyzer {
     pub fn bulk_hydration_count_for_test(&self) -> usize {
         self.inner.bulk_hydration_count_for_test()
     }
-}
-
-fn scala_default_type_name(name: &str) -> bool {
-    if scala_standard_arity_type_name(name) {
-        return true;
-    }
-    matches!(
-        name,
-        "Any"
-            | "AnyRef"
-            | "AnyVal"
-            | "Nothing"
-            | "Null"
-            | "Unit"
-            | "Boolean"
-            | "Byte"
-            | "Short"
-            | "Int"
-            | "Long"
-            | "Float"
-            | "Double"
-            | "Char"
-            | "String"
-            | "Array"
-            | "Option"
-            | "Some"
-            | "None"
-            | "Either"
-            | "Left"
-            | "Right"
-            | "List"
-            | "Nil"
-            | "Seq"
-            | "Set"
-            | "Map"
-            | "Iterable"
-            | "Iterator"
-            | "Product"
-            | "PartialFunction"
-            | "Matchable"
-            | "Dynamic"
-            | "Singleton"
-            | "AnyKind"
-            | "CanEqual"
-            | "ValueOf"
-            | "DummyImplicit"
-            | "RuntimeException"
-            | "Exception"
-            | "Throwable"
-            | "Error"
-            | "Object"
-            | "Class"
-            | "Number"
-            | "Math"
-            | "System"
-            | "StringBuilder"
-    )
-}
-
-fn scala_standard_arity_type_name(name: &str) -> bool {
-    for prefix in ["Tuple", "Function", "ContextFunction"] {
-        if let Some(arity) = name
-            .strip_prefix(prefix)
-            .and_then(|value| value.parse::<u8>().ok())
-            && arity <= 22
-        {
-            return true;
-        }
-    }
-    false
 }
 
 fn weight_scala_usage_edges(
