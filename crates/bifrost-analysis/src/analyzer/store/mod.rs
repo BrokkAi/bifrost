@@ -2337,6 +2337,16 @@ impl AnalyzerStore {
         Ok(result)
     }
 
+    /// The namespace of `oid`'s first top-level declaration in source order, as
+    /// the persisted half of `file_namespace_hint_limited`'s fallback.
+    ///
+    /// `top_level_ordinal` is the index a unit had in the parsed file's
+    /// top-level vector, so restricting the scan to non-null ordinals and
+    /// ordering by them reproduces the source order the hydrated branch reads
+    /// off `FileState::top_level_declarations`. Ordering by `unit_key` instead
+    /// answered from an unrelated key order and admitted nested members, which
+    /// made a two-namespace file answer differently depending on whether its
+    /// state was hydrated (#1726).
     pub(crate) fn first_declaration_content_qualifier_for_key_limited(
         &self,
         oid: Oid,
@@ -2363,8 +2373,9 @@ impl AnalyzerStore {
              JOIN blob_meta AS meta
                ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
              WHERE units.blob_oid = ?1 AND units.lang = ?2
+               AND units.top_level_ordinal IS NOT NULL
                AND {PARSED_BLOB_COMPLETE_CONDITION}
-             ORDER BY units.unit_key
+             ORDER BY units.top_level_ordinal
              LIMIT ?3"
         );
         let mut statement = tx.prepare_cached(&sql)?;

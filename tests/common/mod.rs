@@ -12,8 +12,8 @@ pub mod semantic_graph;
 pub mod usage_graph;
 
 use brokk_bifrost::{
-    CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, RubyAnalyzer, SearchToolsService,
-    TestProject,
+    CSharpAnalyzer, CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, RubyAnalyzer,
+    SearchToolsService, TestProject,
 };
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -195,6 +195,21 @@ pub fn go_analyzer_with_files(files: &[(&str, &str)]) -> (BuiltInlineTestProject
     }
     let project = builder.build();
     let analyzer = GoAnalyzer::from_project(project.project().clone());
+    (project, analyzer)
+}
+
+/// An inline C# workspace and a fresh analyzer over it. The project is returned
+/// alongside because it owns the temporary root the analyzer reads from.
+#[allow(dead_code)]
+pub fn csharp_analyzer_with_files(
+    files: &[(&str, &str)],
+) -> (BuiltInlineTestProject, CSharpAnalyzer) {
+    let mut builder = InlineTestProject::with_language(Language::CSharp);
+    for (path, contents) in files {
+        builder = builder.file(*path, *contents);
+    }
+    let project = builder.build();
+    let analyzer = CSharpAnalyzer::from_project(project.project().clone());
     (project, analyzer)
 }
 

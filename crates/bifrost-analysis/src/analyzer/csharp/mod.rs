@@ -225,7 +225,10 @@ impl CSharpAnalyzer {
         namespace
     }
 
-    pub(crate) fn namespace_of_file_limited(
+    /// The bounded twin of [`Self::namespace_of_file`], sharing its memo cell.
+    /// Public because the two spellings are required to agree and the #1726
+    /// regression test calls both against one analyzer in both orders.
+    pub fn namespace_of_file_limited(
         &self,
         file: &ProjectFile,
         limit: usize,

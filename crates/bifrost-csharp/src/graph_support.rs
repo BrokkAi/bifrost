@@ -19,6 +19,7 @@
 use brokk_bifrost_core::analyzer::capabilities::{
     ImportAnalysisProvider, TypeHierarchyProvider, build_reverse_file_index,
 };
+use brokk_bifrost_core::analyzer::code_unit_index::file_namespace_from_top_level_declarations;
 use brokk_bifrost_core::analyzer::model::{CodeUnitType, ImportInfo, SignatureMetadata};
 use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
 use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, ProjectFile};
@@ -135,14 +136,16 @@ pub trait CSharpAnalysisSource:
 
     /// The namespace the store recorded for `file`: `None` when the file has no
     /// recorded state at all, empty when it has state but no namespace. The
-    /// first input to [`Self::namespace_of_file`].
+    /// first input to [`Self::namespace_of_file`]. C#'s extractor never records
+    /// one -- the namespace lives on each declaration -- so in practice the
+    /// declaration fallback is what answers.
     fn package_name_of(&self, file: &ProjectFile) -> Option<String>;
 
     /// The recorded namespace of `file` as at most one row, falling back to the
-    /// first top-level declaration that carries one. `limit` caps the
-    /// declarations inspected. This is a narrower fallback than the one
-    /// [`Self::namespace_of_file`] uses, which is why that method is not a
-    /// default over this one.
+    /// first top-level declaration in source order that carries one. `limit`
+    /// caps the declarations inspected. [`Self::namespace_of_file`] applies the
+    /// same rule at an unbounded budget but reads the hydrating in-memory path,
+    /// so it stays a distinct method rather than a default over this one.
     fn file_namespace_hint_limited(
         &self,
         file: &ProjectFile,
@@ -198,14 +201,19 @@ pub trait CSharpAnalysisSource:
 
     /// The namespace `file`'s declarations sit in, empty when it declares
     /// nothing. When the store recorded no namespace this falls back to the
-    /// first of all the file's declarations that carries one. Memoized per
-    /// file.
+    /// namespace of the file's first top-level declaration in source order.
+    /// Memoized per file.
+    ///
+    /// A file may open more than one namespace; this names the one it opens
+    /// with. Callers that need every namespace of the file must read the
+    /// declarations themselves.
     fn namespace_of_file(&self, file: &ProjectFile) -> String;
 
-    /// [`Self::namespace_of_file`] under a budget. Its fallback scans only
-    /// top-level declarations, in source order rather than in declaration
-    /// order, so for a file holding more than one namespace the two spellings
-    /// can name different ones.
+    /// [`Self::namespace_of_file`] under a budget, answering the same rule from
+    /// the same memo cell. This is the one pair on this trait whose two
+    /// spellings are required to agree: they share
+    /// `memo_caches.namespace_by_file`, so a divergence would make the
+    /// memoized answer depend on which spelling ran first (#1726).
     fn namespace_of_file_limited(
         &self,
         file: &ProjectFile,
@@ -417,18 +425,23 @@ pub fn type_candidates_by_fqn(
 // ---------------------------------------------------------------------------
 
 /// The uncached half of the analyzer's `namespace_of_file`.
+///
+/// Answers the same rule as `namespace_of_file_limited` below, at an unbounded
+/// budget, so the memo cell the two spellings share cannot serve one spelling's
+/// answer to the other (#1726). The earlier fallback scanned every declaration
+/// of the file out of a `BTreeSet`, which named whichever namespace sorted
+/// first rather than whichever one the file opens with.
 pub fn compute_namespace_of_file(source: &dyn CSharpAnalysisSource, file: &ProjectFile) -> String {
-    let package = source.package_name_of(file).unwrap_or_default();
-    if package.is_empty() {
-        source
-            .declarations(file)
-            .into_iter()
-            .map(|unit| unit.package_name().to_string())
-            .find(|package| !package.is_empty())
-            .unwrap_or_default()
-    } else {
-        package
-    }
+    let recorded = source.package_name_of(file).unwrap_or_default();
+    file_namespace_from_top_level_declarations(
+        &recorded,
+        &source.top_level_declarations(file),
+        usize::MAX,
+    )
+    .rows
+    .into_iter()
+    .next()
+    .unwrap_or_default()
 }
 
 /// The uncached half of the analyzer's `namespace_of_file_limited`. A complete

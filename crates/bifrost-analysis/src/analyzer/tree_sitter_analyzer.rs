@@ -23,6 +23,7 @@ pub(crate) use brokk_bifrost_core::analyzer::prepared_syntax::{
 
 use crate::analyzer::CodeUnitIndex;
 use arc_swap::ArcSwapOption;
+use brokk_bifrost_core::analyzer::code_unit_index::file_namespace_from_top_level_declarations;
 
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::project::{OverlayRevision, ProjectSourceOrigin, ProjectSourceSnapshot};
@@ -6726,32 +6727,16 @@ where
         file: &ProjectFile,
         limit: usize,
     ) -> LimitedQueryRows<String> {
+        // One shared rule for every namespace-per-file spelling, bounded or not
+        // (#1726): `declarations` is a HashSet and its persisted twin is keyed
+        // by `unit_key`, so stopping at either one's first qualified unit makes
+        // the answer depend on iteration order rather than on the source.
         fn from_state(state: &FileState, limit: usize) -> LimitedQueryRows<String> {
-            if limit == 0 {
-                return LimitedQueryRows::incomplete(Vec::new(), 0);
-            }
-            if !state.package_name.is_empty() {
-                return LimitedQueryRows::complete(vec![state.package_name.clone()], 1);
-            }
-            let mut inspected = 1usize;
-            // `declarations` is a HashSet, so stopping at its first qualified
-            // unit makes bounded work depend on randomized iteration order.
-            // Top-level declarations retain source order and are sufficient
-            // to recover a file-level namespace when the adapter did not
-            // populate `package_name` directly.
-            for unit in &state.top_level_declarations {
-                if inspected == limit {
-                    return LimitedQueryRows::incomplete(Vec::new(), inspected);
-                }
-                inspected += 1;
-                if !unit.package_name().is_empty() {
-                    return LimitedQueryRows::complete(
-                        vec![unit.package_name().to_string()],
-                        inspected,
-                    );
-                }
-            }
-            LimitedQueryRows::complete(vec![String::new()], inspected)
+            file_namespace_from_top_level_declarations(
+                &state.package_name,
+                &state.top_level_declarations,
+                limit,
+            )
         }
 
         if limit == 0 {

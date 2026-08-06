@@ -15,6 +15,7 @@ mod cpp_macro_sentinel_recovery_test;
 mod cpp_type_hierarchy_test;
 mod csharp_analyzer_test;
 mod csharp_analyzer_update_test;
+mod csharp_namespace_of_file;
 mod csharp_test_detection_test;
 mod go_analyzer_parity;
 mod go_analyzer_test;

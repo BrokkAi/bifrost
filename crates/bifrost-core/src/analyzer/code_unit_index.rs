@@ -17,6 +17,7 @@ use crate::analyzer::model::{
     CodeUnit, Language, ProjectFile, Range, SignatureMetadata, SummaryFileProjection,
 };
 use crate::analyzer::project::Project;
+use crate::analyzer::query_batch::LimitedQueryRows;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -335,6 +336,51 @@ pub fn default_parent_fq_name(code_unit: &CodeUnit) -> Option<String> {
     let interner = crate::analyzer::fq_name::segment_interner();
     let language = crate::analyzer::common::language_for_file(code_unit.source());
     Some(parent.display_native(language, interner))
+}
+
+/// The file-level namespace every spelling of a namespace-per-file query must
+/// answer with: the qualifier the extractor recorded for the file when it is
+/// non-empty, otherwise the namespace carried by the first TOP-LEVEL
+/// declaration in source order.
+///
+/// Only top-level declarations are eligible, because they are the one
+/// declaration sequence that keeps source order everywhere this rule is
+/// evaluated -- the hydrated file state's vector, the
+/// [`CodeUnitIndex::top_level_declarations`] projection and the persisted
+/// `top_level_ordinal` column. Scanning every declaration instead ordered the
+/// scan by `CodeUnit`'s `Ord`, so a file holding two namespaces answered with
+/// whichever namespace happened to sort first; C#'s bounded and unbounded
+/// `namespace_of_file` spellings then disagreed while sharing one memo cell,
+/// which made the memoized answer depend on which spelling ran first (#1726).
+///
+/// `limit` caps the declarations inspected and counts the recorded-qualifier
+/// probe as one of them. `usize::MAX` is the unbounded spelling: the cap can
+/// never be reached, so that batch is always complete.
+pub fn file_namespace_from_top_level_declarations<'a, I>(
+    recorded_qualifier: &str,
+    top_level_declarations: I,
+    limit: usize,
+) -> LimitedQueryRows<String>
+where
+    I: IntoIterator<Item = &'a CodeUnit>,
+{
+    if limit == 0 {
+        return LimitedQueryRows::incomplete(Vec::new(), 0);
+    }
+    if !recorded_qualifier.is_empty() {
+        return LimitedQueryRows::complete(vec![recorded_qualifier.to_string()], 1);
+    }
+    let mut inspected = 1usize;
+    for unit in top_level_declarations {
+        if inspected == limit {
+            return LimitedQueryRows::incomplete(Vec::new(), inspected);
+        }
+        inspected += 1;
+        if !unit.package_name().is_empty() {
+            return LimitedQueryRows::complete(vec![unit.package_name().to_string()], inspected);
+        }
+    }
+    LimitedQueryRows::complete(vec![String::new()], inspected)
 }
 
 #[cfg(test)]
