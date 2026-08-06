@@ -394,6 +394,8 @@ dependencies = [
  "brokk-bifrost-core",
  "cc",
  "regex",
+ "serde",
+ "serde_json",
  "tempfile",
  "tree-sitter",
  "tree-sitter-java",

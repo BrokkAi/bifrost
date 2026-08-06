@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
-use crate::analyzer::StructuredImportScope;
+use brokk_bifrost_core::analyzer::model::StructuredImportScope;
 
-pub(super) struct ScalaSupertypeFact {
-    pub(super) raw: String,
-    pub(super) lookup_path: ScalaSupertypeLookupPath,
+pub(crate) struct ScalaSupertypeFact {
+    pub(crate) raw: String,
+    pub(crate) lookup_path: ScalaSupertypeLookupPath,
 }
 
 /// Parser-derived path used to resolve a Scala supertype without reparsing its
@@ -13,7 +13,7 @@ pub(super) struct ScalaSupertypeFact {
 /// owners such as `Outer.Base`, where the first and last identifiers carry
 /// different resolution semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ScalaSupertypeLookupPath {
+pub struct ScalaSupertypeLookupPath {
     segments: Vec<String>,
     /// Parser-established package scopes at the owner declaration, ordered
     /// outermost to innermost. Sequential clauses retain each intermediate
@@ -26,36 +26,36 @@ pub(crate) struct ScalaSupertypeLookupPath {
 }
 
 impl ScalaSupertypeLookupPath {
-    pub(crate) fn segments(&self) -> &[String] {
+    pub fn segments(&self) -> &[String] {
         &self.segments
     }
 
-    pub(crate) fn package_prefixes(&self) -> &[String] {
+    pub fn package_prefixes(&self) -> &[String] {
         &self.package_prefixes
     }
 
-    pub(crate) fn lexical_scopes(&self) -> &[StructuredImportScope] {
+    pub fn lexical_scopes(&self) -> &[StructuredImportScope] {
         &self.lexical_scopes
     }
 
-    pub(super) fn set_package_prefixes(&mut self, package_prefixes: &[String]) {
+    pub(crate) fn set_package_prefixes(&mut self, package_prefixes: &[String]) {
         self.package_prefixes = package_prefixes.to_vec();
     }
 
-    pub(super) fn set_lexical_scopes(&mut self, lexical_scopes: &[StructuredImportScope]) {
+    pub(crate) fn set_lexical_scopes(&mut self, lexical_scopes: &[StructuredImportScope]) {
         self.lexical_scopes = lexical_scopes.to_vec();
     }
 
-    pub(super) fn encode(&self) -> String {
+    pub(crate) fn encode(&self) -> String {
         serde_json::to_string(self).expect("Scala supertype lookup path is serializable")
     }
 
-    pub(crate) fn decode(value: &str) -> Option<Self> {
+    pub fn decode(value: &str) -> Option<Self> {
         serde_json::from_str(value).ok()
     }
 }
 
-pub(super) fn extract_scala_supertypes(
+pub(crate) fn extract_scala_supertypes(
     declaration: Node<'_>,
     source: &str,
 ) -> Vec<ScalaSupertypeFact> {
@@ -78,7 +78,7 @@ pub(super) fn extract_scala_supertypes(
 /// `enum_case_definitions`, outside the `full_enum_case` node, so derive this
 /// relationship from the parser-owned ancestor chain instead of reconstructing
 /// it from source text.
-pub(super) fn scala_full_enum_case_owner_supertype(
+pub(crate) fn scala_full_enum_case_owner_supertype(
     declaration: Node<'_>,
     source: &str,
 ) -> Option<ScalaSupertypeFact> {
@@ -119,7 +119,7 @@ pub(super) fn scala_full_enum_case_owner_supertype(
 /// template declaration. Local classes and objects are intentionally absent
 /// from the declaration index, so usage analysis needs the same structured AST
 /// facts without inventing a source-text parser.
-pub(crate) fn scala_supertype_lookup_nodes(declaration: Node<'_>) -> Vec<(Node<'_>, Node<'_>)> {
+pub fn scala_supertype_lookup_nodes(declaration: Node<'_>) -> Vec<(Node<'_>, Node<'_>)> {
     let Some(extends_clause) = declaration.child_by_field_name("extend") else {
         return Vec::new();
     };
@@ -129,7 +129,7 @@ pub(crate) fn scala_supertype_lookup_nodes(declaration: Node<'_>) -> Vec<(Node<'
         .collect()
 }
 
-pub(crate) fn scala_type_lookup_segments(node: Node<'_>, source: &str) -> Vec<String> {
+pub fn scala_type_lookup_segments(node: Node<'_>, source: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
@@ -211,7 +211,7 @@ fn collect_parent_type_roots<'tree>(node: Node<'tree>, parents: &mut Vec<Node<'t
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text(node, source)
+    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
 #[cfg(test)]
@@ -222,7 +222,7 @@ mod tests {
     fn facts_for(source: &str, class_name: &str) -> Vec<(String, String)> {
         let mut parser = Parser::new();
         parser
-            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
+            .set_language(&crate::scala::language::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse(source, None).unwrap();
         let mut stack = vec![tree.root_node()];

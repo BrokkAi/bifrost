@@ -467,16 +467,7 @@ pub(in crate::analyzer::usages) fn scala_numeric_builtins(left: &str, right: &st
     NUMERIC.contains(&left) && NUMERIC.contains(&right)
 }
 
-pub(in crate::analyzer::usages) fn scala_literal_type_name(kind: &str) -> Option<&'static str> {
-    match kind {
-        "string" | "string_literal" | "interpolated_string_expression" => Some("String"),
-        "integer_literal" => Some("Int"),
-        "floating_point_literal" => Some("Double"),
-        "boolean_literal" | "true" | "false" => Some("Boolean"),
-        "character_literal" => Some("Char"),
-        _ => None,
-    }
-}
+pub(in crate::analyzer::usages) use brokk_bifrost_jvm::scala::graph::syntax::scala_literal_type_name;
 
 pub(in crate::analyzer::usages) fn scala_extension_receiver_matches_resolved(
     extension_receiver_type: Option<&str>,

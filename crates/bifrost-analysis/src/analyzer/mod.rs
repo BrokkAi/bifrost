@@ -196,7 +196,6 @@ pub use rust::{
     rust_tree_parsed_bytes_for_test,
 };
 pub use scala::ScalaAnalyzer;
-pub(crate) use scala::scala_parenthesized_arity;
 pub use source_content::SourceContent;
 pub use source_ingestion::{
     IngestedSource, SourceIngestionError, SourceIngestionKind, ingest_source_bytes,

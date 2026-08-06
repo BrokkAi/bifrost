@@ -1,116 +1,18 @@
+//! The analysis-side entry point for Scala's structural-clone candidates.
+//!
+//! `CloneCandidateData` and `compact_clone_excerpt` are analysis-owned and the
+//! declaration source comes from the analyzer; the token and AST-label
+//! normalization that knows Scala moved to [`brokk_bifrost_jvm::scala::clones`].
+
 use crate::CloneSmellWeights;
 use crate::analyzer::CodeUnit;
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::clone_detection::{CloneCandidateData, compact_clone_excerpt};
-use tree_sitter::{Node, Parser, Tree};
+use brokk_bifrost_jvm::scala::clones::{
+    build_scala_clone_ast_signature, normalized_clone_tokens_scala,
+};
 
 use super::ScalaAnalyzer;
-
-const SCALA_CLONE_AST_IDENTIFIER_TYPES: &[&str] = &["identifier"];
-const SCALA_CLONE_AST_STRING_TYPES: &[&str] = &["string"];
-const SCALA_CLONE_AST_NUMBER_TYPES: &[&str] = &["integer_literal", "floating_point_literal"];
-
-fn normalized_clone_tokens_scala(source: &str) -> Vec<String> {
-    let Some(tree) = parse_scala_tree(source) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    collect_normalized_leaf_tokens_scala(tree.root_node(), source, &mut out);
-    out
-}
-
-fn collect_normalized_leaf_tokens_scala(node: Node<'_>, source: &str, out: &mut Vec<String>) {
-    if node.named_child_count() == 0 {
-        let token = normalize_scala_clone_leaf_token(node, source);
-        if !token.is_empty() {
-            out.push(token);
-        }
-    }
-    let child_count = node.child_count();
-    for index in 0..child_count {
-        if let Some(child) = node.child(index) {
-            collect_normalized_leaf_tokens_scala(child, source, out);
-        }
-    }
-}
-
-fn normalize_scala_clone_leaf_token(node: Node<'_>, source: &str) -> String {
-    let kind = node.kind();
-    let token = source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or("")
-        .trim();
-    if token.is_empty() || kind == "comment" {
-        return String::new();
-    }
-    if SCALA_CLONE_AST_IDENTIFIER_TYPES.contains(&kind) {
-        return "ID".to_string();
-    }
-    if SCALA_CLONE_AST_STRING_TYPES.contains(&kind) {
-        return "STR".to_string();
-    }
-    if SCALA_CLONE_AST_NUMBER_TYPES.contains(&kind) {
-        return "NUM".to_string();
-    }
-    if matches!(token, "true" | "false") {
-        return "BOOL".to_string();
-    }
-    if token.chars().count() == 1 && token.chars().all(|ch| !ch.is_alphanumeric()) {
-        return format!("OP:{token}");
-    }
-    format!("T:{kind}")
-}
-
-fn build_scala_clone_ast_signature(source: &str) -> String {
-    let Some(tree) = parse_scala_tree(source) else {
-        return String::new();
-    };
-    let mut labels = Vec::new();
-    collect_scala_clone_ast_labels(tree.root_node(), source, &mut labels);
-    labels.join("|")
-}
-
-fn collect_scala_clone_ast_labels(node: Node<'_>, source: &str, out: &mut Vec<String>) {
-    out.push(normalize_scala_clone_ast_label(node, source));
-    let child_count = node.child_count();
-    for index in 0..child_count {
-        if let Some(child) = node.child(index) {
-            collect_scala_clone_ast_labels(child, source, out);
-        }
-    }
-}
-
-fn normalize_scala_clone_ast_label(node: Node<'_>, source: &str) -> String {
-    let kind = node.kind();
-    let text = source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or("")
-        .trim();
-    if SCALA_CLONE_AST_IDENTIFIER_TYPES.contains(&kind) {
-        return "ID".to_string();
-    }
-    if SCALA_CLONE_AST_STRING_TYPES.contains(&kind) {
-        return "STR".to_string();
-    }
-    if SCALA_CLONE_AST_NUMBER_TYPES.contains(&kind) {
-        return "NUM".to_string();
-    }
-    if matches!(text, "true" | "false") {
-        return "BOOL".to_string();
-    }
-    format!("N:{kind}")
-}
-
-fn parse_scala_tree(source: &str) -> Option<Tree> {
-    if crate::analyzer::common::is_unparseable_source(source) {
-        return None;
-    }
-    let mut parser = Parser::new();
-    parser
-        .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
-        .expect("failed to load scala parser");
-    parser.parse(source, None)
-}
 
 pub(super) fn build_scala_clone_candidate_data(
     analyzer: &ScalaAnalyzer,

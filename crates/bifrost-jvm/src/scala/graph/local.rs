@@ -1,5 +1,5 @@
-use crate::analyzer::CodeUnit;
-use crate::analyzer::usages::local_inference::LocalInferenceEngine;
+use brokk_bifrost_core::analyzer::CodeUnit;
+use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
 
 /// The two independent facts known about a Scala local or member binding.
 ///
@@ -8,8 +8,8 @@ use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 /// is referenced. Keeping them separate prevents a field's enclosing class
 /// from being mistaken for the type of the value stored in that field.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(in crate::analyzer::usages) struct ScalaLocalBinding {
-    pub(in crate::analyzer::usages) receiver_type: Option<String>,
+pub struct ScalaLocalBinding {
+    pub receiver_type: Option<String>,
     /// Parser-proven physical declaration for `receiver_type`, when the type
     /// name resolved in this binding's lexical declaration context.
     ///
@@ -17,11 +17,11 @@ pub(in crate::analyzer::usages) struct ScalaLocalBinding {
     /// when a workspace contains multiple source replicas with the same FQN.
     /// Bindings inferred only from logical return types intentionally leave it
     /// absent so those ambiguous lookups continue to fail closed.
-    pub(in crate::analyzer::usages) receiver_declaration: Option<CodeUnit>,
-    pub(in crate::analyzer::usages) declaration_owner: Option<CodeUnit>,
+    pub receiver_declaration: Option<CodeUnit>,
+    pub declaration_owner: Option<CodeUnit>,
 }
 
-pub(in crate::analyzer::usages) fn seed_scala_binding(
+pub fn seed_scala_binding(
     name: &str,
     receiver_type: Option<String>,
     declaration_owner: Option<CodeUnit>,
@@ -41,7 +41,7 @@ pub(in crate::analyzer::usages) fn seed_scala_binding(
     );
 }
 
-pub(in crate::analyzer::usages) fn seed_scala_binding_with_receiver_declaration(
+pub fn seed_scala_binding_with_receiver_declaration(
     name: &str,
     receiver_declaration: CodeUnit,
     declaration_owner: Option<CodeUnit>,
@@ -57,7 +57,7 @@ pub(in crate::analyzer::usages) fn seed_scala_binding_with_receiver_declaration(
     );
 }
 
-pub(in crate::analyzer::usages) fn precise_scala_binding(
+pub fn precise_scala_binding(
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
     name: &str,
 ) -> Option<ScalaLocalBinding> {

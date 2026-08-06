@@ -1,8 +1,8 @@
-use crate::analyzer::CodeUnit;
-use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::CodeUnit;
+use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::Node;
 
-pub(crate) fn scala_type_reference_is_singleton(node: Node<'_>) -> bool {
+pub fn scala_type_reference_is_singleton(node: Node<'_>) -> bool {
     let mut current = Some(node);
     while let Some(candidate) = current {
         if candidate.kind() == "singleton_type" {
@@ -22,7 +22,7 @@ pub(crate) fn scala_type_reference_is_singleton(node: Node<'_>) -> bool {
 /// which owns it. Type-argument nodes interrupt this walk, so `T` in
 /// `Outer[T]` remains its own lookup while `Outer.Member` is considered as one
 /// qualified path.
-pub(crate) fn scala_qualified_type_root(mut node: Node<'_>) -> Node<'_> {
+pub fn scala_qualified_type_root(mut node: Node<'_>) -> Node<'_> {
     while let Some(parent) = node.parent().filter(|parent| {
         matches!(
             parent.kind(),
@@ -47,7 +47,7 @@ pub(crate) fn scala_qualified_type_root(mut node: Node<'_>) -> Node<'_> {
 /// `Ambiguous` preserves two or more distinct physical declarations instead
 /// of collapsing them through their shared rendered fqn.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ScalaTypeNamespaceResolution {
+pub enum ScalaTypeNamespaceResolution {
     NoMatch,
     Resolved(CodeUnit),
     Ambiguous,
@@ -61,13 +61,13 @@ pub(crate) enum ScalaTypeNamespaceResolution {
 /// instead. Callers must treat every non-resolved outcome as terminal except
 /// `NoMatch`, which alone permits a lower-precedence tier.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ScalaQualifiedTypeRootBinding {
+pub enum ScalaQualifiedTypeRootBinding {
     StableObjects(Vec<CodeUnit>),
     Package(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ScalaQualifiedTypeRootResolution {
+pub enum ScalaQualifiedTypeRootResolution {
     NoMatch,
     Resolved(ScalaQualifiedTypeRootBinding),
     Ambiguous,
@@ -75,7 +75,7 @@ pub(crate) enum ScalaQualifiedTypeRootResolution {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ScalaDirectAncestorResolution {
+pub enum ScalaDirectAncestorResolution {
     Resolved(Vec<CodeUnit>),
     Ambiguous,
 }
@@ -88,7 +88,7 @@ pub(crate) enum ScalaDirectAncestorResolution {
 /// exact `CodeUnit` is retained throughout: the same base reached through a
 /// diamond is deduplicated, while distinct declarations at the winning tier
 /// are ambiguous even when they render the same fqn.
-pub(crate) fn resolve_exact_lexical_type_namespace<Owners, DirectMembers, DirectAncestors>(
+pub fn resolve_exact_lexical_type_namespace<Owners, DirectMembers, DirectAncestors>(
     owners_nearest_first: Owners,
     name: &str,
     authoritative_local_barrier: bool,
@@ -166,12 +166,12 @@ fn unique_units(units: Vec<CodeUnit>) -> Vec<CodeUnit> {
 /// of the exact constructed base; the inverse scanner retains the instance node
 /// so it can prove that relationship without inventing an anonymous identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScalaUnindexedTypeBinding<'tree> {
+pub enum ScalaUnindexedTypeBinding<'tree> {
     Authoritative,
     AnonymousRefinement(Node<'tree>),
 }
 
-pub(crate) fn scala_nearest_unindexed_type_binding<'tree>(
+pub fn scala_nearest_unindexed_type_binding<'tree>(
     source: &str,
     reference: Node<'tree>,
     root_name: &str,
@@ -245,9 +245,7 @@ pub(crate) fn scala_nearest_unindexed_type_binding<'tree>(
     None
 }
 
-pub(crate) fn scala_anonymous_instance_for_template<'tree>(
-    template: Node<'tree>,
-) -> Option<Node<'tree>> {
+pub fn scala_anonymous_instance_for_template<'tree>(template: Node<'tree>) -> Option<Node<'tree>> {
     let parent = template.parent()?;
     if parent.kind() == "instance_expression" {
         return Some(parent);
@@ -260,7 +258,7 @@ pub(crate) fn scala_anonymous_instance_for_template<'tree>(
 /// Compatibility predicate for definition lookup, which already knows how to
 /// resolve anonymous refinements through its forward path. Only ordinary local
 /// bindings should prevent that path from continuing.
-pub(crate) fn scala_unindexed_type_binding_shadows(
+pub fn scala_unindexed_type_binding_shadows(
     source: &str,
     reference: Node<'_>,
     root_name: &str,

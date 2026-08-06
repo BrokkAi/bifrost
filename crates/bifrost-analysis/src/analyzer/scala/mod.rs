@@ -1,17 +1,20 @@
 mod adapter;
 mod clones;
-pub(crate) mod declarations;
 mod diagnostics;
 mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
 mod semantic;
-pub(crate) mod structural;
-mod supertypes;
-mod tests;
-pub(crate) mod wildcard_imports;
+mod structural;
+
 use crate::analyzer::Range;
 use crate::analyzer::store::LimitedQueryRows;
+/// The Scala declaration walk, structured import/export parsing, raw-supertype
+/// extraction and ordered wildcard-import environment now live in
+/// [`brokk_bifrost_jvm::scala`]. Re-exporting the modules under their historical
+/// names keeps every `crate::analyzer::scala::…` path in this crate pointing at
+/// the same items.
+pub(crate) use brokk_bifrost_jvm::scala::{declarations, wildcard_imports};
 
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
@@ -59,17 +62,22 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
+pub(crate) use crate::analyzer::{ScalaExportInfo, ScalaExportSelector};
 pub(crate) use adapter::ScalaAdapter;
-use clones::build_scala_clone_candidate_data;
-pub(crate) use declarations::scala_class_parameter_field_keyword;
-pub(crate) use imports::{
-    ScalaExportInfo, ScalaExportSelector, scala_lexical_scope_path_at,
-    scala_lexical_scope_path_checked,
+pub(crate) use brokk_bifrost_jvm::scala::imports::{
+    scala_lexical_scope_path_at, scala_lexical_scope_path_checked,
 };
-pub(crate) use supertypes::{
+pub(crate) use brokk_bifrost_jvm::scala::supertypes::{
     ScalaSupertypeLookupPath, scala_supertype_lookup_nodes, scala_type_lookup_segments,
 };
-use tests::detect_scala_test_assertion_smells;
+use brokk_bifrost_jvm::scala::test_detection::detect_scala_test_assertion_smells;
+/// Scala's pure name, signature and delimiter helpers. They read and produce
+/// strings only, so they moved with the language knowledge they serve.
+pub(crate) use brokk_bifrost_jvm::scala::{
+    scala_nested_type_candidates, scala_normalize_full_name,
+};
+use clones::build_scala_clone_candidate_data;
+pub(crate) use declarations::scala_class_parameter_field_keyword;
 pub(crate) use wildcard_imports::{
     ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaWildcardImportEnvironment,
     ScalaWildcardOwnerFacts, resolve_scala_explicit_import_tier,
@@ -77,10 +85,6 @@ pub(crate) use wildcard_imports::{
     scala_import_path, scala_import_path_candidates, scala_import_visible_at,
     scala_package_prefixes_at, scala_package_prefixes_at_checked,
 };
-
-pub(crate) fn scala_normalize_full_name(fq_name: &str) -> String {
-    fq_name.replace("$.", ".").trim_end_matches('$').to_string()
-}
 
 /// Object/class/trait declarations lexically enclosing a Scala byte
 /// position, innermost first.
@@ -123,49 +127,6 @@ pub(crate) fn scala_enclosing_template_owner_fq_names(
     owners
 }
 
-/// Candidate spellings of `segments` rooted at `prefix`, plus the "$"
-/// companion-object spelling Scala singletons use in fqns.
-///
-/// `prefix_is_owner` distinguishes an owner whose *own* spelling still needs
-/// a trailing `$` inserted (an object/class fqn segment used as a qualifying
-/// prefix) from a prefix that already carries its correct spelling (e.g. a
-/// package name, or another candidate's fqn taken as-is).
-pub(crate) fn scala_nested_type_candidates(
-    prefix: String,
-    segments: &[String],
-    prefix_is_owner: bool,
-) -> Vec<String> {
-    let mut direct = prefix.clone();
-    for segment in segments {
-        if !direct.is_empty() {
-            direct.push('.');
-        }
-        direct.push_str(segment);
-    }
-    if segments.is_empty() {
-        return vec![direct];
-    }
-
-    let mut singleton_qualified = prefix;
-    if prefix_is_owner {
-        singleton_qualified.push('$');
-    }
-    for (index, segment) in segments.iter().enumerate() {
-        if !singleton_qualified.is_empty() {
-            singleton_qualified.push('.');
-        }
-        singleton_qualified.push_str(segment);
-        if index + 1 < segments.len() {
-            singleton_qualified.push('$');
-        }
-    }
-    if singleton_qualified == direct {
-        vec![direct]
-    } else {
-        vec![direct, singleton_qualified]
-    }
-}
-
 pub(crate) fn scala_simple_type_name(unit: &CodeUnit) -> String {
     // Reuses the shared terminal-segment splitter (see its doc comment):
     // Scala identifiers never contain a literal `.`, so this reproduces
@@ -182,74 +143,6 @@ pub(crate) struct ScalaForwardOwnerFacts {
     pub(crate) supertype_lookup_paths: Vec<ScalaSupertypeLookupPath>,
     pub(crate) signatures: Vec<String>,
     pub(crate) is_trait: bool,
-}
-
-pub(crate) fn scala_signature_return_type(signature: &str) -> Option<&str> {
-    let (_, after_colon) = signature.rsplit_once(':')?;
-    let end = after_colon.find(['=', '{']).unwrap_or(after_colon.len());
-    let return_type = after_colon[..end].trim();
-    (!return_type.is_empty()).then_some(return_type)
-}
-
-pub(crate) fn scala_member_signature_arity(signature: &str) -> Option<usize> {
-    if let Some(extension_signature) = signature.strip_prefix("extension ") {
-        let after_receiver = extension_signature.split_once(')')?.1.trim_start();
-        return after_receiver
-            .find('(')
-            .and_then(|open| scala_parenthesized_arity(&after_receiver[open..]))
-            .or(Some(0));
-    }
-    let open = signature.find('(')?;
-    scala_parenthesized_arity(&signature[open..])
-}
-
-pub(crate) fn scala_balanced_parenthesized_prefix(source: &str) -> Option<&str> {
-    let mut chars = source.char_indices();
-    let (_, first) = chars.next()?;
-    if first != '(' {
-        return None;
-    }
-    let mut depth = 1usize;
-    for (idx, ch) in chars {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(&source[1..idx]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-pub(crate) fn scala_split_top_level_commas(value: &str) -> impl Iterator<Item = &str> {
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    let mut parts = Vec::new();
-    for (idx, ch) in value.char_indices() {
-        match ch {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(value[start..idx].trim());
-                start = idx + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    parts.push(value[start..].trim());
-    parts.into_iter().filter(|part| !part.is_empty())
-}
-
-pub(crate) fn scala_parenthesized_arity(source: &str) -> Option<usize> {
-    let inner = scala_balanced_parenthesized_prefix(source)?;
-    if inner.trim().is_empty() {
-        return Some(0);
-    }
-    Some(scala_split_top_level_commas(inner).count())
 }
 
 #[derive(Clone)]
@@ -1346,7 +1239,7 @@ impl LanguageSupport for ScalaSupport {
     }
 
     fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
-        &structural::SCALA_STRUCTURAL_SPEC
+        &brokk_bifrost_jvm::scala::structural::SCALA_STRUCTURAL_SPEC
     }
 
     fn highlight_query(&self) -> Option<&'static str> {

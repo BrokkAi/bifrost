@@ -1,34 +1,35 @@
-use crate::analyzer::{ImportInfo, StructuredImportScope};
-use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::model::{ImportInfo, StructuredImportScope};
+use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::Node;
 
-use super::{scala_nested_type_candidates, scala_type_lookup_segments};
+use crate::scala::scala_nested_type_candidates;
+use crate::scala::supertypes::scala_type_lookup_segments;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum ScalaWildcardOwnerKind {
+pub enum ScalaWildcardOwnerKind {
     Package,
     StableSingleton,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ScalaWildcardOwnerFacts {
-    pub(crate) package: bool,
-    pub(crate) stable_singleton: bool,
+pub struct ScalaWildcardOwnerFacts {
+    pub package: bool,
+    pub stable_singleton: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct ScalaWildcardImportOwner {
-    pub(crate) import_index: usize,
-    pub(crate) fqn: String,
-    pub(crate) kind: ScalaWildcardOwnerKind,
+pub struct ScalaWildcardImportOwner {
+    pub import_index: usize,
+    pub fqn: String,
+    pub kind: ScalaWildcardOwnerKind,
 }
 
 impl ScalaWildcardImportOwner {
-    pub(crate) fn is_singleton(&self) -> bool {
+    pub fn is_singleton(&self) -> bool {
         self.kind == ScalaWildcardOwnerKind::StableSingleton
     }
 
-    pub(crate) fn declaration_fqn(&self) -> String {
+    pub fn declaration_fqn(&self) -> String {
         match self.kind {
             ScalaWildcardOwnerKind::Package => self.fqn.clone(),
             ScalaWildcardOwnerKind::StableSingleton => format!("{}$", self.fqn),
@@ -42,29 +43,29 @@ impl ScalaWildcardImportOwner {
 /// lets candidate discovery conservatively retain every source file, while a
 /// name binder can reject the environment when `ambiguous` is true.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ScalaWildcardImportEnvironment {
-    pub(crate) owners: Vec<ScalaWildcardImportOwner>,
-    pub(crate) ambiguous: bool,
+pub struct ScalaWildcardImportEnvironment {
+    pub owners: Vec<ScalaWildcardImportOwner>,
+    pub ambiguous: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ScalaExplicitImportFacts {
-    pub(crate) declaration: bool,
-    pub(crate) package: bool,
+pub struct ScalaExplicitImportFacts {
+    pub declaration: bool,
+    pub package: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ScalaExplicitImportTier {
-    pub(crate) candidate: String,
-    pub(crate) declaration: bool,
-    pub(crate) package: bool,
+pub struct ScalaExplicitImportTier {
+    pub candidate: String,
+    pub declaration: bool,
+    pub package: bool,
 }
 
 /// Select the first relative/global candidate tier that denotes either a
 /// declaration or a package. Both namespaces are retained when the same
 /// candidate denotes both so semantic binders can fail closed while candidate
 /// discovery remains conservative.
-pub(crate) fn resolve_scala_explicit_import_tier(
+pub fn resolve_scala_explicit_import_tier(
     path: &str,
     package_prefixes: &[String],
     mut facts: impl FnMut(&str) -> ScalaExplicitImportFacts,
@@ -96,7 +97,7 @@ pub(crate) fn resolve_scala_explicit_import_tier(
 /// access to compute that chain (e.g. the type-hierarchy-only resolver,
 /// which never sees a live `ScalaAnalyzer`) pass `|_| Vec::new()` and keep
 /// today's package-only behavior.
-pub(crate) fn resolve_scala_wildcard_import_environment(
+pub fn resolve_scala_wildcard_import_environment(
     imports: &[ImportInfo],
     package_prefixes: &[String],
     mut enclosing_owner_fq_names: impl FnMut(usize) -> Vec<String>,
@@ -199,7 +200,7 @@ fn is_visible_lexical_scope(
             .all(|(import, active)| import == active)
 }
 
-pub(crate) fn scala_import_visible_at(
+pub fn scala_import_visible_at(
     import: &ImportInfo,
     active_lexical_prefixes: &[String],
     active_lexical_scopes: &[StructuredImportScope],
@@ -244,7 +245,7 @@ fn owners_for_candidate(
     owners
 }
 
-pub(crate) fn scala_import_path_candidates(path: &str, package_prefixes: &[String]) -> Vec<String> {
+pub fn scala_import_path_candidates(path: &str, package_prefixes: &[String]) -> Vec<String> {
     let mut candidates = Vec::new();
     for prefix in package_prefixes.iter().rev() {
         if prefix.is_empty() || path.starts_with(&format!("{prefix}.")) {
@@ -267,7 +268,7 @@ pub(crate) fn scala_import_path_candidates(path: &str, package_prefixes: &[Strin
 /// direct child `javadsl` of the enclosing `akka.stream` package. Keep these
 /// candidates separate from [`scala_package_prefixes_at`] so parent packages
 /// do not leak into ordinary lexical lookup.
-pub(crate) fn scala_enclosing_package_root_candidates(
+pub fn scala_enclosing_package_root_candidates(
     package_prefixes: &[String],
     root: &str,
 ) -> Vec<String> {
@@ -293,14 +294,14 @@ pub(crate) fn scala_enclosing_package_root_candidates(
     candidates
 }
 
-pub(crate) fn scala_import_path(info: &ImportInfo) -> Option<String> {
+pub fn scala_import_path(info: &ImportInfo) -> Option<String> {
     info.path
         .as_ref()
         .filter(|path| !path.segments.is_empty())
         .map(|path| path.segments.join("."))
 }
 
-pub(crate) fn scala_package_prefixes_at(
+pub fn scala_package_prefixes_at(
     root: Node<'_>,
     source: &str,
     reference_byte: usize,
@@ -309,7 +310,7 @@ pub(crate) fn scala_package_prefixes_at(
         .expect("unbounded Scala package traversal cannot stop")
 }
 
-pub(crate) fn scala_package_prefixes_at_checked(
+pub fn scala_package_prefixes_at_checked(
     root: Node<'_>,
     source: &str,
     reference_byte: usize,

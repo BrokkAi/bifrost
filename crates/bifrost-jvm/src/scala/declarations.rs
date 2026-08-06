@@ -1,11 +1,11 @@
-use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
-use crate::analyzer::model::StructuredTypeIdentityBuilder;
-use crate::analyzer::tree_walk::subtree_contains;
-use crate::analyzer::{
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
+use brokk_bifrost_core::analyzer::model::{
     CallableArity, CodeUnit, CodeUnitType, DispatchExtensibility, ParameterMetadata, ProjectFile,
     Range, SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
 };
-use crate::hash::HashMap;
+use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
+use brokk_bifrost_core::hash::HashMap;
 use tree_sitter::{Node, Tree};
 
 /// Intern one qualified-name segment in the process-global interner.
@@ -52,19 +52,19 @@ fn scala_type_name_segment(raw_name: &str, is_object: bool) -> SegmentId {
     }
 }
 
-use super::imports::{
+use crate::scala::imports::{
     scala_export_info_from_node, scala_import_infos_from_node_with_prefixes,
     scala_lexical_scope_path,
 };
-use super::supertypes::{extract_scala_supertypes, scala_full_enum_case_owner_supertype};
-use super::wildcard_imports::scala_package_prefixes_at;
+use crate::scala::supertypes::{extract_scala_supertypes, scala_full_enum_case_owner_supertype};
+use crate::scala::wildcard_imports::scala_package_prefixes_at;
 
-pub(crate) fn parse_scala_file(
+pub fn parse_scala_file(
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
-) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
-    let mut parsed = crate::analyzer::tree_sitter_analyzer::ParsedFile::new(String::new());
+) -> brokk_bifrost_core::analyzer::parsed_file::ParsedFile {
+    let mut parsed = brokk_bifrost_core::analyzer::parsed_file::ParsedFile::new(String::new());
     let mut visitor = ScalaVisitor {
         file,
         source,
@@ -90,7 +90,7 @@ fn scala_compilation_children(node: Node<'_>) -> Vec<Node<'_>> {
 fn collect_scala_imports(
     root: Node<'_>,
     source: &str,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
 ) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -118,7 +118,7 @@ fn collect_scala_imports(
 struct ScalaVisitor<'a> {
     file: &'a ProjectFile,
     source: &'a str,
-    parsed: &'a mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    parsed: &'a mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
 }
 
 enum ScalaWork<'tree> {
@@ -1561,7 +1561,7 @@ fn scala_class_parameter_field_signature(node: Node<'_>, source: &str, name: &st
     format!("{keyword} {name}{type_text}{default_value}")
 }
 
-pub(crate) fn scala_class_parameter_field_keyword(node: Node<'_>) -> Option<&'static str> {
+pub fn scala_class_parameter_field_keyword(node: Node<'_>) -> Option<&'static str> {
     let mut cursor = node.walk();
     node.children(&mut cursor)
         .find_map(|child| match child.kind() {
@@ -1594,13 +1594,13 @@ fn scala_modifier_prefix(node: Node<'_>, source: &str) -> String {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum ScalaDeclarationVisibility {
+pub enum ScalaDeclarationVisibility {
     Public,
     Protected,
     NonApi,
 }
 
-pub(crate) fn scala_declaration_visibility(node: Node<'_>) -> ScalaDeclarationVisibility {
+pub fn scala_declaration_visibility(node: Node<'_>) -> ScalaDeclarationVisibility {
     let mut stack = vec![node];
     while let Some(candidate) = stack.pop() {
         if candidate.kind() == "access_modifier" {

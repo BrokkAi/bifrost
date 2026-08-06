@@ -32,6 +32,10 @@ name = "brokk_bifrost_jvm"
 [dependencies]
 brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22" }
 regex = "1.12.2"
+# Scala's supertype lookup path is stored as its own JSON envelope inside the
+# declaration index, so the type that owns that encoding travels with `serde`.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 tree-sitter = "0.25.10"
 # tree-sitter-java is a grammar generation behind the fleet's 0.25 line, in the
 # same class as tree-sitter-cpp 0.23.4, tree-sitter-c-sharp 0.23.1,

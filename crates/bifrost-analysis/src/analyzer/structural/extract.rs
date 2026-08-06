@@ -314,7 +314,7 @@ mod tests {
     /// into a clean, empty, and wrong answer (#1473).
     #[test]
     fn adapters_declaring_no_occurrence_roles_emit_none() {
-        let spec = &crate::analyzer::scala::structural::SCALA_STRUCTURAL_SPEC;
+        let spec = &brokk_bifrost_jvm::scala::structural::SCALA_STRUCTURAL_SPEC;
         assert!(spec.occurrence_role_support().is_empty());
 
         let grammar = tree_sitter_scala::LANGUAGE.into();

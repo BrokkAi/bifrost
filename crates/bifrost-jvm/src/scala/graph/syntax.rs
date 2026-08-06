@@ -1,67 +1,84 @@
-use super::resolver::scala_literal_type_name;
-use crate::analyzer::scala::{scala_package_prefixes_at, scala_type_lookup_segments};
-use crate::analyzer::tree_walk::subtree_contains;
-use crate::analyzer::{CallableArity, CodeUnit, ImportInfo, scala_parenthesized_arity};
-use crate::hash::{HashMap, HashSet};
+use crate::scala::scala_parenthesized_arity;
+use crate::scala::supertypes::scala_type_lookup_segments;
+use crate::scala::wildcard_imports::scala_package_prefixes_at;
+use brokk_bifrost_core::analyzer::CodeUnit;
+use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo};
+use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Parser};
+
+/// The builtin type a Scala literal node denotes.
+///
+/// Moved here from `scala_graph/resolver.rs` ahead of the rest of that file:
+/// it is a pure node-kind mapping and this module's `types.push(...)` walk is
+/// its only caller on this side of the seam.
+pub fn scala_literal_type_name(kind: &str) -> Option<&'static str> {
+    match kind {
+        "string" | "string_literal" | "interpolated_string_expression" => Some("String"),
+        "integer_literal" => Some("Int"),
+        "floating_point_literal" => Some("Double"),
+        "boolean_literal" | "true" | "false" => Some("Boolean"),
+        "character_literal" => Some("Char"),
+        _ => None,
+    }
+}
 
 type ScalaParameterFunctionTypePaths = Vec<Vec<Option<Vec<Option<Vec<String>>>>>>;
 
 #[derive(Default)]
-pub(crate) struct ScalaSourceFacts {
-    pub(crate) callable_alternatives_by_range:
-        HashMap<(usize, usize), ScalaCallableSourceAlternative>,
-    pub(crate) field_type_paths_by_range: HashMap<(usize, usize), Vec<String>>,
-    pub(crate) type_alias_paths_by_range: HashMap<(usize, usize), Vec<String>>,
-    pub(crate) stable_owner_ranges: HashSet<(usize, usize)>,
-    pub(crate) enum_ranges: HashSet<(usize, usize)>,
-    pub(crate) case_class_ranges: HashSet<(usize, usize)>,
-    pub(crate) abstract_callable_ranges: HashSet<(usize, usize)>,
-    pub(crate) generic_owner_facts_by_range: HashMap<(usize, usize), ScalaGenericOwnerSourceFacts>,
+pub struct ScalaSourceFacts {
+    pub callable_alternatives_by_range: HashMap<(usize, usize), ScalaCallableSourceAlternative>,
+    pub field_type_paths_by_range: HashMap<(usize, usize), Vec<String>>,
+    pub type_alias_paths_by_range: HashMap<(usize, usize), Vec<String>>,
+    pub stable_owner_ranges: HashSet<(usize, usize)>,
+    pub enum_ranges: HashSet<(usize, usize)>,
+    pub case_class_ranges: HashSet<(usize, usize)>,
+    pub abstract_callable_ranges: HashSet<(usize, usize)>,
+    pub generic_owner_facts_by_range: HashMap<(usize, usize), ScalaGenericOwnerSourceFacts>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ScalaTypeExpressionPath {
-    pub(crate) segments: Vec<String>,
-    pub(crate) arguments: Vec<ScalaTypeExpressionPath>,
+pub struct ScalaTypeExpressionPath {
+    pub segments: Vec<String>,
+    pub arguments: Vec<ScalaTypeExpressionPath>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ScalaGenericOwnerSourceFacts {
-    pub(crate) type_parameters: Vec<String>,
-    pub(crate) supertypes: Vec<ScalaTypeExpressionPath>,
+pub struct ScalaGenericOwnerSourceFacts {
+    pub type_parameters: Vec<String>,
+    pub supertypes: Vec<ScalaTypeExpressionPath>,
 }
 
 #[derive(Clone)]
-pub(crate) struct ScalaCallableSourceAlternative {
-    pub(crate) role: ScalaCallableRole,
-    pub(crate) shape: Vec<ScalaCallableParameterList>,
-    pub(crate) parameter_defaults: Vec<Vec<bool>>,
-    pub(crate) parameter_function_arities: Vec<Vec<Option<usize>>>,
-    pub(crate) parameter_type_paths: Vec<Vec<Option<Vec<String>>>>,
-    pub(crate) parameter_type_expressions: Vec<Vec<Option<ScalaTypeExpressionPath>>>,
-    pub(crate) parameter_function_type_paths: ScalaParameterFunctionTypePaths,
-    pub(crate) extension_receiver_type_path: Option<Vec<String>>,
-    pub(crate) return_type_path: Option<Vec<String>>,
-    pub(crate) return_type_expression: Option<ScalaTypeExpressionPath>,
+pub struct ScalaCallableSourceAlternative {
+    pub role: ScalaCallableRole,
+    pub shape: Vec<ScalaCallableParameterList>,
+    pub parameter_defaults: Vec<Vec<bool>>,
+    pub parameter_function_arities: Vec<Vec<Option<usize>>>,
+    pub parameter_type_paths: Vec<Vec<Option<Vec<String>>>>,
+    pub parameter_type_expressions: Vec<Vec<Option<ScalaTypeExpressionPath>>>,
+    pub parameter_function_type_paths: ScalaParameterFunctionTypePaths,
+    pub extension_receiver_type_path: Option<Vec<String>>,
+    pub return_type_path: Option<Vec<String>>,
+    pub return_type_expression: Option<ScalaTypeExpressionPath>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ScalaCallableRole {
+pub enum ScalaCallableRole {
     Ordinary,
     PrimaryConstructor,
     SecondaryConstructor,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ScalaMethodValueContext {
+pub enum ScalaMethodValueContext {
     Unknown,
     Function(ScalaFunctionParameterShape),
     Incompatible,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum ScalaParameterTypeIdentity {
+pub enum ScalaParameterTypeIdentity {
     Builtin(&'static str),
     Declaration(CodeUnit),
     Logical(String),
@@ -71,14 +88,14 @@ pub(crate) enum ScalaParameterTypeIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ScalaFunctionParameterShape {
-    pub(crate) arity: usize,
-    pub(crate) parameter_types: Option<Vec<ScalaParameterTypeIdentity>>,
-    pub(crate) parameter_types_authoritative: bool,
+pub struct ScalaFunctionParameterShape {
+    pub arity: usize,
+    pub parameter_types: Option<Vec<ScalaParameterTypeIdentity>>,
+    pub parameter_types_authoritative: bool,
 }
 
 impl ScalaFunctionParameterShape {
-    pub(crate) fn arity_only(arity: usize) -> Self {
+    pub fn arity_only(arity: usize) -> Self {
         Self {
             arity,
             parameter_types: None,
@@ -88,42 +105,42 @@ impl ScalaFunctionParameterShape {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ScalaParameterListKind {
+pub enum ScalaParameterListKind {
     Explicit,
     Contextual,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ScalaCallArgumentListKind {
+pub enum ScalaCallArgumentListKind {
     Ordinary,
     Contextual,
     Block,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ScalaCallArgumentList {
-    pub(crate) arity: usize,
-    pub(crate) kind: ScalaCallArgumentListKind,
+pub struct ScalaCallArgumentList {
+    pub arity: usize,
+    pub kind: ScalaCallArgumentListKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ScalaCallSiteShape {
-    pub(crate) lists: Vec<ScalaCallArgumentList>,
+pub struct ScalaCallSiteShape {
+    pub lists: Vec<ScalaCallArgumentList>,
     /// Builtin types of the first ordinary argument list's literal arguments,
     /// positionally aligned (`None` per argument when it is not a literal, and
     /// `None` overall when the list is unknown or uses named arguments).
     /// Purely kind-derived, so numeric literal suffixes are not represented;
     /// consumers must treat numeric/numeric differences as inconclusive
     /// (see `scala_numeric_builtins`).
-    pub(crate) leading_literal_argument_types: Option<Vec<Option<&'static str>>>,
-    pub(crate) method_value_arity: Option<usize>,
-    pub(crate) method_value_parameter_types: Option<Vec<ScalaParameterTypeIdentity>>,
-    pub(crate) method_value_parameter_types_authoritative: bool,
-    pub(crate) type_arguments_only: bool,
+    pub leading_literal_argument_types: Option<Vec<Option<&'static str>>>,
+    pub method_value_arity: Option<usize>,
+    pub method_value_parameter_types: Option<Vec<ScalaParameterTypeIdentity>>,
+    pub method_value_parameter_types_authoritative: bool,
+    pub type_arguments_only: bool,
 }
 
 impl ScalaCallSiteShape {
-    pub(crate) fn ordinary(arities: &[usize]) -> Self {
+    pub fn ordinary(arities: &[usize]) -> Self {
         Self {
             lists: arities
                 .iter()
@@ -141,17 +158,14 @@ impl ScalaCallSiteShape {
         }
     }
 
-    pub(crate) fn with_method_value_arity(mut self, arity: Option<usize>) -> Self {
+    pub fn with_method_value_arity(mut self, arity: Option<usize>) -> Self {
         self.method_value_arity = arity;
         self.method_value_parameter_types = None;
         self.method_value_parameter_types_authoritative = false;
         self
     }
 
-    pub(crate) fn with_method_value_shape(
-        mut self,
-        shape: Option<ScalaFunctionParameterShape>,
-    ) -> Self {
+    pub fn with_method_value_shape(mut self, shape: Option<ScalaFunctionParameterShape>) -> Self {
         self.method_value_arity = shape.as_ref().map(|shape| shape.arity);
         self.method_value_parameter_types_authoritative = shape
             .as_ref()
@@ -162,7 +176,7 @@ impl ScalaCallSiteShape {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ScalaCallableUsePolicy {
+pub enum ScalaCallableUsePolicy {
     OrdinaryMethod,
     CompleteCall,
 }
@@ -176,14 +190,14 @@ pub(crate) enum ScalaCallableUsePolicy {
 /// separate from call shape prevents either family from making an unrelated
 /// alternative look unique merely because its arity happens to fit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ScalaCallableSiteRole {
+pub enum ScalaCallableSiteRole {
     Ordinary,
     ExplicitConstruction,
     PrimaryConstruction,
 }
 
 impl ScalaCallableSiteRole {
-    pub(crate) fn accepts(self, declared: ScalaCallableRole) -> bool {
+    pub fn accepts(self, declared: ScalaCallableRole) -> bool {
         match self {
             Self::Ordinary => declared == ScalaCallableRole::Ordinary,
             Self::ExplicitConstruction => matches!(
@@ -194,7 +208,7 @@ impl ScalaCallableSiteRole {
         }
     }
 
-    pub(crate) fn use_policy(self) -> ScalaCallableUsePolicy {
+    pub fn use_policy(self) -> ScalaCallableUsePolicy {
         match self {
             Self::Ordinary => ScalaCallableUsePolicy::OrdinaryMethod,
             Self::ExplicitConstruction | Self::PrimaryConstruction => {
@@ -205,20 +219,20 @@ impl ScalaCallableSiteRole {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ScalaCallShapeRelation {
+pub enum ScalaCallShapeRelation {
     Incompatible,
     Complete,
     Partial { next_explicit_arity: CallableArity },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ScalaCallableParameterList {
-    pub(crate) arity: CallableArity,
-    pub(crate) kind: ScalaParameterListKind,
+pub struct ScalaCallableParameterList {
+    pub arity: CallableArity,
+    pub kind: ScalaParameterListKind,
 }
 
 impl ScalaCallableParameterList {
-    pub(crate) fn explicit(arity: CallableArity) -> Self {
+    pub fn explicit(arity: CallableArity) -> Self {
         Self {
             arity,
             kind: ScalaParameterListKind::Explicit,
@@ -226,19 +240,16 @@ impl ScalaCallableParameterList {
     }
 }
 
-pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
+pub fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
     let mut parser = Parser::new();
     parser
-        .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
+        .set_language(&crate::scala::language::LANGUAGE.into())
         .ok()?;
     let tree = parser.parse(source, None)?;
     Some(scala_source_facts_from_tree(&tree, source))
 }
 
-pub(crate) fn scala_source_facts_from_tree(
-    tree: &tree_sitter::Tree,
-    source: &str,
-) -> ScalaSourceFacts {
+pub fn scala_source_facts_from_tree(tree: &tree_sitter::Tree, source: &str) -> ScalaSourceFacts {
     let mut facts = ScalaSourceFacts::default();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
@@ -498,7 +509,7 @@ fn record_generic_owner_facts(node: Node<'_>, source: &str, facts: &mut ScalaSou
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let supertypes = crate::analyzer::scala::scala_supertype_lookup_nodes(node)
+    let supertypes = crate::scala::supertypes::scala_supertype_lookup_nodes(node)
         .into_iter()
         .filter_map(|(parent, _)| scala_type_expression_path(parent, source))
         .collect::<Vec<_>>();
@@ -616,7 +627,7 @@ fn scala_type_expression_path(node: Node<'_>, source: &str) -> Option<ScalaTypeE
 /// walk therefore cannot define lexical scope correctly.  This parser-backed
 /// collector follows the grammar's pattern fields and deliberately excludes
 /// every non-binding role.
-pub(crate) fn scala_pattern_binder_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
+pub fn scala_pattern_binder_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
     scala_pattern_binder_nodes(node)
         .into_iter()
         .filter_map(|node| {
@@ -691,7 +702,7 @@ fn scala_pattern_binder_nodes(node: Node<'_>) -> Vec<Node<'_>> {
 /// Whether this exact identifier node declares a case-pattern value binder.
 /// Comparing node identities matters when a binder intentionally has the same
 /// spelling as a qualifier in its own type annotation.
-pub(crate) fn is_scala_case_pattern_binder(node: Node<'_>) -> bool {
+pub fn is_scala_case_pattern_binder(node: Node<'_>) -> bool {
     if !matches!(node.kind(), "identifier" | "operator_identifier") {
         return false;
     }
@@ -719,7 +730,7 @@ pub(crate) fn is_scala_case_pattern_binder(node: Node<'_>) -> bool {
 /// Scala 3 union type. Tree-sitter represents `A | B` as an `infix_type`; only
 /// the `|` operator is flattened, so unrelated infix/compound type syntax is
 /// never reinterpreted as a union.
-pub(crate) fn scala_union_type_alternative_paths(
+pub fn scala_union_type_alternative_paths(
     node: Node<'_>,
     source: &str,
 ) -> Option<Vec<Vec<String>>> {
@@ -923,19 +934,19 @@ fn contains_repeated_parameter_type(node: Node<'_>) -> bool {
     subtree_contains(node, |current| current.kind() == "repeated_parameter_type")
 }
 
-pub(super) fn parenthesized_arity(source: &str) -> Option<usize> {
+pub fn parenthesized_arity(source: &str) -> Option<usize> {
     scala_parenthesized_arity(source)
 }
 
-pub(crate) fn scala_import_path(info: &ImportInfo) -> Option<String> {
-    crate::analyzer::scala::scala_import_path(info)
+pub fn scala_import_path(info: &ImportInfo) -> Option<String> {
+    crate::scala::wildcard_imports::scala_import_path(info)
 }
 
-pub(crate) struct ScalaImportContextIndex {
+pub struct ScalaImportContextIndex {
     segments: Vec<ScalaImportContextSegment>,
 }
 
-pub(crate) struct ScalaPackageContextIndex {
+pub struct ScalaPackageContextIndex {
     segments: Vec<ScalaPackageContextSegment>,
 }
 
@@ -945,7 +956,7 @@ struct ScalaPackageContextSegment {
 }
 
 impl ScalaPackageContextIndex {
-    pub(crate) fn new(root: Node<'_>, source: &str) -> Self {
+    pub fn new(root: Node<'_>, source: &str) -> Self {
         let mut boundaries = vec![0, root.end_byte()];
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
@@ -985,14 +996,14 @@ impl ScalaPackageContextIndex {
         Self { segments }
     }
 
-    pub(crate) fn advance_to(&self, byte: usize, cursor: &mut usize) -> &[String] {
+    pub fn advance_to(&self, byte: usize, cursor: &mut usize) -> &[String] {
         while *cursor + 1 < self.segments.len() && self.segments[*cursor + 1].start_byte <= byte {
             *cursor += 1;
         }
         &self.segments[*cursor].prefixes
     }
 
-    pub(crate) fn prefixes_at(&self, byte: usize) -> &[String] {
+    pub fn prefixes_at(&self, byte: usize) -> &[String] {
         let index = self
             .segments
             .partition_point(|segment| segment.start_byte <= byte)
@@ -1001,7 +1012,7 @@ impl ScalaPackageContextIndex {
     }
 }
 
-pub(crate) fn scala_import_is_visible_at_byte(import: &ImportInfo, byte: usize) -> bool {
+pub fn scala_import_is_visible_at_byte(import: &ImportInfo, byte: usize) -> bool {
     let Some(path) = import.path.as_ref() else {
         return true;
     };
@@ -1019,7 +1030,7 @@ struct ScalaImportContextSegment {
 }
 
 impl ScalaImportContextIndex {
-    pub(crate) fn new(imports: &[ImportInfo], file_end_byte: usize) -> Self {
+    pub fn new(imports: &[ImportInfo], file_end_byte: usize) -> Self {
         let mut events = Vec::with_capacity(imports.len() * 2);
         for (index, import) in imports.iter().enumerate() {
             let Some(path) = import.path.as_ref() else {
@@ -1069,7 +1080,7 @@ impl ScalaImportContextIndex {
         Self { segments }
     }
 
-    pub(crate) fn advance_to(&self, byte: usize, cursor: &mut usize) -> &[usize] {
+    pub fn advance_to(&self, byte: usize, cursor: &mut usize) -> &[usize] {
         while *cursor + 1 < self.segments.len() && self.segments[*cursor + 1].start_byte <= byte {
             *cursor += 1;
         }
@@ -1077,14 +1088,14 @@ impl ScalaImportContextIndex {
     }
 }
 
-pub(crate) fn is_identifier_node(node: Node<'_>) -> bool {
+pub fn is_identifier_node(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
         "identifier" | "type_identifier" | "operator_identifier"
     )
 }
 
-pub(crate) fn is_bare_companion_method_value_reference(node: Node<'_>) -> bool {
+pub fn is_bare_companion_method_value_reference(node: Node<'_>) -> bool {
     if node.kind() != "identifier" || is_call_function_reference(node) {
         return false;
     }
@@ -1098,7 +1109,7 @@ pub(crate) fn is_bare_companion_method_value_reference(node: Node<'_>) -> bool {
     }
 }
 
-pub(crate) fn is_type_like_reference(node: Node<'_>, source: &str) -> bool {
+pub fn is_type_like_reference(node: Node<'_>, source: &str) -> bool {
     node.kind() == "type_identifier"
         || is_constructor_like_reference(node, source)
         || is_anonymous_instance_mixin_type_reference(node, source)
@@ -1166,13 +1177,13 @@ fn is_anonymous_instance_mixin_type_reference(node: Node<'_>, source: &str) -> b
 
 /// In `A TypeOperator B`, the grammar exposes `TypeOperator` as the exact
 /// `operator` field of `infix_type`, even when it is an ordinary `identifier`.
-pub(crate) fn is_infix_type_operator_reference(node: Node<'_>) -> bool {
+pub fn is_infix_type_operator_reference(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         parent.kind() == "infix_type" && parent.child_by_field_name("operator") == Some(node)
     })
 }
 
-pub(crate) fn is_scala_object_reference(node: Node<'_>) -> bool {
+pub fn is_scala_object_reference(node: Node<'_>) -> bool {
     is_singleton_type_reference(node)
         || is_stable_type_qualifier(node)
         || qualified_stable_type_expression_shape_role(node).is_some_and(|role| {
@@ -1240,20 +1251,20 @@ fn qualified_stable_type_expression_shape_role(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum ScalaQualifiedStableTypeRole {
+pub enum ScalaQualifiedStableTypeRole {
     Type,
     Apply,
     Extractor,
     Constructor,
 }
 
-pub(crate) struct ScalaQualifiedStableTypeReference<'tree> {
-    pub(crate) segments: Vec<String>,
-    pub(crate) expression: Node<'tree>,
-    pub(crate) role: ScalaQualifiedStableTypeRole,
+pub struct ScalaQualifiedStableTypeReference<'tree> {
+    pub segments: Vec<String>,
+    pub expression: Node<'tree>,
+    pub role: ScalaQualifiedStableTypeRole,
 }
 
-pub(crate) fn qualified_stable_type_reference<'tree>(
+pub fn qualified_stable_type_reference<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<ScalaQualifiedStableTypeReference<'tree>> {
@@ -1381,7 +1392,7 @@ fn qualified_stable_type_expression_role<'tree>(
     Some((expression, role, segments))
 }
 
-pub(crate) fn is_scala_class_reference(node: Node<'_>, source: &str) -> bool {
+pub fn is_scala_class_reference(node: Node<'_>, source: &str) -> bool {
     is_type_like_reference(node, source)
         && !is_singleton_type_reference(node)
         && !is_stable_type_qualifier(node)
@@ -1398,7 +1409,7 @@ fn is_singleton_type_reference(node: Node<'_>) -> bool {
         .is_some_and(|parent| parent.kind() == "singleton_type")
 }
 
-pub(crate) fn is_stable_type_qualifier(node: Node<'_>) -> bool {
+pub fn is_stable_type_qualifier(node: Node<'_>) -> bool {
     let Some(parent) = node
         .parent()
         .filter(|parent| parent.kind() == "stable_type_identifier")
@@ -1409,7 +1420,7 @@ pub(crate) fn is_stable_type_qualifier(node: Node<'_>) -> bool {
     parent.named_children(&mut cursor).last() != Some(node)
 }
 
-pub(crate) fn is_extractor_reference(node: Node<'_>) -> bool {
+pub fn is_extractor_reference(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -1436,13 +1447,13 @@ pub(crate) fn is_extractor_reference(node: Node<'_>) -> bool {
     false
 }
 
-pub(crate) fn is_infix_pattern_operator(node: Node<'_>) -> bool {
+pub fn is_infix_pattern_operator(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         parent.kind() == "infix_pattern" && parent.child_by_field_name("operator") == Some(node)
     })
 }
 
-pub(crate) fn is_call_function_reference(node: Node<'_>) -> bool {
+pub fn is_call_function_reference(node: Node<'_>) -> bool {
     let mut expression = node;
     if let Some(generic) = expression.parent().filter(|parent| {
         parent.kind() == "generic_function"
@@ -1462,7 +1473,7 @@ pub(crate) fn is_call_function_reference(node: Node<'_>) -> bool {
 /// `generic_function`, while `Factory(...)` exposes the identifier directly.
 /// Call-role consumers must classify both through the same reference node so
 /// generic applications retain the identifier's exact source range.
-pub(crate) fn invocation_function_reference(function: Node<'_>) -> Node<'_> {
+pub fn invocation_function_reference(function: Node<'_>) -> Node<'_> {
     if function.kind() == "generic_function" {
         function.child_by_field_name("function").unwrap_or(function)
     } else {
@@ -1470,7 +1481,7 @@ pub(crate) fn invocation_function_reference(function: Node<'_>) -> Node<'_> {
     }
 }
 
-pub(crate) fn is_terminal_stable_field_reference(node: Node<'_>) -> bool {
+pub fn is_terminal_stable_field_reference(node: Node<'_>) -> bool {
     let Some(field) = node.parent().filter(|parent| {
         parent.kind() == "field_expression" && parent.child_by_field_name("field") == Some(node)
     }) else {
@@ -1484,7 +1495,7 @@ pub(crate) fn is_terminal_stable_field_reference(node: Node<'_>) -> bool {
 /// Resolve a stable object path from its tree-sitter structure. The root and
 /// each child segment are resolved independently so callers never infer object
 /// identity by splitting source text.
-pub(crate) fn resolve_stable_object_expression<T>(
+pub fn resolve_stable_object_expression<T>(
     mut node: Node<'_>,
     source: &str,
     mut resolve_root: impl FnMut(&str) -> Option<T>,
@@ -1513,15 +1524,15 @@ pub(crate) fn resolve_stable_object_expression<T>(
     Some(resolved)
 }
 
-pub(crate) struct ScalaStableIdentifierReference {
-    pub(crate) segments: Vec<String>,
+pub struct ScalaStableIdentifierReference {
+    pub segments: Vec<String>,
 }
 
 /// Return the ordered identifier leaves of the outermost `stable_identifier`
 /// containing `node`, but only when `node` is that path's terminal leaf. Scala
 /// represents these paths recursively, so walking named children preserves the
 /// grammar's structure without reparsing the source spelling.
-pub(crate) fn stable_identifier_reference<'tree>(
+pub fn stable_identifier_reference<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<ScalaStableIdentifierReference> {
@@ -1565,7 +1576,7 @@ pub(crate) fn stable_identifier_reference<'tree>(
 /// Return the shortest parser-backed stable path ending at `node`. Unlike
 /// `stable_identifier_reference`, this preserves intermediate selections in a
 /// nested chain so a file-major walk can emit every field edge exactly once.
-pub(crate) fn stable_identifier_prefix_reference<'tree>(
+pub fn stable_identifier_prefix_reference<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<ScalaStableIdentifierReference> {
@@ -1605,7 +1616,7 @@ pub(crate) fn stable_identifier_prefix_reference<'tree>(
 /// Return the parser-backed stable type path ending at an intermediate
 /// qualifier. For example, visiting `ReferenceOr` in
 /// `OpenAPI.ReferenceOr.Or[Int]` yields `[OpenAPI, ReferenceOr]`.
-pub(crate) fn stable_type_prefix_reference<'tree>(
+pub fn stable_type_prefix_reference<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<ScalaStableIdentifierReference> {
@@ -1657,7 +1668,7 @@ pub(crate) fn stable_type_prefix_reference<'tree>(
 /// enclosing field expression to be the value of another field expression
 /// keeps ordinary terminal selections under their existing receiver/member
 /// dispatch.
-pub(crate) fn intermediate_field_qualifier_reference<'tree>(
+pub fn intermediate_field_qualifier_reference<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<ScalaStableIdentifierReference> {
@@ -1719,13 +1730,13 @@ fn is_bare_term_reference(node: Node<'_>) -> bool {
     }
 }
 
-pub(crate) fn is_field_expression_value(node: Node<'_>) -> bool {
+pub fn is_field_expression_value(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         parent.kind() == "field_expression" && parent.child_by_field_name("value") == Some(node)
     })
 }
 
-pub(crate) fn is_qualified_stable_root(node: Node<'_>) -> bool {
+pub fn is_qualified_stable_root(node: Node<'_>) -> bool {
     if is_field_expression_value(node) {
         return true;
     }
@@ -1754,17 +1765,17 @@ pub(crate) fn is_qualified_stable_root(node: Node<'_>) -> bool {
     }
 }
 
-pub(crate) fn is_constructor_like_reference(node: Node<'_>, source: &str) -> bool {
+pub fn is_constructor_like_reference(node: Node<'_>, source: &str) -> bool {
     let prefix = source[..node.start_byte()].trim_end();
     prefix.ends_with("new")
         || parent_kind(node).is_some_and(|kind| matches!(kind, "call_expression" | "type"))
 }
 
-pub(crate) fn parent_kind(node: Node<'_>) -> Option<&str> {
+pub fn parent_kind(node: Node<'_>) -> Option<&str> {
     node.parent().map(|parent| parent.kind())
 }
 
-pub(crate) fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
+pub fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
     let mut current = node.parent();
     while let Some(parent) = current {
         if parent.kind() == kind {
@@ -1775,7 +1786,7 @@ pub(crate) fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
     false
 }
 
-pub(crate) fn field_expression_for_member(node: Node<'_>) -> Option<Node<'_>> {
+pub fn field_expression_for_member(node: Node<'_>) -> Option<Node<'_>> {
     let parent = node.parent()?;
     if parent.kind() == "field_expression" && parent.child_by_field_name("field") == Some(node) {
         Some(parent)
@@ -1784,11 +1795,11 @@ pub(crate) fn field_expression_for_member(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-pub(crate) fn member_qualifier_node(node: Node<'_>) -> Option<Node<'_>> {
+pub fn member_qualifier_node(node: Node<'_>) -> Option<Node<'_>> {
     field_expression_for_member(node)?.child_by_field_name("value")
 }
 
-pub(crate) fn member_qualifier(node: Node<'_>, source: &str) -> Option<String> {
+pub fn member_qualifier(node: Node<'_>, source: &str) -> Option<String> {
     member_qualifier_node(node)
         .map(|value| {
             node_text(value, source)
@@ -1799,14 +1810,14 @@ pub(crate) fn member_qualifier(node: Node<'_>, source: &str) -> Option<String> {
         .filter(|qualifier| !qualifier.is_empty())
 }
 
-pub(crate) fn is_owner_qualified_this(qualifier: Node<'_>, source: &str) -> bool {
+pub fn is_owner_qualified_this(qualifier: Node<'_>, source: &str) -> bool {
     qualifier.kind() == "field_expression"
         && qualifier
             .child_by_field_name("field")
             .is_some_and(|field| node_text(field, source).trim() == "this")
 }
 
-pub(crate) fn stable_type_qualifier(node: Node<'_>, source: &str) -> Option<String> {
+pub fn stable_type_qualifier(node: Node<'_>, source: &str) -> Option<String> {
     let parent = node.parent()?;
     if parent.kind() != "stable_type_identifier" || parent.end_byte() != node.end_byte() {
         return None;
@@ -1819,12 +1830,12 @@ pub(crate) fn stable_type_qualifier(node: Node<'_>, source: &str) -> Option<Stri
     (!prefix.is_empty()).then_some(prefix)
 }
 
-pub(crate) fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
+pub fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
     call_site_shape_for_reference(node)
         .map(|shape| shape.lists.into_iter().map(|list| list.arity).collect())
 }
 
-pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallSiteShape> {
+pub fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallSiteShape> {
     // Qualified extractor types may wrap the focused terminal in stable and
     // applied type nodes before reaching the case-class pattern.
     let mut pattern_type = node;
@@ -1963,7 +1974,7 @@ fn literal_argument_types(arguments: Node<'_>) -> Option<Vec<Option<&'static str
     Some(types)
 }
 
-pub(crate) fn applied_expression_for_reference(node: Node<'_>) -> Option<Node<'_>> {
+pub fn applied_expression_for_reference(node: Node<'_>) -> Option<Node<'_>> {
     let parent = node.parent()?;
     if parent.kind() == "infix_expression" && parent.child_by_field_name("operator") == Some(node) {
         return Some(parent);
@@ -2026,11 +2037,11 @@ fn call_argument_list(arguments: Node<'_>) -> ScalaCallArgumentList {
     }
 }
 
-pub(crate) fn is_semantic_call_argument(node: Node<'_>) -> bool {
+pub fn is_semantic_call_argument(node: Node<'_>) -> bool {
     !matches!(node.kind(), "comment" | "block_comment")
 }
 
-pub(crate) fn scala_call_shape_relation(
+pub fn scala_call_shape_relation(
     declared: &[ScalaCallableParameterList],
     actual: &ScalaCallSiteShape,
 ) -> ScalaCallShapeRelation {
@@ -2113,7 +2124,7 @@ pub(crate) fn scala_call_shape_relation(
     }
 }
 
-pub(crate) fn scala_callable_shape_matches(
+pub fn scala_callable_shape_matches(
     declared: &[ScalaCallableParameterList],
     actual: Option<&ScalaCallSiteShape>,
     policy: ScalaCallableUsePolicy,
@@ -2133,7 +2144,7 @@ pub(crate) fn scala_callable_shape_matches(
     }
 }
 
-pub(crate) fn scala_callable_alternative_matches(
+pub fn scala_callable_alternative_matches(
     declared_role: ScalaCallableRole,
     declared_shape: &[ScalaCallableParameterList],
     actual: Option<&ScalaCallSiteShape>,
@@ -2149,7 +2160,7 @@ pub(crate) fn scala_callable_alternative_matches(
         )
 }
 
-pub(crate) fn scala_callable_alternative_is_candidate(
+pub fn scala_callable_alternative_is_candidate(
     declared_role: ScalaCallableRole,
     declared_shape: &[ScalaCallableParameterList],
     actual: &ScalaCallSiteShape,
@@ -2159,7 +2170,7 @@ pub(crate) fn scala_callable_alternative_is_candidate(
         && scala_callable_shape_is_candidate(declared_shape, actual, site_role.use_policy())
 }
 
-pub(crate) fn scala_callable_shape_is_candidate(
+pub fn scala_callable_shape_is_candidate(
     declared: &[ScalaCallableParameterList],
     actual: &ScalaCallSiteShape,
     policy: ScalaCallableUsePolicy,
@@ -2178,7 +2189,7 @@ pub(crate) fn scala_callable_shape_is_candidate(
     }
 }
 
-pub(crate) fn named_argument_invocation_owner(node: Node<'_>) -> Option<Node<'_>> {
+pub fn named_argument_invocation_owner(node: Node<'_>) -> Option<Node<'_>> {
     let assignment = node.parent()?;
     if assignment.kind() != "assignment_expression"
         || assignment.child_by_field_name("left") != Some(node)
@@ -2213,7 +2224,7 @@ pub(crate) fn named_argument_invocation_owner(node: Node<'_>) -> Option<Node<'_>
 /// the invocation's `arguments`. Binding inference must not refresh `name`
 /// after visiting that node: the left side names a parameter/member of the
 /// callee, not a value being reassigned in the current lexical scope.
-pub(crate) fn is_scala_named_argument_assignment(node: Node<'_>) -> bool {
+pub fn is_scala_named_argument_assignment(node: Node<'_>) -> bool {
     if node.kind() != "assignment_expression" {
         return false;
     }
@@ -2225,7 +2236,7 @@ pub(crate) fn is_scala_named_argument_assignment(node: Node<'_>) -> bool {
     })
 }
 
-pub(crate) fn terminal_invocation_owner_name(node: Node<'_>) -> Option<Node<'_>> {
+pub fn terminal_invocation_owner_name(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "identifier" | "type_identifier" => Some(node),
         "generic_function" => node
@@ -2250,7 +2261,7 @@ pub(crate) fn terminal_invocation_owner_name(node: Node<'_>) -> Option<Node<'_>>
 /// Enclosing class/object/trait/enum declarations from the innermost template
 /// to the outermost. This includes local templates that the analyzer does not
 /// publish as global declarations.
-pub(crate) fn enclosing_template_declarations(node: Node<'_>) -> Vec<Node<'_>> {
+pub fn enclosing_template_declarations(node: Node<'_>) -> Vec<Node<'_>> {
     let mut declarations = Vec::new();
     let mut current = node;
     while let Some(parent) = current.parent() {
@@ -2268,7 +2279,7 @@ pub(crate) fn enclosing_template_declarations(node: Node<'_>) -> Vec<Node<'_>> {
     declarations
 }
 
-pub(crate) fn template_self_type(declaration: Node<'_>) -> Option<Node<'_>> {
+pub fn template_self_type(declaration: Node<'_>) -> Option<Node<'_>> {
     let mut declaration_cursor = declaration.walk();
     declaration
         .named_children(&mut declaration_cursor)
@@ -2289,11 +2300,7 @@ pub(crate) fn template_self_type(declaration: Node<'_>) -> Option<Node<'_>> {
 /// Whether a template directly declares a term with `name`. For local
 /// templates, such a declaration must conservatively block inherited-member
 /// resolution because it has no globally indexed CodeUnit/signature.
-pub(crate) fn template_direct_term_member_named(
-    declaration: Node<'_>,
-    name: &str,
-    source: &str,
-) -> bool {
+pub fn template_direct_term_member_named(declaration: Node<'_>, name: &str, source: &str) -> bool {
     let mut declaration_cursor = declaration.walk();
     let Some(body) = declaration
         .named_children(&mut declaration_cursor)
@@ -2350,11 +2357,11 @@ fn pattern_contains_identifier(node: Node<'_>, name: &str, source: &str) -> bool
     false
 }
 
-pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    crate::analyzer::common::node_source_text(node, source)
+pub fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
-pub(crate) fn is_declaration_name(node: Node<'_>) -> bool {
+pub fn is_declaration_name(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         if parent.kind() == "type_definition" {
             let mut cursor = parent.walk();
@@ -2407,7 +2414,7 @@ mod tests {
 "#;
         let mut parser = Parser::new();
         parser
-            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
+            .set_language(&crate::scala::language::LANGUAGE.into())
             .expect("Scala grammar");
         let tree = parser.parse(source, None).expect("Scala tree");
         let mut calls = Vec::new();
@@ -2577,7 +2584,7 @@ mod tests {
 "#;
         let mut parser = Parser::new();
         parser
-            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
+            .set_language(&crate::scala::language::LANGUAGE.into())
             .expect("Scala grammar");
         let tree = parser.parse(source, None).expect("Scala tree");
         let mut actual = Vec::new();
@@ -2615,7 +2622,7 @@ enum Event:
 "#;
         let mut parser = Parser::new();
         parser
-            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
+            .set_language(&crate::scala::language::LANGUAGE.into())
             .expect("Scala grammar");
         let tree = parser.parse(source, None).expect("Scala tree");
         let mut simple_case = None;
@@ -2728,7 +2735,7 @@ object Use { val value = new ArrayOps(1) }
 "#;
         let mut parser = Parser::new();
         parser
-            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
+            .set_language(&crate::scala::language::LANGUAGE.into())
             .expect("Scala grammar");
         let tree = parser.parse(source, None).expect("Scala tree");
         let index = ScalaPackageContextIndex::new(tree.root_node(), source);
@@ -2767,7 +2774,7 @@ object EnumUse:
 "#;
         let mut parser = Parser::new();
         parser
-            .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
+            .set_language(&crate::scala::language::LANGUAGE.into())
             .expect("Scala grammar");
         let tree = parser.parse(source, None).expect("Scala tree");
         let mut value_roles = Vec::new();

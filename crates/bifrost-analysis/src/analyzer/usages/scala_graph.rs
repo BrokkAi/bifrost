@@ -1,11 +1,14 @@
 mod inverted;
-pub(in crate::analyzer::usages) mod local;
-pub(crate) mod namespace;
 mod resolver;
 pub(crate) mod shared;
-pub(crate) mod syntax;
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
+/// Scala's pure graph syntax -- the node predicates, the lexical
+/// type-namespace walk and the local-binding seeds -- now lives in
+/// [`brokk_bifrost_jvm::scala::graph`]. Re-exporting the modules under their
+/// historical names keeps every `scala_graph::…` path in this crate pointing
+/// at the same items.
+pub(crate) use brokk_bifrost_jvm::scala::graph::{local, namespace, syntax};
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};

@@ -1,31 +1,26 @@
+//! The `LanguageAdapter` forwarding shell for Scala.
+//!
+//! Every answer below that knows Scala comes from [`brokk_bifrost_jvm`];
+//! `simple_type_name` is the one exception, because its terminal-segment
+//! splitter still lives beside the usage graph in this crate.
+
 use crate::analyzer::cognitive_complexity;
-use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile, SignatureMetadata};
 use brokk_bifrost_jvm::queries::SCALA_QUERY_DIRECTORY;
-use std::sync::LazyLock;
+use brokk_bifrost_jvm::scala::adapter::{
+    SCALA_COGNITIVE_CONFIG, SCALA_FILE_EXTENSION, scala_extract_call_receiver,
+    scala_object_encoded_short_name_candidates,
+};
+use brokk_bifrost_jvm::scala::declarations::parse_scala_file;
+use brokk_bifrost_jvm::scala::test_detection::scala_contains_tests;
+use brokk_bifrost_jvm::scala::{
+    scala_member_signature_arity, scala_normalize_full_name, scala_signature_return_type,
+};
 use tree_sitter::Tree;
 
-use super::declarations::parse_scala_file;
-use super::tests::scala_contains_tests;
-use super::{
-    scala_member_signature_arity, scala_normalize_full_name, scala_signature_return_type,
-    scala_simple_type_name,
-};
+use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 
-static SCALA_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
-    LazyLock::new(|| cognitive_complexity::Config {
-        if_types: &["if_expression"],
-        loop_types: &["for_expression", "while_expression", "do_while_expression"],
-        case_types: &["case_clause"],
-        binary_types: &["infix_expression"],
-        logical_operators: &["&&", "||"],
-        jump_types: &["break_expression", "continue_expression"],
-        named_function_boundary_types: &["function_definition"],
-        anonymous_function_types: &["lambda_expression"],
-        else_clause_types: &["else_clause"],
-        default_case_predicate: Some(cognitive_complexity::is_wildcard_case),
-        ..cognitive_complexity::Config::empty()
-    });
+use super::scala_simple_type_name;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ScalaAdapter;
@@ -42,7 +37,7 @@ impl LanguageAdapter for ScalaAdapter {
     }
 
     fn file_extension(&self) -> &'static str {
-        "scala"
+        SCALA_FILE_EXTENSION
     }
 
     fn normalize_full_name(&self, fq_name: &str) -> String {
@@ -87,14 +82,7 @@ impl LanguageAdapter for ScalaAdapter {
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        let trimmed = reference.trim();
-        let before_args = trimmed
-            .split_once('(')
-            .map(|(head, _)| head)
-            .unwrap_or(trimmed);
-        before_args
-            .rsplit_once('.')
-            .map(|(receiver, _)| receiver.to_string())
+        scala_extract_call_receiver(reference)
     }
 
     fn contains_tests(
@@ -119,34 +107,4 @@ impl LanguageAdapter for ScalaAdapter {
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&SCALA_COGNITIVE_CONFIG)
     }
-}
-
-fn scala_object_encoded_short_name_candidates(normalized: &str) -> Vec<String> {
-    const MAX_OBJECT_ENCODING_SEGMENTS: usize = 8;
-
-    let parts: Vec<_> = normalized
-        .split('.')
-        .filter(|part| !part.is_empty())
-        .collect();
-    if parts.is_empty() {
-        return Vec::new();
-    }
-    if parts.len() > MAX_OBJECT_ENCODING_SEGMENTS {
-        return Vec::new();
-    }
-
-    let variant_count = 1_usize << parts.len();
-    let mut out = Vec::new();
-    for mask in 1..variant_count {
-        let mut encoded = Vec::with_capacity(parts.len());
-        for (index, part) in parts.iter().enumerate() {
-            if (mask & (1 << index)) != 0 {
-                encoded.push(format!("{part}$"));
-            } else {
-                encoded.push((*part).to_string());
-            }
-        }
-        out.push(encoded.join("."));
-    }
-    out
 }
