@@ -1852,12 +1852,19 @@ fn resolve_csharp_constructor(
     let call_arity = csharp_argument_count(creation, source);
     let mut constructors = Vec::new();
     let mut applicable = Vec::new();
-    let mut implicit_value_type_owners = Vec::new();
+    let mut implicit_parameterless_owners = Vec::new();
     for owner in &owners {
-        let owner_constructors = definitions.members_for_owner_name(
-            &owner.fq_name(),
-            crate::analyzer::csharp_source_identifier(owner),
-        );
+        let owner_constructors = definitions
+            .members_for_owner_name(
+                &owner.fq_name(),
+                crate::analyzer::csharp_source_identifier(owner),
+            )
+            .into_iter()
+            // The member index also tries the generic-arity-stripped owner
+            // name. Keep only constructors whose parent is the exact owner;
+            // otherwise `Item`2 can receive `Item`'s constructor.
+            .filter(|candidate| candidate.fq().parent().as_ref() == Some(owner.fq()))
+            .collect::<Vec<_>>();
         let owner_applicable = csharp_filter_candidates_by_arity(
             csharp,
             definitions,
@@ -1867,10 +1874,14 @@ fn resolve_csharp_constructor(
         if !owner_applicable.is_empty() {
             applicable.extend(owner_applicable);
         } else if call_arity == 0
-            && !owner_constructors.is_empty()
-            && csharp_uses_implicit_parameterless_value_constructor(analyzer, definitions, owner)
+            && (owner_constructors.is_empty()
+                || csharp_uses_implicit_parameterless_value_constructor(
+                    analyzer,
+                    definitions,
+                    owner,
+                ))
         {
-            implicit_value_type_owners.push(owner.clone());
+            implicit_parameterless_owners.push(owner.clone());
         }
         constructors.extend(owner_constructors);
     }
@@ -1881,10 +1892,10 @@ fn resolve_csharp_constructor(
     if !applicable.is_empty() {
         return candidates_outcome(applicable);
     }
-    sort_units(&mut implicit_value_type_owners);
-    implicit_value_type_owners.dedup();
-    if !implicit_value_type_owners.is_empty() {
-        return candidates_outcome(implicit_value_type_owners);
+    sort_units(&mut implicit_parameterless_owners);
+    implicit_parameterless_owners.dedup();
+    if !implicit_parameterless_owners.is_empty() {
+        return candidates_outcome(implicit_parameterless_owners);
     }
     if !constructors.is_empty() {
         return candidates_outcome(constructors);

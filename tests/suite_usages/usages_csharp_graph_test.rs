@@ -2806,11 +2806,21 @@ fn usage_finder_csharp_accepts_optional_and_params_arity_ranges() {
         (
             "Domain/Service.cs",
             r#"
+using System.Runtime.InteropServices;
+
+namespace Custom {
+    public sealed class OptionalAttribute : System.Attribute {}
+}
+
 namespace Domain {
     public sealed class Service {
         public Service(string label = "default") {}
         public void Send(int required, string note = "default") {}
         public void Pack(string head, params object[] tail) {}
+        public void Interop(int required, [Optional, DefaultParameterValue(7)] int optional) {}
+        public void DefaultOnly([DefaultParameterValue(7)] int required) {}
+        public void QualifiedInterop([global::System.Runtime.InteropServices.Optional] int optional) {}
+        public void CustomQualified([Custom.Optional] int required) {}
     }
 }
 "#,
@@ -2833,6 +2843,15 @@ namespace App {
             service.Pack("head");
             service.Pack("head", 1, 2);
             service.Pack();
+            service.Interop(1);
+            service.Interop(1, 2);
+            service.Interop();
+            service.DefaultOnly(1);
+            service.DefaultOnly();
+            service.QualifiedInterop();
+            service.QualifiedInterop(1);
+            service.CustomQualified(1);
+            service.CustomQualified();
         }
     }
 }
@@ -2843,6 +2862,10 @@ namespace App {
     let constructor = member_function(&analyzer, "Domain.Service", "Service");
     let send = member_function(&analyzer, "Domain.Service", "Send");
     let pack = member_function(&analyzer, "Domain.Service", "Pack");
+    let interop = member_function(&analyzer, "Domain.Service", "Interop");
+    let default_only = member_function(&analyzer, "Domain.Service", "DefaultOnly");
+    let qualified_interop = member_function(&analyzer, "Domain.Service", "QualifiedInterop");
+    let custom_qualified = member_function(&analyzer, "Domain.Service", "CustomQualified");
     let consumer = project.file("App/Consumer.cs");
     let provider =
         ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
@@ -2859,6 +2882,22 @@ namespace App {
         .match_indices("service.Pack")
         .map(|(start, _)| start + "service.".len())
         .collect::<Vec<_>>();
+    let interop_offsets = source
+        .match_indices("service.Interop")
+        .map(|(start, _)| start + "service.".len())
+        .collect::<Vec<_>>();
+    let default_only_offsets = source
+        .match_indices("service.DefaultOnly")
+        .map(|(start, _)| start + "service.".len())
+        .collect::<Vec<_>>();
+    let qualified_interop_offsets = source
+        .match_indices("service.QualifiedInterop")
+        .map(|(start, _)| start + "service.".len())
+        .collect::<Vec<_>>();
+    let custom_qualified_offsets = source
+        .match_indices("service.CustomQualified")
+        .map(|(start, _)| start + "service.".len())
+        .collect::<Vec<_>>();
 
     for (target, expected_offsets, rejected_offsets) in [
         (
@@ -2868,6 +2907,22 @@ namespace App {
         ),
         (send, send_offsets[..2].to_vec(), send_offsets[2..].to_vec()),
         (pack, pack_offsets[..2].to_vec(), pack_offsets[2..].to_vec()),
+        (
+            interop,
+            interop_offsets[..2].to_vec(),
+            interop_offsets[2..].to_vec(),
+        ),
+        (
+            default_only,
+            default_only_offsets[..1].to_vec(),
+            default_only_offsets[1..].to_vec(),
+        ),
+        (qualified_interop, qualified_interop_offsets, Vec::new()),
+        (
+            custom_qualified,
+            custom_qualified_offsets[..1].to_vec(),
+            custom_qualified_offsets[1..].to_vec(),
+        ),
     ] {
         let query = UsageFinder::new()
             .with_authoritative_scope(true)
