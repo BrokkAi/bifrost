@@ -451,6 +451,50 @@ impl ScalaAnalyzer {
         })
     }
 
+    /// Whether a bare Scala type name is declared in `file` itself or anywhere
+    /// in `package_name`. The source-declaration half of both
+    /// [`ScalaSource::simple_type_knownness`] and
+    /// [`ScalaSource::is_known_simple_term`], which decide whether
+    /// `SCALA_UNRECOGNIZED_SYMBOL` fires for a name.
+    ///
+    /// Two indexed lookups, one per disjunct, in place of one
+    /// `all_declarations()` walk per name. The walk cost the whole workspace's
+    /// declarations for every bare identifier in a file, which is the product
+    /// that made diagnostics on a large Scala checkout quadratic.
+    ///
+    /// The name test is the same in both halves and is not what either index is
+    /// keyed on, so it is re-applied to whatever the index returns:
+    ///
+    /// * `types_in_package` keys on `scala_simple_type_name`, the *terminal*
+    ///   segment of the short name with `$` trimmed, so it answers a bare
+    ///   `Inner` with the nested `app.Outer$.Inner$`. The predicate here trims
+    ///   only the trailing `$` of the whole short name, so `Outer$.Inner$` has
+    ///   never matched `Inner` and must not start to.
+    /// * The global usage-definition index also admits definition-lookup-only
+    ///   units, which `all_declarations()` excludes. Scala's parser records
+    ///   none today, but a candidate is confirmed against its own file's
+    ///   declarations rather than against that absence, so the equivalence does
+    ///   not depend on a set staying empty.
+    ///
+    /// The per-file half needs no such repair: `declarations(file)` is exactly
+    /// `all_declarations()` restricted to one file, minus file scopes, which
+    /// were never `is_class()`.
+    fn declares_simple_type(&self, file: &ProjectFile, package_name: &str, name: &str) -> bool {
+        let matches_name =
+            |unit: &CodeUnit| unit.is_class() && unit.short_name().trim_end_matches('$') == name;
+        if self.inner.declarations(file).iter().any(matches_name) {
+            return true;
+        }
+        self.global_usage_definition_index()
+            .types_in_package(package_name, name)
+            .iter()
+            .any(|unit| {
+                matches_name(unit)
+                    && unit.package_name() == package_name
+                    && self.inner.declarations(unit.source()).contains(unit)
+            })
+    }
+
     pub(crate) fn full_usage_edges(
         &self,
         nodes: &HashSet<String>,
@@ -592,11 +636,7 @@ impl ScalaSource for ScalaAnalyzer {
         }
 
         let package_name = self.inner.package_name_of(file).unwrap_or_default();
-        if self.inner.all_declarations().any(|declaration| {
-            declaration.is_class()
-                && declaration.short_name().trim_end_matches('$') == name
-                && (declaration.source() == file || declaration.package_name() == package_name)
-        }) {
+        if self.declares_simple_type(file, &package_name, name) {
             return ScalaTypeKnownness::Known;
         }
 
@@ -645,14 +685,11 @@ impl ScalaSource for ScalaAnalyzer {
 
     fn is_known_simple_term(&self, file: &ProjectFile, name: &str) -> bool {
         let package_name = self.inner.package_name_of(file).unwrap_or_default();
-        self.inner.all_declarations().any(|declaration| {
-            declaration.is_class()
-                && declaration.short_name().trim_end_matches('$') == name
-                && (declaration.source() == file || declaration.package_name() == package_name)
-        }) || self
-            .external_declaration_index()
-            .resolve_same_package(&package_name, name)
-            .is_some()
+        self.declares_simple_type(file, &package_name, name)
+            || self
+                .external_declaration_index()
+                .resolve_same_package(&package_name, name)
+                .is_some()
     }
 
     fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -1455,6 +1492,141 @@ class Use(api: Api) { def call(): Int = api.choose(1)("overlay") }
                 .any(|(caller, callee)| caller == "app.Use.call" && callee == "app.Api.choose"),
             "inverted lookup must use overlay ranges and callable facts: {:?}",
             edges.edges.keys().collect::<Vec<_>>()
+        );
+    }
+}
+
+/// The answers [`ScalaSource::simple_type_knownness`] and
+/// [`ScalaSource::is_known_simple_term`] give for a bare name, pinned on a
+/// fixture that separates every disjunct of the declaration test.
+///
+/// These predicates decide whether `SCALA_UNRECOGNIZED_SYMBOL` fires, so a
+/// changed answer is a changed diagnostic and nothing else reports it. The
+/// cases below existed before the indexed lookups replaced the whole-workspace
+/// `all_declarations()` scan and read identically after, which is the whole
+/// point of writing them as one table.
+#[cfg(test)]
+mod knownness_tests {
+    use super::*;
+    use crate::analyzer::TestProject;
+
+    /// `app/Consumer.scala` declares `nested.FileLocal` in a second package
+    /// clause, so that unit is same-file but *not* same-package: it isolates
+    /// the `source() == file` disjunct from the `package_name()` one.
+    ///
+    /// `app/Companion.scala` carries the `$` shapes: a lone `object`
+    /// (`app.Lonely$`), a class/companion pair (`app.Paired` and
+    /// `app.Paired$`), and an object nested in an object
+    /// (`app.Outer$.Inner$`), whose short name is `Outer$.Inner$` and so has
+    /// never answered a bare `Inner`.
+    fn fixture() -> (tempfile::TempDir, ScalaAnalyzer, ProjectFile) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        for (path, source) in [
+            (
+                "app/Consumer.scala",
+                "package app\nclass Consumer\npackage nested { class FileLocal }\n",
+            ),
+            (
+                "app/Companion.scala",
+                "package app\nclass Paired\nobject Paired\nobject Lonely\nobject Outer { object Inner }\n",
+            ),
+            ("app/Sibling.scala", "package app\nclass Sibling\n"),
+            ("other/Far.scala", "package other\nclass Far\n"),
+        ] {
+            let file = ProjectFile::new(root.clone(), path);
+            std::fs::create_dir_all(file.abs_path().parent().expect("source parent"))
+                .expect("source directory");
+            file.write(source).expect("scala source");
+        }
+        let analyzer = ScalaAnalyzer::new(
+            Arc::new(TestProject::new(root.clone(), Language::Scala)) as Arc<dyn Project>,
+        );
+        let consumer = ProjectFile::new(root, "app/Consumer.scala");
+        (temp, analyzer, consumer)
+    }
+
+    #[test]
+    fn simple_type_knownness_answers_each_declaration_shape() {
+        let (_temp, analyzer, consumer) = fixture();
+        for (name, expected) in [
+            // Same package, another file: the plain class.
+            ("Sibling", ScalaTypeKnownness::Known),
+            // Same package, class and companion object under one name.
+            ("Paired", ScalaTypeKnownness::Known),
+            // Same package, companion object with no class: the only unit is
+            // `app.Lonely$`, matched with its trailing `$` trimmed.
+            ("Lonely", ScalaTypeKnownness::Known),
+            ("Outer", ScalaTypeKnownness::Known),
+            // The `$`-carrying spelling is not a Scala type name, and trimming
+            // the declaration's `$` must not make it one.
+            ("Lonely$", ScalaTypeKnownness::Absent),
+            // Nested object: short name `Outer$.Inner$`, so a bare `Inner` has
+            // never matched it even though the type exists in the package.
+            ("Inner", ScalaTypeKnownness::Absent),
+            // Same file, different package.
+            ("FileLocal", ScalaTypeKnownness::Known),
+            // Another package entirely, and no import to reach it.
+            ("Far", ScalaTypeKnownness::Absent),
+            ("Missing", ScalaTypeKnownness::Absent),
+        ] {
+            assert_eq!(
+                expected,
+                ScalaSource::simple_type_knownness(&analyzer, &consumer, name),
+                "knownness of `{name}`"
+            );
+        }
+    }
+
+    #[test]
+    fn is_known_simple_term_answers_each_declaration_shape() {
+        let (_temp, analyzer, consumer) = fixture();
+        for (name, expected) in [
+            ("Sibling", true),
+            ("Paired", true),
+            ("Lonely", true),
+            ("Outer", true),
+            ("Lonely$", false),
+            ("Inner", false),
+            ("FileLocal", true),
+            ("Far", false),
+            ("Missing", false),
+        ] {
+            assert_eq!(
+                expected,
+                ScalaSource::is_known_simple_term(&analyzer, &consumer, name),
+                "term knownness of `{name}`"
+            );
+        }
+    }
+
+    /// The reason the two predicates above stopped calling `all_declarations()`.
+    ///
+    /// Without this the swap to indexed lookups is unobservable: every
+    /// assertion in this module passes just as well against a whole-workspace
+    /// scan, which is exactly what made the scan survive this long.
+    #[test]
+    fn knownness_never_scans_every_workspace_declaration() {
+        let (_temp, analyzer, consumer) = fixture();
+        // Warm the indexes first: building one is allowed to scan, answering a
+        // name is not.
+        let _ = ScalaSource::simple_type_knownness(&analyzer, &consumer, "Sibling");
+        analyzer.inner.reset_full_declaration_scan_count_for_test();
+        for name in [
+            "Sibling",
+            "Paired",
+            "Lonely",
+            "Inner",
+            "FileLocal",
+            "Missing",
+        ] {
+            let _ = ScalaSource::simple_type_knownness(&analyzer, &consumer, name);
+            let _ = ScalaSource::is_known_simple_term(&analyzer, &consumer, name);
+        }
+        assert_eq!(
+            0,
+            analyzer.inner.full_declaration_scan_count_for_test(),
+            "answering a bare Scala name must not walk every declaration in the workspace"
         );
     }
 }
