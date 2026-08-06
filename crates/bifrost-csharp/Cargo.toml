@@ -2,10 +2,14 @@
 name = "brokk-bifrost-csharp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "C# language knowledge for brokk-bifrost: declarations, using-directive resolution, and usage-graph resolution"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 publish = true
 
 [lib]

@@ -2,10 +2,14 @@
 name = "brokk-bifrost-jvm"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "JVM language knowledge for brokk-bifrost: Java, Scala and Kotlin declarations, imports and hierarchy, the shared JVM source realm, and the vendored Scala and Kotlin tree-sitter grammars"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 publish = true
 build = "build.rs"
 # Order matters: gitignore semantics, last match wins. A "!" negation only

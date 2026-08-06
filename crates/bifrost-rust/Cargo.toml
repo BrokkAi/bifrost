@@ -2,10 +2,14 @@
 name = "brokk-bifrost-rust"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Rust language knowledge for brokk-bifrost: cargo routes, declarations, hierarchy, lexical scope, and usage-graph resolution"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 publish = true
 
 [lib]

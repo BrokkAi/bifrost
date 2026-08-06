@@ -29,9 +29,16 @@ resolver = "3"
 [workspace.package]
 version = "0.8.22"
 edition = "2024"
+# The floor is what CI actually pins and tests (rust-toolchain.toml); raise
+# both together.
+rust-version = "1.96"
 license = "LGPL-3.0-or-later"
 repository = "https://github.com/BrokkAi/bifrost"
 homepage = "https://github.com/BrokkAi/bifrost"
+# Shared discovery metadata for the implementation crates; the facade keeps
+# its own richer lists below.
+keywords = ["analyzer", "tree-sitter", "code-analysis"]
+categories = ["development-tools", "parser-implementations"]
 
 [package]
 name = "brokk-bifrost"
@@ -39,11 +46,12 @@ name = "brokk-bifrost"
 # implementation packages, and the Python wheel. Maturin inherits it through
 # `dynamic = ["version"]` in pyproject.toml.
 version.workspace = true
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
 description = "Tree-sitter-backed multi-language code analyzer with bundled LSP and MCP search-tool servers. Powers Brokk's `bifrost` binary."
-license = "LGPL-3.0-or-later"
-repository = "https://github.com/BrokkAi/bifrost"
-homepage = "https://github.com/BrokkAi/bifrost"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 readme = "README.md"
 keywords = ["analyzer", "tree-sitter", "lsp", "mcp", "code-analysis"]
 categories = ["development-tools", "parser-implementations", "command-line-utilities"]

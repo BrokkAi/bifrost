@@ -2,10 +2,14 @@
 name = "brokk-bifrost-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Foundation model, project, and workspace utilities shared by every brokk-bifrost crate"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 publish = true
 
 [lib]

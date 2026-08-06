@@ -264,6 +264,8 @@ package names. Confirm these items for each package:
 - The publisher uses `release.yml` and the `release` environment.
 - `release.yml` includes the package in its publication graph.
 - Each internal dependency uses the release version.
+- The manifest declares `description` and `readme`, and inherits the
+  workspace `keywords`, `categories`, and `rust-version`.
 
 Do not add a crate only to move code into a new directory. A new crate must
 have a clear dependency, compilation, publication, or ownership boundary.

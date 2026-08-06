@@ -2,10 +2,14 @@
 name = "brokk-bifrost-python"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Python language knowledge for brokk-bifrost: module identity, declarations, imports, and usage-graph resolution"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 publish = true
 
 [lib]

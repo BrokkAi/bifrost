@@ -2,10 +2,14 @@
 name = "brokk-bifrost-js-ts"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "JavaScript and TypeScript language knowledge for brokk-bifrost: declarations, ESM/CommonJS imports and tsconfig path aliases, receiver facts, and usage-graph resolution"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 publish = true
 
 [lib]

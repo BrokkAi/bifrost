@@ -2,10 +2,14 @@
 name = "brokk-bifrost-ruby"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Ruby language knowledge for brokk-bifrost: declarations, require/autoload and Zeitwerk visibility, mixin and dispatch-mode facts, and usage-graph resolution"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 publish = true
 
 [lib]

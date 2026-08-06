@@ -2,10 +2,14 @@
 name = "brokk-bifrost-php"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "PHP language knowledge for brokk-bifrost: declarations, namespace and use-alias resolution, composer autoload visibility, and usage-graph resolution"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 publish = true
 
 [lib]
