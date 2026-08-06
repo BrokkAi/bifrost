@@ -4,10 +4,11 @@ use super::{
     ContainerListingEntry, DefinitionCandidateRenderCache, ScanUsageRequest,
     ScanUsagesAbsenceCaveat, ScanUsagesByLocationParams, ScanUsagesCandidateFilesSample,
     ScanUsagesExecutionContext, ScanUsagesIncompleteReason, ScanUsagesStatus, ScanUsagesSurface,
-    ScanUsagesTarget, ScanUsagesWorkEntry, SymbolLookupParams, SymbolUsageRenderState,
-    UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering, classify_scan_usages_entry,
-    definition_candidate_from_range, get_summaries, get_symbol_sources, list_symbols,
-    resolve_file_patterns, scan_usages_by_location_with_context, trim_summary_signature,
+    ScanUsagesTarget, ScanUsagesWorkEntry, SymbolLookupParams, SymbolSourcesResult,
+    SymbolUsageRenderState, UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering,
+    classify_scan_usages_entry, definition_candidate_from_range, get_summaries, get_symbol_sources,
+    list_symbols, resolve_file_patterns, scan_usages_by_location_with_context,
+    symbol_source_candidate_files, trim_summary_signature,
 };
 use super::{function_like_macro_query, route_summary_targets, usage_failure_hint};
 use crate::analyzer::{
@@ -242,6 +243,27 @@ fn broad_navigation_fallback_omits_unproven_columns() {
     let value = serde_json::to_value(candidate).unwrap();
     assert!(value.get("start_column").is_none(), "{value}");
     assert!(value.get("end_column").is_none(), "{value}");
+}
+
+#[test]
+fn complete_symbol_index_skips_enclosing_owner_regex_scan() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let analyzer = CountingAnalyzer::new(root, &["Broken.java"]);
+    let result = SymbolSourcesResult {
+        sources: Vec::new(),
+        not_found: vec![super::NotFoundInput {
+            input: "missing.Owner.member".to_string(),
+            note: None,
+        }],
+        ambiguous: Vec::new(),
+        ambiguous_paths: Vec::new(),
+    };
+
+    let files = symbol_source_candidate_files(&analyzer, &result);
+
+    assert!(files.is_empty());
+    assert_eq!(analyzer.search_definitions_calls(), 0);
 }
 
 #[test]

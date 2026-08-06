@@ -44,9 +44,18 @@ pub(crate) fn resolve_enclosing_codeunits(analyzer: &dyn IAnalyzer, input: &str)
                 let terminal = owner_path.last().expect("non-empty owner path");
 
                 let mut found_at_depth = false;
-                for candidate in
-                    analyzer.search_definitions_with_literal(&pattern, terminal, language)
-                {
+                let candidates = if analyzer.has_complete_symbol_lookup_index() {
+                    // The identifier index covers every persisted declaration. A
+                    // missing owner after this lookup cannot match the suffix
+                    // regex, and the regex scan can read millions of rows.
+                    analyzer.lookup_candidates_by_identifier(terminal)
+                } else {
+                    analyzer
+                        .search_definitions_with_literal(&pattern, terminal, language)
+                        .into_iter()
+                        .collect()
+                };
+                for candidate in candidates {
                     if code_unit_language(&candidate) != language
                         || !codeunit_lookup_aliases(&candidate)
                             .iter()
