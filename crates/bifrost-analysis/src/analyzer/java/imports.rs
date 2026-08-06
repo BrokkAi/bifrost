@@ -1,12 +1,27 @@
+//! Java's `ImportAnalysisProvider` impl and the memo cells behind it, plus the
+//! external half of type-name resolution.
+//!
+//! What an `import` declaration *says*, and how Java's import, wildcard and
+//! same-package tiers decide a written type name, moved to
+//! [`brokk_bifrost_jvm::java::imports`] and
+//! [`brokk_bifrost_jvm::java::graph_support`]. The caching, the reverse import
+//! index and the same-package reference index stay here because they read the
+//! analyzer's own cells, and so does everything that consults
+//! [`JvmExternalDeclarationIndex`]: that index imports `semantic_model` and
+//! cannot cross the crate line.
+
 use super::*;
+use crate::analyzer::ImportInfo;
 use crate::analyzer::jvm::external::JvmExternalType;
 use crate::analyzer::structural::resolution::{PrecedenceTier, RejectionReason};
 use crate::analyzer::usages::get_definition::trace;
-use crate::analyzer::{
-    ImportInfo, StructuredImportPath, StructuredImportPathKind, build_reverse_file_index,
+use brokk_bifrost_jvm::java::graph_support::{
+    compute_java_relevant_imports, compute_java_same_package_reference_index,
+    java_could_import_file, java_could_import_file_without_source, java_same_package_fqn,
+    resolve_java_import_infos, resolve_java_type_name, resolve_java_usage_type_name_in,
 };
+use brokk_bifrost_jvm::java::imports::non_static_import_path;
 use std::sync::Arc;
-use tree_sitter::Node;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JavaTypeResolution {
@@ -74,105 +89,7 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             return (*cached).clone();
         }
 
-        let Some(source) = self.get_source(code_unit, false) else {
-            return HashSet::default();
-        };
-
-        let all_imports = self.import_info_of(code_unit.source());
-        if all_imports.is_empty() {
-            let empty = HashSet::default();
-            self.memo_caches
-                .relevant_imports
-                .insert(code_unit.clone(), Arc::new(empty.clone()));
-            return empty;
-        }
-
-        let type_identifiers = self.extract_type_identifiers(&source);
-        if type_identifiers.is_empty() {
-            let empty = HashSet::default();
-            self.memo_caches
-                .relevant_imports
-                .insert(code_unit.clone(), Arc::new(empty.clone()));
-            return empty;
-        }
-
-        let explicit_imports: Vec<_> = all_imports
-            .iter()
-            .filter(|import| !import.is_wildcard && import.identifier.is_some())
-            .collect();
-        let wildcard_imports: Vec<_> = all_imports
-            .iter()
-            .filter(|import| import.is_wildcard)
-            .collect();
-
-        let mut matched_imports = HashSet::default();
-        let mut resolved_identifiers = HashSet::default();
-
-        for import in explicit_imports {
-            let Some(identifier) = import.identifier.as_deref() else {
-                continue;
-            };
-
-            if type_identifiers.contains(identifier) {
-                matched_imports.insert(import.raw_snippet.clone());
-                resolved_identifiers.insert(identifier.to_string());
-            }
-        }
-
-        let mut unresolved_identifiers: HashSet<String> = type_identifiers
-            .into_iter()
-            .filter(|identifier| !resolved_identifiers.contains(identifier))
-            .collect();
-        if unresolved_identifiers.is_empty() {
-            self.memo_caches
-                .relevant_imports
-                .insert(code_unit.clone(), Arc::new(matched_imports.clone()));
-            return matched_imports;
-        }
-
-        let import_packages: HashSet<String> =
-            all_imports.iter().filter_map(import_package).collect();
-
-        unresolved_identifiers.retain(|identifier| {
-            if !identifier.contains('.') {
-                return true;
-            }
-
-            import_packages
-                .iter()
-                .any(|package| identifier.starts_with(&format!("{package}.")))
-        });
-        if unresolved_identifiers.is_empty() {
-            return matched_imports;
-        }
-
-        let mut resolved_via_wildcard = HashSet::default();
-        for identifier in &unresolved_identifiers {
-            for import in &wildcard_imports {
-                let Some(package) = import_package(import) else {
-                    continue;
-                };
-
-                let lookup_name = format!("{package}.{identifier}");
-                if self
-                    .definitions(&lookup_name)
-                    .any(|code_unit| code_unit.is_class())
-                {
-                    matched_imports.insert(import.raw_snippet.clone());
-                    resolved_via_wildcard.insert(identifier.clone());
-                }
-            }
-        }
-
-        let still_unresolved_simple = unresolved_identifiers.iter().any(|identifier| {
-            !resolved_via_wildcard.contains(identifier) && !identifier.contains('.')
-        });
-        if still_unresolved_simple {
-            for import in wildcard_imports {
-                matched_imports.insert(import.raw_snippet.clone());
-            }
-        }
-
+        let matched_imports = compute_java_relevant_imports(self, code_unit);
         self.memo_caches
             .relevant_imports
             .insert(code_unit.clone(), Arc::new(matched_imports.clone()));
@@ -185,43 +102,11 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         imports: &[ImportInfo],
         target: &ProjectFile,
     ) -> bool {
-        if source_file == target {
-            return false;
-        }
-
-        let source_package = self.package_name_of(source_file).unwrap_or_default();
-        let target_package = self.package_name_of(target).unwrap_or_default();
-        if source_package == target_package {
-            return true;
-        }
-
-        self.could_import_file_without_source(imports, target)
+        java_could_import_file(self, source_file, imports, target)
     }
 }
 
 impl JavaAnalyzer {
-    /// Resolve a source type for a forward definition/type request without
-    /// constructing the workspace-wide usage index.
-    pub(super) fn resolve_forward_type_name(
-        &self,
-        file: &ProjectFile,
-        raw_name: &str,
-    ) -> Option<CodeUnit> {
-        unique_candidate(self.resolve_forward_type_name_candidates(file, raw_name))
-    }
-
-    /// The full candidate set a forward type-name lookup produces. More than
-    /// one entry means colliding on-demand imports: each candidate is a peer
-    /// no wildcard tier can prove unique, and the ambiguity stays explicit as
-    /// multiple rows (issue #1602) rather than as a silent first-route win.
-    pub(super) fn resolve_forward_type_name_candidates(
-        &self,
-        file: &ProjectFile,
-        raw_name: &str,
-    ) -> Vec<CodeUnit> {
-        self.resolve_type_name_with(file, raw_name, |fqn| self.forward_source_type_by_fqn(fqn))
-    }
-
     /// Resolve a source type while a usage query already owns the complete
     /// workspace declaration index. This preserves the same import and package
     /// tiers as forward resolution without serializing every AST type node on
@@ -238,181 +123,28 @@ impl JavaAnalyzer {
     /// Java's own import and package tiers.
     ///
     /// The index is a parameter because Java, Scala, and Kotlin share one JVM
-    /// candidate space (issue #1237): a Java file can name a Kotlin class
-    /// declared next door with no ceremony beyond an ordinary import, and the
-    /// Java-only index cannot see it. Callers holding the realm-aware
-    /// `MultiAnalyzer` index pass that one, which is what makes the realm
-    /// symmetric — Kotlin source could already resolve onto Java declarations,
-    /// and this is the return direction (issue #1239, milestone 4). What does
-    /// *not* widen is Java's visibility model: the same import, wildcard, and
-    /// same-package tiers decide, so a Kotlin class in another package still
-    /// needs an import.
+    /// candidate space (issue #1237); see
+    /// [`resolve_java_usage_type_name_in`] for what widening it does and does
+    /// not change.
     pub(crate) fn resolve_usage_type_name_in(
         &self,
         index: &crate::analyzer::DefinitionIndexHandle<'_>,
         file: &ProjectFile,
         raw_name: &str,
     ) -> Option<CodeUnit> {
-        unique_candidate(self.resolve_type_name_with(file, raw_name, |fqn| {
-            index
-                .fqn(fqn)
-                .iter()
-                .find(|unit| unit.is_class() && unit.fq_name() == fqn)
-                .cloned()
-        }))
-    }
-
-    /// Walk Java's type-name tiers and return every candidate the deciding
-    /// tier produced.
-    ///
-    /// Every tier but one is unique by construction, so the result is almost
-    /// always zero or one unit. The exception is the on-demand tier: two
-    /// wildcard imports can both supply the simple name, and a selection
-    /// through that tier is then not provably unique. All peers are returned
-    /// so the caller can report the ambiguity, mirroring what
-    /// `resolve_external_imports` already expresses for external targets by
-    /// refusing to pick one (issue #1602).
-    pub(crate) fn resolve_type_name_with(
-        &self,
-        file: &ProjectFile,
-        raw_name: &str,
-        mut source_type_by_fqn: impl FnMut(&str) -> Option<CodeUnit>,
-    ) -> Vec<CodeUnit> {
-        let normalized = raw_name.trim();
-        if normalized.is_empty() {
-            return Vec::new();
-        }
-
-        if normalized.contains('.')
-            && let Some(unit) = source_type_by_fqn(normalized)
-        {
-            return vec![unit];
-        }
-
-        let imports = self.inner.import_info_of(file);
-        for import in &imports {
-            let Some(import_path) = non_static_import_path(import) else {
-                continue;
-            };
-            if import.is_wildcard {
-                continue;
-            }
-            let Some(imported_name) = import.identifier.as_deref() else {
-                continue;
-            };
-            // A matching single-type import constrains this name even when its
-            // declaration is outside the indexed workspace.
-            if normalized == imported_name {
-                let unit = source_type_by_fqn(&import_path.render_segments("."));
-                trace_explicit_import_win(file, normalized, unit.as_ref(), &imports);
-                return unit.into_iter().collect();
-            }
-            if let Some(rest) = normalized
-                .strip_prefix(imported_name)
-                .and_then(|rest| rest.strip_prefix('.'))
-            {
-                let nested_fqn = format!("{}.{rest}", import_path.render_segments("."));
-                let unit = source_type_by_fqn(&nested_fqn);
-                trace_explicit_import_win(file, normalized, unit.as_ref(), &imports);
-                return unit.into_iter().collect();
-            }
-        }
-
-        let mut wildcard_candidates: Vec<CodeUnit> = Vec::new();
-        for import in &imports {
-            let Some(import_path) = non_static_import_path(import) else {
-                continue;
-            };
-            if !import.is_wildcard {
-                continue;
-            }
-            let fqn = format!("{}.{normalized}", import_path.render_segments("."));
-            if let Some(unit) = source_type_by_fqn(&fqn)
-                && !wildcard_candidates.contains(&unit)
-            {
-                wildcard_candidates.push(unit);
-            }
-        }
-        if !wildcard_candidates.is_empty() {
-            trace_tier(
-                normalized,
-                &wildcard_candidates,
-                PrecedenceTier::WildcardImport,
-            );
-            return wildcard_candidates;
-        }
-
-        let same_package_fqn = self.same_package_fqn(file, normalized);
-        let unit = source_type_by_fqn(&same_package_fqn).or_else(|| {
-            self.file_is_in_default_package(file)
-                .then(|| source_type_by_fqn(normalized))
-                .flatten()
-        });
-        if let Some(unit) = unit.as_ref() {
-            trace_tier(
-                normalized,
-                std::slice::from_ref(unit),
-                PrecedenceTier::PackageOrModule,
-            );
-        }
-        unit.into_iter().collect()
-    }
-
-    fn forward_source_type_by_fqn(&self, fqn: &str) -> Option<CodeUnit> {
-        self.inner
-            .forward_definition_fqn(fqn)
-            .into_iter()
-            .find(|unit| unit.is_class() && unit.fq_name() == fqn)
+        resolve_java_usage_type_name_in(self, index, file, raw_name)
     }
 }
 
 impl TestDetectionProvider for JavaAnalyzer {}
 
 impl JavaAnalyzer {
-    fn same_package_reference_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
-        self.memo_caches.same_package_reference_index.get_or_build(
-            || self.compute_same_package_reference_index(true),
-            || self.compute_same_package_reference_index(false),
-        )
-    }
-
-    fn compute_same_package_reference_index(
+    pub(super) fn same_package_reference_index(
         &self,
-        parallel: bool,
-    ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
-        let mut targets_by_package_and_name: HashMap<(String, String), Vec<ProjectFile>> =
-            HashMap::default();
-        for file in self.inner.all_files() {
-            let package = self.package_name_of(&file).unwrap_or_default();
-            for declaration in self.inner.top_level_declarations(&file) {
-                if declaration.is_class() || declaration.is_module() {
-                    targets_by_package_and_name
-                        .entry((package.clone(), declaration.identifier().to_string()))
-                        .or_default()
-                        .push(file.clone());
-                }
-            }
-        }
-
-        let files: Vec<_> = self.inner.all_files();
-        build_reverse_file_index(
-            &files,
-            |candidate| {
-                let package = self.package_name_of(candidate).unwrap_or_default();
-                let Some(identifiers) = self.inner.type_identifiers_of(candidate) else {
-                    return Vec::new();
-                };
-                let mut targets = Vec::new();
-                for identifier in identifiers {
-                    if let Some(matching_targets) =
-                        targets_by_package_and_name.get(&(package.clone(), identifier.clone()))
-                    {
-                        targets.extend(matching_targets.iter().cloned());
-                    }
-                }
-                targets
-            },
-            parallel,
+    ) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
+        self.memo_caches.same_package_reference_index.get_or_build(
+            || compute_java_same_package_reference_index(self, true),
+            || compute_java_same_package_reference_index(self, false),
         )
     }
 
@@ -421,66 +153,10 @@ impl JavaAnalyzer {
         imports: &[ImportInfo],
         target: &ProjectFile,
     ) -> bool {
-        let target_package = self.package_name_of(target).unwrap_or_default();
-        let mut target_name = target
-            .rel_path()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_string();
-        if let Some(stripped) = target_name.strip_suffix(".java") {
-            target_name = stripped.to_string();
-        }
-
-        let target_type_fqn = if target_package.is_empty() {
-            target_name.clone()
-        } else {
-            format!("{target_package}.{target_name}")
-        };
-
-        for import in imports {
-            if let Some(path) = static_import_path(import) {
-                // A static import names a member (or `*`) past the type, so
-                // the target type's FQN must be a strict dotted prefix.
-                if path
-                    .render_segments(".")
-                    .strip_prefix(&target_type_fqn)
-                    .is_some_and(|suffix| suffix.starts_with('.'))
-                {
-                    return true;
-                }
-                continue;
-            }
-            let Some(path) = non_static_import_path(import) else {
-                continue;
-            };
-
-            if !import.is_wildcard {
-                if import.identifier.as_deref() == Some(target_name.as_str()) {
-                    return true;
-                }
-                // An interior segment (neither the leading package root nor
-                // the imported terminal) naming the target type marks a
-                // nested-type import through it.
-                let segments = &path.segments;
-                if segments.len() > 2 && segments[1..segments.len() - 1].contains(&target_name) {
-                    return true;
-                }
-                continue;
-            }
-
-            let import_package = path.render_segments(".");
-            if import_package == target_package
-                || import_package == format!("{}.{}", target_package, target_name)
-            {
-                return true;
-            }
-        }
-
-        false
+        java_could_import_file_without_source(self, imports, target)
     }
 
-    fn resolve_imports(&self, file: &ProjectFile) -> Arc<HashMap<String, CodeUnit>> {
+    pub(super) fn resolve_imports(&self, file: &ProjectFile) -> Arc<HashMap<String, CodeUnit>> {
         if let Some(cached) = self.memo_caches.resolved_imports.get(file) {
             return cached;
         }
@@ -498,69 +174,7 @@ impl JavaAnalyzer {
     }
 
     pub(crate) fn resolve_import_infos(&self, imports: &[ImportInfo]) -> HashMap<String, CodeUnit> {
-        let mut resolved = HashMap::default();
-        let mut wildcard_resolved = HashMap::<String, CodeUnit>::default();
-
-        for import in imports {
-            let Some(import_path) = non_static_import_path(import) else {
-                continue;
-            };
-
-            if !import.is_wildcard {
-                if let Some(code_unit) = self.source_type_by_fqn(&import_path.render_segments("."))
-                {
-                    resolved.insert(code_unit.identifier().to_string(), code_unit);
-                }
-                continue;
-            }
-
-            let package_name = import_path.render_segments(".");
-            for code_unit in self.source_types_in_package(&package_name) {
-                let identifier = code_unit.identifier().to_string();
-                if resolved.contains_key(&identifier)
-                    && !wildcard_resolved.contains_key(&identifier)
-                {
-                    continue;
-                }
-                if wildcard_resolved.contains_key(&identifier) {
-                    continue;
-                }
-                wildcard_resolved.insert(identifier.clone(), code_unit.clone());
-                resolved.insert(identifier, code_unit.clone());
-            }
-        }
-
-        resolved
-    }
-
-    pub(super) fn resolve_type_name(&self, file: &ProjectFile, raw_name: &str) -> Option<CodeUnit> {
-        let normalized = raw_name.trim();
-        if normalized.is_empty() {
-            return None;
-        }
-
-        if normalized.contains('.') {
-            if let Some(code_unit) = self.source_type_by_fqn(normalized) {
-                return Some(code_unit);
-            }
-            if let Some(code_unit) = self.resolve_nested_type_name(file, normalized) {
-                return Some(code_unit);
-            }
-        }
-
-        let imports = self.resolve_imports(file);
-        if let Some(code_unit) = imports.get(normalized) {
-            return Some(code_unit.clone());
-        }
-
-        let same_package_fqn = self.same_package_fqn(file, normalized);
-        if let Some(code_unit) = self.source_type_by_fqn(&same_package_fqn) {
-            return Some(code_unit);
-        }
-
-        self.file_is_in_default_package(file)
-            .then(|| self.source_type_by_fqn(normalized))
-            .flatten()
+        resolve_java_import_infos(self, imports)
     }
 
     pub(crate) fn resolve_type_name_with_external(
@@ -573,7 +187,7 @@ impl JavaAnalyzer {
             return None;
         }
 
-        if let Some(code_unit) = self.resolve_type_name(file, normalized) {
+        if let Some(code_unit) = resolve_java_type_name(self, file, normalized) {
             return Some(JavaTypeResolution::Source(code_unit));
         }
 
@@ -608,7 +222,7 @@ impl JavaAnalyzer {
             }
         }
 
-        let same_package = self.same_package_fqn(file, normalized);
+        let same_package = java_same_package_fqn(self, file, normalized);
         if let Some(external_type) = external.resolve_same_package(&access_package, normalized) {
             return Some(JavaTypeResolution::External(external_type.clone()));
         }
@@ -624,13 +238,6 @@ impl JavaAnalyzer {
             .resolve_java_lang(normalized)
             .cloned()
             .map(JavaTypeResolution::External)
-    }
-
-    fn resolve_nested_type_name(&self, file: &ProjectFile, normalized: &str) -> Option<CodeUnit> {
-        let (first, rest) = normalized.split_once('.')?;
-        let owner = self.resolve_visible_simple_type(file, first)?;
-        let nested_fqn = format!("{}.{}", owner.fq_name(), rest);
-        self.source_type_by_fqn(&nested_fqn)
     }
 
     fn resolve_visible_external_simple_type(
@@ -697,125 +304,16 @@ impl JavaAnalyzer {
 
         wildcard_match
     }
-
-    fn resolve_visible_simple_type(&self, file: &ProjectFile, name: &str) -> Option<CodeUnit> {
-        if let Some(code_unit) = self.resolve_imports(file).get(name) {
-            return Some(code_unit.clone());
-        }
-        let same_package_fqn = self.same_package_fqn(file, name);
-        self.source_type_by_fqn(&same_package_fqn).or_else(|| {
-            self.file_is_in_default_package(file)
-                .then(|| self.source_type_by_fqn(name))
-                .flatten()
-        })
-    }
-
-    fn source_type_by_fqn(&self, fqn: &str) -> Option<CodeUnit> {
-        self.inner
-            .global_usage_definition_index()
-            .fqn(fqn)
-            .iter()
-            .find(|code_unit| code_unit.is_class())
-            .cloned()
-    }
-
-    fn source_types_in_package(&self, package_name: &str) -> Vec<CodeUnit> {
-        let mut types: Vec<_> = self
-            .inner
-            .global_usage_definition_index()
-            .package_types()
-            .filter(|((package, _), _)| package == package_name)
-            .flat_map(|(_, units)| units.iter().cloned())
-            .collect();
-        types.sort();
-        types.dedup();
-        types
-    }
-
-    fn same_package_fqn(&self, file: &ProjectFile, name: &str) -> String {
-        let package_name = self
-            .cached_package_name(file)
-            .unwrap_or_else(|| Arc::from(""));
-        if package_name.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}.{}", package_name, name)
-        }
-    }
-
-    fn file_is_in_default_package(&self, file: &ProjectFile) -> bool {
-        self.cached_package_name(file)
-            .is_none_or(|package| package.is_empty())
-    }
-}
-
-pub(super) fn parse_import_info(node: Node<'_>, source: &str, raw: String) -> ImportInfo {
-    let mut segments = Vec::new();
-    let mut last_segment_node = None;
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if matches!(current.kind(), "identifier" | "type_identifier") {
-            segments.push(node_text(current, source).to_owned());
-            last_segment_node = Some(current);
-            continue;
-        }
-        for index in (0..current.named_child_count()).rev() {
-            if let Some(child) = current.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    let mut is_wildcard = false;
-    let mut is_static = false;
-    for child in node.children(&mut node.walk()) {
-        match child.kind() {
-            "asterisk" => is_wildcard = true,
-            "static" => is_static = true,
-            _ => {}
-        }
-    }
-    let identifier = (!is_wildcard).then(|| segments.last().cloned()).flatten();
-    let kind = if is_static {
-        StructuredImportPathKind::StaticMember
-    } else {
-        StructuredImportPathKind::Namespace
-    };
-    // Java has no import aliases, so the token that spells the bound name is
-    // always the path's last segment; a wildcard binds no single name.
-    let binder_span = (!is_wildcard)
-        .then(|| last_segment_node.map(crate::analyzer::common::node_span))
-        .flatten();
-
-    ImportInfo {
-        raw_snippet: raw,
-        is_wildcard,
-        identifier,
-        alias: None,
-        path: (!segments.is_empty()).then_some(StructuredImportPath {
-            segments,
-            kind: Some(kind),
-            lexical_prefixes: Vec::new(),
-            lexical_scopes: Vec::new(),
-            declaration_start_byte: node.start_byte(),
-        }),
-        binder_span,
-    }
-}
-
-/// The single answer of a candidate set, or `None` when the set is empty or
-/// holds ambiguous peers no tier could prove unique.
-fn unique_candidate(mut candidates: Vec<CodeUnit>) -> Option<CodeUnit> {
-    (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
 /// Stage the tier a type-name lookup resolved at, so the outcome constructor
 /// these units flow into records them at that tier.
 ///
-/// The staging is guarded twice, because `resolve_type_name_with` also runs for
-/// receiver types and owners on the way to an answer: only a lookup for the
+/// The staging is guarded twice, because `resolve_java_type_name_with` also runs
+/// for receiver types and owners on the way to an answer: only a lookup for the
 /// name the traced resolver path is currently resolving stages anything, and
 /// the staged tier is spent only by an outcome that reports these very units.
-fn trace_tier(normalized: &str, units: &[CodeUnit], tier: PrecedenceTier) {
+pub(super) fn trace_tier(normalized: &str, units: &[CodeUnit], tier: PrecedenceTier) {
     if trace::recording() && trace::deep_scope_is(normalized) {
         trace::stage_tier(tier, units.iter().map(CodeUnit::fq_name).collect());
     }
@@ -825,8 +323,8 @@ fn trace_tier(normalized: &str, units: &[CodeUnit], tier: PrecedenceTier) {
 /// import routes that were therefore never consulted.
 ///
 /// Java resolves a simple type name against single-type imports before
-/// on-demand (`.*`) imports, which is why the wildcard loop below runs only
-/// when this loop found nothing. The wildcard routes are the resolver's own
+/// on-demand (`.*`) imports, which is why the wildcard loop runs only when the
+/// explicit loop found nothing. The wildcard routes are the resolver's own
 /// enumerated import list, not a re-derivation, so recording them as rejected
 /// peers reports a decision the resolver made rather than inventing one.
 ///
@@ -834,7 +332,7 @@ fn trace_tier(normalized: &str, units: &[CodeUnit], tier: PrecedenceTier) {
 /// import binds no single identifier -- and names what it pointed at through
 /// `target_segments`, the parser-derived package path `parse_import_info`
 /// read from the `import_declaration` node (#1600).
-fn trace_explicit_import_win(
+pub(super) fn trace_explicit_import_win(
     file: &ProjectFile,
     normalized: &str,
     unit: Option<&CodeUnit>,
@@ -867,31 +365,4 @@ fn trace_explicit_import_win(
                 )
             }),
     );
-}
-
-/// The parser-derived path of a non-static import, or `None` for a static
-/// import (or a malformed declaration that produced no segments). For an
-/// on-demand (`.*`) import the segments name the package; the asterisk is
-/// not a segment.
-pub(super) fn non_static_import_path(import: &ImportInfo) -> Option<&StructuredImportPath> {
-    let path = import.path.as_ref()?;
-    (path.kind != Some(StructuredImportPathKind::StaticMember)).then_some(path)
-}
-
-/// The parser-derived path of a static import, or `None` otherwise.
-fn static_import_path(import: &ImportInfo) -> Option<&StructuredImportPath> {
-    let path = import.path.as_ref()?;
-    (path.kind == Some(StructuredImportPathKind::StaticMember)).then_some(path)
-}
-
-/// The package prefix an import makes visible: every segment for an
-/// on-demand (`.*`) import, every segment but the terminal member or type
-/// name otherwise. `None` when no package segments remain.
-fn import_package(import: &ImportInfo) -> Option<String> {
-    let path = import.path.as_ref()?;
-    if import.is_wildcard {
-        return Some(path.render_segments("."));
-    }
-    let (_, package) = path.segments.split_last()?;
-    (!package.is_empty()).then(|| package.join("."))
 }

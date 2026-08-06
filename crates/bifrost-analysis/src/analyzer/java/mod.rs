@@ -29,11 +29,11 @@ use crate::analyzer::usages::java_graph::{
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BuildProgressEvent, BulkFileStateSource,
-    CallableArity, CloneSmell, CloneSmellWeights, CodeUnit, DeclarationKind,
-    ExceptionHandlingAnalysis, ExceptionSmellWeights, ForwardQueryProvider, IAnalyzer,
-    ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
-    UsageFactsIndex, resolve_analyzer,
+    CloneSmell, CloneSmellWeights, CodeUnit, DeclarationKind, ExceptionHandlingAnalysis,
+    ExceptionSmellWeights, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, ImportInfo,
+    Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
+    resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -42,14 +42,19 @@ use std::sync::Arc;
 use crate::analyzer::java::imports::JavaTypeResolution;
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
-use crate::analyzer::structural::resolution::BoundaryStatus;
+use crate::analyzer::structural::resolution::{BoundaryStatus, PrecedenceTier};
 pub(crate) use adapter::JavaAdapter;
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_jvm::java::declarations::{
-    collect_type_identifiers, find_nearest_declaration_from_node, is_comment_node,
-    is_declaration_parent, is_java_anonymous_structure, node_text, normalize_java_full_name,
-    parse_tree,
+    find_nearest_declaration_from_node, is_comment_node, is_declaration_parent,
+    is_java_anonymous_structure, node_text, normalize_java_full_name, parse_tree,
 };
 use brokk_bifrost_jvm::java::exceptions::detect_exception_handling_smells_java;
+use brokk_bifrost_jvm::java::graph_support::{
+    JavaSource, java_constructor_context, java_extract_type_identifiers, java_package_name_of,
+    resolve_java_forward_type_name, resolve_java_forward_type_name_candidates,
+    resolve_java_type_name_candidates_in_realm,
+};
 use brokk_bifrost_jvm::java::test_detection::detect_test_assertion_smells_java;
 use cache::JavaMemoCaches;
 use clones::build_clone_candidate_data;
@@ -189,12 +194,7 @@ impl JavaAnalyzer {
     }
 
     pub fn extract_type_identifiers(&self, source: &str) -> BTreeSet<String> {
-        let Some(tree) = parse_tree(source) else {
-            return BTreeSet::new();
-        };
-        let mut identifiers = HashSet::default();
-        collect_type_identifiers(tree.root_node(), source, &mut identifiers);
-        identifiers.into_iter().collect()
+        java_extract_type_identifiers(source)
     }
 
     pub fn resolve_type_name_in_file(
@@ -202,7 +202,7 @@ impl JavaAnalyzer {
         file: &ProjectFile,
         raw_name: &str,
     ) -> Option<CodeUnit> {
-        self.resolve_forward_type_name(file, raw_name)
+        resolve_java_forward_type_name(self, file, raw_name)
     }
 
     /// Every candidate the deciding type-name tier produced for `raw_name`.
@@ -213,7 +213,7 @@ impl JavaAnalyzer {
         file: &ProjectFile,
         raw_name: &str,
     ) -> Vec<CodeUnit> {
-        self.resolve_forward_type_name_candidates(file, raw_name)
+        resolve_java_forward_type_name_candidates(self, file, raw_name)
     }
 
     pub(crate) fn resolve_type_name_candidates_in_realm(
@@ -222,14 +222,12 @@ impl JavaAnalyzer {
         file: &ProjectFile,
         raw_name: &str,
     ) -> Vec<CodeUnit> {
-        self.resolve_type_name_with(file, raw_name, |fqn| {
-            analyzer
-                .global_usage_definition_index()
-                .fqn(fqn)
-                .iter()
-                .find(|unit| unit.is_class() && unit.fq_name() == fqn && !unit.is_synthetic())
-                .cloned()
-        })
+        resolve_java_type_name_candidates_in_realm(
+            self,
+            &analyzer.global_usage_definition_index(),
+            file,
+            raw_name,
+        )
     }
 
     pub fn is_known_type_name_in_file(&self, file: &ProjectFile, raw_name: &str) -> bool {
@@ -238,8 +236,7 @@ impl JavaAnalyzer {
     }
 
     pub fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
-        self.cached_package_name(file)
-            .map(|package| package.to_string())
+        java_package_name_of(self, file)
     }
 
     /// How far a lookup for `name` from `file` could see past the workspace,
@@ -285,7 +282,29 @@ impl JavaAnalyzer {
         self.inner.bulk_file_states(files, source_mode)
     }
 
-    pub(crate) fn cached_package_name(&self, file: &ProjectFile) -> Option<Arc<str>> {
+    /// Classify exact-FQN callable candidates and the source-level constructor
+    /// shape from one coherent parser snapshot.
+    pub(crate) fn constructor_context(
+        &self,
+        owner: &CodeUnit,
+        candidates: Vec<CodeUnit>,
+        call_arity: usize,
+    ) -> (Vec<CodeUnit>, bool) {
+        java_constructor_context(self, owner, candidates, call_arity)
+    }
+}
+
+/// The analyzer-resident products the crate-side Java logic resolves through.
+///
+/// Every method forwards to one of this analyzer's own accessors or memo
+/// cells, so the cells stay here and the free functions in
+/// [`brokk_bifrost_jvm::java::graph_support`] cannot reach past this surface.
+impl JavaSource for JavaAnalyzer {
+    fn java_all_files(&self) -> Vec<ProjectFile> {
+        self.inner.all_files()
+    }
+
+    fn cached_package_name(&self, file: &ProjectFile) -> Option<Arc<str>> {
         if let Some(package) = self.memo_caches.package_names.get(file) {
             return Some(package);
         }
@@ -296,66 +315,63 @@ impl JavaAnalyzer {
         Some(package)
     }
 
-    /// Classify exact-FQN callable candidates and the source-level constructor
-    /// shape from one coherent parser snapshot.
-    ///
-    /// Java permits an ordinary method to have the same simple name as its
-    /// enclosing class, so FQN and arity alone cannot distinguish the two.
-    pub(crate) fn constructor_context(
+    fn resolved_imports(&self, file: &ProjectFile) -> Arc<HashMap<String, CodeUnit>> {
+        self.resolve_imports(file)
+    }
+
+    fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        ForwardQueryProvider::forward_definition_fqn(self, fqn)
+    }
+
+    fn usage_definitions(&self) -> &dyn crate::analyzer::BoundedDefinitionLookup {
+        self.inner.global_usage_definition_index_ref()
+    }
+
+    fn source_types_in_package(&self, package_name: &str) -> Vec<CodeUnit> {
+        let mut types: Vec<_> = self
+            .inner
+            .global_usage_definition_index()
+            .package_types()
+            .filter(|((package, _), _)| package == package_name)
+            .flat_map(|(_, units)| units.iter().cloned())
+            .collect();
+        types.sort();
+        types.dedup();
+        types
+    }
+
+    fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>> {
+        self.inner.type_identifiers_of(file)
+    }
+
+    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.inner.raw_supertypes_of(code_unit)
+    }
+
+    fn prepared_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>> {
+        self.inner.prepared_syntax(file)
+    }
+
+    fn external_boundary_evidence(
         &self,
-        owner: &CodeUnit,
-        candidates: Vec<CodeUnit>,
-        call_arity: usize,
-    ) -> (Vec<CodeUnit>, bool) {
-        let Some(prepared) = self.inner.prepared_syntax(owner.source()) else {
-            return (Vec::new(), false);
-        };
-        let owner_children = prepared.direct_children(owner);
-        let has_explicit_constructor = owner_children.iter().any(|child| {
-            prepared.declaration_node(child).is_some_and(|node| {
-                matches!(
-                    node.kind(),
-                    "constructor_declaration" | "compact_constructor_declaration"
-                )
-            })
-        });
-        let direct_children = owner_children.iter().collect::<HashSet<_>>();
-        let constructors = candidates
-            .into_iter()
-            .filter(|candidate| direct_children.contains(candidate))
-            .filter(|candidate| {
-                prepared.declaration_node(candidate).is_some_and(|node| {
-                    matches!(
-                        node.kind(),
-                        "constructor_declaration" | "compact_constructor_declaration"
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        let owner_shape_accepts = match prepared.declaration_node(owner) {
-            Some(node) if node.kind() == "class_declaration" => {
-                !has_explicit_constructor && call_arity == 0
-            }
-            Some(node) if node.kind() == "record_declaration" => {
-                let Some(parameters) = node.child_by_field_name("parameters") else {
-                    return (constructors, false);
-                };
-                let mut cursor = parameters.walk();
-                let mut required = 0;
-                let mut repeated = false;
-                for parameter in parameters.named_children(&mut cursor) {
-                    match parameter.kind() {
-                        "formal_parameter" => required += 1,
-                        "spread_parameter" => repeated = true,
-                        _ => {}
-                    }
-                }
-                CallableArity::new(required, required + usize::from(repeated), repeated)
-                    .accepts(call_arity)
-            }
-            _ => false,
-        };
-        (constructors, owner_shape_accepts)
+        file: &ProjectFile,
+        name: &str,
+    ) -> (BoundaryStatus, Option<String>) {
+        JavaAnalyzer::external_boundary_evidence(self, file, name)
+    }
+
+    fn trace_type_name_tier(&self, normalized: &str, units: &[CodeUnit], tier: PrecedenceTier) {
+        imports::trace_tier(normalized, units, tier);
+    }
+
+    fn trace_explicit_import_win(
+        &self,
+        file: &ProjectFile,
+        normalized: &str,
+        unit: Option<&CodeUnit>,
+        imports: &[ImportInfo],
+    ) {
+        imports::trace_explicit_import_win(file, normalized, unit, imports);
     }
 }
 

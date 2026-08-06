@@ -1,4 +1,3 @@
-use super::imports::parse_import_info;
 use super::*;
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::{LanguageAdapter, SignatureMetadata};
@@ -7,6 +6,7 @@ use brokk_bifrost_jvm::java::declarations::{
     is_java_anonymous_structure, module_code_unit, node_text, normalize_java_full_name,
     visit_class_like,
 };
+use brokk_bifrost_jvm::java::imports::parse_import_info;
 use brokk_bifrost_jvm::java::test_detection::java_source_contains_tests;
 use brokk_bifrost_jvm::queries::JAVA_QUERY_DIRECTORY;
 use std::sync::LazyLock;
