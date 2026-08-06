@@ -27,7 +27,15 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 
-pub type MethodCallReturnCacheKey = (String, String, usize);
+/// Identifies one resolved call shape: the fully qualified name of the type the
+/// call is dispatched on, the called method's name, and the argument count that
+/// selects the overload.
+#[derive(PartialEq, Eq, Hash)]
+pub struct MethodCallReturnCacheKey {
+    pub owner_fqn: String,
+    pub method_name: String,
+    pub arity: usize,
+}
 
 pub struct ScanState<'a> {
     pub max_usages: usize,

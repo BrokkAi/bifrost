@@ -16,7 +16,6 @@ use tree_sitter::Node;
 pub struct RustHierarchyIndex {
     pub direct_ancestors: HashMap<CodeUnit, Vec<CodeUnit>>,
     pub direct_descendants: HashMap<CodeUnit, HashSet<CodeUnit>>,
-    #[allow(dead_code)]
     pub relations: Vec<TypeRelation>,
 }
 

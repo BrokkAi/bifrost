@@ -1,5 +1,10 @@
 use tree_sitter_language::LanguageFn;
 
+// SAFETY: build.rs compiles vendor/tree-sitter-scala/src with
+// `-Dtree_sitter_scala=brokk_bifrost_tree_sitter_scala`, so the symbol linked here is
+// the grammar's own generated entry point under a private name. Its C
+// signature is `const TSLanguage *(void)`; the rename changes the symbol only,
+// never the ABI, so this declaration matches the definition.
 unsafe extern "C" {
     fn brokk_bifrost_tree_sitter_scala() -> *const ();
 }
@@ -9,6 +14,10 @@ unsafe extern "C" {
 /// The symbol is renamed by `build.rs` so it cannot collide with the crates.io
 /// `tree-sitter-scala` that `brokk-bifrost-analysis` keeps as a dev-dependency
 /// for two deliberately-different-parser call sites.
+// SAFETY: `brokk_bifrost_tree_sitter_scala` is tree-sitter's generated `tree_sitter_scala`
+// under the private name (see the rename above). It returns a pointer to a
+// `TSLanguage` in static storage that outlives the process, which is what
+// `LanguageFn::from_raw` requires of the function it wraps.
 pub const LANGUAGE: LanguageFn = unsafe { LanguageFn::from_raw(brokk_bifrost_tree_sitter_scala) };
 
 #[cfg(test)]

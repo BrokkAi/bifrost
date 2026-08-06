@@ -19,6 +19,14 @@
 use crate::analyzer::model::{CodeUnit, Language, ProjectFile};
 use crate::path_utils::rel_path_string;
 
+/// Deferred access to a [`BoundedDefinitionLookup`], handed to a graph source
+/// instead of the index itself: the callback runs the consumer, so the index --
+/// a handle that borrows the analyzer and merges one shard per delegate -- is
+/// only materialized when a consumer actually asks a question. Every language
+/// graph source takes the same shape, so it is declared once here.
+pub type DefinitionLookupAccess<'a> =
+    dyn Fn(&mut dyn FnMut(&dyn BoundedDefinitionLookup)) + Sync + 'a;
+
 pub trait BoundedDefinitionLookup {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit>;
     fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit>;

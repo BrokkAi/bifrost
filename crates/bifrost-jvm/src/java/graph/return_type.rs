@@ -13,11 +13,27 @@ use tree_sitter::{Node, Parser};
 pub const METHOD_RECEIVER_CHAIN_LIMIT: usize = 64;
 pub const METHOD_RECEIVER_CHAIN_LIMIT_NAME: &str = "java_method_receiver_chain_depth";
 
-pub type MethodReturnCacheKey = (ProjectFile, String, Option<String>);
+/// Identifies one method declaration across the whole workspace. The declaring
+/// file is part of the key because one fully qualified name can be declared in
+/// more than one file; the signature separates overloads.
+#[derive(PartialEq, Eq, Hash)]
+pub struct MethodReturnCacheKey {
+    pub source: ProjectFile,
+    pub fq_name: String,
+    pub signature: Option<String>,
+}
+
+/// Identifies one method declaration inside a single already-selected file, so
+/// only the overload has to be distinguished.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct FileReturnCacheKey {
+    pub fq_name: String,
+    pub signature: Option<String>,
+}
+
 pub type MethodReturnCache = Mutex<HashMap<MethodReturnCacheKey, ReceiverAnalysisOutcome<String>>>;
 pub type MethodAnonymousReturnCache =
     Mutex<HashMap<MethodReturnCacheKey, ReceiverAnalysisOutcome<String>>>;
-pub type FileReturnCacheKey = (String, Option<String>);
 pub type FileReturnCache = Mutex<HashMap<ProjectFile, JavaFileReturnFacts>>;
 
 #[derive(Clone, Default)]
@@ -88,11 +104,11 @@ fn method_unit_declared_return_type<C>(
 where
     C: JavaReturnTypeContext + ?Sized,
 {
-    let cache_key = (
-        method.source().clone(),
-        method.fq_name(),
-        method.signature().map(str::to_string),
-    );
+    let cache_key = MethodReturnCacheKey {
+        source: method.source().clone(),
+        fq_name: method.fq_name(),
+        signature: method.signature().map(str::to_string),
+    };
     if let Some(cached) = ctx
         .method_return_cache()
         .lock()
@@ -130,7 +146,10 @@ where
     }
     java_file_return_facts(ctx, method.source())
         .declared_types
-        .get(&(method.fq_name(), method.signature().map(str::to_string)))
+        .get(&FileReturnCacheKey {
+            fq_name: method.fq_name(),
+            signature: method.signature().map(str::to_string),
+        })
         .cloned()
         .unwrap_or(ReceiverAnalysisOutcome::Unknown)
 }
@@ -169,11 +188,11 @@ fn method_unit_anonymous_return_type<C>(
 where
     C: JavaReturnTypeContext + ?Sized,
 {
-    let cache_key = (
-        method.source().clone(),
-        method.fq_name(),
-        method.signature().map(str::to_string),
-    );
+    let cache_key = MethodReturnCacheKey {
+        source: method.source().clone(),
+        fq_name: method.fq_name(),
+        signature: method.signature().map(str::to_string),
+    };
     if let Some(cached) = ctx
         .method_anonymous_return_cache()
         .lock()
@@ -216,7 +235,10 @@ where
     }
     java_file_return_facts(ctx, method.source())
         .anonymous_return_types
-        .get(&(method.fq_name(), method.signature().map(str::to_string)))
+        .get(&FileReturnCacheKey {
+            fq_name: method.fq_name(),
+            signature: method.signature().map(str::to_string),
+        })
         .cloned()
         .unwrap_or(ReceiverAnalysisOutcome::Unknown)
 }
@@ -267,7 +289,10 @@ where
         .into_iter()
         .filter(|unit| unit.is_function())
     {
-        let key = (unit.fq_name(), unit.signature().map(str::to_string));
+        let key = FileReturnCacheKey {
+            fq_name: unit.fq_name(),
+            signature: unit.signature().map(str::to_string),
+        };
         let declaration = ctx
             .java()
             .ranges(&unit)

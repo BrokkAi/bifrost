@@ -75,7 +75,12 @@ impl ReceiverFactsFactory for JsTsReceiverFacts {
         &self,
         ctx: ReceiverFactContext<'a, 'tree>,
     ) -> Box<dyn ReceiverFacts<'tree> + 'a> {
-        let facts = ctx.facts.downcast::<JsTsReceiverFileFacts>();
+        // This factory is the only thing that writes these facts, so the stored
+        // type is this one by construction; a mismatch is a registration bug.
+        let facts = ctx
+            .facts
+            .downcast::<JsTsReceiverFileFacts>()
+            .expect("receiver facts are read back by the language that produced them");
         // The SPI hands the framework's `&dyn IAnalyzer`; everything below the
         // factory is on `JsTsAnalyzerHost`, so the downcast happens once, here.
         // `ReceiverFactsFactory` has no error channel and only the JavaScript and

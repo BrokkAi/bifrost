@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::analyzer::CodeUnit;
 use crate::hash::HashSet;
 

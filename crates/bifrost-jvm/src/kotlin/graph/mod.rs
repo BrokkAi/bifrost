@@ -14,7 +14,9 @@ pub mod resolver;
 use brokk_bifrost_core::analyzer::capabilities::{
     ImportAnalysisProvider, TypeAliasProvider, TypeHierarchyProvider,
 };
-use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnitIndex};
+use brokk_bifrost_core::analyzer::{
+    BoundedDefinitionLookup, CodeUnitIndex, DefinitionLookupAccess,
+};
 
 /// The *dispatching* analyzer's side of a Kotlin usage-graph scan.
 ///
@@ -33,13 +35,6 @@ pub struct KotlinGraphSource<'a> {
     pub imports: Option<&'a dyn ImportAnalysisProvider>,
     pub definitions: &'a DefinitionLookupAccess<'a>,
 }
-
-/// See [`KotlinGraphSource::definitions`]: called with a consumer that reads the
-/// analyzer's global definition index, so the index -- a handle that borrows the
-/// analyzer and merges one shard per delegate -- is only materialized when a
-/// consumer actually runs.
-pub type DefinitionLookupAccess<'a> =
-    dyn Fn(&mut dyn FnMut(&dyn BoundedDefinitionLookup)) + Sync + 'a;
 
 impl KotlinGraphSource<'_> {
     /// Run `read` against the dispatching analyzer's definition index.

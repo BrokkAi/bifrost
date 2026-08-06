@@ -1,5 +1,10 @@
 use tree_sitter_language::LanguageFn;
 
+// SAFETY: build.rs compiles vendor/tree-sitter-kotlin/src with
+// `-Dtree_sitter_kotlin=brokk_bifrost_tree_sitter_kotlin`, so the symbol linked here is
+// the grammar's own generated entry point under a private name. Its C
+// signature is `const TSLanguage *(void)`; the rename changes the symbol only,
+// never the ABI, so this declaration matches the definition.
 unsafe extern "C" {
     fn brokk_bifrost_tree_sitter_kotlin() -> *const ();
 }
@@ -8,6 +13,10 @@ unsafe extern "C" {
 /// for [`brokk_bifrost_core::analyzer::Language::Kotlin`] (issue #1236). The
 /// tests below validate the native build and parser contract independently of
 /// the analyzer integration.
+// SAFETY: `brokk_bifrost_tree_sitter_kotlin` is tree-sitter's generated `tree_sitter_kotlin`
+// under the private name (see the rename above). It returns a pointer to a
+// `TSLanguage` in static storage that outlives the process, which is what
+// `LanguageFn::from_raw` requires of the function it wraps.
 pub const LANGUAGE: LanguageFn = unsafe { LanguageFn::from_raw(brokk_bifrost_tree_sitter_kotlin) };
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use super::JavaGraphSource;
-use super::extractor::ScanCtx;
+use super::extractor::{MethodCallReturnCacheKey, ScanCtx};
 use super::hits::enclosing_context;
 use super::return_type::{
     FileReturnCache, JavaReturnTypeContext, LexicalTypeResolution, METHOD_RECEIVER_CHAIN_LIMIT,
@@ -1030,7 +1030,11 @@ fn method_return_type_for_call(
     arity: usize,
     ctx: &ScanCtx<'_>,
 ) -> Option<CodeUnit> {
-    let cache_key = (owner.fq_name(), method_name.to_string(), arity);
+    let cache_key = MethodCallReturnCacheKey {
+        owner_fqn: owner.fq_name(),
+        method_name: method_name.to_string(),
+        arity,
+    };
     if let Some(cached) = ctx
         .method_call_return_cache
         .borrow()
@@ -1040,7 +1044,7 @@ fn method_return_type_for_call(
         return single_return_class(ctx, cached);
     }
 
-    let mut owners = vec![cache_key.0.clone()];
+    let mut owners = vec![cache_key.owner_fqn.clone()];
     if let Some(provider) = ctx.graph.hierarchy {
         owners.extend(
             provider

@@ -102,8 +102,12 @@ pub fn build_jsts_usage_index_with_cancellation(
     let resolve = |file: &ProjectFile, module_specifier: &str| {
         resolve_js_ts_module_specifier(file, module_specifier, language, Some(&aliases))
     };
-    let (reexport_edges, direct_reexport_edges, star_reexports, direct_star_reexports) =
-        build_reexport_edges(&exports_by_file, &binders_by_file, &resolve, cancellation)?;
+    let ReexportEdges {
+        reexport_edges,
+        direct_reexport_edges,
+        star_reexports,
+        direct_star_reexports,
+    } = build_reexport_edges(&exports_by_file, &binders_by_file, &resolve, cancellation)?;
     let importer_reverse = build_importer_reverse(
         &files,
         &binders_by_file,
@@ -348,9 +352,13 @@ pub fn combine_jsts_usage_indices<'a>(
         resolved.dedup();
         resolved
     };
-    let (reexport_edges, direct_reexport_edges, star_reexports, direct_star_reexports) =
-        build_reexport_edges(&exports_by_file, &binders_by_file, &resolve, None)
-            .unwrap_or_default();
+    let ReexportEdges {
+        reexport_edges,
+        direct_reexport_edges,
+        star_reexports,
+        direct_star_reexports,
+    } = build_reexport_edges(&exports_by_file, &binders_by_file, &resolve, None)
+        .unwrap_or_default();
     let mut files: Vec<_> = binders_by_file.keys().cloned().collect();
     files.sort();
     let importer_reverse = build_importer_reverse(
@@ -375,18 +383,24 @@ pub fn combine_jsts_usage_indices<'a>(
     }
 }
 
-#[allow(clippy::type_complexity)]
+/// The re-export maps that one pass over the export indices produces. The
+/// `direct_` maps point outward, from a re-exporting file to what it re-exports;
+/// the other two are the same edges reversed, which is the direction the usage
+/// walk follows back to the importers.
+#[derive(Default)]
+struct ReexportEdges {
+    reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
+    direct_reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
+    star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
+    direct_star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
+}
+
 fn build_reexport_edges(
     exports_by_file: &HashMap<ProjectFile, ExportIndex>,
     binders_by_file: &HashMap<ProjectFile, JsTsImportBinder>,
     resolve: &impl Fn(&ProjectFile, &str) -> Vec<ProjectFile>,
     cancellation: Option<&CancellationToken>,
-) -> Option<(
-    HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
-    HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
-    HashMap<ProjectFile, Vec<ProjectFile>>,
-    HashMap<ProjectFile, Vec<ProjectFile>>,
-)> {
+) -> Option<ReexportEdges> {
     let mut reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>> =
         HashMap::default();
     let mut direct_reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>> =
@@ -498,12 +512,12 @@ fn build_reexport_edges(
             }
         }
     }
-    Some((
+    Some(ReexportEdges {
         reexport_edges,
         direct_reexport_edges,
         star_reexports,
         direct_star_reexports,
-    ))
+    })
 }
 
 fn imported_member_reexport_targets<'a>(

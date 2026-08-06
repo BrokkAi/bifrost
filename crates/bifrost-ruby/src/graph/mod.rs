@@ -14,7 +14,7 @@ pub mod inverted;
 pub mod resolver;
 pub mod syntax;
 
-use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnitIndex};
+use brokk_bifrost_core::analyzer::{CodeUnitIndex, DefinitionLookupAccess};
 
 /// The *dispatching* analyzer's side of a Ruby usage-graph scan.
 ///
@@ -36,9 +36,3 @@ pub struct RubyGraphSource<'a> {
     pub index: &'a dyn CodeUnitIndex,
     pub definitions: &'a DefinitionLookupAccess<'a>,
 }
-
-/// See [`RubyGraphSource::definitions`]: called with a consumer that reads the
-/// analyzer's global definition index, so the index is only resolved when a
-/// consumer actually runs.
-pub type DefinitionLookupAccess<'a> =
-    dyn Fn(&mut dyn FnMut(&dyn BoundedDefinitionLookup)) + Sync + 'a;

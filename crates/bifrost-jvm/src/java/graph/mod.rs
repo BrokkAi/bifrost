@@ -17,7 +17,9 @@ pub mod resolver;
 pub mod return_type;
 
 use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
-use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnitIndex, ProjectFile};
+use brokk_bifrost_core::analyzer::{
+    BoundedDefinitionLookup, CodeUnitIndex, DefinitionLookupAccess, ProjectFile,
+};
 
 /// The *dispatching* analyzer's side of a Java usage-graph scan.
 ///
@@ -37,13 +39,6 @@ pub struct JavaGraphSource<'a> {
     pub definitions: &'a DefinitionLookupAccess<'a>,
     pub import_statements: &'a ImportStatementAccess<'a>,
 }
-
-/// See [`JavaGraphSource::definitions`]: called with a consumer that reads the
-/// analyzer's global definition index, so the index -- a handle that borrows the
-/// analyzer and merges one shard per delegate -- is only materialized when a
-/// consumer actually runs.
-pub type DefinitionLookupAccess<'a> =
-    dyn Fn(&mut dyn FnMut(&dyn BoundedDefinitionLookup)) + Sync + 'a;
 
 /// See [`JavaGraphSource::import_statements`]: the raw `import` statement text
 /// of a file, which `IAnalyzer` answers from persisted per-file state rather

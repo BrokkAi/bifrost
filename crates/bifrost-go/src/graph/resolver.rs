@@ -137,15 +137,19 @@ impl GoProjectGraph {
     }
 }
 
-#[allow(clippy::type_complexity)]
+/// The re-export maps that one pass over the export indices produces, both
+/// reversed: they point from the re-exported file back to the file that
+/// re-exports it, which is the direction the usage walk follows.
+struct ReexportEdges {
+    reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
+    star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
+}
+
 fn build_reexport_edges(
     exports_by_file: &HashMap<ProjectFile, ExportIndex>,
     binders_by_file: &HashMap<ProjectFile, ImportBinder>,
     resolve: &impl Fn(&str) -> Vec<ProjectFile>,
-) -> (
-    HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
-    HashMap<ProjectFile, Vec<ProjectFile>>,
-) {
+) -> ReexportEdges {
     let mut reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>> =
         HashMap::default();
     let mut star_reexports: HashMap<ProjectFile, Vec<ProjectFile>> = HashMap::default();
@@ -192,7 +196,10 @@ fn build_reexport_edges(
             }
         }
     }
-    (reexport_edges, star_reexports)
+    ReexportEdges {
+        reexport_edges,
+        star_reexports,
+    }
 }
 
 fn build_importer_reverse_go(
@@ -1065,8 +1072,10 @@ pub fn build_go_graph(
 
     let resolve =
         |module: &str| resolve_go_module(target_file, module, &dir_index, workspace_paths);
-    let (reexport_edges, star_reexports) =
-        build_reexport_edges(&exports_by_file, &binders_by_file, &resolve);
+    let ReexportEdges {
+        reexport_edges,
+        star_reexports,
+    } = build_reexport_edges(&exports_by_file, &binders_by_file, &resolve);
     let importer_reverse =
         build_importer_reverse_go(&files, &binders_by_file, &exports_by_file, &resolve);
 

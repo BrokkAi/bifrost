@@ -440,10 +440,12 @@ impl ReceiverFileFacts {
         Self(Arc::new(facts))
     }
 
-    pub fn downcast<T: Any + Send + Sync>(&self) -> &T {
-        self.0
-            .downcast_ref()
-            .expect("receiver facts are read back by the language that produced them")
+    /// `None` when `T` is not the type the producing language stored. The
+    /// framework cannot know which type that is, so the invariant "read it back
+    /// as what you wrote" belongs to the language that registered the factory,
+    /// and only that caller can fail on a mismatch.
+    pub fn downcast<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.0.downcast_ref()
     }
 }
 

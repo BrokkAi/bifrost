@@ -33,7 +33,7 @@ pub mod type_relations;
 pub mod usages;
 
 pub use code_unit_index::{CodeUnitIndex, default_parent_fq_name};
-pub use definition_lookup::BoundedDefinitionLookup;
+pub use definition_lookup::{BoundedDefinitionLookup, DefinitionLookupAccess};
 pub use model::{
     CodeUnit, Language, PackageAnchor, ProjectFile, Range, SemanticAbsenceProof,
     SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,

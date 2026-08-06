@@ -113,7 +113,7 @@ pub fn resolve_namespace_value(
         .unwrap_or(NamespaceValueResolution::Missing)
 }
 
-pub struct ScopedUsingEnumOwners {
+pub(crate) struct ScopedUsingEnumOwners {
     scopes: Vec<Vec<CodeUnit>>,
 }
 
@@ -121,23 +121,19 @@ pub struct ScopedUsingEnumOwners {
 /// Cross-file and inherited class imports are deliberately not inferred without persisted
 /// evidence; a missing imported enumerator therefore remains unproven rather than being
 /// misresolved.
-pub struct SemanticUsingEnumOwners {
+pub(crate) struct SemanticUsingEnumOwners {
     class_imports: HashMap<CodeUnit, Vec<CodeUnit>>,
     namespace_imports: HashMap<Vec<String>, Vec<(usize, CodeUnit)>>,
 }
 
-pub enum SemanticUsingEnumMemberResolution {
+pub(crate) enum SemanticUsingEnumMemberResolution {
     Class(UsingEnumMemberResolution),
     Namespace(UsingEnumMemberResolution),
     Missing,
 }
 
 impl SemanticUsingEnumOwners {
-    // A constructor, not a default: the type is only ever built by the scan
-    // that owns it. It became visible to clippy when the graph crossed the
-    // crate line, not by changing shape.
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             class_imports: HashMap::default(),
             namespace_imports: HashMap::default(),
@@ -238,11 +234,7 @@ fn resolve_using_enum_member_for_owners<'a>(
 }
 
 impl ScopedUsingEnumOwners {
-    // A constructor, not a default: the type is only ever built by the scan
-    // that owns it. It became visible to clippy when the graph crossed the
-    // crate line, not by changing shape.
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             scopes: vec![Vec::new()],
         }

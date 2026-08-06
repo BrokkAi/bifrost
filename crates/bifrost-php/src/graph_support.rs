@@ -22,6 +22,13 @@ use tree_sitter::{Node, Parser};
 /// only implementor that matters and every method it answers comes from one of
 /// its own accessors, so the ancestor cache stays where it is and no free
 /// function below can reach past this surface.
+///
+/// Empty on purpose. Rust has no `dyn CodeUnitIndex + TypeHierarchyProvider`:
+/// a trait object can name at most one non-auto trait. The free functions below
+/// need both halves behind a single `&dyn`, so this names the intersection and
+/// the blanket impl below makes every type that already satisfies both a
+/// `PhpAnalysisSource` without writing an impl. Adding a method here would
+/// defeat that -- implementors would have to opt in one by one.
 pub trait PhpAnalysisSource: CodeUnitIndex + TypeHierarchyProvider {}
 
 impl<T: CodeUnitIndex + TypeHierarchyProvider + ?Sized> PhpAnalysisSource for T {}

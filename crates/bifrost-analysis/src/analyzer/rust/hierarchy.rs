@@ -53,7 +53,6 @@ impl RustAnalyzer {
             .get_or_init(|| RustHierarchyIndex::build(self))
     }
 
-    #[allow(dead_code)]
     pub fn type_relations(&self) -> &[TypeRelation] {
         self.type_relations
             .get_or_init(|| self.hierarchy_index().relations.clone())
