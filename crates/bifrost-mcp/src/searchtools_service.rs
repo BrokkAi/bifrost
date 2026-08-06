@@ -3769,12 +3769,11 @@ fn assemble_session(
     );
     let watcher = start_session_watcher(Arc::clone(&project), update_strategy, watcher_starter)?;
     let snapshot = Arc::new(workspace);
-    // Pre-build the lazy Rust usage index off the request path (issue #1416):
-    // warmed here in the background, the first `scan_usages` call no longer
-    // pays whole-workspace index construction inside its wall-clock budget.
-    // The PoolSafeMemo backing the index keeps a failed build unpublished, so
-    // any panic here resurfaces on the first query that needs the index.
-    {
+    // Pre-build the lazy Rust usage index off the request path (issue #1416)
+    // unless the caller disables it. Large C++ workspaces can contain a large
+    // vendored Rust tree. Warming every Rust reference context in those trees
+    // competes with ordinary symbol requests and delays their first result.
+    if rust_usage_warming_enabled() {
         let snapshot = Arc::clone(&snapshot);
         std::thread::Builder::new()
             .name("bifrost-usage-index-warm".to_string())
@@ -3796,6 +3795,18 @@ fn assemble_session(
         #[cfg(feature = "nlp")]
         semantic,
     })
+}
+
+/// Return whether the session should eagerly build the Rust usage graph.
+///
+/// The default keeps the interactive behavior for normal sessions. Benchmark
+/// and symbol-only callers can set `BIFROST_WARM_USAGE_ANALYSIS=off` when a
+/// large workspace contains unrelated Rust sources.
+fn rust_usage_warming_enabled() -> bool {
+    !matches!(
+        std::env::var("BIFROST_WARM_USAGE_ANALYSIS").as_deref(),
+        Ok("0") | Ok("off") | Ok("false") | Ok("disabled")
+    )
 }
 
 fn start_session_watcher(
