@@ -13,7 +13,11 @@ pub fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 pub fn push_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    push_hit_with_options(node, ctx, false, UsageHitKind::Reference, true);
+    if ctx.has_physically_visible_type_target {
+        push_hit_with_options(node, ctx, false, UsageHitKind::Reference, true);
+    } else {
+        push_unproven_hit(node, ctx);
+    }
 }
 
 pub fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

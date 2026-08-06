@@ -2375,7 +2375,7 @@ class CodeQueryGeneratedDeclaration:
 
 @dataclass(frozen=True)
 class CodeQueryGenerationSite:
-    """One construct that materializes declarations (schema version 10).
+    """One construct that materializes declarations.
 
     ``input`` is ``literal`` when ``generated`` is the exact set, and
     ``dynamic`` when the site generates declarations the analyzer cannot
@@ -2430,7 +2430,7 @@ class CodeQueryGenerationSite:
 
 @dataclass(frozen=True)
 class CodeQueryExport:
-    """One export declaration (schema version 10)."""
+    """One export declaration."""
 
     id: str
     path: str
@@ -2475,7 +2475,7 @@ class CodeQueryExport:
 @dataclass(frozen=True)
 class CodeQueryDeclarationState:
     """The state of one declaration: where it came from and what it must not
-    be mistaken for (schema version 10)."""
+    be mistaken for."""
 
     id: str
     path: str

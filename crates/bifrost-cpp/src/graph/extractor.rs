@@ -56,6 +56,7 @@ pub struct ScanCtx<'a> {
     pub line_starts: &'a [usize],
     pub spec: &'a TargetSpec,
     pub target_group: &'a HashSet<CodeUnit>,
+    pub has_physically_visible_type_target: bool,
     type_reference_component_names: HashSet<String>,
     pub target_declaration_ranges: Vec<Range>,
     orphaned_namespaces: Vec<OrphanedNamespaceEnvelope>,
@@ -113,6 +114,24 @@ pub fn scan_prepared_file(
         return;
     }
     let needs_using_enum_member_resolution = spec.enum_owner_kind == EnumOwnerKind::Scoped;
+    let has_physically_visible_type_target = spec.kind == TargetKind::Type
+        && target_group.iter().any(|target| {
+            same_logical_symbol(target, &spec.target)
+                && visibility.is_physically_visible(file, target)
+        });
+    if spec.kind == TargetKind::Type
+        && !has_physically_visible_type_target
+        && visibility
+            .visible_identifier_candidates(file, spec.target.identifier())
+            .any(|candidate| {
+                candidate != &spec.target
+                    && !target_group.contains(candidate)
+                    && same_logical_symbol(candidate, &spec.target)
+                    && visibility.is_physically_visible(file, candidate)
+            })
+    {
+        return;
+    }
     let target_declaration_ranges = if spec.kind == TargetKind::Type {
         target_group
             .iter()
@@ -154,6 +173,7 @@ pub fn scan_prepared_file(
         line_starts: prepared.line_starts(),
         spec,
         target_group,
+        has_physically_visible_type_target,
         type_reference_component_names,
         target_declaration_ranges,
         orphaned_namespaces,
@@ -2768,9 +2788,7 @@ fn inherited_injected_class_qualifier_scope<'tree>(
     let injected_name = &qualified.names[0];
     if !ctx.spec.target.is_class()
         || ctx.spec.target.identifier() != injected_name
-        || !ctx
-            .visibility
-            .is_physically_visible(ctx.file, &ctx.spec.target)
+        || physically_visible_type_target(ctx).is_none()
     {
         return None;
     }
@@ -3005,12 +3023,7 @@ fn target_guided_missing_type_leaf<'tree>(
     node: Node<'tree>,
     ctx: &ScanCtx<'_>,
 ) -> Option<Node<'tree>> {
-    if !ctx
-        .visibility
-        .is_physically_visible(ctx.file, &ctx.spec.target)
-    {
-        return None;
-    }
+    physically_visible_type_target(ctx)?;
     target_guided_missing_dependent_nested_type_leaf(node, ctx)
         .or_else(|| target_guided_missing_declaration_type_leaf(node, ctx))
         .or_else(|| target_guided_missing_alias_rhs_type_leaf(node, ctx))
@@ -3657,9 +3670,9 @@ fn local_type_name_shadows(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 
 fn local_type_name_declaration_node(node: Node<'_>) -> Option<Node<'_>> {
     local_type_alias_name_node(node).or_else(|| match node.kind() {
-        "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier" => {
-            node.child_by_field_name("name")
-        }
+        "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier" => node
+            .child_by_field_name("name")
+            .filter(|name| is_declaration_name(*name)),
         _ => None,
     })
 }
@@ -3697,8 +3710,10 @@ fn local_alias_scope_contains_node(alias: Node<'_>, node: Node<'_>) -> bool {
                 && node.end_byte() <= parent.end_byte();
         }
         if matches!(parent.kind(), "function_definition" | "lambda_expression") {
-            return parent.start_byte() <= node.start_byte()
-                && node.end_byte() <= parent.end_byte();
+            let Some(body) = parent.child_by_field_name("body") else {
+                return false;
+            };
+            return node_is_within(body, alias) && node_is_within(body, node);
         }
         current = parent.parent();
     }
