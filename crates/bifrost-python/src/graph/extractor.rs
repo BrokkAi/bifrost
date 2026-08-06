@@ -172,6 +172,20 @@ pub fn scan_files_for_seeds(
             let _scope = brokk_bifrost_core::profiling::scope("python_graph::matching_edges");
             usage_matching_edges(python, file, seeds)
         };
+        // This is an AST-name gate, not a source-text resolver. Every usage
+        // accepted by the later structural walk has a matching identifier or
+        // can occur inside an annotation string. Skip files that lack both
+        // before building their scope facts and performing that expensive walk.
+        if !file_may_reference_target(
+            tree_ref.root_node(),
+            source_str,
+            target,
+            target_short.as_str(),
+            target_member.as_deref(),
+            &edges,
+        ) {
+            return;
+        }
         let module_bindings = {
             let _scope =
                 brokk_bifrost_core::profiling::scope("python_graph::module_binding_timeline");
@@ -255,6 +269,42 @@ pub fn scan_files_for_seeds(
             .into_inner()
             .expect("usage unproven hit collector mutex poisoned"),
     }
+}
+
+fn file_may_reference_target(
+    root: Node<'_>,
+    source: &str,
+    target: &CodeUnit,
+    target_short: &str,
+    target_member: Option<&str>,
+    edges: &[ImportEdge],
+) -> bool {
+    if target.is_module() {
+        return true;
+    }
+
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "string" {
+            // Annotation strings can use an FQN or a re-export alias that is
+            // not an exact identifier node. Keep them for the structured
+            // annotation resolver below.
+            return true;
+        }
+        if node.kind() == "identifier" {
+            let name = slice(node, source);
+            if name == target_short
+                || target_member.is_some_and(|member| name == member)
+                || edges.iter().any(|edge| edge.local_name == name)
+            {
+                return true;
+            }
+        }
+
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
 }
 
 pub struct ScanResult {

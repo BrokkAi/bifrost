@@ -993,10 +993,6 @@ impl TypeAliasProvider for CppAnalyzer {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.is_type_alias(code_unit)
     }
-
-    fn type_aliases_in_file(&self, file: &ProjectFile) -> Option<HashSet<CodeUnit>> {
-        Some(self.inner.type_aliases_in_file(file))
-    }
 }
 
 static CPP_USAGE_STRATEGY: CppUsageGraphStrategy = CppUsageGraphStrategy::new();

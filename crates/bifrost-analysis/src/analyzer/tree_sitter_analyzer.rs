@@ -6601,15 +6601,19 @@ where
         self.search_candidate_hydration_count
             .fetch_add(rows.rows.len(), Ordering::Relaxed);
         let resolved = resolver.resolve_rows_with_payload_cancellable(
-            rows.rows
-                .into_iter()
-                .map(|row| (row.candidate, (row.primary_range, row.in_test_region))),
+            rows.rows.into_iter().map(|row| {
+                let is_type_alias = row.candidate.flags.is_type_alias;
+                (
+                    row.candidate,
+                    (row.primary_range, row.in_test_region, is_type_alias),
+                )
+            }),
             cancellation,
         );
         inspected = inspected.saturating_add(resolved.inspected);
         complete &= resolved.complete;
         let mut candidates = BTreeMap::new();
-        for (code_unit, (primary_range, in_test_region)) in resolved.rows {
+        for (code_unit, (primary_range, in_test_region, is_type_alias)) in resolved.rows {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 complete = false;
                 break;
@@ -6622,6 +6626,7 @@ where
                         code_unit,
                         primary_range,
                         in_test_region,
+                        is_type_alias,
                     });
             }
         }
@@ -6647,6 +6652,7 @@ where
                         .into_iter()
                         .min_by_key(|range| (range.start_line, range.start_byte)),
                     in_test_region: self.in_test_region(&code_unit),
+                    is_type_alias: self.is_type_alias(&code_unit),
                     code_unit,
                 });
         }
@@ -6671,6 +6677,7 @@ where
                         .into_iter()
                         .min_by_key(|range| (range.start_line, range.start_byte)),
                     in_test_region: self.in_test_region(&code_unit),
+                    is_type_alias: self.is_type_alias(&code_unit),
                     code_unit,
                 });
         }
@@ -7252,12 +7259,6 @@ where
         self.fetch_file_state(code_unit.source())
             .map(|state| state.type_aliases.contains(code_unit))
             .unwrap_or(false)
-    }
-
-    pub(crate) fn type_aliases_in_file(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
-        self.fetch_file_state(file)
-            .map(|state| state.type_aliases.clone())
-            .unwrap_or_default()
     }
 
     pub(crate) fn signatures_vec_of(&self, code_unit: &CodeUnit) -> Vec<String> {

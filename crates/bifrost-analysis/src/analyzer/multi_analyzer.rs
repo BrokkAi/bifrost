@@ -575,12 +575,6 @@ impl TypeAliasProvider for MultiAnalyzer {
             .map(|provider| provider.is_type_alias(code_unit))
             .unwrap_or(false)
     }
-
-    fn type_aliases_in_file(&self, file: &ProjectFile) -> Option<HashSet<CodeUnit>> {
-        self.delegate_for_file(file)
-            .and_then(AnalyzerDelegate::type_alias_provider)
-            .and_then(|provider| provider.type_aliases_in_file(file))
-    }
 }
 
 impl TestDetectionProvider for MultiAnalyzer {}
