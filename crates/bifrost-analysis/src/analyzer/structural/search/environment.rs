@@ -447,6 +447,7 @@ pub(super) fn public_candidate(
     value: &CandidateValue,
     range: CodeQueryRange,
     candidate: CodeQueryCandidateRef,
+    canonical_member_id: Option<String>,
 ) -> CodeQueryResolutionCandidate {
     let row = &value.occurrence;
     let trace = &value.candidate;
@@ -467,6 +468,7 @@ pub(super) fn public_candidate(
         trace_completeness: value.completeness.label(),
         candidate,
         external_target: trace.external_target.clone(),
+        canonical_member_id,
     }
 }
 

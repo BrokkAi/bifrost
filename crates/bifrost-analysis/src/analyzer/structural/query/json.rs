@@ -609,7 +609,8 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::EdgeTarget
         | QueryStep::SegmentTarget
         | QueryStep::ReceiverOutcome
-        | QueryStep::ReceiverEvidence => {}
+        | QueryStep::ReceiverEvidence
+        | QueryStep::MemberSelection => {}
         QueryStep::DeclarationStateOf(filter) => {
             object.extend(declaration_state_filter_to_json(filter));
         }

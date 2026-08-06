@@ -783,6 +783,117 @@ PN_CPP_CLASS_EXTERN connection : public internal::object<pn_connection_t>, publi
 }
 
 #[test]
+fn enum_enumerators_are_children_not_top_level_declarations() {
+    let project = inline_cpp_project(&[(
+        "colors.hpp",
+        r#"namespace ui {
+enum class color { alice_blue, antique_white, aqua };
+enum stroke { thin, thick };
+}
+"#,
+    )]);
+    let analyzer = CppAnalyzer::from_project(project);
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "colors.hpp");
+
+    let top_level = analyzer.get_top_level_declarations(&file);
+    assert!(
+        top_level.iter().any(|unit| unit.fq_name() == "ui.color"),
+        "the enum itself must stay top-level: {top_level:#?}"
+    );
+    assert!(
+        top_level
+            .iter()
+            .all(|unit| unit.kind() != CodeUnitType::Field),
+        "enumerators must not appear as top-level declarations: {top_level:#?}"
+    );
+
+    let color = top_level
+        .iter()
+        .find(|unit| unit.fq_name() == "ui.color")
+        .unwrap();
+    let children: Vec<_> = analyzer
+        .direct_children(color)
+        .into_iter()
+        .map(|unit| unit.fq_name())
+        .collect();
+    for expected in [
+        "ui.color.alice_blue",
+        "ui.color.antique_white",
+        "ui.color.aqua",
+    ] {
+        assert!(
+            children.iter().any(|name| name == expected),
+            "missing enumerator child {expected}: {children:#?}"
+        );
+    }
+}
+
+#[test]
+fn stacked_sentinel_enum_keeps_later_sibling_declarations() {
+    // fmt's color.h shape: two stacked unknown export macros make tree-sitter
+    // wrap the whole file in one ERROR envelope, and the first enum's body is
+    // recovered through the sentinel macro region. The declarations after the
+    // recovered enum's close must survive as ordinary siblings.
+    let project = inline_cpp_project(&[(
+        "color.h",
+        r#"FMT_BEGIN_NAMESPACE
+FMT_BEGIN_EXPORT
+
+enum class color : uint32_t {
+  alice_blue = 0xF0F8FF,               // rgb(240,248,255)
+  antique_white = 0xFAEBD7,            // rgb(250,235,215)
+};  // enum class color
+
+enum class terminal_color : uint8_t {
+  black = 30,
+  red
+};
+
+struct rgb {
+  int r;
+};
+
+FMT_END_EXPORT
+FMT_END_NAMESPACE
+"#,
+    )]);
+    let analyzer = CppAnalyzer::from_project(project);
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "color.h");
+
+    let declarations = analyzer.get_declarations(&file);
+    for expected in [
+        "color",
+        "color.alice_blue",
+        "terminal_color",
+        "terminal_color.black",
+        "terminal_color.red",
+        "rgb",
+        "rgb.r",
+    ] {
+        assert!(
+            declarations.iter().any(|unit| unit.fq_name() == expected),
+            "missing {expected}: {declarations:#?}"
+        );
+    }
+    let color_count = declarations
+        .iter()
+        .filter(|unit| unit.fq_name() == "color")
+        .count();
+    assert_eq!(
+        color_count, 1,
+        "the recovered enum must not be indexed twice: {declarations:#?}"
+    );
+
+    let top_level = analyzer.get_top_level_declarations(&file);
+    for expected in ["color", "terminal_color", "rgb"] {
+        assert!(
+            top_level.iter().any(|unit| unit.fq_name() == expected),
+            "missing top-level {expected}: {top_level:#?}"
+        );
+    }
+}
+
+#[test]
 fn cpp_iterative_visitor_preserves_top_level_source_order() {
     let project = inline_cpp_project(&[(
         "ordered.cpp",
