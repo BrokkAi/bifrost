@@ -3,7 +3,7 @@
 //!
 //! The resolution policy itself moved to `brokk-bifrost-js-ts`; what stays here
 //! is everything that touches the moka bucket. `JsTsMemoCaches` is instance
-//! state on the two analyzers -- five moka caches, one `OnceLock` and two
+//! state on the two analyzers -- five moka caches and three
 //! `PoolSafeMemo`s -- and moka is deliberately not a dependency of the language
 //! crate, exactly as `analyzer/go/imports.rs`, `analyzer/java/imports.rs` and
 //! `analyzer/csharp/imports.rs` keep their own get-then-insert wrappers here and
