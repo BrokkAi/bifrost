@@ -105,7 +105,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
     descriptors.push(rename_symbol_descriptor());
     descriptors.push(tool_descriptor(
         "usage_graph",
-        "Return the whole-workspace caller->callee reference graph in one call: classes and functions as nodes, resolved references as weighted edges. Use to build a code map or rank symbols by importance instead of issuing one per-symbol scan-usage call. Each edge carries its reference locations as a `sites` array of {path, line} (1-based), so you can map call sites without re-scanning; the site count equals the edge weight. Edges reuse scan-usage resolution; symbols whose call sites exceed the enumeration guardrail are listed under truncated_symbols with their inbound edges omitted.",
+        "Build a whole-workspace caller->callee reference graph. This is an expensive batch analysis, not a normal file-localization lookup. Use it only when the task explicitly needs caller/callee relationships or a workspace-wide code map; prefer search_symbols, get_summaries, get_symbol_sources, or a scoped usage query for ordinary localization. Each edge carries its reference locations as a `sites` array of {path, line} (1-based), so you can map call sites without re-scanning; the site count equals the edge weight. Edges reuse scan-usage resolution; symbols whose call sites exceed the enumeration guardrail are listed under truncated_symbols with their inbound edges omitted.",
         json!({
             "type": "object",
             "properties": {
