@@ -1,47 +1,45 @@
 use super::inverted::{CachedCallableAlternatives, is_package_level_type, same_overload_family};
-use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::scala::scala_import_path;
-use crate::analyzer::usages::scala_graph::syntax::{ScalaCallableRole, parenthesized_arity};
-use crate::analyzer::{
-    CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile, ScalaAnalyzer, TypeHierarchyProvider,
-};
-use crate::hash::{HashMap, HashSet};
+use crate::scala::graph::syntax::{ScalaCallableRole, parenthesized_arity};
+use crate::scala::graph_support::ScalaSource;
+use crate::scala::wildcard_imports::scala_import_path;
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, default_parent_fq_name};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum TargetKind {
+pub enum TargetKind {
     Type,
     Constructor,
     Method,
     Field,
 }
 
-pub(super) struct TargetSpec {
-    pub(super) target: CodeUnit,
-    pub(super) kind: TargetKind,
-    pub(super) owner: Option<CodeUnit>,
-    pub(super) owner_name: Option<String>,
-    pub(super) family_owners: Vec<CodeUnit>,
-    pub(super) receiver_owners: Vec<CodeUnit>,
-    pub(super) member_name: String,
-    pub(super) target_fq_name: String,
-    pub(super) owner_fq_name: Option<String>,
-    pub(super) arity: Option<usize>,
-    pub(super) callable_alternatives: CachedCallableAlternatives,
+pub struct TargetSpec {
+    pub target: CodeUnit,
+    pub kind: TargetKind,
+    pub owner: Option<CodeUnit>,
+    pub owner_name: Option<String>,
+    pub family_owners: Vec<CodeUnit>,
+    pub receiver_owners: Vec<CodeUnit>,
+    pub member_name: String,
+    pub target_fq_name: String,
+    pub owner_fq_name: Option<String>,
+    pub arity: Option<usize>,
+    pub callable_alternatives: CachedCallableAlternatives,
     /// Alternatives of the whole same-file overload family (#1327). Candidate
     /// counting for "unique callable" leniency must span the family, while
     /// matching stays on the target's own `callable_alternatives`.
-    pub(super) family_callable_alternatives: CachedCallableAlternatives,
-    pub(super) is_extension_method: bool,
-    pub(super) accepts_field_implementation: bool,
-    pub(super) is_object_type: bool,
-    pub(super) accepts_apply_role: bool,
-    pub(super) accepts_term_field_role: bool,
-    pub(super) accepts_companion_apply_syntax: bool,
+    pub family_callable_alternatives: CachedCallableAlternatives,
+    pub is_extension_method: bool,
+    pub accepts_field_implementation: bool,
+    pub is_object_type: bool,
+    pub accepts_apply_role: bool,
+    pub accepts_term_field_role: bool,
+    pub accepts_companion_apply_syntax: bool,
 }
 
 impl TargetSpec {
-    pub(super) fn from_target(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<Self> {
+    pub fn from_target(scala: &dyn ScalaSource, target: &CodeUnit) -> Option<Self> {
         if target.is_class() || scala.is_type_alias(target) {
             let owner_name = scala_display_name(target);
             let is_type_alias = scala.is_type_alias(target);
@@ -169,7 +167,7 @@ impl TargetSpec {
 }
 
 fn companion_apply_owner_is_unambiguous(
-    scala: &ScalaAnalyzer,
+    scala: &dyn ScalaSource,
     target: &CodeUnit,
     owner: Option<&CodeUnit>,
 ) -> bool {
@@ -187,8 +185,7 @@ fn companion_apply_owner_is_unambiguous(
     }
     let normalized_target = scala_normalized_fq_name(&target.fq_name());
     !scala
-        .global_usage_definition_index()
-        .by_normalized_fqn(&normalized_target)
+        .definitions_by_normalized_fqn(&normalized_target)
         .iter()
         .filter(|candidate| candidate.is_function() && !same_overload_family(candidate, target))
         .filter_map(|candidate| scala.structural_parent_of(candidate))
@@ -200,14 +197,13 @@ fn companion_apply_owner_is_unambiguous(
 }
 
 fn inherited_companion_apply_fallback_is_unambiguous(
-    scala: &ScalaAnalyzer,
+    scala: &dyn ScalaSource,
     target: &CodeUnit,
     owner: &CodeUnit,
 ) -> bool {
-    let index = scala.global_usage_definition_index();
     let normalized_target = scala_normalized_fq_name(&target.fq_name());
-    if index
-        .by_normalized_fqn(&normalized_target)
+    if scala
+        .definitions_by_normalized_fqn(&normalized_target)
         .iter()
         .any(|candidate| candidate.is_function() && !same_overload_family(candidate, target))
     {
@@ -215,7 +211,7 @@ fn inherited_companion_apply_fallback_is_unambiguous(
     }
 
     let normalized_owner = scala_normalized_fq_name(&owner.fq_name());
-    let normalized_owners = index.by_normalized_fqn(&normalized_owner);
+    let normalized_owners = scala.definitions_by_normalized_fqn(&normalized_owner);
     let mut companions = normalized_owners.iter().filter(|candidate| {
         candidate.is_class()
             && *candidate != owner
@@ -266,7 +262,7 @@ enum DirectMemberState {
 }
 
 fn inherited_member_owners(
-    scala: &ScalaAnalyzer,
+    scala: &dyn ScalaSource,
     owner: &Option<CodeUnit>,
     kind: TargetKind,
     member_name: &str,
@@ -334,7 +330,7 @@ fn inherited_member_owners(
 }
 
 fn inherited_member_state_from_ancestors(
-    scala: &ScalaAnalyzer,
+    scala: &dyn ScalaSource,
     descendant: &CodeUnit,
     kind: TargetKind,
     member_name: &str,
@@ -373,7 +369,7 @@ fn inherited_member_state_from_ancestors(
 }
 
 fn direct_member_state(
-    scala: &ScalaAnalyzer,
+    scala: &dyn ScalaSource,
     owner: &CodeUnit,
     kind: TargetKind,
     member_name: &str,
@@ -408,7 +404,7 @@ fn direct_member_state(
 }
 
 fn owner_declares_matching_member(
-    scala: &ScalaAnalyzer,
+    scala: &dyn ScalaSource,
     owner: &CodeUnit,
     kind: TargetKind,
     member_name: &str,
@@ -422,8 +418,8 @@ fn owner_declares_matching_member(
         })
 }
 
-pub(super) fn member_matches_target_kind(
-    scala: &ScalaAnalyzer,
+pub fn member_matches_target_kind(
+    scala: &dyn ScalaSource,
     unit: &CodeUnit,
     kind: TargetKind,
     arity: Option<usize>,
@@ -440,9 +436,7 @@ pub(super) fn member_matches_target_kind(
     }
 }
 
-pub(in crate::analyzer::usages) fn scala_builtin_type_name(
-    type_text: &str,
-) -> Option<&'static str> {
+pub fn scala_builtin_type_name(type_text: &str) -> Option<&'static str> {
     let simple = scala_simple_type_name(type_text)?;
     match simple {
         "String" => Some("String"),
@@ -462,14 +456,14 @@ pub(in crate::analyzer::usages) fn scala_builtin_type_name(
 /// Whether both builtin type names sit in Scala's numeric-widening family, in
 /// which case a literal of one may still select a parameter of the other
 /// during overload resolution and no exact-identity conclusion is safe.
-pub(in crate::analyzer::usages) fn scala_numeric_builtins(left: &str, right: &str) -> bool {
+pub fn scala_numeric_builtins(left: &str, right: &str) -> bool {
     const NUMERIC: [&str; 7] = ["Byte", "Short", "Char", "Int", "Long", "Float", "Double"];
     NUMERIC.contains(&left) && NUMERIC.contains(&right)
 }
 
-pub(in crate::analyzer::usages) use brokk_bifrost_jvm::scala::graph::syntax::scala_literal_type_name;
+pub use crate::scala::graph::syntax::scala_literal_type_name;
 
-pub(in crate::analyzer::usages) fn scala_extension_receiver_matches_resolved(
+pub fn scala_extension_receiver_matches_resolved(
     extension_receiver_type: Option<&str>,
     receiver_owner: Option<&str>,
     mut resolve_type: impl FnMut(&str) -> Option<String>,
@@ -486,7 +480,7 @@ pub(in crate::analyzer::usages) fn scala_extension_receiver_matches_resolved(
     scala_normalized_fq_name(&resolved) == scala_normalized_fq_name(receiver_owner)
 }
 
-pub(in crate::analyzer::usages) fn extension_receiver_type(signature: &str) -> Option<String> {
+pub fn extension_receiver_type(signature: &str) -> Option<String> {
     let trimmed = signature.strip_prefix("extension ")?.trim_start();
     let parameters = trimmed.strip_prefix('(')?.split_once(')')?.0;
     let parameter = parameters.split(',').next()?.trim();
@@ -495,8 +489,8 @@ pub(in crate::analyzer::usages) fn extension_receiver_type(signature: &str) -> O
     (!receiver_type.is_empty()).then(|| receiver_type.to_string())
 }
 
-pub(in crate::analyzer::usages) fn resolved_extension_receiver_type(
-    scala: &ScalaAnalyzer,
+pub fn resolved_extension_receiver_type(
+    scala: &dyn ScalaSource,
     unit: &CodeUnit,
     signature: &str,
 ) -> Option<String> {
@@ -506,8 +500,8 @@ pub(in crate::analyzer::usages) fn resolved_extension_receiver_type(
     })
 }
 
-pub(in crate::analyzer::usages) fn scala_resolve_declared_type(
-    scala: &ScalaAnalyzer,
+pub fn scala_resolve_declared_type(
+    scala: &dyn ScalaSource,
     file: &ProjectFile,
     package_name: &str,
     type_text: &str,
@@ -559,13 +553,12 @@ pub(in crate::analyzer::usages) fn scala_resolve_declared_type(
 }
 
 fn scala_declared_type_in_package(
-    scala: &ScalaAnalyzer,
+    scala: &dyn ScalaSource,
     package_name: &str,
     simple: &str,
 ) -> Option<String> {
     preferred_scala_type(
         scala
-            .global_usage_definition_index()
             .types_in_package(package_name, simple)
             .iter()
             .filter(|unit| is_package_level_type(unit)),
@@ -573,19 +566,18 @@ fn scala_declared_type_in_package(
     .map(|unit| unit.fq_name())
 }
 
-fn scala_declared_type_fqn(scala: &ScalaAnalyzer, fqn: &str) -> Option<String> {
+fn scala_declared_type_fqn(scala: &dyn ScalaSource, fqn: &str) -> Option<String> {
     let normalized = scala_normalized_fq_name(fqn);
     preferred_scala_type(
         scala
-            .global_usage_definition_index()
-            .by_normalized_fqn(&normalized)
+            .definitions_by_normalized_fqn(&normalized)
             .iter()
             .filter(|unit| unit.is_class()),
     )
     .map(|unit| unit.fq_name())
 }
 
-pub(in crate::analyzer::usages) fn preferred_scala_type<'a>(
+pub fn preferred_scala_type<'a>(
     units: impl IntoIterator<Item = &'a CodeUnit>,
 ) -> Option<&'a CodeUnit> {
     let mut first = None;
@@ -619,8 +611,8 @@ fn scala_simple_type_name(type_text: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
-pub(in crate::analyzer::usages) fn method_arity_matches(
-    scala: &ScalaAnalyzer,
+pub fn method_arity_matches(
+    scala: &dyn ScalaSource,
     unit: &CodeUnit,
     target_arity: Option<usize>,
 ) -> bool {
@@ -630,10 +622,7 @@ pub(in crate::analyzer::usages) fn method_arity_matches(
     method_signature_arity(scala, unit).is_none_or(|arity| arity == target_arity)
 }
 
-pub(in crate::analyzer::usages) fn method_signature_arity(
-    scala: &ScalaAnalyzer,
-    unit: &CodeUnit,
-) -> Option<usize> {
+pub fn method_signature_arity(scala: &dyn ScalaSource, unit: &CodeUnit) -> Option<usize> {
     unit.signature().and_then(signature_arity).or_else(|| {
         scala
             .signatures(unit)
@@ -642,7 +631,7 @@ pub(in crate::analyzer::usages) fn method_signature_arity(
     })
 }
 
-fn owner_of(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
+fn owner_of(scala: &dyn ScalaSource, target: &CodeUnit) -> Option<CodeUnit> {
     if let Some(owner) = scala.structural_parent_of(target) {
         return owner.is_class().then_some(owner);
     }
@@ -652,7 +641,7 @@ fn owner_of(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
     // where the legacy short_name string's last `.` falls plus a manual
     // package re-qualification (this branch's old body did exactly that
     // reconstruction by hand).
-    if let Some(owner_fq) = crate::analyzer::default_parent_fq_name(target)
+    if let Some(owner_fq) = default_parent_fq_name(target)
         && let Some(owner) = scala.definitions(&owner_fq).find(|unit| unit.is_class())
     {
         return Some(owner);
@@ -669,10 +658,7 @@ fn owner_of(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
         })
 }
 
-pub(in crate::analyzer::usages) fn import_candidate_fq_names(
-    path: &str,
-    package_name: &str,
-) -> HashSet<String> {
+pub fn import_candidate_fq_names(path: &str, package_name: &str) -> HashSet<String> {
     let mut candidates = HashSet::from_iter([path.to_string()]);
     if !package_name.is_empty() && !path.starts_with(&format!("{package_name}.")) {
         candidates.insert(format!("{package_name}.{path}"));
@@ -680,10 +666,7 @@ pub(in crate::analyzer::usages) fn import_candidate_fq_names(
     candidates
 }
 
-pub(in crate::analyzer::usages) fn import_candidate_owner_fq_names(
-    path: &str,
-    package_name: &str,
-) -> HashSet<String> {
+pub fn import_candidate_owner_fq_names(path: &str, package_name: &str) -> HashSet<String> {
     let mut owners = HashSet::default();
     for candidate in import_candidate_fq_names(path, package_name) {
         owners.insert(candidate.clone());
@@ -706,10 +689,7 @@ fn signature_arity(signature: &str) -> Option<usize> {
     parenthesized_arity(&signature[open..])
 }
 
-pub(in crate::analyzer::usages) fn package_name_of(
-    scala: &ScalaAnalyzer,
-    file: &ProjectFile,
-) -> Option<String> {
+pub fn package_name_of(scala: &dyn ScalaSource, file: &ProjectFile) -> Option<String> {
     scala
         .declarations(file)
         .into_iter()
@@ -717,12 +697,12 @@ pub(in crate::analyzer::usages) fn package_name_of(
         .map(|unit| unit.package_name().to_string())
 }
 
-pub(in crate::analyzer::usages) fn scala_normalized_fq_name(fq_name: &str) -> String {
+pub fn scala_normalized_fq_name(fq_name: &str) -> String {
     fq_name.replace("$.", ".").trim_end_matches('$').to_string()
 }
 
-pub(in crate::analyzer::usages) fn scala_display_name(unit: &CodeUnit) -> String {
-    super::shared::scala_short_name_terminal_segment(unit.short_name())
+pub fn scala_display_name(unit: &CodeUnit) -> String {
+    crate::scala::scala_short_name_terminal_segment(unit.short_name())
         .trim_end_matches('$')
         .to_string()
 }

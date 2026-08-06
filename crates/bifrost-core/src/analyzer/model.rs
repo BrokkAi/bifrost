@@ -355,6 +355,21 @@ impl CallableArity {
     }
 }
 
+/// What a workspace-wide usage-facts index knows about one callable
+/// declaration: how many arguments it accepts, in both the legacy flat and the
+/// required/total/repeated spelling, and the fq name of the type it returns.
+///
+/// Pure data over [`CallableArity`], so it sits beside it rather than in the
+/// analysis-side index that builds it; the language crates that read the facts
+/// through a narrow accessor need the shape, not the index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallableFacts {
+    pub arity: Option<usize>,
+    pub callable_arity: Option<CallableArity>,
+    pub return_type_fqn: Option<String>,
+    pub is_function: bool,
+}
+
 impl ParameterMetadata {
     pub fn new(label: impl Into<String>, start_byte: usize, end_byte: usize) -> Self {
         Self {

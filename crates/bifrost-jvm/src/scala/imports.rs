@@ -5,11 +5,57 @@
 //! analyzer-facing half -- `ScalaAnalyzer`'s import resolution and its
 //! `ImportAnalysisProvider` impl -- stays in `brokk-bifrost-analysis`.
 
-use brokk_bifrost_core::analyzer::CodeUnit;
+use crate::scala::graph_support::ScalaSource;
 use brokk_bifrost_core::analyzer::model::{
     ImportInfo, ScalaExportInfo, ScalaExportSelector, StructuredImportPath, StructuredImportScope,
 };
+use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
 use tree_sitter::Node;
+
+/// Object/class/trait declarations lexically enclosing a Scala byte
+/// position, innermost first.
+///
+/// A relative Scala import path -- and any wildcard-imported member reached
+/// through it -- resolves against these enclosing template scopes before the
+/// package (mirroring ordinary qualified-identifier lookup). This walks the
+/// same `ClassRangeIndex` byte-range lookup + `structural_parent_of` chain
+/// that call/type-namespace resolution already uses for "which singleton
+/// owns this site" (see `scala_exact_lexical_singleton_for_call` and
+/// `scala_type_namespace_resolution` in `usages::get_definition::scala`).
+///
+/// Lives here rather than in `usages::get_definition::scala` (where it was
+/// first written, for the import-token click fix) because
+/// [`crate::scala::wildcard_imports`]'s
+/// `resolve_scala_wildcard_import_environment` needs the identical owner chain
+/// for the *usage* side of the same gap (resolving a member reached through a
+/// wildcard import), and `ScalaAnalyzer`'s own `wildcard_import_environment`
+/// (workspace-wide import/usage-graph edges) needs it too. `wildcard_imports`
+/// is deliberately analyzer-free and closure-based for testability, so it does
+/// not call this directly; its callers compute the owner chain and pass it in
+/// via a closure instead.
+///
+/// `index` is the *dispatching* analyzer and `scala` the Scala one, for the
+/// reason `ScalaWorkspaceSource` records: the byte-range lookup is answered
+/// from whatever analyzer the caller holds.
+pub fn scala_enclosing_template_owner_fq_names(
+    index: &dyn CodeUnitIndex,
+    scala: &dyn ScalaSource,
+    file: &ProjectFile,
+    byte: usize,
+) -> Vec<String> {
+    let mut owners = Vec::new();
+    let mut current = ClassRangeIndex::build(index, file)
+        .enclosing_unit(byte)
+        .cloned();
+    while let Some(owner) = current {
+        current = scala.structural_parent_of(&owner);
+        if owner.is_class() {
+            owners.push(owner.fq_name());
+        }
+    }
+    owners
+}
 
 pub fn scala_import_infos_from_node(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
     scala_import_infos_from_node_with_prefixes(node, source, &[])

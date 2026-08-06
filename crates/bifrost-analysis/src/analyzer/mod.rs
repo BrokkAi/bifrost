@@ -148,8 +148,8 @@ pub use jvm::kotlin_artifact::KotlinSourceJarPackProducer;
 pub use jvm::scala_artifact::ScalaSourceJarPackProducer;
 pub use kotlin::KotlinAnalyzer;
 pub use model::{
-    CallableArity, CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType,
-    CommentDensityStats, DeclarationInfo, DeclarationKind, DispatchExtensibility,
+    CallableArity, CallableFacts, CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit,
+    CodeUnitType, CommentDensityStats, DeclarationInfo, DeclarationKind, DispatchExtensibility,
     ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo, Language,
     LanguageDialect, MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights, ParameterMetadata,
     ParseError, ParseErrorKind, ProjectFile, Range, RubyMethodDispatchMode, ScalaExportInfo,

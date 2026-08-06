@@ -161,3 +161,80 @@ pub fn scala_parenthesized_arity(source: &str) -> Option<usize> {
     }
     Some(scala_split_top_level_commas(inner).count())
 }
+/// Whether `name` is a type the Scala standard prelude puts in scope without
+/// an import.
+///
+/// The list is deliberately generous: every entry is a name the analyzer will
+/// never find a workspace declaration for, so a semantic diagnostic that
+/// reported it would be a guaranteed false positive.
+pub fn scala_default_type_name(name: &str) -> bool {
+    if scala_standard_arity_type_name(name) {
+        return true;
+    }
+    matches!(
+        name,
+        "Any"
+            | "AnyRef"
+            | "AnyVal"
+            | "Nothing"
+            | "Null"
+            | "Unit"
+            | "Boolean"
+            | "Byte"
+            | "Short"
+            | "Int"
+            | "Long"
+            | "Float"
+            | "Double"
+            | "Char"
+            | "String"
+            | "Array"
+            | "Option"
+            | "Some"
+            | "None"
+            | "Either"
+            | "Left"
+            | "Right"
+            | "List"
+            | "Nil"
+            | "Seq"
+            | "Set"
+            | "Map"
+            | "Iterable"
+            | "Iterator"
+            | "Product"
+            | "PartialFunction"
+            | "Matchable"
+            | "Dynamic"
+            | "Singleton"
+            | "AnyKind"
+            | "CanEqual"
+            | "ValueOf"
+            | "DummyImplicit"
+            | "RuntimeException"
+            | "Exception"
+            | "Throwable"
+            | "Error"
+            | "Object"
+            | "Class"
+            | "Number"
+            | "Math"
+            | "System"
+            | "StringBuilder"
+    )
+}
+
+/// The arity-suffixed prelude families -- `TupleN`, `FunctionN`,
+/// `ContextFunctionN` for N up to 22.
+pub fn scala_standard_arity_type_name(name: &str) -> bool {
+    for prefix in ["Tuple", "Function", "ContextFunction"] {
+        if let Some(arity) = name
+            .strip_prefix(prefix)
+            .and_then(|value| value.parse::<u8>().ok())
+            && arity <= 22
+        {
+            return true;
+        }
+    }
+    false
+}

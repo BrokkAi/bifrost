@@ -1,33 +1,32 @@
-mod inverted;
-mod resolver;
 pub(crate) mod shared;
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
-/// Scala's pure graph syntax -- the node predicates, the lexical
-/// type-namespace walk and the local-binding seeds -- now lives in
-/// [`brokk_bifrost_jvm::scala::graph`]. Re-exporting the modules under their
-/// historical names keeps every `scala_graph::…` path in this crate pointing
-/// at the same items.
-pub(crate) use brokk_bifrost_jvm::scala::graph::{local, namespace, syntax};
+/// Scala's usage-graph language knowledge -- the node predicates, the lexical
+/// type-namespace walk, the local-binding seeds, the project type index, the
+/// per-file scans and the find-references target-shape analysis -- now lives in
+/// [`brokk_bifrost_jvm::scala::graph`]. Every reader outside this module names
+/// it there directly; what is re-exported here is what this module and its
+/// `shared` sibling still resolve through.
+pub(crate) use brokk_bifrost_jvm::scala::graph::{inverted, resolver, syntax};
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::scala_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::scala_graph::shared::{ScalaEdgeResolver, ScalaQueryResolver};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, ProjectFile, ScalaAnalyzer, resolve_analyzer,
 };
 use crate::hash::HashSet;
+use resolver::{TargetKind, TargetSpec};
 use std::sync::Arc;
 
 pub(crate) use inverted::{NameResolver as ScalaNameResolver, ProjectTypes as ScalaProjectTypes};
 pub(in crate::analyzer::usages) use resolver::{
-    import_candidate_fq_names, import_candidate_owner_fq_names, method_signature_arity,
-    package_name_of, resolved_extension_receiver_type, scala_builtin_type_name,
-    scala_extension_receiver_matches_resolved, scala_literal_type_name, scala_normalized_fq_name,
+    import_candidate_fq_names, import_candidate_owner_fq_names, package_name_of,
+    scala_builtin_type_name, scala_extension_receiver_matches_resolved, scala_literal_type_name,
+    scala_normalized_fq_name,
 };
 pub(in crate::analyzer::usages) use syntax::{node_text as scala_node_text, scala_import_path};
 
