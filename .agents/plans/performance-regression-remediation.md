@@ -26,8 +26,12 @@ action on this branch will show the result.
   Keep the real fmt executor and Gson import-traversal work separate.
 - [x] (2026-08-06 14:42Z) Repaired Serde symbol lookup with an indexed suffix
   return. The focused test passes and the location p50 is 0.4 ms locally.
-- [ ] Run focused tests, policy validation, the strict Benchmark action, and
-  open one pull request.
+- [x] (2026-08-06 15:56Z) Reprofiled the second strict action
+  `31112520238` and repaired the measured C++, Scala, Python, and Go paths.
+- [x] (2026-08-06 16:12Z) Ran formatting, the complete usage suite, focused
+  Scala, C++, and structural-query tests, and the code-smell policy pack.
+- [ ] Dispatch the final strict Benchmark action on this commit and open one
+  pull request after it passes.
 
 ## Surprises & Discoveries
 
@@ -54,10 +58,14 @@ action on this branch will show the result.
 - Observation: the Scala cold delay is outside structural query execution.
   Evidence: the action took 25,673 ms end to end while its query profile took
   7.48 ms with a memory hit. Dapper retains its existing scan-first policy.
-- Observation: Gson and the reported fmt query regression do not persist on
-  the current release binary.
-  Evidence: Gson importers p50 is 38.2 ms against a 247.5 ms baseline. The
-  fmt C++ query needs no shared cold-cache repair after the renderer fix.
+- Observation: the second strict run found stable renderer, graph, and
+  semantic-overlay costs.
+  Evidence: `31112520238` measured C++ symbol render at 1,161 ms, C++ query
+  render at 615 ms, Click scan at 12,805 ms, Gin scan at 1,122 ms, and Scala
+  semantic-pack acquisition at 2,472 ms.
+- Observation: each remaining regression has a local repair below baseline.
+  Evidence: Click scan p50 is 2,290 ms against 2,469 ms; Gin scan p50 is
+  122 ms against 782 ms; fmt query render is 16 ms with byte-identical JSON.
 
 ## Decision Log
 
@@ -73,29 +81,30 @@ action on this branch will show the result.
   Rationale: Similar action names do not prove a shared cause across language
   adapters.
   Date/Author: 2026-08-06 / Codex.
-- Decision: Do not change `scan_usages` or its baseline now.
-  Rationale: Six fresh profiles are below the baseline and the language paths
-  do not share a hot phase. The GitHub result needs a strict rerun after the
-  verified repairs.
+- Decision: Keep language-specific `scan_usages` repairs and retain the
+  baseline.
+  Rationale: Python spent time in full scope scans, while Go walked receiver
+  ancestors for every identifier. The new AST gate and type-node gate retain
+  behavior tests and improve both measured paths.
   Date/Author: 2026-08-06 / Codex.
 - Decision: Return a unique indexed suffix before the SQL suffix fallback.
   Rationale: The index has already proved the same public fuzzy result. The
   fallback adds latency without changing its result.
   Date/Author: 2026-08-06 / Codex.
-- Decision: Do not change shared query-code preparation now.
-  Rationale: Scala, Exposed, and Dapper do not share an internal query phase
-  that explains the action result. Fmt and Gson have separate steady-state
-  paths that need their own evidence.
+- Decision: Remove repeated lookup and rendering work, not result data.
+  Rationale: Scala overlay activation repeated 74 global definition lookups.
+  C++ result render repeated file-state and declaration-range scans. Direct
+  existing data preserves anchors and query JSON.
   Date/Author: 2026-08-06 / Codex.
 
 ## Outcomes & Retrospective
 
-The branch repairs two proven regressions. Rust fuzzy lookup now returns a
-unique indexed suffix before it starts an SQL pattern search. C++ symbol
-rendering now loads type aliases once per file and skips occurrence parsing
-when a symbol has only one range. The other action failures did not reproduce
-on the release binary, so this plan deliberately does not alter their code or
-the benchmark baseline. Record the strict branch action link here before
+The branch repairs proven Serde, C++, Scala, Python, and Go regressions.
+Rust fuzzy lookup returns a unique indexed suffix before SQL search. C++ uses
+stored alias data and cached file declaration ranges. Scala uses direct known
+declaration anchors. Python avoids unneeded scope scans with an AST-only name
+gate. Go walks receiver ancestors only for type identifiers. The benchmark
+baseline is unchanged. Record the final strict branch action link here before
 opening the pull request.
 
 ## Context and Orientation
@@ -124,15 +133,14 @@ its reason is documented.
 First, record a profiling run for each affected repository. Capture both the
 first and warm request timings. Use the profile fields to identify the phase
 that changed: workspace build, durable fact preparation, query compilation,
-language resolution, or response rendering. This work completed with no
-usage-scan or shared query-code implementation change because their action
-values did not reproduce.
+language resolution, or response rendering. This work uses profile evidence to
+repair each language path without changing accepted timing thresholds.
 
 For Click and Gin, compare `scan_usages` candidate discovery and per-file scan
-cost. Make a shared change only when both profiles show the same hot phase.
-Otherwise, keep language-specific changes in their adapters and add a focused
-behavior test for each. Three profiles per repository were at or below the
-baseline, so no change is justified.
+cost. Keep separate repairs because the paths differ. Python now uses an
+AST-only necessary name gate before expensive scope facts. Go checks method
+receiver ancestry only for `type_identifier` nodes. A Python direct and alias
+usage test protects the new gate.
 
 For fmt, measure workspace creation, declaration collection, and
 `get_symbol_locations` separately. Repair the earliest shared slow phase.
@@ -142,10 +150,10 @@ symbol rendering. It also avoids C++ occurrence classification when a symbol
 has one range. Existing C++ lookup tests prove the result stays correct.
 
 For query-code, measure the first structural query and ten warm requests in
-Scala first. Use the result to decide whether structural-fact preparation must
-be lazy, cached, or bounded. Apply the same change to Dapper, Exposed, fmt,
-and Gson only if their profiles use that path. The profiles did not show a
-shared internal path. Gson now measures 38.2 ms locally, so no change follows.
+Scala first. Scala semantic overlay construction now uses the existing
+`CodeUnit` range instead of global definition lookup. C++ structural-query
+rendering caches declaration ranges once per file. Each preserves the prior
+public result.
 
 For Serde, trace the `value.to_value` symbol-location query. Correct the
 canonical-name or stored-location cache path, not the timing threshold. The
@@ -196,10 +204,9 @@ retain its profile report in the plan decision log.
 
 ## Artifacts and Notes
 
-The source comparison report is the `benchmark-31104312306` artifact from
-GitHub action `31104312306`. Key values are Click `scan_usages` 9,524 ms,
-Gin `scan_usages` 1,245 ms, fmt `workspace_build` 4,282 ms, and Scala first
-`query_code` 25,673 ms.
+The source comparison reports are the `benchmark-31104312306` and
+`benchmark-31112520238` artifacts. The second report has eight regressions.
+Its exact profiles identified the final renderer, graph, and overlay costs.
 
 ## Interfaces and Dependencies
 
@@ -213,6 +220,5 @@ Plan created on 2026-08-06 because the user requested a multi-agent,
 single-pull-request performance repair. It records the current action evidence
 and the required integration order.
 
-Plan updated on 2026-08-06 after parallel profiling. The update records why
-usage scans and query cold starts have no code change, and specifies the two
-implemented measured repairs.
+Plan updated on 2026-08-06 after the second strict action. It records each
+measured repair and retains the final strict action as the release gate.

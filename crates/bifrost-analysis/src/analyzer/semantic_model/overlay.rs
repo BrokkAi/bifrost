@@ -2329,14 +2329,7 @@ fn capture_values(
             };
             scalar(
                 projected_declaration_value(analyzer, binding.projection, file, enclosing),
-                authored_anchor(
-                    analyzer,
-                    &Locator::Source {
-                        path: file.rel_path().to_string_lossy().replace('\\', "/"),
-                        symbol: Some(enclosing.fq_name()),
-                    },
-                    &enclosing.fq_name(),
-                ),
+                Some(code_unit_anchor(analyzer, enclosing)),
             )
         }
         CaptureSource::OwningType => {
@@ -2353,14 +2346,7 @@ fn capture_values(
             };
             scalar(
                 projected_declaration_value(analyzer, binding.projection, file, &owner),
-                authored_anchor(
-                    analyzer,
-                    &Locator::Source {
-                        path: file.rel_path().to_string_lossy().replace('\\', "/"),
-                        symbol: Some(owner.fq_name()),
-                    },
-                    &owner.fq_name(),
-                ),
+                Some(code_unit_anchor(analyzer, &owner)),
             )
         }
         CaptureSource::OwnedFields | CaptureSource::OwnedMutableFields => {
@@ -2387,14 +2373,7 @@ fn capture_values(
                     projected_declaration_value(analyzer, binding.projection, file, &field).map(
                         |value| CapturedValue {
                             value,
-                            anchor: authored_anchor(
-                                analyzer,
-                                &Locator::Source {
-                                    path: file.rel_path().to_string_lossy().replace('\\', "/"),
-                                    symbol: Some(field.fq_name()),
-                                },
-                                &field.fq_name(),
-                            ),
+                            anchor: Some(code_unit_anchor(analyzer, &field)),
                         },
                     )
                 })
@@ -2478,6 +2457,27 @@ fn span_anchor(
             start_line: facts.line_of_byte(span.start_byte),
             end_line: facts.line_of_byte(span.end_byte),
         },
+    }
+}
+
+fn code_unit_anchor(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> SemanticModelAuthoredAnchor {
+    let range = analyzer
+        .ranges(unit)
+        .into_iter()
+        .min_by_key(|range| (range.start_line, range.start_byte));
+    SemanticModelAuthoredAnchor {
+        path: unit
+            .source()
+            .rel_path()
+            .to_string_lossy()
+            .replace('\\', "/"),
+        symbol: unit.fq_name(),
+        range: range.map(Into::into).unwrap_or(SemanticModelRange {
+            start_byte: 0,
+            end_byte: 0,
+            start_line: 0,
+            end_line: 0,
+        }),
     }
 }
 

@@ -789,7 +789,7 @@ pub(super) fn is_definition_identifier(node: Node<'_>, _source: &str) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    if is_method_receiver_type(node) {
+    if node.kind() == "type_identifier" && is_method_receiver_type(node) {
         return true;
     }
     if keyed_element_for_key(node).is_some() {

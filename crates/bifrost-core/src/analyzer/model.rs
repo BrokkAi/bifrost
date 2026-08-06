@@ -2307,6 +2307,9 @@ pub struct SummaryFileProjection {
 pub struct SearchSymbolCandidate {
     pub code_unit: CodeUnit,
     pub primary_range: Option<Range>,
+    /// Whether the persisted declaration represents a type alias. This keeps
+    /// `search_symbols` rendering out of the complete file-state path.
+    pub is_type_alias: bool,
     /// Per-declaration test-region taint (issue #1102): whether this specific
     /// symbol is inside a structurally-evidenced test region. `search_symbols`
     /// combines it with a path-based test check to decide test filtering, so a

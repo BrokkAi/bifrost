@@ -289,6 +289,36 @@ def run():
 }
 
 #[test]
+fn scan_usages_keeps_direct_and_reexport_aliases_and_ignores_unrelated_files() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "def target():\n    return None\n")
+        .file("pkg/__init__.py", "from service import target as alias\n")
+        .file("direct.py", "from service import target\n\ntarget()\n")
+        .file("alias.py", "from pkg import alias\n\nalias()\n")
+        .file("unrelated.py", "def unrelated():\n    return None\n")
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.target");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve direct and re-export aliases");
+
+    let files: BTreeMap<_, _> = hits
+        .iter()
+        .map(|hit| (hit.file.clone(), hit.snippet.clone()))
+        .collect();
+    assert!(files.contains_key(&project.file("direct.py")), "{hits:#?}");
+    assert!(files.contains_key(&project.file("alias.py")), "{hits:#?}");
+    assert!(
+        !files.contains_key(&project.file("unrelated.py")),
+        "an unrelated file must not produce a usage: {hits:#?}"
+    );
+}
+
+#[test]
 fn private_module_function_resolves_same_file_usage() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(

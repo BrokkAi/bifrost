@@ -189,13 +189,6 @@ pub trait TypeAliasProvider: CapabilityProvider {
     fn is_type_alias(&self, _code_unit: &CodeUnit) -> bool {
         false
     }
-
-    /// Return every type alias declared in one file when the provider can
-    /// load the file state once. `None` preserves the per-unit fallback for
-    /// providers without a bulk projection.
-    fn type_aliases_in_file(&self, _file: &ProjectFile) -> Option<HashSet<CodeUnit>> {
-        None
-    }
 }
 
 pub trait TestDetectionProvider: CapabilityProvider {}
