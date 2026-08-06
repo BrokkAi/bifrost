@@ -86,8 +86,13 @@ impl ActiveIndex {
 
             let occurrences_started = Instant::now();
             tx.execute_batch(
-                "INSERT INTO active_occurrences(rel_path, chunk_ord)
-                 SELECT active.rel_path, chunks.chunk_ord
+                "INSERT INTO active_occurrences(
+                     rel_path, chunk_ord, symbol, start_line, end_line,
+                     vector_hash, fts_tokens
+                 )
+                 SELECT active.rel_path, chunks.chunk_ord, chunks.symbol,
+                        chunks.start_line, chunks.end_line, chunks.vector_hash,
+                        chunks.fts_tokens
                  FROM active_files AS active
                  JOIN semantic_file_chunks AS chunks
                    ON chunks.blob_oid = active.blob_oid
@@ -99,13 +104,7 @@ impl ActiveIndex {
             let vectors_started = Instant::now();
             tx.execute_batch(
                 "INSERT INTO active_vectors(vector_hash)
-                 SELECT DISTINCT chunks.vector_hash
-                 FROM active_occurrences AS occurrence
-                 JOIN active_files AS active USING(rel_path)
-                 JOIN semantic_file_chunks AS chunks
-                   ON chunks.blob_oid = active.blob_oid
-                  AND chunks.rel_path = active.rel_path
-                  AND chunks.chunk_ord = occurrence.chunk_ord;
+                 SELECT DISTINCT vector_hash FROM active_occurrences;
                  ANALYZE temp.active_vectors;",
             )
             .map_err(|err| err.to_string())?;
@@ -114,13 +113,7 @@ impl ActiveIndex {
             let fts_started = Instant::now();
             tx.execute_batch(
                 "INSERT INTO bm25_idx(rowid, tokens)
-                 SELECT occurrence.occ_id, chunks.fts_tokens
-                 FROM active_occurrences AS occurrence
-                 JOIN active_files AS active USING(rel_path)
-                 JOIN semantic_file_chunks AS chunks
-                   ON chunks.blob_oid = active.blob_oid
-                  AND chunks.rel_path = active.rel_path
-                  AND chunks.chunk_ord = occurrence.chunk_ord;",
+                 SELECT occ_id, fts_tokens FROM active_occurrences;",
             )
             .map_err(|err| err.to_string())?;
             let fts_elapsed = fts_started.elapsed();
@@ -172,14 +165,9 @@ impl ActiveIndex {
             for path in removed.iter().chain(changed.keys()) {
                 tx.execute(
                     "INSERT INTO touched_vectors(vector_hash)
-                     SELECT DISTINCT chunks.vector_hash
-                     FROM active_occurrences AS occurrence
-                     JOIN active_files AS active USING(rel_path)
-                     JOIN semantic_file_chunks AS chunks
-                       ON chunks.blob_oid = active.blob_oid
-                      AND chunks.rel_path = active.rel_path
-                      AND chunks.chunk_ord = occurrence.chunk_ord
-                     WHERE occurrence.rel_path = ?1
+                     SELECT DISTINCT vector_hash
+                     FROM active_occurrences
+                     WHERE rel_path = ?1
                      ON CONFLICT(vector_hash) DO NOTHING",
                     [path],
                 )
@@ -203,8 +191,13 @@ impl ActiveIndex {
                 )
                 .map_err(|err| err.to_string())?;
                 tx.execute(
-                    "INSERT INTO active_occurrences(rel_path, chunk_ord)
-                     SELECT active.rel_path, chunks.chunk_ord
+                    "INSERT INTO active_occurrences(
+                         rel_path, chunk_ord, symbol, start_line, end_line,
+                         vector_hash, fts_tokens
+                     )
+                     SELECT active.rel_path, chunks.chunk_ord, chunks.symbol,
+                            chunks.start_line, chunks.end_line, chunks.vector_hash,
+                            chunks.fts_tokens
                      FROM active_files AS active
                      JOIN semantic_file_chunks AS chunks
                        ON chunks.blob_oid = active.blob_oid
@@ -215,27 +208,17 @@ impl ActiveIndex {
                 .map_err(|err| err.to_string())?;
                 tx.execute(
                     "INSERT INTO bm25_idx(rowid, tokens)
-                     SELECT occurrence.occ_id, chunks.fts_tokens
-                     FROM active_occurrences AS occurrence
-                     JOIN active_files AS active USING(rel_path)
-                     JOIN semantic_file_chunks AS chunks
-                       ON chunks.blob_oid = active.blob_oid
-                      AND chunks.rel_path = active.rel_path
-                      AND chunks.chunk_ord = occurrence.chunk_ord
-                     WHERE occurrence.rel_path = ?1",
+                     SELECT occ_id, fts_tokens
+                     FROM active_occurrences
+                     WHERE rel_path = ?1",
                     [path],
                 )
                 .map_err(|err| err.to_string())?;
                 tx.execute(
                     "INSERT INTO touched_vectors(vector_hash)
-                     SELECT DISTINCT chunks.vector_hash
-                     FROM active_occurrences AS occurrence
-                     JOIN active_files AS active USING(rel_path)
-                     JOIN semantic_file_chunks AS chunks
-                       ON chunks.blob_oid = active.blob_oid
-                      AND chunks.rel_path = active.rel_path
-                      AND chunks.chunk_ord = occurrence.chunk_ord
-                     WHERE occurrence.rel_path = ?1
+                     SELECT DISTINCT vector_hash
+                     FROM active_occurrences
+                     WHERE rel_path = ?1
                      ON CONFLICT(vector_hash) DO NOTHING",
                     [path],
                 )
@@ -250,15 +233,10 @@ impl ActiveIndex {
             .map_err(|err| err.to_string())?;
             tx.execute(
                 "INSERT INTO active_vectors(vector_hash)
-                 SELECT DISTINCT chunks.vector_hash
+                 SELECT DISTINCT occurrence.vector_hash
                  FROM active_occurrences AS occurrence
-                 JOIN active_files AS active USING(rel_path)
-                 JOIN semantic_file_chunks AS chunks
-                   ON chunks.blob_oid = active.blob_oid
-                  AND chunks.rel_path = active.rel_path
-                  AND chunks.chunk_ord = occurrence.chunk_ord
                  JOIN touched_vectors AS touched
-                   ON touched.vector_hash = chunks.vector_hash
+                   ON touched.vector_hash = occurrence.vector_hash
                  ON CONFLICT(vector_hash) DO NOTHING",
                 [],
             )
@@ -404,15 +382,10 @@ impl ActiveIndex {
         let mut statement = conn
             .prepare(
                 "WITH hits(symbol, score) AS MATERIALIZED (
-                     SELECT chunks.symbol, -bm25(bm25_idx)
+                     SELECT occurrence.symbol, -bm25(bm25_idx)
                      FROM bm25_idx
                      JOIN active_occurrences AS occurrence
                        ON occurrence.occ_id = bm25_idx.rowid
-                     JOIN active_files AS active USING(rel_path)
-                     JOIN semantic_file_chunks AS chunks
-                       ON chunks.blob_oid = active.blob_oid
-                      AND chunks.rel_path = active.rel_path
-                      AND chunks.chunk_ord = occurrence.chunk_ord
                      WHERE bm25_idx MATCH ?1
                  )
                  SELECT symbol, MAX(score) AS best_score
@@ -442,16 +415,25 @@ impl ActiveIndex {
 fn create_active_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "CREATE TEMP TABLE active_files(
-             rel_path TEXT PRIMARY KEY CHECK(length(rel_path) > 0),
              blob_oid TEXT NOT NULL CHECK(
                  length(blob_oid) = 40 AND blob_oid NOT GLOB '*[^0-9a-f]*'
-             )
+             ),
+             rel_path TEXT NOT NULL UNIQUE CHECK(length(rel_path) > 0),
+             -- Keep the table in the persistent chunk table's key order. A
+             -- path-ordered scan caused random reads across multi-repository
+             -- caches while each short-lived CodeScale session built BM25.
+             PRIMARY KEY(blob_oid, rel_path)
          ) WITHOUT ROWID, STRICT;
 
          CREATE TEMP TABLE active_occurrences(
              occ_id INTEGER PRIMARY KEY,
              rel_path TEXT NOT NULL,
              chunk_ord INTEGER NOT NULL,
+             symbol TEXT NOT NULL,
+             start_line INTEGER,
+             end_line INTEGER,
+             vector_hash BLOB NOT NULL CHECK(length(vector_hash) = 32),
+             fts_tokens TEXT NOT NULL,
              UNIQUE(rel_path, chunk_ord),
              FOREIGN KEY(rel_path) REFERENCES active_files(rel_path) ON DELETE CASCADE
          ) STRICT;
@@ -474,15 +456,9 @@ fn create_active_schema(conn: &Connection) -> Result<(), String> {
 fn load_all_occurrence_rows(conn: &Connection) -> Result<Vec<OccurrenceRow>, String> {
     let mut statement = conn
         .prepare(
-            "SELECT occurrence.occ_id, occurrence.rel_path, chunks.symbol,
-                    chunks.start_line, chunks.end_line, chunks.vector_hash
-             FROM active_occurrences AS occurrence
-             JOIN active_files AS active USING(rel_path)
-             JOIN semantic_file_chunks AS chunks
-               ON chunks.blob_oid = active.blob_oid
-              AND chunks.rel_path = active.rel_path
-              AND chunks.chunk_ord = occurrence.chunk_ord
-             ORDER BY occurrence.occ_id",
+            "SELECT occ_id, rel_path, symbol, start_line, end_line, vector_hash
+             FROM active_occurrences
+             ORDER BY occ_id",
         )
         .map_err(|err| err.to_string())?;
     let mut rows = statement.query([]).map_err(|err| err.to_string())?;
@@ -499,16 +475,10 @@ fn load_occurrence_rows_for_paths(
 ) -> Result<Vec<OccurrenceRow>, String> {
     let mut statement = conn
         .prepare(
-            "SELECT occurrence.occ_id, occurrence.rel_path, chunks.symbol,
-                    chunks.start_line, chunks.end_line, chunks.vector_hash
-             FROM active_occurrences AS occurrence
-             JOIN active_files AS active USING(rel_path)
-             JOIN semantic_file_chunks AS chunks
-               ON chunks.blob_oid = active.blob_oid
-              AND chunks.rel_path = active.rel_path
-              AND chunks.chunk_ord = occurrence.chunk_ord
-             WHERE occurrence.rel_path = ?1
-             ORDER BY occurrence.occ_id",
+            "SELECT occ_id, rel_path, symbol, start_line, end_line, vector_hash
+             FROM active_occurrences
+             WHERE rel_path = ?1
+             ORDER BY occ_id",
         )
         .map_err(|err| err.to_string())?;
     let mut output = Vec::new();

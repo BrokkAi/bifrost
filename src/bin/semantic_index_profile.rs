@@ -61,7 +61,13 @@ fn main() -> Result<(), String> {
 
     let project: Arc<dyn Project> =
         Arc::new(FilesystemProject::new(root.clone()).map_err(|err| err.to_string())?);
-    let snapshot = Arc::new(WorkspaceAnalyzer::build(project, AnalyzerConfig::default()));
+    // CodeScale prewarm runs this profiler in a short-lived container. Use the
+    // shared analyzer store so each container does not rebuild a large
+    // ephemeral database before it can prewarm the semantic index.
+    let snapshot = Arc::new(
+        WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
+            .map_err(|err| err.to_string())?,
+    );
     let analyzed_files = snapshot.analyzer().analyzed_files().len();
     let build_secs = start.elapsed().as_secs_f64();
     eprintln!(
