@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use git2::{DiffOptions, IndexEntry, ObjectType, Oid, Repository, Status, StatusOptions};
+use git2::{IndexEntry, ObjectType, Oid, Repository, Status, StatusOptions};
 use growable_bloom_filter::GrowableBloom;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -474,25 +474,45 @@ fn dirty_paths(repo: &Repository) -> Result<HashSet<String>> {
 }
 
 fn dirty_worktree_paths(repo: &Repository) -> Result<HashSet<String>> {
-    let mut options = DiffOptions::new();
-    options
-        .include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .include_typechange(true)
-        .ignore_submodules(true)
-        .skip_binary_check(true);
-    let mut index = repo.index().map_err(|error| error.to_string())?;
-    index.read(true).map_err(|error| error.to_string())?;
-    let diff = repo
-        .diff_index_to_workdir(Some(&index), Some(&mut options))
-        .map_err(|error| error.to_string())?;
+    let workdir = workdir(repo)?;
+    // libgit2's recursive index-to-worktree diff can rescan very large trees
+    // one entry at a time. Native Git uses its optimized index and filesystem
+    // checks for the same dirty overlay. This matters for repositories such as
+    // Firefox, where the libgit2 scan exceeded the MCP request budget.
+    let output = Command::new("git")
+        .current_dir(workdir)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .map_err(|error| format!("git status failed to spawn: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
     let mut dirty = HashSet::new();
-    for delta in diff.deltas() {
-        if let Some(path) = delta.old_file().path() {
-            dirty.insert(path.to_string_lossy().into_owned());
+    let mut fields = output.stdout.split(|byte| *byte == 0);
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            continue;
         }
-        if let Some(path) = delta.new_file().path() {
-            dirty.insert(path.to_string_lossy().into_owned());
+        // Porcelain v1 records two status bytes, one space, then the path.
+        // With -z, rename and copy records contain the second path as the next
+        // NUL-delimited field. Keep both paths so deletions and additions are
+        // removed or overlaid correctly by callers.
+        if field.len() < 4 {
+            continue;
+        }
+        let status = &field[..2];
+        let path = &field[3..];
+        if status != b"  " && status != b"!!" {
+            dirty.insert(String::from_utf8_lossy(path).into_owned());
+            if status.contains(&b'R') || status.contains(&b'C') {
+                if let Some(previous) = fields.next().filter(|previous| !previous.is_empty()) {
+                    dirty.insert(String::from_utf8_lossy(previous).into_owned());
+                }
+            }
         }
     }
     Ok(dirty)
