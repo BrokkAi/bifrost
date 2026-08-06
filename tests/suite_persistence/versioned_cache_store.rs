@@ -127,6 +127,32 @@ fn an_upgrade_imports_the_newest_older_store_and_leaves_it_in_place() {
 }
 
 #[test]
+fn a_current_store_open_sweeps_a_disused_older_store() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache_dir = temp.path();
+    let older = store_for_version(cache_dir, cache_db::cache_db_schema_version() - 1);
+    let carried = oid(b"carried during startup cleanup");
+    seed_store(&older, carried);
+
+    let beyond_grace = Duration::from_secs((cache_gc::VERSION_STORE_GRACE_SECS + 24 * 3600) as u64);
+    for suffix in cache_db::STORE_FILE_SUFFIXES {
+        let sidecar = cache_db::store_file_with_suffix(&older, suffix);
+        if sidecar.exists() {
+            set_modified(&sidecar, beyond_grace);
+        }
+    }
+
+    let current = AnalyzerStore::open_persistent(&current_store(cache_dir)).unwrap();
+
+    assert!(current.contains_blob(carried, "python").unwrap());
+    assert!(
+        !older.exists(),
+        "startup cleanup must remove a disused older store: {:?}",
+        file_names(cache_dir)
+    );
+}
+
+#[test]
 fn a_legacy_store_from_a_newer_schema_is_ignored() {
     let temp = tempfile::tempdir().unwrap();
     let cache_dir = temp.path();
@@ -199,15 +225,16 @@ fn collection_removes_a_disused_older_store_and_keeps_everything_else() {
 
     let disused = store_for_version(cache_dir, current_version - 2);
     let recent = store_for_version(cache_dir, current_version - 1);
+    let newer = store_for_version(cache_dir, current_version + 1);
     let legacy = legacy_store(cache_dir);
     let backup = cache_dir.join("bifrost_cache.db.schema14.bak");
-    for path in [&disused, &recent, &legacy, &backup] {
+    for path in [&disused, &recent, &newer, &legacy, &backup] {
         seed_store(path, oid(b"content"));
     }
     seed_store(&current_store(cache_dir), oid(b"content"));
 
     let beyond_grace = Duration::from_secs((cache_gc::VERSION_STORE_GRACE_SECS + 24 * 3600) as u64);
-    for path in [&disused, &legacy, &backup] {
+    for path in [&disused, &newer, &legacy, &backup] {
         for suffix in cache_db::STORE_FILE_SUFFIXES {
             let sidecar = cache_db::store_file_with_suffix(path, suffix);
             if sidecar.exists() {
@@ -221,6 +248,10 @@ fn collection_removes_a_disused_older_store_and_keeps_everything_else() {
     assert_eq!(removed, vec![disused.clone()]);
     assert!(!disused.exists());
     assert!(recent.exists(), "a store in recent use must survive");
+    assert!(
+        newer.exists(),
+        "a store from a newer schema must not be removed"
+    );
     assert!(
         current_store(cache_dir).exists(),
         "this build's own store is never a candidate"

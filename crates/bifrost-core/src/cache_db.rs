@@ -1,5 +1,6 @@
 //! Shared SQLite schema and connection setup for bifrost's rebuildable cache DB.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
@@ -143,6 +144,12 @@ const GENERATED_LEGACY_PROJECT_GITIGNORE: &[u8] = b"/.gitignore\n/bifrost_cache.
 // openers for one canonical cache path. SQLite remains the cross-process lock.
 static PROCESS_LOCAL_OPEN_GUARDS: Lazy<Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static PROCESS_LOCAL_VERSION_SWEEP_ATTEMPTS: Lazy<Mutex<HashSet<PathBuf>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// How long a store from another schema version must go untouched before
+/// collection removes it.
+pub const VERSION_STORE_GRACE_SECS: i64 = 14 * 24 * 3600;
 /// The store file this build owns: `bifrost_cache.v{schema version}.db`.
 ///
 /// The schema version belongs in the name rather than only in the file's
@@ -192,6 +199,83 @@ pub fn store_file_with_suffix(store: &Path, suffix: &str) -> PathBuf {
         .to_os_string();
     name.push(suffix);
     store.with_file_name(name)
+}
+
+/// Remove versioned stores that have not been used during the grace period.
+///
+/// Only older stores are candidates. The current store and stores from a
+/// newer build remain available to older or newer checkouts. The newest mtime
+/// across the store and its sidecars represents use because WAL activity may
+/// not update the main database file.
+pub fn sweep_disused_version_stores(cache_dir: &Path) -> Result<Vec<PathBuf>> {
+    let stores = disused_version_store_paths(cache_dir)?;
+    remove_version_stores(&stores)?;
+    Ok(stores)
+}
+
+fn disused_version_store_paths(cache_dir: &Path) -> Result<Vec<PathBuf>> {
+    let now = now_unix_seconds();
+    let mut stores = Vec::new();
+    for entry in std::fs::read_dir(cache_dir).map_err(|err| format!("cache DB I/O error: {err}"))? {
+        let entry = entry.map_err(|err| format!("cache DB I/O error: {err}"))?;
+        let name = entry.file_name();
+        let Some(version) = name.to_str().and_then(store_file_version) else {
+            continue;
+        };
+        if version >= cache_db_schema_version() {
+            continue;
+        }
+        let store = entry.path();
+        if last_store_use_unix_seconds(&store)? + VERSION_STORE_GRACE_SECS > now {
+            continue;
+        }
+        stores.push(store);
+    }
+    Ok(stores)
+}
+
+fn remove_version_stores(stores: &[PathBuf]) -> Result<()> {
+    for store in stores {
+        for suffix in STORE_FILE_SUFFIXES {
+            let path = store_file_with_suffix(store, suffix);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(format!(
+                        "cache DB I/O error removing {}: {err}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn last_store_use_unix_seconds(store: &Path) -> Result<i64> {
+    let mut newest = 0;
+    for suffix in STORE_FILE_SUFFIXES {
+        let path = store_file_with_suffix(store, suffix);
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(format!(
+                    "cache DB I/O error reading {}: {err}",
+                    path.display()
+                ));
+            }
+        };
+        let modified = metadata
+            .modified()
+            .map_err(|err| format!("cache DB I/O error reading {}: {err}", path.display()))?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|delta| delta.as_secs() as i64)
+            .unwrap_or(0);
+        newest = newest.max(modified);
+    }
+    Ok(newest)
 }
 
 /// Open the workspace's shared cache database, creating it if necessary.
@@ -287,6 +371,7 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
             db_path.display()
         )
     })?;
+    let startup_cleanup = disused_version_stores_on_startup(&db_path);
     import_newest_older_store(&db_path)?;
     let mut conn = Connection::open_with_flags(
         &db_path,
@@ -302,7 +387,36 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
     if !initialized_before_open {
         delete_legacy_cache_files(&db_path);
     }
+    if let Some(stores) = startup_cleanup
+        && let Err(error) = remove_version_stores(&stores)
+    {
+        eprintln!("Bifrost cache startup cleanup skipped: {error}");
+    }
     Ok(conn)
+}
+
+fn disused_version_stores_on_startup(db_path: &Path) -> Option<Vec<PathBuf>> {
+    if db_path.file_name() != Some(std::ffi::OsStr::new(cache_db_file_name())) {
+        return None;
+    }
+    let cache_dir = db_path.parent()?;
+    let should_attempt = PROCESS_LOCAL_VERSION_SWEEP_ATTEMPTS
+        .lock()
+        .expect("cache version sweep mutex poisoned")
+        .insert(cache_dir.to_path_buf());
+    if !should_attempt {
+        return None;
+    }
+    match disused_version_store_paths(cache_dir) {
+        Ok(stores) => Some(stores),
+        Err(error) => {
+            // Old stores are optional cache data. An unreadable old store must
+            // not prevent the current store from opening. A later process can
+            // retry the sweep.
+            eprintln!("Bifrost cache startup cleanup skipped: {error}");
+            None
+        }
+    }
 }
 
 /// Open a read-only connection to an already-initialized cache DB.
