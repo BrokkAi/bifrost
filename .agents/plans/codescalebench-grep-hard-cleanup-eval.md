@@ -33,6 +33,7 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - [x] (2026-08-06 02:25Z) Made answer-contract errors unscorable and selected 20 valid empirical Luna grep near-misses.
 - [x] (2026-08-06 03:05Z) Removed OpenJDK from the paired set after its cold generated-file parse tail exceeded 35 minutes.
 - [x] (2026-08-06 03:45Z) Filed Bifrost issue #1690 and bounded each complete-file tree-sitter parse to ten seconds.
+- [x] (2026-08-06 04:20Z) Versioned immutable prewarm records by profiler identity in Brokkbench commit `9c7102391c5`.
 - [ ] Prewarm the replacement 20-task set and restart the corrected symbol arm.
 - [ ] (2026-08-05 23:25Z) Run the selected tasks with symbol tools. The first 20-task arm stopped after a linked-worktree fault and a false cache-readiness assumption.
 - [ ] Run the same tasks with symbol and NLP tools.
@@ -101,6 +102,8 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Evidence: Its prewarm wrote about 40 GB, then spent more than 35 minutes on one CPU core in tree-sitter. The largest Java files are generated-style tables and field fixtures. The run stopped before agent execution.
 - Observation: LLVM has the same unbounded parse-tail class.
   Evidence: Its prewarm also entered a low-parallelism tree-sitter tail after ordinary files finished. The run stopped before agent execution.
+- Observation: A changed profiler could complete prewarm and then fail while writing readiness state.
+  Evidence: The immutable readiness path omitted the profiler hash. Runtime r10 tried to replace the old Kubernetes record after 90 seconds of valid work.
 
 ## Decision Log
 
@@ -160,6 +163,9 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Date/Author: 2026-08-06 / Codex
 - Decision: Give each complete-file tree-sitter parse a ten-second budget and persist a minimal file-scope state after timeout.
   Rationale: One generated blob must not block workspace readiness. The stored blob marker prevents the same cold parse on later startup.
+  Date/Author: 2026-08-06 / Codex
+- Decision: Include the profiler digest in each immutable CodeScale readiness file name.
+  Rationale: The record content already validates this digest. Its path must permit records from more than one Bifrost build.
   Date/Author: 2026-08-06 / Codex
 
 ## Outcomes & Retrospective
@@ -248,3 +254,5 @@ Revision note: The second symbol arm stopped after issue #1688 exposed a full `c
 Revision note: Runtime r9 stopped before use after a new audit found that the 11-task paired set included malformed baseline answers. The replacement set uses only valid empirical Luna maximum grep failures.
 
 Revision note: OpenJDK and LLVM exposed unbounded tree-sitter parse tails. Issue #1690 records the profiles. Bifrost now persists a minimal marker after a ten-second complete-file parse limit.
+
+Revision note: Brokkbench readiness record version 5 includes the profiler digest. This prevents a new Bifrost build from replacing an older immutable campaign record.
