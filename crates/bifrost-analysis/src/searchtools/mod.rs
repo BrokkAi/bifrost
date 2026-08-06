@@ -114,6 +114,7 @@ pub use navigation::SymbolAncestorsResult;
 pub use navigation::SymbolLocation;
 pub use navigation::SymbolLocationsResult;
 pub use navigation::SymbolLookupParams;
+pub use navigation::TooManySymbolMatches;
 pub use navigation::TypeLookupCandidate;
 pub use navigation::TypeLookupResult;
 pub use navigation::TypeReferenceQuery;
@@ -262,6 +263,17 @@ pub const GET_SUMMARIES_MAX_FILES_PER_TARGET: usize = 20;
 /// tool skips it. Half the `get_summaries` cap because this tool answers with
 /// full source text, the heaviest payload per file the searchtools produce.
 pub const GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET: usize = 10;
+
+/// Deduplicated `search_symbols` candidates that may be ranked before the tool
+/// gives up and answers with counts instead. Broad multi-pattern search with
+/// ranking is this tool's normal, intended use, so the cap only has to catch
+/// pathological explosions.
+///
+/// The value is provisional. It comes from the Firefox measurement in
+/// `.agents/docs/codescale-grep-hard-checkpoint-2026-08-06.md` -- about 34 s of
+/// ranking for a broad six-pattern search -- without a candidate count for that
+/// workload. Record the measured count here and retune once one exists.
+pub const SEARCH_SYMBOLS_MAX_RANKED_CANDIDATES: usize = 10_000;
 
 /// A single request target that matched more of the workspace than the
 /// tool will process. The work was skipped, not truncated: `sample`

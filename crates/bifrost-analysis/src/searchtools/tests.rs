@@ -1,3 +1,5 @@
+use super::SearchSymbolsParams;
+use super::navigation::search_symbols_with_cap;
 use super::scan_usages::render_symbol_usages;
 use super::summaries::SummariesParams;
 use super::{
@@ -14,6 +16,7 @@ use super::{function_like_macro_query, route_summary_targets, usage_failure_hint
 use crate::analyzer::{
     CodeUnit, CodeUnitType, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
 };
+use crate::searchtools_render::{RenderOptions, RenderText};
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -59,6 +62,10 @@ struct CountingAnalyzer {
     project: CountingProject,
     analyzed_files_calls: AtomicUsize,
     search_definitions_calls: AtomicUsize,
+    /// Declarations `search_definitions` reports, which the default
+    /// `IAnalyzer::search_symbol_candidates` turns into search candidates.
+    /// Empty unless a test asks for them, so every other test is unaffected.
+    search_definition_results: BTreeSet<CodeUnit>,
 }
 
 impl CountingAnalyzer {
@@ -71,7 +78,13 @@ impl CountingAnalyzer {
             project: CountingProject::new(root, files),
             analyzed_files_calls: AtomicUsize::new(0),
             search_definitions_calls: AtomicUsize::new(0),
+            search_definition_results: BTreeSet::new(),
         }
+    }
+
+    fn with_search_definitions(mut self, code_units: impl IntoIterator<Item = CodeUnit>) -> Self {
+        self.search_definition_results = code_units.into_iter().collect();
+        self
     }
 
     fn analyzed_files_calls(&self) -> usize {
@@ -102,6 +115,7 @@ impl IAnalyzer for CountingAnalyzer {
             project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
             analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
             search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
+            search_definition_results: self.search_definition_results.clone(),
         }
     }
 
@@ -110,6 +124,7 @@ impl IAnalyzer for CountingAnalyzer {
             project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
             analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
             search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
+            search_definition_results: self.search_definition_results.clone(),
         }
     }
 
@@ -173,8 +188,18 @@ impl IAnalyzer for CountingAnalyzer {
         None
     }
 
-    fn ranges_of(&self, _code_unit: &CodeUnit) -> Vec<Range> {
-        Vec::new()
+    // `ranges_of` defaults to this, so overriding `ranges` alone keeps the two
+    // consistent for every caller.
+    fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
+        if !self.search_definition_results.contains(code_unit) {
+            return Vec::new();
+        }
+        vec![Range {
+            start_byte: 0,
+            end_byte: 1,
+            start_line: 1,
+            end_line: 1,
+        }]
     }
 
     fn get_skeleton(&self, _code_unit: &CodeUnit) -> Option<String> {
@@ -196,7 +221,7 @@ impl IAnalyzer for CountingAnalyzer {
     fn search_definitions(&self, _pattern: &str, _auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.search_definitions_calls
             .fetch_add(1, Ordering::Relaxed);
-        BTreeSet::new()
+        self.search_definition_results.clone()
     }
 
     fn has_complete_symbol_lookup_index(&self) -> bool {
@@ -1361,4 +1386,70 @@ pub fn helper() {}
         expectation_failures.join("\n")
     );
     assert!(!cancellation.is_cancelled());
+}
+
+/// `count` distinct class declarations in one file, all reported by
+/// `CountingAnalyzer::search_definitions` regardless of the pattern, so a test
+/// controls the candidate count exactly.
+fn widget_declarations(root: &Path, count: usize) -> Vec<CodeUnit> {
+    let file = ProjectFile::new(root.to_path_buf(), "src/Widget.java");
+    (0..count)
+        .map(|index| {
+            CodeUnit::new(
+                file.clone(),
+                CodeUnitType::Class,
+                "app",
+                &format!("Widget{index}"),
+            )
+        })
+        .collect()
+}
+
+fn widget_search_params(limit: usize) -> SearchSymbolsParams {
+    SearchSymbolsParams {
+        patterns: vec!["Widget".to_string()],
+        include_tests: false,
+        limit,
+    }
+}
+
+#[test]
+fn search_symbols_over_candidate_cap_skips_ranking_and_reports_the_totals() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let analyzer = CountingAnalyzer::new(root.clone(), &["src/Widget.java"])
+        .with_search_definitions(widget_declarations(&root, 5));
+
+    let result = search_symbols_with_cap(&analyzer, widget_search_params(100), 3, None);
+
+    let too_many = result
+        .too_many_matches
+        .as_ref()
+        .expect("five candidates over a cap of three must report the overload");
+    assert_eq!(5, too_many.total_candidates);
+    assert_eq!(3, too_many.cap);
+    assert!(result.truncated);
+    assert!(result.files.is_empty(), "{:?}", result.files);
+    assert_eq!(0, result.total_files);
+
+    let rendered = result.render_text(RenderOptions::default());
+    assert!(rendered.contains('5'), "{rendered}");
+    assert!(rendered.contains('3'), "{rendered}");
+    assert!(rendered.contains("Widget"), "{rendered}");
+    assert!(rendered.contains("more specific"), "{rendered}");
+}
+
+#[test]
+fn search_symbols_under_candidate_cap_ranks_and_reports_files_as_before() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let analyzer = CountingAnalyzer::new(root.clone(), &["src/Widget.java"])
+        .with_search_definitions(widget_declarations(&root, 5));
+
+    let result = search_symbols_with_cap(&analyzer, widget_search_params(100), 10, None);
+
+    assert!(result.too_many_matches.is_none());
+    assert_eq!(1, result.total_files);
+    assert_eq!(1, result.files.len(), "{:?}", result.files);
+    assert_eq!(5, result.files[0].classes.len(), "{:?}", result.files[0]);
 }

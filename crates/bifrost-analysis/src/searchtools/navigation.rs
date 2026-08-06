@@ -161,6 +161,23 @@ pub struct SearchSymbolsResult {
     pub model_symbols: Vec<crate::analyzer::semantic_model::SemanticModelSymbol>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub too_many_matches: Option<TooManySymbolMatches>,
+}
+
+/// The patterns resolved to more deduplicated candidates than `search_symbols`
+/// will rank. Ranking was skipped, not truncated, so no file is reported:
+/// `total_candidates` is the true count the patterns reached.
+///
+/// There is no per-pattern breakdown. Which name spelling made a candidate
+/// match is decided inside each language's `search_symbol_candidates`, and
+/// re-deriving it here from `fq_name` alone would produce counts that disagree
+/// with the total. See the Decision Log in
+/// `.agents/plans/searchtools-too-broad-scope-guards.md`.
+#[derive(Debug, Clone, Serialize)]
+pub struct TooManySymbolMatches {
+    pub total_candidates: usize,
+    pub cap: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -332,6 +349,25 @@ pub fn search_symbols_with_cancellation(
     params: SearchSymbolsParams,
     cancellation: Option<&crate::CancellationToken>,
 ) -> SearchSymbolsResult {
+    search_symbols_with_cap(
+        analyzer,
+        params,
+        SEARCH_SYMBOLS_MAX_RANKED_CANDIDATES,
+        cancellation,
+    )
+}
+
+/// `max_ranked_candidates` bounds how many deduplicated candidates the tool
+/// will rank. Over the bound it stops before ranking, before git-tier lookup,
+/// and before the semantic-model overlay, and answers with the counts instead:
+/// a top-100 slice of a pathological match is not a useful answer, and the
+/// ranking pass that would produce it is the expensive half of the request.
+pub(super) fn search_symbols_with_cap(
+    analyzer: &dyn IAnalyzer,
+    params: SearchSymbolsParams,
+    max_ranked_candidates: usize,
+    cancellation: Option<&crate::CancellationToken>,
+) -> SearchSymbolsResult {
     let _scope = profiling::scope("searchtools::search_symbols");
     let patterns: Vec<String> = strip_params(params.patterns)
         .into_iter()
@@ -382,6 +418,24 @@ pub fn search_symbols_with_cancellation(
         }
         filtered
     };
+
+    if filtered.len() > max_ranked_candidates {
+        return SearchSymbolsResult {
+            patterns,
+            // The same `complete = false` reporting `scan_usages` uses for
+            // `TooManyCallsites`: the answer is deliberately partial.
+            truncated: true,
+            total_files: 0,
+            files: Vec::new(),
+            total_model_symbols: 0,
+            model_symbols: Vec::new(),
+            note: Some(too_many_symbol_matches_note()),
+            too_many_matches: Some(TooManySymbolMatches {
+                total_candidates: filtered.len(),
+                cap: max_ranked_candidates,
+            }),
+        };
+    }
 
     let (ranked, ranking_complete) = {
         let _scope = profiling::scope("searchtools::search_symbols.rank");
@@ -542,7 +596,16 @@ pub fn search_symbols_with_cancellation(
         total_model_symbols,
         model_symbols,
         note,
+        too_many_matches: None,
     }
+}
+
+/// Guidance for a request that tripped the candidate cap. The counts live in
+/// the typed `too_many_matches` block; this is the "what do I do now" half,
+/// carried in the same `note` channel every other partial result uses.
+pub(super) fn too_many_symbol_matches_note() -> String {
+    "Ranking was skipped because the patterns matched too many symbols to rank. Re-run with more specific identifier, qualified, or regex-like patterns, or drop the broadest pattern; get_summaries or list_symbols on a subdirectory answers 'what is in here' without ranking."
+        .to_string()
 }
 
 pub(super) fn search_symbols_note(
