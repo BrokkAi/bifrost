@@ -673,6 +673,10 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.lookup_declarations_by_identifier(identifier)
     }
 
+    fn has_complete_symbol_lookup_index(&self) -> bool {
+        self.inner.has_complete_symbol_lookup_index()
+    }
+
     fn search_symbol_candidates(
         &self,
         patterns: &crate::analyzer::SearchSymbolPatternBatch,

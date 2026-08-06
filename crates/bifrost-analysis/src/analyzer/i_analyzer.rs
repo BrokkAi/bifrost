@@ -692,6 +692,14 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn lookup_candidates_by_identifier(&self, _identifier: &str) -> BTreeSet<CodeUnit> {
         BTreeSet::new()
     }
+    /// Whether the indexed lookup methods cover every persisted declaration.
+    ///
+    /// A complete index makes a qualified miss conclusive. Callers can then
+    /// avoid a whole-table regex scan. In-memory or third-party analyzers keep
+    /// the default and retain their broader fallback paths.
+    fn has_complete_symbol_lookup_index(&self) -> bool {
+        false
+    }
     /// Search candidates with the metadata needed by `search_symbols`. The
     /// default preserves existing analyzer behavior; persisted analyzers
     /// override it with a projection that avoids full file hydration.

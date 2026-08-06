@@ -1249,6 +1249,12 @@ impl IAnalyzer for MultiAnalyzer {
             })
     }
 
+    fn has_complete_symbol_lookup_index(&self) -> bool {
+        self.delegates
+            .values()
+            .all(|delegate| delegate.analyzer().has_complete_symbol_lookup_index())
+    }
+
     fn search_symbol_candidates(
         &self,
         patterns: &SearchSymbolPatternBatch,

@@ -198,6 +198,10 @@ impl IAnalyzer for CountingAnalyzer {
         BTreeSet::new()
     }
 
+    fn has_complete_symbol_lookup_index(&self) -> bool {
+        true
+    }
+
     fn list_symbols(&self, file: &ProjectFile) -> String {
         format!("- {}", super::rel_path_string(file).replace('/', "_"))
     }
@@ -382,6 +386,27 @@ fn missing_explicit_source_paths_skip_fuzzy_symbol_resolution() {
         0,
         analyzer.analyzed_files_calls(),
         "explicit missing source paths must not enumerate files for nonexistent directories"
+    );
+}
+
+#[test]
+fn complete_symbol_index_miss_skips_broad_fuzzy_scan() {
+    let root = std::env::current_dir().unwrap();
+    let analyzer = CountingAnalyzer::new(root, &["src/Present.java"]);
+
+    let sources = get_symbol_sources(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["org.example.MissingType".to_string()],
+        },
+    );
+
+    assert_eq!(1, sources.not_found.len(), "{sources:#?}");
+    assert!(sources.sources.is_empty(), "{sources:#?}");
+    assert_eq!(
+        0,
+        analyzer.search_definitions_calls(),
+        "a complete index makes a qualified miss conclusive"
     );
 }
 

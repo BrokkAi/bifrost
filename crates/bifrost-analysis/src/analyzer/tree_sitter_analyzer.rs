@@ -8410,6 +8410,10 @@ where
         self.lookup_declarations_by_identifier(identifier)
     }
 
+    fn has_complete_symbol_lookup_index(&self) -> bool {
+        true
+    }
+
     fn search_symbol_candidates(
         &self,
         patterns: &SearchSymbolPatternBatch,

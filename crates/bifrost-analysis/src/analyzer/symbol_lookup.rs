@@ -353,10 +353,18 @@ fn suffix_resolution_from_index(
             &mut exact_suffix_matches,
         );
     }
+    let no_indexed_matches = exact_matches.is_empty() && exact_suffix_matches.is_empty();
     if let Some(CodeUnitResolution::Resolved(matches)) =
         unique_resolution_from_matches(analyzer, exact_matches, include)
     {
         return Some(CodeUnitResolution::Resolved(matches));
+    }
+
+    // The persisted identifier index is complete for tree-sitter analyzers.
+    // If it found no alias for the terminal, the suffix regex cannot find a
+    // declaration either. Avoid the unbounded SQLite scan on this miss.
+    if analyzer.has_complete_symbol_lookup_index() && no_indexed_matches {
+        return Some(CodeUnitResolution::NotFound);
     }
 
     drop(stage1_scope);

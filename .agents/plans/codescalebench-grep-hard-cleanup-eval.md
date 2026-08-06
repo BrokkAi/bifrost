@@ -36,6 +36,7 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - [x] (2026-08-06 04:20Z) Versioned immutable prewarm records by profiler identity in Brokkbench commit `9c7102391c5`.
 - [x] (2026-08-06 05:25Z) Rescored all 64 baseline archives with the corrected answer contract. The result is 39 scorable tasks, 25 invalid outputs, and 2 solves. The rescore report is `baseline-rescore-v2.json` in the campaign directory.
 - [x] (2026-08-06 05:28Z) Started a sequential host-only DW10 prewarm for the 18 unique source revisions used by the 20-task near-miss set. No evaluation container performs prewarm.
+- [x] (2026-08-06 09:05Z) Profiled the Java source timeout and added a complete-index miss fast path. Four concurrent Kafka source calls fell from an unbounded 90-second SQLite scan to 6.3 seconds total.
 - [ ] Prewarm the replacement 20-task set and restart the corrected symbol arm.
 - [ ] (2026-08-05 23:25Z) Run the selected tasks with symbol tools. The first 20-task arm stopped after a linked-worktree fault and a false cache-readiness assumption.
 - [ ] Run the same tasks with symbol and NLP tools.
@@ -94,6 +95,8 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Evidence: `get_symbol_sources` took 92.0 seconds for one call. Timing showed `suffix_resolution.pattern_stage`, and a CPU profile stayed inside SQLite. The persisted row had short name `Replica.handleRaftReady` and indexed identifier `handleRaftReady`.
 - Observation: The indexed terminal lookup removes the pathological fallback.
   Evidence: The exact three-symbol CockroachDB reproduction fell from more than 90 seconds to 4.55 seconds, including 0.96 seconds of process startup.
+- Observation: A concurrent Java source timeout was caused by unresolved qualified names, not Java parsing or SQLite writer contention.
+  Evidence: Four concurrent requests entered `suffix_resolution.pattern_stage`; two literal SQLite scans ran for 53.4 and 58.7 seconds while the isolated exact request completed in 115 ms. The complete identifier index now makes these misses conclusive. The same four-request profile completed in 6.3 seconds with no `sql_search_definitions` timing.
 - Observation: The old corrected baseline still called contract-breaking answers scorable.
   Evidence: Only 37 of 64 outputs are valid grep failures. Two are solves, six are missing, and nineteen have answer-contract errors.
 - Observation: The stored baseline result records used the old contract scorer.
@@ -155,6 +158,9 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Date/Author: 2026-08-06 / Codex
 - Decision: Add terminal-identifier candidates to structured suffix resolution before substring search.
   Rationale: The terminal is already a parsed symbol segment and has a persistent index. The existing alias matcher remains the final authority, so the faster candidate source does not change accepted matches.
+  Date/Author: 2026-08-06 / Codex
+- Decision: Treat a qualified miss as final when the analyzer advertises a complete symbol lookup index.
+  Rationale: The index covers every persisted declaration and definition-lookup unit. A miss after terminal and short-name candidate lookup cannot match the broad suffix pattern. This removes an unbounded SQLite substring scan while preserving the fallback for in-memory or third-party analyzers.
   Date/Author: 2026-08-06 / Codex
 - Decision: Treat every answer-contract error as unscorable.
   Rationale: A partial score from a malformed answer cannot prove that grep did or did not solve the task.
