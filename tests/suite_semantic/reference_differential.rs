@@ -245,6 +245,53 @@ Filter::FilterDecision LevelRangeFilter::decide() const {
 }
 
 #[test]
+fn cpp_forward_definition_keeps_visible_declaration_route_for_inverse_lookup() {
+    let consumer = r#"#pragma once
+#define API_EXPORT
+namespace demo {
+class Widget;
+class API_EXPORT Node {
+public:
+    Node* clone(Widget* target) const;
+};
+}
+"#;
+    let report = cpp_differential(&[
+        ("aaa_helpers.h", "namespace demo { class Widget; }\n"),
+        ("node.h", consumer),
+        ("consumer.cc", "#include \"node.h\"\n"),
+    ]);
+    let start = consumer
+        .find("Widget* target")
+        .expect("parameter type reference");
+    let site = report
+        .sites
+        .iter()
+        .find(|site| site.path == "node.h" && site.start_byte == start)
+        .unwrap_or_else(|| panic!("parameter type site: {:#?}", report.sites));
+
+    assert_eq!(site.forward_status, "resolved", "{site:#?}");
+    assert!(
+        site.targets.iter().any(|target| target.path == "node.h"),
+        "forward lookup must retain the physically visible declaration route: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Consistent,
+        "a visible forward declaration must keep the inverse route to the parameter type: {site:#?}"
+    );
+    assert!(
+        site.inverse_hit.as_ref().is_some_and(|hit| {
+            hit.path == "node.h"
+                && hit.start_byte == start
+                && hit.end_byte == start + "Widget".len()
+                && hit.exact_range
+        }),
+        "{site:#?}"
+    );
+}
+
+#[test]
 fn typescript_export_alias_is_excluded_as_a_declaration_site() {
     let source = r#"const createListItem = () => {};
 const createListItemWithValidation = () => {};
