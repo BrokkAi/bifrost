@@ -5,10 +5,11 @@ pub mod query;
 
 use std::cell::RefCell;
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use bincode::Options;
@@ -20,6 +21,12 @@ use rusqlite::{
 };
 use sha2::{Digest, Sha256};
 use tree_sitter::Language as TsLanguage;
+
+use brokk_bifrost_core::cache_db::{
+    OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA, OPTIONAL_FACT_KIND_MATERIALIZATION_RECORD,
+    OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE, OPTIONAL_FACT_KIND_SCALA_EXPORT,
+    OPTIONAL_FACT_KIND_SCALA_TRAIT,
+};
 
 use crate::CancellationToken;
 use crate::analyzer::fq_name::{FqName, segment_interner};
@@ -194,7 +201,8 @@ const EXACT_PATH_SYMBOL_FQN_SQL: &str =
       )
     ORDER BY rel_path, exact_fqn";
 
-const PARSED_BLOB_INTEGRITY_CONDITION: &str = "
+static PARSED_BLOB_INTEGRITY_CONDITION: LazyLock<String> = LazyLock::new(|| {
+    let mut condition = "
 meta.is_complete = 1
 AND EXISTS (
   SELECT 1
@@ -221,10 +229,30 @@ AND meta.signature_metadata_count = (
   SELECT COUNT(*) FROM unit_signature_metadata AS metadata
   WHERE metadata.blob_oid = meta.blob_oid AND metadata.lang = meta.lang
 )
-AND meta.cpp_template_metadata_count = (
-  SELECT COUNT(*) FROM unit_cpp_template_metadata AS metadata
-  WHERE metadata.blob_oid = meta.blob_oid AND metadata.lang = meta.lang
-)
+AND (SELECT
+"
+    .to_string();
+    for (index, descriptor) in OPTIONAL_FACT_DESCRIPTORS.iter().enumerate() {
+        if index > 0 {
+            condition.push_str("  AND ");
+        } else {
+            condition.push_str("  ");
+        }
+        writeln!(
+            condition,
+            "COALESCE(MAX(CASE WHEN manifest.fact_kind = {} THEN manifest.row_count END), 0) = (\n    SELECT COUNT(*) FROM {} AS facts\n    WHERE facts.blob_oid = meta.blob_oid AND facts.lang = meta.lang\n  )",
+            descriptor.kind as i64, descriptor.table
+        )
+        .expect("write optional fact integrity SQL");
+    }
+    let known_kinds = optional_fact_kind_list();
+    write!(
+        condition,
+        "  AND COUNT(manifest.fact_kind) =\n      COUNT(CASE WHEN manifest.fact_kind IN ({known_kinds}) THEN 1 END)\n  FROM blob_optional_fact_manifest AS manifest\n  WHERE manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang\n)\n"
+    )
+    .expect("write optional fact integrity guard");
+    condition.push_str(
+        "
 AND meta.supertype_count = (
   SELECT COUNT(*) FROM unit_supertypes AS supertypes
   WHERE supertypes.blob_oid = meta.blob_oid AND supertypes.lang = meta.lang
@@ -245,14 +273,30 @@ AND meta.type_identifier_count = (
   SELECT COUNT(*) FROM type_identifiers AS identifiers
   WHERE identifiers.blob_oid = meta.blob_oid AND identifiers.lang = meta.lang
 )
-AND meta.ruby_dispatch_count = (
-  SELECT COUNT(*) FROM ruby_method_dispatch_modes AS modes
-  WHERE modes.blob_oid = meta.blob_oid AND modes.lang = meta.lang
-)
-AND meta.scala_trait_count = (
-  SELECT COUNT(*) FROM scala_traits AS traits
-  WHERE traits.blob_oid = meta.blob_oid AND traits.lang = meta.lang
-)";
+",
+    );
+    condition
+});
+
+static OPTIONAL_FACT_COUNT_PROJECTION: LazyLock<String> = LazyLock::new(|| {
+    let mut projection = OPTIONAL_FACT_DESCRIPTORS
+        .iter()
+        .map(|descriptor| {
+            format!(
+                "COALESCE(MAX(CASE WHEN manifest.fact_kind = {} THEN manifest.row_count END), 0)",
+                descriptor.kind as i64
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let known_kinds = optional_fact_kind_list();
+    write!(
+        projection,
+        ",\nCOUNT(manifest.fact_kind) -\nCOUNT(CASE WHEN manifest.fact_kind IN ({known_kinds}) THEN 1 END)"
+    )
+    .expect("write optional fact projection guard");
+    projection
+});
 
 pub struct AnalyzerStore {
     // Field order is load-bearing for `Drop`: Rust drops struct fields in
@@ -3762,14 +3806,130 @@ struct PersistedSideTableCounts {
     range_count: usize,
     signature_count: usize,
     signature_metadata_count: usize,
-    cpp_template_metadata_count: usize,
     supertype_count: usize,
     child_count: usize,
     import_statement_count: usize,
     import_count: usize,
     type_identifier_count: usize,
-    ruby_dispatch_count: usize,
-    scala_trait_count: usize,
+    optional: OptionalFactCounts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i64)]
+enum OptionalFactKind {
+    CppTemplateMetadata = OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA,
+    RubyMethodDispatchMode = OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE,
+    ScalaTrait = OPTIONAL_FACT_KIND_SCALA_TRAIT,
+    ScalaExport = OPTIONAL_FACT_KIND_SCALA_EXPORT,
+    MaterializationRecord = OPTIONAL_FACT_KIND_MATERIALIZATION_RECORD,
+}
+
+impl OptionalFactKind {
+    const fn slot(self) -> usize {
+        match self {
+            Self::CppTemplateMetadata => 0,
+            Self::RubyMethodDispatchMode => 1,
+            Self::ScalaTrait => 2,
+            Self::ScalaExport => 3,
+            Self::MaterializationRecord => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OptionalFactDescriptor {
+    kind: OptionalFactKind,
+    table: &'static str,
+}
+
+const OPTIONAL_FACT_DESCRIPTORS: [OptionalFactDescriptor; 5] = [
+    OptionalFactDescriptor {
+        kind: OptionalFactKind::CppTemplateMetadata,
+        table: "unit_cpp_template_metadata",
+    },
+    OptionalFactDescriptor {
+        kind: OptionalFactKind::RubyMethodDispatchMode,
+        table: "ruby_method_dispatch_modes",
+    },
+    OptionalFactDescriptor {
+        kind: OptionalFactKind::ScalaTrait,
+        table: "scala_traits",
+    },
+    OptionalFactDescriptor {
+        kind: OptionalFactKind::ScalaExport,
+        table: "scala_exports",
+    },
+    OptionalFactDescriptor {
+        kind: OptionalFactKind::MaterializationRecord,
+        table: "materialization_records",
+    },
+];
+
+fn optional_fact_kind_list() -> String {
+    OPTIONAL_FACT_DESCRIPTORS
+        .iter()
+        .map(|descriptor| (descriptor.kind as i64).to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OptionalFactCounts([usize; OPTIONAL_FACT_DESCRIPTORS.len()]);
+
+impl OptionalFactCounts {
+    fn get(self, kind: OptionalFactKind) -> usize {
+        self.0[kind.slot()]
+    }
+
+    fn set(&mut self, kind: OptionalFactKind, count: usize) {
+        self.0[kind.slot()] = count;
+    }
+
+    fn nonzero_len(self) -> usize {
+        self.0.into_iter().filter(|count| *count > 0).count()
+    }
+}
+
+fn optional_fact_counts(
+    cpp_template_metadata: usize,
+    ruby_dispatch_modes: usize,
+    scala_traits: usize,
+    scala_exports: usize,
+    materialization_records: usize,
+) -> OptionalFactCounts {
+    let mut counts = OptionalFactCounts::default();
+    counts.set(OptionalFactKind::CppTemplateMetadata, cpp_template_metadata);
+    counts.set(
+        OptionalFactKind::RubyMethodDispatchMode,
+        ruby_dispatch_modes,
+    );
+    counts.set(OptionalFactKind::ScalaTrait, scala_traits);
+    counts.set(OptionalFactKind::ScalaExport, scala_exports);
+    counts.set(
+        OptionalFactKind::MaterializationRecord,
+        materialization_records,
+    );
+    counts
+}
+
+fn insert_optional_fact_manifest(
+    tx: &Transaction<'_>,
+    oid: &str,
+    lang: &str,
+    counts: OptionalFactCounts,
+) -> Result<()> {
+    let mut stmt = tx.prepare_cached(
+        "INSERT INTO blob_optional_fact_manifest(blob_oid, lang, fact_kind, row_count)
+         VALUES(?1, ?2, ?3, ?4)",
+    )?;
+    for descriptor in OPTIONAL_FACT_DESCRIPTORS {
+        let kind = descriptor.kind;
+        let count = counts.get(kind);
+        if count > 0 {
+            stmt.execute(params![oid, lang, kind as i64, usize_to_i64(count)?])?;
+        }
+    }
+    Ok(())
 }
 
 fn saturating_sum(values: impl IntoIterator<Item = usize>) -> usize {
@@ -3942,8 +4102,16 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
     let mut type_identifiers: Vec<_> = state.type_identifiers.iter().cloned().collect();
     type_identifiers.sort();
 
+    let optional_counts = optional_fact_counts(
+        cpp_template_metadata.len(),
+        ruby_dispatch_modes.len(),
+        scala_traits.len(),
+        scala_exports.len(),
+        materialization_records.len(),
+    );
     let logical_rows = saturating_sum([
         3,
+        optional_counts.nonzero_len(),
         units.len(),
         ranges.len(),
         signatures.len(),
@@ -4181,9 +4349,8 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
         "INSERT OR IGNORE INTO blob_meta(
            blob_oid, lang, contains_tests, content_package, stored_unit_count,
            range_count, signature_count, signature_metadata_count, supertype_count,
-           child_count, import_statement_count, import_count, type_identifier_count,
-           ruby_dispatch_count, scala_trait_count, cpp_template_metadata_count, is_complete
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 1)",
+           child_count, import_statement_count, import_count, type_identifier_count, is_complete
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1)",
         params![
             oid,
             lang,
@@ -4198,15 +4365,25 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
             usize_to_i64(blob.import_statements.len())?,
             usize_to_i64(blob.imports.len())?,
             usize_to_i64(blob.type_identifiers.len())?,
-            usize_to_i64(blob.ruby_dispatch_modes.len())?,
-            usize_to_i64(blob.scala_traits.len())?,
-            usize_to_i64(blob.cpp_template_metadata.len())?,
         ],
     )?;
+    insert_optional_fact_manifest(
+        tx,
+        oid,
+        lang,
+        optional_fact_counts(
+            blob.cpp_template_metadata.len(),
+            blob.ruby_dispatch_modes.len(),
+            blob.scala_traits.len(),
+            blob.scala_exports.len(),
+            blob.materialization_records.len(),
+        ),
+    )?;
+    let integrity_condition = PARSED_BLOB_INTEGRITY_CONDITION.as_str();
     let integrity_sql = format!(
         "SELECT 1 FROM blob_meta AS meta
          WHERE meta.blob_oid = ?1 AND meta.lang = ?2
-           AND {PARSED_BLOB_INTEGRITY_CONDITION}"
+           AND {integrity_condition}"
     );
     let complete = tx
         .query_row(&integrity_sql, params![oid, lang], |_| Ok(()))
@@ -4312,20 +4489,26 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
     )?;
     let scala_trait_count = insert_scala_traits(tx, &oid, lang, &unit_keys, &state.scala_traits)?;
     let (import_statement_count, import_count) = insert_imports(tx, &oid, lang, state)?;
-    insert_scala_exports(tx, &oid, lang, &unit_keys, &state.scala_exports)?;
-    insert_materialization_records(tx, &oid, lang, &unit_keys, &state.materialization_records)?;
+    let scala_export_count =
+        insert_scala_exports(tx, &oid, lang, &unit_keys, &state.scala_exports)?;
+    let materialization_record_count =
+        insert_materialization_records(tx, &oid, lang, &unit_keys, &state.materialization_records)?;
     let side_counts = PersistedSideTableCounts {
         range_count,
         signature_count,
         signature_metadata_count,
-        cpp_template_metadata_count,
         supertype_count,
         child_count,
         import_statement_count,
         import_count,
         type_identifier_count: state.type_identifiers.len(),
-        ruby_dispatch_count,
-        scala_trait_count,
+        optional: optional_fact_counts(
+            cpp_template_metadata_count,
+            ruby_dispatch_count,
+            scala_trait_count,
+            scala_export_count,
+            materialization_record_count,
+        ),
     };
     insert_blob_meta(tx, &oid, lang, adapter, state, units.len(), side_counts)?;
     update_blob_payload_cost_tx(tx, &oid, lang)?;
@@ -4724,9 +4907,8 @@ fn insert_blob_meta<A: LanguageAdapter>(
         "INSERT OR IGNORE INTO blob_meta(
            blob_oid, lang, contains_tests, content_package, stored_unit_count,
            range_count, signature_count, signature_metadata_count, supertype_count,
-           child_count, import_statement_count, import_count, type_identifier_count,
-           ruby_dispatch_count, scala_trait_count, cpp_template_metadata_count, is_complete
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+           child_count, import_statement_count, import_count, type_identifier_count, is_complete
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             oid,
             lang,
@@ -4741,12 +4923,10 @@ fn insert_blob_meta<A: LanguageAdapter>(
             usize_to_i64(side_counts.import_statement_count)?,
             usize_to_i64(side_counts.import_count)?,
             usize_to_i64(side_counts.type_identifier_count)?,
-            usize_to_i64(side_counts.ruby_dispatch_count)?,
-            usize_to_i64(side_counts.scala_trait_count)?,
-            usize_to_i64(side_counts.cpp_template_metadata_count)?,
             1,
         ],
     )?;
+    insert_optional_fact_manifest(tx, oid, lang, side_counts.optional)?;
     let mut type_identifiers: Vec<_> = state.type_identifiers.iter().collect();
     type_identifiers.sort();
     let mut stmt = tx.prepare(
@@ -4816,9 +4996,8 @@ struct RawSideTableCounts {
     import_statement_count: i64,
     import_count: i64,
     type_identifier_count: i64,
-    ruby_dispatch_count: i64,
-    scala_trait_count: i64,
-    cpp_template_metadata_count: i64,
+    optional: [i64; OPTIONAL_FACT_DESCRIPTORS.len()],
+    unknown_optional_count: i64,
 }
 
 type BlobMetaRows = HashMap<String, BlobMetaRow>;
@@ -4910,6 +5089,8 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
         type_identifier_count: meta.type_identifiers.len(),
         ruby_dispatch_count: ruby_method_dispatch_modes.len(),
         scala_trait_count: scala_traits.len(),
+        scala_export_count: scala_exports.values().map(Vec::len).sum(),
+        materialization_record_count: materialization_records.len(),
     });
     if actual_counts != meta.side_counts {
         return Ok(None);
@@ -5137,6 +5318,8 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             type_identifier_count: meta.type_identifiers.len(),
             ruby_dispatch_count: ruby_method_dispatch_modes.len(),
             scala_trait_count: scala_traits.len(),
+            scala_export_count: scala_exports.values().map(Vec::len).sum(),
+            materialization_record_count: materialization_records.len(),
         });
         if actual_counts != meta.side_counts {
             continue;
@@ -5187,16 +5370,20 @@ fn read_blob_meta<A: LanguageAdapter>(
     file: &ProjectFile,
     source: &str,
 ) -> Result<Option<BlobMetaRow>> {
+    let optional_fact_projection = OPTIONAL_FACT_COUNT_PROJECTION.as_str();
     let row: Option<(i64, String, i64, RawSideTableCounts)> = conn
         .query_row(
             &format!(
                 "SELECT contains_tests, content_package, stored_unit_count,
                     range_count, signature_count, signature_metadata_count, supertype_count,
                     child_count, import_statement_count, import_count, type_identifier_count,
-                    ruby_dispatch_count, scala_trait_count, cpp_template_metadata_count
+                    {optional_fact_projection}
              FROM blob_meta AS meta
-             WHERE blob_oid = ?1 AND lang = ?2
-               AND {PARSED_BLOB_COMPLETE_CONDITION}"
+             LEFT JOIN blob_optional_fact_manifest AS manifest
+               ON manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang
+             WHERE meta.blob_oid = ?1 AND meta.lang = ?2
+               AND {PARSED_BLOB_COMPLETE_CONDITION}
+             GROUP BY meta.blob_oid, meta.lang"
             ),
             params![oid, lang],
             |row| {
@@ -5213,13 +5400,14 @@ fn read_blob_meta<A: LanguageAdapter>(
         return Ok(None);
     };
     let type_identifiers = read_type_identifiers(conn, oid, lang)?;
+    let side_counts = side_table_counts_from_raw(raw_side_counts)?;
     Ok(Some(BlobMetaRow {
         contains_tests: adapter.hydrate_contains_tests(contains_tests != 0, file, source),
         content_package: adapter.hydrate_content_qualifier(&content_package, file),
         raw_content_package: content_package,
         type_identifiers,
         stored_unit_count: i64_to_usize(stored_unit_count)?,
-        side_counts: side_table_counts_from_raw(raw_side_counts)?,
+        side_counts,
     }))
 }
 
@@ -5278,13 +5466,28 @@ fn raw_side_table_counts_from_row(
         import_statement_count: row.get(offset + 5)?,
         import_count: row.get(offset + 6)?,
         type_identifier_count: row.get(offset + 7)?,
-        ruby_dispatch_count: row.get(offset + 8)?,
-        scala_trait_count: row.get(offset + 9)?,
-        cpp_template_metadata_count: row.get(offset + 10)?,
+        optional: [
+            row.get(offset + 8)?,
+            row.get(offset + 9)?,
+            row.get(offset + 10)?,
+            row.get(offset + 11)?,
+            row.get(offset + 12)?,
+        ],
+        unknown_optional_count: row.get(offset + 13)?,
     })
 }
 
 fn side_table_counts_from_raw(raw: RawSideTableCounts) -> Result<PersistedSideTableCounts> {
+    if raw.unknown_optional_count != 0 {
+        return Err(StoreError::new(format!(
+            "manifest contains {} unknown optional analyzer fact kinds",
+            raw.unknown_optional_count
+        )));
+    }
+    let mut optional = OptionalFactCounts::default();
+    for (descriptor, count) in OPTIONAL_FACT_DESCRIPTORS.into_iter().zip(raw.optional) {
+        optional.set(descriptor.kind, i64_to_usize(count)?);
+    }
     Ok(PersistedSideTableCounts {
         range_count: i64_to_usize(raw.range_count)?,
         signature_count: i64_to_usize(raw.signature_count)?,
@@ -5294,9 +5497,7 @@ fn side_table_counts_from_raw(raw: RawSideTableCounts) -> Result<PersistedSideTa
         import_statement_count: i64_to_usize(raw.import_statement_count)?,
         import_count: i64_to_usize(raw.import_count)?,
         type_identifier_count: i64_to_usize(raw.type_identifier_count)?,
-        ruby_dispatch_count: i64_to_usize(raw.ruby_dispatch_count)?,
-        scala_trait_count: i64_to_usize(raw.scala_trait_count)?,
-        cpp_template_metadata_count: i64_to_usize(raw.cpp_template_metadata_count)?,
+        optional,
     })
 }
 
@@ -5348,6 +5549,7 @@ fn chunk_placeholders(chunk: &[String]) -> String {
 
 fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result<BlobMetaRows> {
     let mut out = HashMap::default();
+    let optional_fact_projection = OPTIONAL_FACT_COUNT_PROJECTION.as_str();
     for chunk in oids.chunks(900) {
         if chunk.is_empty() {
             continue;
@@ -5357,10 +5559,13 @@ fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result
             "SELECT meta.blob_oid, contains_tests, content_package, stored_unit_count,
                     range_count, signature_count, signature_metadata_count, supertype_count,
                     child_count, import_statement_count, import_count, type_identifier_count,
-                    ruby_dispatch_count, scala_trait_count, cpp_template_metadata_count
+                    {optional_fact_projection}
              FROM blob_meta AS meta
+             LEFT JOIN blob_optional_fact_manifest AS manifest
+               ON manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang
              WHERE meta.lang = ? AND meta.blob_oid IN ({placeholders})
                AND {PARSED_BLOB_COMPLETE_CONDITION}
+             GROUP BY meta.blob_oid, meta.lang
              ORDER BY meta.blob_oid"
         );
         let params = chunk_params(lang, chunk);
@@ -6019,6 +6224,8 @@ struct HydratedSideTableParts<'a> {
     type_identifier_count: usize,
     ruby_dispatch_count: usize,
     scala_trait_count: usize,
+    scala_export_count: usize,
+    materialization_record_count: usize,
 }
 
 fn side_table_counts_from_hydrated_parts(
@@ -6028,14 +6235,18 @@ fn side_table_counts_from_hydrated_parts(
         range_count: count_vec_entries(parts.ranges),
         signature_count: count_vec_entries(parts.signatures),
         signature_metadata_count: count_vec_entries(parts.signature_metadata),
-        cpp_template_metadata_count: parts.cpp_template_metadata.len(),
         supertype_count: count_vec_entries(parts.raw_supertypes),
         child_count: count_vec_entries(parts.children),
         import_statement_count: parts.import_statement_count,
         import_count: parts.import_count,
         type_identifier_count: parts.type_identifier_count,
-        ruby_dispatch_count: parts.ruby_dispatch_count,
-        scala_trait_count: parts.scala_trait_count,
+        optional: optional_fact_counts(
+            parts.cpp_template_metadata.len(),
+            parts.ruby_dispatch_count,
+            parts.scala_trait_count,
+            parts.scala_export_count,
+            parts.materialization_record_count,
+        ),
     }
 }
 
@@ -7466,10 +7677,11 @@ fn current_generation_conn(conn: &Connection, lang: &str) -> Result<GenerationId
 }
 
 fn contains_parsed_blob_conn(conn: &Connection, oid: Oid, lang: &str) -> Result<bool> {
+    let integrity_condition = PARSED_BLOB_INTEGRITY_CONDITION.as_str();
     let sql = format!(
         "SELECT 1 FROM blob_meta AS meta
          WHERE meta.blob_oid = ?1 AND meta.lang = ?2
-           AND {PARSED_BLOB_INTEGRITY_CONDITION}
+           AND {integrity_condition}
          LIMIT 1"
     );
     Ok(conn
@@ -7568,12 +7780,12 @@ fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
            CASE WHEN blob.blob_oid IS NULL THEN 0
              WHEN meta.blob_oid IS NULL THEN 1
              ELSE 2 + meta.stored_unit_count + meta.range_count + meta.signature_count
-               + meta.signature_metadata_count + meta.cpp_template_metadata_count
+               + meta.signature_metadata_count
                + meta.supertype_count + meta.child_count
                + meta.import_statement_count + meta.import_count + meta.type_identifier_count
-               + meta.ruby_dispatch_count + meta.scala_trait_count
-               + (SELECT COUNT(*) FROM scala_exports AS exports
-                  WHERE exports.blob_oid = meta.blob_oid AND exports.lang = meta.lang)
+               + (SELECT COALESCE(SUM(row_count), 0) + COUNT(*)
+                  FROM blob_optional_fact_manifest AS manifest
+                  WHERE manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang)
                + (SELECT COUNT(*) FROM structural_facts_snapshots AS snapshots
                   WHERE snapshots.blob_oid = meta.blob_oid AND snapshots.lang = meta.lang)
                + CASE WHEN costs.blob_oid IS NULL THEN 0 ELSE 1 END END,
@@ -7607,12 +7819,12 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
     "SELECT
        1 + CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
          1 + meta.stored_unit_count + meta.range_count + meta.signature_count
-           + meta.signature_metadata_count + meta.cpp_template_metadata_count
+           + meta.signature_metadata_count
            + meta.supertype_count + meta.child_count
            + meta.import_statement_count + meta.import_count + meta.type_identifier_count
-           + meta.ruby_dispatch_count + meta.scala_trait_count
-           + (SELECT COUNT(*) FROM scala_exports AS exports
-              WHERE exports.blob_oid = meta.blob_oid AND exports.lang = meta.lang)
+           + (SELECT COALESCE(SUM(row_count), 0) + COUNT(*)
+              FROM blob_optional_fact_manifest AS manifest
+              WHERE manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang)
            + (SELECT COUNT(*) FROM structural_facts_snapshots AS snapshots
               WHERE snapshots.blob_oid = meta.blob_oid AND snapshots.lang = meta.lang) END,
        CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
@@ -7639,6 +7851,8 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
            + COALESCE((SELECT SUM(length(info)) FROM import_details
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(info)) FROM scala_exports
+               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+           + COALESCE((SELECT SUM(length(payload)) FROM materialization_records
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(CAST(type_identifier AS BLOB))) FROM type_identifiers
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
@@ -7687,7 +7901,12 @@ fn parsed_blob_keys_conn(
     conn: &Connection,
     entries: &[(Oid, String)],
 ) -> Result<HashSet<(Oid, String)>> {
-    parsed_blob_keys_conn_with_condition(conn, entries, "", PARSED_BLOB_INTEGRITY_CONDITION)
+    parsed_blob_keys_conn_with_condition(
+        conn,
+        entries,
+        "",
+        PARSED_BLOB_INTEGRITY_CONDITION.as_str(),
+    )
 }
 
 fn missing_published_parsed_blob_keys_conn(
@@ -7822,11 +8041,14 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
             "SELECT blobs.blob_oid, blobs.lang,
                     1 + CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
                       1 + meta.stored_unit_count + meta.range_count + meta.signature_count
-                        + meta.signature_metadata_count + meta.cpp_template_metadata_count
+                        + meta.signature_metadata_count
                         + meta.supertype_count + meta.child_count
                         + meta.import_statement_count + meta.import_count
-                        + meta.type_identifier_count + meta.ruby_dispatch_count
-                        + meta.scala_trait_count
+                        + meta.type_identifier_count
+                        + (SELECT COALESCE(SUM(row_count), 0) + COUNT(*)
+                           FROM blob_optional_fact_manifest AS manifest
+                           WHERE manifest.blob_oid = meta.blob_oid
+                             AND manifest.lang = meta.lang)
                         + (SELECT COUNT(*) FROM structural_facts_snapshots AS snapshots
                            WHERE snapshots.blob_oid = meta.blob_oid
                              AND snapshots.lang = meta.lang)
@@ -9811,6 +10033,85 @@ mod tests {
     }
 
     #[test]
+    fn unknown_optional_fact_kind_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "pkg/unknown.py", "class Unknown:\n    pass\n");
+        let source = file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(
+                oid,
+                "python",
+                &PythonAdapter,
+                &parse_state(&PythonAdapter, &file),
+            )
+            .unwrap();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO blob_optional_fact_manifest(
+                   blob_oid, lang, fact_kind, row_count
+                 ) VALUES(?1, 'python', 99, 1)",
+                [oid.to_string()],
+            )
+            .unwrap();
+        }
+
+        assert!(!store.contains_parsed_blob(oid, "python").unwrap());
+        let error = store
+            .hydrate_file_state(oid, "python", &PythonAdapter, &file)
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown optional analyzer fact"));
+    }
+
+    #[test]
+    fn missing_optional_fact_manifest_row_is_treated_as_incomplete() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "include/missing.h",
+            "template <typename T, typename U = T*> class Missing {};\n",
+        );
+        let source = file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "cpp", &CppAdapter, &parse_state(&CppAdapter, &file))
+            .unwrap();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            let deleted = conn
+                .execute(
+                    "DELETE FROM blob_optional_fact_manifest
+                     WHERE blob_oid = ?1 AND lang = 'cpp' AND fact_kind = 1",
+                    [oid.to_string()],
+                )
+                .unwrap();
+            assert_eq!(deleted, 1);
+        }
+
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert!(
+            store
+                .hydrate_file_state(oid, "cpp", &CppAdapter, &file)
+                .unwrap()
+                .is_none()
+        );
+        let hydrated = store
+            .hydrate_file_states(
+                &[(file.clone(), oid)],
+                "cpp",
+                &CppAdapter,
+                &HashMap::from_iter([(file.clone(), source)]),
+            )
+            .unwrap();
+        assert!(!hydrated.contains_key(&file));
+    }
+
+    #[test]
     fn metadata_side_table_count_mismatches_are_treated_as_incomplete() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path();
@@ -9832,12 +10133,17 @@ mod tests {
         let scala_file = write_file(
             root,
             "src/main/scala/app/Corrupt.scala",
-            "package app\ntrait Runnable\nclass Worker extends Runnable\n",
+            "package app\ntrait Runnable\nclass Worker extends Runnable\nobject Core { def run(): Int = 1 }\nobject Facade { export Core.{run as execute, *} }\n",
         );
         let cpp_file = write_file(
             root,
             "include/corrupt.h",
             "template <typename T, typename U = T*> class Corrupt {};\ntemplate <typename T> class Corrupt<T, T*> {};\n",
+        );
+        let typescript_file = write_file(
+            root,
+            "src/corrupt.ts",
+            "export interface Shape { area(): number }\nexport class Corrupt implements Shape { area(): number { return 1; } }\n",
         );
 
         for table in [
@@ -9860,11 +10166,14 @@ mod tests {
         for table in ["unit_supertypes", "type_identifiers"] {
             assert_deleting_side_table_marks_incomplete(&JavaAdapter, "java", &java_file, table);
         }
+        for table in ["scala_traits", "scala_exports"] {
+            assert_deleting_side_table_marks_incomplete(&ScalaAdapter, "scala", &scala_file, table);
+        }
         assert_deleting_side_table_marks_incomplete(
-            &ScalaAdapter,
-            "scala",
-            &scala_file,
-            "scala_traits",
+            &TypescriptAdapter,
+            "typescript",
+            &typescript_file,
+            "materialization_records",
         );
         assert_deleting_side_table_marks_incomplete(
             &CppAdapter,
@@ -11541,7 +11850,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_ruby_dispatch_and_scala_trait_side_tables() {
+    fn round_trips_optional_fact_manifest_languages_and_unrelated_language() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path();
         let ruby_file = write_file(
@@ -11554,9 +11863,39 @@ mod tests {
             "src/main/scala/app/Demo.scala",
             "package app\ntrait Runnable { def run(first: Int = 0)(rest: String*): Int }\nclass Worker extends Runnable\nobject Core { def run(): Int = 1 }\nobject Facade { export Core.{run as execute, *} }\n",
         );
+        let cpp_file = write_file(
+            root,
+            "include/demo.h",
+            "template <typename T, typename U = T*> class Demo {};\ntemplate <typename T> class Demo<T, T*> {};\n",
+        );
+        let python_file = write_file(root, "pkg/demo.py", "class Demo:\n    pass\n");
 
         assert_round_trip(&RubyAdapter, "ruby", &ruby_file);
         assert_round_trip(&ScalaAdapter, "scala", &scala_file);
+        assert_round_trip(&CppAdapter, "cpp", &cpp_file);
+        assert_round_trip(&PythonAdapter, "python", &python_file);
+
+        let source = python_file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(
+                oid,
+                "python",
+                &PythonAdapter,
+                &parse_state(&PythonAdapter, &python_file),
+            )
+            .unwrap();
+        let conn = store.conn.lock().unwrap();
+        let manifest_rows: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blob_optional_fact_manifest
+                 WHERE blob_oid = ?1 AND lang = 'python'",
+                [oid.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(manifest_rows, 0);
     }
 
     #[test]
@@ -11578,10 +11917,16 @@ mod tests {
             "src/demo.test.ts",
             "import {Thing} from './thing';\nexport class Demo { run(value: Thing): Thing { return value; } }\n",
         );
+        let cpp_file = write_file(
+            root,
+            "include/demo.h",
+            "template <typename T, typename U = T*> class Demo {};\ntemplate <typename T> class Demo<T, T*> {};\n",
+        );
 
         assert_legacy_prepared_parity(&RubyAdapter, "ruby", &ruby_file);
         assert_legacy_prepared_parity(&ScalaAdapter, "scala", &scala_file);
         assert_legacy_prepared_parity(&TypescriptAdapter, "typescript", &ts_file);
+        assert_legacy_prepared_parity(&CppAdapter, "cpp", &cpp_file);
     }
 
     #[test]

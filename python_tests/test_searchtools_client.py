@@ -110,9 +110,9 @@ def _code_query_explain_payload(
 ) -> dict:
     return {
         "format": "bifrost_code_query_explain/v1",
-        "query_schema_version": 2,
+        "query_schema_version": 1,
         "parsed_query": {
-            "schema_version": 2,
+            "schema_version": 1,
             "match": {"kind": "class", "name": "A"},
             "where": ["src/**"],
             "limit": 20,
@@ -1332,7 +1332,7 @@ class SearchToolsClientTest(unittest.TestCase):
                 {"kind": "class", "name": "A"},
                 where=[absolute_where],
                 languages=["java"],
-                schema_version=2,
+                schema_version=1,
             )
 
         self.assertIsInstance(result, CodeQueryResult)

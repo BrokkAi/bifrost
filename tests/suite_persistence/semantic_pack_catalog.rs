@@ -13,6 +13,7 @@ use brokk_bifrost::analyzer::semantic_model::{CompiledSemanticModelPack, Compile
 use brokk_bifrost::analyzer::store::{
     AnalyzerStore, SemanticPackActivationSourceKind, SemanticPackActiveReference,
 };
+use brokk_bifrost::cache_db;
 use filetime::{FileTime, set_file_mtime};
 use rusqlite::{Connection, params};
 use semver::Version;
@@ -1006,7 +1007,7 @@ fn active_set_digest_is_order_independent_and_persists() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        15
+        cache_db::cache_db_schema_version()
     );
 }
 
