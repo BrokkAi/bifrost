@@ -79,6 +79,9 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::ReceiverAnalysis(_)
                     | PipelineValue::ReceiverOutcome(_)
                     | PipelineValue::ReceiverEvidence(_)
+                    | PipelineValue::CallShape(_)
+                    | PipelineValue::CallArgumentGroup(_)
+                    | PipelineValue::CallArgument(_)
                     | PipelineValue::MemberSelection(_)
                     | PipelineValue::Occurrence(_)
                     | PipelineValue::LexicalScope(_)
@@ -135,6 +138,9 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::ReceiverAnalysis(_)
                                 | PipelineValue::ReceiverOutcome(_)
                                 | PipelineValue::ReceiverEvidence(_)
+                                | PipelineValue::CallShape(_)
+                                | PipelineValue::CallArgumentGroup(_)
+                                | PipelineValue::CallArgument(_)
                                 | PipelineValue::MemberSelection(_)
                                 | PipelineValue::Occurrence(_)
                                 | PipelineValue::LexicalScope(_)
@@ -199,6 +205,9 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::ReceiverAnalysis(_)
                         | PipelineValue::ReceiverOutcome(_)
                         | PipelineValue::ReceiverEvidence(_)
+                        | PipelineValue::CallShape(_)
+                        | PipelineValue::CallArgumentGroup(_)
+                        | PipelineValue::CallArgument(_)
                         | PipelineValue::MemberSelection(_)
                         | PipelineValue::Occurrence(_)
                         | PipelineValue::LexicalScope(_)
@@ -1229,6 +1238,21 @@ pub(super) fn apply_pipeline_step(
                     value.report.site.file.clone(),
                 ))]
             }
+            (PipelineValue::CallShape(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.report.outcome.file.clone(),
+                ))]
+            }
+            (PipelineValue::CallArgumentGroup(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.shape.report.outcome.file.clone(),
+                ))]
+            }
+            (PipelineValue::CallArgument(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.shape.report.outcome.file.clone(),
+                ))]
+            }
             (PipelineValue::ReceiverEvidence(value), QueryStep::FileOf) => {
                 vec![pipeline_expansion(PipelineValue::File(
                     value.receiver.report.site.file.clone(),
@@ -1583,6 +1607,64 @@ pub(super) fn apply_pipeline_step(
             }
             (PipelineValue::ReceiverAnalysis(value), QueryStep::ReceiverEvidence) => {
                 receiver_evidence_expansions(value)
+            }
+            (PipelineValue::StructuralMatch(seed), QueryStep::CallShape) => {
+                let fact_range = seed.facts.node(seed.fact_match.node).range;
+                call_shape::call_shape_expansions_for_input(
+                    analyzer,
+                    &row.traces,
+                    &seed.file,
+                    fact_range,
+                    Some(&seed.facts),
+                    Some(seed.fact_match.node),
+                    receiver_facts,
+                    budget,
+                    limits,
+                    cancellation,
+                    diagnostics,
+                    cache_profile,
+                    &mut row_exhausted,
+                )
+            }
+            (PipelineValue::CallSite(site), QueryStep::CallShape) => {
+                call_shape::call_shape_expansions_for_input(
+                    analyzer,
+                    &row.traces,
+                    &site.0.file,
+                    site.0.range,
+                    None,
+                    None,
+                    receiver_facts,
+                    budget,
+                    limits,
+                    cancellation,
+                    diagnostics,
+                    cache_profile,
+                    &mut row_exhausted,
+                )
+            }
+            (PipelineValue::Occurrence(value), QueryStep::CallShape) => {
+                call_shape::call_shape_expansions_for_input(
+                    analyzer,
+                    &row.traces,
+                    value.file(),
+                    value.row.range,
+                    None,
+                    None,
+                    receiver_facts,
+                    budget,
+                    limits,
+                    cancellation,
+                    diagnostics,
+                    cache_profile,
+                    &mut row_exhausted,
+                )
+            }
+            (PipelineValue::CallShape(value), QueryStep::CallArgumentGroups) => {
+                call_shape::call_argument_group_expansions(value)
+            }
+            (PipelineValue::CallArgumentGroup(value), QueryStep::CallArguments) => {
+                call_shape::call_argument_expansions(value)
             }
             (PipelineValue::File(file), QueryStep::OccurrencesIn(filter)) => {
                 occurrence_expansions_for_file(

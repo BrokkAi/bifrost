@@ -2211,6 +2211,9 @@ fn evaluate_match_query_candidates(
             QueryValueKind::ReceiverAnalysis
             | QueryValueKind::ReceiverOutcome
             | QueryValueKind::ReceiverEvidence
+            | QueryValueKind::CallShape
+            | QueryValueKind::CallArgumentGroup
+            | QueryValueKind::CallArgument
             | QueryValueKind::MemberSelection
             | QueryValueKind::Procedure
             | QueryValueKind::ProgramPoint
@@ -2739,6 +2742,9 @@ fn terminal_presentation(
         | CodeQueryResultValue::ReceiverAnalysis { .. }
         | CodeQueryResultValue::ReceiverOutcome { .. }
         | CodeQueryResultValue::ReceiverEvidence { .. }
+        | CodeQueryResultValue::CallShape { .. }
+        | CodeQueryResultValue::CallArgumentGroup { .. }
+        | CodeQueryResultValue::CallArgument { .. }
         | CodeQueryResultValue::MemberSelection { .. } => return Err(()),
         CodeQueryResultValue::Occurrence { value } => (
             DetailedCodeQueryDomain::Occurrence,
@@ -3392,6 +3398,9 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::ReceiverOutcome { .. } => "receiver_outcome",
         CodeQueryResultRef::MemberSelection { .. } => "member_selection",
         CodeQueryResultRef::ReceiverEvidence { .. } => "receiver_evidence",
+        CodeQueryResultRef::CallShape { .. } => "call_shape",
+        CodeQueryResultRef::CallArgumentGroup { .. } => "call_argument_group",
+        CodeQueryResultRef::CallArgument { .. } => "call_argument",
         CodeQueryResultRef::Occurrence { .. } => "occurrence",
         CodeQueryResultRef::LexicalScope { .. } => "lexical_scope",
         CodeQueryResultRef::Binding { .. } => "binding",
@@ -3424,6 +3433,9 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::ReceiverAnalysis { path, .. }
         | CodeQueryResultRef::ReceiverOutcome { path, .. }
         | CodeQueryResultRef::ReceiverEvidence { path, .. }
+        | CodeQueryResultRef::CallShape { path, .. }
+        | CodeQueryResultRef::CallArgumentGroup { path, .. }
+        | CodeQueryResultRef::CallArgument { path, .. }
         | CodeQueryResultRef::MemberSelection { path, .. }
         | CodeQueryResultRef::Occurrence { path, .. }
         | CodeQueryResultRef::LexicalScope { path, .. }
@@ -3484,6 +3496,9 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::ReceiverAnalysis
         | DetailedCodeQueryDomain::ReceiverOutcome
         | DetailedCodeQueryDomain::ReceiverEvidence
+        | DetailedCodeQueryDomain::CallShape
+        | DetailedCodeQueryDomain::CallArgumentGroup
+        | DetailedCodeQueryDomain::CallArgument
         | DetailedCodeQueryDomain::MemberSelection => None,
     }
 }
@@ -3650,9 +3665,15 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_optional_hash(&mut hasher, capture.as_deref());
         }
         DetailedCodeQueryKey::ReceiverOutcome { id, site_id }
-        | DetailedCodeQueryKey::ReceiverEvidence { id, site_id } => {
+        | DetailedCodeQueryKey::ReceiverEvidence { id, site_id }
+        | DetailedCodeQueryKey::CallShape { id, site_id }
+        | DetailedCodeQueryKey::CallArgumentGroup { id, site_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, site_id.as_bytes());
+        }
+        DetailedCodeQueryKey::CallArgument { id, group_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, group_id.as_bytes());
         }
         DetailedCodeQueryKey::MemberSelection { id, site_ast_id } => {
             update_hash(&mut hasher, id.as_bytes());
@@ -3706,6 +3727,9 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::ReceiverAnalysis => "receiver_analysis",
         DetailedCodeQueryDomain::ReceiverOutcome => "receiver_outcome",
         DetailedCodeQueryDomain::ReceiverEvidence => "receiver_evidence",
+        DetailedCodeQueryDomain::CallShape => "call_shape",
+        DetailedCodeQueryDomain::CallArgumentGroup => "call_argument_group",
+        DetailedCodeQueryDomain::CallArgument => "call_argument",
         DetailedCodeQueryDomain::MemberSelection => "member_selection",
         DetailedCodeQueryDomain::Occurrence => "occurrence",
         DetailedCodeQueryDomain::ReferenceEdge => "reference_edge",
