@@ -1,6 +1,8 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::declaration_range::DeclarationNameRangeContext;
-use crate::analyzer::reference_candidates::{ReferenceCandidateRanges, reference_candidate_ranges};
+use crate::analyzer::reference_candidates::{
+    ReferenceCandidateRanges, reference_candidate_ranges, reference_candidate_requires_point_lookup,
+};
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::cpp_graph::CppAuthoritativeUsageBatch;
 #[cfg(test)]
@@ -230,6 +232,7 @@ struct SampledSite {
     file: ProjectFile,
     range: Range,
     csharp_nameof_argument: bool,
+    point_lookup: bool,
 }
 
 impl Ord for SampledSite {
@@ -605,6 +608,7 @@ fn collect_sampled_sites(
                             context.content(),
                         )
                     });
+            let point_lookup = reference_candidate_requires_point_lookup(root, language, &range);
             let priority = site_priority(config.seed, &path, &range);
             push_bounded(
                 &mut heap,
@@ -613,6 +617,7 @@ fn collect_sampled_sites(
                     file: file.clone(),
                     range,
                     csharp_nameof_argument,
+                    point_lookup,
                 },
                 config.max_sites,
             );
@@ -708,7 +713,7 @@ fn forward_resolve_file(
             line: None,
             column: None,
             start_byte: Some(site.range.start_byte),
-            end_byte: Some(site.range.end_byte),
+            end_byte: (!site.point_lookup).then_some(site.range.end_byte),
         })
         .collect();
     let outcomes =
@@ -726,9 +731,13 @@ fn forward_resolve_file(
                 matches!(target.kind(), CodeUnitType::Field | CodeUnitType::Function)
             });
         let reference = outcome.reference.as_ref();
-        let text = reference
-            .map(|reference| reference.text.clone())
-            .unwrap_or_else(|| source[site.range.start_byte..site.range.end_byte].to_string());
+        let text = if site.point_lookup {
+            source[site.range.start_byte..site.range.end_byte].to_string()
+        } else {
+            reference
+                .map(|reference| reference.text.clone())
+                .unwrap_or_else(|| source[site.range.start_byte..site.range.end_byte].to_string())
+        };
         let stable_targets = outcome
             .definitions
             .iter()
@@ -2998,6 +3007,88 @@ public sealed class Model {
             site.inverse_hit.as_ref().map(|hit| hit.exact_range),
             Some(true),
             "{site:#?}"
+        );
+        assert_eq!(report.summary.classifications.missing, 0, "{report:#?}");
+        assert!(!report.has_actionable_findings(), "{report:#?}");
+    }
+
+    #[test]
+    fn cpp_compound_operator_uses_point_lookup_and_preserves_full_range() {
+        let fixture = RoundTripFixture {
+            corpus_language: "cpp",
+            analyzer_language: Language::Cpp,
+            file_name: "operator.cpp",
+            source: concat!(
+                "struct Index {\n",
+                "    int operator[](int value) const { return value; }\n",
+                "    int value() const { return 0; }\n",
+                "};\n",
+                "int use(Index index) {\n",
+                "    return index.operator[](0) + index.value();\n",
+                "}\n",
+            ),
+            call_line: "return index.operator[](0) + index.value();",
+        };
+
+        let report = audit_fixture(&fixture);
+        assert_eq!(report.summary.forward.invalid_location, 0, "{report:#?}");
+        assert!(
+            report.summary.declaration_sites_excluded >= 2,
+            "operator and near-miss declarations must use existing declaration metadata: {report:#?}"
+        );
+        let operator_declaration_start = fixture
+            .source
+            .find("operator[]")
+            .expect("operator declaration text");
+        assert!(
+            report
+                .sites
+                .iter()
+                .all(|site| site.start_byte != operator_declaration_start),
+            "operator declaration must not be sampled: {report:#?}"
+        );
+
+        let operator_start = fixture
+            .source
+            .rfind("operator[]")
+            .expect("operator call text");
+        let operator_site = report
+            .sites
+            .iter()
+            .find(|site| site.start_byte == operator_start)
+            .unwrap_or_else(|| panic!("operator call site was not sampled: {report:#?}"));
+        assert_eq!(
+            &fixture.source[operator_site.start_byte..operator_site.end_byte],
+            "operator[]",
+            "report must retain the structured compound range: {operator_site:#?}"
+        );
+        assert_eq!(operator_site.text, "operator[]", "{operator_site:#?}");
+        assert_eq!(
+            operator_site.forward_status, "resolved",
+            "{operator_site:#?}"
+        );
+        assert_eq!(
+            operator_site.classification,
+            ReferenceClassification::Consistent,
+            "{operator_site:#?}"
+        );
+
+        let value_start = fixture.source.rfind("value").expect("near-miss call text");
+        let value_site = report
+            .sites
+            .iter()
+            .find(|site| site.start_byte == value_start)
+            .unwrap_or_else(|| panic!("near-miss value site was not sampled: {report:#?}"));
+        assert_eq!(
+            &fixture.source[value_site.start_byte..value_site.end_byte],
+            "value",
+            "ordinary member references must retain their normal range: {value_site:#?}"
+        );
+        assert_eq!(value_site.forward_status, "resolved", "{value_site:#?}");
+        assert_eq!(
+            value_site.classification,
+            ReferenceClassification::Consistent,
+            "{value_site:#?}"
         );
         assert_eq!(report.summary.classifications.missing, 0, "{report:#?}");
         assert!(!report.has_actionable_findings(), "{report:#?}");

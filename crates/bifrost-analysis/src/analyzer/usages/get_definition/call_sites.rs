@@ -1,5 +1,6 @@
 use tree_sitter::{Node, Tree};
 
+use crate::analyzer::reference_candidates::reference_candidate_requires_point_lookup;
 use crate::analyzer::structural::{FileFacts, NormalizedKind, Role, Span};
 use crate::analyzer::{Language, ProjectFile, Range};
 
@@ -151,30 +152,7 @@ pub(crate) fn call_reference_requires_point_lookup(
     language: Language,
     range: &Range,
 ) -> bool {
-    if language != Language::Cpp {
-        return false;
-    }
-    let Some(mut node) = tree
-        .root_node()
-        .named_descendant_for_byte_range(range.start_byte, range.end_byte)
-    else {
-        return false;
-    };
-    loop {
-        if matches!(
-            node.kind(),
-            "operator_name" | "operator_cast" | "literal_operator_name"
-        ) {
-            return true;
-        }
-        let Some(parent) = node.parent() else {
-            return false;
-        };
-        if parent.start_byte() != range.start_byte || parent.end_byte() != range.end_byte {
-            return false;
-        }
-        node = parent;
-    }
+    reference_candidate_requires_point_lookup(tree.root_node(), language, range)
 }
 
 pub(crate) fn call_site_syntax_for_reference(
