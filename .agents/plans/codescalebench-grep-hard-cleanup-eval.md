@@ -20,6 +20,8 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - [x] (2026-08-05 22:31Z) Ran all 64 valid tasks without Bifrost at concurrency 10 and a 1,800-second task limit.
 - [x] (2026-08-05 22:34Z) Selected 20 high-scoring baseline failures with ready sources and cache data.
 - [x] (2026-08-05 22:43Z) Fixed Bifrost MCP workspace arguments and proved symbol calls in one end-to-end task.
+- [x] (2026-08-06 00:31Z) Replaced the false 20-task cache set with 11 valid baseline failures and prewarmed all 11 against schema 15.
+- [x] (2026-08-06 00:31Z) Fixed persistent prewarm, ordered active membership, one-pass active chunk loading, and canonical container workspace paths.
 - [ ] (2026-08-05 23:25Z) Run the selected tasks with symbol tools. The first 20-task arm stopped after a linked-worktree fault and a false cache-readiness assumption.
 - [ ] Run the same tasks with symbol and NLP tools.
 - [ ] Add synthetic semantic step zero if natural semantic use is too low.
@@ -57,6 +59,14 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Evidence: Grafana took about 154 seconds to fill missing analyzer rows in schema 15. Its next analyzer build took 1.23 seconds.
 - Observation: Semantic membership order caused most of the corrected prewarm delay.
   Evidence: Django exceeded five minutes before ordered lookup. It completed in 10.8 seconds after `(blob_oid, rel_path)` sorting. Semantic membership took 3.2 milliseconds.
+- Observation: The semantic profiler did not prewarm the persistent analyzer cache.
+  Evidence: Each short-lived container wrote about 1.4 GB to a temporary analyzer database and deleted it. The profiler now uses `build_persisted`.
+- Observation: Active semantic setup repeated random reads from the 28 GB shared database.
+  Evidence: The temporary membership table used path order, while the persistent chunk key uses `(blob_oid, rel_path)`. The active table now uses the same key and reads each active chunk once.
+- Observation: Canonical task containers gave Bifrost a path alias that Git did not use.
+  Evidence: Django had 2,887 Python files, but Bifrost reported zero analyzed files at `/opt/work/analysis`. The canonical self-bind reports 2,997 analyzed files and reaches semantic readiness in 11.5 seconds.
+- Observation: Ordinary clones did not have a full source self-bind at their canonical path.
+  Evidence: Kafka exposed only `.git` there. The harness now self-binds every full prepared source tree. All 11 selected tasks completed prewarm.
 
 ## Decision Log
 
@@ -87,6 +97,12 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - Decision: Replace the incorrect 20-task set with the 11 valid baseline failures that intersect the existing prewarm campaign.
   Rationale: Paired arms must not include cold analyzer or embedding work. The active schema-15 cache will receive a fresh readiness check before either arm runs.
   Date/Author: 2026-08-05 / Codex
+- Decision: Use the prepared source's canonical absolute path inside canonical task containers.
+  Rationale: Git and Bifrost must construct ProjectFile identities from the same root. An alias can make the persisted analyzer appear empty.
+  Date/Author: 2026-08-06 / Codex
+- Decision: Run sequential prewarm with all 60 workstation cores, then use six cores per task at concurrency 10.
+  Rationale: Initial cache hydration is parallel and persistent. The paired evaluation must share the workstation without forcing each large repository onto one core.
+  Date/Author: 2026-08-06 / Codex
 
 ## Outcomes & Retrospective
 
@@ -154,3 +170,5 @@ The dataset audit will use the CodeScaleBench task loaders and verifier modules.
 Revision note: Created after the invalid Bifrost run. It expands the work to the complete 67-task cleanup and staged reevaluation.
 
 Revision note: The complete audit found three invalid candidates. The execution count is now 64, while the audit still covers all 67 rows.
+
+Revision note: The paired set now contains 11 cache-ready baseline failures. Canonical path and semantic startup faults were fixed before either paired arm.
