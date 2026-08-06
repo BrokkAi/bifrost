@@ -406,6 +406,12 @@ impl CSharpAnalyzer {
         batch
     }
 
+    pub(crate) fn global_static_using_type_names(&self) -> &[String] {
+        self.memo_caches
+            .global_static_using_type_names
+            .get_or_init(|| graph_support::compute_global_static_using_type_names(self))
+    }
+
     pub(crate) fn global_static_using_type_names_limited(
         &self,
         limit: usize,
@@ -609,6 +615,10 @@ impl CSharpAnalysisSource for CSharpAnalyzer {
         continue_query: &mut dyn FnMut() -> bool,
     ) -> LimitedQueryRows<(String, String)> {
         CSharpAnalyzer::using_aliases_of_limited(self, file, limit, continue_query)
+    }
+
+    fn global_static_using_type_names(&self) -> &[String] {
+        CSharpAnalyzer::global_static_using_type_names(self)
     }
 
     fn global_static_using_type_names_limited(

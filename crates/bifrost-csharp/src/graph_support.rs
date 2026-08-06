@@ -17,7 +17,7 @@
 //! `CSharpAnalyzer` lives in `brokk-bifrost-analysis`; this crate never names it.
 
 use brokk_bifrost_core::analyzer::capabilities::{
-    ImportAnalysisProvider, TypeHierarchyProvider, build_reverse_file_index,
+    ImportAnalysisProvider, ImportReachability, TypeHierarchyProvider, build_reverse_file_index,
 };
 use brokk_bifrost_core::analyzer::code_unit_index::file_namespace_from_top_level_declarations;
 use brokk_bifrost_core::analyzer::model::{CodeUnitType, ImportInfo, SignatureMetadata};
@@ -32,6 +32,7 @@ use crate::imports::{
 };
 use crate::syntax::{
     csharp_arity_preserving_full_name, csharp_normalize_full_name, normalize_csharp_type_fragment,
+    strip_csharp_generic_arity,
 };
 
 /// The analyzer-resident products C#'s language logic resolves through, on top
@@ -252,8 +253,13 @@ pub trait CSharpAnalysisSource:
     ) -> LimitedQueryRows<(String, String)>;
 
     /// The normalized type names named by the workspace's `global using static`
-    /// directives, sorted and deduplicated, under a budget. Names only;
-    /// [`Self::global_static_using_types`] is the resolved form.
+    /// directives, sorted and deduplicated, memoized whole. Names rather than
+    /// resolved units: a reachability proof cannot treat an unresolvable name
+    /// as an absent one.
+    fn global_static_using_type_names(&self) -> &[String];
+
+    /// [`Self::global_static_using_type_names`] under a budget. It fills the
+    /// same memo cell when the batch completes.
     fn global_static_using_type_names_limited(
         &self,
         limit: usize,
@@ -531,6 +537,290 @@ pub fn compute_using_namespaces_of_limited(
     LimitedQueryRows::complete(namespaces, inspected)
 }
 
+// ---------------------------------------------------------------------------
+// Import reachability
+// ---------------------------------------------------------------------------
+
+/// Whether `source_file` can reference a declaration of `target`.
+///
+/// C# has no named imports: a `using` directive names a namespace, so asking
+/// the framework's generic question "which declarations does this file import"
+/// materializes every top-level type of every used namespace. Candidate
+/// discovery then reduces that whole set to one boolean. Answering the boolean
+/// directly is cheap; answering it *authoritatively* is what lets the caller
+/// skip the expansion (#1730, after the #1194 incident).
+///
+/// [`ImportReachability::Reaches`] is the historical `could_import_file`
+/// answer, unchanged. [`ImportReachability::DoesNotReach`] is returned only
+/// from the proof in [`csharp_cannot_reach_target`]. Everything else stays
+/// [`ImportReachability::Unknown`], which is exactly the old behavior.
+///
+/// Proven, each with a behavior test and a near miss:
+///
+/// - plain `using N;`, including `global using N;` from another file, via the
+///   workspace-level global-using cells rather than per-file import facts
+/// - same-namespace visibility with no `using` at all, read from every
+///   namespace the file declares into rather than from `namespace_of_file`,
+///   which names only the first of them (#1726)
+/// - nested-namespace implicit visibility (`namespace A.B` sees `A.*`)
+/// - fully qualified references, `global::`-qualified references, and
+///   alias-qualified (`A::N.T`) references, from the file's type-identifier set
+/// - `using` aliases and namespace aliases, file-local and global
+/// - `using static`, file-local and global
+/// - generic arity spellings: compared with the arity stripped from both
+///   sides, so ``Foo`1`` and ``Foo`2`` are treated as possible references to
+///   each other rather than as a proof of difference
+/// - partial classes split across files, which fall under same-namespace
+///   visibility because both parts declare into the namespace
+///
+/// NOT proven, and therefore always `Unknown` for that file pair:
+///
+/// - a file whose extractor recorded no type-identifier set at all
+///   (`type_identifiers_of` is `None`): an absent set is not an empty one
+/// - a target with no class declarations, where there is nothing to prove
+///   against
+///
+/// One class of reference is invisible to this proof and to the expansion it
+/// replaces, so neither loses to the other: a reference whose type is only
+/// inferred (`var x = Factory.Create(); x.Method();`) names no target type and
+/// needs no `using`, so it appears neither in the file's identifier set nor in
+/// its imported declarations. The import-graph candidate walk never found
+/// those; it is not a regression to keep not finding them.
+pub fn csharp_import_reachability(
+    source: &dyn CSharpAnalysisSource,
+    source_file: &ProjectFile,
+    imports: &[ImportInfo],
+    target: &ProjectFile,
+) -> ImportReachability {
+    let target_classes: Vec<CodeUnit> = source
+        .declarations(target)
+        .into_iter()
+        .filter(|unit| unit.kind() == CodeUnitType::Class)
+        .collect();
+    if csharp_reaches_target(source, source_file, imports, target, &target_classes) {
+        return ImportReachability::Reaches;
+    }
+    if csharp_cannot_reach_target(source, source_file, imports, &target_classes) {
+        return ImportReachability::DoesNotReach;
+    }
+    ImportReachability::Unknown
+}
+
+/// The cheap positive answer: the historical `could_import_file` body, which
+/// reports a possible reference and never a proven absence.
+fn csharp_reaches_target(
+    source: &dyn CSharpAnalysisSource,
+    source_file: &ProjectFile,
+    imports: &[ImportInfo],
+    target: &ProjectFile,
+    target_classes: &[CodeUnit],
+) -> bool {
+    let arity_sensitive = target_classes
+        .iter()
+        .any(|unit| unit.identifier().contains('`'));
+    if source.namespace_of_file(source_file) == source.namespace_of_file(target) && !arity_sensitive
+    {
+        return true;
+    }
+    let target_namespaces: HashSet<String> = target_classes
+        .iter()
+        .map(|unit| unit.package_name().to_string())
+        .collect();
+    let target_names: HashSet<String> = target_classes
+        .iter()
+        .flat_map(|unit| {
+            let fq_name = unit.fq_name();
+            [
+                unit.identifier().to_string(),
+                fq_name.clone(),
+                fq_name.replace('$', "."),
+            ]
+        })
+        .collect();
+    let source_aliases = source.using_aliases_of(source_file);
+    if let Some(identifiers) = source.type_identifiers_of(source_file) {
+        for identifier in identifiers {
+            if target_names.contains(&identifier) {
+                return true;
+            }
+            if identifier
+                .strip_prefix("global::")
+                .is_some_and(|global_name| target_names.contains(global_name))
+            {
+                return true;
+            }
+            let uses_namespace_alias = source_aliases.keys().any(|alias| {
+                identifier
+                    .strip_prefix(alias)
+                    .is_some_and(|suffix| suffix.starts_with("::"))
+            });
+            if uses_namespace_alias {
+                let candidates = visible_type_candidates(source, source_file, &identifier);
+                if target_classes
+                    .iter()
+                    .any(|target| candidates.contains(target))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    let source_imports = source.using_namespaces_of(source_file);
+    imports
+        .iter()
+        .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
+        .chain(source_imports)
+        .any(|namespace| target_namespaces.contains(&namespace))
+        || source_aliases.values().any(|alias_target| {
+            let candidates = visible_type_candidates(source, source_file, alias_target);
+            target_classes.iter().any(|unit| candidates.contains(unit))
+        })
+}
+
+/// The proof behind a `DoesNotReach`.
+///
+/// A reference from `source_file` into one of `target_classes` must do one of
+/// two things, and the two checks below close both:
+///
+/// 1. spell one of the target's type names somewhere in the file -- qualified,
+///    `global::`-qualified, alias-qualified or bare. Every such spelling is a
+///    type-position or member-access node, which is what the extractor records
+///    in the file's type-identifier set.
+/// 2. bind a name without spelling the type -- an unqualified type name, an
+///    extension-method call, a `using static` member. Every one of those needs
+///    the declaring namespace in scope, so none survives an empty intersection
+///    between the target's namespaces and the file's visible ones.
+///
+/// Both checks over-approximate on purpose: any doubt admits a match and the
+/// verdict falls back to `Unknown`.
+fn csharp_cannot_reach_target(
+    source: &dyn CSharpAnalysisSource,
+    source_file: &ProjectFile,
+    imports: &[ImportInfo],
+    target_classes: &[CodeUnit],
+) -> bool {
+    if target_classes.is_empty() {
+        return false;
+    }
+    // `None` means the extractor recorded no identifier set for this file,
+    // which is not the same as a file that names nothing.
+    let Some(identifiers) = source.type_identifiers_of(source_file) else {
+        return false;
+    };
+
+    let target_names: HashSet<&str> = target_classes
+        .iter()
+        .flat_map(csharp_target_name_segments)
+        .collect();
+    for identifier in &identifiers {
+        if csharp_reference_name_segments(identifier).any(|segment| target_names.contains(segment))
+        {
+            return false;
+        }
+    }
+
+    let visible = csharp_visible_namespaces(source, source_file, imports);
+    !target_classes
+        .iter()
+        .any(|unit| visible.contains(unit.package_name()))
+}
+
+/// Every short name a reference could use to name `unit`: its own identifier,
+/// the leaf of its fully-qualified name and the leaf of its short name, each
+/// with the generic arity stripped so ``Foo`1`` and ``Foo`2`` are not treated
+/// as different types. A nested type is reachable as `Outer.Inner`, so `Inner`
+/// has to be one of them.
+fn csharp_target_name_segments(unit: &CodeUnit) -> impl Iterator<Item = &str> {
+    [unit.identifier(), unit.short_name()]
+        .into_iter()
+        .flat_map(|spelling| spelling.split(['.', '$', '+']))
+        .map(strip_csharp_generic_arity)
+        .filter(|segment| !segment.is_empty())
+}
+
+/// The identifier segments a C# type spelling can name a type with.
+///
+/// `N.C.Nested` can name `N`, `C` or `Nested`, so a proof that a file names
+/// none of the target's types has to test every segment rather than the last.
+/// The extractor's identifier set also holds raw declaration spans -- a class
+/// body arrives as one entry -- and a span is not a name, so a spelling
+/// carrying whitespace or a brace contributes nothing.
+fn csharp_reference_name_segments(identifier: &str) -> impl Iterator<Item = &str> {
+    let is_name = !identifier
+        .chars()
+        .any(|character| character.is_whitespace() || character == '{' || character == '(');
+    is_name
+        .then_some(identifier)
+        .into_iter()
+        .flat_map(|identifier| identifier.split(['.', ':', '$', '+']))
+        .map(strip_csharp_generic_arity)
+        .filter(|segment| !segment.is_empty())
+}
+
+/// Every namespace `source_file` can name a type in without qualifying it.
+///
+/// Over-approximating this set only costs an `Unknown`, so each `using` path
+/// contributes every dotted prefix of what it names rather than a decision
+/// about which of its segments are namespaces and which are types.
+fn csharp_visible_namespaces(
+    source: &dyn CSharpAnalysisSource,
+    source_file: &ProjectFile,
+    imports: &[ImportInfo],
+) -> HashSet<String> {
+    let mut visible: HashSet<String> = HashSet::default();
+    // The global namespace is in scope everywhere.
+    visible.insert(String::new());
+    // Every namespace the file declares into, and every enclosing one:
+    // `namespace A.B` sees `A.*` unqualified. Read from the declarations
+    // rather than from `namespace_of_file`, which names only the first
+    // namespace of a file that opens several (#1726).
+    for unit in source.declarations(source_file) {
+        insert_namespace_prefixes(unit.package_name(), &mut visible);
+    }
+    // File-local and global `using` namespaces, and alias targets, both of
+    // which already merge the workspace-level `global using` cells.
+    for namespace in source.using_namespaces_of(source_file) {
+        insert_namespace_prefixes(&namespace, &mut visible);
+    }
+    for alias_target in source.using_aliases_of(source_file).values() {
+        insert_namespace_prefixes(alias_target, &mut visible);
+    }
+    // `using static N.C;` puts `C`'s members in scope, so `N` is live. The
+    // file's own directives arrive twice -- once from the caller's batch, once
+    // from the store -- because the caller's batch is the authority for a file
+    // whose imports it already loaded.
+    for import in imports
+        .iter()
+        .chain(source.import_info_of(source_file).iter())
+    {
+        if let Some(namespace) = csharp_using_namespace(&import.raw_snippet) {
+            insert_namespace_prefixes(&namespace, &mut visible);
+        }
+        if let Some(static_target) = csharp_static_using_from_import(import) {
+            insert_namespace_prefixes(static_target, &mut visible);
+        }
+    }
+    // `global using static` lives in other files of the compilation, so it
+    // comes from the workspace-level cell rather than from per-file facts.
+    for static_target in source.global_static_using_type_names() {
+        insert_namespace_prefixes(static_target, &mut visible);
+    }
+    visible
+}
+
+/// Insert `path` and every dotted prefix of it, `global::`-stripped.
+fn insert_namespace_prefixes(path: &str, visible: &mut HashSet<String>) {
+    let path = path.strip_prefix("global::").unwrap_or(path);
+    let mut prefix = String::new();
+    for segment in path.split('.').filter(|segment| !segment.is_empty()) {
+        if !prefix.is_empty() {
+            prefix.push('.');
+        }
+        prefix.push_str(strip_csharp_generic_arity(segment));
+        visible.insert(prefix.clone());
+    }
+}
+
 /// The uncached half of the analyzer's `using_aliases_of`.
 pub fn compute_using_aliases_of(
     source: &dyn CSharpAnalysisSource,
@@ -651,6 +941,25 @@ pub fn compute_global_using_aliases_limited(
 }
 
 /// The uncached half of the analyzer's `global_static_using_type_names_limited`.
+/// The uncached half of the analyzer's `global_static_using_type_names`.
+pub fn compute_global_static_using_type_names(source: &dyn CSharpAnalysisSource) -> Vec<String> {
+    let mut names: Vec<_> = source
+        .all_files()
+        .into_iter()
+        .flat_map(|file| source.import_info_of(&file).into_iter())
+        .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
+        .filter_map(|import| {
+            let target = csharp_static_using_from_import(&import)?;
+            let target =
+                normalize_csharp_type_fragment(target.strip_prefix("global::").unwrap_or(target));
+            (!target.is_empty()).then_some(target)
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 pub fn compute_global_static_using_type_names_limited(
     source: &dyn CSharpAnalysisSource,
     limit: usize,
