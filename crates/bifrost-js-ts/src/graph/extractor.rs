@@ -9,7 +9,7 @@ use crate::graph::resolver::{
 };
 use crate::imports::require_call_module_specifier;
 use crate::parse::js_ts_tree_sitter_language_for_file;
-use crate::providers::JsTsAnalyzerHost;
+use crate::providers::JsTsSource;
 use crate::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, JsTsLexicalBindingScope,
     direct_property_definitions, is_commonjs_require_declarator, is_declaration_identifier,
@@ -41,7 +41,7 @@ const TARGET_OBJECT_BINDING: &str = "__target_object__";
 
 #[allow(clippy::too_many_arguments)]
 pub fn scan_files_for_seeds(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     analyzer: &dyn CodeUnitIndex,
     index: &JsTsUsageIndex,
     files: &HashSet<ProjectFile>,
@@ -273,7 +273,7 @@ pub struct ScanCtx<'a> {
     pub analyzer: &'a dyn CodeUnitIndex,
     /// The JS/TS host for `language`, resolved once by `scan_files_for_seeds`, for the
     /// parts of the scan that call the host-parameterized owner resolution.
-    host: &'a dyn JsTsAnalyzerHost,
+    host: &'a dyn JsTsSource,
     target: &'a CodeUnit,
     /// Top-level identifier (the class/function/field's own name component).
     target_short: &'a str,

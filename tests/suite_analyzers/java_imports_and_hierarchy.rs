@@ -141,7 +141,7 @@ fn explicit_import_beats_wildcard() {
         .unwrap();
     let imports = analyzer.imported_code_units_of(consumer.source());
     let ambiguous: Vec<_> = imports
-        .into_iter()
+        .iter()
         .filter(|code_unit| code_unit.identifier() == "Ambiguous")
         .collect();
 
@@ -173,7 +173,7 @@ fn wildcard_imports_are_deterministic() {
         .unwrap();
     let imports = analyzer.imported_code_units_of(consumer.source());
     let ambiguous: Vec<_> = imports
-        .into_iter()
+        .iter()
         .filter(|code_unit| code_unit.identifier() == "Ambiguous")
         .collect();
 

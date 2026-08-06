@@ -2270,7 +2270,7 @@ fn python_unresolved_import_boundary(
         if alias_or_identifier == Some(local) {
             return provider
                 .imported_code_units_of(file)
-                .into_iter()
+                .iter()
                 .all(|unit| unit.identifier() != local);
         }
         if let Some(attribute) = attribute
@@ -2279,7 +2279,7 @@ fn python_unresolved_import_boundary(
         {
             return provider
                 .imported_code_units_of(file)
-                .into_iter()
+                .iter()
                 .all(|unit| unit.identifier() != attribute);
         }
     }

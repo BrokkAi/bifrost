@@ -250,7 +250,7 @@ pub fn resolve_kotlin_type_name_with_external_in_realm(
     raw_name: &str,
     realm: Option<&JvmSourceRealm<'_>>,
 ) -> Option<KotlinTypeResolution> {
-    let package_name = source.kotlin_package_name_of(file).unwrap_or_default();
+    let package_name = source.package_name_of(file).unwrap_or_default();
     let imports = source.import_info_of(file);
     let scope = KotlinNameScope {
         package_name: &package_name,

@@ -6,7 +6,7 @@
 //! body of code and crossed together: they import each other's items freely.
 //!
 //! No analyzer handle appears here. `brokk-bifrost-analysis` downcasts once per
-//! language and hands over a [`JsTsAnalyzerHost`](crate::providers::JsTsAnalyzerHost);
+//! language and hands over a [`JsTsSource`](crate::providers::JsTsSource);
 //! where a scan spans both dialects at once it is handed a [`JsTsHosts`] view,
 //! the `JvmSourceRealm` shape.
 
@@ -20,7 +20,7 @@ pub mod resolver;
 use crate::graph::extractor::scan_files_for_seeds;
 use crate::graph::resolver::{JsTsUsageIndex, is_static_member, member_name};
 use crate::parse::js_ts_tree_sitter_language_for_file;
-use crate::providers::JsTsAnalyzerHost;
+use crate::providers::JsTsSource;
 use crate::syntax::{direct_property_definitions, slice};
 use crate::tsconfig::AliasResolver;
 use brokk_bifrost_core::analyzer::usages::model::{
@@ -43,12 +43,12 @@ use tree_sitter::Parser;
 /// `brokk-bifrost-analysis` does the downcast and hands the list here, exactly
 /// as it does for [`JvmSourceRealm`](https://docs.rs/brokk-bifrost-jvm).
 pub struct JsTsHosts<'a> {
-    hosts: Vec<(Language, &'a dyn JsTsAnalyzerHost)>,
+    hosts: Vec<(Language, &'a dyn JsTsSource)>,
 }
 
 impl<'a> JsTsHosts<'a> {
     /// A view over `hosts`, in the order the builder found them.
-    pub fn new(hosts: Vec<(Language, &'a dyn JsTsAnalyzerHost)>) -> Self {
+    pub fn new(hosts: Vec<(Language, &'a dyn JsTsSource)>) -> Self {
         Self { hosts }
     }
 
@@ -63,7 +63,7 @@ impl<'a> JsTsHosts<'a> {
     }
 
     /// The host for `language`, when the workspace analyzes it.
-    pub fn get(&self, language: Language) -> Option<&'a dyn JsTsAnalyzerHost> {
+    pub fn get(&self, language: Language) -> Option<&'a dyn JsTsSource> {
         self.hosts
             .iter()
             .find(|(member, _)| *member == language)
@@ -80,7 +80,7 @@ impl<'a> JsTsHosts<'a> {
 /// analyzer for `language`.
 #[allow(clippy::too_many_arguments)]
 pub fn find_js_ts_usages(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     analyzer: &dyn CodeUnitIndex,
     index: &JsTsUsageIndex,
     target: &CodeUnit,

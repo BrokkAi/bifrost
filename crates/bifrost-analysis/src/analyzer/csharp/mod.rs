@@ -3,7 +3,7 @@
 //! What lives here is everything the language crate cannot name: the
 //! [`CSharpAnalyzer`] newtype and its six moka caches, six `OnceLock`s and two
 //! `PoolSafeMemo`s; the accessors that implement
-//! [`graph_support::CSharpAnalysisSource`] out of them; the `CSharpAdapter`
+//! [`graph_support::CSharpSource`] out of them; the `CSharpAdapter`
 //! forwarding shell; the `IAnalyzer`/`CodeUnitIndex` impls; and the
 //! `LanguageSupport` SPI block.
 
@@ -80,7 +80,7 @@ use brokk_bifrost_csharp::test_detection::detect_csharp_test_assertion_smells;
 use cache::CSharpMemoCaches;
 use clones::build_csharp_clone_candidate_data;
 use external::{CSharpExternalDeclarationIndex, CSharpExternalMember, CSharpExternalType};
-use graph_support::CSharpAnalysisSource;
+use graph_support::CSharpSource;
 
 fn limited_known_values<T>(
     len: usize,
@@ -310,14 +310,14 @@ impl CSharpAnalyzer {
         batch
     }
 
-    pub fn using_aliases_of(&self, file: &ProjectFile) -> HashMap<String, String> {
+    pub fn using_aliases_of(&self, file: &ProjectFile) -> Arc<HashMap<String, String>> {
         if let Some(cached) = self.memo_caches.using_aliases.get(file) {
-            return (*cached).clone();
+            return cached;
         }
-        let aliases = graph_support::compute_using_aliases_of(self, file);
+        let aliases = Arc::new(graph_support::compute_using_aliases_of(self, file));
         self.memo_caches
             .using_aliases
-            .insert(file.clone(), Arc::new(aliases.clone()));
+            .insert(file.clone(), Arc::clone(&aliases));
         aliases
     }
 
@@ -447,7 +447,7 @@ impl CSharpAnalyzer {
     }
 }
 
-impl CSharpAnalysisSource for CSharpAnalyzer {
+impl CSharpSource for CSharpAnalyzer {
     fn persisted_declaration_candidates_by_fqn(
         &self,
         fqn: &str,
@@ -604,7 +604,7 @@ impl CSharpAnalysisSource for CSharpAnalyzer {
         CSharpAnalyzer::using_namespaces_of_limited(self, file, limit, continue_query)
     }
 
-    fn using_aliases_of(&self, file: &ProjectFile) -> HashMap<String, String> {
+    fn using_aliases_of(&self, file: &ProjectFile) -> Arc<HashMap<String, String>> {
         CSharpAnalyzer::using_aliases_of(self, file)
     }
 

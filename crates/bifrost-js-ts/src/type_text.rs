@@ -7,7 +7,7 @@
 //! name them without importing the definition route, which the route then
 //! imports back (issue: the js_ts crate extraction, Js-1).
 
-use crate::providers::JsTsAnalyzerHost;
+use crate::providers::JsTsSource;
 use brokk_bifrost_core::analyzer::CodeUnit;
 use tree_sitter::Node;
 
@@ -25,7 +25,7 @@ pub fn ts_clean_type_text(text: &str) -> String {
 }
 
 pub fn jsts_value_space_candidates(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     candidates: Vec<CodeUnit>,
 ) -> Vec<CodeUnit> {
     let value_candidates: Vec<_> = candidates
@@ -41,7 +41,7 @@ pub fn jsts_value_space_candidates(
 }
 
 pub fn jsts_type_space_candidates(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     candidates: Vec<CodeUnit>,
 ) -> Vec<CodeUnit> {
     let type_candidates: Vec<_> = candidates
@@ -56,13 +56,13 @@ pub fn jsts_type_space_candidates(
     }
 }
 
-/// The type-alias question goes through [`JsTsAnalyzerHost::js_ts_is_type_alias`]
+/// The type-alias question goes through [`JsTsSource::is_type_alias`]
 /// rather than `IAnalyzer::type_alias_provider`: both spellings read the same
 /// TypeScript declaration index for a TypeScript unit, and both answer `false`
 /// for a JavaScript one (JavaScript has no `TypeAliasProvider`), but only the
 /// host spelling keeps this file off `IAnalyzer`.
-pub fn jsts_unit_is_type_only(host: &dyn JsTsAnalyzerHost, unit: &CodeUnit) -> bool {
-    if host.js_ts_is_type_alias(unit) {
+pub fn jsts_unit_is_type_only(host: &dyn JsTsSource, unit: &CodeUnit) -> bool {
+    if host.is_type_alias(unit) {
         return true;
     }
     unit.signature().is_some_and(jsts_signature_is_type_only)

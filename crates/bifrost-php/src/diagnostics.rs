@@ -1,6 +1,6 @@
 //! PHP's semantic diagnostics: conservative unresolved-reference reporting.
 //!
-//! The analyzer facts this needs are the [`PhpAnalysisSource`] the rest of the
+//! The analyzer facts this needs are the [`PhpSource`] the rest of the
 //! crate already takes, the dispatching analyzer's `CodeUnitIndex`, and a
 //! [`BoundedDefinitionLookup`] for "is this fqn indexed".
 //! `analyzer/php/diagnostics.rs` in `brokk-bifrost-analysis` keeps the downcast
@@ -10,7 +10,7 @@ use crate::aliases::{
     PhpFileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
 };
 use crate::graph_support::{
-    PhpAnalysisSource, php_direct_declared_class_parent, php_file_context_from_source,
+    PhpSource, php_direct_declared_class_parent, php_file_context_from_source,
 };
 use brokk_bifrost_core::analyzer::model::{Range, SemanticDiagnostic};
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{node_range, node_text};
@@ -55,7 +55,7 @@ impl From<PhpSemanticDiagnostic> for SemanticDiagnostic {
 /// names, variable function names, variable member names, magic members, and
 /// external Composer/vendor symbols that are not indexed by this workspace.
 pub fn collect_php_semantic_diagnostics(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     index: &dyn CodeUnitIndex,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
@@ -98,7 +98,7 @@ fn parse_php_tree(source: &str) -> Option<Tree> {
 }
 
 struct PhpDiagnosticCollector<'a> {
-    php: &'a dyn PhpAnalysisSource,
+    php: &'a dyn PhpSource,
     index: &'a dyn CodeUnitIndex,
     support: &'a dyn BoundedDefinitionLookup,
     file: &'a ProjectFile,

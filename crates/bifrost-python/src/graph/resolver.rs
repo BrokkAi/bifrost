@@ -137,10 +137,10 @@ pub fn resolve_receiver_type(
     if let Some(provider) = graph.imports
         && let Some(imported) = provider
             .imported_code_units_of(file)
-            .into_iter()
+            .iter()
             .find(|code_unit| code_unit.identifier() == raw_type && code_unit.is_class())
     {
-        return Some(imported);
+        return Some(imported.clone());
     }
 
     graph

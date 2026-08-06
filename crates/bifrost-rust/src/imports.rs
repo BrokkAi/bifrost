@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use tree_sitter::Node;
 
 use crate::declarations::{rust_node_text, rust_package_name};
-use crate::graph_support::{RustAnalysisSource, resolve_module_package};
+use crate::graph_support::{RustSource, resolve_module_package};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RustVisibility {
@@ -624,7 +624,7 @@ pub fn resolve_rust_module_path_with_crate(
 /// the import. In particular, `self` and `super` must start from an inline
 /// module's package rather than the package inferred from the backing file.
 pub fn resolve_rust_import_package_scoped(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     file: &ProjectFile,
     source: &str,
     scope_start: usize,

@@ -12,7 +12,7 @@
 //! `TreeSitterAnalyzer`, or `PythonAnalyzer`.
 //!
 //! Where analysis code would reach for an analyzer handle, the functions here
-//! take [`graph_support::PythonAnalysisSource`] (or
+//! take [`graph_support::PythonSource`] (or
 //! [`graph_support::PythonUsageSource`] once the usage index exists) -- a core
 //! [`brokk_bifrost_core::analyzer::CodeUnitIndex`] plus the memoized per-file
 //! products Python resolves through. `analyzer/python/` in

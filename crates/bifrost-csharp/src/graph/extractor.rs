@@ -13,7 +13,7 @@ use crate::graph::resolver::{
     unqualified_member_has_structured_shadow, unqualified_member_resolves_to_owner,
     usage_unqualified_value_member_shadows_type, usage_visible_extension_method_candidates,
 };
-use crate::graph_support::{self, CSharpAnalysisSource};
+use crate::graph_support::{self, CSharpSource};
 use crate::hierarchy;
 use crate::syntax::{
     csharp_attribute_terminal_name, csharp_attribute_type_names, csharp_conditional_member_access,
@@ -32,6 +32,7 @@ use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
 
 pub struct ScanState<'a> {
@@ -46,13 +47,10 @@ pub struct PreparedCSharpFile {
     tree: Tree,
     line_starts: Vec<usize>,
     class_ranges: ClassRangeIndex,
-    using_aliases: HashMap<String, String>,
+    using_aliases: Arc<HashMap<String, String>>,
 }
 
-pub fn prepare_file(
-    csharp: &dyn CSharpAnalysisSource,
-    file: &ProjectFile,
-) -> Option<PreparedCSharpFile> {
+pub fn prepare_file(csharp: &dyn CSharpSource, file: &ProjectFile) -> Option<PreparedCSharpFile> {
     let Ok(source) = file.read_to_string() else {
         return None;
     };
@@ -84,7 +82,7 @@ pub fn prepare_file(
 }
 
 pub fn scan_prepared_file(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     graph: &CSharpGraphSource<'_>,
     file: &ProjectFile,
     prepared: &PreparedCSharpFile,
@@ -116,7 +114,7 @@ pub fn scan_prepared_file(
 }
 
 pub(super) struct ScanCtx<'a> {
-    pub(super) csharp: &'a dyn CSharpAnalysisSource,
+    pub(super) csharp: &'a dyn CSharpSource,
     pub(super) graph: &'a CSharpGraphSource<'a>,
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,

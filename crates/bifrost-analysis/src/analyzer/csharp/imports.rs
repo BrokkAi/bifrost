@@ -17,14 +17,14 @@ use super::graph_support::{
     compute_implicit_reference_index, csharp_import_reachability, visible_type_candidates,
 };
 impl ImportAnalysisProvider for CSharpAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         if let Some(cached) = self.memo_caches.imported_code_units.get(file) {
-            return (*cached).clone();
+            return cached;
         }
         let namespaces = self.using_namespaces_of(file);
         let aliases = self.using_aliases_of(file);
         if namespaces.is_empty() && aliases.is_empty() {
-            return HashSet::default();
+            return Arc::new(HashSet::default());
         }
         let mut imported: HashSet<CodeUnit> = HashSet::default();
         for namespace in &namespaces {
@@ -38,9 +38,10 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         for target in aliases.values() {
             imported.extend(visible_type_candidates(self, file, target));
         }
+        let imported = Arc::new(imported);
         self.memo_caches
             .imported_code_units
-            .insert(file.clone(), Arc::new(imported.clone()));
+            .insert(file.clone(), Arc::clone(&imported));
         imported
     }
 

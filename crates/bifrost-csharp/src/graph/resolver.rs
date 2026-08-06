@@ -1,6 +1,6 @@
 use crate::declarations::CSHARP_IDENTIFIER_SIGIL;
 use crate::graph::CSharpGraphSource;
-use crate::graph_support::{self, CSharpAnalysisSource};
+use crate::graph_support::{self, CSharpSource};
 use crate::hierarchy;
 use crate::syntax::{
     CSharpMemberName, csharp_callable_arity, csharp_conditional_member_access, csharp_member_name,
@@ -38,6 +38,7 @@ use brokk_bifrost_core::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
+use std::sync::Arc;
 use tree_sitter::Node;
 
 fn resolution_scope_step(session: Option<&ResolutionSession>) -> bool {
@@ -151,7 +152,7 @@ impl TargetSpec {
 pub fn seed_visible_bindings_at(
     scope: Node<'_>,
     target: Node<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -162,7 +163,7 @@ pub fn seed_visible_bindings_at(
 pub fn seed_bindings_before(
     node: Node<'_>,
     cutoff_start: usize,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -173,7 +174,7 @@ pub fn seed_bindings_before(
 pub fn seed_bindings_before_in_session(
     node: Node<'_>,
     cutoff_start: usize,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -219,7 +220,7 @@ pub fn seed_bindings_before_in_session(
 fn seed_bindings_before_inner(
     node: Node<'_>,
     cutoff_start: usize,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -265,7 +266,7 @@ const SCOPE_NODES: &[&str] = &[
 fn seed_visible_bindings_inner(
     node: Node<'_>,
     target: Node<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -309,7 +310,7 @@ fn node_covers(container: Node<'_>, target: Node<'_>) -> bool {
 
 fn seed_parameter(
     node: Node<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -326,7 +327,7 @@ fn seed_parameter(
 
 fn seed_parameter_in_session(
     node: Node<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -345,7 +346,7 @@ fn seed_parameter_in_session(
 
 fn seed_variable_declaration(
     node: Node<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -392,7 +393,7 @@ fn seed_variable_declaration(
 
 fn seed_variable_declaration_in_session(
     node: Node<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -451,7 +452,7 @@ pub(super) fn is_member_variable_declaration(node: Node<'_>) -> bool {
 
 fn var_initializer_member_type(
     declarator: Node<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
@@ -487,7 +488,7 @@ fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
 
 fn expression_type_fq_name(
     expression: Node<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
@@ -497,7 +498,7 @@ fn expression_type_fq_name(
 
 fn expression_type_fq_name_inner(
     expression: Node<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
@@ -561,7 +562,7 @@ fn expression_type_fq_name_inner(
 
 fn invocation_expression_return_type_fq_name(
     invocation: Node<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
@@ -631,7 +632,7 @@ fn invocation_expression_return_type_fq_name(
 
 fn receiver_type_units(
     receiver: Node<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
@@ -691,7 +692,7 @@ fn member_access_name(node: Node<'_>) -> Option<Node<'_>> {
 
 pub(super) fn enclosing_declared_type(
     node: Node<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     _source: &str,
 ) -> Option<CodeUnit> {
@@ -701,10 +702,7 @@ pub(super) fn enclosing_declared_type(
     class_unit_for_fq_name(csharp, fqn)
 }
 
-pub(super) fn class_unit_for_fq_name(
-    csharp: &dyn CSharpAnalysisSource,
-    fqn: &str,
-) -> Option<CodeUnit> {
+pub(super) fn class_unit_for_fq_name(csharp: &dyn CSharpSource, fqn: &str) -> Option<CodeUnit> {
     let mut candidates = usage_type_declarations_for_fq_name(csharp, fqn);
     graph_support::sort_dedup_type_candidates(&mut candidates);
     (candidates.len() == 1).then(|| candidates.remove(0))
@@ -712,7 +710,7 @@ pub(super) fn class_unit_for_fq_name(
 
 pub fn usage_direct_base(
     graph: &CSharpGraphSource<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     owner: &CodeUnit,
 ) -> Option<CodeUnit> {
     let mut candidates = hierarchy::usage_direct_ancestors(csharp, owner)
@@ -739,28 +737,19 @@ fn csharp_is_class_base_declaration(graph: &CSharpGraphSource<'_>, candidate: &C
     })
 }
 
-fn forward_class_unit_for_fq_name(
-    csharp: &dyn CSharpAnalysisSource,
-    fqn: &str,
-) -> Option<CodeUnit> {
+fn forward_class_unit_for_fq_name(csharp: &dyn CSharpSource, fqn: &str) -> Option<CodeUnit> {
     let mut candidates = forward_type_declarations_for_fq_name(csharp, fqn);
     graph_support::sort_dedup_type_candidates(&mut candidates);
     (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
-fn usage_type_declarations_for_fq_name(
-    csharp: &dyn CSharpAnalysisSource,
-    fqn: &str,
-) -> Vec<CodeUnit> {
+fn usage_type_declarations_for_fq_name(csharp: &dyn CSharpSource, fqn: &str) -> Vec<CodeUnit> {
     let mut candidates = graph_support::usage_type_candidates_by_fqn(csharp, fqn);
     graph_support::sort_dedup_type_candidates(&mut candidates);
     candidates
 }
 
-fn forward_type_declarations_for_fq_name(
-    csharp: &dyn CSharpAnalysisSource,
-    fqn: &str,
-) -> Vec<CodeUnit> {
+fn forward_type_declarations_for_fq_name(csharp: &dyn CSharpSource, fqn: &str) -> Vec<CodeUnit> {
     let mut candidates = graph_support::declaration_candidates_by_fqn(csharp, fqn, false)
         .into_iter()
         .filter(|unit| unit.is_class())
@@ -776,7 +765,7 @@ fn forward_type_declarations_for_fq_name(
 }
 
 fn forward_type_declarations_for_fq_name_in_session(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     fqn: &str,
     session: &ResolutionSession,
 ) -> Vec<CodeUnit> {
@@ -809,7 +798,7 @@ fn forward_type_declarations_for_fq_name_in_session(
 }
 
 fn forward_class_unit_for_fq_name_in_session(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     fqn: &str,
     session: &ResolutionSession,
 ) -> Option<CodeUnit> {
@@ -818,7 +807,7 @@ fn forward_class_unit_for_fq_name_in_session(
 }
 
 fn using_aliases_for_file_in_session(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     session: &ResolutionSession,
 ) -> HashMap<String, String> {
@@ -831,7 +820,7 @@ fn using_aliases_for_file_in_session(
 }
 
 fn using_namespaces_for_file_in_session(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     session: &ResolutionSession,
 ) -> Vec<String> {
@@ -841,14 +830,14 @@ fn using_namespaces_for_file_in_session(
 }
 
 fn visible_type_candidates_in_session(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     name: &str,
     resolve_aliases: bool,
     session: &ResolutionSession,
 ) -> Vec<CodeUnit> {
     let mut using_aliases = || {
-        let aliases = using_aliases_for_file_in_session(csharp, file, session);
+        let aliases = Arc::new(using_aliases_for_file_in_session(csharp, file, session));
         session.observe_cancellation().then_some(aliases)
     };
     let mut namespace_of_file = || {
@@ -876,7 +865,7 @@ fn visible_type_candidates_in_session(
 }
 
 fn forward_direct_ancestors_in_session(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     owner: &CodeUnit,
     session: &ResolutionSession,
 ) -> Vec<CodeUnit> {
@@ -935,7 +924,7 @@ fn forward_direct_ancestors_in_session(
 }
 
 pub fn member_declared_type_fq_name(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     _file: &ProjectFile,
     owner: &CodeUnit,
     member_name: &str,
@@ -944,7 +933,7 @@ pub fn member_declared_type_fq_name(
 }
 
 pub fn member_declared_type_fq_name_in_session(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     _file: &ProjectFile,
     owner: &CodeUnit,
     member_name: &str,
@@ -954,7 +943,7 @@ pub fn member_declared_type_fq_name_in_session(
 }
 
 pub(super) fn usage_member_declared_type_fq_name(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     owner: &CodeUnit,
     member_name: &str,
 ) -> Option<String> {
@@ -962,7 +951,7 @@ pub(super) fn usage_member_declared_type_fq_name(
 }
 
 fn member_declared_type_fq_name_for_scope(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     owner: &CodeUnit,
     member_name: &str,
     usage: bool,
@@ -971,7 +960,7 @@ fn member_declared_type_fq_name_for_scope(
 }
 
 fn member_declared_type_fq_name_inner(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     owner: &CodeUnit,
     member_name: &str,
     usage: bool,
@@ -1053,7 +1042,7 @@ fn member_declared_type_fq_name_inner(
 /// `signature()` keeps only the parameter list, so read the return type from the
 /// full signature text (`signatures`), which is `Return Name(params) { … }`.
 pub fn method_return_type_fq_name_for_arity(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     _file: &ProjectFile,
     owner: &CodeUnit,
     method_name: &str,
@@ -1075,7 +1064,7 @@ pub fn method_return_type_fq_name_for_arity(
 
 #[allow(clippy::too_many_arguments)]
 pub fn method_return_type_fq_name_for_arity_in_session(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     _file: &ProjectFile,
     owner: &CodeUnit,
     method_name: &str,
@@ -1097,7 +1086,7 @@ pub fn method_return_type_fq_name_for_arity_in_session(
 }
 
 pub(super) fn usage_method_return_type_fq_name_for_arity(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     owner: &CodeUnit,
     method_name: &str,
     arity: Option<usize>,
@@ -1118,7 +1107,7 @@ pub(super) fn usage_method_return_type_fq_name_for_arity(
 
 #[allow(clippy::too_many_arguments)]
 fn method_return_type_fq_name_for_arity_inner(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     owner: &CodeUnit,
     method_name: &str,
     arity: Option<usize>,
@@ -1173,7 +1162,7 @@ fn method_return_type_fq_name_for_arity_inner(
 /// unit's own parent is unavailable. Shared between ordinary member return typing
 /// and extension-method return typing so both derive the return FQN identically.
 fn callable_return_type_fq_name(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     unit: &CodeUnit,
     owner_fallback: &CodeUnit,
     explicit_type_arguments: Option<&[String]>,
@@ -1230,7 +1219,7 @@ fn callable_return_type_fq_name(
 /// derivation. Returns a type FQN only when the matching extensions agree on one.
 #[allow(clippy::too_many_arguments)]
 pub fn extension_invocation_return_type_fq_name(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     graph: &CSharpGraphSource<'_>,
     source: &str,
     site: Node<'_>,
@@ -1258,7 +1247,7 @@ pub fn extension_invocation_return_type_fq_name(
 
 #[allow(clippy::too_many_arguments)]
 pub fn extension_invocation_return_type_fq_name_in_session(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     graph: &CSharpGraphSource<'_>,
     source: &str,
     site: Node<'_>,
@@ -1287,7 +1276,7 @@ pub fn extension_invocation_return_type_fq_name_in_session(
 
 #[allow(clippy::too_many_arguments)]
 fn extension_invocation_return_type_fq_name_inner(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     graph: &CSharpGraphSource<'_>,
     source: &str,
     site: Node<'_>,
@@ -1340,7 +1329,7 @@ fn extension_invocation_return_type_fq_name_inner(
 
 fn resolved_type_arguments(
     name: CSharpMemberName<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     usage: bool,
@@ -1376,7 +1365,7 @@ fn substituted_method_type_parameter(
 }
 
 fn resolve_member_type_fq_name(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     owner: &CodeUnit,
     type_text: &str,
@@ -1406,7 +1395,7 @@ fn resolve_member_type_fq_name(
 }
 
 fn resolve_structured_method_return_type_fq_name_in_session(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     owner: &CodeUnit,
     metadata: &SignatureMetadata,
@@ -1434,7 +1423,7 @@ fn resolve_structured_method_return_type_fq_name_in_session(
 }
 
 fn resolve_structured_member_type_fq_name_in_session(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     owner: &CodeUnit,
     identity: &StructuredTypeIdentity,
@@ -1456,7 +1445,7 @@ fn csharp_structured_name_is_method_type_parameter(
 }
 
 fn csharp_owner_chain_declares_type_parameter_in_session(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     owner: &CodeUnit,
     name: &StructuredTypeName,
     session: &ResolutionSession,
@@ -1492,7 +1481,7 @@ fn csharp_owner_chain_declares_type_parameter_in_session(
 }
 
 fn resolve_structured_type_fq_name_in_session(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     name: &StructuredTypeName,
     session: &ResolutionSession,
@@ -1508,7 +1497,7 @@ fn resolve_structured_type_fq_name_in_session(
 }
 
 fn resolve_non_builtin_structured_type_fq_name_in_session(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     name: &StructuredTypeName,
     session: &ResolutionSession,
@@ -1584,7 +1573,7 @@ fn unique_logical_type_fq_name(
     graph_support::first_logical_type_fqn(candidates)
 }
 
-fn member_declared_type(csharp: &dyn CSharpAnalysisSource, member: &CodeUnit) -> Option<String> {
+fn member_declared_type(csharp: &dyn CSharpSource, member: &CodeUnit) -> Option<String> {
     let signatures = csharp.signatures(member);
     let signature = member
         .signature()
@@ -1595,7 +1584,7 @@ fn member_declared_type(csharp: &dyn CSharpAnalysisSource, member: &CodeUnit) ->
 /// A method's declared return type, read from the full signature
 /// (`Return Name(params) { … }`); constructors, whose signature starts at the
 /// name, yield `None`.
-fn method_return_type(csharp: &dyn CSharpAnalysisSource, method: &CodeUnit) -> Option<String> {
+fn method_return_type(csharp: &dyn CSharpSource, method: &CodeUnit) -> Option<String> {
     let signatures = csharp.signatures(method);
     let signature = signatures.first().map(String::as_str)?;
     type_text_before_name(signature, method.identifier())
@@ -1610,7 +1599,7 @@ fn type_text_before_name(signature: &str, name: &str) -> Option<String> {
 fn seed_symbol_for_type(
     name_node: Node<'_>,
     type_node: Node<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -1639,7 +1628,7 @@ fn seed_symbol_for_type(
 fn seed_symbol_for_type_in_session(
     name_node: Node<'_>,
     type_node: Node<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
@@ -1681,7 +1670,7 @@ pub fn object_created_type(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 pub(super) fn resolves_to_target(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     reference: &str,
     target: &CodeUnit,
@@ -1699,14 +1688,14 @@ pub(super) fn resolves_to_target_at(
     node: Node<'_>,
     source: &str,
     target: &CodeUnit,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
 ) -> bool {
     resolve_type_fq_name_at(csharp, file, class_ranges, reference, node, source)
         .is_some_and(|resolved| type_identity_matches(&resolved, &target.fq_name()))
 }
 
 pub(super) fn resolve_type_fq_name_at(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     class_ranges: &ClassRangeIndex,
     reference: &str,
@@ -1727,7 +1716,7 @@ pub(super) fn resolve_type_fq_name_at(
 }
 
 pub fn resolve_type_fq_name(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     reference: &str,
 ) -> Option<String> {
@@ -1742,7 +1731,7 @@ pub fn resolve_type_fq_name(
 }
 
 fn resolve_type_fq_name_in_session(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     reference: &str,
     session: &ResolutionSession,
@@ -1760,7 +1749,7 @@ fn resolve_type_fq_name_in_session(
 }
 
 fn resolve_usage_type_fq_name(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     reference: &str,
 ) -> Option<String> {
@@ -1775,7 +1764,7 @@ fn resolve_usage_type_fq_name(
 }
 
 fn resolve_type_fq_name_for_scope(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     reference: &str,
     usage: bool,
@@ -1788,7 +1777,7 @@ fn resolve_type_fq_name_for_scope(
 }
 
 fn expand_alias_qualified_type(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     reference: &str,
 ) -> String {
@@ -1812,7 +1801,7 @@ fn expand_alias_qualified_type(
 }
 
 fn resolve_visible_type_fq_name(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     reference: &str,
 ) -> Option<String> {
@@ -1823,7 +1812,7 @@ fn resolve_visible_type_fq_name(
 }
 
 fn resolve_usage_visible_type_fq_name(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     reference: &str,
 ) -> Option<String> {
@@ -1834,7 +1823,7 @@ fn resolve_usage_visible_type_fq_name(
 }
 
 fn resolve_in_enclosing_type_scopes(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     class_ranges: &ClassRangeIndex,
     name: &str,
     byte: usize,
@@ -1869,7 +1858,7 @@ fn resolve_in_enclosing_type_scopes(
 }
 
 fn resolve_in_enclosing_namespace(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     namespace: &str,
     name: &str,
 ) -> Option<CodeUnit> {
@@ -1978,7 +1967,7 @@ pub fn is_extension_method(graph: &CSharpGraphSource<'_>, unit: &CodeUnit) -> bo
 
 pub fn extension_method_receiver_type(
     graph: &CSharpGraphSource<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     unit: &CodeUnit,
 ) -> Option<CSharpExtensionReceiver> {
     extension_method_receiver_type_inner(graph, csharp, unit, false, None)
@@ -1986,7 +1975,7 @@ pub fn extension_method_receiver_type(
 
 fn usage_extension_method_receiver_type(
     graph: &CSharpGraphSource<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     unit: &CodeUnit,
 ) -> Option<CSharpExtensionReceiver> {
     extension_method_receiver_type_inner(graph, csharp, unit, true, None)
@@ -1994,7 +1983,7 @@ fn usage_extension_method_receiver_type(
 
 fn extension_method_receiver_type_in_session(
     graph: &CSharpGraphSource<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     unit: &CodeUnit,
     session: &ResolutionSession,
 ) -> Option<CSharpExtensionReceiver> {
@@ -2014,7 +2003,7 @@ pub enum CSharpExtensionReceiver {
 /// any of them.
 fn extension_method_receiver_type_inner(
     graph: &CSharpGraphSource<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     unit: &CodeUnit,
     usage: bool,
     session: Option<&ResolutionSession>,
@@ -2090,7 +2079,7 @@ pub(super) fn extension_visibility_site_key(site: Node<'_>) -> (usize, usize) {
 
 #[allow(clippy::too_many_arguments)]
 pub fn visible_extension_method_candidates(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     graph: &CSharpGraphSource<'_>,
     _file: &ProjectFile,
     source: &str,
@@ -2118,7 +2107,7 @@ pub fn visible_extension_method_candidates(
 
 #[allow(clippy::too_many_arguments)]
 pub fn visible_extension_method_candidates_in_session(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     graph: &CSharpGraphSource<'_>,
     _file: &ProjectFile,
     source: &str,
@@ -2147,7 +2136,7 @@ pub fn visible_extension_method_candidates_in_session(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn usage_visible_extension_method_candidates(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     graph: &CSharpGraphSource<'_>,
     source: &str,
     site: Node<'_>,
@@ -2174,7 +2163,7 @@ pub(super) fn usage_visible_extension_method_candidates(
 
 #[allow(clippy::too_many_arguments)]
 fn visible_extension_method_candidates_inner(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     graph: &CSharpGraphSource<'_>,
     source: &str,
     site: Node<'_>,
@@ -2343,7 +2332,7 @@ fn visible_extension_method_candidates_inner(
 }
 
 fn extension_visibility_scopes(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     source: &str,
     site: Node<'_>,
     usage: bool,
@@ -2485,7 +2474,7 @@ fn extension_visibility_scopes(
 
 #[allow(clippy::too_many_arguments)]
 fn push_namespace_scopes(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     source: &str,
     scopes: &mut Vec<CSharpExtensionScope>,
     namespace: &str,
@@ -2545,7 +2534,7 @@ fn csharp_namespace_parent(current: &str) -> Option<String> {
 
 #[allow(clippy::too_many_arguments)]
 fn collect_scope_using_directives(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     source: &str,
     scope_node: Node<'_>,
     resolution_namespace: &str,
@@ -2630,7 +2619,7 @@ fn namespace_relative_names(namespace: &str, target: &str) -> Vec<String> {
 }
 
 pub fn compatible_receiver_type_names(
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     graph: &CSharpGraphSource<'_>,
     receiver_type_names: &[String],
     usage: bool,
@@ -2768,7 +2757,7 @@ pub fn binding_scope_node(mut node: Node<'_>) -> Node<'_> {
 pub(super) fn receiver_targets_owner(
     receiver_node: Node<'_>,
     graph: &CSharpGraphSource<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
@@ -2779,7 +2768,7 @@ pub(super) fn receiver_targets_owner(
 fn receiver_type_fq_names(
     receiver_node: Node<'_>,
     graph: &CSharpGraphSource<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
@@ -2848,7 +2837,7 @@ pub(super) fn usage_class_field_receiver_type(
     receiver_node: Node<'_>,
     receiver: &str,
     graph: &CSharpGraphSource<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
 ) -> SymbolResolution<String> {
@@ -2890,7 +2879,7 @@ pub(super) fn usage_unqualified_value_member_shadows_type(
     node: Node<'_>,
     name: &str,
     graph: &CSharpGraphSource<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
 ) -> bool {
@@ -2925,7 +2914,7 @@ pub(super) enum UnqualifiedMethodGroupResolution {
 
 pub(super) fn nearest_member_candidates_for_owner(
     graph: &CSharpGraphSource<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     owner: &CodeUnit,
     name: &str,
     explicit_generic_arity: Option<usize>,
@@ -2944,7 +2933,7 @@ pub(super) fn nearest_member_candidates_for_owner(
 
 pub(super) fn applicable_member_candidates_for_owner(
     graph: &CSharpGraphSource<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     owner: &CodeUnit,
     name: &str,
     explicit_generic_arity: Option<usize>,
@@ -2967,7 +2956,7 @@ pub(super) fn applicable_member_candidates_for_owner(
 /// method candidates are constrained by the outer argument list.
 pub(super) fn invocation_member_candidates_for_owner(
     graph: &CSharpGraphSource<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     owner: &CodeUnit,
     name: &str,
     explicit_generic_arity: Option<usize>,
@@ -2996,7 +2985,7 @@ pub(super) fn invocation_member_candidates_for_owner(
 #[allow(clippy::too_many_arguments)]
 pub fn nearest_member_candidates_for_owner_inner(
     graph: &CSharpGraphSource<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     owner: &CodeUnit,
     name: &str,
     explicit_generic_arity: Option<usize>,
@@ -3190,7 +3179,7 @@ pub(super) fn unqualified_member_has_structured_shadow(node: Node<'_>, source: &
 
 pub(super) fn resolve_unqualified_method_group_for_owner(
     graph: &CSharpGraphSource<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     owner: &CodeUnit,
     name: &str,
 ) -> UnqualifiedMethodGroupResolution {
@@ -3362,7 +3351,7 @@ pub(super) fn unqualified_member_resolves_to_owner(
     member_name: &str,
     owner: &CodeUnit,
     graph: &CSharpGraphSource<'_>,
-    csharp: &dyn CSharpAnalysisSource,
+    csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,

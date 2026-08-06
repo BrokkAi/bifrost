@@ -18,7 +18,7 @@ use tree_sitter::{Language as TsLanguage, Parser, Tree};
 use crate::analyzer::js_ts::cache::JsTsMemoCaches;
 use crate::analyzer::js_ts::clones::build_js_ts_clone_candidate_data;
 use crate::analyzer::js_ts::diagnostics::collect_typescript_semantic_diagnostics;
-use crate::analyzer::js_ts::providers::{self, JsTsMemoHost};
+use crate::analyzer::js_ts::providers::{self, JsTsMemoSource};
 use crate::analyzer::js_ts::{
     path_contains_tests as js_ts_path_contains_tests,
     source_contains_tests as js_ts_source_contains_tests,
@@ -29,7 +29,7 @@ use crate::analyzer::usages::js_ts_graph::JsTsUsageIndex;
 use brokk_bifrost_js_ts::identifiers::collect_js_ts_identifiers;
 use brokk_bifrost_js_ts::imports::extract_js_ts_call_receiver;
 use brokk_bifrost_js_ts::model::{module_code_unit, module_scoped_field_uses_file_name};
-use brokk_bifrost_js_ts::providers::JsTsAnalyzerHost;
+use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::test_detection::detect_js_ts_test_assertion_smells;
 use brokk_bifrost_js_ts::typescript::*;
 
@@ -156,39 +156,36 @@ pub struct TypescriptAnalyzer {
     alias_resolver: Arc<AliasResolver>,
 }
 
-impl JsTsAnalyzerHost for TypescriptAnalyzer {
+impl JsTsSource for TypescriptAnalyzer {
     fn alias_resolver(&self) -> &Arc<AliasResolver> {
         &self.alias_resolver
     }
 
-    fn js_ts_language(&self) -> Language {
+    fn language(&self) -> Language {
         Language::TypeScript
     }
 
-    fn js_ts_all_files(&self) -> Vec<ProjectFile> {
+    fn all_files(&self) -> Vec<ProjectFile> {
         self.inner.all_files()
     }
 
-    fn js_ts_bulk_import_infos(
-        &self,
-        files: &[ProjectFile],
-    ) -> HashMap<ProjectFile, Vec<ImportInfo>> {
+    fn bulk_import_infos(&self, files: &[ProjectFile]) -> HashMap<ProjectFile, Vec<ImportInfo>> {
         self.inner.bulk_import_infos(files.iter().cloned())
     }
 
-    fn js_ts_raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner.raw_supertypes_of(code_unit)
     }
 
-    fn js_ts_import_statements(&self, file: &ProjectFile) -> Vec<String> {
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
         self.inner.import_statements(file)
     }
 
-    fn js_ts_is_type_alias(&self, code_unit: &CodeUnit) -> bool {
+    fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
         self.inner.is_type_alias(code_unit)
     }
 
-    fn js_ts_raw_signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
+    fn raw_signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner.signatures_vec_of(code_unit)
     }
 
@@ -196,7 +193,7 @@ impl JsTsAnalyzerHost for TypescriptAnalyzer {
         self.inner.global_usage_definition_index_ref()
     }
 
-    fn js_ts_usage_index(
+    fn usage_index(
         &self,
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> Option<Arc<JsTsUsageIndex>> {
@@ -207,7 +204,7 @@ impl JsTsAnalyzerHost for TypescriptAnalyzer {
     }
 }
 
-impl JsTsMemoHost for TypescriptAnalyzer {
+impl JsTsMemoSource for TypescriptAnalyzer {
     fn memo_caches(&self) -> &JsTsMemoCaches {
         &self.memo_caches
     }
@@ -314,7 +311,7 @@ impl TypescriptAnalyzer {
 }
 
 impl ImportAnalysisProvider for TypescriptAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         providers::imported_code_units_of(self, file)
     }
 
@@ -337,7 +334,7 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         &self,
         file: &ProjectFile,
         imports: &[ImportInfo],
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Option<Arc<HashSet<CodeUnit>>> {
         providers::imported_code_units_from_infos(self, file, imports)
     }
 

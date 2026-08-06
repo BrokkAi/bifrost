@@ -30,8 +30,8 @@ pub(crate) enum JavaTypeResolution {
 }
 
 impl ImportAnalysisProvider for JavaAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
-        self.resolve_imports(file).values().cloned().collect()
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
+        Arc::new(self.resolve_imports(file).values().cloned().collect())
     }
 
     fn import_infos_for_files(
@@ -80,8 +80,10 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         &self,
         _file: &ProjectFile,
         imports: &[ImportInfo],
-    ) -> Option<HashSet<CodeUnit>> {
-        Some(self.resolve_import_infos(imports).into_values().collect())
+    ) -> Option<Arc<HashSet<CodeUnit>>> {
+        Some(Arc::new(
+            self.resolve_import_infos(imports).into_values().collect(),
+        ))
     }
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {

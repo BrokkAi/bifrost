@@ -346,7 +346,7 @@ mod tests {
     use brokk_bifrost_python::graph::extractor::{
         collect_scope_facts_from_parsed_source, with_callable_return_type_lookup_counter_for_test,
     };
-    use brokk_bifrost_python::graph_support::PythonAnalysisSource;
+    use brokk_bifrost_python::graph_support::PythonSource;
     use std::fs;
 
     /// The imported-factory return-type walk must read the analyzer's prepared

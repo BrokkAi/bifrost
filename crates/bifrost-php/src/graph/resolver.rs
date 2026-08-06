@@ -1,6 +1,6 @@
 use crate::aliases::{PhpFileContext, resolve_php_type};
 use crate::graph::PhpGraphSource;
-use crate::graph_support::PhpAnalysisSource;
+use crate::graph_support::PhpSource;
 use crate::graph_support::php_is_interface;
 use brokk_bifrost_core::analyzer::model::Range;
 pub use brokk_bifrost_core::analyzer::usages::common::node_text;
@@ -30,7 +30,7 @@ pub struct TargetSpec {
 }
 
 impl TargetSpec {
-    pub fn from_target(php: &dyn PhpAnalysisSource, target: &CodeUnit) -> Option<Self> {
+    pub fn from_target(php: &dyn PhpSource, target: &CodeUnit) -> Option<Self> {
         if target.is_class() {
             return Some(Self {
                 target: target.clone(),
@@ -81,7 +81,7 @@ pub struct PhpHierarchyIndex {
 }
 
 impl PhpHierarchyIndex {
-    pub fn for_target_owner(php: &dyn PhpAnalysisSource, spec: &TargetSpec) -> Self {
+    pub fn for_target_owner(php: &dyn PhpSource, spec: &TargetSpec) -> Self {
         let Some(owner) = spec.owner.as_ref() else {
             return Self::default();
         };
@@ -93,7 +93,7 @@ impl PhpHierarchyIndex {
         }
     }
 
-    fn is_subtype(&self, php: &dyn PhpAnalysisSource, receiver_fq_name: &str, owner: &str) -> bool {
+    fn is_subtype(&self, php: &dyn PhpSource, receiver_fq_name: &str, owner: &str) -> bool {
         if self.owner_fq_name.as_deref() != Some(owner) {
             return false;
         }
@@ -115,7 +115,7 @@ impl PhpHierarchyIndex {
 
     pub fn overriding_methods(
         &self,
-        php: &dyn PhpAnalysisSource,
+        php: &dyn PhpSource,
         spec: &TargetSpec,
         files: &HashSet<ProjectFile>,
         cancellation: Option<&CancellationToken>,
@@ -140,7 +140,7 @@ impl PhpHierarchyIndex {
 }
 
 fn class_is_subtype_of_owner(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     class_unit: &CodeUnit,
     owner_fq_name: &str,
 ) -> bool {
@@ -159,7 +159,7 @@ fn class_is_subtype_of_owner(
 }
 
 pub fn receiver_type_matches(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     receiver_fq_name: &str,
     owner: &str,
     hierarchy: &PhpHierarchyIndex,
@@ -172,7 +172,7 @@ pub fn receiver_type_matches(
 
 #[allow(clippy::too_many_arguments)]
 pub fn static_receiver_matches(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
     start: usize,
@@ -203,7 +203,7 @@ pub fn static_receiver_matches(
 
 #[allow(clippy::too_many_arguments)]
 pub fn receiver_is_enclosing_subtype(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     file: &ProjectFile,
     start: usize,

@@ -4,7 +4,7 @@
 //! Everything these methods call lives in [`brokk_bifrost_rust::graph_support`];
 //! the caches are moka and the analyzer type is analysis-owned, so the cells and
 //! their accessors cannot leave. `RustAnalyzer` implements
-//! [`brokk_bifrost_rust::brokk_bifrost_rust::graph_support::RustAnalysisSource`] out of exactly
+//! [`brokk_bifrost_rust::brokk_bifrost_rust::graph_support::RustSource`] out of exactly
 //! these accessors, which is how the free functions below reach back for the
 //! products they need without naming the analyzer.
 

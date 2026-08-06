@@ -173,7 +173,7 @@ fn test_import_provider_sees_top_level_members() {
 
     let imported: BTreeSet<_> = analyzer
         .imported_code_units_of(&consumer)
-        .into_iter()
+        .iter()
         .map(|unit| unit.fq_name())
         .collect();
     assert!(imported.contains("pkg.Service"));

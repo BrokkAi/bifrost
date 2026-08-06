@@ -1,4 +1,4 @@
-use crate::providers::JsTsAnalyzerHost;
+use crate::providers::JsTsSource;
 use crate::syntax::JsTsImportBinder;
 use crate::tsconfig::AliasResolver;
 use crate::type_text::{jsts_type_space_candidates, jsts_value_space_candidates};
@@ -511,7 +511,7 @@ pub fn extract_js_ts_call_receiver(reference: &str) -> Option<String> {
 
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_js_ts_module_binding_candidates(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     language: Language,
     file: &ProjectFile,
@@ -553,7 +553,7 @@ pub fn resolve_js_ts_module_binding_candidates(
 
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_js_ts_direct_import_candidates(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     language: Language,
     file: &ProjectFile,
@@ -591,13 +591,13 @@ pub fn resolve_js_ts_direct_import_candidates(
 }
 
 fn jsts_module_export_candidates(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     files: &[ProjectFile],
     exported_name: &str,
     value_position: bool,
 ) -> Vec<CodeUnit> {
-    let Some(index) = host.js_ts_usage_index(None) else {
+    let Some(index) = host.usage_index(None) else {
         return Vec::new();
     };
 

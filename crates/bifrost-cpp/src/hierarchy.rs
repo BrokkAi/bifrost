@@ -6,7 +6,7 @@
 //! `test-support` build counter; every decision they memoize is a function here.
 
 use crate::declarations::normalize_cpp_whitespace;
-use crate::graph_support::CppAnalysisSource;
+use crate::graph_support::CppSource;
 use crate::imports::{include_paths, resolve_include_targets_with_index};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
@@ -16,13 +16,10 @@ use brokk_bifrost_core::profiling;
 /// Every class-like or alias declaration reachable from `file` through its
 /// transitive `#include` closure, sorted and deduplicated.
 ///
-/// This is the builder behind [`CppAnalysisSource::visible_type_units`]; the
+/// This is the builder behind [`CppSource::visible_type_units`]; the
 /// analyzer memoizes the result per file and records the build for the
 /// `visible_type_units_build_count_for_test` counter before calling in.
-pub fn build_cpp_visible_type_units(
-    cpp: &dyn CppAnalysisSource,
-    file: &ProjectFile,
-) -> Vec<CodeUnit> {
+pub fn build_cpp_visible_type_units(cpp: &dyn CppSource, file: &ProjectFile) -> Vec<CodeUnit> {
     let _scope =
         profiling::scope_with(|| format!("cpp.visible_types.build[{}]", rel_path_string(file)));
     let include_targets = cpp.include_target_index();
@@ -69,17 +66,14 @@ pub fn build_cpp_visible_type_units(
 
 /// The direct base classes of `code_unit`, resolved through the include-visible
 /// class table and canonicalized past any type-alias hops.
-pub fn cpp_resolve_direct_ancestors(
-    cpp: &dyn CppAnalysisSource,
-    code_unit: &CodeUnit,
-) -> Vec<CodeUnit> {
+pub fn cpp_resolve_direct_ancestors(cpp: &dyn CppSource, code_unit: &CodeUnit) -> Vec<CodeUnit> {
     if !code_unit.is_class() || cpp.is_type_alias(code_unit) {
         return Vec::new();
     }
 
     let visible = cpp.visible_type_units(code_unit.source());
     let mut ancestors = Vec::new();
-    for raw in cpp.cpp_raw_supertypes_of(code_unit) {
+    for raw in cpp.raw_supertypes_of(code_unit) {
         if let Some(ancestor) = resolve_base_type(cpp, code_unit, &raw, &visible)
             && !ancestors.iter().any(|existing| existing == &ancestor)
         {
@@ -90,7 +84,7 @@ pub fn cpp_resolve_direct_ancestors(
 }
 
 fn resolve_base_type(
-    cpp: &dyn CppAnalysisSource,
+    cpp: &dyn CppSource,
     code_unit: &CodeUnit,
     raw: &str,
     visible: &[CodeUnit],
@@ -128,7 +122,7 @@ fn resolve_unqualified_base<'a>(
 }
 
 fn canonicalize_alias(
-    cpp: &dyn CppAnalysisSource,
+    cpp: &dyn CppSource,
     unit: &CodeUnit,
     visible: &[CodeUnit],
     seen: &mut HashSet<String>,

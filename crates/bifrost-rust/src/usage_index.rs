@@ -26,8 +26,8 @@ use tree_sitter::Node;
 use crate::cargo_routes::{RustCargoRouteIndex, RustCargoRouteKind, RustCargoTargetRelation};
 use crate::declarations::rust_package_name;
 use crate::graph_support::{
-    RustAnalysisSource, RustUsageSource, export_index_of_declarations,
-    is_external_module_declaration, is_rust_macro_export_declaration, is_rust_trait_declaration,
+    RustSource, RustUsageSource, export_index_of_declarations, is_external_module_declaration,
+    is_rust_macro_export_declaration, is_rust_trait_declaration,
     resolve_imported_export_from_binder_forward, rust_declaration_visibility,
     rust_module_files_from_path, rust_module_files_from_segments, rust_named_declaration_node,
     rust_value_constructor_visibilities,
@@ -92,7 +92,7 @@ pub enum RustReferenceNamespace {
 }
 
 impl RustSymbolNamespace {
-    fn of(rust: &dyn RustAnalysisSource, declaration: &CodeUnit) -> Option<Self> {
+    fn of(rust: &dyn RustSource, declaration: &CodeUnit) -> Option<Self> {
         if rust.is_type_alias(declaration) {
             return Some(Self::Type);
         }
@@ -319,7 +319,7 @@ pub struct RustPhysicalOwnerIndex {
 
 impl RustPhysicalOwnerIndex {
     fn build(
-        rust: &dyn RustAnalysisSource,
+        rust: &dyn RustSource,
         module_files: &RustModuleFiles,
         physical_roots: &HashMap<ProjectFile, ModuleKey>,
         declarations: &HashMap<CodeUnit, RustSymbolIdentity>,
@@ -756,7 +756,7 @@ impl RustModuleFiles {
 }
 
 fn build_macro_scope_edges(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     files: &[ProjectFile],
     module_files: &RustModuleFiles,
     physical_owners: &RustPhysicalOwnerIndex,
@@ -1106,7 +1106,7 @@ impl RustUsageIndex {
 
     fn declaration_owner_visible_to(
         &self,
-        rust: &dyn RustAnalysisSource,
+        rust: &dyn RustSource,
         identity: &RustSymbolIdentity,
         caller_file: &ProjectFile,
         caller_module: &ModuleKey,
@@ -1145,7 +1145,7 @@ impl RustUsageIndex {
 
     fn resolved_declaration_visible_to(
         &self,
-        rust: &dyn RustAnalysisSource,
+        rust: &dyn RustSource,
         identity: &RustSymbolIdentity,
         caller_file: &ProjectFile,
         caller_module: &ModuleKey,
@@ -1169,7 +1169,7 @@ impl RustUsageIndex {
 
     fn declaration_visible_at(
         &self,
-        rust: &dyn RustAnalysisSource,
+        rust: &dyn RustSource,
         declaration: &CodeUnit,
         caller_file: &ProjectFile,
         caller_byte: usize,
@@ -1217,13 +1217,13 @@ impl RustUsageIndex {
             && domain.contains_module(caller_module)
     }
 
-    pub fn build(rust: &dyn RustAnalysisSource, parallel: bool) -> Self {
+    pub fn build(rust: &dyn RustSource, parallel: bool) -> Self {
         Self::build_while(rust, parallel, &|| true)
             .expect("uninterrupted Rust usage-index construction")
     }
 
     pub fn build_while(
-        rust: &dyn RustAnalysisSource,
+        rust: &dyn RustSource,
         parallel: bool,
         keep_going: &(impl Fn() -> bool + Sync),
     ) -> Option<Self> {
@@ -1625,7 +1625,7 @@ impl RustUsageIndex {
 
     pub fn binding_seeds(
         &self,
-        rust: &dyn RustAnalysisSource,
+        rust: &dyn RustSource,
         roots: &BTreeSet<CodeUnit>,
     ) -> RustBindingSeeds {
         self.binding_seeds_while(rust, roots, &|| true)
@@ -1634,7 +1634,7 @@ impl RustUsageIndex {
 
     fn binding_seeds_while(
         &self,
-        rust: &dyn RustAnalysisSource,
+        rust: &dyn RustSource,
         roots: &BTreeSet<CodeUnit>,
         keep_going: &impl Fn() -> bool,
     ) -> Option<RustBindingSeeds> {

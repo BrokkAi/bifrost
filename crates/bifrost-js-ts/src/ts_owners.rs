@@ -11,9 +11,9 @@
 //! graph would otherwise have to import (issue: the js_ts crate extraction,
 //! Js-1b).
 //!
-//! Analyzer access is on [`JsTsAnalyzerHost`] wherever the cluster reaches a
+//! Analyzer access is on [`JsTsSource`] wherever the cluster reaches a
 //! JS/TS-only capability (the type-vs-value candidate spaces, which read
-//! `js_ts_is_type_alias`, and the import-candidate resolvers, which reach the
+//! `is_type_alias`, and the import-candidate resolvers, which reach the
 //! per-language usage index through the host's memo caches). The three helpers
 //! that only read declaration ranges take `&dyn CodeUnitIndex` instead, so their
 //! framework callers need no downcast at all.
@@ -21,7 +21,7 @@
 use crate::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
 };
-use crate::providers::JsTsAnalyzerHost;
+use crate::providers::JsTsSource;
 use crate::syntax::compute_import_binder as compute_jsts_import_binder;
 use crate::syntax::{JsTsImportBinder, parse_js_ts_tree};
 use crate::tsconfig::AliasResolver;
@@ -86,7 +86,7 @@ impl Drop for TsReceiverResolutionGuard<'_> {
 }
 
 pub fn jsts_member_candidates(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     receiver_candidates: Vec<CodeUnit>,
     member: &str,
@@ -129,7 +129,7 @@ pub fn ts_unwrap_expression(node: Node<'_>) -> Option<Node<'_>> {
 
 #[allow(clippy::too_many_arguments)]
 pub fn ts_receiver_owner_candidates_at_byte(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -155,7 +155,7 @@ pub fn ts_receiver_owner_candidates_at_byte(
 
 #[allow(clippy::too_many_arguments)]
 fn ts_receiver_owner_candidates_at_byte_with_resolution(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -224,7 +224,7 @@ pub fn jsts_enclosing_function_scope(root: Node<'_>, byte: usize) -> Option<Node
 
 #[allow(clippy::too_many_arguments)]
 fn ts_receiver_owners_from_parameters(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -294,7 +294,7 @@ fn ts_receiver_owners_from_parameters(
 
 #[allow(clippy::too_many_arguments)]
 fn ts_receiver_owners_from_contextual_callback(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -375,7 +375,7 @@ fn ts_callback_argument_context(scope: Node<'_>) -> Option<(Node<'_>, usize)> {
 }
 
 fn ts_callback_parameter_owners_from_callee(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     callee: &CodeUnit,
     argument_index: usize,
@@ -507,7 +507,7 @@ fn ts_split_top_level_commas(text: &str) -> Vec<&str> {
 
 #[allow(clippy::too_many_arguments)]
 fn ts_receiver_owners_from_local_bindings(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -543,7 +543,7 @@ fn ts_receiver_owners_from_local_bindings(
 
 #[allow(clippy::too_many_arguments)]
 fn ts_collect_receiver_owners_from_bindings(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -644,7 +644,7 @@ fn ts_collect_receiver_owners_from_bindings(
 
 #[allow(clippy::too_many_arguments)]
 fn ts_expression_property_owners(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -752,7 +752,7 @@ fn ts_expression_property_owners(
 
 #[allow(clippy::too_many_arguments)]
 pub fn jsts_constructor_owner_candidates(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     language: Language,
@@ -800,7 +800,7 @@ fn jsts_constructor_name<'a>(constructor: Node<'_>, source: &'a str) -> Option<&
 
 #[allow(clippy::too_many_arguments)]
 pub fn ts_call_expression_callees(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -871,7 +871,7 @@ pub fn ts_call_expression_callees(
 
 #[allow(clippy::too_many_arguments)]
 fn ts_expression_receiver_owners(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -928,7 +928,7 @@ pub fn root_node(mut node: Node<'_>) -> Node<'_> {
 
 #[allow(clippy::too_many_arguments)]
 fn ts_identifier_candidates(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -952,7 +952,7 @@ fn ts_identifier_candidates(
 
 #[allow(clippy::too_many_arguments)]
 pub fn jsts_identifier_candidates(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     language: Language,
     file: &ProjectFile,
@@ -989,7 +989,7 @@ pub fn jsts_identifier_candidates(
 
 #[allow(clippy::too_many_arguments)]
 pub fn ts_resolve_type_text_to_property_owners(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -1060,7 +1060,7 @@ pub fn ts_resolve_type_text_to_property_owners(
 }
 
 fn ts_expand_property_owners(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     candidates: Vec<CodeUnit>,
     depth: usize,
@@ -1111,7 +1111,7 @@ fn ts_expand_property_owners(
 }
 
 pub fn ts_expand_call_return_property_owners(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     callees: Vec<CodeUnit>,
     depth: usize,
@@ -1217,7 +1217,7 @@ fn jsts_indexed_callable_node(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn ts_resolve_type_from_unit_context(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     unit: &CodeUnit,
     type_text: &str,
@@ -1244,7 +1244,7 @@ fn ts_resolve_type_from_unit_context(
 }
 
 pub fn ts_function_return_property_owners(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     function: &CodeUnit,
     depth: usize,
@@ -1320,7 +1320,7 @@ pub fn ts_nodes_for_code_unit<'tree>(
 
 #[allow(clippy::too_many_arguments)]
 fn ts_collect_return_property_owners(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
@@ -1377,7 +1377,7 @@ fn ts_collect_return_property_owners(
 
 #[allow(clippy::too_many_arguments)]
 fn ts_field_signature_type_owners(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,

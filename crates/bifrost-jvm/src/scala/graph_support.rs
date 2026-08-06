@@ -5,7 +5,7 @@
 //! `IAnalyzer::update`/`update_all` rebuild the analyzer wholesale through
 //! `Self::from_inner`. What crosses the crate line is [`ScalaSource`], which is
 //! how a free function reaches back for a memoized product without naming the
-//! analyzer type -- the same idiom `RubySource` and `CppAnalysisSource` landed.
+//! analyzer type -- the same idiom `RubySource` and `CppSource` landed.
 //!
 //! [`ScalaSource::simple_type_knownness`] and [`ScalaSource::is_known_simple_term`]
 //! are load-bearing beyond their signature. Both answer "does the workspace know

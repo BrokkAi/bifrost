@@ -15,7 +15,7 @@ use crate::graph::hits::{
 };
 use crate::graph::resolver::*;
 use crate::graph::syntax::explicit_qualified_callable_value;
-use crate::graph_support::CppAnalysisSource;
+use crate::graph_support::CppSource;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
@@ -91,10 +91,7 @@ pub struct EnclosingContext {
     pub owner: Option<CodeUnit>,
 }
 
-pub fn prepare_file(
-    cpp: &dyn CppAnalysisSource,
-    file: &ProjectFile,
-) -> Option<Arc<PreparedSyntaxTree>> {
+pub fn prepare_file(cpp: &dyn CppSource, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>> {
     cpp.prepared_syntax(file)
 }
 

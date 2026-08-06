@@ -24,7 +24,7 @@
 //! # Where the analyzer stayed
 //!
 //! Where analysis code would reach for an analyzer handle, the functions here
-//! take [`providers::JsTsAnalyzerHost`] -- a core
+//! take [`providers::JsTsSource`] -- a core
 //! [`brokk_bifrost_core::analyzer::CodeUnitIndex`] plus the memoized JS/TS
 //! products the language logic resolves through. `analyzer/{js_ts, javascript,
 //! typescript}/` in `brokk-bifrost-analysis` keeps the shim: the two analyzer

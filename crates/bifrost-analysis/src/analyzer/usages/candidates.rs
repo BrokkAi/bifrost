@@ -694,8 +694,8 @@ mod tests {
     }
 
     impl ImportAnalysisProvider for FileEdgeProvider {
-        fn imported_code_units_of(&self, _file: &ProjectFile) -> HashSet<CodeUnit> {
-            HashSet::default()
+        fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
+            Arc::new(HashSet::default())
         }
 
         fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {
@@ -713,7 +713,7 @@ mod tests {
     }
 
     impl ImportAnalysisProvider for BatchedImportProvider {
-        fn imported_code_units_of(&self, _file: &ProjectFile) -> HashSet<CodeUnit> {
+        fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
             panic!("batched importer discovery must not hydrate individual import states");
         }
 
@@ -743,16 +743,16 @@ mod tests {
             &self,
             _file: &ProjectFile,
             _imports: &[ImportInfo],
-        ) -> Option<HashSet<CodeUnit>> {
-            Some([self.imported.clone()].into_iter().collect())
+        ) -> Option<Arc<HashSet<CodeUnit>>> {
+            Some(Arc::new([self.imported.clone()].into_iter().collect()))
         }
     }
 
     impl ImportAnalysisProvider for CancellingImportProvider {
-        fn imported_code_units_of(&self, _file: &ProjectFile) -> HashSet<CodeUnit> {
+        fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
             self.calls.fetch_add(1, Ordering::AcqRel);
             self.cancellation.cancel();
-            [self.imported.clone()].into_iter().collect()
+            Arc::new([self.imported.clone()].into_iter().collect())
         }
 
         fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {

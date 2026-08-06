@@ -35,7 +35,7 @@ tree-sitter-cpp = "0.23.4"
 default = []
 # Mirrors `brokk-bifrost-analysis`'s feature of the same name, chained exactly
 # like `brokk-bifrost-core`'s. C++ is the first fleet language to need it: the
-# `CppAnalysisSource` implementors on the analysis side record build counters
+# `CppSource` implementors on the analysis side record build counters
 # from production paths that moved here, so the counter hooks on the source
 # trait must be reachable across the crate boundary under the same gate.
 test-support = ["brokk-bifrost-core/test-support"]

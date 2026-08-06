@@ -2,7 +2,7 @@ use super::resolver::node_text;
 use crate::adapter::php_signature_return_type_text;
 use crate::aliases::{PhpFileContext, resolve_php_type};
 use crate::graph::PhpGraphSource;
-use crate::graph_support::PhpAnalysisSource;
+use crate::graph_support::PhpSource;
 use crate::graph_support::{php_direct_declared_class_parent, php_file_context_from_source};
 use brokk_bifrost_core::analyzer::CodeUnit;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
@@ -92,7 +92,7 @@ pub fn static_member_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
 /// so return-type inference for assignments follows the same owner semantics as
 /// the static call edge itself.
 pub fn static_scope_type_fq_name(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     raw: &str,
     ctx: &PhpFileContext,
@@ -129,7 +129,7 @@ pub fn static_property_identifier<'a>(node: Node<'_>, source: &'a str) -> Option
 }
 
 pub fn declared_field_type_fq_name(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     field: &CodeUnit,
 ) -> Option<String> {
@@ -141,7 +141,7 @@ pub fn declared_field_type_fq_name(
 }
 
 pub fn declared_callable_return_type_fq_name(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     callable: &CodeUnit,
 ) -> Option<String> {
@@ -157,7 +157,7 @@ pub fn declared_callable_return_type_fq_name(
 /// from their innermost receiver outward, and every step fails closed unless it
 /// has one structured declaration with a class return/type fact.
 pub fn instance_receiver_type_fq_name<F>(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     root: Node<'_>,
     source: &str,
@@ -271,7 +271,7 @@ where
 }
 
 pub fn declared_instance_callable(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     owner_fq_name: &str,
     member: &str,
@@ -280,7 +280,7 @@ pub fn declared_instance_callable(
 }
 
 pub fn declared_instance_field(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     owner_fq_name: &str,
     member: &str,
@@ -289,7 +289,7 @@ pub fn declared_instance_field(
 }
 
 fn declared_member(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     owner_fq_name: &str,
     member: &str,
@@ -359,7 +359,7 @@ fn indexed_declared_type_fq_name(analyzer: PhpGraphSource<'_>, unit: &CodeUnit) 
 }
 
 fn signature_declared_type_fq_name(
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     analyzer: PhpGraphSource<'_>,
     unit: &CodeUnit,
 ) -> Option<String> {

@@ -186,15 +186,22 @@ impl<'a> CSharpDefinitionProvider<'a> {
         }
     }
 
-    fn using_aliases(&self, file: &ProjectFile) -> HashMap<String, String> {
-        let aliases = match self.session {
-            Some(session) => session.query_limited_rows(|limit| {
-                self.csharp
-                    .using_aliases_of_limited(file, limit, || session.observe_cancellation())
-            }),
-            None => self.csharp.using_aliases_of(file).into_iter().collect(),
-        };
-        aliases.into_iter().collect()
+    fn using_aliases(&self, file: &ProjectFile) -> Arc<HashMap<String, String>> {
+        match self.session {
+            Some(session) => Arc::new(
+                session
+                    .query_limited_rows(|limit| {
+                        self.csharp.using_aliases_of_limited(file, limit, || {
+                            session.observe_cancellation()
+                        })
+                    })
+                    .into_iter()
+                    .collect(),
+            ),
+            // The analyzer's own memo cell already holds this map behind an
+            // `Arc`, so the unbudgeted path hands it straight back.
+            None => self.csharp.using_aliases_of(file),
+        }
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {

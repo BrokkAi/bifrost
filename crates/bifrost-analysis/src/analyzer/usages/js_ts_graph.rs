@@ -31,7 +31,7 @@ pub(in crate::analyzer::usages) use brokk_bifrost_js_ts::graph::resolver::{
 };
 pub(in crate::analyzer::usages) use brokk_bifrost_js_ts::syntax::compute_import_binder as compute_jsts_import_binder;
 
-use crate::analyzer::js_ts::providers::resolve_js_ts_host;
+use crate::analyzer::js_ts::providers::resolve_js_ts_source;
 use crate::analyzer::usages::common::analyzed_files_for_language;
 use crate::analyzer::usages::inverted_edges::{
     CallSite, JsTsScopedNodeStatus, JsTsScopedUsageEdges, UsageEdgeBuildOutput, UsageEdgeWeights,
@@ -53,7 +53,7 @@ use crate::hash::HashSet;
 use brokk_bifrost_js_ts::graph::resolver::{combine_jsts_usage_indices, target_language};
 use brokk_bifrost_js_ts::graph::{JsTsHosts, inverted};
 use brokk_bifrost_js_ts::parse::{js_ts_tree_sitter_language_for_file, tree_sitter_language_for};
-use brokk_bifrost_js_ts::providers::JsTsAnalyzerHost;
+use brokk_bifrost_js_ts::providers::JsTsSource;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -70,8 +70,8 @@ fn js_ts_hosts(analyzer: &dyn IAnalyzer) -> JsTsHosts<'_> {
         JS_TS_LANGUAGES
             .into_iter()
             .filter_map(|language| {
-                resolve_js_ts_host(analyzer, language)
-                    .map(|host| (language, host as &dyn JsTsAnalyzerHost))
+                resolve_js_ts_source(analyzer, language)
+                    .map(|host| (language, host as &dyn JsTsSource))
             })
             .collect(),
     )
@@ -103,14 +103,14 @@ where
 ///
 /// The downcasting half of the pair: framework callers that hold only a
 /// `&dyn IAnalyzer` (the definition trace, the dead-code pass, the edge builders)
-/// come through here. Everything already holding a `JsTsAnalyzerHost` calls
-/// `JsTsAnalyzerHost::js_ts_usage_index` directly.
+/// come through here. Everything already holding a `JsTsSource` calls
+/// `JsTsSource::usage_index` directly.
 pub(crate) fn cached_jsts_index(
     analyzer: &dyn IAnalyzer,
     language: Language,
     cancellation: Option<&CancellationToken>,
 ) -> Option<Arc<JsTsUsageIndex>> {
-    resolve_js_ts_host(analyzer, language)?.js_ts_usage_index(cancellation)
+    resolve_js_ts_source(analyzer, language)?.usage_index(cancellation)
 }
 
 pub(in crate::analyzer::usages) fn prewarm_cached_jsts_index(
@@ -158,10 +158,8 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
         }
 
         let cancellation = scan_scope.cancellation();
-        let index = resolve_js_ts_host(analyzer, language).and_then(|host| {
-            host.js_ts_usage_index(cancellation)
-                .map(|index| (host, index))
-        });
+        let index = resolve_js_ts_source(analyzer, language)
+            .and_then(|host| host.usage_index(cancellation).map(|index| (host, index)));
         let Some((host, index)) = index else {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());

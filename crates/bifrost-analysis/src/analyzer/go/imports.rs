@@ -20,21 +20,21 @@ use std::sync::Arc;
 use super::GoAnalyzer;
 
 impl ImportAnalysisProvider for GoAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         if let Some(cached) = self.memo_caches.imported_code_units.get(file) {
-            return (*cached).clone();
+            return cached;
         }
 
-        let resolved = go_imported_code_units_of(
+        let resolved = Arc::new(go_imported_code_units_of(
             &self.inner,
             &self.import_tables(),
             file,
             &self.inner.import_info_of(file),
-        );
+        ));
 
         self.memo_caches
             .imported_code_units
-            .insert(file.clone(), Arc::new(resolved.clone()));
+            .insert(file.clone(), Arc::clone(&resolved));
         resolved
     }
 
@@ -108,7 +108,7 @@ impl ImportAnalysisProvider for GoAnalyzer {
             target_pkg.as_deref() == Some(path.as_str()) || dir_suffix_matches(target, &path)
         }) || self
             .imported_code_units_of(source_file)
-            .into_iter()
+            .iter()
             .any(|code_unit| code_unit.source() == target)
     }
 }

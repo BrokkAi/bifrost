@@ -39,7 +39,7 @@ use crate::aliases::{
     PhpFileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
 };
 use crate::graph::PhpGraphSource;
-use crate::graph_support::PhpAnalysisSource;
+use crate::graph_support::PhpSource;
 use crate::graph_support::php_file_context_from_source;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
@@ -59,7 +59,7 @@ use tree_sitter::Node;
 /// rather than the workspace size (#200).
 pub fn scan_php_file(
     analyzer: PhpGraphSource<'_>,
-    php: &dyn PhpAnalysisSource,
+    php: &dyn PhpSource,
     file: &ProjectFile,
     input: &FileEdgeScanInput<'_>,
 ) -> PerFileEdges {
@@ -80,7 +80,7 @@ pub fn scan_php_file(
 
 struct PhpScan<'a> {
     analyzer: PhpGraphSource<'a>,
-    php: &'a dyn PhpAnalysisSource,
+    php: &'a dyn PhpSource,
     ctx: PhpFileContext,
     source: &'a str,
     class_ranges: ClassRangeIndex,

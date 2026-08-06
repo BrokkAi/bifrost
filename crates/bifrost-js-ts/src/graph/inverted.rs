@@ -22,7 +22,7 @@ use super::receiver_analysis::JsTsReceiverFactProvider;
 use super::resolver::{
     JsTsUsageIndex, browser_global_property_shape, unbound_browser_global_property,
 };
-use crate::providers::JsTsAnalyzerHost;
+use crate::providers::JsTsSource;
 use crate::syntax::{
     JsTsLexicalBindingIndex, compute_import_binder, is_declaration_identifier,
     is_lexically_nested_type_declaration, is_object_in_member_expression,
@@ -56,7 +56,7 @@ use tree_sitter::Node;
 /// file's declaration set is the same one the pre-extraction scan read; `host`
 /// is the JS/TS analyzer for `language`.
 pub fn scan_file(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     declarations_index: &dyn CodeUnitIndex,
     language: Language,
     file: &ProjectFile,
@@ -185,7 +185,7 @@ pub fn prepare_scoped_file(
 /// fan-out stays on the analysis side.
 #[allow(clippy::too_many_arguments)]
 pub fn scan_scoped_file(
-    host: &dyn JsTsAnalyzerHost,
+    host: &dyn JsTsSource,
     index: &JsTsUsageIndex,
     prep: &ScopedScanPrep,
     file_prep: ScopedFilePrep,

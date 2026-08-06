@@ -90,7 +90,7 @@ pub fn collect_kotlin_semantic_diagnostics(
     }
 
     let line_starts = compute_line_starts(source);
-    let package_name = kotlin.kotlin_package_name_of(file).unwrap_or_default();
+    let package_name = kotlin.package_name_of(file).unwrap_or_default();
     let imports = kotlin.import_info_of(file);
     let mut collector = KotlinDiagnosticCollector {
         owners,

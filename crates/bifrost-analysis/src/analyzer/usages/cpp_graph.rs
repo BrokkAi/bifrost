@@ -32,7 +32,7 @@ use crate::hash::HashSet;
 pub(in crate::analyzer::usages) use brokk_bifrost_cpp::call_match::cpp_split_top_level_commas;
 use brokk_bifrost_cpp::graph::resolver::{TargetKind, TargetSpec};
 use brokk_bifrost_cpp::graph::{CppGraphSource, CppWorkspaceSource};
-use brokk_bifrost_cpp::graph_support::CppAnalysisSource;
+use brokk_bifrost_cpp::graph_support::CppSource;
 
 pub(in crate::analyzer::usages) use brokk_bifrost_cpp::graph::extractor::{
     BareCallTargetResolution as CppBareCallTargetResolution,
@@ -88,7 +88,7 @@ impl<'a> CppDispatch<'a> {
     pub(in crate::analyzer::usages) fn source(&self) -> CppGraphSource<'_> {
         CppGraphSource {
             index: self.analyzer,
-            cpp: self.cpp.map(|cpp| cpp as &dyn CppAnalysisSource),
+            cpp: self.cpp.map(|cpp| cpp as &dyn CppSource),
             aliases: self.analyzer.type_alias_provider(),
             hierarchy: self.analyzer.type_hierarchy_provider(),
             workspace: self,

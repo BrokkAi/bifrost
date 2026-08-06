@@ -101,7 +101,7 @@ end
             ProjectFile::new(analyzer.project().root().to_path_buf(), "app/repository.rb");
         let imported: Vec<_> = analyzer
             .imported_code_units_of(&repository_file)
-            .into_iter()
+            .iter()
             .map(|unit| unit.fq_name())
             .collect();
         assert!(

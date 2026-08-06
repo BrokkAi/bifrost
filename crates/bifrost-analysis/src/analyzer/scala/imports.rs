@@ -251,12 +251,12 @@ impl ScalaAnalyzer {
 }
 
 impl ImportAnalysisProvider for ScalaAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         if let Some(cached) = self.imported_code_units.get(file) {
-            return (*cached).clone();
+            return cached;
         }
         if file_language(file) != Language::Scala {
-            return HashSet::default();
+            return Arc::new(HashSet::default());
         }
         let imports = self.inner.import_info_of(file);
         let wildcard_environment = self.wildcard_import_environment(file, &imports);
@@ -268,8 +268,9 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
                 imported.insert(code_unit);
             }
         }
+        let imported = Arc::new(imported);
         self.imported_code_units
-            .insert(file.clone(), Arc::new(imported.clone()));
+            .insert(file.clone(), Arc::clone(&imported));
         imported
     }
 

@@ -11,7 +11,7 @@ use crate::graph::resolver::{
     receiver_annotation_matches_target, resolve_constructor_types, resolve_receiver_type,
     target_owner_code_unit, top_level_identifier,
 };
-use crate::graph_support::{PythonAnalysisSource, PythonUsageSource};
+use crate::graph_support::{PythonSource, PythonUsageSource};
 use crate::imports::resolve_fqn_candidates;
 use crate::usage_index::{
     ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
@@ -1879,7 +1879,7 @@ fn collect_imported_factory_return_types(
 
 fn collect_imported_class_method_return_types(
     graph: &PythonGraphSource<'_>,
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     local_class_name: &str,
     class_unit: &CodeUnit,
     factory_return_types: &mut HashMap<String, String>,
@@ -1899,7 +1899,7 @@ fn collect_imported_class_method_return_types(
 
 fn callable_return_type_name(
     graph: &PythonGraphSource<'_>,
-    python: &dyn PythonAnalysisSource,
+    python: &dyn PythonSource,
     callable: &CodeUnit,
 ) -> Option<String> {
     // The analyzer's already-parsed whole-file tree when it has one. This runs

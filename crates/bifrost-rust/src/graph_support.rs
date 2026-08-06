@@ -34,7 +34,7 @@ use crate::usage_index::{RustUsageIndex, exported_targets_from_files};
 /// The usage index is deliberately absent: [`RustUsageIndex::build`] and
 /// everything it calls take this trait, so the build cannot re-enter the cell it
 /// is filling. Code that runs once the index exists takes [`RustUsageSource`].
-pub trait RustAnalysisSource:
+pub trait RustSource:
     CodeUnitIndex + ImportAnalysisProvider + TypeAliasProvider + TypeHierarchyProvider
 {
     /// The same index this trait already extends, for handing to the free
@@ -67,9 +67,9 @@ pub trait RustAnalysisSource:
     fn note_module_file_resolution(&self);
 }
 
-/// [`RustAnalysisSource`] plus the built usage index. Everything reached from
+/// [`RustSource`] plus the built usage index. Everything reached from
 /// the inverted export walk needs it; the index build itself must not.
-pub trait RustUsageSource: RustAnalysisSource {
+pub trait RustUsageSource: RustSource {
     fn usage_index(&self) -> Arc<RustUsageIndex>;
 
     /// [`Self::usage_index`], abandoning a cold build when `keep_going` stops
@@ -405,7 +405,7 @@ pub fn resolve_visible_import_targets_forward(
 }
 
 pub fn export_index_of_declarations(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     file: &ProjectFile,
     declarations: &BTreeSet<CodeUnit>,
 ) -> ExportIndex {
@@ -579,7 +579,7 @@ pub fn resolve_imported_export_from_binder(
 /// the inverted usage-graph builder can turn `(module_specifier, name)` into a
 /// callee fqn without re-deriving the path arithmetic.
 pub fn resolve_module_package(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     importing_file: &ProjectFile,
     module_specifier: &str,
 ) -> Option<String> {
@@ -925,7 +925,7 @@ fn insert_reexport_reference_bindings(
 }
 
 fn collect_export_names_from_files(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     module_files: &[ProjectFile],
     visited: &mut HashSet<ProjectFile>,
     names: &mut HashSet<String>,
@@ -951,7 +951,7 @@ fn collect_export_names_from_files(
 }
 
 pub fn forward_exported_targets_from_files(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     module_files: &[ProjectFile],
     export_name: &str,
 ) -> BTreeSet<(ProjectFile, String)> {
@@ -960,7 +960,7 @@ pub fn forward_exported_targets_from_files(
 }
 
 fn forward_exported_targets_from_files_with_progress(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     module_files: &[ProjectFile],
     export_name: &str,
     progress: &dyn Fn() -> bool,
@@ -1032,7 +1032,7 @@ fn forward_exported_targets_from_files_with_progress(
 }
 
 pub fn rust_member_reexport_targets(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     file: &ProjectFile,
     owner_path: &str,
     member_name: &str,
@@ -1058,7 +1058,7 @@ pub fn rust_member_reexport_targets(
 /// otherwise the alias root is unknown and draws a false "not indexed"
 /// boundary even though the crate is in the workspace (issue #1089).
 pub fn rust_apply_import_alias(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     importing_file: &ProjectFile,
     module_specifier: &str,
 ) -> Option<String> {
@@ -1088,7 +1088,7 @@ pub fn rust_apply_import_alias(
 }
 
 pub fn resolve_module_files(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     importing_file: &ProjectFile,
     module_specifier: &str,
 ) -> Vec<ProjectFile> {
@@ -1182,7 +1182,7 @@ pub fn exact_member(
 }
 
 pub fn rust_usage_candidate_files(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     export_names: HashSet<String>,
     target: &CodeUnit,
 ) -> HashSet<ProjectFile> {
@@ -1205,7 +1205,7 @@ pub fn rust_usage_candidate_files(
 }
 
 pub fn trait_implementer_names(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     trait_owner: &CodeUnit,
     _importer_file: &ProjectFile,
 ) -> HashSet<String> {
@@ -1224,7 +1224,7 @@ pub fn trait_implementer_names(
 }
 
 pub fn rust_trait_member_implementations(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     trait_member: &CodeUnit,
 ) -> Option<Vec<CodeUnit>> {
     let trait_owner = rust.parent_of(trait_member)?;
@@ -1336,10 +1336,7 @@ pub fn is_rust_public_like_declaration(index: &dyn CodeUnitIndex, code_unit: &Co
     })
 }
 
-pub fn rust_declaration_visibility(
-    rust: &dyn RustAnalysisSource,
-    code_unit: &CodeUnit,
-) -> RustVisibility {
+pub fn rust_declaration_visibility(rust: &dyn RustSource, code_unit: &CodeUnit) -> RustVisibility {
     let Some(prepared) = rust.prepared_syntax(code_unit.source()) else {
         return RustVisibility::Private;
     };
@@ -1446,7 +1443,7 @@ pub fn is_visible_module_path(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -
 /// Reads the cached prepared syntax rather than `rust_declaration_node_is`'s
 /// own read-and-parse: `resolve_module_files` asks this per resolution, and
 /// #1230 made that path per-call cheap.
-pub fn is_external_module_declaration(rust: &dyn RustAnalysisSource, code_unit: &CodeUnit) -> bool {
+pub fn is_external_module_declaration(rust: &dyn RustSource, code_unit: &CodeUnit) -> bool {
     if !code_unit.is_module() {
         return false;
     }
@@ -1610,7 +1607,7 @@ enum RustTraitMemberKind {
 }
 
 fn rust_trait_member_kind(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     trait_member: &CodeUnit,
 ) -> Option<RustTraitMemberKind> {
     if trait_member.is_function() {
@@ -1815,7 +1812,7 @@ fn named_descendants_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'
 }
 
 fn trait_implementer_names_from_source(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     trait_owner: &CodeUnit,
     impl_file: &ProjectFile,
     source: &str,
@@ -1839,7 +1836,7 @@ fn trait_implementer_names_from_source(
 
 fn collect_trait_implementer_names(
     node: Node<'_>,
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     trait_owner: &CodeUnit,
     impl_file: &ProjectFile,
     source: &str,
@@ -1904,7 +1901,7 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 }
 
 fn trait_reference_matches(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     trait_owner: &CodeUnit,
     impl_file: &ProjectFile,
     trait_ref: &str,
@@ -1933,7 +1930,7 @@ fn trait_reference_matches(
 }
 
 pub fn resolve_direct_import_files(
-    rust: &dyn RustAnalysisSource,
+    rust: &dyn RustSource,
     importing_file: &ProjectFile,
     segments: &[String],
 ) -> Vec<ProjectFile> {

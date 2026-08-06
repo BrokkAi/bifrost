@@ -342,11 +342,19 @@ fn suffix_resolution_from_index(
     {
         return Some(CodeUnitResolution::Resolved(matches));
     }
-    if let Some(CodeUnitResolution::Resolved(matches)) =
-        unique_resolution_from_matches(analyzer, exact_suffix_matches, include)
-    {
-        return Some(CodeUnitResolution::Resolved(matches));
-    }
+    // Only a *full* stage-1 match may short-circuit. A lone stage-1 suffix
+    // match is not evidence that the query resolves uniquely: this stage
+    // enumerates through `lookup_candidates_by_short_name`, which the
+    // `CodeUnitIndex` contract defines as best-effort ("Implementations return
+    // an empty set when they cannot answer this cheaply; callers retain their
+    // broader lookup path then"). The pattern stage below is the authority on
+    // which declarations a suffix query reaches, and it reaches strictly more
+    // of them, because `suffix_search_pattern` treats `$` as a path delimiter
+    // and lets Go's module-scope segment be skipped. Returning the lone
+    // short-name hit early therefore turned missing recall into a confident
+    // wrong answer: `pkg.Foo$Bar` lost its full-match precedence to
+    // `pkg.Foo.Bar`, and a genuinely ambiguous `pkg.Name` collapsed onto
+    // whichever package the short-name index happened to hold (#1739).
 
     drop(stage1_scope);
 
