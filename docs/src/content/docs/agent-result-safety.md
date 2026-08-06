@@ -20,7 +20,7 @@ Never claim **all** or **none** unless every relevant check below passes:
 | Proof tier | The claim distinguishes `proven` from `unproven` graph edges | Describe unproven rows as possible candidates or exclude them explicitly. |
 | Provenance | Every result used for a path claim has `provenance_truncated != true` | Cite the retained paths only; do not claim every derivation is present. |
 | Receiver outcome | Every `receiver_analysis` row used by the claim has the required `outcome`; unsupported/budget rows and candidate truncation are absent | Preserve unknown/unsupported/ambiguous states, narrow the query, or avoid the claim. |
-| Analysis boundary | The claim stays within supported structural/graph analysis or a configured query-local typestate policy; it does not require unsupported whole-program points-to, general alias sets, taint evaluation, or unmodeled flow semantics | Restate the narrower fact, inspect typestate completeness/uncertainty, or use another analyzer. |
+| Analysis boundary | The claim stays within supported structural/graph analysis or an explicitly configured value-flow, taint, or typestate analysis; it does not require path feasibility, complete whole-program points-to, general alias sets, or unmodeled flow semantics | Restate the narrower fact, inspect analysis completeness/uncertainty, or use another analyzer. |
 
 An empty `results` array is only a zero-result inside the query's actual workspace, language/path filters, supported capabilities, and execution budgets. It is never proof about files outside the index, unindexed external declarations, unsupported syntax roles, or possible runtime behavior that static resolution does not model.
 
@@ -42,6 +42,8 @@ An empty `results` array is only a zero-result inside the query's actual workspa
 | Inconclusive (including cancellation), unsupported, or failed policy run | “The report retained these findings, but cannot establish a complete result for the reported reason.” | “The policy passed.” |
 | Endpoint selector match | “This site matched the reusable source/sink endpoint definition.” | “This endpoint emitted a vulnerability.” |
 | Source and sink endpoint co-presence | “Both endpoint candidates occur in the analyzed scope.” | “The source can reach the sink.” |
+| Complete reached flow endpoint or taint meeting | “The configured analysis found this source-to-sink flow with the retained witness.” | “Every feasible runtime path carries this value.” |
+| Inconclusive flow endpoint or taint run | “Bifrost retained this bounded evidence but could not complete the configured analysis.” | “No flow exists.” |
 
 Prefer “returned,” “indexed,” “resolved,” and “within this scope” when they describe the actual evidence. Reserve “all” for a bounded response that passed every decision-rule check, and even then name the boundary: for example, “all analyzer-resolved proven callers returned for this indexed workspace and query.”
 
@@ -72,8 +74,8 @@ Reusable policy endpoints are another deliberate separation. An `(endpoint
 binding. Loading it as a dependency creates no policy run or finding, and
 passing it as an executable policy root fails visibly. A source endpoint and a
 sink endpoint both matching says only that both candidates are present. The
-phrase “can reach” requires an actual compatible taint meeting from the future
-#824 compiler/adapter; match co-presence is never a reachability fallback.
+phrase “can reach” requires an actual compatible meeting from the production
+taint evaluator; match co-presence is never a reachability fallback.
 
 ## Treat Proof As Per-Edge Evidence
 

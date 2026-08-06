@@ -57,10 +57,11 @@ A saved query may select planning-only explain or measured profile mode with `(e
 
 ## Static-Analysis Policies
 
-> **Current execution boundary:** Policy execution supports analyses with
-> `:type match` and `:type typestate`. Taint-analysis policies can be parsed,
-> validated, and composed, but taint evaluation is not implemented yet.
-> Running taint reports `unsupported` and exits with status 2.
+> **Current execution boundary:** Policy execution supports `:type match`,
+> `:type taint`, `:type typestate`, and `:type assertion`. Taint compiles
+> compatible source and sink sets into bounded shared solves. Missing bindings,
+> unsupported semantics, cancellation, or exhausted budgets remain non-clean
+> completion states rather than empty successful results.
 
 Run one or more workspace-relative `.rqlp` policy roots and emit one combined
 canonical report:
@@ -174,14 +175,18 @@ run. `--require-explicit-schema-versions` rejects compatible inference for the
 root and every loaded endpoint or RQL dependency. Omitted versions otherwise
 select only the newest compiled-in compatible lineage.
 
-`match` and query-local `typestate` evaluation are available now. Typestate
+`match`, `taint`, query-local `typestate`, and `assertion` evaluation are
+available now. Typestate
 compiles resolved subject/event selectors into the semantic protocol engine and
 preserves finding identity, locations, witnesses, and completeness across all
-three report formats. `taint` policies still emit an `unsupported` completion
-and exit 2 until the remaining [#824](https://github.com/BrokkAi/bifrost/issues/824)
-flow adapter lands. See [Static-Analysis
-Policies](/static-analysis-policies/) for syntax, endpoint composition,
-completeness, finding identity, and CVSS rules.
+three report formats. Taint resolves typed endpoint bindings, batches compatible
+source/sink demand, runs the production data-flow engine, and projects one
+retained report. Source-backed analysis works in the ordinary CLI; external
+procedure summaries require an embedding that supplies an explicit
+semantic-model catalog and activation request. See [Data Flow, Taint, and
+Typestate](/data-flow-and-typestate/) and [Static-Analysis
+Policies](/static-analysis-policies/) for execution boundaries, endpoint
+composition, completeness, finding identity, and CVSS rules.
 
 For the available tool families and tool names, see [MCP Server](../mcp/). For a single tool's description and parameters, ask the CLI directly:
 

@@ -2,6 +2,7 @@ mod adapter;
 mod cache;
 mod cargo_routes;
 mod clones;
+mod crate_naming;
 mod declarations;
 mod dependency_discovery;
 mod diagnostics;

@@ -4583,7 +4583,7 @@ mod tests {
         "{value}"
     );
     assert_eq!(
-        result["definitions"][0]["fqn"], "tokio-test.src.task",
+        result["definitions"][0]["fqn"], "tokio_test.task",
         "{value}"
     );
 }
@@ -4691,7 +4691,7 @@ fn run() {
         "{value}"
     );
     assert_eq!(
-        result["definitions"][0]["fqn"], "examples.shared",
+        result["definitions"][0]["fqn"], "examples.examples.first.shared",
         "{value}"
     );
     assert_eq!(
@@ -5521,12 +5521,12 @@ fn imports() {
     for (needle, expected_fqn, expected_path) in [
         (
             "error::GritResult",
-            "grit-util.src.error",
+            "grit_util.error",
             "grit-util/src/lib.rs",
         ),
         (
             "Auth, Other",
-            "grit-util.src.auth.Auth",
+            "grit_util.auth.Auth",
             "grit-util/src/auth.rs",
         ),
     ] {
@@ -5570,7 +5570,7 @@ fn imports() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "grit-util.src.error",
+        result["definitions"][0]["fqn"], "grit_util.error",
         "{value}"
     );
     assert_eq!(
@@ -5603,7 +5603,10 @@ fn rust_focused_reexport_module_segment_does_not_collapse_to_terminal_function()
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["kind"], "module", "{value}");
     assert_eq!(result["definitions"][0]["path"], "src/lib.rs", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "copy", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "focused_use.copy",
+        "{value}"
+    );
 }
 
 #[test]
@@ -6018,10 +6021,7 @@ mod child {
             result["definitions"][0]["path"], "app/src/lib.rs",
             "{value}"
         );
-        assert_eq!(
-            result["definitions"][0]["fqn"], "app.src.toml_edit",
-            "{value}"
-        );
+        assert_eq!(result["definitions"][0]["fqn"], "app.toml_edit", "{value}");
     }
 
     let legacy_root = legacy
@@ -6113,7 +6113,7 @@ mod test {
     );
     assert_eq!(result["definitions"][0]["kind"], "module", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "non_blocking.test",
+        result["definitions"][0]["fqn"], "appender.non_blocking.test",
         "{value}"
     );
 
@@ -6133,7 +6133,10 @@ mod test {
     );
     assert_eq!(result["definitions"][0]["path"], "src/lib.rs", "{value}");
     assert_eq!(result["definitions"][0]["kind"], "module", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "non_blocking", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "appender.non_blocking",
+        "{value}"
+    );
 }
 
 #[test]
@@ -6170,7 +6173,10 @@ fn consume(_: types::Item) {}
         Some(1),
         "{value}"
     );
-    assert_eq!(result["definitions"][0]["fqn"], "types.Item", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "namespace_expansion.types.Item",
+        "{value}"
+    );
     assert_eq!(result["definitions"][0]["kind"], "class", "{value}");
 }
 
@@ -6380,17 +6386,17 @@ pub enum ListStyleType {
     for (start, expected_fqn, expected_kind) in [
         (
             main.find("-> Self").expect("bare Self return type") + "-> ".len(),
-            "parser.options.ListStyleType",
+            "comrak.parser.options.ListStyleType",
             "class",
         ),
         (
             main.find("Self::Plus").expect("associated owner"),
-            "parser.options.ListStyleType",
+            "comrak.parser.options.ListStyleType",
             "class",
         ),
         (
             main.find("Self::Plus").expect("associated item") + "Self::".len(),
-            "parser.options.ListStyleType.Plus",
+            "comrak.parser.options.ListStyleType.Plus",
             "field",
         ),
     ] {
@@ -6676,10 +6682,10 @@ impl Service for Svc {
     let reference = first.rfind("Self::Future").expect("Self associated type");
 
     for (start, fqn, kind) in [
-        (reference, "examples.examples.Svc", "class"),
+        (reference, "examples.examples.first.Svc", "class"),
         (
             reference + "Self::".len(),
-            "examples.examples.Svc.Future",
+            "examples.examples.first.Svc.Future",
             "field",
         ),
     ] {
@@ -6749,7 +6755,7 @@ impl Service for &[SocketAddr] {
         "{value}"
     );
     assert_eq!(
-        result["definitions"][0]["fqn"], "SocketAddr.Future",
+        result["definitions"][0]["fqn"], "self_impl_identity.SocketAddr.Future",
         "{value}"
     );
     assert_eq!(
@@ -7100,7 +7106,7 @@ mod child {
 
     assert_eq!(value["results"][0]["status"], "resolved", "{value}");
     assert_eq!(
-        value["results"][0]["definitions"][0]["fqn"], "child.Local.name",
+        value["results"][0]["definitions"][0]["fqn"], "app.child.Local.name",
         "{value}"
     );
 }
@@ -7139,7 +7145,7 @@ mod child {
 
     assert_eq!(value["results"][0]["status"], "resolved", "{value}");
     assert_eq!(
-        value["results"][0]["definitions"][0]["fqn"], "child.Local.name",
+        value["results"][0]["definitions"][0]["fqn"], "app.child.Local.name",
         "{value}"
     );
 }
@@ -7180,7 +7186,7 @@ use crate::hidden::Hidden;
 
     assert_eq!(value["results"][0]["status"], "resolved", "{value}");
     assert_eq!(
-        value["results"][0]["definitions"][0]["fqn"], "hidden.Hidden.name",
+        value["results"][0]["definitions"][0]["fqn"], "app.hidden.Hidden.name",
         "{value}"
     );
 }
@@ -7223,7 +7229,8 @@ fn run() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "route.RouteCheapnessEstimate.input_price_per_mtok_micros",
+        result["definitions"][0]["fqn"],
+        "app.route.RouteCheapnessEstimate.input_price_per_mtok_micros",
         "{value}"
     );
 }
@@ -7448,7 +7455,7 @@ fn fit_to_json(fit: &ModelFit) {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "fit.ModelFit.model",
+        result["definitions"][0]["fqn"], "app.fit.ModelFit.model",
         "{value}"
     );
 }
@@ -7487,7 +7494,7 @@ pub struct Service {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "models.MemoryRepository",
+        result["definitions"][0]["fqn"], "app.models.MemoryRepository",
         "{value}"
     );
 }
@@ -7526,7 +7533,7 @@ pub fn build() -> MemoryRepository {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "models.MemoryRepository",
+        result["definitions"][0]["fqn"], "app.models.MemoryRepository",
         "{value}"
     );
 }
@@ -7589,7 +7596,7 @@ pub struct MemoryRepository {
         let result = &value["results"][0];
         assert_eq!(result["status"], "resolved", "{value}");
         assert_eq!(
-            result["definitions"][0]["fqn"], "models.MemoryRepository.name",
+            result["definitions"][0]["fqn"], "app.models.MemoryRepository.name",
             "{value}"
         );
     }
@@ -8407,7 +8414,7 @@ pub fn build_service(repository: MemoryRepository) -> Service {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "service.Service.execute",
+        result["definitions"][0]["fqn"], "app.service.Service.execute",
         "{value}"
     );
     assert_eq!(
@@ -9805,8 +9812,10 @@ mod edit {
             );
             assert_eq!(result["definitions"][0]["path"], path, "{value}");
             assert_eq!(result["definitions"][0]["kind"], "field", "{value}");
+            let stem = path.trim_start_matches("benches/").trim_end_matches(".rs");
             assert_eq!(
-                result["definitions"][0]["fqn"], "benches._module_.NUM_ENTRIES",
+                result["definitions"][0]["fqn"],
+                format!("demo.benches.{stem}._module_.NUM_ENTRIES"),
                 "{value}"
             );
         }
@@ -9845,8 +9854,10 @@ fn run() {
         );
         assert_eq!(result["definitions"][0]["path"], path, "{value}");
         assert_eq!(result["definitions"][0]["kind"], "module", "{value}");
+        let stem = path.trim_start_matches("examples/").trim_end_matches(".rs");
         assert_eq!(
-            result["definitions"][0]["fqn"], "examples.yak_shave",
+            result["definitions"][0]["fqn"],
+            format!("demo.examples.{stem}.yak_shave"),
             "{value}"
         );
     }

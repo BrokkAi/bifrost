@@ -36,8 +36,8 @@ use crate::analyzer::structural::materialization::{
 };
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, CppTemplateMetadata, ImportInfo, Language, ProjectFile, QueryBatch,
-    Range, RubyMethodDispatchMode, SignatureMetadata, SummaryFileProjection,
+    CodeUnit, CodeUnitType, CppTemplateMetadata, ImportInfo, Language, PackageAnchor, ProjectFile,
+    QueryBatch, Range, RubyMethodDispatchMode, SignatureMetadata, SummaryFileProjection,
 };
 use crate::gitblob;
 use crate::hash::{HashMap, HashSet, set_with_capacity};
@@ -8140,14 +8140,34 @@ fn serialize_blob<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
 
 const FQ_SEGMENTS_MAGIC: &[u8; 4] = b"FQ2\0";
 const FQ_SEGMENTS_FULL: u8 = 0;
-const FQ_SEGMENTS_PATH_TAIL: u8 = 1;
+const FQ_SEGMENTS_OWN_MODULE: u8 = 1;
+const FQ_SEGMENTS_CRATE_ROOT: u8 = 2;
 const FQ_SEGMENTS_HEADER_LEN: usize = 9;
 
-/// Persist one structured declaration identity. Content-derived packages are
-/// stored in full. When a package depends on the live path, only the
-/// content-stable declaration tail is stored so one content-addressed blob can
-/// still be mounted at multiple paths; the adapter recreates that prefix from
-/// the live `ProjectFile` without parsing a rendered name.
+/// Pack the mode-dependent u32 header field for an anchored row.
+///
+/// Mode `FULL` reads that field as an absolute package segment count. The
+/// anchored modes read it as `{u16 boundary_in_tail, u8 pop, u8 reserved}`,
+/// little endian. Rows written before anchors existed always stored a literal
+/// `0`, which decodes as `boundary_in_tail = 0, pop = 0` — exactly the
+/// semantics they were written with, so they hydrate unchanged and their
+/// languages need no epoch bump.
+fn pack_anchored_header(boundary_in_tail: u16, pop: u8) -> u32 {
+    u32::from(boundary_in_tail) | (u32::from(pop) << 16)
+}
+
+fn unpack_anchored_header(field: u32) -> (u16, u8) {
+    ((field & 0xffff) as u16, ((field >> 16) & 0xff) as u8)
+}
+
+/// Persist one structured declaration identity as an anchor plus a
+/// content-stable tail.
+///
+/// A unit whose package is intrinsic to the blob (no effective anchor) is
+/// stored in full. Otherwise only the tail past the anchor's resolved prefix is
+/// stored, so one content-addressed blob can be mounted at several paths and
+/// still hydrate with per-mount package names; the adapter recreates the prefix
+/// from the live `ProjectFile` without parsing a rendered name.
 fn encode_unit_fq_segments<A: LanguageAdapter>(
     adapter: &A,
     unit: &CodeUnit,
@@ -8158,36 +8178,64 @@ fn encode_unit_fq_segments<A: LanguageAdapter>(
         return None;
     }
     let interner = segment_interner();
-    let path_prefix = adapter
-        .code_unit_package_is_path_derived(unit, content_qualifier)
-        .then(|| {
-            adapter
-                .path_derived_package_fq(content_qualifier, unit.source())
-                .expect("path-derived CodeUnit package requires an adapter prefix")
+    let explicit_anchor = unit.package_anchor();
+    let anchored = explicit_anchor
+        .or_else(|| adapter.default_package_anchor())
+        .and_then(|anchor| {
+            let prefix =
+                adapter.resolve_package_anchor(anchor, content_qualifier, unit.source())?;
+            let package = unit.package_fq();
+            // An extractor-supplied anchor names where a package *starts*, so
+            // the tail may carry content-written package segments. The adapter
+            // default only claims that a unit sits in its own package, so it
+            // applies only when the resolved prefix IS that package — otherwise
+            // a genuinely foreign package (`impl Trait for serde::Value`) would
+            // be re-anchored to the mount path whenever the file's own package
+            // happens to be empty and therefore a trivial prefix of it.
+            let placed = if explicit_anchor.is_some() {
+                package.starts_with(&prefix)
+            } else {
+                package == prefix
+            };
+            if !placed {
+                return None;
+            }
+            let boundary_in_tail = u16::try_from(package.len() - prefix.len()).ok()?;
+            let (mode, pop) = match anchor {
+                PackageAnchor::OwnModule { pop } => (FQ_SEGMENTS_OWN_MODULE, pop),
+                PackageAnchor::CrateRoot => (FQ_SEGMENTS_CRATE_ROOT, 0),
+            };
+            Some((
+                mode,
+                pack_anchored_header(boundary_in_tail, pop),
+                fq.suffix_from(prefix.len()),
+            ))
         });
-    let (mode, package_segment_count, persisted_fq) = match path_prefix {
-        Some(prefix) => {
-            assert_eq!(
-                prefix,
-                unit.package_fq(),
-                "path-derived package prefix must equal the CodeUnit's structured prefix \
-                 (content_qualifier={content_qualifier:?}, unit={unit:?})"
+    let (mode, header_field, persisted_fq) = match anchored {
+        Some(anchored) => anchored,
+        None => {
+            // Falling back to a full name is a safety valve, not a plan: an
+            // extractor that recorded an anchor asserted the unit can be placed
+            // from its live path, so failing to place it is an extractor bug.
+            // An adapter DEFAULT anchor legitimately fails to apply — a unit
+            // whose package is foreign to its own file keeps its complete name
+            // — so that path stays silent.
+            debug_assert!(
+                explicit_anchor.is_none(),
+                "an explicitly anchored CodeUnit must resolve to a prefix of its package \
+                 (anchor={explicit_anchor:?}, content_qualifier={content_qualifier:?}, \
+                 unit={unit:?})"
             );
-            (
-                FQ_SEGMENTS_PATH_TAIL,
-                0usize,
-                fq.suffix_from(unit.package_segment_count()),
-            )
+            let package_segment_count = u32::try_from(unit.package_segment_count())
+                .expect("CodeUnit package segment count must fit in u32");
+            (FQ_SEGMENTS_FULL, package_segment_count, fq.clone())
         }
-        None => (FQ_SEGMENTS_FULL, unit.package_segment_count(), fq.clone()),
     };
-    let package_segment_count = u32::try_from(package_segment_count)
-        .expect("CodeUnit package segment count must fit in u32");
     let encoded_segments = persisted_fq.encode_segments(interner);
     let mut encoded = Vec::with_capacity(FQ_SEGMENTS_HEADER_LEN + encoded_segments.len());
     encoded.extend_from_slice(FQ_SEGMENTS_MAGIC);
     encoded.push(mode);
-    encoded.extend_from_slice(&package_segment_count.to_le_bytes());
+    encoded.extend_from_slice(&header_field.to_le_bytes());
     encoded.extend_from_slice(&encoded_segments);
     Some(encoded)
 }
@@ -8209,34 +8257,47 @@ pub(crate) fn hydrate_unit_fq<A: LanguageAdapter>(
         ));
     }
     let mode = bytes[4];
-    let stored_package_segment_count = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+    let header_field = u32::from_le_bytes(bytes[5..9].try_into().unwrap());
     let stored_fq = FqName::decode_segments(&bytes[FQ_SEGMENTS_HEADER_LEN..], interner)
         .map_err(|err| StoreError::new(format!("analyzer store fq segment decode error: {err}")))?;
-    match mode {
+    let anchor = match mode {
         FQ_SEGMENTS_FULL => {
+            let stored_package_segment_count = header_field as usize;
             if stored_package_segment_count >= stored_fq.len() {
                 return Err(StoreError::new(
                     "analyzer store FqName package boundary leaves no declaration tail",
                 ));
             }
-            Ok((stored_fq, stored_package_segment_count))
+            return Ok((stored_fq, stored_package_segment_count));
         }
-        FQ_SEGMENTS_PATH_TAIL => {
-            let mut prefix = adapter
-                .path_derived_package_fq(content_qualifier, file)
-                .ok_or_else(|| {
-                    StoreError::new(
-                        "analyzer adapter did not provide the persisted path-derived package prefix",
-                    )
-                })?;
-            let package_segment_count = prefix.len();
-            prefix.extend_from(&stored_fq);
-            Ok((prefix, package_segment_count))
+        // The reserved header byte is ignored: a writer that starts using it
+        // must take a new mode so old readers cannot silently misread it.
+        FQ_SEGMENTS_OWN_MODULE => PackageAnchor::OwnModule {
+            pop: unpack_anchored_header(header_field).1,
+        },
+        FQ_SEGMENTS_CRATE_ROOT => PackageAnchor::CrateRoot,
+        _ => {
+            return Err(StoreError::new(format!(
+                "analyzer store FqName has unknown mode {mode}"
+            )));
         }
-        _ => Err(StoreError::new(format!(
-            "analyzer store FqName has unknown mode {mode}"
-        ))),
+    };
+    let boundary_in_tail = usize::from(unpack_anchored_header(header_field).0);
+    let mut prefix = adapter
+        .resolve_package_anchor(anchor, content_qualifier, file)
+        .ok_or_else(|| {
+            StoreError::new(
+                "analyzer adapter did not provide the persisted anchored package prefix",
+            )
+        })?;
+    let package_segment_count = prefix.len() + boundary_in_tail;
+    prefix.extend_from(&stored_fq);
+    if package_segment_count >= prefix.len() {
+        return Err(StoreError::new(
+            "analyzer store FqName package boundary leaves no declaration tail",
+        ));
     }
+    Ok((prefix, package_segment_count))
 }
 
 fn serialize_signature_metadata_blob(value: &SignatureMetadata) -> Result<Vec<u8>> {
@@ -12022,6 +12083,380 @@ mod tests {
                 .iter()
                 .any(|unit| unit.fq_name() == "pkg_b.sub.mod.Shared")
         );
+    }
+
+    /// The persisted row for the unit whose rendered name is `fq_name`, plus
+    /// the mode byte, the anchored header's `(boundary_in_tail, pop)`, and the
+    /// content-stable tail the row actually stores.
+    fn encoded_unit_row<A: LanguageAdapter>(
+        adapter: &A,
+        state: &FileState,
+        fq_name: &str,
+    ) -> (u8, u16, u8, String) {
+        let unit = state
+            .declarations
+            .iter()
+            .find(|unit| unit.fq_name() == fq_name)
+            .unwrap_or_else(|| panic!("fixture must declare {fq_name}: {:?}", state.declarations));
+        let content_qualifier = adapter.storage_content_qualifier(unit, &state.content_qualifier);
+        let encoded = encode_unit_fq_segments(adapter, unit, &content_qualifier).unwrap();
+        let (boundary_in_tail, pop) =
+            unpack_anchored_header(u32::from_le_bytes(encoded[5..9].try_into().unwrap()));
+        let interner = segment_interner();
+        let tail = FqName::decode_segments(&encoded[FQ_SEGMENTS_HEADER_LEN..], interner)
+            .unwrap()
+            .display(interner);
+        (encoded[4], boundary_in_tail, pop, tail)
+    }
+
+    /// A crate-root-qualified impl owner (`use crate::JsError; impl T for
+    /// JsError`) has a package that is neither the file's own nor foreign: it
+    /// is the crate root. Persisting it in full would bake the extracting
+    /// mount's directory names into a content-addressed row, and treating it as
+    /// the file's own package would be wrong wherever those differ. It must
+    /// persist as a crate-root anchor plus a package-free tail, and hydrate
+    /// with each mount's own crate root.
+    #[test]
+    fn identical_rust_crate_impl_blob_hydrates_with_live_crate_roots() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let _ = write_file(root, "src/lib.rs", "pub struct JsError;\n");
+        let _ = write_file(root, "crates/webidl/src/lib.rs", "pub struct JsError;\n");
+        let content = "use crate::JsError;\n\npub trait WasmDescribe {\n    fn describe();\n}\n\nimpl WasmDescribe for JsError {\n    fn describe() {}\n}\n";
+        let file_a = write_file(root, "src/describe.rs", content);
+        let file_b = write_file(root, "crates/webidl/src/describe.rs", content);
+        let oid = oid_for(content.as_bytes());
+        let adapter = RustAdapter;
+        let state = parse_state(&adapter, &file_a);
+
+        let (mode, boundary_in_tail, pop, tail) =
+            encoded_unit_row(&adapter, &state, "JsError.describe");
+        assert_eq!(mode, FQ_SEGMENTS_CRATE_ROOT);
+        assert_eq!((boundary_in_tail, pop), (0, 0));
+        assert_eq!(tail, "JsError.describe");
+
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .unwrap();
+        let hydrated_a = store
+            .hydrate_file_state(oid, "rust", &adapter, &file_a)
+            .unwrap()
+            .unwrap();
+        let hydrated_b = store
+            .hydrate_file_state(oid, "rust", &adapter, &file_b)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            hydrated_a
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "JsError.describe")
+        );
+        assert!(
+            hydrated_b
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "crates.webidl.src.JsError.describe"),
+            "{:?}",
+            hydrated_b.declarations
+        );
+    }
+
+    /// The same impl-bearing blob mounted at two directory depths must hydrate
+    /// with per-mount package prefixes: an own-module impl stores only the
+    /// declaration tail, never the directory names it was extracted under.
+    #[test]
+    fn identical_rust_impl_blob_hydrates_with_live_module_packages() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let content = "pub struct Client;\n\nimpl Client {\n    pub fn connect(&self) {}\n}\n";
+        let file_a = write_file(root, "alpha/src/service.rs", content);
+        let file_b = write_file(root, "beta/nested/src/service.rs", content);
+        let oid = oid_for(content.as_bytes());
+        let adapter = RustAdapter;
+        let state = parse_state(&adapter, &file_a);
+
+        let (mode, boundary_in_tail, pop, tail) =
+            encoded_unit_row(&adapter, &state, "alpha.src.service.Client.connect");
+        assert_eq!(mode, FQ_SEGMENTS_OWN_MODULE);
+        assert_eq!((boundary_in_tail, pop), (0, 0));
+        assert_eq!(tail, "Client.connect");
+
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .unwrap();
+        let hydrated_a = store
+            .hydrate_file_state(oid, "rust", &adapter, &file_a)
+            .unwrap()
+            .unwrap();
+        let hydrated_b = store
+            .hydrate_file_state(oid, "rust", &adapter, &file_b)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            hydrated_a
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "alpha.src.service.Client.connect")
+        );
+        assert!(
+            hydrated_b
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "beta.nested.src.service.Client.connect"),
+            "{:?}",
+            hydrated_b.declarations
+        );
+    }
+
+    /// `super` pops the LEXICAL package, which inside an inline `mod` starts
+    /// with a content-written component. Only the pops that survive past those
+    /// components cross the file-package boundary, so this owner resolves back
+    /// to the file's own module with an effective pop of zero. Counting the
+    /// `super` naively would anchor one level up and push the file's
+    /// path-derived final component (`b`) into the content-addressed tail.
+    #[test]
+    fn inline_module_super_impl_owner_persists_no_path_derived_segments() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let content = "mod m {\n    use super::T;\n\n    pub trait X {\n        fn f();\n    }\n\n    impl X for T {\n        fn f() {}\n    }\n}\n";
+        let file = write_file(root, "src/a/b.rs", content);
+        let adapter = RustAdapter;
+        let state = parse_state(&adapter, &file);
+
+        let (mode, boundary_in_tail, pop, tail) = encoded_unit_row(&adapter, &state, "a.b.T.f");
+        assert_eq!(mode, FQ_SEGMENTS_OWN_MODULE);
+        assert_eq!((boundary_in_tail, pop), (0, 0));
+        assert_eq!(tail, "T.f");
+    }
+
+    /// An import and the `impl` it feeds can sit in different lexical scopes: a
+    /// file-level `use super::T` resolves against the file's package while an
+    /// `impl` inside `mod m` resolves against `<file>.m`. The anchor is derived
+    /// from the package the owner actually ends up with, so the two scopes
+    /// disagreeing cannot produce an anchor that fails to place its own package
+    /// (the debug assertions this suite runs under would abort if it did).
+    #[test]
+    fn file_level_import_feeding_an_inline_module_impl_stays_placeable() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let content = "use super::T;\n\nmod m {\n    pub trait X {\n        fn f();\n    }\n\n    impl X for T {\n        fn f() {}\n    }\n}\n";
+        let file_a = write_file(root, "src/a/b.rs", content);
+        let file_b = write_file(root, "crates/z/src/a/b.rs", content);
+        let oid = oid_for(content.as_bytes());
+        let adapter = RustAdapter;
+        let state = parse_state(&adapter, &file_a);
+
+        // The file-level binding is not in scope inside `mod m` (the module
+        // body gets its own binder), so this owner resolves as a bare local
+        // name under the inline module and keeps `m` in the content tail.
+        let (mode, boundary_in_tail, pop, tail) = encoded_unit_row(&adapter, &state, "a.b.m.T.f");
+        assert_eq!(mode, FQ_SEGMENTS_OWN_MODULE);
+        assert_eq!((boundary_in_tail, pop), (0, 0));
+        assert_eq!(tail, "m.T.f");
+
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .unwrap();
+        let hydrated_b = store
+            .hydrate_file_state(oid, "rust", &adapter, &file_b)
+            .unwrap()
+            .unwrap();
+        assert!(
+            hydrated_b
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "crates.z.src.a.b.m.T.f"),
+            "{:?}",
+            hydrated_b.declarations
+        );
+    }
+
+    /// `impl crate::foo::Bar` names a module below the crate root, so the
+    /// crate-root anchor leaves a source-written `foo` package segment inside
+    /// the persisted tail. The package boundary is one segment past the anchor,
+    /// and that offset must survive the round trip at a mount whose crate root
+    /// has a different depth.
+    #[test]
+    fn crate_rooted_module_impl_owner_persists_a_package_segment_in_its_tail() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let _ = write_file(root, "crates/webidl/src/lib.rs", "pub mod foo;\n");
+        let _ = write_file(root, "src/lib.rs", "pub mod foo;\n");
+        let content = "use crate::foo::Bar;\n\npub trait X {\n    fn f();\n}\n\nimpl X for Bar {\n    fn f() {}\n}\n";
+        let file_a = write_file(root, "crates/webidl/src/generator.rs", content);
+        let file_b = write_file(root, "src/generator.rs", content);
+        let oid = oid_for(content.as_bytes());
+        let adapter = RustAdapter;
+        let state = parse_state(&adapter, &file_a);
+
+        let (mode, boundary_in_tail, pop, tail) =
+            encoded_unit_row(&adapter, &state, "crates.webidl.src.foo.Bar.f");
+        assert_eq!(mode, FQ_SEGMENTS_CRATE_ROOT);
+        assert_eq!((boundary_in_tail, pop), (1, 0));
+        assert_eq!(tail, "foo.Bar.f");
+
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .unwrap();
+        let hydrated_b = store
+            .hydrate_file_state(oid, "rust", &adapter, &file_b)
+            .unwrap()
+            .unwrap();
+        let member = hydrated_b
+            .declarations
+            .iter()
+            .find(|unit| unit.fq_name() == "foo.Bar.f")
+            .unwrap_or_else(|| panic!("{:?}", hydrated_b.declarations));
+        assert_eq!(member.package_name(), "foo");
+    }
+
+    /// A file-level `use super::T` genuinely crosses the file-package boundary,
+    /// so the owner anchors one module above the file and hydrates against the
+    /// live mount's parent package rather than the extraction-time one.
+    #[test]
+    fn cross_file_super_impl_owner_persists_a_popped_own_module_anchor() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let content =
+            "use super::T;\n\npub trait X {\n    fn f();\n}\n\nimpl X for T {\n    fn f() {}\n}\n";
+        let file_a = write_file(root, "src/a/b.rs", content);
+        let file_b = write_file(root, "crates/z/src/a/b.rs", content);
+        let oid = oid_for(content.as_bytes());
+        let adapter = RustAdapter;
+        let state = parse_state(&adapter, &file_a);
+
+        let (mode, boundary_in_tail, pop, tail) = encoded_unit_row(&adapter, &state, "a.T.f");
+        assert_eq!(mode, FQ_SEGMENTS_OWN_MODULE);
+        assert_eq!((boundary_in_tail, pop), (0, 1));
+        assert_eq!(tail, "T.f");
+
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .unwrap();
+        let hydrated_b = store
+            .hydrate_file_state(oid, "rust", &adapter, &file_b)
+            .unwrap()
+            .unwrap();
+        assert!(
+            hydrated_b
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "crates.z.src.a.T.f"),
+            "{:?}",
+            hydrated_b.declarations
+        );
+    }
+
+    /// An impl owner rooted in another crate has no placeable anchor: its
+    /// package is not derived from this file's path at any depth. It keeps its
+    /// complete persisted name, and because the anchor came from the adapter
+    /// default rather than the extractor, that fallback is silent (a debug
+    /// build would abort here if it were treated as an extractor bug).
+    #[test]
+    fn foreign_crate_impl_owner_persists_its_complete_name() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let content = "pub trait Local {\n    fn f();\n}\n\nimpl Local for serde::Value {\n    fn f() {}\n}\n";
+        let file = write_file(root, "src/model.rs", content);
+        let oid = oid_for(content.as_bytes());
+        let adapter = RustAdapter;
+        let state = parse_state(&adapter, &file);
+
+        let (mode, _, _, tail) = encoded_unit_row(&adapter, &state, "serde.Value.f");
+        assert_eq!(mode, FQ_SEGMENTS_FULL);
+        assert_eq!(tail, "serde.Value.f");
+
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "rust", &adapter, &state)
+            .unwrap();
+        let hydrated = store
+            .hydrate_file_state(oid, "rust", &adapter, &file)
+            .unwrap()
+            .unwrap();
+        assert!(
+            hydrated
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "serde.Value.f"),
+            "{:?}",
+            hydrated.declarations
+        );
+    }
+
+    /// The anchored encoding changes only Rust rows. Rust blobs cached under
+    /// the pre-change salt must be discarded, and a Go blob cached alongside
+    /// them must stay warm through that cutover.
+    #[test]
+    fn rust_anchored_fq_epoch_invalidates_rust_blobs_and_leaves_go_warm() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let rust_file = write_file(
+            root,
+            "src/service.rs",
+            "pub struct Client;\n\nimpl Client {\n    pub fn connect(&self) {}\n}\n",
+        );
+        let rust_state = Arc::new(parse_state(&RustAdapter, &rust_file));
+        let rust_oid = oid_for(rust_state.source.as_bytes());
+        let _ = write_file(root, "go.mod", "module example.com/demo\n");
+        let go_file = write_file(
+            root,
+            "internal/service/service.go",
+            "package service\ntype Client struct{}\n",
+        );
+        let go_state = Arc::new(parse_state(&GoAdapter, &go_file));
+        let go_oid = oid_for(go_state.source.as_bytes());
+
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_rust_generation = store
+            .ensure_language_epoch_value("rust", &epoch::rust_epoch_before_anchored_fq_encoding())
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                rust_oid,
+                "rust",
+                prior_rust_generation,
+                &RustAdapter,
+                rust_state.as_ref(),
+            )
+            .unwrap();
+        let go_generation = store
+            .ensure_language_epoch(Language::Go, &tree_sitter_go::LANGUAGE.into())
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                go_oid,
+                "go",
+                go_generation,
+                &GoAdapter,
+                go_state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(rust_oid, "rust").unwrap());
+        assert!(store.contains_parsed_blob(go_oid, "go").unwrap());
+
+        let current_rust_generation = store
+            .ensure_language_epoch(Language::Rust, &tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_rust_generation, prior_rust_generation);
+        assert!(!store.contains_parsed_blob(rust_oid, "rust").unwrap());
+        assert_eq!(
+            store
+                .ensure_language_epoch(Language::Go, &tree_sitter_go::LANGUAGE.into())
+                .unwrap(),
+            go_generation,
+            "the Rust salt bump must not move Go's epoch"
+        );
+        assert!(store.contains_parsed_blob(go_oid, "go").unwrap());
     }
 
     #[test]

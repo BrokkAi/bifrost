@@ -363,11 +363,17 @@ fn inverse_rust_shared_lib_bin_external_module_keeps_exact_grouped_prefix() {
         .file("src/other.rs", "pub struct ApiResult;\n")
         .build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
-    let target = analyzer
-        .declarations(&project.file("src/main.rs"))
-        .into_iter()
-        .find(|unit| unit.is_module() && unit.identifier() == "error")
-        .expect("main-target error module");
+    let module_named = |file, name: &str| {
+        analyzer
+            .declarations(&file)
+            .into_iter()
+            .find(|unit| unit.is_module() && unit.identifier() == name)
+            .unwrap_or_else(|| panic!("{name} module"))
+    };
+    // `src/api.rs` is a library module, so `crate::` roots at the library and
+    // its grouped prefix names the library's `error`, not the binary target's
+    // same-named sibling.
+    let target = module_named(project.file("src/lib.rs"), "error");
     let found = authoritative_hits(
         &analyzer,
         target,
@@ -385,7 +391,16 @@ fn inverse_rust_shared_lib_bin_external_module_keeps_exact_grouped_prefix() {
             hit.file == project.file("src/api.rs")
                 && (hit.start_offset, hit.end_offset) == (expected, expected + "error".len())
         }),
-        "external module prefix must resolve to the exact main-target declaration: {found:#?}"
+        "external module prefix must resolve to the exact library declaration: {found:#?}"
+    );
+    let binary_sibling = authoritative_hits(
+        &analyzer,
+        module_named(project.file("src/main.rs"), "error"),
+        [project.file("src/api.rs")].into_iter().collect(),
+    );
+    assert!(
+        binary_sibling.is_empty(),
+        "the binary target's same-named module must not claim library uses: {binary_sibling:#?}"
     );
     assert!(
         found.iter().all(|hit| {
@@ -663,7 +678,7 @@ fn shadowed(filter_as_usize: fn(&Option<Level>) -> usize) -> usize {
         .file("tracing-core/src/metadata.rs", source)
         .build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
-    let target = definition(&analyzer, "tracing-core.src.metadata.filter_as_usize");
+    let target = definition(&analyzer, "tracing_core.metadata.filter_as_usize");
     let candidates: HashSet<_> = [project.file("tracing-core/src/metadata.rs")]
         .into_iter()
         .collect();
@@ -721,7 +736,7 @@ fn large() {
         .file("examples/client.rs", consumer)
         .build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
-    let target = definition(&analyzer, "parser.options.Options");
+    let target = definition(&analyzer, "demo.parser.options.Options");
     let candidates = [project.file("examples/client.rs")].into_iter().collect();
     let found = authoritative_hits(&analyzer, target, candidates);
     let expected: Vec<_> = consumer
@@ -775,7 +790,7 @@ impl From<ListStyleType> for options::ListStyleType {
         .file("src/main.rs", consumer)
         .build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
-    let target = definition(&analyzer, "parser.options.ListStyleType");
+    let target = definition(&analyzer, "demo.parser.options.ListStyleType");
     let candidates = [project.file("src/main.rs")].into_iter().collect();
     let found = authoritative_hits(&analyzer, target, candidates);
     let expected = consumer
@@ -815,7 +830,7 @@ impl From<ListStyleType> for ListStyleType {
         .file("src/main.rs", consumer)
         .build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
-    let physical = definition(&analyzer, "parser.ListStyleType");
+    let physical = definition(&analyzer, "demo.parser.ListStyleType");
     let candidates = [project.file("src/main.rs")].into_iter().collect();
     let found = authoritative_hits(&analyzer, physical, candidates);
     let self_range = consumer

@@ -12,10 +12,17 @@ Bifrost's public documentation currently provides executable correctness example
 | [Ten-minute evaluation](/evaluate-bifrost/) | One checked-in Python fixture produces the same structural result through CLI JSON, saved RQL, agent MCP, and VS Code LSP. | Corpus-wide accuracy, dynamic call completeness, or large-repository performance. |
 | [Language query tutorials](/code-query-tutorials/) | Checked-in source, query, and expected output remain executable across all supported languages. | Representative prevalence or accuracy across real-world repositories. |
 | [Receiver traversal cookbook](/code-query-tutorials/receiver-traversal/) | The shared outcome and provenance contract executes against exact cookbook output; adapter conformance regressions exercise proven forms and explicit uncertainty boundaries, while the cookbook also demonstrates reference-site and call-input composition. | Whole-program points-to completeness, general alias analysis, path feasibility, taint, or data-flow accuracy. |
+| Data-flow solver, adapter, and production-taint conformance suites | Bounded language-neutral ICFG scenarios agree with independent reference implementations; every direct-ready language has one exact helper-flow case across the direct solver, JSON CodeQuery, and RQL; production taint fixtures exercise retained report/projection parity and semantic summaries. | Representative real-project precision/recall, complete language-feature coverage, or externally reviewed accuracy. |
+| Semantic-summary taint lifecycle harness | The production route can report activation, acquisition, binding, batching, propagation, witness reconstruction, projection, retained bytes, and peak RSS for deterministic scaling cases. | Published repeatability thresholds, a realistic public corpus, or a comparative performance claim. |
 | Analyzer and service test suites | Specific resolution, proof, diagnostics, truncation, and language-regression contracts are exercised in the repository. | An independently sampled benchmark or an externally reviewed accuracy result. |
 | [Capability matrix](/capabilities/) | The implemented analysis surfaces and known hard boundaries are stated in one place. | A guarantee that every valid program within a language will resolve every edge. |
 
-There is not yet a public, versioned table of cold and warm timings, peak memory, corpus revisions, or aggregate precision and recall. Until one exists, treat unqualified performance adjectives and global accuracy percentages as unsupported.
+There is not yet a public, versioned table of cold and warm data-flow timings,
+peak memory, pinned real-project flow expectations, or aggregate precision and
+recall. Until one exists, treat unqualified performance adjectives and global
+data-flow accuracy percentages as unsupported. The capability is documented as
+experimental for this reason, not because the solver or policy evaluator is a
+placeholder.
 
 ## Performance Evaluation Protocol
 
@@ -32,7 +39,13 @@ Launcher downloads and first-use semantic-model downloads are installation costs
 
 ## Accuracy Evaluation Protocol
 
-Define the unit of judgment before counting: a declaration, reference site, call edge, structural match, receiver-analysis input/candidate set, or file edge. Build a labeled corpus with positive and negative cases, including ambiguity, unsupported syntax, generated code policy, external dependencies, and language-specific dynamic behavior.
+Define the unit of judgment before counting: a declaration, reference site,
+call edge, structural match, receiver-analysis input/candidate set, file edge,
+flow meeting, or ordered flow witness. Build a labeled corpus with positive and
+negative cases, including ambiguity, unsupported syntax, generated code policy,
+external dependencies, and language-specific dynamic behavior. For data flow,
+record clean, reached, and inconclusive expectations separately; absence from a
+partial result is never a true negative.
 
 For each result, retain Bifrost's proof tier and diagnostics. Report at least:
 
