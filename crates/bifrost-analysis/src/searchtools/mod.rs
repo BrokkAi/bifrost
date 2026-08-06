@@ -334,8 +334,8 @@ fn cpp_occurrence_classifier_for(
                 cached.clone()
             }
             _ => {
-                let built = crate::analyzer::CppOccurrenceClassifier::new(source)
-                    .map(std::rc::Rc::new);
+                let built =
+                    crate::analyzer::CppOccurrenceClassifier::new(source).map(std::rc::Rc::new);
                 *guard = Some((source.len(), content_hash, built.clone()));
                 built
             }
