@@ -533,6 +533,38 @@ the focus.
       and
       `6bf35bd98b235d7460aac5cb3ee31cd97870cf8c14b38edbdc08447165df1ff0`.
       The next active repository is rank fifteen.
+    - [x] (2026-08-06 12:57Z) Rank fifteen
+      `BehaviorTree__BehaviorTree.CPP` completed at pinned head `4630e066`.
+      The fresh pushed-head baseline kept zero missing rows across all 957
+      inverse targets. It exposed nine `invalid_location` rows for compound C++
+      operator names. Seven were declaration-like sites in the vendored JSON
+      header. Two were explicit `operator[]` calls. The reference candidate
+      frontier retained each complete structured operator range, but the
+      differential sent that range through the single lexical-token definition
+      location contract. Jonathan-assigned issue #1716 grouped these related
+      forms. An oldskool implementation pass and an independent oldskool review
+      identified the existing structured point-lookup rule used by call
+      relations. Root review moved that rule to the shared reference-candidate
+      API, retained complete report and inverse ranges, and preserved the full
+      operator evidence text. Commit `a3f77da9` reached `origin/master` through
+      merge head `a45fcbab`; issue #1716 is closed and remains assigned only to
+      `jbellis`. The focused end-to-end `operator[]` regression passes. It proves
+      exact inverse round-trip, declaration exclusion, and the unchanged normal
+      identifier path. The featureless workspace library gate passed after the
+      one Java parity fixture was skipped because this host lacks `javac` and
+      `jar`; the initial unskipped gate passed 1,821 analyzer tests before that
+      environment-only failure. The final clean replay audited all 168 files,
+      2,181,895 source bytes, 85,336 candidates, and 10,000 sites. It queried all
+      957 targets and reported 4,801 resolved forward sites, zero invalid
+      locations, 1,920 consistent, 194 editor-only, 110 honestly unproven,
+      7,776 inconclusive, and zero missing rows. It had no file errors, skipped
+      targets, truncation, or configured-limit failures. The report and exact
+      pushed-head runner SHA-256 values are
+      `ca5fb63150d88e911b80f405002e28cac50723bf6c514e44cd8ac2748f88e6cb`
+      and
+      `81f90974a3c547077cef72e35ef4cb23b739964b8dd5c3059ec8561f11ced92a`.
+      The next active repository is rank sixteen
+      `GoogleCloudPlatform__esp-v2`.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
