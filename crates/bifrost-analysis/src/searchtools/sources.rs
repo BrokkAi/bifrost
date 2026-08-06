@@ -44,7 +44,8 @@ pub(super) fn source_blocks_for_resolved_units(
 ) -> Vec<SourceBlock> {
     let mut blocks = Vec::new();
     let mut module_units = Vec::new();
-    let mut cpp_identity = CppIdentityRenderCache::default();
+    let mut render_cache = SourceRenderCache::default();
+    let mut seen_function_units: HashSet<(String, ProjectFile)> = HashSet::default();
 
     for code_unit in code_units {
         if is_file_listing_target(code_unit) {
@@ -52,8 +53,21 @@ pub(super) fn source_blocks_for_resolved_units(
             continue;
         }
 
+        // Duplicate resolved function units sharing (fq_name, source) render
+        // byte-identical blocks -- every input to the block is derived from
+        // that pair -- and dedup_source_blocks collapses them downstream
+        // anyway. Skip the repeats up front: against generated amalgamations
+        // (#1689, phalcon's 9.5 MB phalcon.zep.c) N duplicate units each
+        // re-collect N candidate ranges, an O(N^2) range render that dominated
+        // both CPU and the multi-GB pre-dedup block heap.
+        if code_unit.is_function()
+            && !seen_function_units.insert((code_unit.fq_name(), code_unit.source().clone()))
+        {
+            continue;
+        }
+
         let source_blocks =
-            source_blocks_for_code_unit_with_cache(analyzer, code_unit, true, &mut cpp_identity);
+            source_blocks_for_code_unit_with_cache(analyzer, code_unit, true, &mut render_cache);
         if source_blocks.is_empty() && is_scala_object_like(code_unit) {
             module_units.push(code_unit.clone());
         } else {
@@ -552,18 +566,26 @@ fn semantic_model_source_outcome_with_anchor(
     }
 }
 
+#[derive(Default)]
+struct SourceRenderCache {
+    cpp_identity: CppIdentityRenderCache,
+    line_starts: HashMap<ProjectFile, std::rc::Rc<Vec<usize>>>,
+}
+
 fn source_blocks_for_code_unit_with_cache(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
     include_comments: bool,
-    cpp_identity: &mut CppIdentityRenderCache,
+    render_cache: &mut SourceRenderCache,
 ) -> Vec<SourceBlock> {
     let Some(content) = analyzer.indexed_source(code_unit.source()) else {
         return Vec::new();
     };
 
     let language = language_for_target(code_unit);
-    let canonical_selector = cpp_identity.canonical_selector(analyzer, code_unit);
+    let canonical_selector = render_cache
+        .cpp_identity
+        .canonical_selector(analyzer, code_unit);
 
     let mut ranges = if code_unit.is_function() {
         let mut grouped = Vec::new();
@@ -576,12 +598,28 @@ fn source_blocks_for_code_unit_with_cache(
     } else {
         analyzer.ranges(code_unit).to_vec()
     };
-    ranges.sort_by_key(|range| range.start_byte);
+    ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
+    // definitions() can return the same candidate through multiple identity
+    // paths; identical ranges render identical blocks, so drop the repeats
+    // before paying for text extraction.
+    ranges.dedup_by_key(|range| (range.start_byte, range.end_byte));
+
+    // The line-start table is derived data of the immutable indexed content;
+    // compute it once per file per tool call instead of twice per range
+    // (#1689: two full-file scans per range dominated get_symbol_sources on
+    // multi-megabyte generated files).
+    let line_starts = render_cache
+        .line_starts
+        .entry(code_unit.source().clone())
+        .or_insert_with(|| std::rc::Rc::new(compute_line_starts(&content)))
+        .clone();
 
     ranges
         .into_iter()
         .filter_map(|range| {
-            let occurrence_role = cpp_identity.occurrence_role(analyzer, code_unit, &range);
+            let occurrence_role = render_cache
+                .cpp_identity
+                .occurrence_role(analyzer, code_unit, &range);
             let start_byte = if include_comments {
                 expanded_comment_start(language, &content, range.start_byte)
             } else {
@@ -596,14 +634,17 @@ fn source_blocks_for_code_unit_with_cache(
                 text,
                 range.start_byte.saturating_sub(start_byte),
             );
-            let start_line = line_number_at_offset(&content, start_byte);
+            let start_line = find_line_index_for_offset(&line_starts, start_byte) + 1;
             Some(SourceBlock {
                 label: display_symbol_for_target(code_unit),
                 path: rel_path_string(code_unit.source()),
                 start_line,
-                // Same CR-aware line table as start_line: text.lines() counts
-                // only \n, which undercounts rows on CR-only files (#1431).
-                end_line: line_number_at_offset(&content, range.end_byte.saturating_sub(1)),
+                // Same CR-aware line table as start_line: the line-start index
+                // counts both \n and CR-only row starts (#1431).
+                end_line: find_line_index_for_offset(
+                    &line_starts,
+                    range.end_byte.saturating_sub(1),
+                ) + 1,
                 text,
                 canonical_selector: canonical_selector.clone(),
                 occurrence_role,
@@ -897,11 +938,6 @@ pub(super) fn is_file_listing_target(code_unit: &CodeUnit) -> bool {
 
 pub(super) fn is_ancestor_target(code_unit: &CodeUnit) -> bool {
     code_unit.is_class() || code_unit.is_module()
-}
-
-pub(super) fn line_number_at_offset(content: &str, offset: usize) -> usize {
-    let bounded = offset.min(content.len());
-    find_line_index_for_offset(&compute_line_starts(content), bounded) + 1
 }
 
 pub(super) fn expanded_comment_start(language: Language, source: &str, start_byte: usize) -> usize {
