@@ -703,6 +703,78 @@ export function caller(flag: boolean) {
     );
 }
 
+/// Every reference occurrence projects exactly one member-selection summary
+/// row from the production resolver's candidate trace, and the summary's
+/// selected set agrees with the ordinary get-definition answer.
+#[test]
+fn member_selection_summary_projects_the_production_trace() {
+    let source = r#"class Service { run() {} }
+class Other { run() {} }
+export function caller(service: Service) { service.run(); }
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+        .write(source)
+        .expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let query = CodeQuery::from_json(&json!({
+        "where": ["app.ts"],
+        "occurrences": { "role": ["member_position"] },
+        "steps": [{ "op": "member_selection" }],
+        "result_detail": "full"
+    }))
+    .expect("member selection query");
+
+    let first = execute(&analyzer, &query);
+    let second = execute(&analyzer, &query);
+    assert_eq!(first.results.len(), 1, "{}", first.render_text());
+    let CodeQueryResultValue::MemberSelection { value: row } = &first.results[0].value else {
+        panic!("expected member selection, got {}", first.render_text())
+    };
+    assert_eq!(row.member, "run");
+    assert_eq!(row.outcome, "selected", "{row:#?}");
+    assert!(row.selected_count >= 1);
+    assert!(row.candidate_count >= row.selected_count);
+    assert!(!row.site_ast_id.is_empty());
+    assert!(matches!(row.trace_completeness, "full" | "selection_only"));
+    match row.trace_completeness {
+        "full" => assert_eq!(row.coverage, "exhaustive"),
+        _ => assert_eq!(row.coverage, "open"),
+    }
+    let CodeQueryResultValue::MemberSelection { value: again } = &second.results[0].value else {
+        panic!("expected member selection")
+    };
+    assert_eq!(again.id, row.id, "the summary row identity is stable");
+
+    // The summary joins to the candidate rows it summarizes by AST identity.
+    let candidates = execute(
+        &analyzer,
+        &CodeQuery::from_json(&json!({
+            "where": ["app.ts"],
+            "occurrences": { "role": ["member_position"] },
+            "steps": [{ "op": "candidates_of" }],
+            "result_detail": "full"
+        }))
+        .expect("candidate query"),
+    );
+    let candidate_rows = candidates
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::ResolutionCandidate { value } => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(candidate_rows.len(), row.candidate_count, "{candidates:#?}");
+    assert!(
+        candidate_rows
+            .iter()
+            .all(|candidate| candidate.ast_id == row.site_ast_id),
+        "candidate rows join the summary by ast identity"
+    );
+}
+
 /// An unresolvable receiver still emits its mandatory outcome row. The row
 /// states `unknown` with unknown coverage and zero evidence rows, so an empty
 /// evidence relation can never masquerade as a proven-empty value set.

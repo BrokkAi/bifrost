@@ -314,6 +314,10 @@ pub fn validate_relational_assertion_plan(
                         | DetailedCodeQueryDomain::ReceiverAnalysis,
                         crate::definition::RowExpansionStep::ReceiverEvidence,
                     ) => DetailedCodeQueryDomain::ReceiverEvidence,
+                    (
+                        DetailedCodeQueryDomain::Occurrence,
+                        crate::definition::RowExpansionStep::MemberSelection,
+                    ) => DetailedCodeQueryDomain::MemberSelection,
                     _ => {
                         return Err(RelationalAssertionPlanError::ExpansionDomainUnavailable {
                             binding: binding.name.as_str().to_string(),

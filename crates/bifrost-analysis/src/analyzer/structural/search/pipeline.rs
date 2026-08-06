@@ -79,6 +79,7 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::ReceiverAnalysis(_)
                     | PipelineValue::ReceiverOutcome(_)
                     | PipelineValue::ReceiverEvidence(_)
+                    | PipelineValue::MemberSelection(_)
                     | PipelineValue::Occurrence(_)
                     | PipelineValue::LexicalScope(_)
                     | PipelineValue::Binding(_)
@@ -134,6 +135,7 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::ReceiverAnalysis(_)
                                 | PipelineValue::ReceiverOutcome(_)
                                 | PipelineValue::ReceiverEvidence(_)
+                                | PipelineValue::MemberSelection(_)
                                 | PipelineValue::Occurrence(_)
                                 | PipelineValue::LexicalScope(_)
                                 | PipelineValue::Binding(_)
@@ -197,6 +199,7 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::ReceiverAnalysis(_)
                         | PipelineValue::ReceiverOutcome(_)
                         | PipelineValue::ReceiverEvidence(_)
+                        | PipelineValue::MemberSelection(_)
                         | PipelineValue::Occurrence(_)
                         | PipelineValue::LexicalScope(_)
                         | PipelineValue::Binding(_)
@@ -1782,6 +1785,15 @@ pub(super) fn apply_pipeline_step(
                     filter,
                     cancellation,
                     diagnostics,
+                    &mut row_exhausted,
+                )
+            }
+            (PipelineValue::Occurrence(value), QueryStep::MemberSelection) => {
+                member_selection_expansions(
+                    analyzer,
+                    environment_cache,
+                    &value.row,
+                    cancellation,
                     &mut row_exhausted,
                 )
             }

@@ -77,6 +77,9 @@ pub(super) fn render_pipeline_item(
         PipelineValue::ReceiverEvidence(value) => CodeQueryResultValue::ReceiverEvidence {
             value: Box::new(render_receiver_evidence(analyzer, &value, cache)),
         },
+        PipelineValue::MemberSelection(value) => CodeQueryResultValue::MemberSelection {
+            value: Box::new(render_member_selection(analyzer, &value, cache)),
+        },
         PipelineValue::Occurrence(value) => CodeQueryResultValue::Occurrence {
             value: Box::new(render_occurrence(analyzer, &value, detail, cache)),
         },
@@ -152,6 +155,9 @@ pub(super) fn render_provenance(
                     }
                     PipelineTraceValue::ReceiverEvidence(value) => {
                         render_receiver_evidence_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::MemberSelection(value) => {
+                        render_member_selection_ref(analyzer, value, cache)
                     }
                     PipelineTraceValue::Occurrence(value) => {
                         render_occurrence_ref(analyzer, value, cache)
@@ -379,6 +385,58 @@ pub(super) fn render_edge_ref(
         range: render_source_range(analyzer, &row.site.file, &row.site.range, cache),
         target_fq_name: value.target.unit.fq_name(),
         provenance: row.provenance.label(),
+    }
+}
+
+/// The mandatory member-selection summary for one occurrence, computed from
+/// the production resolver's candidate trace. `untraced` states the language
+/// recorded no trace; it is never rendered as a proven-empty selection.
+pub(super) fn render_member_selection(
+    analyzer: &dyn IAnalyzer,
+    value: &MemberSelectionValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryMemberSelection {
+    use crate::analyzer::usages::get_definition::trace::TraceCompleteness;
+    let row = &value.occurrence;
+    let resolved = if value.selected > 0 {
+        "selected"
+    } else {
+        "unresolved"
+    };
+    let (outcome, trace_completeness, coverage) = match value.completeness {
+        Some(TraceCompleteness::Full) => (resolved, "full", "exhaustive"),
+        Some(TraceCompleteness::SelectionOnly) => (resolved, "selection_only", "open"),
+        None => ("untraced", "absent", "unsupported"),
+    };
+    CodeQueryMemberSelection {
+        id: value.stable_id(),
+        site_ast_id: row.ast_id(),
+        path: rel_path_string(&row.file),
+        language: crate::analyzer::common::language_for_file(&row.file).config_label(),
+        range: render_source_range(analyzer, &row.file, &row.range, cache),
+        member: row.effective_spelling().to_string(),
+        role: row.role.label(),
+        outcome,
+        selected_count: value.selected,
+        candidate_count: value.candidates,
+        trace_completeness,
+        coverage,
+    }
+}
+
+pub(super) fn render_member_selection_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &MemberSelectionValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let rendered = render_member_selection(analyzer, value, cache);
+    CodeQueryResultRef::MemberSelection {
+        id: rendered.id,
+        site_ast_id: rendered.site_ast_id,
+        path: rendered.path,
+        range: rendered.range,
+        outcome: rendered.outcome,
+        coverage: rendered.coverage,
     }
 }
 

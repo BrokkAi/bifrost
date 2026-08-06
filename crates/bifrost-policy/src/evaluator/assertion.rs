@@ -808,6 +808,16 @@ fn evaluate_relational_assertion_policy(
                 let projection = match step {
                     RowExpansionStep::ReceiverOutcome => QueryStep::ReceiverOutcome,
                     RowExpansionStep::ReceiverEvidence => QueryStep::ReceiverEvidence,
+                    RowExpansionStep::MemberSelection => {
+                        // The member-selection projection consumes occurrence
+                        // rows directly; no receiver-analysis lowering exists
+                        // or is needed for it.
+                        let mut query = binding_queries[source_index].clone();
+                        query.plan.steps.push(QueryStep::MemberSelection);
+                        binding_index_by_name.insert(&binding.name, index);
+                        binding_queries.push(query);
+                        continue;
+                    }
                     other => {
                         return failed_policy_run(
                             policy,

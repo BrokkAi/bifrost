@@ -650,7 +650,8 @@ fn validate_wrapper(
         | RqlForm::EdgeTarget
         | RqlForm::SegmentTarget
         | RqlForm::ReceiverOutcome
-        | RqlForm::ReceiverEvidence => {
+        | RqlForm::ReceiverEvidence
+        | RqlForm::MemberSelection => {
             if args.len() != 1 {
                 analysis.error(
                     query.range.clone(),
