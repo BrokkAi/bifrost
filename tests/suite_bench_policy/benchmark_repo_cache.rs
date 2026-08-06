@@ -59,6 +59,76 @@ fn prepare_repo_disables_autocrlf_for_deterministic_checkout_bytes() {
     assert_eq!(working_oid, committed_oid);
 }
 
+/// A cached blobless clone left by the pre-#1373 harness (or a restored CI
+/// cache) must be upgraded to a full clone: `most_relevant_files` refuses the
+/// git history walk on a partial clone with a network promisor remote, so a
+/// blobless fixture benchmarks the import-only fallback instead of the pinned
+/// history ranking.
+#[test]
+fn prepare_repo_upgrades_a_cached_blobless_clone_to_a_full_clone() {
+    let temp = TempDir::new().expect("temp dir");
+    let source_root = temp.path().join("source");
+    fs::create_dir_all(&source_root).expect("source root");
+    init_git_repo(&source_root);
+
+    let cache_root = temp.path().join("cache");
+    fs::create_dir_all(&cache_root).expect("cache root");
+    let checkout_path = cache_root.join("fixture-repo");
+    // file:// forces the partial-clone transport; a plain local path would
+    // silently ignore the filter.
+    let source_url = format!("file://{}", source_root.display());
+    let clone = std::process::Command::new("git")
+        .arg("clone")
+        .arg("--no-checkout")
+        .arg("--filter=blob:none")
+        .arg(&source_url)
+        .arg(&checkout_path)
+        .output()
+        .expect("run git clone");
+    assert!(clone.status.success(), "{clone:?}");
+    {
+        let repo = Repository::open(&checkout_path).expect("open blobless clone");
+        let config = repo.config().expect("clone config");
+        assert!(
+            config.get_bool("remote.origin.promisor").unwrap_or(false),
+            "the fixture must start as a promisor partial clone"
+        );
+    }
+
+    let target = repo_target(&source_root, &head_commit(&source_root));
+    let prepared = prepare_repo(&target, &cache_root).expect("upgrade cached clone");
+
+    let repo = Repository::open(&prepared).expect("open upgraded clone");
+    let config = repo.config().expect("upgraded config");
+    assert!(
+        config.get_bool("remote.origin.promisor").is_err(),
+        "promisor marker must be removed"
+    );
+    assert!(
+        config
+            .get_string("remote.origin.partialclonefilter")
+            .is_err(),
+        "partial-clone filter must be removed"
+    );
+    let missing = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&prepared)
+        .args(["rev-list", "--objects", "--all", "--missing=print"])
+        .output()
+        .expect("run git rev-list");
+    assert!(missing.status.success(), "{missing:?}");
+    let missing_objects: Vec<&str> = std::str::from_utf8(&missing.stdout)
+        .expect("utf8 rev-list output")
+        .lines()
+        .filter(|line| line.starts_with('?'))
+        .collect();
+    assert_eq!(
+        missing_objects,
+        Vec::<&str>::new(),
+        "every historical object must be present after the upgrade"
+    );
+}
+
 fn repo_target(source_root: &Path, commit: &str) -> BenchmarkRepoTarget {
     BenchmarkRepoTarget {
         name: "fixture-repo".to_string(),
