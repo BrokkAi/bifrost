@@ -93,6 +93,50 @@ const SUMMARY_FILE_PROJECTION_CACHE_CAPACITY: usize = 128;
 const STORE_WRITE_IMMEDIATE_RETRIES: usize = 2;
 const STORE_WRITE_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const STORE_WRITE_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+// OpenJDK and LLVM contain generated-style fixtures that can keep one tree-sitter
+// worker busy for tens of minutes after all ordinary files finish (issue #1690).
+// Bound each complete-file parse so one blob cannot hold the workspace build open.
+const COMPLETE_FILE_PARSE_BUDGET: Duration = Duration::from_secs(10);
+
+enum BoundedParse {
+    Complete(Tree),
+    Cancelled,
+    TimedOut,
+    Rejected,
+}
+
+fn parse_complete_file_bounded(
+    parser: &mut Parser,
+    source: &str,
+    cancellation: Option<&CancellationToken>,
+    budget: Duration,
+) -> BoundedParse {
+    let deadline = Instant::now() + budget;
+    let mut timed_out = false;
+    let mut read = |offset: usize, _| &source.as_bytes()[offset..];
+    let mut progress = |_: &tree_sitter::ParseState| {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return true;
+        }
+        timed_out = Instant::now() >= deadline;
+        timed_out
+    };
+    let tree = parser.parse_with_options(
+        &mut read,
+        None,
+        Some(ParseOptions::new().progress_callback(&mut progress)),
+    );
+    if let Some(tree) = tree {
+        return BoundedParse::Complete(tree);
+    }
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        BoundedParse::Cancelled
+    } else if timed_out {
+        BoundedParse::TimedOut
+    } else {
+        BoundedParse::Rejected
+    }
+}
 
 fn limited_projection_rows<T: Clone>(rows: Option<&[T]>, limit: usize) -> LimitedQueryRows<T> {
     if limit == 0 {
@@ -2327,20 +2371,58 @@ where
         file: &ProjectFile,
         source: String,
     ) -> Option<FileState> {
+        Self::analyze_source_with_budget(parser, adapter, file, source, COMPLETE_FILE_PARSE_BUDGET)
+    }
+
+    fn analyze_source_with_budget(
+        parser: &mut Parser,
+        adapter: &A,
+        file: &ProjectFile,
+        source: String,
+        budget: Duration,
+    ) -> Option<FileState> {
         if crate::analyzer::common::is_unparseable_source(source.as_str()) {
             return None;
         }
         parser
             .set_language(&adapter.parser_language_for_file(file))
             .ok()?;
-        let tree = parser.parse(source.as_str(), None)?;
+        let tree = match parse_complete_file_bounded(parser, &source, None, budget) {
+            BoundedParse::Complete(tree) => tree,
+            BoundedParse::TimedOut => {
+                let mut parsed = ParsedFile::new(String::new());
+                parsed.add_file_scope(file, &source);
+                return Some(Self::file_state_from_parsed(
+                    source,
+                    parsed,
+                    false,
+                    Some(Vec::new()),
+                ));
+            }
+            BoundedParse::Cancelled => unreachable!("no cancellation token supplied"),
+            BoundedParse::Rejected => return None,
+        };
         let mut parsed = adapter.parse_file(file, &source, &tree);
         parsed.add_file_scope(file, &source);
         let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
         let mut parse_errors = Vec::new();
         collect_parse_errors(tree.root_node(), &mut parse_errors);
 
-        Some(FileState {
+        Some(Self::file_state_from_parsed(
+            source,
+            parsed,
+            contains_tests,
+            Some(parse_errors),
+        ))
+    }
+
+    fn file_state_from_parsed(
+        source: String,
+        parsed: ParsedFile,
+        contains_tests: bool,
+        parse_errors: Option<Vec<crate::analyzer::ParseError>>,
+    ) -> FileState {
+        FileState {
             source,
             content_qualifier: parsed.content_qualifier,
             package_name: parsed.package_name,
@@ -2364,8 +2446,8 @@ where
             contains_tests,
             test_region_units: parsed.test_region_units,
             materialization_records: parsed.materialization_records,
-            parse_errors: Some(parse_errors),
-        })
+            parse_errors,
+        }
     }
 
     pub fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -4098,23 +4180,17 @@ where
             .entry(file.clone())
             .or_default() += 1;
         let exact_source = source.source();
-        let tree = if let Some(cancellation) = cancellation {
-            let mut read = |offset: usize, _| &exact_source.as_bytes()[offset..];
-            let mut progress = |_: &tree_sitter::ParseState| cancellation.is_cancelled();
-            parser.parse_with_options(
-                &mut read,
-                None,
-                Some(ParseOptions::new().progress_callback(&mut progress)),
-            )
-        } else {
-            parser.parse(exact_source, None)
-        };
-        let Some(tree) = tree else {
-            return if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                PreparedSyntaxPreparation::Cancelled
-            } else {
-                PreparedSyntaxPreparation::Complete(None)
-            };
+        let tree = match parse_complete_file_bounded(
+            &mut parser,
+            exact_source,
+            cancellation,
+            COMPLETE_FILE_PARSE_BUDGET,
+        ) {
+            BoundedParse::Complete(tree) => tree,
+            BoundedParse::Cancelled => return PreparedSyntaxPreparation::Cancelled,
+            BoundedParse::TimedOut | BoundedParse::Rejected => {
+                return PreparedSyntaxPreparation::Complete(None);
+            }
         };
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return PreparedSyntaxPreparation::Cancelled;
@@ -9422,6 +9498,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn parse_timeout_persists_a_file_scope_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = ProjectFile::new(root, "Generated.java");
+        let source = format!(
+            "class Generated {{\n{}\n}}\n",
+            "int generatedField;\n".repeat(10_000)
+        );
+        let mut parser = TreeSitterAnalyzer::<JavaAdapter>::build_parser(
+            JavaAdapter.parser_language_for_file(&file),
+        );
+
+        let state = TreeSitterAnalyzer::<JavaAdapter>::analyze_source_with_budget(
+            &mut parser,
+            &JavaAdapter,
+            &file,
+            source.clone(),
+            Duration::ZERO,
+        )
+        .expect("a timed-out source keeps a persistent file marker");
+
+        assert_eq!(state.declarations.len(), 1);
+        assert!(state.declarations.iter().all(CodeUnit::is_file_scope));
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "java", &JavaAdapter, &state)
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "java").unwrap());
     }
 
     #[test]

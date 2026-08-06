@@ -32,6 +32,7 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - [x] (2026-08-06 02:16Z) Stopped runtime r9 after the paired-set audit found invalid baseline evidence.
 - [x] (2026-08-06 02:25Z) Made answer-contract errors unscorable and selected 20 valid empirical Luna grep near-misses.
 - [x] (2026-08-06 03:05Z) Removed OpenJDK from the paired set after its cold generated-file parse tail exceeded 35 minutes.
+- [x] (2026-08-06 03:45Z) Filed Bifrost issue #1690 and bounded each complete-file tree-sitter parse to ten seconds.
 - [ ] Prewarm the replacement 20-task set and restart the corrected symbol arm.
 - [ ] (2026-08-05 23:25Z) Run the selected tasks with symbol tools. The first 20-task arm stopped after a linked-worktree fault and a false cache-readiness assumption.
 - [ ] Run the same tasks with symbol and NLP tools.
@@ -98,6 +99,8 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Evidence: Its `selection_basis` fields cite behavioral instructions and dispersed oracles. They do not cite a measured grep baseline.
 - Observation: OpenJDK is not shovel-ready with the current analyzer cache.
   Evidence: Its prewarm wrote about 40 GB, then spent more than 35 minutes on one CPU core in tree-sitter. The largest Java files are generated-style tables and field fixtures. The run stopped before agent execution.
+- Observation: LLVM has the same unbounded parse-tail class.
+  Evidence: Its prewarm also entered a low-parallelism tree-sitter tail after ordinary files finished. The run stopped before agent execution.
 
 ## Decision Log
 
@@ -155,6 +158,9 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - Decision: Replace the OpenJDK near-miss with the next valid Kubernetes near-miss.
   Rationale: This campaign measures warm interactive tools. A repository with an unfinished 35-minute cold parse is not shovel-ready.
   Date/Author: 2026-08-06 / Codex
+- Decision: Give each complete-file tree-sitter parse a ten-second budget and persist a minimal file-scope state after timeout.
+  Rationale: One generated blob must not block workspace readiness. The stored blob marker prevents the same cold parse on later startup.
+  Date/Author: 2026-08-06 / Codex
 
 ## Outcomes & Retrospective
 
@@ -179,6 +185,8 @@ Next, correct the dataset and scorers. Use one canonical answer contract where t
 Then, rescore existing outputs. This step measures how much the cleanup changes results without spending model tokens. Run a fresh Bifrost-free Luna maximum baseline across all 67 tasks. Use concurrency 10 because these task containers contain large repositories. Use a 1,800-second task limit. Define the hard set from corrected composite scores and diagnostic categories. A task is eligible only when its low score comes from localization, not output or scorer failure.
 
 After baseline selection, fix `run_task.sh`. Generate the Bifrost MCP argument array from the named workspace specifications. Do not leave a placeholder for another component to expand. Add an end-to-end test that starts Bifrost, lists its tools, and calls one symbol tool against a small repository. Unit tests must not assert command text without executing the user-visible contract.
+
+Before the paired arms, make complete-file parsing bounded. Use tree-sitter's progress callback for cancellation and a ten-second deadline. Persist a minimal file-scope state when a blob exceeds the deadline. Do not detect generated files by path or source-text patterns. See issue #1690.
 
 Run one selected task with symbols. Inspect stderr, the first LLM tool schema, Bifrost startup timing, and at least one tool result. If Bifrost fails or exceeds 120 seconds, stop the batch. Profile and correct the exact path. Repeat the one-task gate until it passes. Then run the complete shovel-ready hard subset with symbols.
 
@@ -238,3 +246,5 @@ Revision note: The grouped and parallel traversal reduced warm Kafka first-call 
 Revision note: The second symbol arm stopped after issue #1688 exposed a full `code_units` substring scan for near-canonical Go receiver selectors. Indexed terminal lookup reduced the exact reproduction to 4.55 seconds including startup.
 
 Revision note: Runtime r9 stopped before use after a new audit found that the 11-task paired set included malformed baseline answers. The replacement set uses only valid empirical Luna maximum grep failures.
+
+Revision note: OpenJDK and LLVM exposed unbounded tree-sitter parse tails. Issue #1690 records the profiles. Bifrost now persists a minimal marker after a ten-second complete-file parse limit.
