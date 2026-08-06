@@ -23,6 +23,7 @@ C++ navigation must render a canonical selector without loading every stored fac
 - [x] Read C++ type-alias facts without hydrating a complete FileState.
 - [x] Read enclosing declaration facts without hydrating a complete FileState.
 - [x] Read alias signatures without hydrating a complete FileState.
+- [x] Index large cached declaration-range sets for owner lookup.
 - [ ] Run the required policy check after MCP tool registration is repaired.
 
 ## Surprises & Discoveries
@@ -73,6 +74,12 @@ C++ navigation must render a canonical selector without loading every stored fac
   Evidence: The owner-projection dump was created at 23:12:25Z and wrote record 44 at 23:12:42Z. The two preceding dumps have the same 17-second interval.
 - Observation: A stored signature projection removes alias signature hydration.
   Evidence: The new test reads 1,025 C++ alias signatures, one above the source-snapshot capacity, with zero full hydrations.
+- Observation: The signature projection removes full FileState hydration from the stalled request.
+  Evidence: The post-signature 10-second sample has no `hydrate_file_state_with_source` frames. It reaches record 44 in 15 seconds after workspace setup, compared with 17 seconds in the preceding run.
+- Observation: Cached large files still scan every declaration for each lexical-owner lookup.
+  Evidence: The post-signature sample attributes 1,057 samples to `enclosing_code_unit`, primarily iterating `HashSet<CodeUnit>` values under 1,693 `indexed_enclosing_owner_scope` calls.
+- Observation: A prefix-max range index can stop the owner lookup after its overlapping declaration ranges.
+  Evidence: The new regression resolves 129 functions in one C++ file, builds one index, and has zero full hydrations.
 
 ## Decision Log
 
@@ -88,12 +95,15 @@ C++ navigation must render a canonical selector without loading every stored fac
 - Decision: Use the complete stored signature projection before generic signature hydration.
   Rationale: Alias resolution needs the same ordered signature strings that the store retains. An incomplete result keeps the complete FileState fallback. Source retrieval remains a lazy final fallback for aliases without usable signature text.
   Date/Author: 2026-08-06 / Codex
+- Decision: Retain a byte-bounded prefix-max interval index for large cached FileState declaration ranges.
+  Rationale: A content-keyed index makes each owner lookup inspect only overlapping ranges. A 32 MiB bound prevents the copied CodeUnit values from becoming an unbounded second FileState cache.
+  Date/Author: 2026-08-06 / Codex
 
 ## Outcomes & Retrospective
 
 The selector path no longer needs full FileState hydration when persisted rows are complete. The dedicated test proves this behavior. Persisted global-field linkage also prevents a visibility-build parse. C++ include reachability now retains bounded answers across visibility indexes. Request-local metadata reads reuse the FileState already hydrated by the visibility build. The Phalcon navigation part now completes before `get_symbol_sources`. Broad source lookup now stops at the response limit and reuses same-name range groups. This cuts the rejected `PHP_METHOD` source probes from about 40 seconds to about 6.5 seconds.
 
-Focused validation passed: `cargo fmt --check`, the persisted selector and alias tests, the enclosing-owner and signature projection tests, the six issue-1092 C++ identity tests, the global-field linkage regression, two BehaviorTree alias regression tests, and `cargo clippy -p brokk-bifrost-analysis -p brokk-bifrost-cpp --all-targets -- -D warnings`. The policy skill is installed, but `list_policies` and `run_policy` are not registered in this task. The required policy result is therefore unavailable.
+Focused validation passed: `cargo fmt --check`, the persisted selector and alias tests, the enclosing-owner, signature, and large-range index tests, the six issue-1092 C++ identity tests, the global-field linkage regression, two BehaviorTree alias regression tests, and `cargo clippy -p brokk-bifrost-analysis -p brokk-bifrost-cpp --all-targets -- -D warnings`. The policy skill is installed, but `list_policies` and `run_policy` are not registered in this task. The required policy result is therefore unavailable.
 
 ## Context and Orientation
 

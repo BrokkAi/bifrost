@@ -147,6 +147,15 @@ const TYPE_ALIAS_STORE_TEXT_BYTES_MULTIPLIER: usize = 2;
 const TYPE_ALIAS_STORE_UNIT_OVERHEAD_BYTES: usize = 256;
 const TYPE_ALIAS_STORE_ENTRY_OVERHEAD_BYTES: usize = 512;
 const TYPE_ALIAS_STORE_MAX_BYTES: usize = 32 * 1024 * 1024;
+// A large generated file can have thousands of declaration ranges. A linear
+// scan for every reference makes lexical-owner lookup quadratic in that file.
+// Keep an interval index only for these large states and bound its retained
+// `CodeUnit` copies independently from complete FileState values.
+const ENCLOSING_CODE_UNIT_INDEX_MIN_DECLARATIONS: usize = 128;
+const ENCLOSING_CODE_UNIT_INDEX_TEXT_BYTES_MULTIPLIER: usize = 2;
+const ENCLOSING_CODE_UNIT_INDEX_ENTRY_OVERHEAD_BYTES: usize = 128;
+const ENCLOSING_CODE_UNIT_INDEX_STORE_ENTRY_OVERHEAD_BYTES: usize = 512;
+const ENCLOSING_CODE_UNIT_INDEX_STORE_MAX_BYTES: usize = 32 * 1024 * 1024;
 // `SummaryFileProjection` is much lighter than `FileState`: no source text,
 // just the declaration/signature/range/children maps used to render
 // `get_summaries`. Call it a few KB per entry; 128 entries is a small,
@@ -962,6 +971,118 @@ impl ByteBounded for Arc<[CodeUnit]> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct EnclosingCodeUnitRange {
+    range: Range,
+    code_unit: CodeUnit,
+    ordinal: usize,
+}
+
+/// A sorted interval index over the persisted declaration ranges in one
+/// `FileState`. `prefix_max_end_bytes` stops a backwards scan once no earlier
+/// range can contain the requested byte span.
+#[derive(Debug)]
+struct EnclosingCodeUnitIndex {
+    ranges: Vec<EnclosingCodeUnitRange>,
+    prefix_max_end_bytes: Vec<usize>,
+}
+
+impl EnclosingCodeUnitIndex {
+    fn from_file_state(state: &FileState) -> Self {
+        let mut ranges = Vec::new();
+        for code_unit in &state.declarations {
+            for (ordinal, range) in state
+                .ranges
+                .get(code_unit)
+                .into_iter()
+                .flatten()
+                .copied()
+                .enumerate()
+            {
+                ranges.push(EnclosingCodeUnitRange {
+                    range,
+                    code_unit: code_unit.clone(),
+                    ordinal,
+                });
+            }
+        }
+        ranges.sort_unstable_by(|left, right| {
+            left.range
+                .start_byte
+                .cmp(&right.range.start_byte)
+                .then_with(|| left.range.end_byte.cmp(&right.range.end_byte))
+                .then_with(|| left.ordinal.cmp(&right.ordinal))
+                .then_with(|| left.code_unit.cmp(&right.code_unit))
+        });
+        let mut prefix_max_end_bytes = Vec::with_capacity(ranges.len());
+        let mut max_end_byte = 0;
+        for candidate in &ranges {
+            max_end_byte = max_end_byte.max(candidate.range.end_byte);
+            prefix_max_end_bytes.push(max_end_byte);
+        }
+        Self {
+            ranges,
+            prefix_max_end_bytes,
+        }
+    }
+
+    fn enclosing_code_unit(&self, range: &Range) -> Option<CodeUnit> {
+        let upper_bound = self
+            .ranges
+            .partition_point(|candidate| candidate.range.start_byte <= range.start_byte);
+        let mut first_containing_range_by_unit = HashMap::default();
+        for index in (0..upper_bound).rev() {
+            let candidate = &self.ranges[index];
+            if candidate.range.contains(range) {
+                first_containing_range_by_unit
+                    .entry(candidate.code_unit.clone())
+                    .and_modify(|(best_ordinal, best_range)| {
+                        if candidate.ordinal < *best_ordinal {
+                            *best_ordinal = candidate.ordinal;
+                            *best_range = candidate.range;
+                        }
+                    })
+                    .or_insert((candidate.ordinal, candidate.range));
+            }
+            if index == 0 || self.prefix_max_end_bytes[index - 1] < range.end_byte {
+                break;
+            }
+        }
+        select_enclosing_code_unit(
+            first_containing_range_by_unit
+                .into_iter()
+                .map(|(code_unit, (_, candidate_range))| (candidate_range, code_unit)),
+        )
+    }
+}
+
+impl ByteBounded for Arc<EnclosingCodeUnitIndex> {
+    fn estimated_bytes(&self) -> usize {
+        self.ranges
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .code_unit
+                    .fq_name()
+                    .len()
+                    .saturating_add(candidate.code_unit.short_name().len())
+                    .saturating_add(candidate.code_unit.signature().map_or(0, str::len))
+                    .saturating_mul(ENCLOSING_CODE_UNIT_INDEX_TEXT_BYTES_MULTIPLIER)
+                    .saturating_add(std::mem::size_of::<EnclosingCodeUnitRange>())
+                    .saturating_add(ENCLOSING_CODE_UNIT_INDEX_ENTRY_OVERHEAD_BYTES)
+            })
+            .chain(std::iter::once(
+                self.prefix_max_end_bytes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            ))
+            .fold(
+                ENCLOSING_CODE_UNIT_INDEX_STORE_ENTRY_OVERHEAD_BYTES,
+                usize::saturating_add,
+            )
+    }
+}
+
 /// A byte-bounded LRU of content-addressed derivations, retained across
 /// requests behind whatever per-request single-flight layer the caller already
 /// has.
@@ -1003,6 +1124,7 @@ type PreparedSyntaxStore = ByteBoundedStore<PreparedSyntaxCacheKey, Arc<Prepared
 /// request, every one a SQLite hydration.
 type ImportInfoStore = ByteBoundedStore<FileStateCacheKey, Arc<[ImportInfo]>>;
 type TypeAliasStore = ByteBoundedStore<FileStateCacheKey, Arc<[CodeUnit]>>;
+type EnclosingCodeUnitStore = ByteBoundedStore<FileStateCacheKey, Arc<EnclosingCodeUnitIndex>>;
 
 impl<K: Eq + std::hash::Hash + Clone, V: Clone + ByteBounded> ByteBoundedStore<K, V> {
     fn new(max_bytes: usize) -> Self {
@@ -1049,6 +1171,11 @@ impl<K: Eq + std::hash::Hash + Clone, V: Clone + ByteBounded> ByteBoundedStore<K
         if self.retained_bytes > self.max_bytes {
             self.evict_to_watermark();
         }
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.entries.len()
     }
 
     /// Evicting past the cap down to a watermark amortizes the recency sort:
@@ -1738,6 +1865,9 @@ pub struct TreeSitterAnalyzer<A> {
     /// Cross-request type-alias projections. A type-alias check is common in
     /// C++ resolution, but it needs only this small persisted fact.
     type_alias_store: Arc<Mutex<TypeAliasStore>>,
+    /// Cross-request indexes for smallest-enclosing declaration lookup in
+    /// generated files with large declaration sets.
+    enclosing_code_unit_store: Arc<Mutex<EnclosingCodeUnitStore>>,
     /// Import hydrations this analyzer issued to the store, for perf pins. The
     /// call count alone cannot see the #1451 shape -- callers legitimately ask
     /// per reference -- so what must stay bounded is the *store reads* those
@@ -1804,6 +1934,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             prepared_syntax_store: Arc::clone(&self.prepared_syntax_store),
             import_info_store: Arc::clone(&self.import_info_store),
             type_alias_store: Arc::clone(&self.type_alias_store),
+            enclosing_code_unit_store: Arc::clone(&self.enclosing_code_unit_store),
             import_info_hydration_count: Arc::clone(&self.import_info_hydration_count),
             #[cfg(test)]
             live_oid_validation_counts: Arc::clone(&self.live_oid_validation_counts),
@@ -2007,6 +2138,9 @@ where
                 IMPORT_INFO_STORE_MAX_BYTES,
             ))),
             type_alias_store: Arc::new(Mutex::new(TypeAliasStore::new(TYPE_ALIAS_STORE_MAX_BYTES))),
+            enclosing_code_unit_store: Arc::new(Mutex::new(EnclosingCodeUnitStore::new(
+                ENCLOSING_CODE_UNIT_INDEX_STORE_MAX_BYTES,
+            ))),
             import_info_hydration_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
@@ -2215,6 +2349,9 @@ where
                 IMPORT_INFO_STORE_MAX_BYTES,
             ))),
             type_alias_store: Arc::new(Mutex::new(TypeAliasStore::new(TYPE_ALIAS_STORE_MAX_BYTES))),
+            enclosing_code_unit_store: Arc::new(Mutex::new(EnclosingCodeUnitStore::new(
+                ENCLOSING_CODE_UNIT_INDEX_STORE_MAX_BYTES,
+            ))),
             import_info_hydration_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
@@ -7331,6 +7468,32 @@ where
             .retain(key, aliases);
     }
 
+    fn enclosing_code_unit_from_cached_state(
+        &self,
+        key: &FileStateCacheKey,
+        state: &FileState,
+        range: &Range,
+    ) -> Option<CodeUnit> {
+        if state.declarations.len() < ENCLOSING_CODE_UNIT_INDEX_MIN_DECLARATIONS {
+            return enclosing_code_unit_from_state(state, range);
+        }
+        if let Some(index) = self
+            .enclosing_code_unit_store
+            .lock()
+            .expect("enclosing code-unit store mutex poisoned")
+            .get(key)
+        {
+            return index.enclosing_code_unit(range);
+        }
+        let index = Arc::new(EnclosingCodeUnitIndex::from_file_state(state));
+        let result = index.enclosing_code_unit(range);
+        self.enclosing_code_unit_store
+            .lock()
+            .expect("enclosing code-unit store mutex poisoned")
+            .retain(key.clone(), index);
+        result
+    }
+
     pub(crate) fn signatures_vec_of(&self, code_unit: &CodeUnit) -> Vec<String> {
         let signatures = self.signatures_limited(code_unit, usize::MAX);
         if signatures.complete {
@@ -7811,10 +7974,10 @@ where
             return enclosing_code_unit_from_state(&state, range);
         }
         if let Some(state) = self.source_snapshot_file_state(file) {
-            return enclosing_code_unit_from_state(&state, range);
+            return self.enclosing_code_unit_from_cached_state(&key, &state, range);
         }
         if let Some(state) = self.query_file_state_snapshot(&key) {
-            return enclosing_code_unit_from_state(&state, range);
+            return self.enclosing_code_unit_from_cached_state(&key, &state, range);
         }
 
         let storage_key = self.adapter.storage_language_key_for_file(file);
@@ -10086,6 +10249,58 @@ mod tests {
             analyzer.full_hydration_count_for_test(),
             0,
             "persisted owner lookup must not hydrate a FileState"
+        );
+    }
+
+    #[test]
+    fn enclosing_code_unit_interval_index_reuses_large_file_ranges() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let source = (0..=ENCLOSING_CODE_UNIT_INDEX_MIN_DECLARATIONS)
+            .map(|index| format!("int method{index}() {{ return {index}; }}\n"))
+            .collect::<String>();
+        let file = temp_file(&root, "src/methods.cpp");
+        file.write(&source).expect("write C++ source");
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let analyzer = TreeSitterAnalyzer::new(project, CppAdapter);
+        let methods = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .filter(|unit| unit.identifier().starts_with("method"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods.len(),
+            ENCLOSING_CODE_UNIT_INDEX_MIN_DECLARATIONS + 1
+        );
+
+        analyzer.reset_full_hydration_count_for_test();
+        for method in methods {
+            let index = method
+                .identifier()
+                .strip_prefix("method")
+                .expect("method declaration")
+                .parse::<usize>()
+                .expect("method index");
+            let needle = format!("return {index}");
+            let start_byte = source.find(&needle).expect("return statement");
+            let range = Range {
+                start_byte,
+                end_byte: start_byte + needle.len(),
+                start_line: 0,
+                end_line: 0,
+            };
+            assert_eq!(analyzer.enclosing_code_unit(&file, &range), Some(method));
+        }
+        assert_eq!(analyzer.full_hydration_count_for_test(), 0);
+        assert_eq!(
+            analyzer
+                .enclosing_code_unit_store
+                .lock()
+                .expect("enclosing code-unit store mutex poisoned")
+                .entry_count(),
+            1,
+            "all large-file owner lookups must reuse one interval index"
         );
     }
 
