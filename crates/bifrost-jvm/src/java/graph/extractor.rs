@@ -1,7 +1,6 @@
-use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
-use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
-use crate::analyzer::usages::java_graph::hits;
-use crate::analyzer::usages::java_graph::resolver::{
+use super::JavaGraphSource;
+use super::hits;
+use super::resolver::{
     ReceiverTargetMatch, TargetKind, TargetSpec, argument_list_arity,
     bare_field_context_matches_target, bare_method_context_matches_target,
     constructor_method_reference_receiver, has_proven_static_import, infer_type_from_value,
@@ -11,60 +10,61 @@ use crate::analyzer::usages::java_graph::resolver::{
     resolve_non_nested_type_from_node, resolve_type_from_node, resolve_type_segments,
     same_owner_context, seed_class_binding,
 };
-use crate::analyzer::usages::java_graph::return_type::{
-    FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache,
-};
-use crate::analyzer::usages::local_inference::{
+use super::return_type::{FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache};
+use crate::java::graph_support::{JavaSource, resolve_java_usage_type_name_in};
+use crate::java::structural::expression_name_node;
+use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
+use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
+use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
-use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
-use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile};
-use crate::hash::HashMap;
-use crate::text_utils::compute_line_starts;
-use brokk_bifrost_jvm::java::structural::expression_name_node;
+use brokk_bifrost_core::analyzer::usages::model::UsageHit;
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
+use brokk_bifrost_core::hash::HashMap;
+use brokk_bifrost_core::text_utils::compute_line_starts;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 
-pub(super) type MethodCallReturnCacheKey = (String, String, usize);
+pub type MethodCallReturnCacheKey = (String, String, usize);
 
-pub(super) struct ScanState<'a> {
-    pub(super) max_usages: usize,
-    pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) raw_match_count: &'a mut usize,
-    pub(super) limit_exceeded: &'a mut bool,
+pub struct ScanState<'a> {
+    pub max_usages: usize,
+    pub hits: &'a mut BTreeSet<UsageHit>,
+    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
+    pub raw_match_count: &'a mut usize,
+    pub limit_exceeded: &'a mut bool,
 }
 
-pub(super) struct ReturnTypeCaches<'a> {
-    pub(super) method_return: &'a MethodReturnCache,
-    pub(super) method_anonymous_return: &'a MethodAnonymousReturnCache,
-    pub(super) file_return: &'a FileReturnCache,
+pub struct ReturnTypeCaches<'a> {
+    pub method_return: &'a MethodReturnCache,
+    pub method_anonymous_return: &'a MethodAnonymousReturnCache,
+    pub file_return: &'a FileReturnCache,
 }
 
-pub(super) struct ScanCtx<'a> {
-    pub(super) java: &'a JavaAnalyzer,
-    pub(super) analyzer: &'a dyn IAnalyzer,
-    pub(super) file: &'a ProjectFile,
-    pub(super) source: &'a str,
-    pub(super) root: Node<'a>,
-    pub(super) line_starts: &'a [usize],
-    pub(super) spec: &'a TargetSpec,
-    pub(super) bindings: &'a mut LocalInferenceEngine<String>,
-    pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) raw_match_count: &'a mut usize,
-    pub(super) max_usages: usize,
-    pub(super) limit_exceeded: &'a mut bool,
-    pub(super) class_ranges: ClassRangeIndex,
-    pub(super) method_call_return_cache:
+pub struct ScanCtx<'a> {
+    pub java: &'a dyn JavaSource,
+    pub graph: &'a JavaGraphSource<'a>,
+    pub file: &'a ProjectFile,
+    pub source: &'a str,
+    pub root: Node<'a>,
+    pub line_starts: &'a [usize],
+    pub spec: &'a TargetSpec,
+    pub bindings: &'a mut LocalInferenceEngine<String>,
+    pub hits: &'a mut BTreeSet<UsageHit>,
+    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
+    pub raw_match_count: &'a mut usize,
+    pub max_usages: usize,
+    pub limit_exceeded: &'a mut bool,
+    pub class_ranges: ClassRangeIndex,
+    pub method_call_return_cache:
         RefCell<HashMap<MethodCallReturnCacheKey, ReceiverAnalysisOutcome<String>>>,
-    pub(super) receiver_target_match_cache: RefCell<HashMap<String, ReceiverTargetMatch>>,
-    pub(super) method_return_cache: &'a MethodReturnCache,
-    pub(super) method_anonymous_return_cache: &'a MethodAnonymousReturnCache,
-    pub(super) file_return_cache: &'a FileReturnCache,
-    pub(super) enclosing_cache: HashMap<(usize, usize), hits::EnclosingContext>,
+    pub receiver_target_match_cache: RefCell<HashMap<String, ReceiverTargetMatch>>,
+    pub method_return_cache: &'a MethodReturnCache,
+    pub method_anonymous_return_cache: &'a MethodAnonymousReturnCache,
+    pub file_return_cache: &'a FileReturnCache,
+    pub enclosing_cache: HashMap<(usize, usize), hits::EnclosingContext>,
     class_scope_depths: Vec<usize>,
 }
 
@@ -79,18 +79,16 @@ impl ScanCtx<'_> {
     /// the reference. Only the universe of declarations widens here — Java's
     /// visibility rules are unchanged, so a class in another package still needs
     /// an import (#1239 milestone 4).
-    pub(super) fn resolve_realm_type_name(&self, type_name: &str) -> Option<CodeUnit> {
-        self.java.resolve_usage_type_name_in(
-            &self.analyzer.global_usage_definition_index(),
-            self.file,
-            type_name,
-        )
+    pub fn resolve_realm_type_name(&self, type_name: &str) -> Option<CodeUnit> {
+        self.graph.with_definitions(|definitions| {
+            resolve_java_usage_type_name_in(self.java, definitions, self.file, type_name)
+        })
     }
 }
 
-pub(super) fn scan_file(
-    java: &JavaAnalyzer,
-    analyzer: &dyn IAnalyzer,
+pub fn scan_file(
+    java: &dyn JavaSource,
+    graph: &JavaGraphSource<'_>,
     file: &ProjectFile,
     spec: &TargetSpec,
     return_caches: &ReturnTypeCaches<'_>,
@@ -121,7 +119,7 @@ pub(super) fn scan_file(
     seed_class_binding(java, file, spec, &mut bindings);
     let mut ctx = ScanCtx {
         java,
-        analyzer,
+        graph,
         file,
         source: &source,
         root: tree.root_node(),
@@ -133,7 +131,7 @@ pub(super) fn scan_file(
         raw_match_count: state.raw_match_count,
         max_usages: state.max_usages,
         limit_exceeded: state.limit_exceeded,
-        class_ranges: ClassRangeIndex::build(analyzer, file),
+        class_ranges: ClassRangeIndex::build(graph.index, file),
         method_call_return_cache: RefCell::new(HashMap::default()),
         receiver_target_match_cache: RefCell::new(HashMap::default()),
         method_return_cache: return_caches.method_return,
@@ -564,7 +562,7 @@ fn maybe_record_constructor_method_reference(
     let constructor_fqn = format!("{}.{}", owner.fq_name(), owner.identifier());
     let candidates = ctx
         .java
-        .global_usage_definition_index()
+        .usage_definitions()
         .fqn(&constructor_fqn)
         .into_iter()
         .filter(|candidate| candidate.is_function() && !candidate.is_synthetic())
@@ -700,7 +698,7 @@ fn method_reference_target_resolution(
     let owners = method_reference_owner_fq_names(receiver, ctx);
     let receiver_matches = owners
         .iter()
-        .filter_map(|owner| ctx.analyzer.definitions(owner).next())
+        .filter_map(|owner| ctx.graph.index.definitions(owner).next())
         .map(|owner| receiver_type_matches_target(&owner, ctx))
         .collect::<Vec<_>>();
     if receiver_matches
@@ -773,22 +771,22 @@ fn method_reference_owner_fq_names(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) ->
 fn method_reference_candidates_for_owner(owner_fq_name: &str, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
     let mut candidates = ctx
         .java
-        .global_usage_definition_index()
+        .usage_definitions()
         .fqn(&format!("{owner_fq_name}.{}", ctx.spec.member_name))
         .iter()
         .filter(|unit| unit.is_function())
         .cloned()
         .collect::<Vec<_>>();
-    let Some(owner) = ctx.analyzer.definitions(owner_fq_name).next() else {
+    let Some(owner) = ctx.graph.index.definitions(owner_fq_name).next() else {
         return candidates;
     };
-    let Some(provider) = ctx.analyzer.type_hierarchy_provider() else {
+    let Some(provider) = ctx.graph.hierarchy else {
         return candidates;
     };
     for ancestor in provider.get_ancestors(&owner) {
         candidates.extend(
             ctx.java
-                .global_usage_definition_index()
+                .usage_definitions()
                 .fqn(&format!("{}.{}", ancestor.fq_name(), ctx.spec.member_name))
                 .iter()
                 .filter(|unit| unit.is_function())

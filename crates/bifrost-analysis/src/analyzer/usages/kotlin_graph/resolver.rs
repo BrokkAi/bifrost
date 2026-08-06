@@ -292,7 +292,7 @@ pub(super) fn extension_receiver_fq_name(
 ///
 /// Shared with Java rather than restated, so the two JVM languages report the
 /// same budget when a chain exhausts it.
-use crate::analyzer::usages::java_graph::return_type::METHOD_RECEIVER_CHAIN_LIMIT;
+use brokk_bifrost_jvm::java::graph::return_type::METHOD_RECEIVER_CHAIN_LIMIT;
 
 /// How many ancestors deep a member lookup walks before giving up.
 const MAX_MEMBER_HIERARCHY_DEPTH: usize = 8;
