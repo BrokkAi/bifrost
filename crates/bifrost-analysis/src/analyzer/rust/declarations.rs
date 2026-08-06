@@ -3,8 +3,8 @@ use crate::analyzer::model::StructuredTypeIdentityBuilder;
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::usages::{ImportBinder, ImportKind};
 use crate::analyzer::{
-    CodeUnit, DispatchExtensibility, ParameterMetadata, ProjectFile, Range, SignatureMetadata,
-    StructuredTypeIdentity, StructuredTypeName,
+    CodeUnit, DispatchExtensibility, PackageAnchor, ParameterMetadata, ProjectFile, Range,
+    SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
 };
 use crate::hash::{HashMap, HashSet};
 use std::path::Path;
@@ -29,7 +29,7 @@ pub(crate) fn rust_file_package_fq(file: &ProjectFile) -> FqName {
     fq
 }
 
-fn rust_semantic_package_fq(package_name: &str) -> FqName {
+pub(super) fn rust_semantic_package_fq(package_name: &str) -> FqName {
     let mut fq = FqName::new();
     for component in package_name
         .split('.')
@@ -49,7 +49,18 @@ fn rust_child_fq_base(parent: Option<&CodeUnit>, file: &ProjectFile) -> FqName {
     }
 }
 
-use super::imports::rust_imports_from_use_declaration;
+/// A member's structured name is built on its parent's, so it is anchored
+/// wherever the parent is. This matters for the synthesized owner of an
+/// `impl crate::Type` / `impl super::Type` block: without inheritance its
+/// members would persist the extracting mount's path-derived package text.
+fn rust_inherit_package_anchor(code_unit: CodeUnit, parent: Option<&CodeUnit>) -> CodeUnit {
+    match parent.and_then(CodeUnit::package_anchor) {
+        Some(anchor) => code_unit.with_package_anchor(anchor),
+        None => code_unit,
+    }
+}
+
+use super::imports::{RustModuleAnchor, rust_imports_from_use_declaration};
 
 /// Text of `node` verbatim from source, EXCEPT that when `node` is one of
 /// tree-sitter-rust's identifier leaf kinds (see
@@ -535,14 +546,17 @@ fn visit_rust_function(
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
     let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Member));
-    let code_unit = CodeUnit::with_signature_and_fq(
-        file.clone(),
-        crate::analyzer::CodeUnitType::Function,
-        package_name.to_string(),
-        short_name,
-        signature,
-        false,
-        fq,
+    let code_unit = rust_inherit_package_anchor(
+        CodeUnit::with_signature_and_fq(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Function,
+            package_name.to_string(),
+            short_name,
+            signature,
+            false,
+            fq,
+        ),
+        parent,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     parsed.add_code_unit(
@@ -1414,14 +1428,17 @@ fn visit_rust_field(
         )),
     }
     .with_pushed(rust_segment(&name, SegmentKind::Member));
-    let code_unit = CodeUnit::with_signature_and_fq(
-        file.clone(),
-        crate::analyzer::CodeUnitType::Field,
-        package_name.to_string(),
-        short_name,
-        rust_impl_member_identity_signature(node, source),
-        false,
-        fq,
+    let code_unit = rust_inherit_package_anchor(
+        CodeUnit::with_signature_and_fq(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Field,
+            package_name.to_string(),
+            short_name,
+            rust_impl_member_identity_signature(node, source),
+            false,
+            fq,
+        ),
+        parent,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     parsed.add_code_unit(
@@ -1513,14 +1530,17 @@ fn visit_rust_alias(
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
     let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Member));
-    let code_unit = CodeUnit::with_signature_and_fq(
-        file.clone(),
-        crate::analyzer::CodeUnitType::Field,
-        package_name.to_string(),
-        short_name,
-        rust_impl_member_identity_signature(node, source),
-        false,
-        fq,
+    let code_unit = rust_inherit_package_anchor(
+        CodeUnit::with_signature_and_fq(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Field,
+            package_name.to_string(),
+            short_name,
+            rust_impl_member_identity_signature(node, source),
+            false,
+            fq,
+        ),
+        parent,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     parsed.add_code_unit(
@@ -1622,6 +1642,20 @@ fn visit_rust_impl(
 struct RustImplOwnerIdentity {
     package_name: String,
     short_name: String,
+    /// How `package_name` was resolved, so a persisted member of this owner can
+    /// be re-anchored against a live path instead of storing the path-derived
+    /// package text of the mount it was extracted from.
+    anchor: RustModuleAnchor,
+}
+
+fn rust_package_anchor(anchor: RustModuleAnchor) -> Option<PackageAnchor> {
+    match anchor {
+        RustModuleAnchor::Crate => Some(PackageAnchor::CrateRoot),
+        RustModuleAnchor::OwnModule { pop } => Some(PackageAnchor::OwnModule { pop }),
+        // A package rooted in another crate cannot be placed from this file's
+        // path; encoding falls back to persisting the complete name.
+        RustModuleAnchor::External => None,
+    }
 }
 
 fn rust_impl_owner(
@@ -1642,6 +1676,11 @@ fn rust_impl_owner(
     let local_identity = RustImplOwnerIdentity {
         package_name: lexical_package.clone(),
         short_name: target_path.join("."),
+        anchor: super::imports::rust_anchor_for_resolved_package(
+            &lexical_package,
+            package_name,
+            false,
+        ),
     };
     if let Some(owner) = rust_declared_impl_owner(parsed, &local_identity) {
         return Some(owner);
@@ -1658,9 +1697,15 @@ fn rust_impl_owner(
                 &super::imports::rust_crate_root_package(file),
                 &binding.module_specifier,
             )?;
+            let anchor = super::imports::rust_anchor_for_resolved_package(
+                &resolved_package,
+                package_name,
+                super::imports::rust_module_specifier_is_crate_rooted(&binding.module_specifier),
+            );
             RustImplOwnerIdentity {
                 package_name: resolved_package,
                 short_name: imported_name.clone(),
+                anchor,
             }
         } else {
             // Generic parameters and `Self` deliberately remain member namespaces only.
@@ -1669,7 +1714,13 @@ fn rust_impl_owner(
             local_identity
         }
     } else {
-        rust_impl_owner_identity_from_path(file, &lexical_package, &target_path, import_binder)?
+        rust_impl_owner_identity_from_path(
+            file,
+            &lexical_package,
+            package_name,
+            &target_path,
+            import_binder,
+        )?
     };
 
     rust_declared_impl_owner(parsed, &identity).or_else(|| {
@@ -1689,9 +1740,19 @@ fn rust_impl_owner(
                 .and_then(|suffix| suffix.strip_prefix('.'))
                 .map(|suffix| format!("{suffix}.{}", identity.short_name))
         };
-        let (owner_package, owner_short_name) = local_short_name
-            .map(|short_name| (package_name.to_string(), short_name))
-            .unwrap_or((identity.package_name, identity.short_name));
+        // Re-expressing the owner relative to this file's package also moves its
+        // anchor: the structured name is then built on the file's own package,
+        // whatever route the specifier took to name it.
+        let identity_anchor = identity.anchor;
+        let (owner_package, owner_short_name, owner_anchor) = local_short_name
+            .map(|short_name| {
+                (
+                    package_name.to_string(),
+                    short_name,
+                    RustModuleAnchor::OwnModule { pop: 0 },
+                )
+            })
+            .unwrap_or((identity.package_name, identity.short_name, identity_anchor));
         // This synthesized owner is not itself indexed, but its `fq` seeds the
         // structured names of the impl members that extend it. A resolved
         // owner path names modules before its terminal nominal type. Treating
@@ -1714,13 +1775,17 @@ fn rust_impl_owner(
             };
             fq.push(rust_segment(component, kind));
         }
-        Some(CodeUnit::new_fq(
+        let owner = CodeUnit::new_fq(
             file.clone(),
             crate::analyzer::CodeUnitType::Class,
             owner_package,
             owner_short_name,
             fq,
-        ))
+        );
+        Some(match rust_package_anchor(owner_anchor) {
+            Some(anchor) => owner.with_package_anchor(anchor),
+            None => owner,
+        })
     })
 }
 
@@ -1748,18 +1813,20 @@ fn rust_declared_impl_owner(
 
 fn rust_impl_owner_identity_from_path(
     file: &ProjectFile,
-    package_name: &str,
+    lexical_package: &str,
+    file_package: &str,
     path: &[String],
     import_binder: &ImportBinder,
 ) -> Option<RustImplOwnerIdentity> {
     let (name, module_path) = path.split_last()?;
     let crate_package = super::imports::rust_crate_root_package(file);
-    let package_name = if let Some((root, remainder)) = module_path.split_first()
+    let (package_name, module_specifier) = if let Some((root, remainder)) =
+        module_path.split_first()
         && let Some(binding) = import_binder.bindings.get(root)
         && binding.kind == ImportKind::Namespace
     {
         let mut resolved = super::imports::resolve_rust_module_path_with_crate(
-            package_name,
+            lexical_package,
             &crate_package,
             &binding.module_specifier,
         )?;
@@ -1769,19 +1836,26 @@ fn rust_impl_owner_identity_from_path(
             }
             resolved.push_str(component);
         }
-        resolved
+        (resolved, binding.module_specifier.clone())
     } else {
         let module_specifier = module_path.join("::");
-        super::imports::resolve_rust_module_path_with_crate(
-            package_name,
+        let resolved = super::imports::resolve_rust_module_path_with_crate(
+            lexical_package,
             &crate_package,
             &module_specifier,
-        )?
+        )?;
+        (resolved, module_specifier)
     };
+    let anchor = super::imports::rust_anchor_for_resolved_package(
+        &package_name,
+        file_package,
+        super::imports::rust_module_specifier_is_crate_rooted(&module_specifier),
+    );
 
     Some(RustImplOwnerIdentity {
         package_name,
         short_name: name.clone(),
+        anchor,
     })
 }
 
