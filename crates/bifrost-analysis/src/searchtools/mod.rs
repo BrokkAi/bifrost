@@ -306,14 +306,49 @@ fn code_unit_kind_name(kind: CodeUnitType) -> &'static str {
     kind.display_lowercase()
 }
 
+thread_local! {
+    /// Per-thread 1-entry memo for the C++ occurrence classifier. Building it
+    /// reparses the whole file with tree-sitter, and the definitions/scan
+    /// paths construct one per candidate unit -- on multi-megabyte generated
+    /// files (phalcon's 9.5 MB phalcon.zep.c, #1698) that meant one full parse
+    /// per candidate unit, hours per tool call. Keyed by (length, content
+    /// hash) so an edit invalidates; one entry per thread keeps it bounded.
+    static CPP_OCCURRENCE_CLASSIFIER: std::cell::RefCell<
+        Option<(usize, u64, Option<std::rc::Rc<crate::analyzer::CppOccurrenceClassifier>>)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+fn cpp_occurrence_classifier_for(
+    source: &str,
+) -> Option<std::rc::Rc<crate::analyzer::CppOccurrenceClassifier>> {
+    use std::hash::Hasher as _;
+    let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write(source.as_bytes());
+    let content_hash = hasher.finish();
+    CPP_OCCURRENCE_CLASSIFIER.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        match &*guard {
+            Some((cached_len, cached_hash, cached))
+                if *cached_len == source.len() && *cached_hash == content_hash =>
+            {
+                cached.clone()
+            }
+            _ => {
+                let built = crate::analyzer::CppOccurrenceClassifier::new(source)
+                    .map(std::rc::Rc::new);
+                *guard = Some((source.len(), content_hash, built.clone()));
+                built
+            }
+        }
+    })
+}
+
 fn primary_range(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<Range> {
-    let source = (language_for_target(code_unit) == Language::Cpp && code_unit.is_callable())
+    let classifier = (language_for_target(code_unit) == Language::Cpp && code_unit.is_callable())
         .then(|| analyzer.indexed_source(code_unit.source()))
-        .flatten();
-    let classifier = source
-        .as_deref()
-        .and_then(crate::analyzer::CppOccurrenceClassifier::new);
-    primary_range_with_cpp_classifier(analyzer, code_unit, classifier.as_ref())
+        .flatten()
+        .and_then(|source| cpp_occurrence_classifier_for(&source));
+    primary_range_with_cpp_classifier(analyzer, code_unit, classifier.as_deref())
 }
 
 fn primary_range_with_cpp_classifier(
