@@ -2,8 +2,8 @@
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, LanguageSupport, ReceiverFactContext, ReceiverFileCtx, ReceiverFileFacts,
-    ReceiverFileSetup, StructuralReceiverResolver, language_support,
+    BoundedReceiverQuery, LanguageSupport, ReceiverFactContext, StructuralReceiverResolver,
+    language_support,
 };
 use crate::analyzer::semantic::{
     AbstractObjectIdentity, CandidateCoverage, OracleLimitValues, OracleLimits, SemanticBudget,
@@ -27,7 +27,7 @@ use crate::analyzer::usages::get_type::{
 };
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverAnalysisReport, ReceiverAnalysisWork,
-    ReceiverBudgetLimit, ReceiverValue,
+    ReceiverBudgetLimit, ReceiverFileCtx, ReceiverFileFacts, ReceiverFileSetup, ReceiverValue,
 };
 use crate::analyzer::usages::receiver_sites::{
     ReceiverSiteIndex, ReceiverSiteIndexBuild, ReceiverSiteIndexLimit, ReceiverSiteInputMode,
@@ -608,6 +608,9 @@ impl<'a> ReceiverQueryService<'a> {
             report.work = ledger.work();
             return Ok(report);
         };
+        // The lookup is created language-blind and re-scoped per dispatch, the same
+        // way the Java receiver path re-scopes it before its own session runs.
+        self.definitions.set_language(language);
         let provider = factory.make_receiver_facts(ReceiverFactContext {
             analyzer: self.analyzer,
             definitions: &self.definitions,

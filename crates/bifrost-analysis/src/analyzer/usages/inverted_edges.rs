@@ -28,9 +28,9 @@
 //! every accounting rule — only the key type differs.
 
 pub(crate) use brokk_bifrost_core::analyzer::usages::inverted_edges::{
-    CallSite, ClassRangeIndex, FileDeclarations, FileEdgeScanInput, NodeKey, PerFileEdges,
-    UsageEdgeWeights, UsageEdges, UsageNodeKey, UsageReferenceCounts, classify_reference_node,
-    first_precise,
+    CallSite, ClassRangeIndex, FileDeclarations, FileEdgeScanInput, JsTsScopedNodeStatus,
+    JsTsScopedUsageEdges, NodeKey, PerFileEdges, UsageEdgeWeights, UsageEdges, UsageNodeKey,
+    UsageReferenceCounts, classify_reference_node, first_precise,
 };
 
 use crate::analyzer::tree_sitter_analyzer::FileState;

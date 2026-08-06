@@ -1,8 +1,16 @@
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
+use crate::analyzer::js_ts::imports::{
+    resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
+};
+use crate::analyzer::js_ts::syntax::parse_js_ts_tree;
 use crate::analyzer::js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, MAX_STATIC_IMPORT_BINDINGS_PER_NAME,
     direct_property_definitions, is_declaration_identifier, is_explicit_object_literal_key, slice,
+};
+use crate::analyzer::js_ts::type_text::{
+    jsts_type_space_candidates, jsts_unit_is_type_only, jsts_value_space_candidates,
+    ts_clean_type_text, ts_type_annotation_text,
 };
 use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::typescript::ts_is_global_internal_module;
@@ -872,94 +880,6 @@ fn resolve_js_ts_module_binding(
     js_ts_candidates_outcome(analyzer, candidates)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve_js_ts_module_binding_candidates(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    language: Language,
-    file: &ProjectFile,
-    module: &str,
-    exported_name: &str,
-    aliases: Option<&AliasResolver>,
-    value_position: bool,
-) -> Vec<CodeUnit> {
-    let files = crate::analyzer::resolve_js_ts_module_specifier(file, module, language, aliases);
-    if files.is_empty() {
-        return Vec::new();
-    }
-
-    let mut candidates = jsts_module_export_candidates(
-        analyzer,
-        support,
-        language,
-        &files,
-        exported_name,
-        value_position,
-    );
-    if value_position {
-        candidates = jsts_value_space_candidates(analyzer, candidates);
-    } else {
-        candidates = jsts_type_space_candidates(analyzer, candidates);
-    }
-    if candidates.is_empty() && exported_name == "default" {
-        for file in &files {
-            candidates.extend(
-                analyzer
-                    .declarations(file)
-                    .into_iter()
-                    .filter(|unit| unit.identifier() == "default"),
-            );
-        }
-        sort_units(&mut candidates);
-        candidates.dedup();
-        if value_position {
-            candidates = jsts_value_space_candidates(analyzer, candidates);
-        } else {
-            candidates = jsts_type_space_candidates(analyzer, candidates);
-        }
-    }
-    candidates
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve_js_ts_direct_import_candidates(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    language: Language,
-    file: &ProjectFile,
-    imports: &JsTsImportBinder,
-    name: &str,
-    aliases: Option<&AliasResolver>,
-    value_position: bool,
-) -> Option<Vec<CodeUnit>> {
-    let mut saw_direct_import = false;
-    let mut candidates = Vec::new();
-    for binding in imports.resolvable_direct_bindings_for(name) {
-        saw_direct_import = true;
-        let exported_name = match binding.kind {
-            ImportKind::Named => binding.imported_name.as_deref().unwrap_or(name),
-            ImportKind::Default => "default",
-            _ => unreachable!("direct bindings contain only named/default imports"),
-        };
-        candidates.extend(resolve_js_ts_module_binding_candidates(
-            analyzer,
-            support,
-            language,
-            file,
-            &binding.module_specifier,
-            exported_name,
-            aliases,
-            value_position,
-        ));
-    }
-    if !saw_direct_import {
-        return None;
-    }
-    sort_units(&mut candidates);
-    candidates.dedup();
-    Some(candidates)
-}
-
 /// Resolve a dotted FQN within one exact declaration file. JS/TS FQNs omit module
 /// paths, so callers that have already resolved a receiver must retain this scope.
 fn jsts_file_scoped_dotted_candidates(
@@ -1671,32 +1591,6 @@ fn jsts_unbound_assigned_property_shape<'a>(
     }
 
     found.then_some((object_name, property_name))
-}
-
-fn jsts_module_export_candidates(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    language: Language,
-    files: &[ProjectFile],
-    exported_name: &str,
-    value_position: bool,
-) -> Vec<CodeUnit> {
-    let Some(index) = cached_jsts_index(analyzer, language, None) else {
-        return Vec::new();
-    };
-
-    let bindings = index.local_bindings_for_exported_name(files, exported_name);
-    let mut candidates = Vec::new();
-    for (file, local_name) in bindings {
-        let file_candidates = support.file_identifier_in_files(&[file], &local_name);
-        candidates.extend(file_candidates);
-    }
-
-    if value_position {
-        jsts_value_space_candidates(analyzer, candidates)
-    } else {
-        jsts_type_space_candidates(analyzer, candidates)
-    }
 }
 
 pub(super) fn jsts_site_for_focus(mut site: ResolvedReferenceSite) -> ResolvedReferenceSite {
@@ -3764,19 +3658,6 @@ fn node_text_matches(node: Node<'_>, source: &str, expected: &str) -> bool {
         .is_some_and(|text| text.trim() == expected)
 }
 
-pub(crate) fn ts_type_annotation_text(node: Node<'_>, source: &str) -> String {
-    ts_clean_type_text(source.get(node.start_byte()..node.end_byte()).unwrap_or(""))
-}
-
-fn ts_clean_type_text(text: &str) -> String {
-    text.trim()
-        .trim_start_matches(':')
-        .trim()
-        .trim_end_matches(';')
-        .trim()
-        .to_string()
-}
-
 fn ts_field_type_text(signature: &str) -> Option<&str> {
     let (_, rhs) = signature.split_once(':')?;
     Some(
@@ -3909,76 +3790,6 @@ fn jsts_reference_is_type_position(mut node: Node<'_>) -> bool {
     }
 }
 
-fn jsts_value_space_candidates(
-    analyzer: &dyn IAnalyzer,
-    candidates: Vec<CodeUnit>,
-) -> Vec<CodeUnit> {
-    let value_candidates: Vec<_> = candidates
-        .iter()
-        .filter(|candidate| !jsts_unit_is_type_only(analyzer, candidate))
-        .cloned()
-        .collect();
-    if value_candidates.is_empty() {
-        candidates
-    } else {
-        value_candidates
-    }
-}
-
-pub(crate) fn jsts_type_space_candidates(
-    analyzer: &dyn IAnalyzer,
-    candidates: Vec<CodeUnit>,
-) -> Vec<CodeUnit> {
-    let type_candidates: Vec<_> = candidates
-        .iter()
-        .filter(|candidate| jsts_unit_is_type_only(analyzer, candidate))
-        .cloned()
-        .collect();
-    if type_candidates.is_empty() {
-        candidates
-    } else {
-        type_candidates
-    }
-}
-
-fn jsts_unit_is_type_only(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
-    if analyzer
-        .type_alias_provider()
-        .is_some_and(|provider| provider.is_type_alias(unit))
-    {
-        return true;
-    }
-    unit.signature().is_some_and(jsts_signature_is_type_only)
-        || analyzer
-            .signatures(unit)
-            .iter()
-            .any(|signature| jsts_signature_is_type_only(signature))
-}
-
-fn jsts_signature_is_type_only(signature: &str) -> bool {
-    let signature = signature.trim_start();
-    signature.starts_with("interface ")
-        || signature.starts_with("export interface ")
-        || signature.starts_with("declare interface ")
-        || signature.starts_with("export declare interface ")
-        || signature.starts_with("type ")
-        || signature.starts_with("export type ")
-        || signature.starts_with("declare type ")
-        || signature.starts_with("export declare type ")
-}
-
 fn is_bare_js_ts_specifier(module: &str) -> bool {
     !module.starts_with("./") && !module.starts_with("../") && !module.starts_with('/')
-}
-
-pub(crate) fn parse_js_ts_tree(
-    file: &ProjectFile,
-    source: &str,
-    language: Language,
-) -> Option<Tree> {
-    let mut parser = Parser::new();
-    let tree_sitter_language =
-        crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file(file, language)?;
-    parser.set_language(&tree_sitter_language).ok()?;
-    parser.parse(source, None)
 }

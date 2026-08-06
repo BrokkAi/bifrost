@@ -412,6 +412,29 @@ impl<K: Ord> Default for UsageEdgeWeights<K> {
     }
 }
 
+/// Why a scoped node did or did not become a proof seed.
+///
+/// Lives beside [`UsageEdgeWeights`] for the reason this module is generic at
+/// all: the module-scoped ecosystem (JS/TS) is the one that needs a per-node
+/// verdict, and the framework's dead-code proof reads all three variants.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JsTsScopedNodeStatus {
+    Resolved,
+    Ambiguous,
+    Unseedable,
+}
+
+/// Module-scoped edge weights plus the per-node seeding verdict that produced
+/// them.
+///
+/// `node_status` is a `BTreeMap` rather than a `HashMap`: the dead-code proof
+/// walks it, and a deterministic order keeps a proof's reported candidates
+/// stable across runs.
+pub struct JsTsScopedUsageEdges {
+    pub edges: UsageEdgeWeights<UsageNodeKey>,
+    pub node_status: BTreeMap<UsageNodeKey, JsTsScopedNodeStatus>,
+}
+
 /// Per-file declaration index for one source file, built in a single pass over
 /// the file's declarations. The driver builds it from an analyzer handle; a
 /// language scan only reads it, through [`FileEdgeScanInput`].

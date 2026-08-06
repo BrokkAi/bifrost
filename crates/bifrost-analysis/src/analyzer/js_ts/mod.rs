@@ -12,6 +12,7 @@ pub(crate) mod structural;
 pub(crate) mod syntax;
 pub(crate) mod tests;
 pub(crate) mod tsconfig;
+pub(crate) mod type_text;
 use crate::analyzer::store::LimitedQueryRows;
 
 pub use external::{

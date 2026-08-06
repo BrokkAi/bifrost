@@ -7,6 +7,9 @@
 #![allow(dead_code)]
 
 use crate::analyzer::{CodeUnit, Language, ProjectFile, Range};
+use crate::cancellation::CancellationToken;
+use std::any::Any;
+use std::sync::Arc;
 
 pub const DEFAULT_RECEIVER_CONTEXT_DEPTH: usize = 1;
 pub const DEFAULT_RECEIVER_MAX_TARGETS: usize = 4;
@@ -421,6 +424,84 @@ impl ReceiverFactProvider for NoopReceiverFactProvider {
     ) -> ReceiverAnalysisOutcome<ReceiverValue> {
         ReceiverAnalysisOutcome::Unknown
     }
+}
+
+/// Per-file receiver state a language builds once and reuses across the receiver queries of
+/// one request.
+///
+/// Opaque to the framework, which only stores it: the language that produced it is the only
+/// thing that reads it back. Retention is the point -- the JS/TS index and import binder
+/// cost a full tree walk each, so a query service prepares a file once and every later query
+/// against that file borrows the same value.
+pub struct ReceiverFileFacts(Arc<dyn Any + Send + Sync>);
+
+impl ReceiverFileFacts {
+    pub fn new<T: Any + Send + Sync>(facts: T) -> Self {
+        Self(Arc::new(facts))
+    }
+
+    pub fn downcast<T: Any + Send + Sync>(&self) -> &T {
+        self.0
+            .downcast_ref()
+            .expect("receiver facts are read back by the language that produced them")
+    }
+}
+
+/// What preparing one file for receiver queries produced, or why it produced nothing.
+///
+/// The three failure shapes are distinct observable outcomes, not degrees of one: an
+/// unparseable file is reported as unsupported, an oversized one charges its partial
+/// traversal and reports a budget limit, and a cancelled one aborts the query.
+pub enum ReceiverFileSetup {
+    Ready {
+        tree: tree_sitter::Tree,
+        facts: ReceiverFileFacts,
+        /// Nodes the setup traversal visited, charged against the query's scope budget.
+        visited: usize,
+    },
+    ParseFailed,
+    ExceededScope {
+        visited: usize,
+    },
+    Cancelled,
+}
+
+pub struct ReceiverFileCtx<'a> {
+    pub file: &'a ProjectFile,
+    pub language: Language,
+    pub source: &'a str,
+    pub max_scope_nodes: usize,
+    pub cancellation: Option<&'a CancellationToken>,
+}
+
+/// The operations a receiver query performs against one prepared file.
+///
+/// `'tree` is a trait parameter rather than a per-method one because an implementation
+/// borrows exactly one tree: a method-level `'tree` would demand an implementation valid for
+/// every tree, which a provider holding a root node cannot be.
+pub trait ReceiverFacts<'tree> {
+    /// The member expression this site names, or `None` when the site is not a member
+    /// access at all.
+    fn member_expression_at_site(
+        &self,
+        node: tree_sitter::Node<'tree>,
+    ) -> Option<tree_sitter::Node<'tree>>;
+
+    fn resolve_receiver(
+        &self,
+        node: tree_sitter::Node<'tree>,
+        budget: ReceiverAnalysisBudget,
+    ) -> ReceiverAnalysisReport<ReceiverValue>;
+
+    /// `None` means `site` is not a member access; the caller validates the site first, so
+    /// reaching `None` after that validation is a contradiction the caller treats as a bug.
+    fn resolve_member_targets_at_site(
+        &self,
+        site: tree_sitter::Node<'tree>,
+        expected_member: Option<&str>,
+        before_byte: usize,
+        budget: ReceiverAnalysisBudget,
+    ) -> Option<ReceiverMemberTargetReport>;
 }
 
 #[cfg(test)]

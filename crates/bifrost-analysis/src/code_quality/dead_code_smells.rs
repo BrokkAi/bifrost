@@ -10,8 +10,9 @@ use crate::analyzer::languages::{
     language_support,
 };
 use crate::analyzer::usages::ImportGraphCandidateProvider;
-use crate::analyzer::usages::inverted_edges::{NodeKey, UsageEdges, UsageNodeKey};
-use crate::analyzer::usages::js_ts_graph::{JsTsScopedNodeStatus, JsTsScopedUsageEdges};
+use crate::analyzer::usages::inverted_edges::{
+    JsTsScopedNodeStatus, JsTsScopedUsageEdges, NodeKey, UsageEdges, UsageNodeKey,
+};
 use crate::analyzer::usages::{
     CandidateFileProvider, FallbackCandidateProvider, FuzzyResult, TextSearchCandidateProvider,
     UsageAnalyzer, UsageHit, UsageHitKind, UsageHitSurface,

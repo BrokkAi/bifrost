@@ -78,8 +78,8 @@ pub(in crate::analyzer::usages) use crate::analyzer::js_ts::syntax::compute_impo
 use crate::analyzer::usages::inverted_edges::CallSite;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::inverted_edges::UsageNodeKey;
+use crate::analyzer::usages::inverted_edges::{JsTsScopedNodeStatus, JsTsScopedUsageEdges};
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageReferenceCounts};
-pub(crate) use inverted::{JsTsScopedNodeStatus, JsTsScopedUsageEdges};
 
 /// Build the whole JS/TS `caller -> callee` edge set in a single inverted pass per
 /// language present, merging TypeScript and JavaScript. Returns `None` when the
@@ -105,7 +105,7 @@ where
 /// Borrow the analyzer-cached [`JsTsUsageIndex`] for `language` off the concrete TS/JS
 /// analyzer behind `analyzer`, building it on first use. `None` when the analyzer does
 /// not expose the matching JS/TS analyzer.
-pub(in crate::analyzer::usages) fn cached_jsts_index(
+pub(crate) fn cached_jsts_index(
     analyzer: &dyn IAnalyzer,
     language: Language,
     cancellation: Option<&CancellationToken>,

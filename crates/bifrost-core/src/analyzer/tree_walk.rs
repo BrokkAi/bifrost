@@ -4,12 +4,14 @@
 //! byte-range readers that every language adapter needs and none of them can
 //! specialize: the leading-comment expansion behind chunk text, and the
 //! parse-error collector.
-//! Nothing here needs a grammar, an analyzer handle, or a store. The traversal
-//! helpers that do -- the budgeted walk with its cancellation token, and the
-//! per-language extractors -- stay in `brokk-bifrost-analysis`, which re-exports
-//! these at their original paths.
+//! Nothing here needs a grammar, an analyzer handle, or a store -- the budgeted
+//! walk charges its own counter against a caller-supplied limit and reads this
+//! crate's own cancellation token, so it belongs here too. The traversal helpers
+//! that do need those -- the per-language extractors -- stay in
+//! `brokk-bifrost-analysis`, which re-exports these at their original paths.
 
 use crate::analyzer::model::{ParseError, ParseErrorKind, Range};
+use crate::cancellation::CancellationToken;
 use tree_sitter::Node;
 
 /// The byte and 1-based line span a node covers. Language-blind: every adapter
@@ -117,6 +119,46 @@ pub fn try_walk_named_tree_preorder<'tree, Error>(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundedNamedTreeWalk {
+    Complete { visited: usize },
+    Exceeded { visited: usize },
+    Cancelled,
+}
+
+/// Visit named nodes in source-order preorder while applying the shared
+/// receiver/setup traversal budget and cancellation policy.
+pub fn walk_named_tree_preorder_bounded<'tree>(
+    root: Node<'tree>,
+    include_root: bool,
+    max_named_nodes: usize,
+    cancellation: Option<&CancellationToken>,
+    mut visit: impl FnMut(Node<'tree>),
+) -> BoundedNamedTreeWalk {
+    enum Stop {
+        Exceeded,
+        Cancelled,
+    }
+
+    let mut visited = 0usize;
+    let result = try_walk_named_tree_preorder(root, include_root, |node| {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(Stop::Cancelled);
+        }
+        visited = visited.saturating_add(1);
+        if visited > max_named_nodes {
+            return Err(Stop::Exceeded);
+        }
+        visit(node);
+        Ok(WalkControl::Continue)
+    });
+    match result {
+        Ok(()) => BoundedNamedTreeWalk::Complete { visited },
+        Err(Stop::Exceeded) => BoundedNamedTreeWalk::Exceeded { visited },
+        Err(Stop::Cancelled) => BoundedNamedTreeWalk::Cancelled,
+    }
 }
 
 /// Expand `start_byte` upward to include the declaration's own leading comment

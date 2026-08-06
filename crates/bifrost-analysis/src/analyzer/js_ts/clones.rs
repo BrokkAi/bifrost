@@ -1,3 +1,6 @@
+use crate::CloneSmellWeights;
+use crate::analyzer::clone_detection::{CloneCandidateData, compact_clone_excerpt};
+use crate::analyzer::{CodeUnit, CodeUnitIndex};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 const JS_TS_IDENTIFIER_TYPES: &[&str] = &["identifier", "property_identifier"];
@@ -58,6 +61,32 @@ fn normalize_js_ts_clone_leaf_token(node: Node<'_>, source: &str) -> String {
         return format!("OP:{token}");
     }
     format!("T:{kind}")
+}
+
+/// One clone-candidate profile for a JS or TS declaration. The dialect enters
+/// only as the grammar the normalizers parse with, so both analyzers call this.
+pub(crate) fn build_js_ts_clone_candidate_data(
+    index: &dyn CodeUnitIndex,
+    code_unit: &CodeUnit,
+    weights: CloneSmellWeights,
+    parser_language: TsLanguage,
+) -> Option<CloneCandidateData> {
+    index
+        .get_source(code_unit, false)
+        .map(|source| source.trim().to_string())
+        .filter(|source| !source.is_empty())
+        .and_then(|source| {
+            let normalized_tokens = normalized_clone_tokens_js_ts(&source, parser_language.clone());
+            if normalized_tokens.len() < weights.min_normalized_tokens.max(0) as usize {
+                return None;
+            }
+            Some(CloneCandidateData {
+                unit: code_unit.clone(),
+                normalized_tokens,
+                ast_signature: build_js_ts_clone_ast_signature(&source, parser_language),
+                excerpt: compact_clone_excerpt(&source),
+            })
+        })
 }
 
 pub(crate) fn build_js_ts_clone_ast_signature(source: &str, parser_language: TsLanguage) -> String {

@@ -30,9 +30,9 @@ use crate::analyzer::js_ts::syntax::{
 };
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
-    FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, UsageEdgeWeights, UsageNodeKey,
-    build_edge_output, build_edge_weights, classify_reference_node, collect_file_edges,
-    parse_and_collect,
+    FileEdgeScanInput, JsTsScopedNodeStatus, JsTsScopedUsageEdges, PerFileEdges,
+    UsageEdgeBuildOutput, UsageEdgeWeights, UsageNodeKey, build_edge_output, build_edge_weights,
+    classify_reference_node, collect_file_edges, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{ExportEntry, ImportKind};
@@ -125,18 +125,6 @@ where
             ctx.edges
         })
     })
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum JsTsScopedNodeStatus {
-    Resolved,
-    Ambiguous,
-    Unseedable,
-}
-
-pub(crate) struct JsTsScopedUsageEdges {
-    pub(crate) edges: UsageEdgeWeights<UsageNodeKey>,
-    pub(crate) node_status: BTreeMap<UsageNodeKey, JsTsScopedNodeStatus>,
 }
 
 pub(super) fn build_jsts_scoped_edges<F>(

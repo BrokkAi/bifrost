@@ -8,7 +8,7 @@ use crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file;
 use crate::analyzer::usages::reexport_seeds;
 use crate::analyzer::usages::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::{
-    AliasResolver, CodeUnit, IAnalyzer, Language, ProjectFile, resolve_js_ts_module_specifier,
+    AliasResolver, CodeUnit, CodeUnitIndex, Language, ProjectFile, resolve_js_ts_module_specifier,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
@@ -37,7 +37,7 @@ pub(crate) struct JsTsUsageIndex {
 /// the syntax trees as soon as the per-file indices are computed (the maps are the only
 /// thing the analyzer caches; the scan phase re-parses its candidate files on demand).
 pub(crate) fn build_jsts_usage_index(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     language: Language,
     parallel: bool,
 ) -> JsTsUsageIndex {
@@ -45,7 +45,7 @@ pub(crate) fn build_jsts_usage_index(
 }
 
 pub(crate) fn build_jsts_usage_index_with_cancellation(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     language: Language,
     parallel: bool,
     cancellation: Option<&CancellationToken>,
@@ -323,7 +323,7 @@ impl JsTsUsageIndex {
 }
 
 pub(super) fn combine_jsts_usage_indices<'a>(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     indices: impl Iterator<Item = &'a JsTsUsageIndex>,
 ) -> JsTsUsageIndex {
     let mut exports_by_file = HashMap::default();
@@ -670,7 +670,10 @@ fn export_names_for_file(
     names
 }
 
-pub(super) fn collect_jsts_files(analyzer: &dyn IAnalyzer, language: Language) -> Vec<ProjectFile> {
+pub(super) fn collect_jsts_files(
+    analyzer: &dyn CodeUnitIndex,
+    language: Language,
+) -> Vec<ProjectFile> {
     let mut result = analyzed_files_for_language(analyzer, language);
     result.sort();
     result.dedup();
@@ -715,7 +718,7 @@ pub(in crate::analyzer::usages) fn browser_global_property_shape(
 }
 
 pub(in crate::analyzer::usages) fn unbound_browser_global_property<'a>(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     target: &'a CodeUnit,
     root: Node<'_>,
     source: &str,

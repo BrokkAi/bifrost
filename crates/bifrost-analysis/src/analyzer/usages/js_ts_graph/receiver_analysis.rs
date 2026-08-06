@@ -6,26 +6,25 @@
 //! returns a constructed value.
 
 use crate::analyzer::js_ts::imports::require_call_module_specifier;
-use crate::analyzer::js_ts::syntax::{JsTsImportBinder, slice};
-use crate::analyzer::languages::{
-    ReceiverFactContext, ReceiverFacts, ReceiverFactsFactory, ReceiverFileCtx, ReceiverFileFacts,
-    ReceiverFileSetup,
+use crate::analyzer::js_ts::imports::{
+    resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
 };
+use crate::analyzer::js_ts::syntax::parse_js_ts_tree;
+use crate::analyzer::js_ts::syntax::{JsTsImportBinder, slice};
+use crate::analyzer::js_ts::type_text::ts_type_annotation_text;
+use crate::analyzer::languages::{ReceiverFactContext, ReceiverFactsFactory};
 use crate::analyzer::tree_sitter_analyzer::{
     BoundedNamedTreeWalk, walk_named_tree_preorder_bounded,
 };
 use crate::analyzer::tree_walk::subtree_contains;
-use crate::analyzer::usages::get_definition::js_ts::{
-    parse_js_ts_tree, resolve_js_ts_direct_import_candidates,
-    resolve_js_ts_module_binding_candidates, ts_resolve_type_text_to_property_owners,
-    ts_type_annotation_text,
-};
+use crate::analyzer::usages::get_definition::js_ts::ts_resolve_type_text_to_property_owners;
 use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
 use crate::analyzer::usages::model::ImportKind;
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisBudgetTracker, ReceiverAnalysisCacheKey,
     ReceiverAnalysisOutcome, ReceiverAnalysisQuery, ReceiverAnalysisReport, ReceiverContext,
-    ReceiverFactProvider, ReceiverMemberTargetReport, ReceiverSummaryQuery, ReceiverValue,
+    ReceiverFactProvider, ReceiverFacts, ReceiverFileCtx, ReceiverFileFacts, ReceiverFileSetup,
+    ReceiverMemberTargetReport, ReceiverSummaryQuery, ReceiverValue,
 };
 use crate::analyzer::usages::reference_site::{node_range, smallest_named_node_covering};
 use crate::analyzer::{
@@ -93,7 +92,6 @@ impl ReceiverFactsFactory for JsTsReceiverFacts {
         ctx: ReceiverFactContext<'a, 'tree>,
     ) -> Box<dyn ReceiverFacts<'tree> + 'a> {
         let facts = ctx.facts.downcast::<JsTsReceiverFileFacts>();
-        ctx.definitions.set_language(ctx.language);
         Box::new(JsTsReceiverFactProvider::new_with_syntax_index(
             ctx.analyzer,
             ctx.definitions,

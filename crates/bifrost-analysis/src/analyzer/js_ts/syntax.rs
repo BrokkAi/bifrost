@@ -1,11 +1,11 @@
-use crate::analyzer::Range;
 use crate::analyzer::js_ts::imports::{
     CommonJsRequireBindingKind, commonjs_require_module_specifier_from_declarator,
     parse_commonjs_require_bindings_from_node,
 };
 use crate::analyzer::usages::{ImportBinding, ImportKind};
+use crate::analyzer::{Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
-use tree_sitter::{Node, Tree};
+use tree_sitter::{Node, Parser, Tree};
 
 pub(crate) const MAX_STATIC_IMPORT_BINDINGS_PER_NAME: usize = 64;
 
@@ -773,6 +773,18 @@ fn unquote(text: &str) -> String {
                 .and_then(|value| value.strip_suffix('\''))
         });
     stripped.unwrap_or(trimmed).to_string()
+}
+
+pub(crate) fn parse_js_ts_tree(
+    file: &ProjectFile,
+    source: &str,
+    language: Language,
+) -> Option<Tree> {
+    let mut parser = Parser::new();
+    let tree_sitter_language =
+        crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file(file, language)?;
+    parser.set_language(&tree_sitter_language).ok()?;
+    parser.parse(source, None)
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use crate::analyzer::js_ts::AliasResolver;
 use crate::analyzer::js_ts::model::node_text;
 use crate::analyzer::usages::{ImportKind, js_ts_graph::JsTsUsageIndex};
 use crate::analyzer::{
-    CodeUnit, DirectDescendantIndex, IAnalyzer, Language, ProjectFile, TypeHierarchyProvider,
+    CodeUnit, CodeUnitIndex, DirectDescendantIndex, Language, ProjectFile, TypeHierarchyProvider,
     resolve_js_ts_module_specifier,
 };
 use crate::hash::{HashMap, HashSet};
@@ -65,7 +65,7 @@ fn collect_ts_heritage_types(
 }
 
 pub(crate) fn resolve_direct_ancestors(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     index: &JsTsUsageIndex,
     language: Language,
     alias_resolver: &AliasResolver,
@@ -96,12 +96,11 @@ pub(crate) fn resolve_direct_ancestors(
     ancestors
 }
 
-pub(crate) fn build_direct_descendant_index_by_unit<A, P>(
-    analyzer: &A,
+pub(crate) fn build_direct_descendant_index_by_unit<P>(
+    analyzer: &dyn CodeUnitIndex,
     provider: &P,
 ) -> DirectDescendantIndex
 where
-    A: IAnalyzer,
     P: TypeHierarchyProvider + ?Sized,
 {
     let mut nodes = analyzer
@@ -186,7 +185,7 @@ fn non_empty_node_text(node: Node<'_>, source: &str) -> Option<String> {
 }
 
 fn resolve_unique_type(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     index: &JsTsUsageIndex,
     language: Language,
     alias_resolver: &AliasResolver,
@@ -208,7 +207,7 @@ fn resolve_unique_type(
 }
 
 fn resolve_imported_type(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     index: &JsTsUsageIndex,
     language: Language,
     alias_resolver: &AliasResolver,
@@ -250,7 +249,7 @@ fn resolve_imported_type(
 }
 
 fn resolve_local_import_binding(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     index: &JsTsUsageIndex,
     language: Language,
     alias_resolver: &AliasResolver,
@@ -284,7 +283,7 @@ fn resolve_local_import_binding(
 }
 
 fn exported_type_declarations(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     index: &JsTsUsageIndex,
     module_files: &[ProjectFile],
     exported_name: &str,
@@ -297,7 +296,7 @@ fn exported_type_declarations(
 }
 
 fn type_declarations_in_file(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     file: &ProjectFile,
     identifier: &str,
 ) -> Vec<CodeUnit> {

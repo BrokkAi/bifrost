@@ -10,7 +10,7 @@ pub(crate) use brokk_bifrost_core::analyzer::usages::common::{
 };
 
 use crate::analyzer::common as analyzer_common;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile};
 
 pub(crate) fn language_for_target(target: &CodeUnit) -> Language {
     language_for_file(target.source())
@@ -33,7 +33,7 @@ pub(super) fn language_for_file(file: &ProjectFile) -> Language {
 }
 
 pub(crate) fn analyzed_files_for_language(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     language: Language,
 ) -> Vec<ProjectFile> {
     let mut files: Vec<ProjectFile> = analyzer

@@ -1,12 +1,14 @@
 // The traversal primitives and the two byte-range readers below them are pure
 // tree-sitter node arithmetic, so they live in `brokk-bifrost-core` and are
-// re-exported here at the paths every caller already uses. What stays is what
-// needs more than a node: `walk_named_tree_preorder_bounded` (traversal budget
-// plus cancellation) and everything built on `FileState`.
+// re-exported here at the paths every caller already uses. The budgeted walk
+// followed them there with the receiver-facts vocabulary it serves: its counter
+// is its own and its cancellation token is a core type. What stays is
+// everything built on `FileState`.
 pub use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
 pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{
-    WalkControl, expanded_comment_start, node_range, try_walk_named_tree_preorder,
-    walk_named_tree_preorder, walk_tree_preorder,
+    BoundedNamedTreeWalk, WalkControl, expanded_comment_start, node_range,
+    try_walk_named_tree_preorder, walk_named_tree_preorder, walk_named_tree_preorder_bounded,
+    walk_tree_preorder,
 };
 
 // `PreparedSyntaxTree` and its source backing hold model data plus a live
@@ -55,7 +57,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
-use tree_sitter::{Language as TsLanguage, Node, ParseOptions, Parser, Tree};
+use tree_sitter::{Language as TsLanguage, ParseOptions, Parser, Tree};
 
 // `FileState` holds the full parsed source (`source: String`) plus every
 // declaration-shaped collection derived from it (imports, signatures,
@@ -168,13 +170,6 @@ pub(crate) enum BulkFileStateSource {
     Omit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BoundedNamedTreeWalk {
-    Complete { visited: usize },
-    Exceeded { visited: usize },
-    Cancelled,
-}
-
 #[derive(Clone)]
 pub(crate) struct AnalyzerStoreContext {
     pub(crate) store: Arc<AnalyzerStore>,
@@ -232,39 +227,6 @@ fn store_context_from_store(project: &dyn Project, store: AnalyzerStore) -> Anal
         live_paths: Arc::new(LivePathMap::default()),
         generations: Arc::new(HashMap::default()),
         startup_cache_validation: StartupCacheValidation::FullIntegrity,
-    }
-}
-
-/// Visit named nodes in source-order preorder while applying the shared
-/// receiver/setup traversal budget and cancellation policy.
-pub(crate) fn walk_named_tree_preorder_bounded<'tree>(
-    root: Node<'tree>,
-    include_root: bool,
-    max_named_nodes: usize,
-    cancellation: Option<&CancellationToken>,
-    mut visit: impl FnMut(Node<'tree>),
-) -> BoundedNamedTreeWalk {
-    enum Stop {
-        Exceeded,
-        Cancelled,
-    }
-
-    let mut visited = 0usize;
-    let result = try_walk_named_tree_preorder(root, include_root, |node| {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err(Stop::Cancelled);
-        }
-        visited = visited.saturating_add(1);
-        if visited > max_named_nodes {
-            return Err(Stop::Exceeded);
-        }
-        visit(node);
-        Ok(WalkControl::Continue)
-    });
-    match result {
-        Ok(()) => BoundedNamedTreeWalk::Complete { visited },
-        Err(Stop::Exceeded) => BoundedNamedTreeWalk::Exceeded { visited },
-        Err(Stop::Cancelled) => BoundedNamedTreeWalk::Cancelled,
     }
 }
 

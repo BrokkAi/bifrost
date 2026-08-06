@@ -1,13 +1,10 @@
 use crate::analyzer::clone_detection::{
-    CloneCandidateData, CloneCandidateProfile, compact_clone_excerpt,
-    detect_structural_clone_smells, refine_clone_similarity_with_ast,
+    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::fq_name::{FqName, SegmentKind};
 use crate::analyzer::js_ts::cache::JsTsMemoCaches;
-use crate::analyzer::js_ts::clones::{
-    build_js_ts_clone_ast_signature, normalized_clone_tokens_js_ts,
-};
+use crate::analyzer::js_ts::clones::build_js_ts_clone_candidate_data;
 use crate::analyzer::js_ts::diagnostics::collect_javascript_semantic_diagnostics;
 use crate::analyzer::js_ts::hierarchy::extract_js_supertypes;
 use crate::analyzer::js_ts::identifiers::collect_js_ts_identifiers;
@@ -215,12 +212,6 @@ pub struct JavascriptAnalyzer {
 }
 
 impl JsTsAnalyzerHost for JavascriptAnalyzer {
-    type Adapter = JavascriptAdapter;
-
-    fn ts_inner(&self) -> &TreeSitterAnalyzer<JavascriptAdapter> {
-        &self.inner
-    }
-
     fn memo_caches(&self) -> &JsTsMemoCaches {
         &self.memo_caches
     }
@@ -231,6 +222,33 @@ impl JsTsAnalyzerHost for JavascriptAnalyzer {
 
     fn js_ts_language(&self) -> Language {
         Language::JavaScript
+    }
+
+    fn js_ts_all_files(&self) -> Vec<ProjectFile> {
+        self.inner.all_files()
+    }
+
+    fn js_ts_bulk_import_infos(
+        &self,
+        files: &[ProjectFile],
+    ) -> HashMap<ProjectFile, Vec<ImportInfo>> {
+        self.inner.bulk_import_infos(files.iter().cloned())
+    }
+
+    fn js_ts_raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.inner.raw_supertypes_of(code_unit)
+    }
+
+    fn js_ts_import_statements(&self, file: &ProjectFile) -> Vec<String> {
+        self.inner.import_statements(file)
+    }
+
+    fn js_ts_is_type_alias(&self, code_unit: &CodeUnit) -> bool {
+        self.inner.is_type_alias(code_unit)
+    }
+
+    fn js_ts_raw_signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.inner.signatures_vec_of(code_unit)
     }
 }
 
@@ -319,15 +337,6 @@ impl JavascriptAnalyzer {
 
     pub fn extract_type_identifiers(&self, source: &str) -> BTreeSet<String> {
         extract_js_type_identifiers(source)
-    }
-
-    fn module_import_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
-        if !code_unit.is_module() {
-            return None;
-        }
-
-        let imports = self.inner.import_statements(code_unit.source());
-        (!imports.is_empty()).then(|| imports.join("\n"))
     }
 }
 impl ImportAnalysisProvider for JavascriptAnalyzer {
@@ -513,12 +522,12 @@ impl CodeUnitIndex for JavascriptAnalyzer {
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.module_import_skeleton(code_unit)
+        providers::module_import_skeleton(self, code_unit)
             .or_else(|| self.inner.get_skeleton(code_unit))
     }
 
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.module_import_skeleton(code_unit)
+        providers::module_import_skeleton(self, code_unit)
             .or_else(|| self.inner.get_skeleton_header(code_unit))
     }
 
@@ -752,7 +761,14 @@ impl IAnalyzer for JavascriptAnalyzer {
                 code_unit.is_function()
                     && matches!(file_language(code_unit.source()), Language::JavaScript)
             })
-            .filter_map(|code_unit| self.build_clone_candidate_data(&code_unit, weights))
+            .filter_map(|code_unit| {
+                build_js_ts_clone_candidate_data(
+                    self,
+                    &code_unit,
+                    weights,
+                    tree_sitter_javascript::LANGUAGE.into(),
+                )
+            })
             .map(|candidate| CloneCandidateProfile::create(candidate, weights))
             .collect();
         if all_candidates.is_empty() {
@@ -810,33 +826,6 @@ impl crate::analyzer::AnalyzerTestHooks for JavascriptAnalyzer {
 
     fn workspace_path_scan_count_for_test(&self) -> usize {
         self.inner.test_hooks().workspace_path_scan_count_for_test()
-    }
-}
-impl JavascriptAnalyzer {
-    fn build_clone_candidate_data(
-        &self,
-        code_unit: &CodeUnit,
-        weights: CloneSmellWeights,
-    ) -> Option<CloneCandidateData> {
-        self.get_source(code_unit, false)
-            .map(|source| source.trim().to_string())
-            .filter(|source| !source.is_empty())
-            .and_then(|source| {
-                let normalized_tokens =
-                    normalized_clone_tokens_js_ts(&source, tree_sitter_javascript::LANGUAGE.into());
-                if normalized_tokens.len() < weights.min_normalized_tokens.max(0) as usize {
-                    return None;
-                }
-                Some(CloneCandidateData {
-                    unit: code_unit.clone(),
-                    normalized_tokens,
-                    ast_signature: build_js_ts_clone_ast_signature(
-                        &source,
-                        tree_sitter_javascript::LANGUAGE.into(),
-                    ),
-                    excerpt: compact_clone_excerpt(&source),
-                })
-            })
     }
 }
 fn visit_js_export(

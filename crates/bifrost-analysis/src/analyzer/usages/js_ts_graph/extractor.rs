@@ -5,9 +5,8 @@ use crate::analyzer::js_ts::syntax::{
     is_lexically_nested_type_declaration, is_object_in_member_expression,
     is_property_key_in_member, nested_type_identifier_parts, slice, static_member_receiver,
 };
-use crate::analyzer::usages::get_definition::js_ts::{
-    ts_resolve_type_text_to_property_owners, ts_type_annotation_text,
-};
+use crate::analyzer::js_ts::type_text::ts_type_annotation_text;
+use crate::analyzer::usages::get_definition::js_ts::ts_resolve_type_text_to_property_owners;
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::js_ts_graph::JsTsReceiverFactProvider;
 use crate::analyzer::usages::js_ts_graph::hits::{

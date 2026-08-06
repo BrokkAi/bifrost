@@ -2,12 +2,14 @@ use super::{
     TypeLookupOutcome, candidates_outcome, candidates_outcome_with_target_kind, no_type,
     type_reference_outcome,
 };
+use crate::analyzer::js_ts::imports::{
+    resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
+};
 use crate::analyzer::js_ts::syntax::JsTsImportBinder;
+use crate::analyzer::js_ts::type_text::{jsts_type_space_candidates, ts_type_annotation_text};
 use crate::analyzer::usages::get_definition::js_ts::{
-    jsts_type_space_candidates, resolve_js_ts_direct_import_candidates,
-    resolve_js_ts_module_binding_candidates, ts_function_return_property_owners,
-    ts_receiver_owner_candidates_at_byte, ts_resolve_type_text_to_property_owners,
-    ts_type_annotation_text,
+    ts_function_return_property_owners, ts_receiver_owner_candidates_at_byte,
+    ts_resolve_type_text_to_property_owners,
 };
 use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
 use crate::analyzer::usages::model::ImportKind;

@@ -17,29 +17,70 @@ use crate::analyzer::usages::js_ts_graph::{
     JsTsUsageIndex, build_jsts_usage_index, build_jsts_usage_index_with_cancellation,
 };
 use crate::analyzer::{
-    AliasResolver, CodeUnit, IAnalyzer, ImportInfo, Language, LanguageAdapter, ProjectFile,
-    TreeSitterAnalyzer, TypeHierarchyProvider, memoized_reverse_import_index,
+    AliasResolver, CodeUnit, ImportAnalysisProvider, ImportInfo, Language, ProjectFile,
+    TypeHierarchyProvider, memoized_reverse_import_index,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// The shared surface the JS/TS provider logic needs from a concrete analyzer:
-/// its wrapped tree-sitter analyzer, its cache bucket, its alias resolver, and
-/// its language tag. Implemented once per adapter as trivial field accessors.
-pub(crate) trait JsTsAnalyzerHost: IAnalyzer + TypeHierarchyProvider {
-    type Adapter: LanguageAdapter;
-
-    fn ts_inner(&self) -> &TreeSitterAnalyzer<Self::Adapter>;
+/// The shared surface the JS/TS provider logic needs from a concrete analyzer,
+/// on top of the three core capability traits it reads declarations, imports and
+/// supertypes with: its cache bucket, its alias resolver, its language tag, and
+/// the four `TreeSitterAnalyzer` queries that have no core spelling.
+///
+/// Implemented once per adapter as trivial field accessors and one-line
+/// delegations into the wrapped analyzer, so the two `impl` blocks reduce to
+/// forwarding and no free function below can reach past this surface.
+///
+/// Three of the six analyzer queries the providers make are already core:
+/// `import_info_of` on [`ImportAnalysisProvider`], `top_level_declarations` and
+/// `get_source` on [`CodeUnitIndex`] -- both analyzers' impls of all three are
+/// the same one-line delegation the free functions used directly before. The
+/// four named below are not: `js_ts_all_files` is the analyzed *live* file set
+/// (`CodeUnitIndex::analyzed_files` is a different query),
+/// `js_ts_bulk_import_infos` has no core counterpart,
+/// `js_ts_raw_supertypes_of` returns the unresolved supertype spellings that
+/// [`TypeHierarchyProvider`] never exposes, and `js_ts_import_statements` reads
+/// the raw import statement text the module skeleton renders.
+pub(crate) trait JsTsAnalyzerHost:
+    CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider
+{
     fn memo_caches(&self) -> &JsTsMemoCaches;
     fn alias_resolver(&self) -> &AliasResolver;
     fn js_ts_language(&self) -> Language;
+
+    /// The analyzed live file set (`TreeSitterAnalyzer::all_files`).
+    fn js_ts_all_files(&self) -> Vec<ProjectFile>;
+
+    /// Import facts for a group of files in one read.
+    fn js_ts_bulk_import_infos(
+        &self,
+        files: &[ProjectFile],
+    ) -> HashMap<ProjectFile, Vec<ImportInfo>>;
+
+    /// The supertype names written on `code_unit`, unresolved.
+    fn js_ts_raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String>;
+
+    /// The file's import statements as written, used to render a module skeleton.
+    fn js_ts_import_statements(&self, file: &ProjectFile) -> Vec<String>;
+
+    /// Whether the indexed declaration is a type alias. Distinct from
+    /// `TypeAliasProvider::is_type_alias`, which only TypeScript answers: this
+    /// reads the analyzer's own index, so both dialects can answer it and only
+    /// TypeScript's skeleton path asks.
+    fn js_ts_is_type_alias(&self, code_unit: &CodeUnit) -> bool;
+
+    /// The indexed signatures for `code_unit` exactly as stored. TypeScript's
+    /// `CodeUnitIndex::signatures` appends a `;` to alias signatures for
+    /// rendering, which the alias skeleton must not double up on.
+    fn js_ts_raw_signatures(&self, code_unit: &CodeUnit) -> Vec<String>;
 }
 
 // --- ImportAnalysisProvider ------------------------------------------------
 
-pub(crate) fn imported_code_units_of<T: JsTsAnalyzerHost>(
-    host: &T,
+pub(crate) fn imported_code_units_of(
+    host: &dyn JsTsAnalyzerHost,
     file: &ProjectFile,
 ) -> HashSet<CodeUnit> {
     let caches = host.memo_caches();
@@ -47,7 +88,7 @@ pub(crate) fn imported_code_units_of<T: JsTsAnalyzerHost>(
         return (*cached).clone();
     }
 
-    let resolved = resolve_imported_code_units(host, file, host.ts_inner().import_info_of(file));
+    let resolved = resolve_imported_code_units(host, file, host.import_info_of(file));
 
     caches
         .imported_code_units
@@ -59,20 +100,19 @@ pub(crate) fn imported_code_units_of<T: JsTsAnalyzerHost>(
 /// unlike Python's binding-name-keyed cache, stores a plain `HashSet<CodeUnit>` with no collision risk
 /// -- so routing through it (rather than re-resolving from the passed-in `imports`) is both correct and
 /// gets the caching this hook exists to provide, shared with `could_import_file` below.
-pub(crate) fn imported_code_units_from_infos<T: JsTsAnalyzerHost>(
-    host: &T,
+pub(crate) fn imported_code_units_from_infos(
+    host: &dyn JsTsAnalyzerHost,
     file: &ProjectFile,
     _imports: &[ImportInfo],
 ) -> Option<HashSet<CodeUnit>> {
     Some(imported_code_units_of(host, file))
 }
 
-fn resolve_imported_code_units<T: JsTsAnalyzerHost>(
-    host: &T,
+fn resolve_imported_code_units(
+    host: &dyn JsTsAnalyzerHost,
     file: &ProjectFile,
     imports: impl IntoIterator<Item = ImportInfo>,
 ) -> HashSet<CodeUnit> {
-    let inner = host.ts_inner();
     let language = host.js_ts_language();
     let alias_resolver = host.alias_resolver();
     let mut resolved = HashSet::default();
@@ -80,7 +120,7 @@ fn resolve_imported_code_units<T: JsTsAnalyzerHost>(
         for target in
             resolve_js_ts_import_paths(file, &import.raw_snippet, language, Some(alias_resolver))
         {
-            let top_level = inner.top_level_declarations(&target);
+            let top_level = host.top_level_declarations(&target);
             if import.is_wildcard {
                 resolved.extend(
                     top_level
@@ -122,8 +162,8 @@ fn resolve_imported_code_units<T: JsTsAnalyzerHost>(
     resolved
 }
 
-pub(crate) fn referencing_files_of<T: JsTsAnalyzerHost>(
-    host: &T,
+pub(crate) fn referencing_files_of(
+    host: &dyn JsTsAnalyzerHost,
     file: &ProjectFile,
 ) -> HashSet<ProjectFile> {
     let caches = host.memo_caches();
@@ -133,7 +173,7 @@ pub(crate) fn referencing_files_of<T: JsTsAnalyzerHost>(
 
     let reverse_index = memoized_reverse_import_index(
         &caches.reverse_import_index,
-        || host.ts_inner().all_files(),
+        || host.js_ts_all_files(),
         |candidate| imported_code_units_of(host, candidate),
     );
     let referencing = reverse_index
@@ -147,15 +187,15 @@ pub(crate) fn referencing_files_of<T: JsTsAnalyzerHost>(
     referencing
 }
 
-pub(crate) fn import_infos_for_files<T: JsTsAnalyzerHost>(
-    host: &T,
+pub(crate) fn import_infos_for_files(
+    host: &dyn JsTsAnalyzerHost,
     files: &[ProjectFile],
 ) -> Option<HashMap<ProjectFile, Vec<ImportInfo>>> {
-    Some(host.ts_inner().bulk_import_infos(files.iter().cloned()))
+    Some(host.js_ts_bulk_import_infos(files))
 }
 
-pub(crate) fn imported_files_from_infos<T: JsTsAnalyzerHost>(
-    host: &T,
+pub(crate) fn imported_files_from_infos(
+    host: &dyn JsTsAnalyzerHost,
     file: &ProjectFile,
     imports: &[ImportInfo],
 ) -> Option<HashSet<ProjectFile>> {
@@ -176,8 +216,8 @@ pub(crate) fn imported_files_from_infos<T: JsTsAnalyzerHost>(
     )
 }
 
-pub(crate) fn relevant_imports_for<T: JsTsAnalyzerHost>(
-    host: &T,
+pub(crate) fn relevant_imports_for(
+    host: &dyn JsTsAnalyzerHost,
     code_unit: &CodeUnit,
 ) -> HashSet<String> {
     let caches = host.memo_caches();
@@ -185,10 +225,9 @@ pub(crate) fn relevant_imports_for<T: JsTsAnalyzerHost>(
         return (*cached).clone();
     }
 
-    let inner = host.ts_inner();
-    let source = inner.get_source(code_unit, false).unwrap_or_default();
+    let source = host.get_source(code_unit, false).unwrap_or_default();
     let mut relevant = HashSet::default();
-    for import in inner.import_info_of(code_unit.source()) {
+    for import in host.import_info_of(code_unit.source()) {
         let tokens = import_info_tokens(&import);
         if tokens.is_empty() || tokens.iter().any(|token| source.contains(token)) {
             relevant.insert(import.raw_snippet.clone());
@@ -204,8 +243,8 @@ pub(crate) fn relevant_imports_for<T: JsTsAnalyzerHost>(
 /// `imports` is intentionally unused, for the same reason as `imported_code_units_from_infos` above:
 /// the cache is keyed by `source_file` and holds every import's resolved target, so reusing it (instead
 /// of re-resolving from the passed-in slice) is correct and gets the caching this hook is for.
-pub(crate) fn could_import_file<T: JsTsAnalyzerHost>(
-    host: &T,
+pub(crate) fn could_import_file(
+    host: &dyn JsTsAnalyzerHost,
     source_file: &ProjectFile,
     _imports: &[ImportInfo],
     target: &ProjectFile,
@@ -222,8 +261,8 @@ pub(crate) fn could_import_file<T: JsTsAnalyzerHost>(
 /// the parallelized workspace-wide import-graph walk, so two worker threads can miss the cache for
 /// the same file at once. `get_with` guarantees only one thread ever runs the resolution closure per
 /// key, matching `PythonAnalyzer::resolve_import_target_files`'s equivalent fix.
-fn resolved_import_target_files<T: JsTsAnalyzerHost>(
-    host: &T,
+fn resolved_import_target_files(
+    host: &dyn JsTsAnalyzerHost,
     file: &ProjectFile,
 ) -> Arc<HashSet<ProjectFile>> {
     let caches = host.memo_caches();
@@ -231,7 +270,6 @@ fn resolved_import_target_files<T: JsTsAnalyzerHost>(
         let language = host.js_ts_language();
         let alias_resolver = host.alias_resolver();
         let targets: HashSet<ProjectFile> = host
-            .ts_inner()
             .import_info_of(file)
             .iter()
             .flat_map(|import| {
@@ -247,10 +285,26 @@ fn resolved_import_target_files<T: JsTsAnalyzerHost>(
     })
 }
 
+// --- Skeletons -------------------------------------------------------------
+
+/// A module unit's skeleton is its own import block: both dialects render the
+/// same thing, so this is one function rather than a method on each analyzer.
+pub(crate) fn module_import_skeleton(
+    host: &dyn JsTsAnalyzerHost,
+    code_unit: &CodeUnit,
+) -> Option<String> {
+    if !code_unit.is_module() {
+        return None;
+    }
+
+    let imports = host.js_ts_import_statements(code_unit.source());
+    (!imports.is_empty()).then(|| imports.join("\n"))
+}
+
 // --- TypeHierarchyProvider -------------------------------------------------
 
-pub(crate) fn get_direct_ancestors<T: JsTsAnalyzerHost>(
-    host: &T,
+pub(crate) fn get_direct_ancestors(
+    host: &dyn JsTsAnalyzerHost,
     code_unit: &CodeUnit,
 ) -> Vec<CodeUnit> {
     let caches = host.memo_caches();
@@ -265,7 +319,7 @@ pub(crate) fn get_direct_ancestors<T: JsTsAnalyzerHost>(
         host.js_ts_language(),
         host.alias_resolver(),
         code_unit,
-        &host.ts_inner().raw_supertypes_of(code_unit),
+        &host.js_ts_raw_supertypes_of(code_unit),
     );
     caches
         .direct_ancestors
@@ -273,8 +327,8 @@ pub(crate) fn get_direct_ancestors<T: JsTsAnalyzerHost>(
     ancestors
 }
 
-pub(crate) fn get_direct_descendants<T: JsTsAnalyzerHost>(
-    host: &T,
+pub(crate) fn get_direct_descendants(
+    host: &dyn JsTsAnalyzerHost,
     code_unit: &CodeUnit,
 ) -> HashSet<CodeUnit> {
     host.memo_caches()
@@ -288,7 +342,7 @@ pub(crate) fn get_direct_descendants<T: JsTsAnalyzerHost>(
 /// Lazily-built, analyzer-cached JS/TS usage-resolution maps for the host's
 /// language. Built once per cache bucket and reused until `update`/`update_all`
 /// installs a fresh bucket.
-pub(crate) fn jsts_usage_index<T: JsTsAnalyzerHost>(host: &T) -> Arc<JsTsUsageIndex> {
+pub(crate) fn jsts_usage_index(host: &dyn JsTsAnalyzerHost) -> Arc<JsTsUsageIndex> {
     let language = host.js_ts_language();
     host.memo_caches().jsts_usage_index.get_or_build(
         || build_jsts_usage_index(host, language, true),
@@ -296,8 +350,8 @@ pub(crate) fn jsts_usage_index<T: JsTsAnalyzerHost>(host: &T) -> Arc<JsTsUsageIn
     )
 }
 
-pub(crate) fn jsts_usage_index_with_cancellation<T: JsTsAnalyzerHost>(
-    host: &T,
+pub(crate) fn jsts_usage_index_with_cancellation(
+    host: &dyn JsTsAnalyzerHost,
     cancellation: &CancellationToken,
 ) -> Option<Arc<JsTsUsageIndex>> {
     let language = host.js_ts_language();
@@ -316,7 +370,7 @@ pub(crate) fn jsts_usage_index_with_cancellation<T: JsTsAnalyzerHost>(
         .ok()
 }
 
-pub(crate) fn prewarm_jsts_usage_index<T: JsTsAnalyzerHost>(host: &T) -> Arc<JsTsUsageIndex> {
+pub(crate) fn prewarm_jsts_usage_index(host: &dyn JsTsAnalyzerHost) -> Arc<JsTsUsageIndex> {
     let language = host.js_ts_language();
     host.memo_caches().jsts_usage_index.get_or_build_parallel(
         || build_jsts_usage_index(host, language, true),

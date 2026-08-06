@@ -1,5 +1,12 @@
+use crate::analyzer::js_ts::syntax::JsTsImportBinder;
 use crate::analyzer::js_ts::tsconfig::AliasResolver;
-use crate::analyzer::{ImportInfo, Language, ProjectFile};
+use crate::analyzer::js_ts::type_text::{jsts_type_space_candidates, jsts_value_space_candidates};
+use crate::analyzer::usages::ImportKind;
+use crate::analyzer::usages::js_ts_graph::cached_jsts_index;
+use crate::analyzer::{
+    BoundedDefinitionLookup, CodeUnit, IAnalyzer, ImportInfo, Language, ProjectFile,
+};
+use brokk_bifrost_core::analyzer::definition_lookup::sort_units;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tree_sitter::Node;
@@ -499,6 +506,120 @@ pub(crate) fn extract_js_ts_call_receiver(reference: &str) -> Option<String> {
         return None;
     }
     Some(receiver.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_js_ts_module_binding_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    language: Language,
+    file: &ProjectFile,
+    module: &str,
+    exported_name: &str,
+    aliases: Option<&AliasResolver>,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let files = crate::analyzer::resolve_js_ts_module_specifier(file, module, language, aliases);
+    if files.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = jsts_module_export_candidates(
+        analyzer,
+        support,
+        language,
+        &files,
+        exported_name,
+        value_position,
+    );
+    if value_position {
+        candidates = jsts_value_space_candidates(analyzer, candidates);
+    } else {
+        candidates = jsts_type_space_candidates(analyzer, candidates);
+    }
+    if candidates.is_empty() && exported_name == "default" {
+        for file in &files {
+            candidates.extend(
+                analyzer
+                    .declarations(file)
+                    .into_iter()
+                    .filter(|unit| unit.identifier() == "default"),
+            );
+        }
+        sort_units(&mut candidates);
+        candidates.dedup();
+        if value_position {
+            candidates = jsts_value_space_candidates(analyzer, candidates);
+        } else {
+            candidates = jsts_type_space_candidates(analyzer, candidates);
+        }
+    }
+    candidates
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_js_ts_direct_import_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    language: Language,
+    file: &ProjectFile,
+    imports: &JsTsImportBinder,
+    name: &str,
+    aliases: Option<&AliasResolver>,
+    value_position: bool,
+) -> Option<Vec<CodeUnit>> {
+    let mut saw_direct_import = false;
+    let mut candidates = Vec::new();
+    for binding in imports.resolvable_direct_bindings_for(name) {
+        saw_direct_import = true;
+        let exported_name = match binding.kind {
+            ImportKind::Named => binding.imported_name.as_deref().unwrap_or(name),
+            ImportKind::Default => "default",
+            _ => unreachable!("direct bindings contain only named/default imports"),
+        };
+        candidates.extend(resolve_js_ts_module_binding_candidates(
+            analyzer,
+            support,
+            language,
+            file,
+            &binding.module_specifier,
+            exported_name,
+            aliases,
+            value_position,
+        ));
+    }
+    if !saw_direct_import {
+        return None;
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    Some(candidates)
+}
+
+fn jsts_module_export_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    language: Language,
+    files: &[ProjectFile],
+    exported_name: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let Some(index) = cached_jsts_index(analyzer, language, None) else {
+        return Vec::new();
+    };
+
+    let bindings = index.local_bindings_for_exported_name(files, exported_name);
+    let mut candidates = Vec::new();
+    for (file, local_name) in bindings {
+        let file_candidates = support.file_identifier_in_files(&[file], &local_name);
+        candidates.extend(file_candidates);
+    }
+
+    if value_position {
+        jsts_value_space_candidates(analyzer, candidates)
+    } else {
+        jsts_type_space_candidates(analyzer, candidates)
+    }
 }
 
 #[cfg(test)]
