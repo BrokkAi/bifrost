@@ -6,7 +6,8 @@ use crate::searchtools::{
     ScanUsagesInput, ScanUsagesResult, ScanUsagesStatus, SearchSymbolHit, SearchSymbolsFile,
     SearchSymbolsResult, SkimFile, SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement,
     SummaryResult, SymbolAncestors, SymbolAncestorsResult, SymbolLocation, SymbolLocationsResult,
-    SymbolSourcesResult, UsageFileGroup, UsageGraphResult, UsageLocation, scan_usages_target_label,
+    SymbolSourcesResult, TooBroadScope, UsageFileGroup, UsageGraphResult, UsageLocation,
+    scan_usages_target_label,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +183,7 @@ impl RenderText for SummaryResult {
         if !self.ambiguous_paths.is_empty() {
             blocks.push(render_ambiguous_paths(&self.ambiguous_paths));
         }
+        blocks.extend(self.too_broad.iter().map(render_too_broad_scope));
         if blocks.is_empty() {
             "No matching summaries found.".to_string()
         } else {
@@ -845,6 +847,24 @@ fn render_ambiguous_paths(paths: &[AmbiguousPathInput]) -> String {
             .map(|item| format!("- {} -> {}", item.input, item.matches.join(", "))),
     );
     lines.join("\n")
+}
+
+fn render_too_broad_scope(scope: &TooBroadScope) -> String {
+    // A scope is only reported once it matched more files than the cap, so it
+    // always carries at least one sample path.
+    assert!(
+        !scope.sample.is_empty(),
+        "too-broad scope without a sample: {scope:?}"
+    );
+    [
+        format!(
+            "Too broad: target {} matched {} files, over the {} file limit for one target, so it was skipped.",
+            scope.target, scope.matched, scope.cap
+        ),
+        format!("Sample of the match: {}", scope.sample.join(", ")),
+        "Narrow the target to a subdirectory, list the specific files you want, or call list_symbols for an outline of the whole match.".to_string(),
+    ]
+    .join("\n")
 }
 
 fn render_skim_file(file: &SkimFile) -> String {

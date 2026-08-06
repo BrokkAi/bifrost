@@ -15,7 +15,7 @@ You can see it working by running the new behavior tests (each fails before its 
 ## Progress
 
 - [x] (2026-08-06) Audit of every searchtools entry point completed; unguarded fan-out paths identified (recorded in Context and Orientation below).
-- [ ] Milestone 1: shared `TooBroadScope` type and the `get_summaries` per-target guard, with render support and behavior tests.
+- [x] (2026-08-06 18:22Z) Milestone 1: shared `TooBroadScope` type and the `get_summaries` per-target guard, with render support and behavior tests. Landed in `crates/bifrost-analysis/src/searchtools/mod.rs` (constants and type), `summaries.rs` (routing guard, `too_broad` on `SummaryTargets` and `SummaryResult`), `crates/bifrost-analysis/src/searchtools_render.rs` (`render_too_broad_scope`), `crates/bifrost-mcp/src/mcp_common.rs` (`render_too_broad_json` for the budgeted path), and four tests in `tests/suite_symbols/searchtools_too_broad_scope.rs`.
 - [ ] Milestone 2: `get_symbol_sources` glob-arm guard, with behavior tests.
 - [ ] Milestone 3: `search_symbols` post-resolution candidate cap, with behavior tests and a provisional cap value.
 - [ ] Milestone 4: investigate workspace-root `get_summaries` latency (the 127 s `all_files()` walk); outcome is a fix or a filed issue with evidence.
@@ -31,6 +31,10 @@ You can see it working by running the new behavior tests (each fails before its 
   Evidence: `crates/bifrost-analysis/src/searchtools/summaries.rs` lines 601-637.
 - Observation: `search_symbols` clamps only its output (top `FILE_SEARCH_LIMIT` = 100 files), after resolving and ranking the entire matching universe. On Firefox the measured split was about 54.6 s resolution, 34.0 s ranking, 0.8 s rendering. A post-resolution candidate cap therefore bounds ranking but not resolution; bounding resolution would require early-stop inside `search_symbol_candidates`, which has ten-plus per-language implementations.
   Evidence: `crates/bifrost-analysis/src/searchtools/navigation.rs` lines 330-460 (resolve, filter, rank, then clamp at line 404); `rg -n "fn search_symbol_candidates" crates/` lists implementations in `tree_sitter_analyzer.rs` and nine language modules.
+- Observation: `get_summaries` result text is not rendered in `crates/bifrost-mcp/src/searchtools_service.rs`, as this plan first stated. That file only decodes arguments and calls `RenderText::render_text`; the implementation is `impl RenderText for SummaryResult` in `crates/bifrost-analysis/src/searchtools_render.rs`. A second, independent renderer exists in `crates/bifrost-mcp/src/mcp_common.rs` (`render_budgeted_get_summaries_text`), which rebuilds the text from the serialized JSON whenever the response exceeds `GET_SUMMARIES_RESPONSE_BUDGET_BYTES`. Milestone 1 therefore edits two render sites, not one; Milestones 2 and 3 should expect the same shape.
+  Evidence: `searchtools_service.rs` `decode_render_and_run` calls `result.render_text(render_options)`; `mcp_common.rs` line 2109 area `render_container_listings_json` already re-implements `render_container_listing` against JSON for the same reason.
+- Observation: three pre-existing test failures in `cargo nextest run -p brokk-bifrost-analysis` and six in the focused `--workspace` searchtools selection are unrelated to this work; they fail identically with the Milestone 1 changes stashed. They are `analyzer::jvm::java_artifact::tests::source_and_class_jars_share_declaration_ids_and_keep_distinct_origins` (panics with "Java producer parity tests require javac and jar"), the two `analyzer::tree_sitter_analyzer::tests::live_oid_resolution_*` rendezvous tests, and `csharp_generic_type_resolves_without_arity_spelling`, `summaries_route_file_anchored_selector_with_extension_like_symbol_member`, `summaries_and_ancestors_accept_js_file_anchored_selectors`, `scan_usages_resolves_public_typescript_static_method_symbol`, `manual_service_sees_change_after_explicit_update_paths`, `bifrost_searchtools_server_speaks_mcp_stdio`.
+  Evidence: `git stash push` of the four changed source files, rerun of the same selection, same six failures; `git stash pop` restored the work.
 
 ## Decision Log
 
@@ -53,9 +57,35 @@ You can see it working by running the new behavior tests (each fails before its 
   Rationale: keeps tests on `InlineTestProject`-scale fixtures without environment knobs or mode flags.
   Date/Author: 2026-08-06, Fable.
 
+- Decision: Milestone 1's behavior tests exercise the shipped constant `GET_SUMMARIES_MAX_FILES_PER_TARGET` on a 25-file inline fixture instead of passing a tiny cap, even though the routing function does take the cap as a parameter.
+  Rationale: `route_summary_targets_with_cancellation` is private to `crates/bifrost-analysis`, so an integration test in `tests/suite_symbols/` cannot reach it, and adding a public test-only entry point to `get_summaries` would be a worse trade than writing 25 one-line Java files (the fixture builds and runs in under a quarter second). Testing through the public MCP tool also proves the whole path -- routing, result assembly, serialization, and rendering -- rather than the routing function alone. The cap parameter stays because Milestone 2 reuses the shape and because the constant belongs at the tool entry point, not buried in routing.
+  Date/Author: 2026-08-06, implementation.
+- Decision: render the too-broad paragraph twice -- once in `impl RenderText for SummaryResult` and once in `render_too_broad_json` in `crates/bifrost-mcp/src/mcp_common.rs` -- rather than share one function.
+  Rationale: the MCP budgeting path has already lost the typed result by the time it rebuilds text; it works from `serde_json::Value` and `TooBroadScope` derives only `Serialize`. `render_container_listings_json` in the same file duplicates `render_container_listing` for exactly this reason, so the duplication follows the established local idiom instead of adding a `Deserialize` derive to a result type purely to undo a serialization. A skipped target must survive the byte-budget degradation, so the budgeted renderer cannot simply drop it.
+  Date/Author: 2026-08-06, implementation.
+- Decision: the guard trips on `matches.files.len() > cap`, not `>=`.
+  Rationale: a target matching exactly the cap is inside the advertised bound and is summarized normally; the reported `cap` then reads as "at most this many", which is what the rendered instruction tells the agent.
+  Date/Author: 2026-08-06, implementation.
+
 ## Outcomes & Retrospective
 
-(To be written at milestone completions.)
+Milestone 1 (2026-08-06): `get_summaries` now answers a too-broad glob target instantly with a structured `too_broad` entry naming the target, the true match count, the cap, and the first ten matched paths, plus an instruction to narrow to a subdirectory, an explicit file list, or `list_symbols`. Nothing else changed: an under-cap glob still summarizes every file, and explicit file targets are exempt no matter how many are given.
+
+Proof, on a 25-file inline fixture with `GET_SUMMARIES_MAX_FILES_PER_TARGET = 20`:
+
+    cargo nextest run --test suite_symbols -E 'test(too_broad)'
+    Summary [0.209s] 4 tests run: 4 passed, 1200 skipped
+
+With the guard branch in `route_summary_targets_with_cancellation` commented out, the same command reports:
+
+    Summary [0.231s] 4 tests run: 2 passed, 2 failed
+    FAIL searchtools_too_broad_scope::get_summaries_glob_over_cap_reports_too_broad_and_skips_summaries
+         assertion `left == right` failed ... left: 1  right: 0
+    FAIL searchtools_too_broad_scope::get_summaries_too_broad_render_names_target_counts_and_narrowing
+
+The two non-regression tests (under-cap glob, 25 explicit file targets) pass in both states, which is the point: the guard adds a branch and changes nothing else.
+
+Remaining: Milestones 2 through 5. Lesson for the next milestone: the plan's render-site pointer was one file off, and the MCP byte-budget renderer is a second, JSON-shaped copy of the same text; check both when adding a new result field that must reach the agent.
 
 ## Context and Orientation
 
@@ -99,11 +129,11 @@ The cap value 20 mirrors `FILE_SKIM_LIMIT`, the bound `list_symbols` already app
 
 In `crates/bifrost-analysis/src/searchtools/summaries.rs`: add a `too_broad: Vec<TooBroadScope>` field to both `SummaryTargets` (the routing result, around line 291) and `SummaryResult` (around line 31, with `#[serde(skip_serializing_if = "Vec::is_empty", default)]` like `ambiguous_paths`). In `route_summary_targets_with_cancellation`, at the site where glob matches are consumed (lines 267-270), compare `matches.files.len()` against the cap; when over, push a `TooBroadScope` (target string, count, cap, first `FILE_PATTERN_FANOUT_SAMPLE` workspace-relative paths, sorted for determinism) instead of extending `file_targets`. Thread the cap in as a parameter of the routing function (the public `get_summaries` entry passes the constant) so tests can pass a tiny cap. In `summarize_routed_targets_with_cancellation` (line 856), copy `too_broad` from targets into the result the same way `listings` is copied.
 
-In `crates/bifrost-mcp/src/searchtools_service.rs`, find the `get_summaries` render site and render each `too_broad` entry as an explicit paragraph naming the target, the matched count, the cap, the sample paths, and the instruction to narrow to a subdirectory, an explicit file list, or `list_symbols` (which self-truncates). Also note there is special-case handling for `get_summaries` output in `crates/bifrost-mcp/src/mcp_common.rs` around line 1365; read it and keep it consistent.
+There are two render sites, not one. The tool text an agent normally sees comes from `impl RenderText for SummaryResult` in `crates/bifrost-analysis/src/searchtools_render.rs`; `crates/bifrost-mcp/src/searchtools_service.rs` only calls it (`decode_render_and_run`). Render each `too_broad` entry there as an explicit paragraph naming the target, the matched count, the cap, the sample paths, and the instruction to narrow to a subdirectory, an explicit file list, or `list_symbols` (which self-truncates). The second site is the byte-budget path: `crates/bifrost-mcp/src/mcp_common.rs` special-cases `get_summaries` output around line 1365 and, when the response exceeds `GET_SUMMARIES_RESPONSE_BUDGET_BYTES`, rebuilds the text from JSON in `render_budgeted_get_summaries_text`. Add the same paragraph there (as implemented: `render_too_broad_json`), otherwise a skipped target disappears exactly when the response was large.
 
-Tests, using `InlineTestProject` in the existing suite file `tests/suite_symbols/searchtools_service.rs` (or a new `tests/suite_symbols/<name>.rs` registered in that suite's `main.rs` if the file is crowded): (a) behavior: a fixture with, say, 6 files and a glob target, cap of 3 passed to the internal routing function, asserts the reply has one `too_broad` entry with `matched = 6`, `cap = 3`, a 3-element sorted sample, and no summaries for those files; (b) non-regression: the same glob under a cap of 10 summarizes all 6 files and `too_broad` is empty; (c) explicit file targets never trip the guard even when more targets than the cap are given; (d) an MCP-level render assertion that the too-broad paragraph appears in the tool text. Do not assert exact prose beyond the load-bearing tokens (target, counts).
+Tests, using `InlineTestProject` in `tests/suite_symbols/searchtools_too_broad_scope.rs` (registered in that suite's `main.rs`; `searchtools_service.rs` is over ten thousand lines): (a) behavior: `wide/**` over a 25-file directory asserts the reply has one `too_broad` entry with `matched = 25`, `cap = GET_SUMMARIES_MAX_FILES_PER_TARGET`, a ten-element sorted sample, and no summaries at all; (b) non-regression: `narrow/**` over five files summarizes all five and `too_broad` is empty; (c) explicit file targets never trip the guard even when more targets than the cap are given (25 explicit paths, 25 summaries); (d) an MCP-level render assertion that the too-broad paragraph appears in the tool text. Do not assert exact prose beyond the load-bearing tokens (target, counts, sample path, `list_symbols`). Note that `too_broad` is `skip_serializing_if = "Vec::is_empty"`, so a test helper must treat an absent key as an empty list.
 
-Acceptance: the new tests fail before the guard exists (compile failure for the new field counts; the behavior assertion fails if you stub the field in first) and pass after; the full focused suite passes.
+Acceptance: the new tests fail before the guard exists (comment out the guard branch in `route_summary_targets_with_cancellation`: the two guard tests fail, the two non-regression tests keep passing) and pass after; the full focused suite passes.
 
 ### Milestone 2: get_symbol_sources guard
 
@@ -111,7 +141,7 @@ Scope: after this milestone, a glob-shaped symbol argument matching more files t
 
 In `mod.rs` add `pub const GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET: usize = 10;` -- smaller than the summaries cap because this tool returns full source text, the heaviest payload per file.
 
-In `crates/bifrost-analysis/src/searchtools/sources.rs`: add a `TooBroad(TooBroadScope)` variant to `SourceLookupOutcome`, and a `too_broad: Vec<TooBroadScope>` field to `SymbolSourcesResult` (same serde attributes as in Milestone 1). At the glob arm (lines 355-369), when `file_matches.files.len()` exceeds the cap, return the new outcome instead of calling `source_blocks_for_files`. Collect it in the outcome loop at lines 447-454. Thread the cap as a parameter the same way as Milestone 1. Update the render site in `searchtools_service.rs` (note `get_symbol_sources` has bespoke handling around lines 1496 and 2976; read both before editing).
+In `crates/bifrost-analysis/src/searchtools/sources.rs`: add a `TooBroad(TooBroadScope)` variant to `SourceLookupOutcome`, and a `too_broad: Vec<TooBroadScope>` field to `SymbolSourcesResult` (same serde attributes as in Milestone 1). At the glob arm (lines 355-369), when `file_matches.files.len()` exceeds the cap, return the new outcome instead of calling `source_blocks_for_files`. Collect it in the outcome loop at lines 447-454. Thread the cap as a parameter the same way as Milestone 1. Update the render site, which for this tool as for `get_summaries` is the `RenderText` impl in `crates/bifrost-analysis/src/searchtools_render.rs`, not `searchtools_service.rs` (note `get_symbol_sources` also has bespoke handling in `searchtools_service.rs` around lines 1496 and 2976; read both before editing).
 
 Tests mirror Milestone 1 in the appropriate `tests/suite_symbols/` file: glob over cap yields `too_broad` and no source blocks; glob under cap yields sources; an exact symbol name and an explicit single-file path are unaffected.
 
@@ -209,4 +239,8 @@ In `crates/bifrost-analysis/src/searchtools/mod.rs`:
         pub sample: Vec<String>,
     }
 
-In `summaries.rs`: `SummaryTargets` and `SummaryResult` gain `too_broad: Vec<TooBroadScope>`. In `sources.rs`: `SymbolSourcesResult` gains `too_broad: Vec<TooBroadScope>`; `SourceLookupOutcome` gains a `TooBroad` variant. In `navigation.rs`: `SearchSymbolsResult` gains `too_many_matches: Option<TooManySymbolMatches>` with the struct as specified in Milestone 3. Internal enforcement functions take the cap as a `usize` parameter; public tool entry points pass the constants. Rendering lives in `crates/bifrost-mcp/src/searchtools_service.rs`; descriptions in `crates/bifrost-mcp/src/mcp_core.rs` / `mcp_extended.rs`.
+In `summaries.rs`: `SummaryTargets` and `SummaryResult` gain `too_broad: Vec<TooBroadScope>`. In `sources.rs`: `SymbolSourcesResult` gains `too_broad: Vec<TooBroadScope>`; `SourceLookupOutcome` gains a `TooBroad` variant. In `navigation.rs`: `SearchSymbolsResult` gains `too_many_matches: Option<TooManySymbolMatches>` with the struct as specified in Milestone 3. Internal enforcement functions take the cap as a `usize` parameter; public tool entry points pass the constants. As implemented in Milestone 1, `route_summary_targets_with_cancellation(analyzer, targets, max_files_per_target, cancellation)` is that function for `get_summaries`, and the module-private helper `too_broad_scope(target, matched, cap) -> TooBroadScope` in `summaries.rs` builds the report. Rendering lives in `crates/bifrost-analysis/src/searchtools_render.rs` (the `RenderText` impls) with a second JSON-shaped copy in `crates/bifrost-mcp/src/mcp_common.rs` for the byte-budget path; descriptions in `crates/bifrost-mcp/src/mcp_core.rs` / `mcp_extended.rs`.
+
+## Revision notes
+
+- 2026-08-06 (Milestone 1 implementation): corrected the render-site pointer from `crates/bifrost-mcp/src/searchtools_service.rs` to `crates/bifrost-analysis/src/searchtools_render.rs`, and added the second render site in `crates/bifrost-mcp/src/mcp_common.rs`, because that is where the text is actually produced; a plan that sent the next contributor to the wrong file would cost them the same search. Replaced the tiny-cap test recipe with the shipped-constant recipe and named the real test file, because the routing function is crate-private and unreachable from an integration suite; the reasoning is in the Decision Log. Recorded the pre-existing unrelated test failures in `Surprises & Discoveries` so a later contributor does not attribute them to this plan.

@@ -2093,6 +2093,10 @@ fn render_budgeted_get_summaries_text(
         structured,
         render_line_numbers,
     ));
+    // Budgeting rebuilds the text from JSON, so the too-broad paragraphs the
+    // analyzer renderer emits have to be rebuilt here too; a skipped target is
+    // exactly the kind of thing an agent must not lose to a size degradation.
+    blocks.extend(render_too_broad_json(structured));
     if blocks.is_empty() {
         blocks.push("No matching summaries found.".to_string());
     }
@@ -2104,6 +2108,31 @@ fn render_budgeted_get_summaries_text(
         text.push_str(suffix);
     }
     text
+}
+
+fn render_too_broad_json(structured: &Value) -> Vec<String> {
+    structured
+        .get("too_broad")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|scope| {
+            let target = scope.get("target")?.as_str()?;
+            let matched = scope.get("matched")?.as_u64()?;
+            let cap = scope.get("cap")?.as_u64()?;
+            let sample = scope
+                .get("sample")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            Some(format!(
+                "Too broad: target {target} matched {matched} files, over the {cap} file limit for one target, so it was skipped.\nSample of the match: {}\nNarrow the target to a subdirectory, list the specific files you want, or call list_symbols for an outline of the whole match.",
+                sample.join(", ")
+            ))
+        })
+        .collect()
 }
 
 fn render_container_listings_json(structured: &Value, render_line_numbers: bool) -> Vec<String> {

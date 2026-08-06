@@ -249,6 +249,27 @@ const SCAN_USAGES_SCOPE_PATH_LIMIT: usize = 5;
 
 const SCAN_USAGES_SCOPE_PATH_MAX_BYTES: usize = 256;
 
+/// How many matched paths a too-broad reply shows so the caller can narrow.
+pub const FILE_PATTERN_FANOUT_SAMPLE: usize = 10;
+
+/// Files a single `get_summaries` glob target may expand to before the tool
+/// skips it. Mirrors `FILE_SKIM_LIMIT`, the bound `list_symbols` already puts
+/// on the same expansion; a summary block is strictly larger than a skim
+/// listing, so a larger cap needs new evidence first.
+pub const GET_SUMMARIES_MAX_FILES_PER_TARGET: usize = 20;
+
+/// A single request target that matched more of the workspace than the
+/// tool will process. The work was skipped, not truncated: `sample`
+/// holds the first `FILE_PATTERN_FANOUT_SAMPLE` matched paths so the
+/// caller can narrow, and `matched` is the true total.
+#[derive(Debug, Clone, Serialize)]
+pub struct TooBroadScope {
+    pub target: String,
+    pub matched: usize,
+    pub cap: usize,
+    pub sample: Vec<String>,
+}
+
 pub const TYPE_LOOKUP_MAX_REFERENCES: usize = 100;
 
 pub const DEFINITION_LOOKUP_MAX_REFERENCES: usize = 100;

@@ -35,6 +35,8 @@ pub struct SummaryResult {
     pub ambiguous: Vec<AmbiguousSymbol>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub too_broad: Vec<TooBroadScope>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -174,6 +176,7 @@ pub(super) struct SummaryTargets {
     pub(super) listings: Vec<ContainerListing>,
     pub(super) symbol_targets: Vec<String>,
     pub(super) ambiguous_paths: Vec<AmbiguousPathInput>,
+    pub(super) too_broad: Vec<TooBroadScope>,
 }
 
 #[cfg(test)]
@@ -181,12 +184,22 @@ pub(super) fn route_summary_targets(
     analyzer: &dyn IAnalyzer,
     targets: &[String],
 ) -> SummaryTargets {
-    route_summary_targets_with_cancellation(analyzer, targets, None)
+    route_summary_targets_with_cancellation(
+        analyzer,
+        targets,
+        GET_SUMMARIES_MAX_FILES_PER_TARGET,
+        None,
+    )
 }
 
+/// `max_files_per_target` bounds how many files one glob target may expand to;
+/// a target over the bound is reported through `too_broad` and contributes no
+/// files at all, because a summary of an arbitrary subset of a huge match
+/// looks complete while meaning nothing.
 fn route_summary_targets_with_cancellation(
     analyzer: &dyn IAnalyzer,
     targets: &[String],
+    max_files_per_target: usize,
     cancellation: Option<&crate::CancellationToken>,
 ) -> SummaryTargets {
     let _scope = profiling::scope("searchtools::route_summary_targets");
@@ -205,6 +218,7 @@ fn route_summary_targets_with_cancellation(
     let mut listed_containers = HashSet::default();
     let mut symbol_targets = Vec::new();
     let mut ambiguous_paths = Vec::new();
+    let mut too_broad = Vec::new();
 
     for target in targets
         .iter()
@@ -265,6 +279,14 @@ fn route_summary_targets_with_cancellation(
             continue;
         }
         if !matches.files.is_empty() {
+            if matches.files.len() > max_files_per_target {
+                too_broad.push(too_broad_scope(
+                    target,
+                    &matches.files,
+                    max_files_per_target,
+                ));
+                continue;
+            }
             file_targets.extend(matches.files);
             continue;
         }
@@ -293,6 +315,25 @@ fn route_summary_targets_with_cancellation(
         listings,
         symbol_targets,
         ambiguous_paths,
+        too_broad,
+    }
+}
+
+/// `matched` is already ordered (it comes out of a `BTreeSet<ProjectFile>`), so
+/// the sample is the first `FILE_PATTERN_FANOUT_SAMPLE` paths; sorting those
+/// few strings makes the rendered order path-lexicographic on every platform.
+fn too_broad_scope(target: &str, matched: &[ProjectFile], cap: usize) -> TooBroadScope {
+    let mut sample: Vec<_> = matched
+        .iter()
+        .take(FILE_PATTERN_FANOUT_SAMPLE)
+        .map(rel_path_string)
+        .collect();
+    sample.sort();
+    TooBroadScope {
+        target: target.to_string(),
+        matched: matched.len(),
+        cap,
+        sample,
     }
 }
 
@@ -559,6 +600,7 @@ fn summarize_symbol_targets_with_cancellation(
         not_found,
         ambiguous,
         ambiguous_paths: Vec::new(),
+        too_broad: Vec::new(),
     }
 }
 
@@ -594,7 +636,12 @@ pub fn get_summaries_with_cancellation(
     // per target through `resolve_file_patterns`, so without a shared listing
     // an N-target request walked the workspace O(N) times (#1334).
     let _analyzer_query = AnalyzerQueryScope::new(analyzer);
-    let targets = route_summary_targets_with_cancellation(analyzer, &params.targets, cancellation);
+    let targets = route_summary_targets_with_cancellation(
+        analyzer,
+        &params.targets,
+        GET_SUMMARIES_MAX_FILES_PER_TARGET,
+        cancellation,
+    );
     summarize_routed_targets_with_cancellation(analyzer, &targets, cancellation)
 }
 
@@ -721,6 +768,7 @@ fn summarize_files_with_cancellation(
         not_found: Vec::new(),
         ambiguous: Vec::new(),
         ambiguous_paths: Vec::new(),
+        too_broad: Vec::new(),
     }
 }
 
@@ -871,6 +919,7 @@ fn summarize_routed_targets_with_cancellation(
 
     file_output.summaries.extend(symbol_output.summaries);
     file_output.listings = summary_targets.listings.clone();
+    file_output.too_broad = summary_targets.too_broad.clone();
     file_output.not_found.extend(symbol_output.not_found);
     file_output.ambiguous.extend(symbol_output.ambiguous);
     file_output
