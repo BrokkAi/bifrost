@@ -1026,6 +1026,9 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             for scope in scopes {
                 push_type_hit(scope, ctx);
             }
+        } else if let Some(scope) = target_guided_unproven_qualified_call_owner_scope(node, ctx) {
+            *ctx.raw_match_count += 1;
+            push_unproven_hit(scope, ctx);
         }
         return;
     }
@@ -1133,12 +1136,21 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             }
             return;
         }
-        LexicalTypeResolution::Resolved { .. } => {
+        LexicalTypeResolution::Resolved {
+            unit: _,
+            candidates,
+            ..
+        } => {
             if let Some(scopes) = static_qualifier_type_scopes(node, ctx) {
                 *ctx.raw_match_count += 1;
                 for scope in scopes {
                     push_type_hit(scope, ctx);
                 }
+            } else if let Some(hit) =
+                target_guided_unproven_alias_type_reference(node, &candidates, ctx)
+            {
+                *ctx.raw_match_count += 1;
+                push_unproven_hit(hit, ctx);
             } else if let Some(leaf) = target_guided_missing_alias_rhs_type_leaf(node, ctx)
                 .or_else(|| target_guided_missing_member_alias_type_leaf(node, ctx))
             {
@@ -2367,6 +2379,50 @@ fn static_qualifier_type_scopes_for_components<'tree>(
     }
 }
 
+/// Recover a class owner in a qualified call when guard-aware lookup cannot
+/// prove the owner. Keep the hit on the owner component, not the method.
+fn target_guided_unproven_qualified_call_owner_scope<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    let target = physically_visible_type_target(ctx)?;
+    if !target.is_class() {
+        return None;
+    }
+    let qualified = qualified_owner_components(node, ctx.source)?;
+    let lexical_scope = match enclosing_lexical_scope_components(
+        node,
+        ctx.analyzer,
+        ctx.visibility,
+        ctx.file,
+        ctx.source,
+    ) {
+        LexicalScopeResolution::Resolved(scope) => scope,
+        LexicalScopeResolution::Ambiguous | LexicalScopeResolution::Missing => {
+            enclosing_namespace_components(node, ctx.source)
+        }
+    };
+    let LexicalTypeResolution::Resolved {
+        unit, candidates, ..
+    } = ctx.visibility.resolve_type_components_lexically_for_target(
+        ctx.analyzer,
+        ctx.file,
+        &qualified.names,
+        qualified.global,
+        &lexical_scope,
+        target,
+    )
+    else {
+        return None;
+    };
+    (same_visible_symbol(&unit, target)
+        || candidates
+            .iter()
+            .any(|candidate| same_visible_symbol(candidate, target)))
+    .then(|| qualified.nodes.last().copied())
+    .flatten()
+}
+
 /// Resolve a nested class-owned alias when the indexed alias path is not a
 /// standalone type candidate. The C++ index stores `basic_json::type_error`
 /// as a synthetic child of `basic_json`, while source can qualify it through
@@ -2443,6 +2499,42 @@ fn canonical_alias_target(candidate: &CodeUnit, ctx: &ScanCtx<'_>) -> CodeUnit {
         return canonical.clone();
     }
     structured.unwrap_or_else(|| candidate.clone())
+}
+
+/// Recover a namespace alias whose guard state blocks ordinary visibility.
+/// Require one visible canonical target and an exact structured alias path.
+fn target_guided_unproven_alias_type_reference<'tree>(
+    node: Node<'tree>,
+    candidates: &[CodeUnit],
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    if cpp_template_reference_arguments(node, ctx.source).is_some() {
+        return None;
+    }
+    let target = physically_visible_type_target(ctx)?;
+    if !target.is_class() {
+        return None;
+    }
+    let alias_provider = ctx.analyzer.type_alias_provider()?;
+    let (components, _) = type_reference_components(node, ctx.source)?;
+    let hit = function_terminal_node(node);
+    candidates
+        .iter()
+        .filter(|candidate| {
+            alias_provider.is_type_alias(candidate)
+                && ctx.visibility.is_physically_visible(ctx.file, candidate)
+                && canonical_cpp_scope_components(candidate) == components
+        })
+        .find(|candidate| {
+            same_visible_symbol(&canonical_alias_target(candidate, ctx), target)
+                || ctx.visibility.structured_alias_primary_preserves_target(
+                    ctx.analyzer,
+                    ctx.file,
+                    candidate,
+                    target,
+                )
+        })
+        .map(|_| hit)
 }
 
 fn target_alias_candidates_visible(
