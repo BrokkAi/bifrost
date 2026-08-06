@@ -3,16 +3,26 @@ use crate::analyzer::cpp::cpp_sentinel_recovered_classes;
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
 use crate::analyzer::usages::cpp_graph::CppDispatch;
 use crate::analyzer::usages::inverted_edges::{
-    UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output, parse_and_collect,
+    ClassRangeIndex, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output,
+    parse_and_collect,
 };
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, CppAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_cpp::declarations::CppSentinelRecoveredClass;
 use brokk_bifrost_cpp::graph::extractor::{ScanState, prepare_file, scan_prepared_file};
 use brokk_bifrost_cpp::graph::resolver::{TargetSpec, TypeScanKey, VisibilityIndex};
 use std::collections::BTreeSet;
+use std::sync::{Arc, OnceLock};
+
+struct PreparedCppFile {
+    prepared: Arc<PreparedSyntaxTree>,
+    recovered_sentinel_classes: Vec<CppSentinelRecoveredClass>,
+    class_ranges: OnceLock<Arc<ClassRangeIndex>>,
+}
 
 fn scan_file_major<F, S, P, I, C, Prepare, Scan>(
     files: I,
@@ -53,6 +63,7 @@ fn retain_scan_spec(seen_type_specs: &mut HashSet<TypeScanKey>, spec: &TargetSpe
 
 pub(crate) struct CppQueryResolver<'a> {
     cpp: &'a CppAnalyzer,
+    class_ranges: HashMap<ProjectFile, Arc<ClassRangeIndex>>,
 }
 
 /// One authoritative inverse batch over a fixed union of caller roots.
@@ -70,7 +81,7 @@ pub struct CppAuthoritativeUsageBatch<'a> {
 
 impl<'a> CppAuthoritativeUsageBatch<'a> {
     pub fn new(analyzer: &'a dyn IAnalyzer, roots: &HashSet<ProjectFile>) -> Option<Self> {
-        let resolver = CppQueryResolver::try_new(analyzer)?;
+        let mut resolver = CppQueryResolver::try_new(analyzer)?;
         // This listing already validates every live path for the active outer
         // request scope.  Have it seed the request's live-source memo before
         // visibility construction or parallel target scans can begin, so those
@@ -83,6 +94,15 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
         resolver
             .cpp
             .bulk_file_states_for_query(roots.iter().cloned());
+        resolver.class_ranges = roots
+            .iter()
+            .map(|file| {
+                (
+                    file.clone(),
+                    Arc::new(ClassRangeIndex::build(analyzer, file)),
+                )
+            })
+            .collect();
         #[cfg(any(test, feature = "test-support"))]
         resolver
             .cpp
@@ -127,6 +147,7 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
     fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         Some(Self {
             cpp: resolve_analyzer::<CppAnalyzer>(analyzer)?,
+            class_ranges: HashMap::default(),
         })
     }
 
@@ -204,20 +225,46 @@ impl CppQueryResolver<'_> {
                         prepared.tree().root_node(),
                         prepared.source(),
                     );
-                    (prepared, recovered_sentinel_classes)
+                    let class_range_cell = OnceLock::new();
+                    if let Some(class_ranges) = self.class_ranges.get(file).cloned() {
+                        assert!(
+                            class_range_cell.set(class_ranges).is_ok(),
+                            "class range cache is initialized once"
+                        );
+                    }
+                    PreparedCppFile {
+                        prepared,
+                        recovered_sentinel_classes,
+                        class_ranges: class_range_cell,
+                    }
                 })
             },
-            |file, (prepared, recovered_sentinel_classes), spec| {
+            |file, prepared_file, spec| {
                 #[cfg(any(test, feature = "test-support"))]
                 self.cpp.record_target_spec_scan_for_test();
-                let spec = spec
-                    .with_visible_callable_arities(source, self.cpp, visibility, file, prepared);
+                let spec = spec.with_visible_callable_arities(
+                    source,
+                    self.cpp,
+                    visibility,
+                    file,
+                    prepared_file.prepared.as_ref(),
+                );
+                let class_ranges = spec
+                    .type_scan_key()
+                    .filter(|_| !prepared_file.recovered_sentinel_classes.is_empty())
+                    .map(|_| {
+                        prepared_file
+                            .class_ranges
+                            .get_or_init(|| Arc::new(ClassRangeIndex::build(analyzer, file)))
+                            .as_ref()
+                    });
                 scan_prepared_file(
                     source,
                     visibility,
                     file,
-                    prepared,
-                    recovered_sentinel_classes,
+                    prepared_file.prepared.as_ref(),
+                    &prepared_file.recovered_sentinel_classes,
+                    class_ranges,
                     spec.as_ref(),
                     &target_group,
                     &mut state,

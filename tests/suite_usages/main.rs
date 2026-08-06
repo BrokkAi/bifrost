@@ -34,6 +34,8 @@ mod usage_graph_test;
 mod usage_graph_ts_test;
 mod usages_cpp_abseil_member_pointer_test;
 mod usages_cpp_abseil_temporary_test;
+mod usages_cpp_behaviortree_alias_test;
+mod usages_cpp_behaviortree_qualifier_test;
 mod usages_cpp_graph_test;
 mod usages_cpp_macro_return_test;
 mod usages_cpp_macro_sentinel_owner_test;

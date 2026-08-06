@@ -1032,6 +1032,13 @@ struct CppSentinelReparsedClass<'tree> {
     raw_supertypes: Option<Vec<String>>,
 }
 
+fn cpp_sentinel_reparsed_leading_template(root: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor)
+        .find(|child| child.kind() != "comment")
+        .filter(|child| child.kind() == "template_declaration")
+}
+
 fn cpp_sentinel_reparsed_class<'tree>(
     root: Node<'tree>,
     template_node: Option<Node<'tree>>,
@@ -1056,6 +1063,21 @@ fn cpp_sentinel_reparsed_class<'tree>(
             });
         }
         if child.kind() == "declaration"
+            && let Some(class_node) = first_class_like_child(child)
+        {
+            let name = class_like_name(class_node, source)?;
+            let body = cpp_body_node(class_node)?;
+            let raw_supertypes =
+                matches!(class_node.kind(), "class_specifier" | "struct_specifier")
+                    .then(|| extract_cpp_supertypes(class_node, source));
+            return Some(CppSentinelReparsedClass {
+                declaration_node: class_node,
+                name,
+                body,
+                raw_supertypes,
+            });
+        }
+        if child.kind() == "function_definition"
             && let Some(class_node) = first_class_like_child(child)
         {
             let name = class_like_name(class_node, source)?;
@@ -2708,12 +2730,7 @@ impl<'a> CppVisitor<'a> {
                 return false;
             };
             let class_root = class_tree.root_node();
-            let template_node = {
-                let mut cursor = class_root.walk();
-                class_root
-                    .named_children(&mut cursor)
-                    .find(|child| child.kind() == "template_declaration")
-            };
+            let template_node = cpp_sentinel_reparsed_leading_template(class_root);
             let Some(reparsed_class) =
                 cpp_sentinel_reparsed_class(class_root, template_node, self.source)
             else {
@@ -6379,6 +6396,15 @@ struct CppSentinelFragmentedClassTail<'tree> {
     consumed_start: usize,
 }
 
+struct CppSentinelDirectBodyClassRegion {
+    namespace_components: Vec<String>,
+    class_start: usize,
+    class_start_line: usize,
+    class_close_end: usize,
+    class_close_line: usize,
+    name: String,
+}
+
 fn cpp_sentinel_body_class_candidate<'tree>(
     child: Node<'tree>,
 ) -> Option<(Node<'tree>, Option<Node<'tree>>)> {
@@ -6408,6 +6434,156 @@ fn cpp_sentinel_body_class_candidate<'tree>(
         }
     })?;
     Some((class_node, Some(child)))
+}
+
+fn cpp_sentinel_direct_body_class_candidate<'tree>(
+    child: Node<'tree>,
+) -> Option<(Node<'tree>, Option<Node<'tree>>)> {
+    if let Some(candidate) = cpp_sentinel_body_class_candidate(child) {
+        return Some(candidate);
+    }
+    if child.kind() != "template_declaration" {
+        return None;
+    }
+    let mut cursor = child.walk();
+    let wrapper = child
+        .named_children(&mut cursor)
+        .find(|candidate| candidate.kind() == "function_definition" && candidate.has_error())?;
+    Some((first_class_like_child(wrapper)?, Some(child)))
+}
+
+fn cpp_sentinel_direct_namespace_components(
+    function: Node<'_>,
+    body: Node<'_>,
+    source: &str,
+) -> Option<Vec<String>> {
+    let mut cursor = function.walk();
+    let children = function
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment" && child.end_byte() <= body.start_byte())
+        .collect::<Vec<_>>();
+    let sentinel_index = children.iter().rposition(|child| {
+        direct_identifier_name(*child, source)
+            .is_some_and(|name| cpp_export_macro_token(&name) && name.ends_with("NAMESPACE_BEGIN"))
+    })?;
+    let mut identifiers = Vec::new();
+    let mut stack = children[sentinel_index + 1..]
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
+    while let Some(current) = stack.pop() {
+        if let Some(name) = direct_identifier_name(current, source) {
+            identifiers.push(name);
+            continue;
+        }
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    let [keyword, namespace] = identifiers.as_slice() else {
+        return None;
+    };
+    (keyword == "namespace" && !namespace.is_empty() && !cpp_export_macro_token(namespace))
+        .then(|| vec![namespace.clone()])
+}
+
+fn cpp_sentinel_namespace_close_follows_class(class_semicolon: Node<'_>, source: &str) -> bool {
+    let mut sibling = class_semicolon.next_named_sibling();
+    let namespace_close = loop {
+        let Some(current) = sibling else {
+            return false;
+        };
+        sibling = current.next_named_sibling();
+        if current.kind() != "comment" {
+            break current;
+        }
+    };
+    if !cpp_is_stray_close_brace(namespace_close, source) {
+        return false;
+    }
+    loop {
+        let Some(current) = sibling else {
+            return false;
+        };
+        sibling = current.next_named_sibling();
+        if current.kind() == "comment" {
+            continue;
+        }
+        return direct_identifier_name(current, source)
+            .is_some_and(|name| name.ends_with("NAMESPACE_END"));
+    }
+}
+
+fn cpp_sentinel_macro_body_class_region(
+    node: Node<'_>,
+    source: &str,
+) -> Option<CppSentinelDirectBodyClassRegion> {
+    let (_, None) = cpp_sentinel_macro_parts(node, source)? else {
+        return None;
+    };
+    if node.kind() != "function_definition" || !node.has_error() {
+        return None;
+    }
+    let body = cpp_body_node(node).filter(|body| body.kind() == "compound_statement")?;
+    let namespace_components = cpp_sentinel_direct_namespace_components(node, body, source)?;
+    let mut cursor = body.walk();
+    let candidates = body
+        .named_children(&mut cursor)
+        .filter_map(cpp_sentinel_direct_body_class_candidate)
+        .filter(|(class_node, _)| class_node.has_error() && cpp_body_node(*class_node).is_some())
+        .collect::<Vec<_>>();
+    let [(class_node, template_node)] = candidates.as_slice() else {
+        return None;
+    };
+    let original_body = cpp_body_node(*class_node)?;
+    let name = class_like_name(*class_node, source)?;
+    if name.is_empty() || cpp_export_macro_token(&name) {
+        return None;
+    }
+
+    let mut sibling = node.next_named_sibling();
+    let (class_close_start, class_close_end, class_close_line) = loop {
+        let current = sibling?;
+        let next = current.next_named_sibling();
+        if cpp_is_stray_close_brace(current, source)
+            && next.is_some_and(|next| cpp_is_stray_semicolon(next, source))
+        {
+            let semicolon = next.expect("checked above");
+            if !cpp_sentinel_namespace_close_follows_class(semicolon, source) {
+                return None;
+            }
+            break (
+                current.start_byte(),
+                semicolon.end_byte(),
+                semicolon.end_position().row + 1,
+            );
+        }
+        sibling = next;
+    };
+    let reparse_start = template_node.map_or(class_node.start_byte(), |node| node.start_byte());
+    let tree = cpp_reparse_region_items(source, reparse_start, class_close_end)?;
+    let root = tree.root_node();
+    let reparsed_template = cpp_sentinel_reparsed_leading_template(root);
+    let reparsed = cpp_sentinel_reparsed_class(root, reparsed_template, source)?;
+    if reparsed.name != name
+        || reparsed.declaration_node.start_byte() != class_node.start_byte()
+        || reparsed.body.start_byte() != original_body.start_byte()
+        || class_close_start <= reparsed.body.end_byte()
+        || class_close_end <= class_node.end_byte()
+    {
+        return None;
+    }
+    Some(CppSentinelDirectBodyClassRegion {
+        namespace_components,
+        class_start: reparse_start,
+        class_start_line: template_node.map_or(class_node.start_position().row + 1, |node| {
+            node.start_position().row + 1
+        }),
+        class_close_end,
+        class_close_line,
+        name,
+    })
 }
 
 /// Recognize the one malformed namespace-sentinel shape emitted for Abseil's
@@ -6475,7 +6651,10 @@ fn cpp_nested_namespace_sentinel<'tree>(
     };
 
     let mut cursor = function.walk();
-    let named = function.named_children(&mut cursor).collect::<Vec<_>>();
+    let named = function
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment")
+        .collect::<Vec<_>>();
     let [first_type, inner_error, inner_name, body] = named.as_slice() else {
         return None;
     };
@@ -6676,6 +6855,31 @@ pub fn cpp_sentinel_recovered_classes(
                     source,
                 );
             }
+        } else if let Some(region) = cpp_sentinel_macro_body_class_region(current, source) {
+            let namespace_components = cpp_sentinel_recovered_namespace_components(
+                current,
+                &region.namespace_components,
+                source,
+            );
+            let owner_container = current
+                .parent()
+                .filter(|parent| parent.kind() == "declaration_list")
+                .unwrap_or(current);
+            let owner_ranges =
+                cpp_sentinel_recovered_owner_ranges(owner_container, &namespace_components, source);
+            push_cpp_sentinel_recovered_class(
+                &mut recovered_classes,
+                cpp_declaration_range(owner_container),
+                &namespace_components,
+                Range {
+                    start_byte: region.class_start,
+                    end_byte: region.class_close_end,
+                    start_line: region.class_start_line,
+                    end_line: region.class_close_line,
+                },
+                region.name,
+                &owner_ranges,
+            );
         } else if let Some(region) = cpp_sentinel_macro_class_region(current, source) {
             // A generic sentinel-prefixed class can be reduced as a malformed
             // function/ERROR without the explicit `namespace X` token pair.
@@ -6687,11 +6891,7 @@ pub fn cpp_sentinel_recovered_classes(
                 continue;
             };
             let root = tree.root_node();
-            let template_node = {
-                let mut cursor = root.walk();
-                root.named_children(&mut cursor)
-                    .find(|child| child.kind() == "template_declaration")
-            };
+            let template_node = cpp_sentinel_reparsed_leading_template(root);
             let Some(reparsed_class) = cpp_sentinel_reparsed_class(root, template_node, source)
             else {
                 continue;
@@ -7286,6 +7486,11 @@ fn cpp_sentinel_macro_class_region(
     let (reparse_start, Some(class_start)) = cpp_sentinel_macro_parts(node, source)? else {
         return None;
     };
+    let body_open_start = cpp_sentinel_macro_class_body_open(node, class_start)
+        .or_else(|| cpp_body_node(node).map(|body| body.start_byte()))?;
+    if class_start >= body_open_start {
+        return None;
+    }
     let sibling_close = {
         let mut sibling = node.next_named_sibling();
         let mut found = None;
@@ -7306,15 +7511,9 @@ fn cpp_sentinel_macro_class_region(
         }
         found
     };
-    let (body_open_start, class_close_start, class_close_end, class_close_line) =
+    let (class_close_start, class_close_end, class_close_line) =
         if let Some((class_close_start, class_close_end, class_close_line)) = sibling_close {
-            let body_open_start = cpp_sentinel_macro_class_body_open(node, class_start)?;
-            (
-                body_open_start,
-                class_close_start,
-                class_close_end,
-                class_close_line,
-            )
+            (class_close_start, class_close_end, class_close_line)
         } else {
             // When the malformed envelope itself is an ERROR, tree-sitter can
             // leave the class's balanced close in the source while promoting
@@ -7323,25 +7522,14 @@ fn cpp_sentinel_macro_class_region(
             // the partition boundary. This keeps balancing in tree-sitter and
             // preserves the source's original byte offsets.
             let tree = cpp_reparse_region_items(source, reparse_start, source.len())?;
-            let template_node = {
-                let mut cursor = tree.root_node().walk();
-                tree.root_node()
-                    .named_children(&mut cursor)
-                    .find(|child| child.kind() == "template_declaration")
-            };
+            let template_node = cpp_sentinel_reparsed_leading_template(tree.root_node());
             let reparsed_class =
                 cpp_sentinel_reparsed_class(tree.root_node(), template_node, source)?;
             let body = reparsed_class.body;
-            let body_open_start = body.start_byte();
             let class_close_end = body.end_byte();
             let class_close_start = class_close_end.checked_sub(1)?;
             let class_close_line = body.end_position().row + 1;
-            (
-                body_open_start,
-                class_close_start,
-                class_close_end,
-                class_close_line,
-            )
+            (class_close_start, class_close_end, class_close_line)
         };
     if class_close_start <= class_start {
         return None;
@@ -7352,21 +7540,16 @@ fn cpp_sentinel_macro_class_region(
     // class-like item; the original malformed tree cannot provide that node.
     let tree = cpp_reparse_region_items(source, reparse_start, class_close_end)?;
     let class_root = tree.root_node();
-    let template_node = {
-        let mut cursor = class_root.walk();
-        class_root
-            .named_children(&mut cursor)
-            .find(|child| child.kind() == "template_declaration")
-    };
+    let template_node = cpp_sentinel_reparsed_leading_template(class_root);
     let reparsed_class = cpp_sentinel_reparsed_class(class_root, template_node, source)?;
     let body = reparsed_class.body;
-    let body_start = body.start_byte().checked_add(1)?;
-    // The class body opening must agree with the original malformed tree's
-    // structured token. This avoids accidentally recovering an inner nested
-    // class when the source has several balanced bodies in the region.
+    // The class body opening must agree with the malformed wrapper's structured
+    // body field. This rejects an inner nested class while permitting later
+    // members to remain fragmented as root-level siblings in the bounded parse.
     if body.start_byte() != body_open_start {
         return None;
     }
+    let body_start = body.start_byte().checked_add(1)?;
     (body_start < class_close_start).then_some((
         reparse_start,
         class_start,
@@ -10445,6 +10628,46 @@ class broken {
                 class.scope_components == ["absl", "container_internal", "broken"]
             }),
             "a complete class body must be recovered despite an internal parser error: {recovered:#?}"
+        );
+    }
+
+    #[test]
+    fn sentinel_recovery_keeps_members_after_nested_body_close() {
+        let source = r#"NLOHMANN_JSON_NAMESPACE_BEGIN
+NLOHMANN_BASIC_JSON_TPL_DECLARATION
+class basic_json {
+ private:
+  union storage {
+    int value;
+  } data;
+ public:
+  using late_alias = int;
+  late_alias value() const;
+};
+NLOHMANN_JSON_NAMESPACE_END
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let recovered = cpp_sentinel_recovered_classes(tree.root_node(), source);
+        let basic_json = recovered
+            .iter()
+            .find(|class| {
+                class
+                    .scope_components
+                    .last()
+                    .is_some_and(|name| name == "basic_json")
+            })
+            .unwrap_or_else(|| panic!("the fragmented class must be recovered: {recovered:#?}"));
+        let late_alias = source
+            .find("late_alias value")
+            .expect("late alias reference");
+        assert!(
+            basic_json.class_range.start_byte < late_alias
+                && late_alias < basic_json.class_range.end_byte,
+            "the recovered class range must include members after a nested close: {basic_json:#?}"
         );
     }
 

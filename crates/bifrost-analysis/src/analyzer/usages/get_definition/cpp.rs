@@ -2060,6 +2060,27 @@ fn cpp_type_node_is_declaration_type(mut node: Node<'_>) -> bool {
     false
 }
 
+fn cpp_is_template_argument_type_leaf(node: Node<'_>) -> bool {
+    let Some(type_descriptor) = node.parent() else {
+        return false;
+    };
+    if type_descriptor.kind() != "type_descriptor"
+        || type_descriptor.child_by_field_name("type") != Some(node)
+    {
+        return false;
+    }
+    let Some(arguments) = type_descriptor.parent() else {
+        return false;
+    };
+    if arguments.kind() != "template_argument_list" {
+        return false;
+    }
+    arguments.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "template_type" | "template_function")
+            && parent.child_by_field_name("arguments") == Some(arguments)
+    })
+}
+
 fn cpp_type_node_resolves_lexically(
     analyzer: &dyn IAnalyzer,
     visibility: &CppVisibilityIndex,
@@ -2219,6 +2240,24 @@ fn resolve_cpp_type(
             "declaration_or_import_site",
             format!("`{text}` is not a C++ reference site"),
         );
+    }
+    if node.kind() == "type_identifier"
+        && cpp_is_template_argument_type_leaf(node)
+        && cpp_active_block_type_alias_node(node, &text, source).is_none()
+        && !cpp_active_template_parameter_reference(node, source)
+    {
+        let candidates = cpp_enclosing_class_member_candidates(
+            analyzer,
+            context.bounded_support(),
+            visibility,
+            file,
+            node,
+            class_ranges,
+            &text,
+        );
+        if !candidates.is_empty() {
+            return candidates_outcome(candidates);
+        }
     }
     // A template-id used as the scope of a qualified access denotes the
     // qualifier, not an independent unqualified template.  Resolve the full
@@ -3020,6 +3059,18 @@ fn resolve_cpp_type_without_focused_qualifier(
         "no_indexed_definition",
         format!("`{text}` did not resolve to an indexed C++ type"),
     )
+}
+
+fn cpp_type_alias_declaration_contains_node(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+    node: Node<'_>,
+) -> bool {
+    cpp_unit_is_type_alias(analyzer, candidate)
+        && analyzer
+            .ranges(candidate)
+            .into_iter()
+            .any(|range| range.start_byte <= node.start_byte() && node.end_byte() <= range.end_byte)
 }
 
 fn cpp_active_template_parameter_reference(node: Node<'_>, source: &str) -> bool {
@@ -4155,6 +4206,18 @@ fn resolve_cpp_construction_type(
                 ),
             );
         }
+        let member_candidates = cpp_enclosing_class_member_candidates(
+            ctx.analyzer,
+            ctx.support,
+            ctx.visibility,
+            ctx.file,
+            type_node,
+            ctx.class_ranges,
+            &text,
+        );
+        if !member_candidates.is_empty() {
+            return candidates_outcome(member_candidates);
+        }
         if let Some(unit) = resolve_in_enclosing_scopes(
             ctx.analyzer,
             ctx.file,
@@ -4432,8 +4495,37 @@ fn cpp_is_non_reference_declaration_name(node: Node<'_>) -> bool {
         return false;
     }
     cpp_is_declaration_name(node)
+        || cpp_is_recovered_template_forward_declaration_name(node)
         || cpp_is_terminal_declarator_name(node)
         || cpp_is_range_for_binding_name(node)
+}
+
+fn cpp_is_recovered_template_forward_declaration_name(node: Node<'_>) -> bool {
+    let Some(specifier) = node.parent() else {
+        return false;
+    };
+    if !matches!(
+        specifier.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier"
+    ) || specifier.child_by_field_name("name") != Some(node)
+        || specifier.child_by_field_name("body").is_some()
+    {
+        return false;
+    }
+    let mut current = specifier.parent();
+    while let Some(ancestor) = current {
+        match ancestor.kind() {
+            "type_descriptor"
+            | "parameter_declaration"
+            | "optional_parameter_declaration"
+            | "template_argument_list"
+            | "cast_expression" => return false,
+            "template_declaration" => return true,
+            "declaration" | "field_declaration" | "translation_unit" => return false,
+            _ => current = ancestor.parent(),
+        }
+    }
+    false
 }
 
 fn cpp_is_out_of_line_destructor_type_name(node: Node<'_>) -> bool {
@@ -5473,6 +5565,44 @@ fn cpp_enclosing_class(
         byte,
         &class_ranges,
     )
+}
+
+fn cpp_enclosing_class_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    node: Node<'_>,
+    class_ranges: Option<&ClassRangeIndex>,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let dispatch = CppDispatch::new(analyzer);
+    let candidates_for_owner = |owner: &CodeUnit| {
+        cpp_direct_type_member_candidates(analyzer, support, owner, name)
+            .into_iter()
+            .filter(|candidate| {
+                !cpp_type_alias_declaration_contains_node(analyzer, candidate, node)
+                    && visibility.external_type_candidate_visible_in_context(
+                        dispatch.source(),
+                        file,
+                        candidate,
+                        node,
+                    )
+            })
+            .collect::<Vec<_>>()
+    };
+    let Some(ranges) = class_ranges else {
+        return Vec::new();
+    };
+    let mut owner = ranges.enclosing_unit(node.start_byte()).cloned();
+    while let Some(current) = owner {
+        let candidates = candidates_for_owner(&current);
+        if !candidates.is_empty() {
+            return candidates;
+        }
+        owner = analyzer.parent_of(&current).filter(CodeUnit::is_class);
+    }
+    Vec::new()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7105,6 +7235,40 @@ mod bounded_tests {
                 .map(|node| node.kind()),
             Some("function_declarator")
         );
+    }
+
+    #[test]
+    fn class_alias_is_not_visible_in_its_own_template_argument() {
+        let source = r#"
+namespace lib {
+template<typename T> struct wrapper {};
+struct value_type {};
+struct holder {
+    using value_type = wrapper<value_type>;
+};
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Cpp, &[("alias.hpp", source)]);
+        let analyzer = fixture.analyzer.analyzer();
+        let alias = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.fq_name().ends_with("holder$value_type"))
+            .expect("member alias");
+        let tree = parse_cpp_tree(source).expect("C++ tree");
+        let start = source
+            .find("wrapper<value_type>")
+            .expect("alias right-hand type")
+            + "wrapper<".len();
+        let node = tree
+            .root_node()
+            .named_descendant_for_byte_range(start, start + "value_type".len())
+            .expect("alias right-hand type node");
+
+        assert_eq!(node.kind(), "type_identifier");
+        assert!(cpp_type_alias_declaration_contains_node(
+            analyzer, &alias, node
+        ));
     }
 
     #[test]

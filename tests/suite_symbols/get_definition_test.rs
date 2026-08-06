@@ -20993,6 +20993,103 @@ private:
 }
 
 #[test]
+fn cpp_template_argument_alias_uses_partial_specialization_owner() {
+    let source = r#"
+namespace lib {
+using error_type = short;
+template<typename T, typename E> class expected {
+public:
+    using error_type = E;
+};
+
+template<typename E>
+class expected<void, E> {
+public:
+    using error_type = E;
+
+    template<typename F>
+    expected<void, error_type> transform(F&&) const & {
+        return expected<void, error_type>();
+    }
+
+    template<typename F>
+    expected<F, error_type> dependent_transform(F&&) const & {
+        return expected<F, error_type>();
+    }
+
+    void local_alias() const {
+        using error_type = long;
+        (void)sizeof(expected<void, error_type>);
+    }
+};
+}
+
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("expected.hpp", source)
+        .build();
+    let return_error = source
+        .find("expected<void, error_type> transform")
+        .expect("dependent return alias")
+        + "expected<void, ".len();
+    let body_error = source
+        .rfind("expected<void, error_type>()")
+        .expect("dependent body alias")
+        + "expected<void, ".len();
+    let local_error = source
+        .find("sizeof(expected<void, error_type>)")
+        .expect("local alias")
+        + "sizeof(expected<void, ".len();
+    let dependent_return_error = source
+        .find("expected<F, error_type> dependent_transform")
+        .expect("dependent return alias")
+        + "expected<F, ".len();
+    let dependent_body_error = source
+        .rfind("expected<F, error_type>()")
+        .expect("dependent body alias")
+        + "expected<F, ".len();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("expected.hpp", source, return_error),
+                location_query("expected.hpp", source, body_error),
+                location_query("expected.hpp", source, local_error),
+                location_query("expected.hpp", source, dependent_return_error),
+                location_query("expected.hpp", source, dependent_body_error),
+            ]
+        })
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "resolved", "{value}");
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(results[2]["status"], "no_definition", "{value}");
+    assert_eq!(results[3]["status"], "resolved", "{value}");
+    assert_eq!(results[4]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[0]["definitions"][0]["fqn"], "lib.expected<void, E>$error_type",
+        "{value}"
+    );
+    assert_eq!(
+        results[1]["definitions"][0]["fqn"], "lib.expected<void, E>$error_type",
+        "{value}"
+    );
+    assert_eq!(
+        results[2]["diagnostics"][0]["kind"], "unresolved_local_type",
+        "{value}"
+    );
+    assert_eq!(
+        results[3]["definitions"][0]["fqn"], "lib.expected<void, E>$error_type",
+        "{value}"
+    );
+    assert_eq!(
+        results[4]["definitions"][0]["fqn"], "lib.expected<void, E>$error_type",
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_exact_fqn_candidate_ordering_does_not_hydrate_hidden_duplicate_files() {
     const HIDDEN_DUPLICATES: usize = 16;
     const EXACT_CANDIDATES: usize = HIDDEN_DUPLICATES + 1;
@@ -22653,6 +22750,140 @@ template <> struct context<link> {
     assert_eq!(results[1]["status"], "resolved", "{value}");
     assert_eq!(
         results[1]["definitions"][0]["fqn"], "link_context",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_template_forward_declaration_name_is_not_reference() {
+    let source = r#"
+template <typename T, typename E>
+class Box;
+
+template <typename T, typename E>
+class Box {};
+
+template <typename T>
+struct Defined {};
+
+void use(Box<int, short>* value) { (void)value; }
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("forward.hpp", source)
+        .build();
+    let forward_name = source.find("class Box").expect("forward declaration") + "class ".len();
+    let use_name = source.find("Box<int, short>").expect("reference");
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("forward.hpp", source, forward_name),
+                location_query("forward.hpp", source, use_name),
+            ]
+        })
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[0]["diagnostics"][0]["kind"], "declaration_or_import_site",
+        "{value}"
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(results[1]["definitions"][0]["fqn"], "Box", "{value}");
+}
+
+#[test]
+fn cpp_macro_namespace_template_forward_declaration_name_is_not_reference() {
+    let source = format!(
+        "{}\n{}",
+        // A macro-heavy header can leave the C++ parser at an ERROR root.
+        "{".repeat(32),
+        r#"
+#define NLOHMANN_JSON_NAMESPACE_BEGIN                \
+    namespace nlohmann                               \
+    {                                                \
+    inline namespace json_abi_v3_11_3                \
+    {
+#define NLOHMANN_JSON_NAMESPACE_END                 \
+    }                                                \
+    }
+
+NLOHMANN_JSON_NAMESPACE_BEGIN
+namespace detail
+{
+template<typename IteratorType> class iteration_proxy;
+template<typename IteratorType> class iteration_proxy_value;
+template<typename IteratorType> class iteration_proxy_value {};
+
+void use(iteration_proxy_value<int>* value) { (void)value; }
+}
+NLOHMANN_JSON_NAMESPACE_END
+"#
+    );
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("json.hpp", source.clone())
+        .build();
+    let forward_name = source
+        .find("class iteration_proxy;")
+        .expect("forward declaration")
+        + "class ".len();
+    let forward_value_name = source
+        .find("class iteration_proxy_value;")
+        .expect("forward declaration")
+        + "class ".len();
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .expect("C++ parser");
+    let tree = parser.parse(&source, None).expect("C++ tree");
+    let mut node = tree
+        .root_node()
+        .named_descendant_for_byte_range(forward_name, forward_name + 1)
+        .expect("forward declaration node");
+    let mut actual_kinds = Vec::new();
+    while let Some(parent) = node.parent() {
+        actual_kinds.push(node.kind());
+        node = parent;
+    }
+    actual_kinds.push(node.kind());
+    assert_eq!(
+        actual_kinds,
+        [
+            "type_identifier",
+            "class_specifier",
+            "template_declaration",
+            "compound_statement",
+            "function_definition",
+            "ERROR",
+        ],
+        "recovered declaration AST"
+    );
+    let use_name = source
+        .find("iteration_proxy_value<int>")
+        .expect("reference");
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("json.hpp", &source, forward_name),
+                location_query("json.hpp", &source, forward_value_name),
+                location_query("json.hpp", &source, use_name),
+            ]
+        })
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for result in &results[..2] {
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "declaration_or_import_site",
+            "{value}"
+        );
+    }
+    assert_eq!(results[2]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[2]["definitions"][0]["name"], "iteration_proxy_value",
         "{value}"
     );
 }
