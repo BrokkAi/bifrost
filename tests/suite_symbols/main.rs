@@ -11,6 +11,7 @@ mod common;
 
 mod bifrostignore;
 mod classify_test_files_test;
+mod csharp_constructor_resolution;
 mod diff_analysis_test;
 mod get_definition_test;
 mod most_relevant_files;
