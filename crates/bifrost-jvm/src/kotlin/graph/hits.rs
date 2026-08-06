@@ -17,22 +17,22 @@
 //! either resolves to the target or does not, with no receiver to be unsure
 //! about. The other two exist for the callable and property arms.
 
-use crate::analyzer::usages::common::{
+use crate::kotlin::graph::extractor::ScanCtx;
+use brokk_bifrost_core::analyzer::usages::common::{
     SNIPPET_CONTEXT_LINES, external_usage_hit_count, reclassify_import_hit_at,
     reclassify_override_declaration_hit_at, reclassify_self_receiver_hit_at, usage_hit,
 };
-use crate::analyzer::usages::kotlin_graph::extractor::ScanCtx;
-use crate::analyzer::{CodeUnit, Range};
-use crate::text_utils::{find_line_index_for_offset, snippet_around_line};
+use brokk_bifrost_core::analyzer::{CodeUnit, Range};
+use brokk_bifrost_core::text_utils::{find_line_index_for_offset, snippet_around_line};
 use tree_sitter::Node;
 
 /// The declaration a reference sits inside.
 #[derive(Clone, Default)]
-pub(super) struct EnclosingContext {
-    pub(super) enclosing: Option<CodeUnit>,
+pub struct EnclosingContext {
+    pub enclosing: Option<CodeUnit>,
 }
 
-pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     *ctx.raw_match_count += 1;
     if *ctx.limit_exceeded {
         return;
@@ -59,14 +59,14 @@ pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     refresh_usage_limit(ctx);
 }
 
-pub(super) fn push_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn push_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
     reclassify_import_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
     refresh_usage_limit(ctx);
 }
 
 /// Record a declaration that overrides the target as a reference to it.
-pub(super) fn push_override_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn push_override_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
     reclassify_override_declaration_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
 }
@@ -80,7 +80,7 @@ pub(super) fn push_override_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_
 /// surface. Without that exclusion every private helper called only from its own
 /// class would look used. `super` is deliberately not routed here: a `super`
 /// call names an ancestor's declaration from outside it.
-pub(super) fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
     reclassify_self_receiver_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
     refresh_usage_limit(ctx);
@@ -97,7 +97,7 @@ fn refresh_usage_limit(ctx: &mut ScanCtx<'_>) {
 /// "yes" or "no". It is surfaced separately in the result and excluded from
 /// proven-edge consumers, so a declaration reachable only through unproven
 /// references reads as inconclusive rather than as confidently dead.
-pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+pub fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let start = node.start_byte();
     let line_idx = find_line_index_for_offset(ctx.line_starts, start);
     let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
@@ -120,7 +120,7 @@ pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 /// The declaration enclosing `node`.
-pub(super) fn enclosing_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> EnclosingContext {
+pub fn enclosing_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> EnclosingContext {
     let key = (node.start_byte(), node.end_byte());
     if let Some(cached) = ctx.enclosing_cache.get(&key) {
         return cached.clone();
@@ -132,7 +132,7 @@ pub(super) fn enclosing_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Enclos
         start_line: find_line_index_for_offset(ctx.line_starts, node.start_byte()),
         end_line: find_line_index_for_offset(ctx.line_starts, node.end_byte()),
     };
-    let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
+    let enclosing = ctx.graph.index.enclosing_code_unit(ctx.file, &range);
     let resolved = EnclosingContext { enclosing };
     ctx.enclosing_cache.insert(key, resolved.clone());
     resolved

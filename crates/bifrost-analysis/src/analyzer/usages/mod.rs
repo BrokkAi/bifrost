@@ -46,9 +46,7 @@ pub(crate) mod workspace_graph_cache;
 // item it holds was already crate-private, in which case the alias narrows to
 // `pub(crate)` rather than re-publishing core's promoted `pub` items.
 use brokk_bifrost_core::analyzer::usages::{graph_core, local_inference, model, reexport_seeds};
-pub(crate) use brokk_bifrost_core::analyzer::usages::{
-    outcome, receiver_analysis, reference_site, same_owner,
-};
+pub(crate) use brokk_bifrost_core::analyzer::usages::{outcome, receiver_analysis, reference_site};
 
 #[cfg(test)]
 pub(crate) use call_relations::CallArgument;

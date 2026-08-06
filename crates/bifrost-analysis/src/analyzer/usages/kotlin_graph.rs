@@ -23,8 +23,9 @@
 //! implicit conversions, `apply`/`unapply` extractors, export clauses, and union
 //! types, none of which Kotlin has. So the module structure here mirrors
 //! `super::java_graph` — a target model, a forward scan, a hit recorder — while
-//! the syntax it reads comes from `crate::analyzer::kotlin::syntax`, shared with
-//! the #1238 definition resolver so navigation and usages cannot drift apart.
+//! the syntax it reads comes from [`brokk_bifrost_jvm::kotlin::syntax`], shared
+//! with the #1238 definition resolver so navigation and usages cannot drift
+//! apart.
 //!
 //! # What this answers
 //!
@@ -38,8 +39,9 @@
 //! `callers`/`callees`, relevance ranking, and dead-code detection.
 //!
 //! Both directions share their entire resolution backbone through
-//! [`resolver::KotlinResolutionCtx`], so find-references and `usage_graph`
-//! cannot disagree about which declaration a call means.
+//! [`brokk_bifrost_jvm::kotlin::graph::resolver::KotlinResolutionCtx`], so
+//! find-references and `usage_graph` cannot disagree about which declaration a
+//! call means.
 //!
 //! Cross-language: a *type* query crosses the realm both ways — a Kotlin class's
 //! Java and Scala call sites are reported, and Kotlin files are scanned for Java
@@ -48,14 +50,9 @@
 //! own member-lookup rules, and answering one language's question with another's
 //! would be a guess. See `.agents/plans/kotlin-usage-graph-1239.md`.
 
-mod extractor;
-mod hits;
-mod inverted;
-mod resolver;
 mod shared;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
-pub(crate) use resolver::is_companion_object;
 pub(crate) use shared::scan_kotlin_files_for_jvm_type;
 
 use crate::analyzer::usages::common::language_for_target;
@@ -64,8 +61,45 @@ use crate::analyzer::usages::kotlin_graph::shared::{KotlinEdgeResolver, KotlinQu
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
+use brokk_bifrost_jvm::kotlin::graph::KotlinGraphSource;
+
+/// Run `visit` with the [`KotlinGraphSource`] built from the *dispatching*
+/// analyzer.
+///
+/// A callback rather than a constructor because the definition-index accessor is
+/// itself a borrowed closure: `analyzer.global_usage_definition_index()` returns
+/// a handle that borrows the analyzer and merges one shard per delegate, and the
+/// Kotlin side takes it lazily so a scan that never reaches a realm-wide lookup
+/// never pays for the merge.
+fn with_kotlin_graph_source<R>(
+    analyzer: &dyn IAnalyzer,
+    visit: impl FnOnce(KotlinGraphSource<'_>) -> R,
+) -> R {
+    let definitions = |consume: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| {
+        consume(&analyzer.global_usage_definition_index());
+    };
+    visit(KotlinGraphSource {
+        index: analyzer,
+        hierarchy: analyzer.type_hierarchy_provider(),
+        type_alias: analyzer.type_alias_provider(),
+        imports: analyzer.import_analysis_provider(),
+        definitions: &definitions,
+    })
+}
+
+/// Whether `unit` is a Kotlin `companion object`.
+///
+/// A wrapper over
+/// [`brokk_bifrost_jvm::kotlin::graph::resolver::is_companion_object`] that
+/// builds the graph source: the definition route asks this from a `&dyn
+/// IAnalyzer` and stays in this crate until the `ResolutionSession` band moves.
+pub(crate) fn is_companion_object(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+    with_kotlin_graph_source(analyzer, |graph| {
+        brokk_bifrost_jvm::kotlin::graph::resolver::is_companion_object(&graph, unit)
+    })
+}
 
 /// Every Kotlin `caller -> callee` edge whose callee is one of `nodes`.
 pub(crate) fn build_kotlin_usage_edges<F>(

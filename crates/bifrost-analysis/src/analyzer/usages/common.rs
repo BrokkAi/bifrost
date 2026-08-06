@@ -3,8 +3,7 @@
 // moved to `brokk-bifrost-core` and are re-exported here at the paths their
 // callers already use. What stays needs an `IAnalyzer` or a `Language`.
 pub(super) use brokk_bifrost_core::analyzer::usages::common::{
-    SNIPPET_CONTEXT_LINES, node_text, reclassify_import_hit_at,
-    reclassify_override_declaration_hit_at, reclassify_self_receiver_hit_at, same_node, usage_hit,
+    SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, same_node, usage_hit,
 };
 pub(crate) use brokk_bifrost_core::analyzer::usages::common::{
     external_usage_hit_count, namespace_prefixes,
