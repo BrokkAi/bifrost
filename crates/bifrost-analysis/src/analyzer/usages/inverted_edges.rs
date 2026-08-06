@@ -29,8 +29,8 @@
 
 pub(crate) use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     CallSite, ClassRangeIndex, FileDeclarations, FileEdgeScanInput, NodeKey, PerFileEdges,
-    UsageEdgeWeights, UsageEdges, UsageNodeKey, UsageReferenceCounts, UsageReferenceKind,
-    classify_reference_node, first_precise,
+    UsageEdgeWeights, UsageEdges, UsageNodeKey, UsageReferenceCounts, classify_reference_node,
+    first_precise,
 };
 
 use crate::analyzer::tree_sitter_analyzer::FileState;
@@ -402,6 +402,7 @@ pub(crate) fn merge_weights_and_cap<K: NodeKey>(
 mod tests {
     use super::*;
     use crate::text_utils::find_line_index_for_offset;
+    use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageReferenceKind;
     use tree_sitter::Node;
 
     fn find_node<'tree>(root: Node<'tree>, source: &str, kind: &str, text: &str) -> Node<'tree> {

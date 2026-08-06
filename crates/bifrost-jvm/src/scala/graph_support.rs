@@ -126,6 +126,28 @@ pub trait ScalaSource:
     fn record_query_walk(&self) {}
 }
 
+/// The *dispatching* analyzer's view a targeted find-references scan needs.
+///
+/// Not [`ScalaSource`]: the query is issued against whatever analyzer the
+/// caller holds, which in a mixed workspace is a `MultiAnalyzer` whose
+/// definition index merges every language's shards and whose enclosing-unit and
+/// range answers cross language boundaries. A Scala class is equally nameable
+/// from Java and Kotlin, so collapsing these three onto the Scala analyzer
+/// would silently narrow the scan -- the trap the Python pass recorded.
+///
+/// Three free-standing methods rather than a `CodeUnitIndex` supertrait,
+/// because `dyn IAnalyzer` cannot be unsized to another trait object and the
+/// shim therefore has to wrap it; wrapping should cost three forwards, not
+/// forty.
+pub trait ScalaWorkspaceSource {
+    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit>;
+    fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range>;
+
+    /// See [`ScalaSource::definitions_by_normalized_fqn`]; this one answers
+    /// from every language's shard.
+    fn definitions_by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit>;
+}
+
 /// The slice of the workspace declaration index [`ProjectTypes`] holds.
 ///
 /// Eleven questions out of `GlobalUsageDefinitionIndex`'s surface, three of

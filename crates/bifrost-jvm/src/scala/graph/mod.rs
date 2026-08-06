@@ -13,5 +13,6 @@
 pub mod inverted;
 pub mod local;
 pub mod namespace;
+pub mod query;
 pub mod resolver;
 pub mod syntax;
