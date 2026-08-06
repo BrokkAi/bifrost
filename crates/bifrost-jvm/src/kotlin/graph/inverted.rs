@@ -40,31 +40,31 @@
 //! called only from its own class is never a proven inbound edge, and never
 //! confidently dead either.
 
+use super::KotlinGraphSource;
 use super::resolver::{
     KotlinNameResolver, KotlinResolutionCtx, bare_callable_unit, kotlin_callable_arities,
     member_unit, receiver_is_same_owner, receiver_type_fq_name, type_unit, visible_extension_unit,
 };
-use crate::analyzer::kotlin::syntax::{
+use crate::kotlin::syntax::{
     kotlin_binding_type_text, kotlin_call_arity, kotlin_call_with_callee, kotlin_callee,
     kotlin_class_literal_type, kotlin_dotted_navigation_segments, kotlin_import_header_segments,
     kotlin_is_declaration_name, kotlin_is_expression_kind, kotlin_is_navigation_kind,
     kotlin_named_argument_label, kotlin_navigation_member, kotlin_navigation_receiver,
     kotlin_user_type_segments,
 };
-use crate::analyzer::tree_sitter_analyzer::FileState;
-use crate::analyzer::tree_walk::{
+use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::tree_walk::{
     TreeWalkAction, first_named_child_of_kind, named_children, walk_tree_iterative,
 };
-use crate::analyzer::usages::common::node_text;
-use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageEdgeBuildOutput, build_edge_output,
-    build_file_declarations, build_file_declarations_from_state, class_range_index_from_state,
-    classify_reference_node, parse_and_collect_with_declarations,
+use brokk_bifrost_core::analyzer::usages::common::node_text;
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node,
 };
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::same_owner::route_same_owner;
-use crate::analyzer::{IAnalyzer, ProjectFile};
-use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
+};
+use brokk_bifrost_core::analyzer::usages::same_owner::route_same_owner;
+use brokk_bifrost_core::hash::HashMap;
 use tree_sitter::Node;
 
 /// Node kinds that open a Kotlin binding scope.
@@ -85,47 +85,37 @@ const SCOPE_NODES: &[&str] = &[
     "secondary_constructor",
 ];
 
-pub(super) fn build_kotlin_edges<Output, F>(
-    analyzer: &dyn IAnalyzer,
-    files: &[ProjectFile],
-    file_states: &HashMap<ProjectFile, FileState>,
-    nodes: &HashSet<String>,
-    keep_file: F,
-) -> Output
-where
-    Output: UsageEdgeBuildOutput<String>,
-    F: Fn(&ProjectFile) -> bool + Sync,
-{
-    let language = crate::analyzer::kotlin::language::LANGUAGE.into();
-    build_edge_output(files, keep_file, |file| {
-        let state = file_states.get(file);
-        let declarations = state
-            .map(build_file_declarations_from_state)
-            .unwrap_or_else(|| build_file_declarations(analyzer, file));
-        let class_ranges = state
-            .map(class_range_index_from_state)
-            .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
-        parse_and_collect_with_declarations(file, nodes, &language, declarations, |input| {
-            let names = KotlinNameResolver::new(analyzer, file, input.root(), input.source);
-            let mut scan = KotlinEdgeScan {
-                analyzer,
-                source: input.source,
-                names: &names,
-                class_ranges,
-                bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
-                declared_type_cache: HashMap::default(),
-                owner_chain_cache: HashMap::default(),
-                input,
-                edges: PerFileEdges::default(),
-            };
-            walk(input.root(), &mut scan);
-            scan.edges
-        })
-    })
+/// Resolve every reference one already-parsed Kotlin file spells.
+///
+/// The whole-workspace fan-out that calls this stays in
+/// `brokk-bifrost-analysis`: both per-file indexes it feeds in have a
+/// `FileState` fast path, and `FileState` is analysis-crate-private (Ruby's
+/// `forward_owner_relation_facts` precedent -- decode on that side, hand the
+/// decoded facts across).
+pub fn scan_file(
+    graph: &KotlinGraphSource<'_>,
+    file: &ProjectFile,
+    input: &FileEdgeScanInput<'_>,
+    class_ranges: ClassRangeIndex,
+) -> PerFileEdges {
+    let names = KotlinNameResolver::new(graph, file, input.root(), input.source);
+    let mut scan = KotlinEdgeScan {
+        graph,
+        source: input.source,
+        names: &names,
+        class_ranges,
+        bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
+        declared_type_cache: HashMap::default(),
+        owner_chain_cache: HashMap::default(),
+        input,
+        edges: PerFileEdges::default(),
+    };
+    walk(input.root(), &mut scan);
+    scan.edges
 }
 
 struct KotlinEdgeScan<'a> {
-    analyzer: &'a dyn IAnalyzer,
+    graph: &'a KotlinGraphSource<'a>,
     source: &'a str,
     names: &'a KotlinNameResolver<'a>,
     class_ranges: ClassRangeIndex,
@@ -139,8 +129,8 @@ struct KotlinEdgeScan<'a> {
 }
 
 impl KotlinResolutionCtx for KotlinEdgeScan<'_> {
-    fn analyzer(&self) -> &dyn IAnalyzer {
-        self.analyzer
+    fn graph(&self) -> &KotlinGraphSource<'_> {
+        self.graph
     }
 
     fn source(&self) -> &str {
@@ -177,7 +167,7 @@ impl KotlinResolutionCtx for KotlinEdgeScan<'_> {
             if unit.is_class() {
                 owners.push(unit.fq_name());
             }
-            current = self.analyzer.parent_of(&unit);
+            current = self.graph.index.parent_of(&unit);
         }
         self.owner_chain_cache.insert(key, owners.clone());
         owners
@@ -455,13 +445,12 @@ fn record_constructor_of(
     };
     let constructor_fqn = format!("{owner_fqn}.{identifier}");
     let declared = scan
-        .analyzer
-        .global_usage_definition_index()
-        .fqn(&constructor_fqn)
+        .graph
+        .with_definitions(|definitions| definitions.fqn(&constructor_fqn))
         .iter()
         .any(|candidate| {
             candidate.is_function()
-                && kotlin_callable_arities(scan.analyzer, candidate)
+                && kotlin_callable_arities(scan.graph, candidate)
                     .iter()
                     .any(|recorded| recorded.accepts(arity))
         });
@@ -523,7 +512,7 @@ fn record_call(call: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
             // `lib.Base(1)` is a fully-qualified construction, not a member call.
             if let Some(owner_fqn) = dotted_navigation_spelling(callee, scan)
                 .and_then(|spelled| scan.names.resolve_type_fqn(&spelled, callee.start_byte()))
-                .filter(|fqn| type_unit(scan.analyzer, fqn).is_some())
+                .filter(|fqn| type_unit(scan.graph, fqn).is_some())
             {
                 let type_node = kotlin_navigation_member(callee).unwrap_or(callee);
                 record_constructor_of(&owner_fqn, type_node, call, arity, scan);
@@ -543,7 +532,7 @@ fn record_call(call: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
             // call are spelled identically, so the type reading is tried first.
             if !scan.bindings.is_shadowed(&name)
                 && let Some(owner_fqn) = scan.names.resolve_type_fqn(&name, callee.start_byte())
-                && type_unit(scan.analyzer, &owner_fqn).is_some()
+                && type_unit(scan.graph, &owner_fqn).is_some()
             {
                 record_constructor_of(&owner_fqn, callee, call, arity, scan);
                 return;
@@ -607,9 +596,8 @@ fn record_bare_callable(
         None => scan
             .resolve_callable_fqn(name, token.start_byte())
             .and_then(|fqn| {
-                scan.analyzer
-                    .global_usage_definition_index()
-                    .fqn(&fqn)
+                scan.graph
+                    .with_definitions(|definitions| definitions.fqn(&fqn))
                     .iter()
                     .find(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
                     .cloned()
@@ -660,7 +648,7 @@ fn record_member_access(navigation: Node<'_>, scan: &mut KotlinEdgeScan<'_>, ari
         // type, not a member: the reference names the nested declaration.
         .or_else(|| {
             let nested = format!("{}.{}", owner_fqn.as_ref()?, name);
-            type_unit(scan.analyzer, &nested).map(|unit| unit.fq_name())
+            type_unit(scan.graph, &nested).map(|unit| unit.fq_name())
         })
         // An extension is declared outside the type it extends, so it is reached
         // through the receiver's type but never found among its members.

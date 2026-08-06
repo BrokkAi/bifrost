@@ -1,6 +1,5 @@
 pub(crate) use brokk_bifrost_core::analyzer::common::{
-    collapse_whitespace, max_line_length_limit, node_ident_text, node_source_text,
-    node_source_text_trimmed, node_span,
+    max_line_length_limit, node_ident_text, node_source_text, node_source_text_trimmed, node_span,
 };
 // The line cap's only remaining in-crate readers are the three suites that
 // build an over-long line to prove the parse guard fires; production reads it

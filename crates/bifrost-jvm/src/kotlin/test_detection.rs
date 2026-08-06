@@ -26,16 +26,18 @@
 //! *inside* a `test`/`it` body without risking double-scoring the same
 //! block twice.
 
-use crate::analyzer::common::node_source_text as node_text;
-use crate::analyzer::kotlin::supertypes::extract_kotlin_supertypes;
-use crate::analyzer::kotlin::syntax::{kotlin_callee, kotlin_named_argument_label};
-use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::analyzer::tree_walk::named_children;
-use crate::analyzer::{IAnalyzer, ProjectFile, TestAssertionSmell, TestAssertionWeights};
-use crate::path_utils::rel_path_string;
+use crate::kotlin::supertypes::extract_kotlin_supertypes;
+use crate::kotlin::syntax::{kotlin_callee, kotlin_named_argument_label};
+use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
+use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
+use brokk_bifrost_core::analyzer::tree_walk::{
+    WalkControl, named_children, walk_named_tree_preorder,
+};
+use brokk_bifrost_core::analyzer::{CodeUnitIndex, ProjectFile};
+use brokk_bifrost_core::path_utils::rel_path_string;
 use tree_sitter::{Node, Parser};
 
-use super::declarations::{KOTLIN_CLASS_LIKE_KINDS, kotlin_identifier_text};
+use crate::kotlin::declarations::{KOTLIN_CLASS_LIKE_KINDS, kotlin_identifier_text};
 
 const KOTLIN_TEST_ANNOTATIONS: &[&str] = &["Test", "ParameterizedTest", "RepeatedTest"];
 
@@ -105,7 +107,7 @@ const KIND_OVERSPECIFIED_LITERAL: &str = "overspecified-literal";
 const TEST_ASSERTION_EXCERPT_MAX_LEN: usize = 180;
 
 /// Whether a Kotlin file contains any recognized test-framework evidence.
-pub(crate) fn kotlin_contains_tests(root: Node<'_>, source: &str) -> bool {
+pub fn kotlin_contains_tests(root: Node<'_>, source: &str) -> bool {
     let mut found = false;
     walk_named_tree_preorder(root, true, |node| {
         found |= match node.kind() {
@@ -189,8 +191,8 @@ struct KotlinTestCase<'tree> {
     end_row: usize,
 }
 
-pub(crate) fn detect_kotlin_test_assertion_smells(
-    analyzer: &dyn IAnalyzer,
+pub fn detect_kotlin_test_assertion_smells(
+    analyzer: &dyn CodeUnitIndex,
     file: &ProjectFile,
     source: &str,
     weights: &TestAssertionWeights,
@@ -217,7 +219,7 @@ pub(crate) fn detect_kotlin_test_assertion_smells(
 fn parse_kotlin_tree_for_tests(source: &str) -> Option<tree_sitter::Tree> {
     let mut parser = Parser::new();
     parser
-        .set_language(&super::language::LANGUAGE.into())
+        .set_language(&crate::kotlin::language::LANGUAGE.into())
         .ok()?;
     parser.parse(source, None)
 }
@@ -292,7 +294,7 @@ fn kotlin_call_trailing_lambda_body(call: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn analyze_kotlin_test_case(
-    analyzer: &dyn IAnalyzer,
+    analyzer: &dyn CodeUnitIndex,
     file: &ProjectFile,
     source: &str,
     case: KotlinTestCase<'_>,

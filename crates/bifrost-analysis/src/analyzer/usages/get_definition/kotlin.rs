@@ -24,13 +24,13 @@
 //! - an import is `import_header` = `identifier` (one `simple_identifier` per
 //!   segment), optional `import_alias`, optional `wildcard_import`.
 //!
-//! The positional reads themselves live in `crate::analyzer::kotlin::syntax`,
+//! The positional reads themselves live in [`brokk_bifrost_jvm::kotlin::syntax`],
 //! shared with the usage graphs (issue #1239) so the two cannot drift apart
 //! about what a syntax shape means.
 //!
 //! # How a name becomes a declaration
 //!
-//! Name precedence is not reimplemented here. `crate::analyzer::kotlin::types`
+//! Name precedence is not reimplemented here. [`brokk_bifrost_jvm::kotlin::types`]
 //! owns Kotlin's ladder (enclosing scopes, then explicit imports, then the
 //! file's package, then star imports, then default imports) as
 //! [`resolve_kotlin_type_name`], parameterised over a "does this
@@ -42,13 +42,6 @@
 
 use super::*;
 use crate::analyzer::kotlin::KotlinAnalyzer;
-use crate::analyzer::kotlin::declarations::kotlin_package_name;
-use crate::analyzer::kotlin::syntax::{
-    kotlin_call_arity, kotlin_call_with_callee, kotlin_callee, kotlin_declaration_node,
-    kotlin_enclosing_import_header, kotlin_is_declaration_name, kotlin_is_expression_kind,
-    kotlin_named_argument_label,
-};
-use crate::analyzer::kotlin::types::{KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name};
 use crate::analyzer::semantic_model::{
     SemanticModelOverlay, SemanticModelSymbol, SemanticModelSymbolKind, TypeRef,
 };
@@ -56,13 +49,20 @@ use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{BoundedDefinitionLookup, ForwardQueryProvider, SignatureMetadata};
+use brokk_bifrost_jvm::kotlin::declarations::kotlin_package_name;
+use brokk_bifrost_jvm::kotlin::syntax::{
+    kotlin_call_arity, kotlin_call_with_callee, kotlin_callee, kotlin_declaration_node,
+    kotlin_enclosing_import_header, kotlin_is_declaration_name, kotlin_is_expression_kind,
+    kotlin_named_argument_label,
+};
+use brokk_bifrost_jvm::kotlin::types::{KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
 /// How many levels of ancestor scope a name lookup inherits.
 ///
-/// Matches `MAX_INHERITED_SCOPE_DEPTH` in `crate::analyzer::kotlin::types`:
+/// Matches `MAX_INHERITED_SCOPE_DEPTH` in [`brokk_bifrost_jvm::kotlin::types`]:
 /// inherited nested types are rare and deep chains rarer, and a small cap keeps
 /// a cyclic hierarchy from turning one lookup into an unbounded traversal.
 const MAX_INHERITED_SCOPE_DEPTH: usize = 4;

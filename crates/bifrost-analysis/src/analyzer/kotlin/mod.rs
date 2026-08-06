@@ -52,19 +52,19 @@
 
 mod adapter;
 mod clones;
-pub(crate) mod declarations;
 pub(crate) mod diagnostics;
 mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
 mod semantic;
-pub(crate) mod structural;
-mod supertypes;
-pub(crate) mod syntax;
-mod tests;
+mod structural;
 pub(crate) mod types;
+
 use crate::analyzer::Range;
 use crate::analyzer::store::LimitedQueryRows;
+use brokk_bifrost_jvm::kotlin::graph_support::KotlinSource;
+use brokk_bifrost_jvm::kotlin::imports::build_kotlin_top_level_declarations_by_package;
+use brokk_bifrost_jvm::kotlin::syntax;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
@@ -99,10 +99,10 @@ use crate::analyzer::{
     UsageFactsIndex, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_jvm::kotlin::test_detection::detect_kotlin_test_assertion_smells;
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
-use tests::detect_kotlin_test_assertion_smells;
 use tree_sitter::Node;
 
 pub(crate) use adapter::KotlinAdapter;
@@ -280,6 +280,46 @@ impl KotlinAnalyzer {
 impl TypeAliasProvider for KotlinAnalyzer {
     fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
         self.inner.is_type_alias(code_unit)
+    }
+}
+
+impl KotlinSource for KotlinAnalyzer {
+    fn kotlin_all_files(&self) -> Vec<ProjectFile> {
+        self.inner.all_files()
+    }
+
+    fn kotlin_package_name_of(&self, file: &ProjectFile) -> Option<String> {
+        self.inner.package_name_of(file)
+    }
+
+    fn usage_definitions(&self) -> &dyn crate::analyzer::BoundedDefinitionLookup {
+        self.inner.global_usage_definition_index_ref()
+    }
+
+    fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>> {
+        self.inner.type_identifiers_of(file)
+    }
+
+    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.inner.raw_supertypes_of(code_unit)
+    }
+
+    /// Built once per analyzer generation: a star import has to widen to a
+    /// whole package, and repeating that scan per file would be quadratic in
+    /// workspace size.
+    fn top_level_declarations_by_package(&self) -> &HashMap<String, Arc<Vec<CodeUnit>>> {
+        self.top_level_declarations_by_package
+            .get_or_init(|| build_kotlin_top_level_declarations_by_package(self))
+    }
+
+    fn external_index_is_empty(&self) -> bool {
+        self.external_declaration_index().is_empty()
+    }
+
+    fn external_qualified_name_exists(&self, fqn: &str, access_package: &str) -> bool {
+        self.external_declaration_index()
+            .resolve_qualified_name(fqn, access_package)
+            .is_some()
     }
 }
 
@@ -777,7 +817,7 @@ impl LanguageSupport for KotlinSupport {
     }
 
     fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
-        &structural::KOTLIN_STRUCTURAL_SPEC
+        &brokk_bifrost_jvm::kotlin::structural::KOTLIN_STRUCTURAL_SPEC
     }
 
     fn highlight_query(&self) -> Option<&'static str> {

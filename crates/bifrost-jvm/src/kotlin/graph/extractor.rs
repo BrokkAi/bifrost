@@ -3,7 +3,7 @@
 //! Walks one Kotlin file top to bottom looking for references to a single target
 //! ([`super::resolver::TargetSpec`]), recording each one it can prove. The walk is
 //! iterative (`walk_tree_iterative`) rather than recursive, per the repository's
-//! stack-safety rule for analyzer tree walks, and it descends with a
+//! stack-safety rule for graph tree walks, and it descends with a
 //! `LocalInferenceEngine` so a binding's type is already known by the time a
 //! reference below it is reached.
 //!
@@ -14,28 +14,31 @@
 //! can prove; a reference whose receiver type could not be established goes to
 //! the unproven channel rather than being guessed into the proven set or dropped.
 
-use crate::analyzer::kotlin::syntax::{
+use super::KotlinGraphSource;
+use crate::kotlin::graph::hits;
+use crate::kotlin::graph::resolver::{
+    KotlinNameResolver, KotlinResolutionCtx, ReceiverTargetMatch, TargetKind, TargetSpec,
+    kotlin_callable_arities, member_unit, receiver_is_same_owner, receiver_matches_target,
+    receiver_type_fq_name,
+};
+use crate::kotlin::syntax::{
     kotlin_binding_type_text, kotlin_call_arity, kotlin_call_with_callee, kotlin_callee,
     kotlin_class_literal_type, kotlin_dotted_navigation_segments, kotlin_import_header_segments,
     kotlin_is_declaration_name, kotlin_is_expression_kind, kotlin_is_navigation_kind,
     kotlin_named_argument_label, kotlin_navigation_member, kotlin_navigation_receiver,
     kotlin_user_type_segments,
 };
-use crate::analyzer::tree_walk::{
+use brokk_bifrost_core::analyzer::tree_walk::{
     TreeWalkAction, first_named_child_of_kind, named_children, walk_tree_iterative,
 };
-use crate::analyzer::usages::common::node_text;
-use crate::analyzer::usages::kotlin_graph::hits;
-use crate::analyzer::usages::kotlin_graph::resolver::{
-    KotlinNameResolver, KotlinResolutionCtx, ReceiverTargetMatch, TargetKind, TargetSpec,
-    kotlin_callable_arities, member_unit, receiver_is_same_owner, receiver_matches_target,
-    receiver_type_fq_name,
+use brokk_bifrost_core::analyzer::usages::common::node_text;
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
 };
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
-use crate::hash::HashMap;
-use crate::text_utils::compute_line_starts;
+use brokk_bifrost_core::analyzer::usages::model::UsageHit;
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::HashMap;
+use brokk_bifrost_core::text_utils::compute_line_starts;
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 
@@ -58,43 +61,43 @@ const SCOPE_NODES: &[&str] = &[
     "secondary_constructor",
 ];
 
-pub(super) struct ScanState<'a> {
-    pub(super) max_usages: usize,
-    pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) raw_match_count: &'a mut usize,
-    pub(super) limit_exceeded: &'a mut bool,
+pub struct ScanState<'a> {
+    pub max_usages: usize,
+    pub hits: &'a mut BTreeSet<UsageHit>,
+    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
+    pub raw_match_count: &'a mut usize,
+    pub limit_exceeded: &'a mut bool,
 }
 
-pub(super) struct ScanCtx<'a> {
-    pub(super) analyzer: &'a dyn IAnalyzer,
-    pub(super) file: &'a ProjectFile,
-    pub(super) source: &'a str,
-    pub(super) line_starts: &'a [usize],
-    pub(super) spec: &'a TargetSpec,
-    pub(super) names: &'a KotlinNameResolver<'a>,
-    pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) raw_match_count: &'a mut usize,
-    pub(super) max_usages: usize,
-    pub(super) limit_exceeded: &'a mut bool,
-    pub(super) enclosing_cache: HashMap<(usize, usize), hits::EnclosingContext>,
+pub struct ScanCtx<'a> {
+    pub graph: &'a KotlinGraphSource<'a>,
+    pub file: &'a ProjectFile,
+    pub source: &'a str,
+    pub line_starts: &'a [usize],
+    pub spec: &'a TargetSpec,
+    pub names: &'a KotlinNameResolver<'a>,
+    pub hits: &'a mut BTreeSet<UsageHit>,
+    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
+    pub raw_match_count: &'a mut usize,
+    pub max_usages: usize,
+    pub limit_exceeded: &'a mut bool,
+    pub enclosing_cache: HashMap<(usize, usize), hits::EnclosingContext>,
     /// Value bindings visible at the node being visited, and what type each one
     /// has when the scan could establish it.
     ///
     /// Separate from the type-parameter stack because Kotlin has separate
     /// namespaces for types and values; see [`TypeParameterScopes`].
-    pub(super) bindings: LocalInferenceEngine<String>,
+    pub bindings: LocalInferenceEngine<String>,
     /// Whether a receiver of a given type reaches the target. Asked once per
     /// distinct receiver type rather than once per reference.
-    pub(super) receiver_match_cache: HashMap<String, ReceiverTargetMatch>,
+    pub receiver_match_cache: HashMap<String, ReceiverTargetMatch>,
     /// The type each declaration declares, resolved in its own file's scope.
     /// A chain expression asks this of the same callee once per link.
-    pub(super) declared_type_cache: HashMap<String, Option<String>>,
+    pub declared_type_cache: HashMap<String, Option<String>>,
     /// Scope depth at which the innermost enclosing class body was entered, so a
     /// bare property reference can tell a local that shadows it from a local
     /// declared outside the class entirely.
-    pub(super) class_scope_depths: Vec<usize>,
+    pub class_scope_depths: Vec<usize>,
     /// Which scope kinds each open frame opened, so the walk's exit callback
     /// unwinds exactly what its matching enter pushed.
     pending_exits: Vec<ScopeExit>,
@@ -114,8 +117,8 @@ struct ScopeExit {
 /// each hit to a caller anyway. The inverted builder answers the same question
 /// from the `ClassRangeIndex` it already holds.
 impl KotlinResolutionCtx for ScanCtx<'_> {
-    fn analyzer(&self) -> &dyn IAnalyzer {
-        self.analyzer
+    fn graph(&self) -> &KotlinGraphSource<'_> {
+        self.graph
     }
 
     fn source(&self) -> &str {
@@ -141,7 +144,7 @@ impl KotlinResolutionCtx for ScanCtx<'_> {
             if unit.is_class() {
                 owners.push(unit.fq_name());
             }
-            current = self.analyzer.parent_of(&unit);
+            current = self.graph.index.parent_of(&unit);
         }
         owners
     }
@@ -151,8 +154,8 @@ impl KotlinResolutionCtx for ScanCtx<'_> {
     }
 }
 
-pub(super) fn scan_file(
-    analyzer: &dyn IAnalyzer,
+pub fn scan_file(
+    graph: &KotlinGraphSource<'_>,
     file: &ProjectFile,
     spec: &TargetSpec,
     state: &mut ScanState<'_>,
@@ -160,9 +163,10 @@ pub(super) fn scan_file(
     if *state.limit_exceeded {
         return;
     }
-    let Some(source) = analyzer
+    let Some(source) = graph
+        .index
         .indexed_source(file)
-        .or_else(|| analyzer.project().read_source(file).ok())
+        .or_else(|| graph.index.project().read_source(file).ok())
     else {
         return;
     };
@@ -172,7 +176,7 @@ pub(super) fn scan_file(
 
     let mut parser = Parser::new();
     if parser
-        .set_language(&crate::analyzer::kotlin::language::LANGUAGE.into())
+        .set_language(&crate::kotlin::language::LANGUAGE.into())
         .is_err()
     {
         return;
@@ -182,10 +186,10 @@ pub(super) fn scan_file(
     };
 
     let line_starts = compute_line_starts(&source);
-    let names = KotlinNameResolver::new(analyzer, file, tree.root_node(), &source);
+    let names = KotlinNameResolver::new(graph, file, tree.root_node(), &source);
     let mut type_parameters: TypeParameterScopes = Vec::new();
     let mut ctx = ScanCtx {
-        analyzer,
+        graph,
         file,
         source: &source,
         line_starts: &line_starts,
@@ -582,7 +586,8 @@ fn record_override_declaration(declaration: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let Some(declared) = ctx
-        .analyzer
+        .graph
+        .index
         .enclosing_code_unit(ctx.file, &node_range(name_node, ctx))
     else {
         return;
@@ -591,7 +596,7 @@ fn record_override_declaration(declaration: Node<'_>, ctx: &mut ScanCtx<'_>) {
         // The target's own declaration site is not a usage of itself.
         return;
     }
-    let Some(owner) = ctx.analyzer.parent_of(&declared) else {
+    let Some(owner) = ctx.graph.index.parent_of(&declared) else {
         return;
     };
     if !ctx
@@ -606,7 +611,7 @@ fn record_override_declaration(declaration: Node<'_>, ctx: &mut ScanCtx<'_>) {
     // not an override — Kotlin would not accept it as one either. A declaration
     // with no recorded arity is admitted: missing metadata is an absence of
     // evidence, not evidence of a mismatch.
-    let arities = kotlin_callable_arities(ctx.analyzer, &declared);
+    let arities = kotlin_callable_arities(ctx.graph, &declared);
     if arities.is_empty()
         || arities
             .iter()
@@ -616,15 +621,18 @@ fn record_override_declaration(declaration: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn node_range(node: Node<'_>, ctx: &ScanCtx<'_>) -> crate::analyzer::Range {
-    crate::analyzer::Range {
+fn node_range(node: Node<'_>, ctx: &ScanCtx<'_>) -> brokk_bifrost_core::analyzer::Range {
+    brokk_bifrost_core::analyzer::Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
-        start_line: crate::text_utils::find_line_index_for_offset(
+        start_line: brokk_bifrost_core::text_utils::find_line_index_for_offset(
             ctx.line_starts,
             node.start_byte(),
         ),
-        end_line: crate::text_utils::find_line_index_for_offset(ctx.line_starts, node.end_byte()),
+        end_line: brokk_bifrost_core::text_utils::find_line_index_for_offset(
+            ctx.line_starts,
+            node.end_byte(),
+        ),
     }
 }
 

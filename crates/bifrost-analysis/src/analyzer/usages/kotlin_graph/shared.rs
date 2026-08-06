@@ -9,9 +9,7 @@
 //! and dead code. Both drive the same receiver typing, member lookup, and name
 //! ladder through `super::resolver::KotlinResolutionCtx`.
 
-use super::extractor::{ScanState, scan_file};
-use super::inverted;
-use super::resolver::TargetSpec;
+use super::with_kotlin_graph_source;
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
@@ -23,6 +21,9 @@ use crate::analyzer::{
     resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_jvm::kotlin::graph::extractor::{ScanState, scan_file};
+use brokk_bifrost_jvm::kotlin::graph::inverted::scan_file as scan_inverted_file;
+use brokk_bifrost_jvm::kotlin::graph::resolver::TargetSpec;
 use std::collections::BTreeSet;
 
 /// Resolves usages of one Kotlin target within a candidate file set.
@@ -50,7 +51,9 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
         let _spec_scope = crate::profiling::scope("kotlin_graph::target_spec");
-        let Some(spec) = TargetSpec::from_targets(analyzer, overloads) else {
+        let Some(spec) = with_kotlin_graph_source(analyzer, |graph| {
+            TargetSpec::from_targets(&graph, overloads)
+        }) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::UnsupportedTargetShape(
@@ -93,16 +96,18 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
             raw_match_count: &mut raw_match_count,
             limit_exceeded: &mut limit_exceeded,
         };
-        for file in ordered {
-            if scan_scope.is_cancelled() {
-                break;
+        with_kotlin_graph_source(analyzer, |graph| {
+            for file in ordered {
+                if scan_scope.is_cancelled() {
+                    break;
+                }
+                let _file_scope = crate::profiling::scope("kotlin_graph::scan_file");
+                scan_file(&graph, &file, &spec, &mut state);
+                if *state.limit_exceeded {
+                    break;
+                }
             }
-            let _file_scope = crate::profiling::scope("kotlin_graph::scan_file");
-            scan_file(analyzer, &file, &spec, &mut state);
-            if *state.limit_exceeded {
-                break;
-            }
-        }
+        });
 
         // A Kotlin class is equally nameable from Java and Scala source, and the
         // three languages share one candidate space, so find-references on a
@@ -173,7 +178,9 @@ pub(crate) fn scan_kotlin_files_for_jvm_type(
     if resolve_analyzer::<KotlinAnalyzer>(analyzer).is_none() {
         return;
     }
-    let Some(spec) = TargetSpec::from_targets(analyzer, std::slice::from_ref(target)) else {
+    let Some(spec) = with_kotlin_graph_source(analyzer, |graph| {
+        TargetSpec::from_targets(&graph, std::slice::from_ref(target))
+    }) else {
         return;
     };
     let mut ordered: Vec<ProjectFile> = candidate_files
@@ -189,12 +196,14 @@ pub(crate) fn scan_kotlin_files_for_jvm_type(
         raw_match_count,
         limit_exceeded,
     };
-    for file in ordered {
-        scan_file(analyzer, &file, &spec, &mut state);
-        if *state.limit_exceeded {
-            break;
+    with_kotlin_graph_source(analyzer, |graph| {
+        for file in ordered {
+            scan_file(&graph, &file, &spec, &mut state);
+            if *state.limit_exceeded {
+                break;
+            }
         }
-    }
+    });
 }
 
 /// Builds the whole Kotlin `caller -> callee` edge set in one inverted pass.
@@ -240,7 +249,7 @@ impl<'a> KotlinEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_kotlin_edges(analyzer, &self.files, &self.file_states, nodes, keep_file)
+        build_kotlin_edges(analyzer, &self.files, &self.file_states, nodes, keep_file)
     }
 
     pub(crate) fn build_edge_weights<F>(
@@ -252,6 +261,48 @@ impl<'a> KotlinEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_kotlin_edges(analyzer, &self.files, &self.file_states, nodes, keep_file)
+        build_kotlin_edges(analyzer, &self.files, &self.file_states, nodes, keep_file)
     }
+}
+
+/// The whole-workspace inverted pass: the shared driver's parallel fan-out plus
+/// on-demand parsing, with
+/// [`brokk_bifrost_jvm::kotlin::graph::inverted::scan_file`] resolving each file.
+///
+/// The two per-file indexes are built here rather than crate-side because both
+/// have a `FileState` fast path, and `FileState` is analysis-crate-private
+/// (Ruby's `forward_owner_relation_facts` precedent: decode on this side, hand
+/// the decoded facts across).
+fn build_kotlin_edges<Output, F>(
+    analyzer: &dyn IAnalyzer,
+    files: &[ProjectFile],
+    file_states: &HashMap<ProjectFile, FileState>,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Output
+where
+    Output: crate::analyzer::usages::inverted_edges::UsageEdgeBuildOutput<String>,
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    use crate::analyzer::usages::inverted_edges::{
+        ClassRangeIndex, build_edge_output, build_file_declarations,
+        build_file_declarations_from_state, class_range_index_from_state,
+        parse_and_collect_with_declarations,
+    };
+
+    let language = brokk_bifrost_jvm::kotlin::language::LANGUAGE.into();
+    with_kotlin_graph_source(analyzer, |graph| {
+        build_edge_output(files, keep_file, |file| {
+            let state = file_states.get(file);
+            let declarations = state
+                .map(build_file_declarations_from_state)
+                .unwrap_or_else(|| build_file_declarations(analyzer, file));
+            let class_ranges = state
+                .map(class_range_index_from_state)
+                .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
+            parse_and_collect_with_declarations(file, nodes, &language, declarations, |input| {
+                scan_inverted_file(&graph, file, input, class_ranges)
+            })
+        })
+    })
 }

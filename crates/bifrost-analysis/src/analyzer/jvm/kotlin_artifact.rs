@@ -4,13 +4,7 @@ use super::java_artifact::{
 };
 use crate::CancellationToken;
 use crate::analyzer::common::node_source_text_trimmed;
-use crate::analyzer::kotlin::declarations::{
-    KotlinClassLikeKind, KotlinDeclaredVisibility, kotlin_class_like_kind,
-    kotlin_declared_visibility, parse_kotlin_file,
-};
-use crate::analyzer::kotlin::imports::KOTLIN_DEFAULT_IMPORT_PACKAGES;
 use crate::analyzer::kotlin::language;
-use crate::analyzer::kotlin::syntax::{kotlin_type_spelling, kotlin_user_type_segments};
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
@@ -24,6 +18,12 @@ use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
 use crate::analyzer::{CodeUnit, ProjectFile, SignatureMetadata};
 use crate::hash::HashMap;
+use brokk_bifrost_jvm::kotlin::declarations::{
+    KotlinClassLikeKind, KotlinDeclaredVisibility, kotlin_class_like_kind,
+    kotlin_declared_visibility, parse_kotlin_file,
+};
+use brokk_bifrost_jvm::kotlin::imports::KOTLIN_DEFAULT_IMPORT_PACKAGES;
+use brokk_bifrost_jvm::kotlin::syntax::{kotlin_type_spelling, kotlin_user_type_segments};
 use std::io::{Cursor, Read};
 use tree_sitter::{Node, Parser, Tree};
 use zip::ZipArchive;

@@ -186,7 +186,10 @@ where
         .collect()
 }
 
-pub trait TypeAliasProvider: CapabilityProvider {
+/// `Send + Sync` like its three sibling capabilities: every implementor is an
+/// analyzer, and a parallel whole-workspace scan holds the provider across its
+/// fan-out (`kotlin_graph`'s edge builder does exactly that).
+pub trait TypeAliasProvider: CapabilityProvider + Send + Sync {
     fn is_type_alias(&self, _code_unit: &CodeUnit) -> bool {
         false
     }

@@ -7,7 +7,7 @@
 //!
 //! Kotlin's grammar is expression-oriented and field-poor, so the shapes this
 //! module depends on are read positionally through [`syntax`], which reuses the
-//! shared Kotlin readers in [`crate::analyzer::kotlin::syntax`] rather than
+//! shared Kotlin readers in [`brokk_bifrost_jvm::kotlin::syntax`] rather than
 //! re-deriving them.
 //!
 //! Deliberate, documented omissions at this boundary:

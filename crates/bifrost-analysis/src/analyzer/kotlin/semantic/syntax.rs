@@ -9,12 +9,12 @@
 //! ordinary children.
 //!
 //! Reads that are already shared with definition navigation and the usage
-//! graphs live in [`crate::analyzer::kotlin::syntax`] and are reused from here
+//! graphs live in [`brokk_bifrost_jvm::kotlin::syntax`] and are reused from here
 //! rather than duplicated.
 
 use super::*;
 
-pub(super) use crate::analyzer::kotlin::syntax::{
+pub(super) use brokk_bifrost_jvm::kotlin::syntax::{
     kotlin_call_arity, kotlin_callee, kotlin_named_argument_label, kotlin_navigation_receiver,
     kotlin_value_arguments,
 };

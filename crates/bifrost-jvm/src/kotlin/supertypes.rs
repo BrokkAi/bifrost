@@ -18,16 +18,16 @@
 
 use tree_sitter::Node;
 
-use crate::analyzer::tree_walk::named_children;
+use brokk_bifrost_core::analyzer::tree_walk::named_children;
 
-use super::declarations::kotlin_identifier_text;
+use crate::kotlin::declarations::kotlin_identifier_text;
 
 /// The dotted paths of the supertypes a class-like declaration names directly,
 /// in source order.
 ///
 /// A function-type specifier (`class Handler : (Int) -> String`) names no
 /// declaration, so it yields no path rather than one that can never resolve.
-pub(crate) fn extract_kotlin_supertypes(declaration: Node<'_>, source: &str) -> Vec<String> {
+pub fn extract_kotlin_supertypes(declaration: Node<'_>, source: &str) -> Vec<String> {
     named_children(declaration)
         .into_iter()
         .filter(|child| child.kind() == "delegation_specifier")
@@ -67,7 +67,7 @@ fn delegation_user_type(specifier: Node<'_>) -> Option<Node<'_>> {
 /// The grammar builds `user_type` as dot-separated simple types, so its
 /// `type_identifier` children are already exactly the path segments in source
 /// order — `Outer.Base<Int>` yields `["Outer", "Base"]` with no text splitting.
-pub(crate) fn kotlin_user_type_segments(user_type: Node<'_>, source: &str) -> Vec<String> {
+pub fn kotlin_user_type_segments(user_type: Node<'_>, source: &str) -> Vec<String> {
     named_children(user_type)
         .into_iter()
         .filter(|child| child.kind() == "type_identifier")
@@ -84,12 +84,12 @@ mod tests {
     fn supertypes_of(source: &str, class_name: &str) -> Vec<String> {
         let mut parser = Parser::new();
         parser
-            .set_language(&super::super::language::LANGUAGE.into())
+            .set_language(&crate::kotlin::language::LANGUAGE.into())
             .expect("load Kotlin grammar");
         let tree = parser.parse(source, None).expect("parse Kotlin source");
         let mut stack = vec![tree.root_node()];
         while let Some(node) = stack.pop() {
-            if super::super::declarations::KOTLIN_CLASS_LIKE_KINDS.contains(&node.kind())
+            if crate::kotlin::declarations::KOTLIN_CLASS_LIKE_KINDS.contains(&node.kind())
                 && named_children(node).into_iter().any(|child| {
                     child.kind() == "type_identifier"
                         && kotlin_identifier_text(child, source) == class_name

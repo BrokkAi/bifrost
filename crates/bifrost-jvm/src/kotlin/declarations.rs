@@ -12,30 +12,31 @@
 //! walk; top-level script *statements* are not declarations and are skipped.
 //!
 //! Name-resolution facts this walk records for issue #1237 live alongside the
-//! declarations: structured imports (see `super::imports`) and the dotted
-//! supertype paths of each class-like declaration (see `super::supertypes`).
+//! declarations: structured imports (see [`crate::kotlin::imports`]) and the dotted
+//! supertype paths of each class-like declaration (see [`crate::kotlin::supertypes`]).
 //!
 //! Boundaries owned by sibling issues: navigation (#1238), usage graphs
 //! (#1239), RQL (#1240), CFG (#1241). Local functions, lambdas, and anonymous
 //! objects inside bodies are deliberately not indexed as declarations in this
 //! tier.
 
-use super::syntax::{
+use crate::kotlin::syntax::{
     kotlin_binding_type_text, kotlin_declared_return_type_text, kotlin_extension_receiver_text,
 };
-use crate::analyzer::common::{
+use brokk_bifrost_core::analyzer::common::{
     collapse_whitespace, node_source_text as node_text,
     node_source_text_trimmed as node_text_trimmed,
 };
-use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
-use crate::analyzer::tree_sitter_analyzer::ParsedFile;
-use crate::analyzer::tree_walk::{
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::model::{
+    CallableArity, CodeUnitType, ParameterMetadata, SignatureMetadata,
+};
+use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::tree_walk::{
     first_named_child_of_kind as first_named_child, has_token_child,
     named_children as named_children_of,
 };
-use crate::analyzer::{
-    CallableArity, CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, SignatureMetadata,
-};
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use tree_sitter::{Node, Tree};
 
 fn kotlin_segment(text: &str, kind: SegmentKind) -> SegmentId {
@@ -49,7 +50,7 @@ fn kotlin_segment(text: &str, kind: SegmentKind) -> SegmentId {
 /// test method names). The backticks are quoting syntax, not part of the name,
 /// so they must not reach an interned segment — otherwise the declaration is
 /// unreachable by its real spelling.
-pub(crate) fn kotlin_identifier_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+pub fn kotlin_identifier_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     let text = node_text_trimmed(node, source);
     text.strip_prefix('`')
         .and_then(|text| text.strip_suffix('`'))
@@ -78,7 +79,7 @@ fn kotlin_child_fq_base(parent: Option<&CodeUnit>, package_name: &str) -> FqName
     }
 }
 
-pub(crate) fn parse_kotlin_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
+pub fn parse_kotlin_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
     let root = tree.root_node();
     let package_name = kotlin_package_name(root, source);
     let mut parsed = ParsedFile::new(package_name.clone());
@@ -95,7 +96,7 @@ pub(crate) fn parse_kotlin_file(file: &ProjectFile, source: &str, tree: &Tree) -
     parsed
 }
 
-pub(crate) fn kotlin_package_name(root: Node<'_>, source: &str) -> String {
+pub fn kotlin_package_name(root: Node<'_>, source: &str) -> String {
     first_named_child(root, "package_header")
         .and_then(|header| first_named_child(header, "identifier"))
         .map(|identifier| {
@@ -124,7 +125,8 @@ fn collect_kotlin_imports(root: Node<'_>, source: &str, parsed: &mut ParsedFile)
             if !raw.is_empty() {
                 parsed.import_statements.push(raw);
             }
-            if let Some(info) = super::imports::kotlin_import_info_from_node(import, source) {
+            if let Some(info) = crate::kotlin::imports::kotlin_import_info_from_node(import, source)
+            {
                 parsed.imports.push(info);
             }
         }
@@ -583,7 +585,7 @@ impl<'a> KotlinVisitor<'a> {
 }
 
 /// The tree-sitter node kinds that declare a Kotlin class-like type.
-pub(crate) const KOTLIN_CLASS_LIKE_KINDS: &[&str] = &[
+pub const KOTLIN_CLASS_LIKE_KINDS: &[&str] = &[
     "class_declaration",
     "object_declaration",
     "companion_object",
@@ -595,7 +597,7 @@ pub(crate) const KOTLIN_CLASS_LIKE_KINDS: &[&str] = &[
 /// lives in the tokens inside the node (`interface`, `enum class`) or in a
 /// `class_modifier` (`annotation class`), never in the node kind alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KotlinClassLikeKind {
+pub enum KotlinClassLikeKind {
     Class,
     Interface,
     Enum,
@@ -605,7 +607,7 @@ pub(crate) enum KotlinClassLikeKind {
 
 /// Classify a class-like declaration node, or `None` when the node does not
 /// declare a type.
-pub(crate) fn kotlin_class_like_kind(node: Node<'_>) -> Option<KotlinClassLikeKind> {
+pub fn kotlin_class_like_kind(node: Node<'_>) -> Option<KotlinClassLikeKind> {
     match node.kind() {
         "object_declaration" | "companion_object" => Some(KotlinClassLikeKind::Object),
         "class_declaration" => {
@@ -631,14 +633,14 @@ pub(crate) fn kotlin_class_like_kind(node: Node<'_>) -> Option<KotlinClassLikeKi
 /// declaration to its own compilation module — which, from the perspective of
 /// anything consuming a published artifact, is as invisible as `private`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KotlinDeclaredVisibility {
+pub enum KotlinDeclaredVisibility {
     Public,
     Protected,
     Internal,
     Private,
 }
 
-pub(crate) fn kotlin_declared_visibility(node: Node<'_>, source: &str) -> KotlinDeclaredVisibility {
+pub fn kotlin_declared_visibility(node: Node<'_>, source: &str) -> KotlinDeclaredVisibility {
     let Some(modifiers) = first_named_child(node, "modifiers") else {
         return KotlinDeclaredVisibility::Public;
     };
@@ -878,7 +880,7 @@ fn kotlin_callable_signature_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::HashMap;
+    use brokk_bifrost_core::hash::HashMap;
     use tree_sitter::Parser;
 
     fn parse(source: &str) -> (ProjectFile, ParsedFile) {
@@ -888,7 +890,7 @@ mod tests {
         );
         let mut parser = Parser::new();
         parser
-            .set_language(&super::super::language::LANGUAGE.into())
+            .set_language(&crate::kotlin::language::LANGUAGE.into())
             .expect("load Kotlin grammar");
         let tree = parser.parse(source, None).expect("parse Kotlin source");
         let parsed = parse_kotlin_file(&file, source, &tree);

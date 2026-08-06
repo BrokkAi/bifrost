@@ -6,7 +6,6 @@
 //! traits), the inverted pass's fan-out and its two `FileState` decoders, the
 //! Java-to-Scala cross-language scan, and the dead-code bulk routing predicate.
 
-mod jvm_scala;
 mod shared;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
@@ -141,13 +140,7 @@ pub(crate) fn scan_jvm_files_for_foreign_type(
                 return;
             }
         }
-        jvm_scala::scan_scala_files_for_java_target(
-            analyzer,
-            candidate_files,
-            &spec,
-            &mut state,
-            None,
-        );
+        scan_scala_files_for_java_target(analyzer, candidate_files, &spec, &mut state, None);
     });
 }
 
@@ -245,6 +238,31 @@ impl UsageAnalyzer for JavaUsageGraphStrategy {
         self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
             .into_fuzzy_result()
     }
+}
+
+/// Collect hits on a Java target from Scala source, when the workspace has a
+/// Scala analyzer to read Scala's own imports and declarations with.
+///
+/// The scan itself is [`brokk_bifrost_jvm::java::graph::jvm_scala`]; what stays
+/// here is the downcast that produces its `ScalaSource`.
+pub(in crate::analyzer::usages) fn scan_scala_files_for_java_target(
+    analyzer: &dyn IAnalyzer,
+    candidate_files: &HashSet<ProjectFile>,
+    spec: &TargetSpec,
+    state: &mut brokk_bifrost_jvm::java::graph::extractor::ScanState<'_>,
+    cancellation: Option<&crate::cancellation::CancellationToken>,
+) {
+    let Some(scala) = resolve_analyzer::<crate::analyzer::ScalaAnalyzer>(analyzer) else {
+        return;
+    };
+    brokk_bifrost_jvm::java::graph::jvm_scala::scan_scala_files_for_java_target(
+        analyzer,
+        scala,
+        candidate_files,
+        spec,
+        state,
+        cancellation,
+    );
 }
 
 /// The whole-workspace inverted pass: the shared driver's parallel fan-out plus

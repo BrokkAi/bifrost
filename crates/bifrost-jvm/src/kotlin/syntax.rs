@@ -38,9 +38,9 @@
 //! `type_identifier` child per segment, not a nested or scoped node. Nothing here
 //! splits source text on `.` or `::` to recover that structure.
 
-use crate::analyzer::Range;
-use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
-use crate::analyzer::usages::reference_site::smallest_named_node_covering;
+use brokk_bifrost_core::analyzer::Range;
+use brokk_bifrost_core::analyzer::tree_walk::{first_named_child_of_kind, named_children};
+use brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering;
 use tree_sitter::Node;
 
 /// The callee expression of a Kotlin call.
@@ -50,14 +50,14 @@ use tree_sitter::Node;
 /// its callee as the `user_type` it constructs followed by `value_arguments`.
 /// Neither names the callee with a field, so the callee is "the first named child
 /// that is not the argument suffix".
-pub(crate) fn kotlin_callee(call: Node<'_>) -> Option<Node<'_>> {
+pub fn kotlin_callee(call: Node<'_>) -> Option<Node<'_>> {
     named_children(call)
         .into_iter()
         .find(|child| !matches!(child.kind(), "call_suffix" | "value_arguments"))
 }
 
 /// The `call_expression` whose callee is `node`, if `node` is a callee at all.
-pub(crate) fn kotlin_call_with_callee(node: Node<'_>) -> Option<Node<'_>> {
+pub fn kotlin_call_with_callee(node: Node<'_>) -> Option<Node<'_>> {
     let call = node
         .parent()
         .filter(|parent| parent.kind() == "call_expression")?;
@@ -68,7 +68,7 @@ pub(crate) fn kotlin_call_with_callee(node: Node<'_>) -> Option<Node<'_>> {
 ///
 /// An ordinary call nests it inside `call_suffix`; a `constructor_invocation`
 /// holds it directly.
-pub(crate) fn kotlin_value_arguments(call: Node<'_>) -> Option<Node<'_>> {
+pub fn kotlin_value_arguments(call: Node<'_>) -> Option<Node<'_>> {
     if let Some(arguments) = first_named_child_of_kind(call, "value_arguments") {
         return Some(arguments);
     }
@@ -82,7 +82,7 @@ pub(crate) fn kotlin_value_arguments(call: Node<'_>) -> Option<Node<'_>> {
 /// outside the parentheses, so it counts: without it, every trailing-lambda call
 /// would look like it passed one argument too few and would fail to match its own
 /// overload.
-pub(crate) fn kotlin_call_arity(call: Node<'_>) -> usize {
+pub fn kotlin_call_arity(call: Node<'_>) -> usize {
     let positional = kotlin_value_arguments(call)
         .map(|arguments| {
             named_children(arguments)
@@ -101,13 +101,13 @@ pub(crate) fn kotlin_call_arity(call: Node<'_>) -> usize {
 /// `foo(name = 1)` is `(value_argument (simple_identifier) (integer_literal))`; a
 /// positional `foo(name)` is `(value_argument (simple_identifier))`. The label is
 /// therefore the first of two or more named children.
-pub(crate) fn kotlin_named_argument_label(argument: Node<'_>, node: Node<'_>) -> bool {
+pub fn kotlin_named_argument_label(argument: Node<'_>, node: Node<'_>) -> bool {
     let children = named_children(argument);
     children.len() > 1 && children[0].id() == node.id()
 }
 
 /// The receiver expression a `navigation_expression` selects from.
-pub(crate) fn kotlin_navigation_receiver(navigation: Node<'_>) -> Option<Node<'_>> {
+pub fn kotlin_navigation_receiver(navigation: Node<'_>) -> Option<Node<'_>> {
     named_children(navigation)
         .into_iter()
         .find(|child| child.kind() != "navigation_suffix")
@@ -121,7 +121,7 @@ pub(crate) fn kotlin_navigation_receiver(navigation: Node<'_>) -> Option<Node<'_
 /// followed by `navigation_suffix`. Missing the second one would report a
 /// property's reads and not its writes, even though Kotlin indexes one
 /// declaration for both.
-pub(crate) fn kotlin_is_navigation_kind(kind: &str) -> bool {
+pub fn kotlin_is_navigation_kind(kind: &str) -> bool {
     matches!(
         kind,
         "navigation_expression" | "directly_assignable_expression"
@@ -133,7 +133,7 @@ pub(crate) fn kotlin_is_navigation_kind(kind: &str) -> bool {
 ///
 /// `.` and `?.` produce the same shape, so a safe call reads exactly like a
 /// plain one — which is correct, because a safe call names the same member.
-pub(crate) fn kotlin_navigation_member(navigation: Node<'_>) -> Option<Node<'_>> {
+pub fn kotlin_navigation_member(navigation: Node<'_>) -> Option<Node<'_>> {
     first_named_child_of_kind(navigation, "navigation_suffix")
         .and_then(|suffix| first_named_child_of_kind(suffix, "simple_identifier"))
 }
@@ -143,7 +143,7 @@ pub(crate) fn kotlin_navigation_member(navigation: Node<'_>) -> Option<Node<'_>>
 ///
 /// `lib.Base` yields the `lib` token then the `Base` token. `None` when any link
 /// is something other than a name — `f().Base` spells no dotted name at all.
-pub(crate) fn kotlin_dotted_navigation_segments(navigation: Node<'_>) -> Option<Vec<Node<'_>>> {
+pub fn kotlin_dotted_navigation_segments(navigation: Node<'_>) -> Option<Vec<Node<'_>>> {
     let mut segments = Vec::new();
     let mut current = navigation;
     loop {
@@ -176,7 +176,7 @@ pub(crate) fn kotlin_dotted_navigation_segments(navigation: Node<'_>) -> Option<
 /// A *bound* literal (`x::class`, on a value) is spelled identically to `C::class`
 /// and is not distinguishable here; the caller separates the two by asking whether
 /// the leading name is a value binding in scope.
-pub(crate) fn kotlin_class_literal_type(node: Node<'_>) -> Option<Node<'_>> {
+pub fn kotlin_class_literal_type(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "callable_reference" if selects_class_keyword(node) => {
             first_named_child_of_kind(node, "type_identifier")
@@ -206,7 +206,7 @@ const MAX_RECEIVER_WRAPPER_DEPTH: usize = 32;
 /// Iterative and depth-capped rather than recursive, per the repository's
 /// stack-safety rule: `(((x)))!!` is legal Kotlin and a malformed tree can nest
 /// further still.
-pub(crate) fn kotlin_unwrap_receiver(node: Node<'_>) -> Node<'_> {
+pub fn kotlin_unwrap_receiver(node: Node<'_>) -> Node<'_> {
     let mut current = node;
     for _ in 0..MAX_RECEIVER_WRAPPER_DEPTH {
         let inner = match current.kind() {
@@ -229,7 +229,7 @@ pub(crate) fn kotlin_unwrap_receiver(node: Node<'_>) -> Node<'_> {
 /// token. `type_arguments` are deliberately excluded — a generic argument is a
 /// type reference in its own right, reached by walking into it, not a segment of
 /// the outer name.
-pub(crate) fn kotlin_user_type_segments(user_type: Node<'_>) -> Vec<Node<'_>> {
+pub fn kotlin_user_type_segments(user_type: Node<'_>) -> Vec<Node<'_>> {
     named_children(user_type)
         .into_iter()
         .filter(|child| child.kind() == "type_identifier")
@@ -238,7 +238,7 @@ pub(crate) fn kotlin_user_type_segments(user_type: Node<'_>) -> Vec<Node<'_>> {
 
 /// Whether `node` is the name a declaration introduces rather than a reference to
 /// something declared elsewhere.
-pub(crate) fn kotlin_is_declaration_name(node: Node<'_>) -> bool {
+pub fn kotlin_is_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -262,7 +262,7 @@ pub(crate) fn kotlin_is_declaration_name(node: Node<'_>) -> bool {
 ///
 /// A focus inside an import can land on the `identifier`'s `simple_identifier`,
 /// on the `import_alias`'s `type_identifier`, or on the header itself.
-pub(crate) fn kotlin_enclosing_import_header(node: Node<'_>) -> Option<Node<'_>> {
+pub fn kotlin_enclosing_import_header(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = Some(node);
     while let Some(candidate) = current {
         if candidate.kind() == "import_header" {
@@ -274,7 +274,7 @@ pub(crate) fn kotlin_enclosing_import_header(node: Node<'_>) -> Option<Node<'_>>
 }
 
 /// The dotted path segments of an `import_header`, in source order.
-pub(crate) fn kotlin_import_header_segments(header: Node<'_>) -> Vec<Node<'_>> {
+pub fn kotlin_import_header_segments(header: Node<'_>) -> Vec<Node<'_>> {
     let Some(path) = first_named_child_of_kind(header, "identifier") else {
         return Vec::new();
     };
@@ -285,7 +285,7 @@ pub(crate) fn kotlin_import_header_segments(header: Node<'_>) -> Vec<Node<'_>> {
 }
 
 /// Whether a node kind can appear as the value half of a property declaration.
-pub(crate) fn kotlin_is_expression_kind(kind: &str) -> bool {
+pub fn kotlin_is_expression_kind(kind: &str) -> bool {
     matches!(
         kind,
         "call_expression"
@@ -322,7 +322,7 @@ const MAX_TYPE_WRAPPER_DEPTH: usize = 32;
 ///
 /// The walk is iterative and depth-capped rather than recursive, per the
 /// repository's stack-safety rule for analyzer tree walks.
-pub(crate) fn kotlin_type_spelling(node: Node<'_>, source: &str) -> Option<String> {
+pub fn kotlin_type_spelling(node: Node<'_>, source: &str) -> Option<String> {
     let mut frontier = vec![node];
     for _ in 0..MAX_TYPE_WRAPPER_DEPTH {
         let mut next = Vec::new();
@@ -364,7 +364,7 @@ pub(crate) fn kotlin_type_spelling(node: Node<'_>, source: &str) -> Option<Strin
 /// expression body and no written type (`fun f() = compute()`) writes no return
 /// type and is reported absent — inferring what the source did not write is
 /// semantic work this does not do.
-pub(crate) fn kotlin_declared_return_type_text(function: Node<'_>, source: &str) -> Option<String> {
+pub fn kotlin_declared_return_type_text(function: Node<'_>, source: &str) -> Option<String> {
     let receiver = function
         .child_by_field_name("receiver")
         .map(|node| node.id());
@@ -379,7 +379,7 @@ pub(crate) fn kotlin_declared_return_type_text(function: Node<'_>, source: &str)
 /// A `variable_declaration` (`val base: Base`) or a `class_parameter`
 /// (`class D(val base: Base)`) holds its name and then its type node, so the
 /// type is the first child that spells one.
-pub(crate) fn kotlin_binding_type_text(binding: Node<'_>, source: &str) -> Option<String> {
+pub fn kotlin_binding_type_text(binding: Node<'_>, source: &str) -> Option<String> {
     named_children(binding)
         .into_iter()
         .find_map(|child| kotlin_type_spelling(child, source))
@@ -391,10 +391,7 @@ pub(crate) fn kotlin_binding_type_text(binding: Node<'_>, source: &str) -> Optio
 /// `receiver` is one of the very few genuine tree-sitter fields in the vendored
 /// grammar, carried by both `function_declaration` and `property_declaration`,
 /// so extension-ness is a structured check and never a name heuristic.
-pub(crate) fn kotlin_extension_receiver_text(
-    declaration: Node<'_>,
-    source: &str,
-) -> Option<String> {
+pub fn kotlin_extension_receiver_text(declaration: Node<'_>, source: &str) -> Option<String> {
     kotlin_type_spelling(declaration.child_by_field_name("receiver")?, source)
 }
 
@@ -405,10 +402,7 @@ pub(crate) fn kotlin_extension_receiver_text(
 /// bytes and would win the smallest-covering walk. Climbing back out to the
 /// outermost node with the same span picks the declaration rather than the name
 /// inside it.
-pub(crate) fn kotlin_declaration_node<'tree>(
-    root: Node<'tree>,
-    range: &Range,
-) -> Option<Node<'tree>> {
+pub fn kotlin_declaration_node<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
     let mut node = smallest_named_node_covering(root, range.start_byte, range.end_byte)?;
     while let Some(parent) = node.parent() {
         if parent.start_byte() != node.start_byte() || parent.end_byte() != node.end_byte() {

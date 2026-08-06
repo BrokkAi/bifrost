@@ -90,13 +90,7 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
             }
         });
         let _scala_scope = crate::profiling::scope("java_graph::scan_scala_files");
-        super::jvm_scala::scan_scala_files_for_java_target(
-            analyzer,
-            candidate_files,
-            &spec,
-            &mut state,
-            None,
-        );
+        super::scan_scala_files_for_java_target(analyzer, candidate_files, &spec, &mut state, None);
         drop(_scala_scope);
         // A Java class is equally nameable from Kotlin source; the realm is one
         // candidate space, so find-references on a Java type must see its Kotlin
