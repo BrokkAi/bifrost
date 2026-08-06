@@ -86,6 +86,7 @@ test-support = [
     "brokk-bifrost-go/test-support",
     "brokk-bifrost-js-ts/test-support",
     "brokk-bifrost-jvm/test-support",
+    "brokk-bifrost-python/test-support",
     "brokk-bifrost-rust/test-support",
 ]
 
@@ -98,6 +99,7 @@ brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.8.23", features = [
 brokk-bifrost-go = { path = "../bifrost-go", version = "=0.8.23", features = ["test-support"] }
 brokk-bifrost-js-ts = { path = "../bifrost-js-ts", version = "=0.8.23", features = ["test-support"] }
 brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.8.23", features = ["test-support"] }
+brokk-bifrost-python = { path = "../bifrost-python", version = "=0.8.23", features = ["test-support"] }
 brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.8.23", features = ["test-support"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 tree-sitter-scala = "=0.25.1"

@@ -15,6 +15,14 @@ publish = true
 [lib]
 name = "brokk_bifrost_python"
 
+[features]
+default = []
+# Same reason as `brokk-bifrost-cpp`'s: the analyzer-level tests that prove
+# these production paths stay off their slow fallbacks live in
+# brokk-bifrost-analysis, so the counter hooks must be reachable across the
+# crate boundary under the same gate.
+test-support = ["brokk-bifrost-core/test-support"]
+
 [dependencies]
 brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.23" }
 rayon = "1.10.0"

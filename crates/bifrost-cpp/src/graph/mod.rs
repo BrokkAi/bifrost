@@ -39,13 +39,15 @@ pub trait CppWorkspaceSource {
 
     /// Declarations in the workspace usage-definition index whose fq name is
     /// exactly `fqn`, across every shard.
-    fn definitions_by_fqn(&self, fqn: &str) -> Vec<CodeUnit>;
-
-    /// The same lookup as [`Self::definitions_by_fqn`], but yielding borrows of
-    /// the shard-owned units rather than clones. The global-field linkage walk
-    /// returns its peers to a caller that outlives the lookup, which is why the
-    /// index is read shard-by-shard there.
-    fn definition_peers_by_fqn(&self, fqn: &str) -> Vec<&CodeUnit>;
+    ///
+    /// Borrows the shard-owned units rather than cloning them. Two constraints
+    /// make that the only workable shape. Every owner-resolution caller filters
+    /// the result and clones at most one survivor, so cloning every match per
+    /// reference was pure waste; and the global-field linkage walk returns its
+    /// matches to a caller that outlives the lookup, so they must borrow the
+    /// analyzer. Both are why the impls read the index shard-by-shard: the
+    /// per-call `DefinitionIndexHandle` dies with the call.
+    fn definitions_by_fqn(&self, fqn: &str) -> Vec<&CodeUnit>;
 }
 
 /// The workspace definition index, spelled so a call reads exactly as it did
@@ -54,12 +56,10 @@ pub trait CppWorkspaceSource {
 pub struct CppWorkspaceDefinitions<'a>(&'a dyn CppWorkspaceSource);
 
 impl<'a> CppWorkspaceDefinitions<'a> {
-    pub fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+    // `self.0` is copied out rather than reborrowed through `&self`, so the
+    // returned borrows carry the source's `'a` and can outlive this call.
+    pub fn fqn(&self, fqn: &str) -> Vec<&'a CodeUnit> {
         self.0.definitions_by_fqn(fqn)
-    }
-
-    pub fn peers(&self, fqn: &str) -> Vec<&'a CodeUnit> {
-        self.0.definition_peers_by_fqn(fqn)
     }
 }
 

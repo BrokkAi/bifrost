@@ -377,6 +377,13 @@ impl PythonAnalysisSource for PythonAnalyzer {
         self.export_index_of(file)
     }
 
+    fn prepared_syntax(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
+        self.inner.prepared_syntax(file)
+    }
+
     fn visit_file_facts(
         &self,
         files: &[ProjectFile],

@@ -338,3 +338,77 @@ impl UsageAnalyzer for PythonExportUsageGraphStrategy {
             .into_fuzzy_result()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::analyzer::usages::python_graph::with_python_graph_source;
+    use crate::analyzer::{CodeUnitIndex, Language, PythonAnalyzer, TestProject};
+    use brokk_bifrost_python::graph::extractor::{
+        collect_scope_facts_from_parsed_source, with_callable_return_type_lookup_counter_for_test,
+    };
+    use brokk_bifrost_python::graph_support::PythonAnalysisSource;
+    use std::fs;
+
+    /// The imported-factory return-type walk must read the analyzer's prepared
+    /// syntax, not clone the file source and build its own parser per class
+    /// member.
+    ///
+    /// Both counter arms are asserted. `reparsed == 0` alone would pass
+    /// vacuously on a fixture that never reaches the walk, so `prepared > 0`
+    /// is what proves the walk ran at all.
+    #[test]
+    fn imported_factory_return_walk_uses_prepared_syntax_not_a_reparse() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let write = |path: &str, contents: &str| {
+            let full = root.join(path);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).expect("create parent directories");
+            }
+            fs::write(&full, contents).expect("write fixture");
+        };
+        write(
+            "models.py",
+            "class User:\n    @property\n    def normalized_name(self) -> str:\n        return \"n\"\n\n    @classmethod\n    def guest(cls) -> \"User\":\n        return cls()\n",
+        );
+        let consumer_source = "from models import User\n\n\ndef run():\n    user = User.guest()\n    return user.normalized_name\n";
+        write("consumer.py", consumer_source);
+
+        let analyzer = PythonAnalyzer::from_project(TestProject::new(root, Language::Python));
+        assert!(
+            !analyzer
+                .get_definitions("models.User.normalized_name")
+                .is_empty(),
+            "fixture should index the property under its module-qualified name"
+        );
+        let consumer = analyzer
+            .get_analyzed_files()
+            .into_iter()
+            .find(|file| file.to_string().ends_with("consumer.py"))
+            .expect("consumer file");
+        let prepared = analyzer
+            .prepared_syntax(&consumer)
+            .expect("consumer prepared syntax");
+
+        let (_facts, counts) = with_callable_return_type_lookup_counter_for_test(|| {
+            with_python_graph_source(&analyzer, |graph| {
+                collect_scope_facts_from_parsed_source(
+                    &graph,
+                    &analyzer,
+                    &consumer,
+                    prepared.source(),
+                    prepared.tree().root_node(),
+                )
+            })
+        });
+
+        assert!(
+            counts.prepared > 0,
+            "fixture must exercise the return-type walk: {counts:?}"
+        );
+        assert_eq!(
+            counts.reparsed, 0,
+            "return-type extraction must reuse the analyzer's prepared syntax rather than reparsing the file per class member: {counts:?}"
+        );
+    }
+}

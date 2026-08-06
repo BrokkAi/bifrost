@@ -9342,7 +9342,7 @@ fn target_forward_owner_resolution(
     for candidate in analyzer
         .global_usage_definition_index()
         .fqn(&owner_fqn)
-        .iter()
+        .into_iter()
         .filter(|candidate| candidate.is_class() && visible_files.contains(candidate.source()))
     {
         match cpp_class_declaration_strength(analyzer, candidate) {
@@ -9482,9 +9482,10 @@ fn same_source_owner(
     owner_fqn: &str,
     owner_name: &str,
 ) -> DirectOwnerResolution {
-    let owners = analyzer.global_usage_definition_index().fqn(owner_fqn);
-    let candidates = owners
-        .iter()
+    let candidates = analyzer
+        .global_usage_definition_index()
+        .fqn(owner_fqn)
+        .into_iter()
         .filter(|candidate| {
             candidate.is_class()
                 && candidate.source() == code_unit.source()
@@ -9513,9 +9514,10 @@ fn visible_full_cpp_owner(
         &mut visible_files,
         None,
     );
-    let owners = analyzer.global_usage_definition_index().fqn(owner_fqn);
-    let candidates = owners
-        .iter()
+    let candidates = analyzer
+        .global_usage_definition_index()
+        .fqn(owner_fqn)
+        .into_iter()
         .filter(|candidate| {
             candidate.is_class()
                 && candidate.short_name() == owner_name
@@ -9578,9 +9580,10 @@ fn directly_included_owner(
             )
         })
         .collect();
-    let owners = analyzer.global_usage_definition_index().fqn(owner_fqn);
-    let candidates = owners
-        .iter()
+    let candidates = analyzer
+        .global_usage_definition_index()
+        .fqn(owner_fqn)
+        .into_iter()
         .filter(|candidate| {
             candidate.is_class()
                 && candidate.short_name() == owner_name
@@ -9764,7 +9767,7 @@ pub fn visible_owner_from_member_name(ctx: &ScanCtx<'_>, code_unit: &CodeUnit) -
     ctx.analyzer
         .global_usage_definition_index()
         .fqn(&owner_fqn)
-        .iter()
+        .into_iter()
         .find(|candidate| {
             candidate.is_class()
                 && ctx.visibility.is_visible(ctx.file, candidate)
@@ -9877,14 +9880,13 @@ fn cpp_global_field_linkage_peers<'a>(
     analyzer: &CppGraphSource<'a>,
     candidate: &'a CodeUnit,
 ) -> impl Iterator<Item = &'a CodeUnit> + 'a {
-    // `peers` rather than `fqn` on the same index: the peers are returned to
-    // the caller, so they must borrow the analyzer for `'a` rather than a
-    // handle that dies with this call. Its implementation reads the shards
-    // directly for exactly that reason.
+    // These peers are returned to the caller, so they must borrow the analyzer
+    // for `'a` rather than a handle that dies with this call. `fqn` reads the
+    // shards directly for exactly that reason.
     let fq_name = candidate.fq_name();
     analyzer
         .global_usage_definition_index()
-        .peers(&fq_name)
+        .fqn(&fq_name)
         .into_iter()
         .filter(move |peer| {
             if *peer == candidate {

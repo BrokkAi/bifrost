@@ -527,11 +527,9 @@ impl CppWorkspaceSource for CppAnalyzer {
         self.inner.import_statements(file)
     }
 
-    fn definitions_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        <Self as IAnalyzer>::global_usage_definition_index(self).fqn(fqn)
-    }
-
-    fn definition_peers_by_fqn(&self, fqn: &str) -> Vec<&CodeUnit> {
+    fn definitions_by_fqn(&self, fqn: &str) -> Vec<&CodeUnit> {
+        // `into_shards` for the same reason as the `CppDispatch` impl: the
+        // matches outlive the per-call handle, so they must borrow the shards.
         <Self as IAnalyzer>::global_usage_definition_index(self)
             .into_shards()
             .into_iter()

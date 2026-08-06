@@ -11,7 +11,7 @@ use crate::graph::resolver::{
     receiver_annotation_matches_target, resolve_constructor_types, resolve_receiver_type,
     target_owner_code_unit, top_level_identifier,
 };
-use crate::graph_support::PythonUsageSource;
+use crate::graph_support::{PythonAnalysisSource, PythonUsageSource};
 use crate::imports::resolve_fqn_candidates;
 use crate::usage_index::{
     ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
@@ -1068,7 +1068,7 @@ pub fn call_result_types(
         .collect::<Vec<_>>();
     let mut classes = Vec::new();
     for callable in callables.into_iter().filter(CodeUnit::is_function) {
-        let Some(raw_type) = callable_return_type_name(graph, &callable) else {
+        let Some(raw_type) = callable_return_type_name(graph, python, &callable) else {
             continue;
         };
         if let Some(class) =
@@ -1803,7 +1803,7 @@ fn collect_imported_factory_return_types(
             resolve_fqn_candidates(python, &fqn, |name| graph.index.definitions(name).collect());
         for unit in units {
             if unit.is_function() {
-                if let Some(return_type) = callable_return_type_name(graph, &unit) {
+                if let Some(return_type) = callable_return_type_name(graph, python, &unit) {
                     factory_return_types
                         .entry(local.clone())
                         .or_insert(return_type);
@@ -1816,13 +1816,20 @@ fn collect_imported_factory_return_types(
             factory_return_types
                 .entry(local.clone())
                 .or_insert_with(|| unit.identifier().to_string());
-            collect_imported_class_method_return_types(graph, local, &unit, factory_return_types);
+            collect_imported_class_method_return_types(
+                graph,
+                python,
+                local,
+                &unit,
+                factory_return_types,
+            );
         }
     }
 }
 
 fn collect_imported_class_method_return_types(
     graph: &PythonGraphSource<'_>,
+    python: &dyn PythonAnalysisSource,
     local_class_name: &str,
     class_unit: &CodeUnit,
     factory_return_types: &mut HashMap<String, String>,
@@ -1831,7 +1838,7 @@ fn collect_imported_class_method_return_types(
         if !member.is_function() {
             continue;
         }
-        let Some(return_type) = callable_return_type_name(graph, &member) else {
+        let Some(return_type) = callable_return_type_name(graph, python, &member) else {
             continue;
         };
         factory_return_types
@@ -1840,7 +1847,27 @@ fn collect_imported_class_method_return_types(
     }
 }
 
-fn callable_return_type_name(graph: &PythonGraphSource<'_>, callable: &CodeUnit) -> Option<String> {
+fn callable_return_type_name(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonAnalysisSource,
+    callable: &CodeUnit,
+) -> Option<String> {
+    // The analyzer's already-parsed whole-file tree when it has one. This runs
+    // once per imported class member, and the fallback below clones the entire
+    // file source and builds a fresh `Parser` per declaration range. Same
+    // prepared-syntax fast path C++ resolution uses for the same reason.
+    if let Some(prepared) = python.prepared_syntax(callable.source()) {
+        #[cfg(any(test, feature = "test-support"))]
+        note_callable_return_type_lookup_for_test(true);
+        return callable_return_type_name_in_tree(
+            graph,
+            callable,
+            prepared.source(),
+            prepared.tree().root_node(),
+        );
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    note_callable_return_type_lookup_for_test(false);
     let source = graph.index.indexed_source(callable.source())?;
     declaration_source_slices(graph, callable, &source)
         .into_iter()
@@ -1853,6 +1880,74 @@ fn callable_return_type_name(graph: &PythonGraphSource<'_>, callable: &CodeUnit)
             let function = first_function_definition(tree.root_node())?;
             factory_return_type(function, declaration_source)
         })
+}
+
+/// How `callable_return_type_name` answered, counted per arm.
+///
+/// Both arms are counted, not just the slow one: a test that asserted only
+/// "no reparses" would pass vacuously on a fixture that never reaches this
+/// function at all.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CallableReturnTypeLookupCounts {
+    /// Answered from the analyzer's already-parsed whole-file tree.
+    pub prepared: usize,
+    /// Fell back to cloning the file source and building a fresh parser.
+    pub reparsed: usize,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static CALLABLE_RETURN_TYPE_LOOKUPS_FOR_TEST: std::cell::Cell<CallableReturnTypeLookupCounts> =
+        const { std::cell::Cell::new(CallableReturnTypeLookupCounts { prepared: 0, reparsed: 0 }) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn note_callable_return_type_lookup_for_test(from_prepared_syntax: bool) {
+    CALLABLE_RETURN_TYPE_LOOKUPS_FOR_TEST.with(|counts| {
+        let mut observed = counts.get();
+        if from_prepared_syntax {
+            observed.prepared += 1;
+        } else {
+            observed.reparsed += 1;
+        }
+        counts.set(observed);
+    });
+}
+
+/// Runs `body` and reports which arm each `callable_return_type_name` call
+/// took. An analyzer that holds prepared syntax must report zero reparses.
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_callable_return_type_lookup_counter_for_test<T>(
+    body: impl FnOnce() -> T,
+) -> (T, CallableReturnTypeLookupCounts) {
+    CALLABLE_RETURN_TYPE_LOOKUPS_FOR_TEST.with(|counts| {
+        counts.set(CallableReturnTypeLookupCounts::default());
+        let result = body();
+        let observed = counts.get();
+        counts.set(CallableReturnTypeLookupCounts::default());
+        (result, observed)
+    })
+}
+
+/// The declaration walk both arms of [`callable_return_type_name`] share.
+///
+/// `source` and `root` must be the same snapshot: `factory_return_type` slices
+/// `source` at the node's byte offsets, so a whole-file tree needs whole-file
+/// source and a per-range reparse needs that range's slice.
+fn callable_return_type_name_in_tree(
+    graph: &PythonGraphSource<'_>,
+    callable: &CodeUnit,
+    source: &str,
+    root: Node<'_>,
+) -> Option<String> {
+    let mut ranges = graph.index.ranges(callable);
+    ranges.sort_by_key(|range| range.start_byte);
+    ranges.into_iter().find_map(|range| {
+        let declaration = root.descendant_for_byte_range(range.start_byte, range.end_byte)?;
+        let function = first_function_definition(declaration)?;
+        factory_return_type(function, source)
+    })
 }
 
 fn first_function_definition(root: Node<'_>) -> Option<Node<'_>> {
