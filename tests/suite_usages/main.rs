@@ -42,6 +42,7 @@ mod usages_cpp_macro_sentinel_owner_test;
 mod usages_cpp_macro_sentinel_receiver_test;
 mod usages_cpp_macro_sibling_class_test;
 mod usages_cpp_recursive_free_function_test;
+mod usages_cpp_repeated_tag_test;
 mod usages_cpp_sentinel_visibility_test;
 mod usages_cpp_source_location_test;
 mod usages_csharp_graph_test;
