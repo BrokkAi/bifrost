@@ -322,6 +322,56 @@ fn run_repo_ephemeral_cache_does_not_create_persisted_database() {
 }
 
 #[test]
+fn run_repo_completion_identity_includes_cache_mode() {
+    let fixture = TinyRepoFixture::new("tiny__rust_cache_mode");
+
+    let persisted = fixture.run(&["--cache-mode", "persisted"]);
+    assert!(
+        persisted.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&persisted.stdout),
+        String::from_utf8_lossy(&persisted.stderr)
+    );
+
+    let ephemeral = fixture.run(&["--cache-mode", "ephemeral"]);
+    assert!(
+        ephemeral.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ephemeral.stdout),
+        String::from_utf8_lossy(&ephemeral.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&ephemeral.stderr).contains("already completed"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&ephemeral.stderr)
+    );
+
+    let persisted_resume = fixture.run(&["--cache-mode", "persisted"]);
+    assert!(
+        persisted_resume.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&persisted_resume.stdout),
+        String::from_utf8_lossy(&persisted_resume.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&persisted_resume.stderr).contains("already completed"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&persisted_resume.stderr)
+    );
+
+    let records = fs::read_to_string(&fixture.output)
+        .expect("read cache-mode report")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse record"))
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_ne!(
+        records[0]["run_fingerprint"], records[1]["run_fingerprint"],
+        "cache modes must have distinct completion fingerprints"
+    );
+}
+
+#[test]
 fn run_repo_cpp_reports_inverse_visibility_progress() {
     let fixture = TinyCppRepoFixture::new("tiny__cpp");
     let output = fixture.run(&["--cache-mode", "ephemeral"]);

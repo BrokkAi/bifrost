@@ -146,7 +146,7 @@ Start a fresh conversation under the Project you created above and use a prompt
 that requires two real MCP calls:
 
 ```text
-Load the bifrost-codebase-search skill. Use only Bifrost MCP tools for this verification; do not use terminal commands or built-in file-reading or search tools. Call search_symbols for antigravity_bifrost_host_probe_4f6f2b7, then call query_code with schema_version 2, languages ["rust"], match {"kind":"function","name":"antigravity_bifrost_host_probe_4f6f2b7"}, limit 10, and result_detail "full". PASS only if both real calls return src/antigravity_bifrost_host_probe_4f6f2b7.rs.
+Load the bifrost-codebase-search skill. Use only Bifrost MCP tools for this verification; do not use terminal commands or built-in file-reading or search tools. Call search_symbols for antigravity_bifrost_host_probe_4f6f2b7, then call query_code with schema_version 1, languages ["rust"], match {"kind":"function","name":"antigravity_bifrost_host_probe_4f6f2b7"}, limit 10, and result_detail "full". PASS only if both real calls return src/antigravity_bifrost_host_probe_4f6f2b7.rs.
 ```
 
 Antigravity should ask for permission to call `bifrost/*` the first time. You

@@ -3324,9 +3324,8 @@ impl<'a> CppVisitor<'a> {
                 false,
                 fq,
             );
-            if self.parsed.contains_declaration_identity(&code_unit) {
-                continue;
-            }
+            // Declaration identity does not include the alias signature. Keep
+            // each physical range so conditional aliases retain their guards.
             self.parsed
                 .add_code_unit(code_unit.clone(), node, self.source, None, None);
             self.parsed
@@ -10581,13 +10580,14 @@ int value(1) ABSL_ATTRIBUTE_LIFETIME_BOUND
         let comparisons = finish_declaration_identity_comparison_probe();
 
         assert_eq!(
-            DISTINCT_PER_KIND,
+            DISTINCT_PER_KIND + 1,
             parsed
                 .declarations()
                 .iter()
                 .filter(|unit| unit.is_class() && unit.short_name().starts_with("Alias"))
                 .count(),
-            "typedef aliases should retain semantic-identity deduplication"
+            "every physical typedef alias declaration must be retained so \
+             conditional branch guards stay available to the resolver"
         );
         assert_eq!(
             DISTINCT_PER_KIND,

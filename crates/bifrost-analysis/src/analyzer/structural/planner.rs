@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn declaration_bounded_containment_contributes_positive_anchors() {
         let anchors = anchors_of(json!({
-            "schema_version": 5,
+            "schema_version": 1,
             "match": { "kind": "call", "name": "run" },
             "inside_decl": { "kind": "loop", "name": "retry" }
         }));

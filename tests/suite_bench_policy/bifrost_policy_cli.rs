@@ -60,7 +60,7 @@ const CROSS_LANGUAGE_ACQUIRE_ENDPOINT: &str = r#"(endpoint
   :categories [resource.lifecycle resource.acquire]
   :selector
     (rql
-      :schema-version 2
+      :schema-version 1
       (union
         (language typescript (call :callee (name "openResource")))
         (language java (call :callee (name "openResource")))))
@@ -75,7 +75,7 @@ const CROSS_LANGUAGE_CLOSE_ENDPOINT: &str = r#"(endpoint
   :categories [resource.lifecycle resource.close]
   :selector
     (rql
-      :schema-version 2
+      :schema-version 1
       (union
         (language typescript (call :callee (name "closeResource")))
         (language java (call :callee (name "closeResource")))))
@@ -90,7 +90,7 @@ const DOMINANT_CLOSE_ENDPOINT: &str = r#"(endpoint
   :categories [resource.lifecycle resource.close]
   :selector
     (rql
-      :schema-version 2
+      :schema-version 1
       (language typescript
         (call :callee (name "closeResource"))))
   :binding (argument :index 0)
@@ -104,7 +104,7 @@ const DOMINANT_ACQUIRE_ENDPOINT: &str = r#"(endpoint
   :categories [resource.lifecycle resource.acquire]
   :selector
     (rql
-      :schema-version 2
+      :schema-version 1
       (language typescript
         (call :callee (name "openResource"))))
   :binding return-value
@@ -891,7 +891,7 @@ fn strict_versions_endpoint_roots_and_typestate_execution_have_typed_statuses() 
     assert!(
         String::from_utf8_lossy(&accepted_inference.stdout)
             .contains(
-                "policy bifrost.security.inferred-dynamic-eval inferred policy schema 1 and RQL schema 13"
+                "policy bifrost.security.inferred-dynamic-eval inferred policy schema 1 and RQL schema 1"
             )
     );
 

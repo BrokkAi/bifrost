@@ -7,7 +7,7 @@
   :categories [input.user-controlled io.external]
   :selector
     (rql
-      :schema-version 2
+      :schema-version 1
       (language python
         (call :callee (name "request_parameter"))))
   :binding return-value

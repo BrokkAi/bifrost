@@ -7,7 +7,7 @@
   :categories [resource.lifecycle resource.acquire]
   :selector
     (rql
-      :schema-version 2
+      :schema-version 1
       (language typescript
         (call :callee (name "openResource"))))
   :binding return-value

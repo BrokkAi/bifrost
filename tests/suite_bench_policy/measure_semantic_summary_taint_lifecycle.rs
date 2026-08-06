@@ -462,7 +462,7 @@ fn retained_query_projections(
     }
     assert_eq!(registrations.registration_count(), 1);
     let json_query = CodeQuery::from_json(&serde_json::json!({
-        "schema_version": 7,
+        "schema_version": 1,
         "match": { "kind": "method", "name": "run" },
         "steps": [
             { "op": "procedure_of" },
@@ -594,7 +594,7 @@ fn policy_source(spec: CaseSpec) -> String {
         .map(|index| {
             format!(
                 r#"(source :id attacker-{index} :display-name "attacker {index}" :categories [input.user]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "attacker_{index}"))))
                 :bind return-value :labels [untrusted])"#
             )
@@ -605,7 +605,7 @@ fn policy_source(spec: CaseSpec) -> String {
         .map(|index| {
             format!(
                 r#"(sink :id sensitive-{index} :display-name "sensitive {index}" :categories [data.sensitive]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "sensitive_{index}"))))
                 :dangerous-operand (argument :index 0) :accepts [untrusted])"#
             )

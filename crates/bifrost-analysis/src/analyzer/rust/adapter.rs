@@ -1,9 +1,11 @@
 use crate::analyzer::cognitive_complexity;
-use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile};
+use crate::analyzer::{Language, LanguageAdapter, PackageAnchor, ProjectFile};
 use std::sync::LazyLock;
 use tree_sitter::Tree;
 
-use super::declarations::{parse_rust_file, rust_file_package_fq, rust_package_name};
+use super::declarations::{
+    parse_rust_file, rust_file_package_fq, rust_package_name, rust_semantic_package_fq,
+};
 use super::tests::rust_source_contains_tests;
 
 static RUST_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
@@ -21,6 +23,14 @@ static RUST_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
         ..cognitive_complexity::Config::empty()
     });
 
+/// Rust persists every unit's package prefix as an anchor plus a
+/// content-stable tail, so `code_units.content_qualifier` is always empty for
+/// this language. The SQL package prefilters that read that column
+/// (`persisted_package_exists`, `forward_fqn_prefix_exists` in
+/// `tree_sitter_analyzer.rs`) therefore cannot see any Rust row and would
+/// report a false negative if one were ever asked about a Rust package. No
+/// Rust caller reaches them today; a future one must resolve the anchor
+/// instead of matching persisted text.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RustAdapter;
 
@@ -39,14 +49,16 @@ impl LanguageAdapter for RustAdapter {
 
     fn storage_content_qualifier(
         &self,
-        code_unit: &crate::analyzer::CodeUnit,
+        _code_unit: &crate::analyzer::CodeUnit,
         _content_qualifier: &str,
     ) -> String {
-        if rust_unit_has_explicit_qualifier(code_unit) {
-            code_unit.package_name().to_string()
-        } else {
-            String::new()
-        }
+        // Every Rust unit carries an effective package anchor (its own, or this
+        // adapter's default), so its package prefix is re-derived from the live
+        // path at hydration. Baking the path-derived text into the row would
+        // make a content-addressed blob unusable at a second mount point. A
+        // unit that falls back to a fully persisted name needs no qualifier
+        // either: mode FULL restores the complete structured name on its own.
+        String::new()
     }
 
     fn persisted_content_qualifier_supports_substring_search(&self) -> bool {
@@ -65,22 +77,29 @@ impl LanguageAdapter for RustAdapter {
         }
     }
 
-    fn path_derived_package_fq(
-        &self,
-        content_qualifier: &str,
-        file: &ProjectFile,
-    ) -> Option<crate::analyzer::FqName> {
-        content_qualifier
-            .is_empty()
-            .then(|| rust_file_package_fq(file))
+    fn default_package_anchor(&self) -> Option<PackageAnchor> {
+        Some(PackageAnchor::OwnModule { pop: 0 })
     }
 
-    fn code_unit_package_is_path_derived(
+    fn resolve_package_anchor(
         &self,
-        code_unit: &CodeUnit,
+        anchor: PackageAnchor,
         _content_qualifier: &str,
-    ) -> bool {
-        !rust_unit_has_explicit_qualifier(code_unit)
+        file: &ProjectFile,
+    ) -> Option<crate::analyzer::FqName> {
+        match anchor {
+            PackageAnchor::OwnModule { pop } => {
+                let package = rust_file_package_fq(file);
+                let keep = package.len().saturating_sub(usize::from(pop));
+                Some(package.prefix(keep))
+            }
+            // An empty crate root (a crate mounted at the repository root) is a
+            // legitimate empty prefix, not an absent one: it is what lets an
+            // `impl crate::Type` member persist a package-free tail.
+            PackageAnchor::CrateRoot => Some(rust_semantic_package_fq(
+                &super::imports::rust_crate_root_package(file),
+            )),
+        }
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
@@ -116,8 +135,4 @@ impl LanguageAdapter for RustAdapter {
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&RUST_COGNITIVE_CONFIG)
     }
-}
-
-fn rust_unit_has_explicit_qualifier(code_unit: &CodeUnit) -> bool {
-    code_unit.package_name() != rust_package_name(code_unit.source())
 }

@@ -111,6 +111,13 @@ impl CacheMode {
             )),
         }
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Persisted => "persisted",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
 }
 
 impl EngineOptions {
@@ -415,7 +422,7 @@ fn run_repo_command(args: RunRepoArgs) -> Result<bool, String> {
     let metadata = repository_metadata(&root)?;
     let bifrost_metadata = repository_metadata(Path::new(env!("CARGO_MANIFEST_DIR")))?;
     let config = args.options.config(&args.language);
-    let fingerprint = run_fingerprint(&config)?;
+    let fingerprint = run_fingerprint(&config, args.options.cache_mode)?;
     let completed = if args.force {
         HashSet::new()
     } else {
@@ -520,7 +527,10 @@ fn run_corpus_command(args: RunCorpusArgs) -> Result<bool, String> {
                         dirty: false,
                     },
                     &bifrost_metadata,
-                    run_fingerprint(&args.options.config(&selected_repo.language))?,
+                    run_fingerprint(
+                        &args.options.config(&selected_repo.language),
+                        args.options.cache_mode,
+                    )?,
                     0.0,
                     Err(format!("failed to read repository metadata: {err}")),
                 );
@@ -529,7 +539,7 @@ fn run_corpus_command(args: RunCorpusArgs) -> Result<bool, String> {
             }
         };
         let config = args.options.config(&selected_repo.language);
-        let fingerprint = run_fingerprint(&config)?;
+        let fingerprint = run_fingerprint(&config, args.options.cache_mode)?;
         let key = CompletionKey::new(
             &selected_repo.language,
             &selected_repo.slug,
@@ -1035,9 +1045,21 @@ fn analyzer_language(corpus_language: &str) -> &'static str {
     }
 }
 
-fn run_fingerprint(config: &ReferenceDifferentialConfig) -> Result<String, String> {
-    let bytes = serde_json::to_vec(config)
-        .map_err(|err| format!("failed to serialize differential config: {err}"))?;
+fn run_fingerprint(
+    config: &ReferenceDifferentialConfig,
+    cache_mode: CacheMode,
+) -> Result<String, String> {
+    #[derive(Serialize)]
+    struct FingerprintInput<'a> {
+        config: &'a ReferenceDifferentialConfig,
+        cache_mode: &'static str,
+    }
+
+    let bytes = serde_json::to_vec(&FingerprintInput {
+        config,
+        cache_mode: cache_mode.as_str(),
+    })
+    .map_err(|err| format!("failed to serialize differential config: {err}"))?;
     let digest = Sha256::digest(bytes);
     Ok(format!("{digest:x}"))
 }

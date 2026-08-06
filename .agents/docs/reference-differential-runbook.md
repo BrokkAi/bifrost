@@ -217,8 +217,9 @@ zero shell status alone. A killed process or a log without a completed record is
 3. Repeat the identical command and output path without `--force`.
 
 The runner computes a semantic completion key from language, repository slug/head, Bifrost head, and
-the configuration fingerprint. Completed keys are skipped; incomplete repositories rerun. Do not
-truncate the JSONL, delete clone caches, or add `--force` merely because a run was interrupted.
+the configuration fingerprint. The fingerprint includes the selected cache mode. Completed keys are
+skipped; incomplete repositories and requests for a different cache mode rerun. Do not truncate the
+JSONL, delete clone caches, or add `--force` merely because a run was interrupted.
 
 Progress within one repository is not checkpointed as a completed record. If that repository process
 dies before append, its forward and inverse phases repeat, although a persisted analyzer cache can

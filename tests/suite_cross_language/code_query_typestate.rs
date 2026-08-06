@@ -244,7 +244,7 @@ fn call_containing<'procedure>(
 
 fn json_query(steps: serde_json::Value) -> CodeQuery {
     CodeQuery::from_json(&json!({
-        "schema_version": 4,
+        "schema_version": 1,
         "match": {"kind": "function", "name": "lifecycle"},
         "steps": steps,
     }))
@@ -322,7 +322,7 @@ fn registered_json_and_rql_return_equal_findings_and_retained_witnesses() {
 fn java_and_typescript_resource_protocol_match_through_json_and_rql() {
     for (fixture, kind) in [(Fixture::new(), "function"), (Fixture::java(), "method")] {
         let json_query = CodeQuery::from_json(&json!({
-            "schema_version": 4,
+            "schema_version": 1,
             "match": {"kind": kind, "name": "lifecycle"},
             "steps": [
                 {"op": "procedure_of"},
@@ -355,7 +355,7 @@ fn java_and_typescript_resource_protocol_match_through_json_and_rql() {
 fn java_and_typescript_public_profiles_preserve_witnesses_on_exact_hits() {
     for (fixture, kind) in [(Fixture::new(), "function"), (Fixture::java(), "method")] {
         let query = CodeQuery::from_json(&json!({
-            "schema_version": 4,
+            "schema_version": 1,
             "execution_mode": "profile",
             "match": {"kind": kind, "name": "lifecycle"},
             "steps": [
@@ -470,7 +470,7 @@ fn registered_root_survives_equivalent_semantic_rematerialization() {
 fn witness_projection_trims_retained_evidence_without_a_second_solve() {
     let fixture = Fixture::new();
     let query = CodeQuery::from_json(&json!({
-        "schema_version": 4,
+        "schema_version": 1,
         "match": {"kind": "function", "name": "lifecycle"},
         "steps": [
             {"op": "procedure_of"},
@@ -517,7 +517,7 @@ fn duplicate_analysis_branches_share_one_request_local_solve() {
         ]
     });
     let query = CodeQuery::from_json(&json!({
-        "schema_version": 4,
+        "schema_version": 1,
         "union": [branch.clone(), branch],
         "execution_mode": "profile"
     }))
@@ -574,7 +574,7 @@ fn unresolved_stale_wrong_root_and_solver_budget_are_explicitly_incomplete() {
     );
 
     let wrong_root = CodeQuery::from_json(&json!({
-        "schema_version": 4,
+        "schema_version": 1,
         "match": {"kind": "function", "name": "use"},
         "steps": [
             {"op": "procedure_of"},

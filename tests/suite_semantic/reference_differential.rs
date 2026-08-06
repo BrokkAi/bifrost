@@ -460,12 +460,12 @@ impl<T> crate::arena_tree::Node<T> {
         (
             owner_start,
             owner_start + "NodeValue".len(),
-            "nodes.NodeValue",
+            "enum_demo.nodes.NodeValue",
         ),
         (
             variant_start,
             variant_start + "Item".len(),
-            "nodes.NodeValue.Item",
+            "enum_demo.nodes.NodeValue.Item",
         ),
     ] {
         let site = report
@@ -631,7 +631,7 @@ pub fn park(_: SignalHandle) {}
             .iter()
             .map(|target| (target.path.as_str(), target.fq_name.as_str()))
             .collect::<Vec<_>>(),
-        [("src/signal.rs", "signal.Handle")],
+        [("src/signal.rs", "nested_wrapper.signal.Handle")],
         "the compositional wrapper must retain the physical source route: {handle:#?}"
     );
     assert_eq!(

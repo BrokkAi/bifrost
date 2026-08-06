@@ -2259,9 +2259,9 @@ mod tests {
 
     fn inline_selector() -> PolicySelector {
         PolicySelector::Inline {
-            schema: schema(2),
+            schema: schema(1),
             query: CodeQuery::from_json(&json!({
-                "schema_version": 2,
+                "schema_version": 1,
                 "match": {
                     "kind": "call",
                     "callee": { "name": "eval" },
@@ -2322,9 +2322,9 @@ mod tests {
                     "type": "match",
                     "selector": {
                         "type": "inline",
-                        "schema_version": 2,
+                        "schema_version": 1,
                         "query": {
-                            "schema_version": 2,
+                            "schema_version": 1,
                             "match": { "kind": "call", "callee": { "name": "eval" } },
                         },
                     },
@@ -2346,7 +2346,7 @@ mod tests {
         let semantic = document.to_inline_local_canonical_semantic_json().unwrap();
         assert_eq!(
             semantic.pointer("/analysis/selector/schema_version"),
-            Some(&json!(2))
+            Some(&json!(1))
         );
         assert!(semantic.pointer("/analysis/selector/type").is_none());
     }
@@ -2367,7 +2367,7 @@ mod tests {
                     PolicyCategoryId::new("io.user").unwrap(),
                 ],
                 selector: PolicySelector::File {
-                    authored_schema_version: Some(2),
+                    authored_schema_version: Some(1),
                     path: WorkspaceRelativePath::new("queries/request.rql").unwrap(),
                 },
                 binding: PolicyEndpointBinding::ArgumentIndex { index: 0 },
@@ -2395,7 +2395,7 @@ mod tests {
                 "categories": ["io.user"],
                 "selector": {
                     "type": "file",
-                    "authored_schema_version": 2,
+                    "authored_schema_version": 1,
                     "path": "queries/request.rql",
                 },
                 "binding": { "type": "argument_index", "index": 0 },

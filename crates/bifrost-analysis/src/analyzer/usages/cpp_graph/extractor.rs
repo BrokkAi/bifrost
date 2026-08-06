@@ -54,6 +54,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) line_starts: &'a [usize],
     pub(super) spec: &'a TargetSpec,
     pub(super) target_group: &'a HashSet<CodeUnit>,
+    pub(super) has_physically_visible_type_target: bool,
     type_reference_component_names: HashSet<String>,
     pub(super) target_declaration_ranges: Vec<Range>,
     orphaned_namespaces: Vec<OrphanedNamespaceEnvelope>,
@@ -111,6 +112,24 @@ pub(super) fn scan_prepared_file(
         return;
     }
     let needs_using_enum_member_resolution = spec.enum_owner_kind == EnumOwnerKind::Scoped;
+    let has_physically_visible_type_target = spec.kind == TargetKind::Type
+        && target_group.iter().any(|target| {
+            same_logical_symbol(target, &spec.target)
+                && visibility.is_physically_visible(file, target)
+        });
+    if spec.kind == TargetKind::Type
+        && !has_physically_visible_type_target
+        && visibility
+            .visible_identifier_candidates(file, spec.target.identifier())
+            .any(|candidate| {
+                candidate != &spec.target
+                    && !target_group.contains(candidate)
+                    && same_logical_symbol(candidate, &spec.target)
+                    && visibility.is_physically_visible(file, candidate)
+            })
+    {
+        return;
+    }
     let target_declaration_ranges = if spec.kind == TargetKind::Type {
         target_group
             .iter()
@@ -152,6 +171,7 @@ pub(super) fn scan_prepared_file(
         line_starts: prepared.line_starts(),
         spec,
         target_group,
+        has_physically_visible_type_target,
         type_reference_component_names,
         target_declaration_ranges,
         orphaned_namespaces,
@@ -1006,6 +1026,9 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             for scope in scopes {
                 push_type_hit(scope, ctx);
             }
+        } else if let Some(scope) = target_guided_unproven_qualified_call_owner_scope(node, ctx) {
+            *ctx.raw_match_count += 1;
+            push_unproven_hit(scope, ctx);
         }
         return;
     }
@@ -1080,6 +1103,27 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         .child_by_field_name("name")
                         .filter(|name| name.kind() == "type_identifier")
                         .unwrap_or(hit_node)
+                } else if ctx
+                    .analyzer
+                    .type_alias_provider()
+                    .is_some_and(|provider| provider.is_type_alias(&ctx.spec.target))
+                    && ctx
+                        .analyzer
+                        .parent_of(&ctx.spec.target)
+                        .is_some_and(|owner| owner.is_class())
+                    && ctx
+                        .visibility
+                        .is_exhaustive_same_fqn_type_declaration_family(
+                            ctx.analyzer,
+                            ctx.file,
+                            &ctx.spec.target,
+                        )
+                    && matches!(
+                        hit_node.kind(),
+                        "qualified_identifier" | "scoped_type_identifier"
+                    )
+                {
+                    hit_node.child_by_field_name("name").unwrap_or(hit_node)
                 } else if qualified_type_scope_contains_template(hit_node) {
                     function_terminal_node(hit_node)
                 } else {
@@ -1092,12 +1136,21 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             }
             return;
         }
-        LexicalTypeResolution::Resolved { .. } => {
+        LexicalTypeResolution::Resolved {
+            unit: _,
+            candidates,
+            ..
+        } => {
             if let Some(scopes) = static_qualifier_type_scopes(node, ctx) {
                 *ctx.raw_match_count += 1;
                 for scope in scopes {
                     push_type_hit(scope, ctx);
                 }
+            } else if let Some(hit) =
+                target_guided_unproven_alias_type_reference(node, &candidates, ctx)
+            {
+                *ctx.raw_match_count += 1;
+                push_unproven_hit(hit, ctx);
             } else if let Some(leaf) = target_guided_missing_alias_rhs_type_leaf(node, ctx)
                 .or_else(|| target_guided_missing_member_alias_type_leaf(node, ctx))
             {
@@ -2326,6 +2379,50 @@ fn static_qualifier_type_scopes_for_components<'tree>(
     }
 }
 
+/// Recover a class owner in a qualified call when guard-aware lookup cannot
+/// prove the owner. Keep the hit on the owner component, not the method.
+fn target_guided_unproven_qualified_call_owner_scope<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    let target = physically_visible_type_target(ctx)?;
+    if !target.is_class() {
+        return None;
+    }
+    let qualified = qualified_owner_components(node, ctx.source)?;
+    let lexical_scope = match enclosing_lexical_scope_components(
+        node,
+        ctx.analyzer,
+        ctx.visibility,
+        ctx.file,
+        ctx.source,
+    ) {
+        LexicalScopeResolution::Resolved(scope) => scope,
+        LexicalScopeResolution::Ambiguous | LexicalScopeResolution::Missing => {
+            enclosing_namespace_components(node, ctx.source)
+        }
+    };
+    let LexicalTypeResolution::Resolved {
+        unit, candidates, ..
+    } = ctx.visibility.resolve_type_components_lexically_for_target(
+        ctx.analyzer,
+        ctx.file,
+        &qualified.names,
+        qualified.global,
+        &lexical_scope,
+        target,
+    )
+    else {
+        return None;
+    };
+    (same_visible_symbol(&unit, target)
+        || candidates
+            .iter()
+            .any(|candidate| same_visible_symbol(candidate, target)))
+    .then(|| qualified.nodes.last().copied())
+    .flatten()
+}
+
 /// Resolve a nested class-owned alias when the indexed alias path is not a
 /// standalone type candidate. The C++ index stores `basic_json::type_error`
 /// as a synthetic child of `basic_json`, while source can qualify it through
@@ -2404,6 +2501,42 @@ fn canonical_alias_target(candidate: &CodeUnit, ctx: &ScanCtx<'_>) -> CodeUnit {
     structured.unwrap_or_else(|| candidate.clone())
 }
 
+/// Recover a namespace alias whose guard state blocks ordinary visibility.
+/// Require one visible canonical target and an exact structured alias path.
+fn target_guided_unproven_alias_type_reference<'tree>(
+    node: Node<'tree>,
+    candidates: &[CodeUnit],
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    if cpp_template_reference_arguments(node, ctx.source).is_some() {
+        return None;
+    }
+    let target = physically_visible_type_target(ctx)?;
+    if !target.is_class() {
+        return None;
+    }
+    let alias_provider = ctx.analyzer.type_alias_provider()?;
+    let (components, _) = type_reference_components(node, ctx.source)?;
+    let hit = function_terminal_node(node);
+    candidates
+        .iter()
+        .filter(|candidate| {
+            alias_provider.is_type_alias(candidate)
+                && ctx.visibility.is_physically_visible(ctx.file, candidate)
+                && canonical_cpp_scope_components(candidate) == components
+        })
+        .find(|candidate| {
+            same_visible_symbol(&canonical_alias_target(candidate, ctx), target)
+                || ctx.visibility.structured_alias_primary_preserves_target(
+                    ctx.analyzer,
+                    ctx.file,
+                    candidate,
+                    target,
+                )
+        })
+        .map(|_| hit)
+}
+
 fn target_alias_candidates_visible(
     candidates: &[CodeUnit],
     reference: Node<'_>,
@@ -2449,17 +2582,28 @@ fn type_candidate_visible_at_reference(
             .parent_of(candidate)
             .is_some_and(|owner| owner.is_class());
     if class_owned_alias {
-        return (qualified_reference_selects_type_candidate(candidate, reference, ctx)
+        let conditional_family = ctx
+            .visibility
+            .is_exhaustive_same_fqn_type_declaration_family(ctx.analyzer, ctx.file, candidate);
+        let owner_match = qualified_reference_selects_type_candidate(candidate, reference, ctx)
             || unqualified_reference_selects_inherited_alias(candidate, reference, ctx)
-            || member_alias_owner_matches_reference_for(candidate, reference, ctx))
-            && ctx
-                .visibility
-                .external_type_candidate_guard_compatible_in_context(
-                    ctx.analyzer,
-                    ctx.file,
-                    candidate,
-                    reference,
-                );
+            || member_alias_owner_matches_reference_for(candidate, reference, ctx);
+        let guard_match = ctx
+            .visibility
+            .external_type_candidate_guard_compatible_in_context(
+                ctx.analyzer,
+                ctx.file,
+                candidate,
+                reference,
+            );
+        let general_match = conditional_family
+            && ctx.visibility.external_type_candidate_visible_in_context(
+                ctx.analyzer,
+                ctx.file,
+                candidate,
+                reference,
+            );
+        return owner_match && (guard_match || general_match);
     }
     ctx.visibility.external_type_candidate_visible_in_context(
         ctx.analyzer,
@@ -2734,9 +2878,7 @@ fn inherited_injected_class_qualifier_scope<'tree>(
     let injected_name = &qualified.names[0];
     if !ctx.spec.target.is_class()
         || ctx.spec.target.identifier() != injected_name
-        || !ctx
-            .visibility
-            .is_physically_visible(ctx.file, &ctx.spec.target)
+        || physically_visible_type_target(ctx).is_none()
     {
         return None;
     }
@@ -2909,8 +3051,25 @@ fn target_guided_qualifier_type_scopes<'tree>(
             [candidate] if same_visible_symbol(candidate, target)
         );
         if direct_alias_target || unique_target || canonical_alias_target_matches {
-            let matched =
-                qualified_type_component_hit_node(qualified.nodes[component_count - 1], node);
+            let matched = if ctx
+                .analyzer
+                .type_alias_provider()
+                .is_some_and(|provider| provider.is_type_alias(target))
+                && ctx
+                    .analyzer
+                    .parent_of(target)
+                    .is_some_and(|owner| owner.is_class())
+                && ctx
+                    .visibility
+                    .is_exhaustive_same_fqn_type_declaration_family(ctx.analyzer, ctx.file, target)
+            {
+                // The alias declaration owns the terminal component. Keep
+                // the inverse range narrow so `MathLib::bigint` records the
+                // `bigint` token, not the complete qualified owner path.
+                qualified.nodes[component_count - 1]
+            } else {
+                qualified_type_component_hit_node(qualified.nodes[component_count - 1], node)
+            };
             if template_type_component_preserves_target(matched, &candidates, ctx) {
                 matches.push(matched);
             }
@@ -2953,12 +3112,7 @@ fn target_guided_missing_type_leaf<'tree>(
     node: Node<'tree>,
     ctx: &ScanCtx<'_>,
 ) -> Option<Node<'tree>> {
-    if !ctx
-        .visibility
-        .is_physically_visible(ctx.file, &ctx.spec.target)
-    {
-        return None;
-    }
+    physically_visible_type_target(ctx)?;
     target_guided_missing_dependent_nested_type_leaf(node, ctx)
         .or_else(|| target_guided_missing_declaration_type_leaf(node, ctx))
         .or_else(|| target_guided_missing_alias_rhs_type_leaf(node, ctx))
@@ -3605,9 +3759,9 @@ fn local_type_name_shadows(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 
 fn local_type_name_declaration_node(node: Node<'_>) -> Option<Node<'_>> {
     local_type_alias_name_node(node).or_else(|| match node.kind() {
-        "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier" => {
-            node.child_by_field_name("name")
-        }
+        "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier" => node
+            .child_by_field_name("name")
+            .filter(|name| is_declaration_name(*name)),
         _ => None,
     })
 }
@@ -3645,8 +3799,10 @@ fn local_alias_scope_contains_node(alias: Node<'_>, node: Node<'_>) -> bool {
                 && node.end_byte() <= parent.end_byte();
         }
         if matches!(parent.kind(), "function_definition" | "lambda_expression") {
-            return parent.start_byte() <= node.start_byte()
-                && node.end_byte() <= parent.end_byte();
+            let Some(body) = parent.child_by_field_name("body") else {
+                return false;
+            };
+            return node_is_within(body, alias) && node_is_within(body, node);
         }
         current = parent.parent();
     }

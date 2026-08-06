@@ -260,23 +260,59 @@ pub(crate) struct WorkspaceUsageGraph {
     pub(crate) resolved_ecosystems: Vec<UsageEcosystem>,
 }
 
+pub(crate) struct WorkspaceUsageRankingNode {
+    pub(crate) primary_file: ProjectFile,
+    pub(crate) seed_files: Vec<ProjectFile>,
+    pub(crate) incomplete: bool,
+}
+
 pub(crate) struct WorkspaceUsageRankingGraph {
-    pub(crate) graph: WorkspaceUsageGraph,
+    pub(crate) nodes: Vec<WorkspaceUsageRankingNode>,
+    pub(crate) edges: Vec<WorkspaceUsageEdge>,
     pub(crate) node_indices_by_file: HashMap<ProjectFile, Vec<usize>>,
+    #[cfg(test)]
+    pub(crate) resolved_ecosystems: Vec<UsageEcosystem>,
 }
 
 impl WorkspaceUsageRankingGraph {
+    pub(crate) fn from_exact(graph: WorkspaceUsageGraph) -> Self {
+        let mut node_indices_by_file: HashMap<ProjectFile, Vec<usize>> = HashMap::default();
+        let nodes = graph
+            .nodes
+            .into_iter()
+            .enumerate()
+            .map(|(index, node)| {
+                for file in &node.declaration_files {
+                    node_indices_by_file
+                        .entry(file.clone())
+                        .or_default()
+                        .push(index);
+                }
+                WorkspaceUsageRankingNode {
+                    primary_file: node.primary.source().clone(),
+                    seed_files: node.declaration_files,
+                    incomplete: node.truncated_inbound.is_some(),
+                }
+            })
+            .collect();
+        Self {
+            nodes,
+            edges: graph.edges,
+            node_indices_by_file,
+            #[cfg(test)]
+            resolved_ecosystems: graph.resolved_ecosystems,
+        }
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         let mut retained = std::mem::size_of::<Self>()
             .saturating_add(
-                self.graph
-                    .nodes
+                self.nodes
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<WorkspaceUsageNode>()),
+                    .saturating_mul(std::mem::size_of::<WorkspaceUsageRankingNode>()),
             )
             .saturating_add(
-                self.graph
-                    .edges
+                self.edges
                     .capacity()
                     .saturating_mul(std::mem::size_of::<WorkspaceUsageEdge>()),
             )
@@ -285,23 +321,15 @@ impl WorkspaceUsageRankingGraph {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<(ProjectFile, Vec<usize>)>()),
             );
-        for node in &self.graph.nodes {
+        for node in &self.nodes {
             retained = retained
-                .saturating_add(node.key.fqn.capacity())
+                .saturating_add(project_file_retained_bytes(&node.primary_file))
                 .saturating_add(
-                    node.key
-                        .defining_file
-                        .as_ref()
-                        .map(project_file_retained_bytes)
-                        .unwrap_or_default(),
-                )
-                .saturating_add(code_unit_retained_bytes(&node.primary))
-                .saturating_add(
-                    node.declaration_files
+                    node.seed_files
                         .capacity()
                         .saturating_mul(std::mem::size_of::<ProjectFile>()),
                 );
-            for file in &node.declaration_files {
+            for file in &node.seed_files {
                 retained = retained.saturating_add(project_file_retained_bytes(file));
             }
         }
@@ -322,15 +350,6 @@ fn project_file_retained_bytes(file: &ProjectFile) -> usize {
     std::mem::size_of::<ProjectFile>()
         .saturating_add(file.root().as_os_str().len())
         .saturating_add(file.rel_path().as_os_str().len())
-}
-
-fn code_unit_retained_bytes(unit: &CodeUnit) -> usize {
-    std::mem::size_of::<CodeUnit>()
-        .saturating_add(project_file_retained_bytes(unit.source()))
-        .saturating_add(unit.package_name().len())
-        .saturating_add(unit.short_name().len())
-        .saturating_add(unit.signature().map(str::len).unwrap_or_default())
-        .saturating_add(unit.fq_name().len())
 }
 
 pub(crate) enum WorkspaceUsageGraphBuildOutcome {

@@ -7,7 +7,7 @@
   :categories [resource.lifecycle resource.close]
   :selector
     (rql
-      :schema-version 2
+      :schema-version 1
       (language typescript
         (call :callee (name "closeResource"))))
   :binding (argument :index 0)

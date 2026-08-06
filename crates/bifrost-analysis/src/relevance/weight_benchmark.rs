@@ -213,7 +213,7 @@ fn benchmark_usage_reference_weight_profiles() {
         let rank_ms = rank_started.elapsed().as_secs_f64() * 1000.0;
 
         let mut counts = UsageReferenceCounts::default();
-        for edge in &ranking_graph.graph.edges {
+        for edge in &ranking_graph.edges {
             counts += edge.counts;
         }
         let profile_results = PROFILES
@@ -241,8 +241,8 @@ fn benchmark_usage_reference_weight_profiles() {
             json!({
                 "repository": root.file_name().and_then(|name| name.to_str()).unwrap_or("unknown"),
                 "commit": repository_head(&root),
-                "nodes": ranking_graph.graph.nodes.len(),
-                "edges": ranking_graph.graph.edges.len(),
+                "nodes": ranking_graph.nodes.len(),
+                "edges": ranking_graph.edges.len(),
                 "reference_counts": {
                     "calls": counts.calls,
                     "members": counts.members,

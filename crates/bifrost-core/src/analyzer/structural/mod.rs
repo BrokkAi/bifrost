@@ -8,6 +8,7 @@
 //! produces. The extraction engine, matcher, planner and RQL query layer that
 //! consume them stay in `brokk-bifrost-analysis`.
 
+pub mod callable;
 pub mod edges;
 pub mod facts;
 pub mod kinds;

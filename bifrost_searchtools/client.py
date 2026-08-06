@@ -64,6 +64,7 @@ class SymbolKindFilter(StrEnum):
 class MostRelevantFilesRankingMode(StrEnum):
     HISTORY_IMPORTS = "history_imports"
     USAGE_GRAPH = "usage_graph"
+    USAGE_GRAPH_EXACT = "usage_graph_exact"
 
 
 _CODE_QUERY_EXECUTION_MODES = frozenset(get_args(CodeQueryExecutionMode))
@@ -198,45 +199,41 @@ class SearchToolsClient:
     ) -> CodeQueryResponse:
         """Query normalized code structure across supported languages.
 
-        The compatible head is schema version 12, which adds the
-        ``generation_sites`` and ``exports`` sources plus the ``generates``,
-        ``generated_by``, ``declaration_state_of``, ``implementation_of``, and
-        ``export_target`` steps over recorded declaration-materialization
-        provenance. The previous head, schema version 11, added the canonical
-        reference-edge domain: ``edges_of`` from a declaration, ``edges_from``
-        from an occurrence, and ``edge_target`` back to a declaration. Before
-        it, schema version 10 added the ``paths`` source plus the
-        ``segments_of`` and ``segment_target`` steps over qualified-path rows.
-        Before it, schema version 9 added the ``scopes``
-        and ``bindings`` sources plus the ``scope_of``, ``scope_ancestors``,
-        ``bindings_in``, ``reaching_binding``, ``binding_occurrence``,
-        ``candidates_of``, and ``candidate_target`` steps, and puts the package
-        clause on the file row. Schema version 8 added the ``occurrences``
-        source plus the ``occurrences_in``, ``occurrences_of``, and
-        ``occurrence_target`` steps; those and version 7 remain available as
-        exact pins. Pass ``schema_version=2`` to
-        pin the pre-CFG vocabulary or ``schema_version=3`` for CFG without
-        typestate. A query starts with normalized syntactic
+        ``schema_version`` is optional. Version ``1`` is the only supported
+        version; omit it or pin it explicitly. Other versions are rejected.
+        A query starts with normalized syntactic
         structure or a typed set of complete query branches, then optionally
         applies typed semantic ``steps`` such as ``enclosing_decl``, ``file_of``,
         ``imports_of``, ``supertypes``, ``subtypes``, ``members``, and ``owner``.
-        Version 3 also provides ``procedure_of``, ``cfg_entry``, ``cfg_exits``,
-        ``cfg_successor_edges``, ``cfg_predecessor_edges``,
+        The vocabulary also provides ``procedure_of``, ``cfg_entry``,
+        ``cfg_exits``, ``cfg_successor_edges``, ``cfg_predecessor_edges``,
         ``cfg_edge_source``, and ``cfg_edge_target`` for bounded,
-        procedure-local control-flow inspection. Version 4 adds a
+        procedure-local control-flow inspection; a
         host-registered ``typestate`` step and pure retained ``witness``
-        projection; callers send only ``protocol_ref`` and finite reductions.
-        Version 5 adds ``inside_decl`` for containment that stops at nested
-        callable declarations.
-        Version 6 adds a host-registered ``value_flow`` step from procedures to
-        diagnostic-neutral flow endpoints and reuses ``witness`` for bounded
-        retained flow paths. Callers send only ``plan_ref``; reachability,
+        projection where callers send only ``protocol_ref`` and finite
+        reductions; ``inside_decl`` for containment that stops at nested
+        callable declarations;
+        a host-registered ``value_flow`` step from procedures to
+        diagnostic-neutral flow endpoints that reuses ``witness`` for bounded
+        retained flow paths (callers send only ``plan_ref``; reachability,
         exact/may certainty, ambiguity, completion, and budget status remain
-        separate typed result fields.
-        Version 7 adds ``taint`` with a host-registered ``taint_ref``. It only
+        separate typed result fields); and ``taint`` with a host-registered
+        ``taint_ref``, which only
         projects retained production taint findings and never compiles or
         solves taint, reconstructs witnesses, or performs policy classification.
-        Version 10 adds ``edges_of``, ``edges_from``, and ``edge_target`` over
+        The ``occurrences`` source pairs with the ``occurrences_in``,
+        ``occurrences_of``, and ``occurrence_target`` steps. The ``scopes``
+        and ``bindings`` sources pair with the ``scope_of``,
+        ``scope_ancestors``, ``bindings_in``, ``reaching_binding``,
+        ``binding_occurrence``, ``candidates_of``, and ``candidate_target``
+        steps, and the package clause sits on the file row. The ``paths``
+        source pairs with the ``segments_of`` and ``segment_target`` steps
+        over qualified-path rows. The ``generation_sites`` and ``exports``
+        sources pair with the ``generates``, ``generated_by``,
+        ``declaration_state_of``, ``implementation_of``, and ``export_target``
+        steps over recorded declaration-materialization provenance.
+        The canonical reference-edge domain provides
+        ``edges_of``, ``edges_from``, and ``edge_target`` over
         canonical ``CodeQueryReferenceEdge`` rows. ``edges_of`` is the inverse
         projection (every usage site the usage index enumerates for a
         declaration) and ``edges_from`` is the forward one (the resolver's own

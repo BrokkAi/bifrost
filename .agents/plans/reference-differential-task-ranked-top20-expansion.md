@@ -401,6 +401,116 @@ the focus.
     `81e80740bdda0b4017d1bde7e84d9f78ad470ff6987e451db8ca5ca7cf16d915`
     and
     `2592520007ef93b828ff6a5e10e9c56d0714c55055776ac3fc63bda9397a23b7`.
+  - [x] (2026-08-06) Completed C++ rank twenty
+    `cppcheck-opensource__cppcheck` at pinned head `4517bc76`. Its fresh
+    persisted-cache replay at pushed Bifrost `1f0bd3ac` audited 290 files,
+    296,420 structured candidates, 10,000 sites, and all 1,226 inverse target
+    groups. It reported 3,137 consistent, 110 editor-only, 33 honestly
+    unproven, 6,720 inconclusive, and zero missing rows, with no file errors,
+    skipped targets, or truncation. The report SHA-256 is
+    `8b6aeab029f8a4ceff0998f07c679dce38e6eeb5e95b6e18bae18041273c7768`;
+    the exact-head release runner SHA-256 is
+    `59c352607e9c57c171c2a654fb1e0773bf0f5dff8079803bbeecfdae4dcc5363`.
+    Jonathan-assigned issue #1691 fixed exhaustive conditional same-FQN alias
+    families, physical alias ranges, branch isolation, and C++ store
+    invalidation. Jonathan-assigned issue #1694 made cache mode part of the
+    repository and corpus completion fingerprint. Both issues are closed and
+    assigned only to `jbellis`. Formatting, 233 C++ usage tests, all nine
+    differential runner tests, the persisted-cache epoch test, and strict
+    workspace all-target/all-feature Clippy pass. The broad featureless run
+    reached one unrelated C# wall-clock failure after 1,529 sibling tests;
+    that exact test passed alone.
+  - [ ] (2026-08-06) Complete the fresh-epoch language certification and
+    reclose earlier ranks in repository order. The first ten-repository replay
+    at clean pushed head `1f0bd3ac` queried every configured target with no
+    file errors, skips, or truncation, but it correctly rejected the language
+    envelope. Fresh C++ blobs exposed 34 missing rows in rank-eleven
+    libarchive, 16 in rank-thirteen open62541, 7 in rank-fourteen Wuffs, 5 in
+    rank-sixteen esp-v2, and 8 in rank-seventeen Abseil. Ranks twelve,
+    fifteen, eighteen, nineteen, and twenty remained clean. Triage resumed at
+    libarchive; later repositories remain read-only until each earlier rank is
+    closed.
+    - [x] (2026-08-06 08:11Z) Revalidated rank eleven
+      `libarchive__libarchive` at pinned head `40a71c83`. All 34 fresh-epoch
+      misses shared one structured cause: a tagged type use with a declarator
+      was treated as a local tag declaration. Jonathan-assigned issue #1697
+      corrected that shadow test and selected a physically visible peer from
+      each repeated same-logical tag group. The fix is closed and pushed to
+      `origin/master` at `668af778`. Its regression covers repeated visible
+      forward declarations, a hidden-only definition, and a true block-scope
+      tag shadow. Formatting, all 234 C++ usage tests, and strict workspace
+      all-target/all-feature Clippy pass. The clean-head persisted replay
+      audited 98 files and 8,212 sites, then queried all 330 targets. It
+      reported 1,632 consistent, 91 honestly unproven, 6,489 inconclusive,
+      and zero missing rows, errors, skips, or truncation. Repeated physical
+      declarations keep the corrected exact-range rows unproven; the result
+      restores inverse presence without claiming one physical identity. The
+      report and runner SHA-256 values are
+      `1447fac16c2f1fb306245f13c71c921d2b14b34a465d03da1ff080c75725837e`
+      and
+      `533eb542663ff104142e628503dcc1db8957510005b285decc0705df87df7bac`.
+      Rank twelve remains clean in the fresh certification, so the next
+      active triage repository is rank thirteen `open62541__open62541`.
+    - [x] (2026-08-06 08:29Z) Revalidated rank thirteen
+      `open62541__open62541` at pinned head `1fe3a857`. The rank-eleven fix
+      removed 15 of its 16 fresh-epoch missing rows. The residual body use was
+      hidden because the callable-local shadow scan treated the function's
+      tagged return type as a body-local declaration. Jonathan-assigned issue
+      #1699 now requires both the declaration and queried reference to be in
+      the callable's structured body. It preserves namespace-scope return-tag
+      declarations and true block-scope shadows. The fix is closed and pushed
+      to `origin/master` at `c628a36c`. The exact witness is consistent, and
+      the focused regression, all 235 C++ usage tests, formatting, and strict
+      workspace all-target/all-feature Clippy pass. The clean-head persisted
+      replay audited 78 files and 10,000 sites, then queried all 302 targets.
+      It reported 2,976 consistent, 44 honestly unproven, 6,980 inconclusive,
+      and zero missing rows, errors, skips, or truncation. The report and
+      runner SHA-256 values are
+      `32dc6dfc9abcc2f32935ad0509dd486f3966ad641225c1c6eb1a01d850e08b04`
+      and
+      `63efc0366803e9bdbe3680f646bcad991ad9d99ab4c1e923b9c963ecde9b090e`.
+      The next active triage repository is rank fourteen `google__wuffs`.
+    - [ ] (2026-08-06 10:18Z) Rank fourteen `google__wuffs` is in
+      depth-first repair at pinned head `46ac36bd`. A clean fresh-epoch
+      baseline had seven missing rows. The repeated-tag visibility correction
+      then changed 37 prior unproven source-fragment rows to missing because
+      those generated fragments omit local include envelopes. Jonathan-assigned
+      issue #1702 now retains these structured matches as unproven when no
+      queried target peer is physically visible. It still rejects a hidden-only
+      target group when a different same-logical peer is visible. The fix is
+      closed and pushed to `origin/master` through merge head `f1bb2c6f`.
+      Focused visibility, repeated-tag, and return-tag tests pass. The full
+      featureless gate passed all suites except one known timing-sensitive C#
+      truncation test under full load; that exact test passed alone in 0.75
+      seconds. The clean-head exact `MemOwner` witness is an exact unproven hit.
+      The clean-head full replay audited 36 files and 10,000 sites, then queried
+      all 606 targets. It reported 2,142 consistent, 17 editor-only, 75
+      honestly unproven, 7,759 inconclusive, and seven missing rows, with no
+      file errors, skips, or truncation. The exact report, full report, and
+      runner SHA-256 values are
+      `50d596748b4cb816f3f1728284bf021fd15de1ec676efc532291ec936469d1d0`,
+      `03a81d43dce5f3b9746767d8b0dd0dc511cc6b5d912ee108d2b576742340da67`,
+      and
+      `407306979b7168b49e71c0b61a070368496f48344729b3f427922896a2b8868b`.
+      Assigned issues #1703 and #1704 shared the guarded C++ type-resolution
+      path, so one grouped implementation retained both shapes as exact
+      unproven evidence. It requires a physically visible target and exact
+      structured owner or alias identity. It excludes template alias
+      applications and does not relax normal visibility. Commit `98dd40a3`
+      reached `origin/master` through merge head `d11ccdb0`; both issues are
+      closed and have clean evidence comments. All 239 C++ usage tests pass.
+      The four clean exact reports have SHA-256 values
+      `598ff6f419973d1c819fb911d86bd104e4ea5355d962f088e236b41ddbc1dbaa`,
+      `5c7e5766a24804f3e3695d6c09b65ed872bdf5a5d7ceb06991137eaf11e3d0b2`,
+      `72428b588efeac7d86088369c315deb09b461b6f10b0496b38e91ccfe90310e9`,
+      and
+      `f0a89f823f55b84cdc1d1778b58778dc7125b41bb353d21160c4b46325b7bcc0`.
+      The clean full replay now reports 2,142 consistent, 17 editor-only, 79
+      honestly unproven, 7,759 inconclusive, and three missing rows. Its
+      SHA-256 is
+      `abafd6611d0a02daf0638590a74cf0c9fbb51fb5da6942b2bac75860868265c7`.
+      Only assigned issue #1705 remains. Wuffs stays active until that issue
+      closes and a clean full replay reports zero missing rows.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
@@ -560,6 +670,30 @@ the focus.
   `operator_name` and a constructor `identifier`, retain the OpenJDK control,
   and bump the C++ persistence epoch.
 
+- Observation: the rank-twenty C++ epoch bump invalidated all older C++
+  persisted blobs, so the final language certification became the first
+  same-head fresh extraction for several earlier ranks. It exposed 70 raw
+  missing rows across libarchive, open62541, Wuffs, esp-v2, and Abseil while
+  cppcheck, cJSON, BehaviorTree, Mbed TLS, and Pyro stayed clean. This proves
+  that a clean replay from an older analyzer blob is not final evidence after
+  a declaration-extraction epoch change. The campaign therefore returned to
+  rank eleven and will repeat repository-depth-first closure before it accepts
+  a C++ language manifest.
+
+- Observation: all 34 fresh libarchive misses formed one root-cause group.
+  The local-shadow scan treated `struct Foo *value` as if it declared a local
+  `Foo` tag. The existing structured declaration predicate distinguishes that
+  use from a real block-scope `struct Foo;` declaration. A second visibility
+  guard is necessary because type scan keys collapse repeated physical
+  declarations with one logical name. A consumer can use that group only when
+  at least one physical peer is in its include closure.
+
+- Observation: repository-depth-first replay can still reuse a prior fix.
+  The libarchive correction removed 15 of open62541's 16 initial misses. The
+  one residual had a separate scope boundary and warranted issue #1699. This
+  kept the grouping useful without combining two different root causes in one
+  ticket.
+
 ## Decision Log
 
 - Decision: Treat this as a new ranks-eleven-through-twenty expansion rather
@@ -611,11 +745,13 @@ the focus.
 
 ## Outcomes & Retrospective
 
-The expansion is in progress. The exact 110-repository scope has been derived
-from the live filtered selector. C rank eleven is locally complete as an honest
-zero-file envelope with no issue scope; the remaining 109 repository
-transitions, C final certification, durable evidence publication, and campaign
-gates remain.
+The expansion is in progress. The exact 110-repository scope comes from the
+live filtered selector. C ranks eleven through twenty are complete and have a
+published language manifest. C++ ranks eleven and thirteen are clean again
+through closed issues #1697 and #1699, rank twelve stayed clean, and rank
+twenty remains clean with its two issues closed on `origin/master`. The
+campaign is processing the remaining fresh-epoch regressions from rank
+fourteen forward before it starts C#.
 
 ## Context and Orientation
 

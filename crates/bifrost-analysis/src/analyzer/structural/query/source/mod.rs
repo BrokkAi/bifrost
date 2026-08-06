@@ -19,8 +19,8 @@ use super::schema::{
     binding_option_for_rql_label, candidate_option_for_rql_label,
     declaration_state_option_for_rql_label, environment_filter_labels, export_field_for_rql_label,
     generation_site_field_for_rql_label, occurrence_filter_labels, occurrence_option_for_rql_label,
-    oldest_rql_schema_version, reference_kind_from_label, rql_schema_version_registry,
-    usage_kind_from_label, usage_proof_from_label, usage_surface_from_label,
+    reference_kind_from_label, rql_schema_version_registry, usage_kind_from_label,
+    usage_proof_from_label, usage_surface_from_label,
 };
 use super::schema::{ExportFilterField, GenerationSiteFilterField};
 use super::sexp::{parse_query_sexp, query_to_json};

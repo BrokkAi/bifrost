@@ -17,7 +17,7 @@ RQL is only a query language. It is not a second matcher or query engine.
 
 Every RQL expression lowers into [JSON `CodeQuery`](/code-query-json/) before validation and execution. MCP hosts with `query_code` call the same engine using canonical JSON inline, or they can load a complete saved `.rql` file through the exclusive `query_file` argument. MCP does not accept raw inline RQL, and the `core` toolset does not expose `query_code`; use `symbol|extended` or `searchtools`. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for the complete surface matrix and [Code Querying](/code-querying/) for the schema and engine overview.
 
-RQL omits a schema version by default and therefore targets the compatible head, currently CodeQuery schema version 7. Use a root `:schema-version 2` through `:schema-version 6` option to pin an earlier vocabulary; explicit older versions reject later forms.
+RQL omits a schema version by default and therefore targets the single supported CodeQuery schema version 1. A root `:schema-version 1` option pins it explicitly; other versions are rejected.
 
 Save a complete RQL expression in a workspace `.rql` file and run it without opening the REPL:
 
@@ -175,7 +175,7 @@ Receiver wrappers consume the structured facts exposed by the selected adapter. 
 
 ## Procedure-Local CFG Inspection
 
-Schema version 3 adds an explicit typed control-flow algebra. `procedure-of` resolves the unique smallest source-backed executable procedure containing a structural match or declaration. `cfg-entry` and `cfg-exits` return validated boundary points. The successor and predecessor forms each traverse exactly one edge, and `cfg-edge-source` or `cfg-edge-target` projects an edge back to a point.
+The typed control-flow algebra is part of the same schema. `procedure-of` resolves the unique smallest source-backed executable procedure containing a structural match or declaration. `cfg-entry` and `cfg-exits` return validated boundary points. The successor and predecessor forms each traverse exactly one edge, and `cfg-edge-source` or `cfg-edge-target` projects an edge back to a point.
 
 <!-- code-query-test:rql:cfg-entry-successor -->
 ```lisp
@@ -191,7 +191,7 @@ This returns `program_point` rows for targets of edges leaving `run`'s entry. Pr
 
 Semantic materialization is lazy and request-scoped. It has separate finite limits of 256 materialized files, 16 MiB of source, 1,000,000 rows per semantic dimension, 64 MiB retained semantic data, and 1,000,000 traversal steps. Repeating an edge form is how an authored query asks for another hop; no form silently computes an unbounded closure.
 
-This schema-v3 surface is a procedure-local CFG inspection API. It does not cross call boundaries and does not provide an ICFG, data-flow, taint, typestate, finding, or witness engine. Schema v4 adds only the registered typestate adapter below.
+This CFG surface is a procedure-local inspection API. It does not cross call boundaries and does not provide an ICFG, data-flow, taint, typestate, finding, or witness engine. The registered typestate adapter below is the only typestate entry point.
 
 Schema v5 adds `inside-decl`: containment that can match an enclosing callable itself, but stops before searching beyond a non-matching nested function, method, constructor, or lambda. Ordinary `inside` remains lexical and can cross those boundaries.
 
@@ -326,7 +326,7 @@ Only Java, Rust, Python, JavaScript and TypeScript answer the forward projection
 
 ## Registered Typestate Findings and Witnesses
 
-Schema version 4 adds `typestate`, which consumes an exact `procedure` and a namespaced `:protocol-ref`, plus `witness`, which consumes each resulting finding. The connected host must already have registered an in-memory compiled protocol and pre-resolved binding plan for that reference and current workspace generation.
+The `typestate` step consumes an exact `procedure` and a namespaced `:protocol-ref`, plus `witness`, which consumes each resulting finding. The connected host must already have registered an in-memory compiled protocol and pre-resolved binding plan for that reference and current workspace generation.
 
 <!-- code-query-test:rql:typestate-witness -->
 ```lisp

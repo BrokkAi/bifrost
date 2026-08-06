@@ -12,7 +12,7 @@
       :type match
       :selector
         (rql
-          :schema-version 2
+          :schema-version 1
           (union
             (language python (call :callee (name "eval")))
             (language python (call :callee (name "exec")))

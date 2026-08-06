@@ -25,7 +25,12 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 pub const STORE_FILE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
-const CURRENT_MIGRATION_VERSION: i64 = 15;
+const CURRENT_MIGRATION_VERSION: i64 = 16;
+pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
+pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
+pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
+pub const OPTIONAL_FACT_KIND_SCALA_EXPORT: i64 = 4;
+pub const OPTIONAL_FACT_KIND_MATERIALIZATION_RECORD: i64 = 5;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
 const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
@@ -52,6 +57,8 @@ const SEMANTIC_FILE_DOCUMENTS_SQL: &str =
     include_str!("../migrations/cache/0014-semantic-file-documents.sql");
 const MATERIALIZATION_RECORDS_SQL: &str =
     include_str!("../migrations/cache/0015-materialization-records.sql");
+const OPTIONAL_FACT_MANIFEST_SQL: &str =
+    include_str!("../migrations/cache/0016-optional-fact-manifest.sql");
 const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CURRENT_BASELINE_SQL,
     PATH_SYMBOL_UNITS_SQL,
@@ -68,6 +75,7 @@ const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     SEMANTIC_MODEL_ACTIVE_SET_SQL,
     SEMANTIC_FILE_DOCUMENTS_SQL,
     MATERIALIZATION_RECORDS_SQL,
+    OPTIONAL_FACT_MANIFEST_SQL,
 ];
 // The store file is named for the schema version that wrote it, and that
 // version is the migration count. Tie the two at compile time so a migration
@@ -118,6 +126,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("apply semantic file documents migration");
     conn.execute_batch(MATERIALIZATION_RECORDS_SQL)
         .expect("apply materialization records migration");
+    conn.execute_batch(OPTIONAL_FACT_MANIFEST_SQL)
+        .expect("apply optional fact manifest migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -2413,6 +2423,255 @@ mod tests {
             )
             .unwrap(),
             1
+        );
+        assert!(current_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn optional_fact_manifest_migration_preserves_populated_v15_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        let version_15 = &CACHE_MIGRATION_SQL[..15];
+        migrate_with_sql(&mut conn, version_15).unwrap();
+        assert_eq!(cache_migration_version(&conn).unwrap(), 15);
+
+        conn.execute_batch(
+            "INSERT INTO blobs(blob_oid, lang) VALUES
+               ('1111111111111111111111111111111111111111', 'cpp'),
+               ('2222222222222222222222222222222222222222', 'ruby'),
+               ('3333333333333333333333333333333333333333', 'scala'),
+               ('4444444444444444444444444444444444444444', 'rust');
+
+             INSERT INTO code_units(
+               blob_oid, lang, unit_key, kind, short_name, identifier,
+               content_qualifier, synthetic, is_type_alias, top_level_ordinal,
+               in_declarations, in_definition_lookup
+             ) VALUES
+               ('1111111111111111111111111111111111111111', 'cpp', 1, 0,
+                'TemplateOne', 'TemplateOne', '', 0, 0, 0, 1, 0),
+               ('1111111111111111111111111111111111111111', 'cpp', 2, 0,
+                'TemplateTwo', 'TemplateTwo', '', 0, 0, 1, 1, 0),
+               ('2222222222222222222222222222222222222222', 'ruby', 1, 2,
+                'dispatch', 'dispatch', '', 0, 0, 0, 1, 0),
+               ('3333333333333333333333333333333333333333', 'scala', 1, 0,
+                'ExportOwner', 'ExportOwner', '', 0, 0, 0, 1, 0);
+
+             INSERT INTO blob_meta(
+               blob_oid, lang, contains_tests, content_package,
+               stored_unit_count, range_count, signature_count,
+               signature_metadata_count, supertype_count, child_count,
+               import_statement_count, import_count, type_identifier_count,
+               ruby_dispatch_count, scala_trait_count, is_complete,
+               cpp_template_metadata_count
+             ) VALUES
+               ('1111111111111111111111111111111111111111', 'cpp', 0, 'cpp.pkg',
+                2, 11, 12, 13, 14, 15, 16, 17, 18, 0, 0, 1, 3),
+               ('2222222222222222222222222222222222222222', 'ruby', 0, 'ruby.pkg',
+                1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0),
+               ('3333333333333333333333333333333333333333', 'scala', 0, 'scala.pkg',
+                1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0),
+               ('4444444444444444444444444444444444444444', 'rust', 0, 'rust.pkg',
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0);
+
+             INSERT INTO unit_cpp_template_metadata(blob_oid, lang, unit_key, metadata) VALUES
+               ('1111111111111111111111111111111111111111', 'cpp', 1, X'01'),
+               ('1111111111111111111111111111111111111111', 'cpp', 2, X'02');
+             INSERT INTO ruby_method_dispatch_modes(blob_oid, lang, unit_key, mode) VALUES
+               ('2222222222222222222222222222222222222222', 'ruby', 1, 2);
+             INSERT INTO scala_traits(blob_oid, lang, unit_key) VALUES
+               ('3333333333333333333333333333333333333333', 'scala', 1);
+             INSERT INTO scala_exports(blob_oid, lang, owner_key, ordinal, info) VALUES
+               ('3333333333333333333333333333333333333333', 'scala', 1, 0, X'03'),
+               ('3333333333333333333333333333333333333333', 'scala', 1, 1, X'04');
+             INSERT INTO materialization_records(blob_oid, lang, ordinal, unit_key, payload) VALUES
+               ('4444444444444444444444444444444444444444', 'rust', 0, NULL, X'05'),
+               ('4444444444444444444444444444444444444444', 'rust', 1, NULL, X'06');
+
+             INSERT INTO blob_payload_costs(blob_oid, lang, payload_bytes) VALUES
+               ('1111111111111111111111111111111111111111', 'cpp', 73);
+             INSERT INTO structural_facts_snapshots(
+               blob_oid, lang, snapshot_version, payload
+             ) VALUES
+               ('1111111111111111111111111111111111111111', 'cpp', 4, X'0708');",
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        let manifest_rows = conn
+            .prepare(
+                "SELECT fact_kind, lang, row_count
+                 FROM blob_optional_fact_manifest
+                 ORDER BY fact_kind",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            manifest_rows,
+            vec![
+                (
+                    OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA,
+                    "cpp".to_string(),
+                    3
+                ),
+                (
+                    OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE,
+                    "ruby".to_string(),
+                    1,
+                ),
+                (OPTIONAL_FACT_KIND_SCALA_TRAIT, "scala".to_string(), 1),
+                (OPTIONAL_FACT_KIND_SCALA_EXPORT, "scala".to_string(), 2),
+                (
+                    OPTIONAL_FACT_KIND_MATERIALIZATION_RECORD,
+                    "rust".to_string(),
+                    2,
+                ),
+            ]
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO blob_optional_fact_manifest(
+                   blob_oid, lang, fact_kind, row_count
+                 ) VALUES(
+                   '1111111111111111111111111111111111111111', 'cpp', 5, 0
+                 )",
+                [],
+            )
+            .is_err(),
+            "the sparse manifest must not store zero counts"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('blob_meta')
+                 WHERE name IN (
+                   'cpp_template_metadata_count',
+                   'ruby_dispatch_count',
+                   'scala_trait_count'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM blob_meta", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT GROUP_CONCAT(content_package, ',')
+                 FROM (SELECT content_package FROM blob_meta ORDER BY lang)",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "cpp.pkg,ruby.pkg,rust.pkg,scala.pkg"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT stored_unit_count, range_count, signature_count,
+                        signature_metadata_count, supertype_count, child_count,
+                        import_statement_count, import_count, type_identifier_count
+                 FROM blob_meta
+                 WHERE blob_oid = '1111111111111111111111111111111111111111'
+                   AND lang = 'cpp'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .unwrap(),
+            (2, 11, 12, 13, 14, 15, 16, 17, 18)
+        );
+        assert_eq!(
+            conn.query_row("SELECT payload_bytes FROM blob_payload_costs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            73
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT snapshot_version, hex(payload) FROM structural_facts_snapshots",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+            (4, "0708".to_string())
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM unit_cpp_template_metadata) +
+                   (SELECT COUNT(*) FROM ruby_method_dispatch_modes) +
+                   (SELECT COUNT(*) FROM scala_traits) +
+                   (SELECT COUNT(*) FROM scala_exports) +
+                   (SELECT COUNT(*) FROM materialization_records)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            8
+        );
+        conn.execute(
+            "INSERT INTO blob_optional_fact_manifest(
+               blob_oid, lang, fact_kind, row_count
+             ) VALUES(
+               '4444444444444444444444444444444444444444', 'rust', 99, 1
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM blob_meta
+             WHERE blob_oid = '4444444444444444444444444444444444444444'
+               AND lang = 'rust'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM blob_optional_fact_manifest WHERE lang = 'rust'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "manifest rows must follow their parsed metadata lifetime"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
         );
         assert!(current_schema_is_valid(&conn).unwrap());
     }

@@ -21,6 +21,7 @@ use crate::analyzer::semantic::{
     SemanticRequest, SemanticRole, SemanticWork, SourceAnchor, SourcePosition, SourceSpan,
     StableDigest, WorkspaceMountId, WorkspaceRelativePath,
 };
+use crate::analyzer::structural::resolution::BoundaryStatus;
 use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
 use crate::analyzer::usages::{
     CallDispatchBoundaryKind, CallDispatchTarget, CallRelationLimits, CallRelationService,
@@ -675,7 +676,17 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                 | DefinitionLookupStatus::NotFound,
             )
             | None => DispatchQuality::Unknown,
-            Some(DefinitionLookupStatus::UnresolvableImportBoundary) => DispatchQuality::Complete,
+            // A boundary outcome is complete only when the refined evidence
+            // (#1474) actually names the external target. A declared-but-
+            // unindexed dependency leaves the answer partial, and an unknown
+            // external root means the resolver never saw the target at all.
+            Some(DefinitionLookupStatus::UnresolvableImportBoundary) => match lookup.boundary {
+                Some(BoundaryStatus::WorkspaceLocal | BoundaryStatus::ExternalIndexed) => {
+                    DispatchQuality::Complete
+                }
+                Some(BoundaryStatus::ExternalDeclaredUnindexed) => DispatchQuality::Unproven,
+                Some(BoundaryStatus::ExternalUnknown) | None => DispatchQuality::Unknown,
+            },
         };
         let quality = if status_quality == DispatchQuality::Ambiguous
             && matches!(
@@ -2201,14 +2212,18 @@ mod tests {
     use crate::test_support::AnalyzerFixture;
 
     fn semantic_call_fixture() -> (AnalyzerFixture, crate::analyzer::semantic::CallSiteHandle) {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::TypeScript,
-            &[(
-                "call.ts",
-                "function target() {}\nexport function caller() { target(); }\n",
-            )],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "call.ts");
+        semantic_call_fixture_for(
+            "call.ts",
+            "function target() {}\nexport function caller() { target(); }\n",
+        )
+    }
+
+    fn semantic_call_fixture_for(
+        name: &str,
+        source: &str,
+    ) -> (AnalyzerFixture, crate::analyzer::semantic::CallSiteHandle) {
+        let fixture = AnalyzerFixture::new_for_language(Language::TypeScript, &[(name, source)]);
+        let file = ProjectFile::new(fixture.project_root(), name);
         let cancellation = CancellationToken::default();
         let mut budget = SemanticBudget::default();
         let artifact = fixture
@@ -2237,6 +2252,100 @@ mod tests {
 
     fn semantic_call_handle() -> crate::analyzer::semantic::CallSiteHandle {
         semantic_call_fixture().1
+    }
+
+    const EXTERNAL_CALL_SOURCE: &str = "import { work } from \"third-party\";\nexport function caller(): number { work(); return 1; }\n";
+
+    /// A complete discovery outcome declaring exactly `modules`, mirroring the
+    /// shape the npm resolver produces.
+    fn discovery_declaring(
+        modules: &[&str],
+    ) -> crate::analyzer::semantic_model::DependencyDiscoveryOutcome {
+        use crate::analyzer::semantic_model::{
+            CatalogCoordinate, DependencyArtifactRole, DependencyDiscoveryOutcome,
+            ExternalArtifactKind, ResolvedDependency, ResolvedDependencyArtifact,
+            SemanticModelActivationEvidence,
+        };
+        DependencyDiscoveryOutcome::complete(
+            modules
+                .iter()
+                .map(|module| ResolvedDependency {
+                    id: format!("test:distribution:{module}"),
+                    evidence: SemanticModelActivationEvidence {
+                        language: "typescript".to_owned(),
+                        ecosystem: "test".to_owned(),
+                        package: None,
+                        module: Some(CatalogCoordinate {
+                            name: (*module).to_owned(),
+                            version: None,
+                        }),
+                        toolchain: None,
+                        target: None,
+                        configuration: None,
+                        artifact_sha256: None,
+                    },
+                    provenance: Vec::new(),
+                    artifacts: vec![ResolvedDependencyArtifact::module_file(
+                        DependencyArtifactRole::Declarations,
+                        ExternalArtifactKind::TypeScriptDeclarationFile,
+                        (*module).to_owned(),
+                        std::path::PathBuf::from("unused-in-this-test.d.ts"),
+                    )],
+                })
+                .collect(),
+        )
+    }
+
+    fn resolve_external_call(
+        fixture: &AnalyzerFixture,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+    ) -> SemanticOutcome<DispatchResult> {
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        oracle
+            .resolve_call(call, &mut SemanticRequest::new(&mut budget, &cancellation))
+            .expect("external dispatch should run")
+    }
+
+    /// #1599: a boundary outcome is only as complete as its refined external
+    /// evidence. An import nothing declares is `external_unknown`, so dispatch
+    /// must answer `Unknown` instead of claiming a closed target set.
+    #[test]
+    fn undeclared_external_call_dispatch_is_unknown() {
+        let (fixture, call) = semantic_call_fixture_for("external.ts", EXTERNAL_CALL_SOURCE);
+        let outcome = resolve_external_call(&fixture, &call);
+        let SemanticOutcome::Unknown {
+            partial: Some(result),
+            ..
+        } = outcome
+        else {
+            panic!("undeclared external dispatch must be Unknown: {outcome:?}");
+        };
+        assert!(
+            result
+                .boundaries()
+                .iter()
+                .any(|boundary| matches!(boundary.kind, DispatchBoundaryKind::External(_))),
+            "{result:?}"
+        );
+    }
+
+    /// #1599: the same call whose module the build declares (but nothing
+    /// indexed) is `external_declared_unindexed`: the target may well be in
+    /// the declared dependency, so the answer is partial, not closed.
+    #[test]
+    fn declared_unindexed_external_call_dispatch_is_unproven() {
+        let (fixture, call) = semantic_call_fixture_for("external.ts", EXTERNAL_CALL_SOURCE);
+        fixture.analyzer.retain_dependency_discovery_evidence(
+            &[Language::JavaScript, Language::TypeScript],
+            &discovery_declaring(&["third-party"]),
+        );
+        let outcome = resolve_external_call(&fixture, &call);
+        assert!(
+            matches!(outcome, SemanticOutcome::Unproven { .. }),
+            "declared-unindexed external dispatch must be Unproven: {outcome:?}"
+        );
     }
 
     #[test]
