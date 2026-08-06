@@ -492,9 +492,25 @@ the focus.
       `03a81d43dce5f3b9746767d8b0dd0dc511cc6b5d912ee108d2b576742340da67`,
       and
       `407306979b7168b49e71c0b61a070368496f48344729b3f427922896a2b8868b`.
-      The remaining seven rows are owned by assigned issues #1703, #1704,
-      and #1705. Wuffs remains the active repository until all three close and
-      a clean full replay reports zero missing rows.
+      Assigned issues #1703 and #1704 shared the guarded C++ type-resolution
+      path, so one grouped implementation retained both shapes as exact
+      unproven evidence. It requires a physically visible target and exact
+      structured owner or alias identity. It excludes template alias
+      applications and does not relax normal visibility. Commit `98dd40a3`
+      reached `origin/master` through merge head `d11ccdb0`; both issues are
+      closed and have clean evidence comments. All 239 C++ usage tests pass.
+      The four clean exact reports have SHA-256 values
+      `598ff6f419973d1c819fb911d86bd104e4ea5355d962f088e236b41ddbc1dbaa`,
+      `5c7e5766a24804f3e3695d6c09b65ed872bdf5a5d7ceb06991137eaf11e3d0b2`,
+      `72428b588efeac7d86088369c315deb09b461b6f10b0496b38e91ccfe90310e9`,
+      and
+      `f0a89f823f55b84cdc1d1778b58778dc7125b41bb353d21160c4b46325b7bcc0`.
+      The clean full replay now reports 2,142 consistent, 17 editor-only, 79
+      honestly unproven, 7,759 inconclusive, and three missing rows. Its
+      SHA-256 is
+      `abafd6611d0a02daf0638590a74cf0c9fbb51fb5da6942b2bac75860868265c7`.
+      Only assigned issue #1705 remains. Wuffs stays active until that issue
+      closes and a clean full replay reports zero missing rows.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
