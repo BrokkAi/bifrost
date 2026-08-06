@@ -269,3 +269,7 @@ Revision note: Runtime r9 stopped before use after a new audit found that the 11
 Revision note: OpenJDK and LLVM exposed unbounded tree-sitter parse tails. Issue #1690 records the profiles. Bifrost now persists a minimal marker after a ten-second complete-file parse limit.
 
 Revision note: Brokkbench readiness record version 5 includes the profiler digest. This prevents a new Bifrost build from replacing an older immutable campaign record.
+
+Revision note: The six completed symbol tasks used runtime r18. One task reached an analyzer-capacity timeout while Chromium was writing the shared cache. A direct warm profile returned concurrent symbol calls in 3.4-11.6 seconds. Brokkbench now gives symbol and symbols-plus-NLP requests a 1,200-second benchmark budget; commit `3e29b4d1c2d`.
+
+Revision note: The interrupted task rerun selected `usage_graph` on the large Kubernetes workspace. The graph stayed CPU-active for more than 18 minutes and read more than 150 GB. It produced no Bifrost error before the run stopped without a result record. The host-only Chromium prewarm remains the single cache writer and has processed about 69,800 of 164,966 files.
