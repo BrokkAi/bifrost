@@ -84,7 +84,10 @@ pub struct CppAnalyzer {
     reconciled_definitions_by_fq: Cache<String, Arc<CppReconciledDefinitionIndex>>,
     include_target_index: Arc<OnceLock<IncludeTargetIndex>>,
     reverse_include_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
-    direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
+    /// `PoolSafeMemo`, not `OnceLock`: this whole-workspace build is reached
+    /// from rayon workers during cold scans, and a blocking `get_or_init` parks
+    /// every one of them behind the single initializer for its full duration.
+    direct_descendant_index: Arc<PoolSafeMemo<DirectDescendantIndex>>,
     compile_contexts: Arc<OnceLock<CppCompileContexts>>,
     #[cfg(test)]
     type_alias_classification_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -151,7 +154,7 @@ impl CppAnalyzer {
             reconciled_definitions_by_fq: moka::sync::Cache::builder().max_capacity(2048).build(),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
-            direct_descendant_index: Arc::new(OnceLock::new()),
+            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
             compile_contexts: Arc::new(OnceLock::new()),
             #[cfg(test)]
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -201,7 +204,7 @@ impl CppAnalyzer {
             reconciled_definitions_by_fq: moka::sync::Cache::builder().max_capacity(2048).build(),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
-            direct_descendant_index: Arc::new(OnceLock::new()),
+            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
             compile_contexts: Arc::new(OnceLock::new()),
             #[cfg(test)]
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -456,7 +459,7 @@ use crate::analyzer::CodeUnitIndex;
 
 /// The memoized C++ products [`brokk_bifrost_cpp`]'s free functions resolve
 /// through. Every method answers from an accessor `CppAnalyzer` already had, so
-/// the five caches, three `OnceLock`s and one `PoolSafeMemo` stay here and no
+/// the five caches, two `OnceLock`s and two `PoolSafeMemo`s stay here and no
 /// function on the other side of the crate line can reach past this surface.
 impl CppAnalysisSource for CppAnalyzer {
     fn include_target_index(&self) -> &IncludeTargetIndex {
@@ -524,11 +527,9 @@ impl CppWorkspaceSource for CppAnalyzer {
         self.inner.import_statements(file)
     }
 
-    fn definitions_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        <Self as IAnalyzer>::global_usage_definition_index(self).fqn(fqn)
-    }
-
-    fn definition_peers_by_fqn(&self, fqn: &str) -> Vec<&CodeUnit> {
+    fn definitions_by_fqn(&self, fqn: &str) -> Vec<&CodeUnit> {
+        // `into_shards` for the same reason as the `CppDispatch` impl: the
+        // matches outlive the per-call handle, so they must borrow the shards.
         <Self as IAnalyzer>::global_usage_definition_index(self)
             .into_shards()
             .into_iter()

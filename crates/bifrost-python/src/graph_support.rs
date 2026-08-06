@@ -11,7 +11,7 @@
 
 use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
 use brokk_bifrost_core::analyzer::model::{CodeUnitType, ImportInfo};
-use brokk_bifrost_core::analyzer::prepared_syntax::IndexedFileFacts;
+use brokk_bifrost_core::analyzer::prepared_syntax::{IndexedFileFacts, PreparedSyntaxTree};
 use brokk_bifrost_core::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
@@ -56,6 +56,17 @@ pub trait PythonAnalysisSource: CodeUnitIndex + ImportAnalysisProvider {
     fn import_binder_of(&self, file: &ProjectFile) -> Arc<ImportBinder>;
 
     fn export_index_of(&self, file: &ProjectFile) -> Arc<ExportIndex>;
+
+    /// The parsed tree and its source backing for `file`, from the analyzer's
+    /// query read cache.
+    ///
+    /// A caller that needs a syntax node for an already-indexed declaration
+    /// must reach it through here rather than re-parsing: `indexed_source`
+    /// hands out an owned copy of the whole file, and building a `Parser` per
+    /// declaration reparses text the analyzer has already parsed. `None` when
+    /// the analyzer holds no prepared tree, which is what keeps the re-parsing
+    /// path alive as a fallback.
+    fn prepared_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>>;
 
     /// Every file's indexed facts, visited in the analyzer's own bulk-read
     /// batches. `None` marks a file the index carries no record for.

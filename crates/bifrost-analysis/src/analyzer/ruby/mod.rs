@@ -72,7 +72,10 @@ pub struct RubyAnalyzer {
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
+    /// `PoolSafeMemo`, not `OnceLock`: this whole-workspace build is reached
+    /// from rayon workers during cold scans, and a blocking `get_or_init` parks
+    /// every one of them behind the single initializer for its full duration.
+    direct_descendant_index: Arc<PoolSafeMemo<DirectDescendantIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     autoload_constant_files: Arc<OnceLock<HashMap<String, HashSet<ProjectFile>>>>,
     zeitwerk_project: Arc<OnceLock<bool>>,
@@ -132,7 +135,7 @@ impl RubyAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
-            direct_descendant_index: Arc::new(OnceLock::new()),
+            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             autoload_constant_files: Arc::new(OnceLock::new()),
             zeitwerk_project: Arc::new(OnceLock::new()),

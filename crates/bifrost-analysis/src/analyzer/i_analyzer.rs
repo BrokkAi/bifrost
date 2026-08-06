@@ -504,6 +504,9 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
                     // test filtering in `search_symbols` still applies), so production
                     // symbols in a file with inline tests are never hidden (#1102).
                     in_test_region: self.in_test_region(&code_unit),
+                    is_type_alias: self
+                        .type_alias_provider()
+                        .is_some_and(|provider| provider.is_type_alias(&code_unit)),
                     code_unit,
                 });
             }

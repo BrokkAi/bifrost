@@ -32,8 +32,13 @@ impl TypeHierarchyProvider for RubyAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+        // The builder itself is serial, so the same closure serves both memo
+        // arms; the memo's value here is the non-blocking claim protocol.
         self.direct_descendant_index
-            .get_or_init(|| build_direct_descendant_index(self, self))
+            .get_or_build(
+                || build_direct_descendant_index(self, self),
+                || build_direct_descendant_index(self, self),
+            )
             .descendants(code_unit)
     }
 }

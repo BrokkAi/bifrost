@@ -131,8 +131,12 @@ pub struct KotlinAnalyzer {
     top_level_declarations_by_package: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     realm_direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    direct_descendant_index: Arc<OnceLock<crate::analyzer::DirectDescendantIndex>>,
-    realm_direct_descendant_index: Arc<OnceLock<crate::analyzer::DirectDescendantIndex>>,
+    /// `PoolSafeMemo`, not `OnceLock`, for the same reason as the two sibling
+    /// index cells above: these whole-workspace builds are reached from rayon
+    /// workers during cold scans, and a blocking `get_or_init` parks every one
+    /// of them behind the single initializer for its full duration.
+    direct_descendant_index: Arc<PoolSafeMemo<crate::analyzer::DirectDescendantIndex>>,
+    realm_direct_descendant_index: Arc<PoolSafeMemo<crate::analyzer::DirectDescendantIndex>>,
 }
 
 crate::analyzer::impl_forward_query_provider!(KotlinAnalyzer);
@@ -208,8 +212,8 @@ impl KotlinAnalyzer {
                 memo_budget / 16,
                 weight_code_unit_vec_by_unit,
             ),
-            direct_descendant_index: Arc::new(OnceLock::new()),
-            realm_direct_descendant_index: Arc::new(OnceLock::new()),
+            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
+            realm_direct_descendant_index: Arc::new(PoolSafeMemo::new()),
         }
     }
 

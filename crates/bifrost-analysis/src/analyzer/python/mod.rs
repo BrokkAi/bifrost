@@ -1,7 +1,7 @@
 //! The analyzer-owned shim over [`brokk_bifrost_python`].
 //!
 //! What lives here is everything the language crate cannot name: the
-//! [`PythonAnalyzer`] newtype and its seven moka caches, one `OnceLock` and two
+//! [`PythonAnalyzer`] newtype and its seven moka caches and three
 //! `PoolSafeMemo`s; the accessors that implement
 //! [`brokk_bifrost_python::graph_support::PythonAnalysisSource`] and
 //! [`brokk_bifrost_python::graph_support::PythonUsageSource`] out of them; the
@@ -62,7 +62,7 @@ use crate::profiling;
 use brokk_bifrost_core::analyzer::prepared_syntax::IndexedFileFacts;
 use moka::sync::Cache;
 use std::collections::BTreeSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub(crate) use adapter::PythonAdapter;
 use brokk_bifrost_python::declarations::python_expanded_comment_start;
@@ -119,7 +119,10 @@ pub struct PythonAnalyzer {
     // queries do not reparse the entire Python workspace.
     usage_edges:
         Cache<PythonUsageEdgesKey, Arc<crate::analyzer::usages::inverted_edges::UsageEdges>>,
-    direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
+    // PoolSafeMemo, not OnceLock: same constraint as `usage_index` below. The
+    // build walks every workspace class and is reached from rayon workers, so a
+    // blocking get_or_init parks each arriving worker behind one initializer.
+    direct_descendant_index: Arc<PoolSafeMemo<DirectDescendantIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     // PoolSafeMemo, not OnceLock: this cell is reached from inside rayon workers -- the graph
     // extractor's per-file fan-out resolves module bindings through it. The builder is serial, so
@@ -246,7 +249,7 @@ impl PythonAnalyzer {
             import_binder: build_weighted_cache(memo_budget / 8, weight_import_binder),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
             usage_edges: build_weighted_cache(memo_budget / 8, weight_python_usage_edges),
-            direct_descendant_index: Arc::new(OnceLock::new()),
+            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(PoolSafeMemo::new()),
         }
@@ -372,6 +375,13 @@ impl PythonAnalysisSource for PythonAnalyzer {
 
     fn export_index_of(&self, file: &ProjectFile) -> Arc<ExportIndex> {
         self.export_index_of(file)
+    }
+
+    fn prepared_syntax(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
+        self.inner.prepared_syntax(file)
     }
 
     fn visit_file_facts(
@@ -658,7 +668,7 @@ impl IAnalyzer for PythonAnalyzer {
             import_binder: build_weighted_cache(self.memo_budget / 8, weight_import_binder),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
             usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
-            direct_descendant_index: Arc::new(OnceLock::new()),
+            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(PoolSafeMemo::new()),
         }
@@ -679,7 +689,7 @@ impl IAnalyzer for PythonAnalyzer {
             import_binder: build_weighted_cache(self.memo_budget / 8, weight_import_binder),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
             usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
-            direct_descendant_index: Arc::new(OnceLock::new()),
+            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(PoolSafeMemo::new()),
         }

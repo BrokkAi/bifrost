@@ -45,9 +45,14 @@ impl TypeHierarchyProvider for JavaAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+        // The builder itself is serial, so the same closure serves both memo
+        // arms; the memo's value here is the non-blocking claim protocol.
         self.memo_caches
             .direct_descendant_index
-            .get_or_init(|| self.build_direct_descendant_index())
+            .get_or_build(
+                || self.build_direct_descendant_index(),
+                || self.build_direct_descendant_index(),
+            )
             .descendants(code_unit)
     }
 }

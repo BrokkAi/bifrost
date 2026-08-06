@@ -353,11 +353,15 @@ fn cpp_occurrence_classifier_for(
 }
 
 fn primary_range(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<Range> {
+    let ranges = analyzer.ranges(code_unit);
+    if ranges.len() < 2 {
+        return ranges.into_iter().next();
+    }
     let classifier = (language_for_target(code_unit) == Language::Cpp && code_unit.is_callable())
         .then(|| analyzer.indexed_source(code_unit.source()))
         .flatten()
         .and_then(|source| cpp_occurrence_classifier_for(&source));
-    primary_range_with_cpp_classifier(analyzer, code_unit, classifier.as_deref())
+    primary_range_from_ranges(code_unit, ranges, classifier.as_deref())
 }
 
 fn primary_range_with_cpp_classifier(
@@ -366,6 +370,14 @@ fn primary_range_with_cpp_classifier(
     classifier: Option<&crate::analyzer::CppOccurrenceClassifier>,
 ) -> Option<Range> {
     let ranges = analyzer.ranges(code_unit);
+    primary_range_from_ranges(code_unit, ranges, classifier)
+}
+
+fn primary_range_from_ranges(
+    code_unit: &CodeUnit,
+    ranges: Vec<Range>,
+    classifier: Option<&crate::analyzer::CppOccurrenceClassifier>,
+) -> Option<Range> {
     if language_for_target(code_unit) == Language::Cpp
         && code_unit.is_callable()
         && let Some(classifier) = classifier
