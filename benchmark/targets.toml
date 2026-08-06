@@ -357,20 +357,20 @@ location_symbols = ["value.to_value"]
 summary_targets = ["src/value/mod.rs"]
 seed_file_paths = ["src/value/mod.rs"]
 code_quality_probes = [
-  { scenario = "dead_code_smells", file_paths = ["src/raw.rs"], fq_names = ["raw.to_raw_value"], expect_report_contains = ["Candidate symbols analyzed: 1", "| 31 | 0.95 | `function` | `raw.to_raw_value` | `src/raw.rs:292-298` |"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
-  { scenario = "comment_density_files", file_paths = ["src/de.rs", "src/ser.rs", "src/value/de.rs"], expect_report_contains = ["### `src/de.rs`", "| `de._module_.POW10` | 0 | 30 | 33 | 0 | 30 | 33 |"], expect_report_absent = ["(comment density unavailable; skipped)"] },
-  { scenario = "comment_density_code_unit", file_paths = ["src/raw.rs"], fq_names = ["raw.to_raw_value"], expect_report_contains = ["- Symbol: `raw.to_raw_value`", "- Own: header 104, inline 0, span 7"], expect_report_absent = ["Comment density is unavailable"] },
-  { scenario = "exception_smells", file_paths = ["src/de.rs", "src/error.rs", "src/read.rs"], expect_report_contains = ["`de.Deserializer.do_deserialize_i128` | `src/de.rs`", "generic-catch:Err"], expect_report_absent = ["unsupported"] },
+  { scenario = "dead_code_smells", file_paths = ["src/raw.rs"], fq_names = ["serde_json.raw.to_raw_value"], expect_report_contains = ["Candidate symbols analyzed: 1", "| 31 | 0.95 | `function` | `serde_json.raw.to_raw_value` | `src/raw.rs:292-298` |"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+  { scenario = "comment_density_files", file_paths = ["src/de.rs", "src/ser.rs", "src/value/de.rs"], expect_report_contains = ["### `src/de.rs`", "| `serde_json.de._module_.POW10` | 0 | 30 | 33 | 0 | 30 | 33 |"], expect_report_absent = ["(comment density unavailable; skipped)"] },
+  { scenario = "comment_density_code_unit", file_paths = ["src/raw.rs"], fq_names = ["serde_json.raw.to_raw_value"], expect_report_contains = ["- Symbol: `serde_json.raw.to_raw_value`", "- Own: header 104, inline 0, span 7"], expect_report_absent = ["Comment density is unavailable"] },
+  { scenario = "exception_smells", file_paths = ["src/de.rs", "src/error.rs", "src/read.rs"], expect_report_contains = ["`serde_json.de.Deserializer.do_deserialize_i128` | `src/de.rs`", "generic-catch:Err"], expect_report_absent = ["unsupported"] },
   { scenario = "test_assertion_smells", file_paths = ["tests/test.rs", "tests/stream.rs", "tests/map.rs"], expect_report_contains = ["| 5 | `no-assertions` | 0 | `tests/test.rs::test_boolean_key` |"] },
-  { scenario = "structural_clone_smells", file_paths = ["src/value/de.rs", "src/value/ser.rs", "src/value/from.rs", "src/number.rs"], expect_report_contains = ["`number.Number.as_str` (src/number.rs) | `raw.RawValue.get` (src/raw.rs)", "token-similarity:100"] },
-  { scenario = "long_method_smells", file_paths = ["src/de.rs", "src/read.rs"], expect_report_contains = ["- `de.Deserializer` in `src/de.rs:32-40` [score 350]", "helper sprawl around a 114-line workflow"] },
+  { scenario = "structural_clone_smells", file_paths = ["src/value/de.rs", "src/value/ser.rs", "src/value/from.rs", "src/number.rs"], expect_report_contains = ["`serde_json.number.Number.as_str` (src/number.rs) | `serde_json.raw.RawValue.get` (src/raw.rs)", "token-similarity:100"] },
+  { scenario = "long_method_smells", file_paths = ["src/de.rs", "src/read.rs"], expect_report_contains = ["- `serde_json.de.Deserializer` in `src/de.rs:32-40` [score 350]", "helper sprawl around a 114-line workflow"] },
   { scenario = "git_hotspots", arguments = { since_iso = "2024-05-01T00:00:00Z", until_iso = "2026-05-22T00:00:00Z", max_files = 20 }, expect_report_contains = ["- Analyzed commits: 249", "| `Cargo.toml` | 58 | 0 | ACTIVE |"] },
 ]
 definition_queries = [
-  { path = "src/value/mod.rs", line = 535, column = 20, symbol = "Number", expected_status = "resolved", expected_fqn = "value.Value.Number" },
+  { path = "src/value/mod.rs", line = 535, column = 20, symbol = "Number", expected_status = "resolved", expected_fqn = "serde_json.value.Value.Number" },
 ]
 query_code_queries = [
-  { id = "exact-value-type", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["rust"],"where":["src/value/mod.rs"],"match":{"kind":"class","name":"Value"},"limit":100}', required_paths = ["src/value/mod.rs"], expected_witness_json = '{"result_type":"structural_match","path":"src/value/mod.rs","kind":"class","enclosing_symbol":"value.Value"}', min_results = 1, max_results = 1 },
+  { id = "exact-value-type", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["rust"],"where":["src/value/mod.rs"],"match":{"kind":"class","name":"Value"},"limit":100}', required_paths = ["src/value/mod.rs"], expected_witness_json = '{"result_type":"structural_match","path":"src/value/mod.rs","kind":"class","enclosing_symbol":"serde_json.value.Value"}', min_results = 1, max_results = 1 },
 ]
 
 [[repos]]
