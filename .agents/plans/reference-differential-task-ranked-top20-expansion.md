@@ -430,6 +430,27 @@ the focus.
     fifteen, eighteen, nineteen, and twenty remained clean. Triage resumed at
     libarchive; later repositories remain read-only until each earlier rank is
     closed.
+    - [x] (2026-08-06 08:11Z) Revalidated rank eleven
+      `libarchive__libarchive` at pinned head `40a71c83`. All 34 fresh-epoch
+      misses shared one structured cause: a tagged type use with a declarator
+      was treated as a local tag declaration. Jonathan-assigned issue #1697
+      corrected that shadow test and selected a physically visible peer from
+      each repeated same-logical tag group. The fix is closed and pushed to
+      `origin/master` at `668af778`. Its regression covers repeated visible
+      forward declarations, a hidden-only definition, and a true block-scope
+      tag shadow. Formatting, all 234 C++ usage tests, and strict workspace
+      all-target/all-feature Clippy pass. The clean-head persisted replay
+      audited 98 files and 8,212 sites, then queried all 330 targets. It
+      reported 1,632 consistent, 91 honestly unproven, 6,489 inconclusive,
+      and zero missing rows, errors, skips, or truncation. Repeated physical
+      declarations keep the corrected exact-range rows unproven; the result
+      restores inverse presence without claiming one physical identity. The
+      report and runner SHA-256 values are
+      `1447fac16c2f1fb306245f13c71c921d2b14b34a465d03da1ff080c75725837e`
+      and
+      `533eb542663ff104142e628503dcc1db8957510005b285decc0705df87df7bac`.
+      Rank twelve remains clean in the fresh certification, so the next
+      active triage repository is rank thirteen `open62541__open62541`.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
@@ -599,6 +620,14 @@ the focus.
   rank eleven and will repeat repository-depth-first closure before it accepts
   a C++ language manifest.
 
+- Observation: all 34 fresh libarchive misses formed one root-cause group.
+  The local-shadow scan treated `struct Foo *value` as if it declared a local
+  `Foo` tag. The existing structured declaration predicate distinguishes that
+  use from a real block-scope `struct Foo;` declaration. A second visibility
+  guard is necessary because type scan keys collapse repeated physical
+  declarations with one logical name. A consumer can use that group only when
+  at least one physical peer is in its include closure.
+
 ## Decision Log
 
 - Decision: Treat this as a new ranks-eleven-through-twenty expansion rather
@@ -652,10 +681,10 @@ the focus.
 
 The expansion is in progress. The exact 110-repository scope comes from the
 live filtered selector. C ranks eleven through twenty are complete and have a
-published language manifest. C++ rank twenty is clean and its two issues are
-closed on `origin/master`, but the required fresh-epoch language certification
-reopened earlier C++ repository work. The campaign is processing those
-regressions from rank eleven forward before it starts C#.
+published language manifest. C++ rank eleven is clean again through closed
+issue #1697, rank twelve stayed clean, and rank twenty remains clean with its
+two issues closed on `origin/master`. The campaign is processing the remaining
+fresh-epoch regressions from rank thirteen forward before it starts C#.
 
 ## Context and Orientation
 
