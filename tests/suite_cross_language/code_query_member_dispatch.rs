@@ -27,7 +27,7 @@ fn serialized(result: &CodeQueryResult) -> Value {
     serde_json::to_value(result).expect("query result should serialize")
 }
 
-fn rows<'a>(value: &'a Value) -> &'a Vec<Value> {
+fn rows(value: &Value) -> &Vec<Value> {
     value["results"].as_array().expect("results array")
 }
 
