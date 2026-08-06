@@ -187,16 +187,6 @@ fn validate_wrapper(
     let Some(query) = args.last() else {
         return;
     };
-    if form.minimum_schema_version() > oldest_rql_schema_version()
-        && let Ok(lowered_query) = query_to_json(query)
-    {
-        let step_index = lowered_query
-            .get("steps")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        let steps_path = rql_query_child_path(path, "steps");
-        analysis.path(format!("{steps_path}[{step_index}].op"), head_range.clone());
-    }
     match form {
         RqlForm::Where => {
             let values = &args[..args.len().saturating_sub(1)];

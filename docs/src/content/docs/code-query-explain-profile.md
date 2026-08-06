@@ -12,7 +12,7 @@ Set `execution_mode` on a JSON query:
 <!-- code-query-test:json:explain-mode -->
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 1,
   "execution_mode": "explain",
   "union": [
     {"match": {"kind": "class", "name": "Legacy"}},
@@ -39,7 +39,7 @@ An explanation has format `bifrost_code_query_explain/v1` and four distinct stag
 - `query_schema_version` identifies the parsed CodeQuery language version. It is independent of the report contract version carried by `format`.
 - `parsed_query` is canonical JSON for the resolved query schema version, including defaults.
 - `logical_plan` is a dependency-first directed acyclic graph. Stable, plan-local node IDs and ordered dependency arrays expose shared work; a dependency ID may appear more than once when authored branches share the same logical seed.
-- `physical_plan` maps each physical node to its logical node, selected operator, output kind, and ordered physical dependencies. A semantic step additionally carries `semantic_request`, with explicit `procedures`, `program_points`, `control_edges`, and schema-v4 `typestate` booleans describing the facets it would need. Explain publishes that demand without resolving a host registration or materializing semantic artifacts. Logical and physical IDs are separate contracts even where the current planner selects them one-to-one.
+- `physical_plan` maps each physical node to its logical node, selected operator, output kind, and ordered physical dependencies. A semantic step additionally carries `semantic_request`, with explicit `procedures`, `program_points`, `control_edges`, and `typestate` booleans describing the facets it would need. Explain publishes that demand without resolving a host registration or materializing semantic artifacts. Logical and physical IDs are separate contracts even where the current planner selects them one-to-one.
 - `scheduling` records the production policy, selected strategy, and maximum concurrency for the selected plan.
 
 The explanation deliberately omits internal cache fingerprints, storage generations, representation versions, and executor-only suffix flags. Those values are implementation details, not a stable public planning contract.

@@ -40,28 +40,10 @@ pub const MAX_OCCURRENCE_FILTER_ENTRIES: usize = 32;
 pub const MAX_ENVIRONMENT_FILTER_ENTRIES: usize = 32;
 /// Upper bound on the length of one `:name` entry of a binding filter.
 pub const MAX_BINDING_NAME_LENGTH: usize = 256;
-pub const SCHEMA_VERSION: u64 = 13;
-pub const DECLARATION_CONTAINMENT_SCHEMA_VERSION: u64 = 5;
-pub const OCCURRENCE_SCHEMA_VERSION: u64 = 8;
-/// Lexical scope, binding and resolution-candidate rows with their seeds and
-/// seven steps (#1474).
-pub const RESOLUTION_SCHEMA_VERSION: u64 = 9;
-/// Canonical reference-edge rows with their forward and inverse projection
-/// steps (#1479). Referenced by transports and tests that pin the minimum
-/// version the edge domain requires.
-pub const REFERENCE_EDGE_SCHEMA_VERSION: u64 = 11;
-/// Qualified-path and path-segment rows with the `paths` seed and the
-/// `segments-of`/`segment-target` steps (#1475).
-pub const IDENTITY_SCHEMA_VERSION: u64 = 10;
-/// Declaration materialization: generation sites, exports, declaration state,
-/// implementation linkage (issue #1476). Renumbered twice at merge time per
-/// the #1473 retrospective's precedent: from 10 to 11 because #1475 claimed
-/// 10 first, then from 11 to 12 because #1479 landed on master with 11 while
-/// this slice was still in flight.
-pub const MATERIALIZATION_SCHEMA_VERSION: u64 = 12;
-/// Receiver outcome/evidence row projections and stable site correlation.
-pub const RECEIVER_EVIDENCE_SCHEMA_VERSION: u64 = 13;
-const _: () = assert!(RECEIVER_EVIDENCE_SCHEMA_VERSION == SCHEMA_VERSION);
+/// The single supported CodeQuery/RQL schema version. The pre-1.0 lineage of
+/// auto-compatible versions was collapsed to 1; a new version is minted only
+/// when an existing query stops parsing or changes meaning.
+pub const SCHEMA_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryValueKind {
@@ -1001,7 +983,6 @@ pub(super) fn validate_query_steps(
     steps: &[QueryStep],
     input: QueryValueKind,
     path: &str,
-    schema_version: u64,
 ) -> Result<QueryValueKind, QueryError> {
     if steps.len() > MAX_QUERY_STEPS {
         return Err(QueryError::new(
@@ -1028,16 +1009,6 @@ pub(super) fn validate_query_steps(
                     "proven_subset requires proof to be proven",
                 ));
             }
-        }
-        let minimum_schema_version = step.op().minimum_schema_version();
-        if schema_version < minimum_schema_version {
-            return Err(QueryError::new(
-                format!("{step_path}.op"),
-                format!(
-                    "query step {} requires schema version {minimum_schema_version}, but this query uses schema version {schema_version}",
-                    step.label()
-                ),
-            ));
         }
         let expected_input = match step {
             QueryStep::EnclosingDecl => "structural_match",
@@ -1232,7 +1203,7 @@ impl CodeQuery {
     /// rely solely on decoder validation.
     pub fn validate_steps(&self) -> Result<QueryValueKind, QueryError> {
         let mut nodes = 0;
-        validate_plan(&self.plan, "", 0, &mut nodes, self.schema_version).map(|domain| domain.kind)
+        validate_plan(&self.plan, "", 0, &mut nodes).map(|domain| domain.kind)
     }
 }
 
@@ -1247,7 +1218,6 @@ fn validate_plan(
     path: &str,
     depth: usize,
     nodes: &mut usize,
-    schema_version: u64,
 ) -> Result<ValidatedDomain, QueryError> {
     if depth > MAX_QUERY_PLAN_DEPTH {
         return Err(QueryError::new(
@@ -1264,87 +1234,34 @@ fn validate_plan(
     }
 
     let mut domain = match &plan.source {
-        CodeQueryPlanSource::Seed(seed) => {
-            if seed.inside_decl.is_some() && schema_version < DECLARATION_CONTAINMENT_SCHEMA_VERSION
-            {
-                return Err(QueryError::new(
-                    child_query_path(path, "inside_decl"),
-                    format!(
-                        "inside_decl requires schema version {DECLARATION_CONTAINMENT_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
-                    ),
-                ));
-            }
-            ValidatedDomain {
-                kind: QueryValueKind::StructuralMatch,
-                captures: Some(seed.positive_capture_names()),
-            }
-        }
-        CodeQueryPlanSource::Occurrences(_) => {
-            if schema_version < OCCURRENCE_SCHEMA_VERSION {
-                return Err(QueryError::new(
-                    child_query_path(path, "occurrences"),
-                    format!(
-                        "the occurrences source requires schema version {OCCURRENCE_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
-                    ),
-                ));
-            }
-            ValidatedDomain {
-                kind: QueryValueKind::Occurrence,
-                captures: None,
-            }
-        }
-        CodeQueryPlanSource::Paths(_) => {
-            if schema_version < IDENTITY_SCHEMA_VERSION {
-                return Err(QueryError::new(
-                    child_query_path(path, "paths"),
-                    format!(
-                        "the paths source requires schema version {IDENTITY_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
-                    ),
-                ));
-            }
-            ValidatedDomain {
-                kind: QueryValueKind::QualifiedPath,
-                captures: None,
-            }
-        }
-        CodeQueryPlanSource::Scopes(_) | CodeQueryPlanSource::Bindings(_) => {
-            let (label, kind) = match &plan.source {
-                CodeQueryPlanSource::Scopes(_) => ("scopes", QueryValueKind::LexicalScope),
-                _ => ("bindings", QueryValueKind::Binding),
-            };
-            if schema_version < RESOLUTION_SCHEMA_VERSION {
-                return Err(QueryError::new(
-                    child_query_path(path, label),
-                    format!(
-                        "the {label} source requires schema version {RESOLUTION_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
-                    ),
-                ));
-            }
-            ValidatedDomain {
-                kind,
-                captures: None,
-            }
-        }
-        CodeQueryPlanSource::GenerationSites(_) | CodeQueryPlanSource::Exports(_) => {
-            let (label, kind) = match &plan.source {
-                CodeQueryPlanSource::GenerationSites(_) => {
-                    ("generation_sites", QueryValueKind::GenerationSite)
-                }
-                _ => ("exports", QueryValueKind::Export),
-            };
-            if schema_version < MATERIALIZATION_SCHEMA_VERSION {
-                return Err(QueryError::new(
-                    child_query_path(path, label),
-                    format!(
-                        "the {label} source requires schema version {MATERIALIZATION_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
-                    ),
-                ));
-            }
-            ValidatedDomain {
-                kind,
-                captures: None,
-            }
-        }
+        CodeQueryPlanSource::Seed(seed) => ValidatedDomain {
+            kind: QueryValueKind::StructuralMatch,
+            captures: Some(seed.positive_capture_names()),
+        },
+        CodeQueryPlanSource::Occurrences(_) => ValidatedDomain {
+            kind: QueryValueKind::Occurrence,
+            captures: None,
+        },
+        CodeQueryPlanSource::Paths(_) => ValidatedDomain {
+            kind: QueryValueKind::QualifiedPath,
+            captures: None,
+        },
+        CodeQueryPlanSource::Scopes(_) => ValidatedDomain {
+            kind: QueryValueKind::LexicalScope,
+            captures: None,
+        },
+        CodeQueryPlanSource::Bindings(_) => ValidatedDomain {
+            kind: QueryValueKind::Binding,
+            captures: None,
+        },
+        CodeQueryPlanSource::GenerationSites(_) => ValidatedDomain {
+            kind: QueryValueKind::GenerationSite,
+            captures: None,
+        },
+        CodeQueryPlanSource::Exports(_) => ValidatedDomain {
+            kind: QueryValueKind::Export,
+            captures: None,
+        },
         CodeQueryPlanSource::Set { op, branches } => {
             let op_path = child_query_path(path, op.label());
             if branches.len() < 2 {
@@ -1362,13 +1279,7 @@ fn validate_plan(
             let mut branch_domains = Vec::with_capacity(branches.len());
             for (index, branch) in branches.iter().enumerate() {
                 let branch_path = format!("{op_path}[{index}]");
-                branch_domains.push(validate_plan(
-                    branch,
-                    &branch_path,
-                    depth + 1,
-                    nodes,
-                    schema_version,
-                )?);
+                branch_domains.push(validate_plan(branch, &branch_path, depth + 1, nodes)?);
             }
             let expected = branch_domains[0].kind;
             for (index, branch) in branch_domains.iter().enumerate().skip(1) {
@@ -1408,7 +1319,7 @@ fn validate_plan(
     };
 
     let steps_path = child_query_path(path, "steps");
-    let output = validate_query_steps(&plan.steps, domain.kind, &steps_path, schema_version)?;
+    let output = validate_query_steps(&plan.steps, domain.kind, &steps_path)?;
     let mut input = domain.kind;
     for (index, step) in plan.steps.iter().enumerate() {
         let filter = match step {

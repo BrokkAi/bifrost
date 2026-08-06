@@ -11,7 +11,7 @@ Receiver-bearing structural sites can expose Bifrost's bounded, demand-driven re
 
 Every analyzed input produces a `receiver_analysis` row. Read its `outcome` before using its candidates: `precise`, `ambiguous`, `unknown`, `unsupported`, and `exceeded_budget` are distinct states. This is not whole-program points-to, general alias analysis, path-sensitive control flow, taint, or data-flow analysis.
 
-> Last verified end to end: 2026-07-23 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-23 (`query_code` schema version 1).
 
 ## Fixture
 

@@ -233,12 +233,12 @@ def outer(items):
         callback = lambda: open(item)
 "#;
     let bounded = json!({
-        "schema_version": 5,
+        "schema_version": 1,
         "match": { "kind": "call", "callee": { "name": "open" } },
         "inside_decl": { "kind": "loop" }
     });
     let lexical = json!({
-        "schema_version": 5,
+        "schema_version": 1,
         "match": { "kind": "call", "callee": { "name": "open" } },
         "inside": { "kind": "loop" }
     });
@@ -255,7 +255,7 @@ def outer(items):
         "nested.py",
         source,
         json!({
-            "schema_version": 5,
+            "schema_version": 1,
             "match": { "kind": "call", "callee": { "name": "open" } },
             "inside_decl": { "kind": "loop", "capture": "loop" }
         }),
@@ -288,7 +288,7 @@ fn declaration_bounded_containment_keeps_the_nearest_callable_and_is_stack_safe(
         "deep.py",
         &source,
         json!({
-            "schema_version": 5,
+            "schema_version": 1,
             "match": { "kind": "call", "callee": { "name": "open" } },
             "inside_decl": { "kind": "function", "name": "outer" }
         }),

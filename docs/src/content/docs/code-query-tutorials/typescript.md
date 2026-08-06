@@ -3,7 +3,7 @@ title: TypeScript
 description: Query TypeScript declarations, callable refinements, decorators, and TSX with query_code.
 ---
 
-> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-14 (`query_code` schema version 1).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/). For bounded allocation/factory provenance, ambiguity, exact member targets, and call-input composition, see [Receiver Traversal](../receiver-traversal/).
 
@@ -205,7 +205,7 @@ The TypeScript language filter includes `.tsx`; `where` narrows this call to the
 
 ## Precision Boundary
 
-Interfaces, enums, and abstract classes intentionally share the normalized `class` kind. Use `name`, containment, or source/path scoping when their source syntax matters; version 2 has no separate public `interface` kind.
+Interfaces, enums, and abstract classes intentionally share the normalized `class` kind. Use `name`, containment, or source/path scoping when their source syntax matters; there is no separate public `interface` kind.
 
 This example exposes bounded receiver values through the shared public `query_code` contract. The adapter preserves explicit `unknown`, `ambiguous`, `unsupported`, and budget outcomes; it does not provide whole-program points-to, general alias analysis, path-sensitive control flow, taint, or general data flow.
 

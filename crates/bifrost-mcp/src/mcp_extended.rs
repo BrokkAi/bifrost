@@ -755,7 +755,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         .collect::<Vec<_>>()
         .join(", ");
     let query_code_description = format!(
-        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Schema version 7 supports {step_vocabulary}; explicit version-2 through version-6 pins retain their earlier vocabularies. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Set execution_mode to explain for planning without workspace execution or profile for the exact ordinary result plus structured operator measurements; results is the default. Procedure-local CFG steps expose source-backed procedure, program_point, and control_edge results. Schema-v4 typestate accepts a host-registered protocol_ref and projects retained typestate witnesses. Schema-v6 value_flow accepts a host-registered plan_ref, consumes the existing ValueFlowPlan and solver, and returns diagnostic-neutral flow_endpoint rows. Schema-v7 taint accepts a host-registered taint_ref and only projects the immutable production TaintFindingReport; it never compiles policy selectors, runs propagation, or reconstructs witnesses. No policy classification is implied. Results include typed taint_finding rows with provenance alongside the earlier terminal domains. Minimal taint query: {{\"schema_version\":7,\"match\":{{\"kind\":\"method\",\"name\":\"run\"}},\"steps\":[{{\"op\":\"procedure_of\"}},{{\"op\":\"taint\",\"taint_ref\":\"request:http-to-database\"}}]}}. Guide: https://bifrost.brokk.ai/code-querying/"
+        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Schema version 1 supports {step_vocabulary}. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Set execution_mode to explain for planning without workspace execution or profile for the exact ordinary result plus structured operator measurements; results is the default. Procedure-local CFG steps expose source-backed procedure, program_point, and control_edge results. The typestate step accepts a host-registered protocol_ref and projects retained typestate witnesses. The value_flow step accepts a host-registered plan_ref, consumes the existing ValueFlowPlan and solver, and returns diagnostic-neutral flow_endpoint rows. The taint step accepts a host-registered taint_ref and only projects the immutable production TaintFindingReport; it never compiles policy selectors, runs propagation, or reconstructs witnesses. No policy classification is implied. Results include typed taint_finding rows with provenance alongside the earlier terminal domains. Minimal taint query: {{\"schema_version\":1,\"match\":{{\"kind\":\"method\",\"name\":\"run\"}},\"steps\":[{{\"op\":\"procedure_of\"}},{{\"op\":\"taint\",\"taint_ref\":\"request:http-to-database\"}}]}}. Guide: https://bifrost.brokk.ai/code-querying/"
     );
     let query_step_variants = query_step_input_variants();
     let query_plan_schema = query_plan_schema(&pattern_schema_description, &query_step_variants);
@@ -791,7 +791,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                 "type": "integer",
                 "default": SCHEMA_VERSION,
                 "enum": schema_versions,
-                "description": "Optional query schema version. Omit for compatible head v6; pin v5 for declaration-bounded containment without value flow, v4 for typestate without containment, v3 for CFG without typestate, or v2 for the pre-CFG vocabulary."
+                "description": "Optional query schema version. Version 1 is the only supported version; omit it or pin it explicitly."
             },
             "query_file": {
                 "type": "string",
@@ -1162,7 +1162,7 @@ mod tests {
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
-            json!([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+            json!([1])
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["execution_mode"]["enum"],

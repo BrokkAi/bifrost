@@ -3,7 +3,7 @@ title: Evaluate Bifrost in Ten Minutes
 description: Run one reproducible query and match policy through the CLI, agent MCP, and VS Code.
 ---
 
-> Last verified end to end: 2026-07-20 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-20 (`query_code` schema version 1).
 > Match-policy path verified the same day (policy schema version 1).
 
 This evaluation uses one checked-in Python fixture, one saved RQL query, and one
@@ -117,7 +117,7 @@ the same RQL selector in stable finding metadata:
       :type match
       :selector
         (rql-file
-          :schema-version 2
+          :schema-version 1
           :path "queries/find-audit.rql")))
 ```
 

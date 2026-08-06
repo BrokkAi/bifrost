@@ -9,6 +9,6 @@
       :type match
       :selector
         (rql
-          :schema-version 2
+          :schema-version 1
           (language python
             (call :callee (name "eval"))))))

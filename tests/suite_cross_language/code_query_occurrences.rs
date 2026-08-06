@@ -409,36 +409,26 @@ fn rql_and_json_occurrence_queries_round_trip_to_the_same_canonical_form() {
     );
 }
 
-/// The schema bump is load-bearing: a document pinned to the previous head
-/// must not silently gain the new forms.
+/// The occurrence surface is available at the single schema version, pinned
+/// or unpinned.
 #[test]
-fn schema_version_seven_rejects_the_occurrence_surface_while_unpinned_resolves_to_the_head() {
-    let pinned_seed = CodeQuery::from_json(&json!({
-        "schema_version": 7,
+fn occurrence_surface_is_available_at_the_single_schema_version() {
+    CodeQuery::from_json(&json!({
+        "schema_version": 1,
         "occurrences": { "role": ["binder"] }
-    }));
-    let error = pinned_seed.expect_err("schema 7 predates the occurrence source");
-    assert!(
-        error.message.contains("schema version 8"),
-        "the rejection must name the version that introduced it: {error:?}"
-    );
+    }))
+    .expect("the pinned occurrence source must decode");
 
-    let pinned_step = CodeQuery::from_json(&json!({
-        "schema_version": 7,
+    CodeQuery::from_json(&json!({
+        "schema_version": 1,
         "match": { "kind": "function" },
         "steps": [{ "op": "occurrences_in" }]
-    }));
-    assert!(
-        pinned_step.is_err(),
-        "schema 7 predates occurrences_in as well"
-    );
+    }))
+    .expect("the pinned occurrences_in step must decode");
 
-    // The head moves as the lineage grows; what this pins is that an unpinned
-    // document lands on it and that the occurrence surface is available there.
     let unpinned = CodeQuery::from_json(&json!({ "occurrences": { "role": ["binder"] } }))
         .expect("an unpinned document resolves to the compatible head");
     assert_eq!(unpinned.schema_version, SCHEMA_VERSION);
-    const { assert!(SCHEMA_VERSION >= 8) };
 }
 
 /// Unknown constrained values are rejected at decode time with the field path,

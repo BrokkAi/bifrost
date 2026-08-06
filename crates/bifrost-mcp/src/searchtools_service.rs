@@ -5517,7 +5517,7 @@ mod query_protocol_tests {
 
     fn query(protocol_ref: &ProtocolRef) -> Value {
         json!({
-            "schema_version": 4,
+            "schema_version": 1,
             "match": {"kind": "function", "name": "lifecycle"},
             "steps": [
                 {"op": "procedure_of"},

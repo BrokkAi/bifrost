@@ -240,20 +240,20 @@ fn policy(id: &str, message: &str, severity: &str) -> String {
             :call-modeling (call-modeling :unmodeled optimistic)
             :sources (endpoint-set :entries [
               (source :id first :display-name "first source" :categories [input.user]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language python (call :callee (name "source_one"))))
                 :bind return-value :labels [untrusted])
               (source :id second :display-name "second source" :categories [input.user]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language python (call :callee (name "source_two"))))
                 :bind return-value :labels [untrusted])])
             :sinks (endpoint-set :entries [
               (sink :id first-store :display-name "first sink" :categories [data.sensitive]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language python (call :callee (name "sink_one"))))
                 :dangerous-operand (argument :index 0) :accepts [untrusted])
               (sink :id second-store :display-name "second sink" :categories [data.sensitive]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language python (call :callee (name "sink_two"))))
                 :dangerous-operand (argument :index 0) :accepts [untrusted])]))
           :classification (classification
@@ -275,12 +275,12 @@ fn subset_policy(id: &str) -> String {
             :call-modeling (call-modeling :unmodeled optimistic)
             :sources (endpoint-set :entries [
               (source :id first :display-name "first source" :categories [input.user]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language python (call :callee (name "source_one"))))
                 :bind return-value :labels [untrusted])])
             :sinks (endpoint-set :entries [
               (sink :id first-store :display-name "first sink" :categories [data.sensitive]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language python (call :callee (name "sink_one"))))
                 :dangerous-operand (argument :index 0) :accepts [untrusted])]))
           :classification (classification
@@ -302,16 +302,16 @@ fn duplicate_source_event_policy(id: &str) -> String {
             :call-modeling (call-modeling :unmodeled optimistic)
             :sources (endpoint-set :entries [
               (source :id first :display-name "first logical source" :categories [input.user]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language python (call :callee (name "source_one"))))
                 :bind return-value :labels [untrusted])
               (source :id second :display-name "second logical source" :categories [input.user]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language python (call :callee (name "source_one"))))
                 :bind return-value :labels [untrusted])])
             :sinks (endpoint-set :entries [
               (sink :id store :display-name "sink" :categories [data.sensitive]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language python (call :callee (name "sink_one"))))
                 :dangerous-operand (argument :index 0) :accepts [untrusted])]))
           :classification (classification
@@ -333,11 +333,11 @@ fn single_policy(id: &str, source_selector: &str, source_binding: &str) -> Strin
             :call-modeling (call-modeling :unmodeled optimistic)
             :sources (endpoint-set :entries [
               (source :id first :display-name "first source" :categories [input.user]
-                :selector (rql :schema-version 6 {source_selector})
+                :selector (rql :schema-version 1 {source_selector})
                 :bind {source_binding} :labels [untrusted])])
             :sinks (endpoint-set :entries [
               (sink :id first-store :display-name "first sink" :categories [data.sensitive]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language python (call :callee (name "sink_one"))))
                 :dangerous-operand (argument :index 0) :accepts [untrusted])]))
           :classification (classification
@@ -359,16 +359,16 @@ fn java_summary_policy(id: &str, message: &str) -> String {
             :call-modeling (call-modeling :unmodeled require-model)
             :sources (endpoint-set :entries [
               (source :id attacker :display-name "attacker input" :categories [input.user]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "attacker"))))
                 :bind return-value :labels [untrusted])
               (source :id clean :display-name "clean sibling" :categories [input.user]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "clean"))))
                 :bind return-value :labels [untrusted])])
             :sinks (endpoint-set :entries [
               (sink :id sensitive :display-name "sensitive sink" :categories [data.sensitive]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "sensitive"))))
                 :dangerous-operand (argument :index 0) :accepts [untrusted])]))
           :classification (classification
@@ -382,11 +382,11 @@ fn java_duplicate_source_summary_policy(id: &str) -> String {
 
 fn java_duplicate_source_summary_policy_with_order(id: &str, reverse_sources: bool) -> String {
     let first = r#"(source :id first :display-name "first logical source" :categories [input.user]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "attacker"))))
                 :bind return-value :labels [untrusted])"#;
     let second = r#"(source :id second :display-name "second logical source" :categories [input.user]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "attacker"))))
                 :bind return-value :labels [untrusted])"#;
     let sources = if reverse_sources {
@@ -409,7 +409,7 @@ fn java_duplicate_source_summary_policy_with_order(id: &str, reverse_sources: bo
               {sources}])
             :sinks (endpoint-set :entries [
               (sink :id sensitive :display-name "sensitive sink" :categories [data.sensitive]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "sensitive"))))
                 :dangerous-operand (argument :index 0) :accepts [untrusted])]))
           :classification (classification
@@ -431,20 +431,20 @@ fn java_multi_demand_summary_policy(id: &str) -> String {
             :call-modeling (call-modeling :unmodeled require-model)
             :sources (endpoint-set :entries [
               (source :id first :display-name "first attacker" :categories [input.user]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "attackerOne"))))
                 :bind return-value :labels [first-label])
               (source :id second :display-name "second attacker" :categories [input.user]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "attackerTwo"))))
                 :bind return-value :labels [second-label])])
             :sinks (endpoint-set :entries [
               (sink :id first-sink :display-name "first sink" :categories [data.sensitive]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "sensitiveOne"))))
                 :dangerous-operand (argument :index 0) :accepts [first-label second-label])
               (sink :id second-sink :display-name "second sink" :categories [data.sensitive]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "sensitiveTwo"))))
                 :dangerous-operand (argument :index 0) :accepts [first-label second-label])]))
           :classification (classification
@@ -466,34 +466,34 @@ fn java_executable_transfer_policy(id: &str) -> String {
             :call-modeling (call-modeling :unmodeled require-model)
             :sources (endpoint-set :entries [
               (source :id parameter :display-name "parameter input" :categories [input.user]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "attackerParameter"))))
                 :bind return-value :labels [parameter-label])
               (source :id receiver-input :display-name "receiver input" :categories [input.user]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "attackerReceiver"))))
                 :bind return-value :labels [receiver-input-label])
               (source :id receiver-output :display-name "receiver output" :categories [input.user]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "attackerReceiverOutput"))))
                 :bind return-value :labels [receiver-output-label])
               (source :id exceptional :display-name "exceptional input" :categories [input.user]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "attackerExceptional"))))
                 :bind return-value :labels [exceptional-label])])
             :sinks (endpoint-set :entries [
               (sink :id normal :display-name "normal sink" :categories [data.sensitive]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "normalSink"))))
                 :dangerous-operand (argument :index 0)
                 :accepts [parameter-label receiver-input-label receiver-output-label exceptional-label])
               (sink :id receiver :display-name "receiver sink" :categories [data.sensitive]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "receiverSink"))))
                 :dangerous-operand (argument :index 0)
                 :accepts [parameter-label receiver-input-label receiver-output-label exceptional-label])
               (sink :id exceptional-sink :display-name "exceptional sink" :categories [data.sensitive]
-                :selector (rql :schema-version 6
+                :selector (rql :schema-version 1
                   (language java (call :callee (name "exceptionalSink"))))
                 :dangerous-operand (argument :index 0)
                 :accepts [parameter-label receiver-input-label receiver-output-label exceptional-label])]))
@@ -1212,7 +1212,7 @@ fn assert_retained_taint_projection_matrix(
     assert_eq!(registrations.registration_count(), 1);
 
     let json_query = CodeQuery::from_json(&serde_json::json!({
-        "schema_version": 7,
+        "schema_version": 1,
         "match": { "kind": "method", "name": "run" },
         "steps": [
             { "op": "procedure_of" },
@@ -3037,7 +3037,7 @@ fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evide
     assert_eq!(registrations.registration_count(), 1);
 
     let json_query = CodeQuery::from_json(&serde_json::json!({
-        "schema_version": 7,
+        "schema_version": 1,
         "match": { "kind": "function", "name": "run" },
         "steps": [
             { "op": "procedure_of" },
@@ -3122,7 +3122,7 @@ fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evide
     );
 
     let missing_query = CodeQuery::from_json(&serde_json::json!({
-        "schema_version": 7,
+        "schema_version": 1,
         "match": { "kind": "function", "name": "run" },
         "steps": [
             { "op": "procedure_of" },
@@ -3147,7 +3147,7 @@ fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evide
     );
 
     let wrong_root_query = CodeQuery::from_json(&serde_json::json!({
-        "schema_version": 7,
+        "schema_version": 1,
         "match": { "kind": "function", "name": "source_one" },
         "steps": [
             { "op": "procedure_of" },

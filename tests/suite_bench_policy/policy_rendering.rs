@@ -18,7 +18,7 @@ const MATCH_POLICY: &str = r#"(policy
     (analysis
       :type match
       :selector
-        (rql :schema-version 2
+        (rql :schema-version 1
           (language typescript (function :name "target")))))"#;
 
 fn evaluation_options() -> PolicyEvaluationOptions {

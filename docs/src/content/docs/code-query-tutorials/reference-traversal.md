@@ -3,7 +3,7 @@ title: Reference Traversal
 description: Traverse exact source references and semantic users with query_code.
 ---
 
-> Last verified end to end: 2026-07-18 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-18 (`query_code` schema version 1).
 
 Reference traversal starts from an exact indexed declaration. `references-of` returns each exact source site, `used-by` returns the smallest exact declaration enclosing each site, and `uses` traverses in the other direction from one exact declaration to the declarations referenced by its body or signature. No operation resolves a display name back into an identity.
 

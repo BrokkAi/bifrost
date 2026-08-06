@@ -39,7 +39,7 @@ fn semantic_projection_rejects_a_newer_source_than_the_retained_scan_seed() {
         AnalyzerConfig::default(),
     );
     let query = CodeQuery::from_json(&json!({
-        "schema_version": 3,
+        "schema_version": 1,
         "match": { "kind": "function", "name": "target" },
         "steps": [{ "op": "procedure_of" }]
     }))

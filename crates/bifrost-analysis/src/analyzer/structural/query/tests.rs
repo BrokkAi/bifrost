@@ -48,9 +48,9 @@ fn parses_the_issue_example_query() {
 }
 
 #[test]
-fn declaration_bounded_containment_round_trips_and_requires_schema_version_five() {
+fn declaration_bounded_containment_round_trips() {
     let json = json!({
-        "schema_version": 5,
+        "schema_version": 1,
         "match": { "kind": "call", "callee": { "name": "open" } },
         "inside_decl": { "kind": "loop", "capture": "loop" }
     });
@@ -63,7 +63,7 @@ fn declaration_bounded_containment_round_trips_and_requires_schema_version_five(
             .kinds,
         vec![NormalizedKind::Loop]
     );
-    assert_eq!(query.to_canonical_json()["schema_version"], json!(5));
+    assert_eq!(query.to_canonical_json()["schema_version"], json!(1));
     assert_eq!(query.to_canonical_json()["match"], json["match"]);
     assert_eq!(
         query.to_canonical_json()["inside_decl"],
@@ -71,7 +71,7 @@ fn declaration_bounded_containment_round_trips_and_requires_schema_version_five(
     );
 
     parse_ok(json!({
-        "schema_version": 5,
+        "schema_version": 1,
         "match": { "kind": "call" },
         "inside_decl": { "kind": "loop", "capture": "loop" },
         "steps": [{ "op": "points_to", "capture": "loop" }]
@@ -84,14 +84,6 @@ fn declaration_bounded_containment_round_trips_and_requires_schema_version_five(
     assert_eq!(rql.schema_version, SCHEMA_VERSION);
     assert_eq!(rql.to_canonical_json()["match"], json["match"]);
     assert_eq!(rql.to_canonical_json()["inside_decl"], json["inside_decl"]);
-
-    let error = error_of(json!({
-        "schema_version": 4,
-        "match": { "kind": "call" },
-        "inside_decl": { "kind": "loop" }
-    }));
-    assert_eq!(error.path, "inside_decl");
-    assert!(error.message.contains("requires schema version 5"));
 }
 
 #[test]
@@ -475,26 +467,26 @@ fn parses_defaults_and_rejects_nested_execution_modes() {
 #[test]
 fn parses_and_rejects_schema_version() {
     let query = parse_ok(json!({
-        "schema_version": 2,
+        "schema_version": 1,
         "match": { "kind": "call" }
     }));
-    assert_eq!(query.schema_version, 2);
-    assert_eq!(query.to_canonical_json()["schema_version"], 2);
+    assert_eq!(query.schema_version, 1);
+    assert_eq!(query.to_canonical_json()["schema_version"], 1);
 
     let defaulted = parse_ok(json!({ "match": { "kind": "call" } }));
     assert_eq!(defaulted.schema_version, SCHEMA_VERSION);
 
     let error = error_of(json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "match": { "kind": "call" }
     }));
     assert_eq!(error.path, "schema_version");
 }
 
 #[test]
-fn schema_version_three_adds_the_typed_cfg_algebra() {
+fn typed_cfg_algebra_parses_and_lowers() {
     let query = parse_ok(json!({
-        "schema_version": 3,
+        "schema_version": 1,
         "match": { "kind": "function" },
         "steps": [
             { "op": "procedure_of" },
@@ -520,23 +512,15 @@ fn schema_version_three_adds_the_typed_cfg_algebra() {
     let rql = CodeQuery::from_sexp(
         "(cfg-edge-target (cfg-successor-edges (cfg-entry (procedure-of (function)))))",
     )
-    .expect("version-three CFG RQL should lower");
+    .expect("CFG RQL should lower");
     assert_eq!(rql.schema_version, SCHEMA_VERSION);
     assert_eq!(rql.plan.steps, query.plan.steps);
-
-    let error = error_of(json!({
-        "schema_version": 2,
-        "match": { "kind": "function" },
-        "steps": [{ "op": "procedure_of" }]
-    }));
-    assert_eq!(error.path, "steps[0].op");
-    assert!(error.message.contains("requires schema version 3"));
 }
 
 #[test]
-fn schema_version_four_adds_registered_typestate_findings_and_witnesses() {
+fn registered_typestate_findings_and_witnesses_parse() {
     let query = parse_ok(json!({
-        "schema_version": 4,
+        "schema_version": 1,
         "match": { "kind": "function", "name": "lifecycle" },
         "steps": [
             { "op": "procedure_of" },
@@ -562,20 +546,9 @@ fn schema_version_four_adds_registered_typestate_findings_and_witnesses() {
     let rql = CodeQuery::from_sexp(
         "(file-of (witness :max-steps 12 :max-bytes 4096 (typestate :protocol-ref embedding:bifrost.test.resource-lifecycle (procedure-of (function :name \"lifecycle\")))))",
     )
-    .expect("schema-four typestate RQL should lower");
+    .expect("typestate RQL should lower");
     assert_eq!(rql.schema_version, SCHEMA_VERSION);
     assert_eq!(rql.plan.steps, query.plan.steps);
-
-    let error = error_of(json!({
-        "schema_version": 3,
-        "match": { "kind": "function" },
-        "steps": [
-            { "op": "procedure_of" },
-            { "op": "typestate", "protocol_ref": "test:lifecycle" }
-        ]
-    }));
-    assert_eq!(error.path, "steps[1].op");
-    assert!(error.message.contains("requires schema version 4"));
 }
 
 #[test]
@@ -613,9 +586,9 @@ fn typestate_step_options_are_required_bounded_and_operation_specific() {
 }
 
 #[test]
-fn schema_version_six_adds_registered_value_flow_endpoints_and_witnesses() {
+fn registered_value_flow_endpoints_and_witnesses_parse() {
     let query = parse_ok(json!({
-        "schema_version": 6,
+        "schema_version": 1,
         "match": { "kind": "function", "name": "run" },
         "steps": [
             { "op": "procedure_of" },
@@ -634,20 +607,9 @@ fn schema_version_six_adds_registered_value_flow_endpoints_and_witnesses() {
     let rql = CodeQuery::from_sexp(
         "(file-of (witness :max-steps 24 :max-bytes 8192 (value-flow :plan-ref test:request-to-sink (procedure-of (function :name \"run\")))))",
     )
-    .expect("schema-six value-flow RQL should lower");
+    .expect("value-flow RQL should lower");
     assert_eq!(rql.schema_version, SCHEMA_VERSION);
     assert_eq!(rql.plan.steps, query.plan.steps);
-
-    let error = error_of(json!({
-        "schema_version": 5,
-        "match": { "kind": "function" },
-        "steps": [
-            { "op": "procedure_of" },
-            { "op": "value_flow", "plan_ref": "test:request-to-sink" }
-        ]
-    }));
-    assert_eq!(error.path, "steps[1].op");
-    assert!(error.message.contains("requires schema version 6"));
 }
 
 #[test]
@@ -675,9 +637,9 @@ fn value_flow_plan_ref_is_required_and_operation_specific() {
 }
 
 #[test]
-fn schema_version_seven_adds_retained_taint_findings() {
+fn retained_taint_findings_parse() {
     let query = parse_ok(json!({
-        "schema_version": 7,
+        "schema_version": 1,
         "match": { "kind": "function", "name": "run" },
         "steps": [
             { "op": "procedure_of" },
@@ -695,20 +657,9 @@ fn schema_version_seven_adds_retained_taint_findings() {
     let rql = CodeQuery::from_sexp(
         "(file-of (taint :taint-ref test:request-to-sink (procedure-of (function :name \"run\"))))",
     )
-    .expect("schema-seven taint RQL should lower");
+    .expect("taint RQL should lower");
     assert_eq!(rql.schema_version, SCHEMA_VERSION);
     assert_eq!(rql.plan.steps, query.plan.steps);
-
-    let error = error_of(json!({
-        "schema_version": 6,
-        "match": { "kind": "function" },
-        "steps": [
-            { "op": "procedure_of" },
-            { "op": "taint", "taint_ref": "test:request-to-sink" }
-        ]
-    }));
-    assert_eq!(error.path, "steps[1].op");
-    assert!(error.message.contains("requires schema version 7"));
 }
 
 #[test]
@@ -769,7 +720,7 @@ fn typed_cfg_algebra_validates_each_domain_transition() {
         ),
     ] {
         let query = parse_ok(json!({
-            "schema_version": 3,
+            "schema_version": 1,
             "match": { "kind": "function" },
             "steps": steps
         }));
@@ -777,7 +728,7 @@ fn typed_cfg_algebra_validates_each_domain_transition() {
     }
 
     let error = error_of(json!({
-        "schema_version": 3,
+        "schema_version": 1,
         "match": { "kind": "function" },
         "steps": [
             { "op": "procedure_of" },
@@ -789,7 +740,7 @@ fn typed_cfg_algebra_validates_each_domain_transition() {
     assert!(error.message.contains("procedure"));
 
     let error = error_of(json!({
-        "schema_version": 3,
+        "schema_version": 1,
         "match": { "kind": "function" },
         "steps": [
             { "op": "enclosing_decl" },
@@ -804,7 +755,7 @@ fn typed_cfg_algebra_validates_each_domain_transition() {
 #[test]
 fn typed_cfg_set_branches_must_have_compatible_domains() {
     let query = parse_ok(json!({
-        "schema_version": 3,
+        "schema_version": 1,
         "union": [
             {
                 "match": { "kind": "function", "name": "left" },
@@ -823,7 +774,7 @@ fn typed_cfg_set_branches_must_have_compatible_domains() {
     );
 
     let error = error_of(json!({
-        "schema_version": 3,
+        "schema_version": 1,
         "union": [
             {
                 "match": { "kind": "function" },
@@ -872,7 +823,7 @@ fn compatible_schema_successor_changes_only_the_emitted_version() {
 #[test]
 fn canonical_query_plan_projection_excludes_execution_controls() {
     let query = parse_ok(json!({
-        "schema_version": 2,
+        "schema_version": 1,
         "match": { "kind": "call" },
         "limit": 7,
         "result_detail": "full",
@@ -880,7 +831,7 @@ fn canonical_query_plan_projection_excludes_execution_controls() {
     }));
     let projected = query.to_canonical_query_plan_json();
 
-    assert_eq!(projected["schema_version"], 2);
+    assert_eq!(projected["schema_version"], 1);
     assert!(projected.get("match").is_some());
     assert!(projected.get("limit").is_none());
     assert!(projected.get("result_detail").is_none());
@@ -1087,10 +1038,10 @@ fn receiver_analysis_projects_typed_outcome_and_evidence_rows() {
         outcome.validate_steps().unwrap(),
         QueryValueKind::ReceiverOutcome
     );
-    assert_eq!(outcome.schema_version, RECEIVER_EVIDENCE_SCHEMA_VERSION);
+    assert_eq!(outcome.schema_version, SCHEMA_VERSION);
 
     let evidence = parse_ok(json!({
-        "schema_version": RECEIVER_EVIDENCE_SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION,
         "match": { "kind": "call", "callee": { "name": "run" } },
         "steps": [
             { "op": "receiver_targets" },
@@ -1105,16 +1056,6 @@ fn receiver_analysis_projects_typed_outcome_and_evidence_rows() {
         evidence.to_canonical_json()["steps"][1]["op"],
         "receiver_evidence"
     );
-
-    let error = error_of(json!({
-        "schema_version": RECEIVER_EVIDENCE_SCHEMA_VERSION - 1,
-        "match": { "kind": "call", "callee": { "name": "run" } },
-        "steps": [
-            { "op": "receiver_targets" },
-            { "op": "receiver_outcome" }
-        ]
-    }));
-    assert_eq!(error.path, "steps[1].op");
 }
 
 #[test]

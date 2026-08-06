@@ -797,7 +797,7 @@ mod tests {
                 origin: SchemaVersionOrigin::Explicit,
             },
             query: CodeQuery::from_json(&json!({
-                "schema_version": 8,
+                "schema_version": 1,
                 "occurrences": { "role": "member_position" }
             }))
             .expect("valid occurrence query"),

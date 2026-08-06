@@ -114,7 +114,7 @@ pub fn claude_bifrost_host_probe_4f6f2b7() {}
 Start a fresh Claude Code session in that checkout and use:
 
 ```text
-Use only the Bifrost MCP server for this verification. Call search_symbols for claude_bifrost_host_probe_4f6f2b7, then call query_code with schema_version 2, languages ["rust"], match {"kind":"function","name":"claude_bifrost_host_probe_4f6f2b7"}, limit 10, and result_detail "full". Do not use terminal, file-reading, text-search, web, or any other tool. PASS only if both real structured results return src/claude_bifrost_host_probe_4f6f2b7.rs.
+Use only the Bifrost MCP server for this verification. Call search_symbols for claude_bifrost_host_probe_4f6f2b7, then call query_code with schema_version 1, languages ["rust"], match {"kind":"function","name":"claude_bifrost_host_probe_4f6f2b7"}, limit 10, and result_detail "full". Do not use terminal, file-reading, text-search, web, or any other tool. PASS only if both real structured results return src/claude_bifrost_host_probe_4f6f2b7.rs.
 ```
 
 A valid pass shows real `mcp__plugin_brokk_bifrost__search_symbols` and

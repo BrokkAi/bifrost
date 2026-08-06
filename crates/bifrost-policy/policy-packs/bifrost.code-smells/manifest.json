@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
   "id": "bifrost.code-smells",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "name": "Bifrost code smells",
   "description": "Curated structured RQLP checks for bug-prone and potentially expensive source patterns.",
   "policies": [
     {
       "path": "policies/dynamic-evaluation.rqlp",
       "id": "bifrost.correctness.dynamic-evaluation",
-      "semantic_hash": "e4cc9105c1495dacc3f8a0692d831d949ad9636f991f558aca1830d5d2db0004",
+      "semantic_hash": "455fca5f51f3291329d71adaa89b4c5e478df8a869272e633b6cd138afe54fb3",
       "category": "correctness",
       "supported_languages": [
         "python",
@@ -25,7 +25,7 @@
     {
       "path": "policies/unsafe-deserialization.rqlp",
       "id": "bifrost.correctness.unsafe-deserialization",
-      "semantic_hash": "59c9395ba3184ae2a9b66df60dbccc34c99c4a8cc26e8ba23e5e34fb79ce5da3",
+      "semantic_hash": "04fe7a69f28ebc3d702bf909b01b29bad3def6fe5d6072351337fcd17c0ed867",
       "category": "correctness",
       "supported_languages": [
         "python"
@@ -40,7 +40,7 @@
     {
       "path": "policies/sort-in-loop.rqlp",
       "id": "bifrost.performance.sort-in-loop",
-      "semantic_hash": "a006832353785914346c8a6e6d845651b861a7cbfa93cb11c0c1ae2d30f9d248",
+      "semantic_hash": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -59,7 +59,7 @@
     {
       "path": "policies/regex-compile-in-loop.rqlp",
       "id": "bifrost.performance.regex-compile-in-loop",
-      "semantic_hash": "1d60c5abe0817d3a15b115729176eaa26bdf0a16d64794d89cc24705852e7b0b",
+      "semantic_hash": "cf97c430a496547a9ffc0731e412d5426e2d5d39effa872c433cbc7dd3c61578",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -79,7 +79,7 @@
     {
       "path": "policies/file-read-in-loop.rqlp",
       "id": "bifrost.performance.file-read-in-loop",
-      "semantic_hash": "bc56641e023039ffaac61b4174dbfa983987bdeb23efe9a9f63e38bf18a68dc3",
+      "semantic_hash": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -99,7 +99,7 @@
     {
       "path": "policies/serialization-in-loop.rqlp",
       "id": "bifrost.performance.serialization-in-loop",
-      "semantic_hash": "8567a7fddef65e550590ec9961f93a51a9f70cea4f6f8dceaf19b3725181d206",
+      "semantic_hash": "da0b97c9fccd69df43320804e18b2325952a603f136ad01af388816b2a49a4b4",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -119,7 +119,7 @@
     {
       "path": "policies/parsing-in-loop.rqlp",
       "id": "bifrost.performance.parsing-in-loop",
-      "semantic_hash": "e32c683255e995ae68dd4c4f0f245d978486388a803b42607bc0957c1493ade5",
+      "semantic_hash": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -139,7 +139,7 @@
     {
       "path": "policies/database-call-in-loop.rqlp",
       "id": "bifrost.performance.database-call-in-loop",
-      "semantic_hash": "25838c735875e36cfba67c007d3bb88a45cb0e419afc0c83eb50f08799ffbe42",
+      "semantic_hash": "0c5648b25f7b2bbd8e3d3dc044530a749599d6154a05ffd50e777aa1cb501af8",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -158,7 +158,7 @@
     {
       "path": "policies/network-call-in-loop.rqlp",
       "id": "bifrost.performance.network-call-in-loop",
-      "semantic_hash": "be1a71660ae9f5d766d8b0b3f7bbc880941e6f8b8a0e86301463de48a9c94aff",
+      "semantic_hash": "fe1a532e1414f2ce515a5f80fd290f340676d320b9fb6909d822757fcb8d34ed",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -178,7 +178,7 @@
     {
       "path": "policies/subprocess-in-loop.rqlp",
       "id": "bifrost.performance.subprocess-in-loop",
-      "semantic_hash": "4b58c82e3d6d0dbc0e5a86853a614f32f571501287c23aa1dd6a03edd91c5da5",
+      "semantic_hash": "5edcae98680abb96e9a7a888e6dc574a5f07588348d0b3b71daed815f3dbd463",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -197,7 +197,7 @@
     {
       "path": "policies/sleep-in-loop.rqlp",
       "id": "bifrost.performance.sleep-in-loop",
-      "semantic_hash": "c4542aa0f583fa5e09026c7d28c0deac2284194b51e50de66844aa86cfd66772",
+      "semantic_hash": "b0319247b09cacb3e1b43e0b3809f7b2ba6858a5522ba6de7bf3a7b8212901ad",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -215,7 +215,7 @@
     {
       "path": "policies/expensive-operation-in-nested-loop.rqlp",
       "id": "bifrost.performance.expensive-operation-in-nested-loop",
-      "semantic_hash": "da78764c47105da598d48aa5582ad1174b9ef9db90569ed7b33794dab51e6968",
+      "semantic_hash": "df760c4255064035c9079548977b6cedb8032cd2c2d5f0af666fcca09b28ac1c",
       "category": "performance",
       "supported_languages": [
         "python",

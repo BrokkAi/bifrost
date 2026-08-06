@@ -1233,8 +1233,8 @@ fn bifrost_lsp_server_validates_and_hovers_unsaved_rqlp_source() {
             "inline RQL selector omits",
         ),
         (
-            r#"(rql :schema-version 2 (call :callee (name "run")))"#,
-            "explicitly pins RQL schema version `2`",
+            r#"(rql :schema-version 1 (call :callee (name "run")))"#,
+            "explicitly pins RQL schema version `1`",
         ),
         (
             r#"(rql-file :path "queries/run.rql")"#,
@@ -1279,7 +1279,7 @@ export function leak_resource(): object {
     fs::create_dir(root.join("queries")).expect("create query directory");
     fs::write(
         root.join("queries/target.rql"),
-        r#"(rql :schema-version 2 (language typescript (function :name "target")))"#,
+        r#"(rql :schema-version 1 (language typescript (function :name "target")))"#,
     )
     .expect("write selector dependency");
     let policy_path = root.join("policies/live.rqlp");
@@ -1295,7 +1295,7 @@ export function leak_resource(): object {
     (analysis
       :type match
       :selector
-        (rql :schema-version 2
+        (rql :schema-version 1
           (language typescript (function :name "other")))))"#,
     )
     .expect("write saved policy");
@@ -1309,7 +1309,7 @@ export function leak_resource(): object {
     (analysis
       :type match
       :selector
-        (rql :schema-version 2
+        (rql :schema-version 1
           (language typescript (function :name "target")))))"#;
     let mut server = LspServer::start(&root);
 
@@ -1677,7 +1677,7 @@ fn bifrost_lsp_server_runs_policy_from_symlinked_workspace_uri() {
     (analysis
       :type match
       :selector
-        (rql :schema-version 2
+        (rql :schema-version 1
           (language python (call :callee (name "eval"))))))"#;
     let mut server = LspServer::start(&real_root);
 
@@ -1721,7 +1721,7 @@ fn bifrost_lsp_server_derives_policy_identity_from_configured_root() {
     (analysis
       :type match
       :selector
-        (rql :schema-version 2
+        (rql :schema-version 1
           (language typescript (function :name "target")))))"#;
     let mut server = LspServer::start_with_params(
         &parent,
@@ -1776,7 +1776,7 @@ fn bifrost_lsp_server_returns_multi_root_finding_paths_in_report_coordinates() {
     (analysis
       :type match
       :selector
-        (rql :schema-version 2
+        (rql :schema-version 1
           (language typescript (function :name "target")))))"#;
     let mut server = LspServer::start_with_params(
         &parent,
