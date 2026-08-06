@@ -402,6 +402,14 @@ impl CodeUnitIndex for JavaAnalyzer {
         self.inner.indexed_source(file)
     }
 
+    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        self.inner.location_declarations(file)
+    }
+
+    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
+        self.inner.location_ranges(code_unit)
+    }
+
     fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
         self.inner.indexed_source_matches(file, source)
     }

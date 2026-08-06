@@ -100,7 +100,7 @@ fn code_unit_declaration_name_ranges_in_tree(
     root: Node<'_>,
     code_unit: &CodeUnit,
 ) -> Vec<Range> {
-    let mut declaration_ranges = analyzer.ranges(code_unit).to_vec();
+    let mut declaration_ranges = analyzer.location_ranges(code_unit);
     declaration_ranges.sort_unstable();
     declaration_ranges.dedup();
 

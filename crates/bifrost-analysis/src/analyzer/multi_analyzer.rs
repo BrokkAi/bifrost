@@ -627,6 +627,18 @@ impl CodeUnitIndex for MultiAnalyzer {
             .and_then(|delegate| delegate.analyzer().indexed_source(file))
     }
 
+    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        self.delegate_for_file(file)
+            .map(|delegate| delegate.analyzer().location_declarations(file))
+            .unwrap_or_default()
+    }
+
+    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
+        self.delegate_for_code_unit(code_unit)
+            .map(|delegate| delegate.analyzer().location_ranges(code_unit))
+            .unwrap_or_default()
+    }
+
     fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
         self.delegate_for_file(file)
             .is_some_and(|delegate| delegate.analyzer().indexed_source_matches(file, source))

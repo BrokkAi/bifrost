@@ -62,6 +62,13 @@ pub trait CodeUnitIndex: Send + Sync {
         self.declarations(file)
     }
 
+    /// Declarations for a source-location query. Persisted analyzers can
+    /// override this when the working-tree source needs a compatible range
+    /// projection without changing ordinary snapshot queries.
+    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        self.get_declarations(file)
+    }
+
     /// Declaration-materialization provenance recorded for `file` by its
     /// language walk (issue #1476). Default empty: an analyzer that records
     /// nothing has no records, and the materialization support tables decide
@@ -213,6 +220,12 @@ pub trait CodeUnitIndex: Send + Sync {
 
     fn ranges_of(&self, code_unit: &CodeUnit) -> Vec<Range> {
         self.ranges(code_unit)
+    }
+
+    /// Ranges for a source-location query. Persisted analyzers can override
+    /// this when the working-tree source needs a compatible range projection.
+    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
+        self.ranges_of(code_unit)
     }
 
     /// Returns at most `max_ranges` declaration ranges, the provider rows

@@ -1365,7 +1365,7 @@ pub(super) fn resolve_scan_usages_target(
                     let selector_matches =
                         selector_arg.is_some_and(|symbol| matches_selector(&unit, symbol));
                     let ranges = if selector_matches && unit.is_module() {
-                        analyzer.ranges_of(&unit)
+                        analyzer.location_ranges(&unit)
                     } else if selector_matches || selector_arg.is_none() {
                         range_context.name_ranges(analyzer, &unit)
                     } else {
@@ -1422,7 +1422,7 @@ pub(super) fn resolve_scan_usages_target(
     if matching_units.is_empty()
         && let Some(symbol) = selector
     {
-        let declarations = analyzer.declarations(&file);
+        let declarations = analyzer.location_declarations(&file);
         let lookup = AnalyzerDefinitionLookup::new(analyzer, language_for_file(&file));
         let lookup_only_candidates: Vec<CodeUnit> = lookup
             .fqn(symbol)
@@ -1569,7 +1569,7 @@ pub(super) fn scan_usages_location_diagnostic(
 
 pub(super) fn declarations_in_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Vec<CodeUnit> {
     let mut declarations: Vec<CodeUnit> = analyzer
-        .get_declarations(file)
+        .location_declarations(file)
         .into_iter()
         .filter(|unit| unit.source() == file)
         .collect();
