@@ -17,7 +17,8 @@ C++ navigation must render a canonical selector without loading every stored fac
 - [x] Run a focused linkage regression and repeat the Phalcon probe.
 - [x] Reuse unconditional C++ include-reachability answers across visibility indexes.
 - [x] Reuse the request FileState snapshot for C++ signature metadata during visibility construction.
-- [ ] Stop source rendering when `get_symbol_sources` exceeds its MCP response budget.
+- [x] Stop source rendering when `get_symbol_sources` exceeds its MCP response budget.
+- [x] Reuse same-name function range groups while rendering broad source results.
 - [ ] Run the required policy check after MCP tool registration is repaired.
 
 ## Surprises & Discoveries
@@ -44,6 +45,12 @@ C++ navigation must render a canonical selector without loading every stored fac
   Evidence: The post-change sample at 1:46 is in `get_symbol_sources`, not `get_definitions_by_reference`, and contains no `signature_metadata_for_unit_limited` frames.
 - Observation: A broad `PHP_METHOD` source lookup renders 18,280,879 bytes before MCP rejects it.
   Evidence: Two raw-symbol probes each take about 41 seconds and exceed the 16 MiB response budget. File-anchored probes finish in less than one second.
+- Observation: The byte budget alone does not improve the broad source lookup time.
+  Evidence: It stops materialization at 16 MiB, but the two raw `PHP_METHOD` probes still take 40,338 ms and 40,257 ms.
+- Observation: The broad-source hot loop repeats one same-name definition lookup for every source file.
+  Evidence: `source_blocks_for_code_unit_with_cache` called `definitions(PHP_METHOD)` for each resolved generated file before it collected that file's ranges.
+- Observation: Caching each same-name range group cuts broad source lookup time by about 84 percent.
+  Evidence: The two raw `PHP_METHOD` probes now take 6,534 ms and 6,409 ms. The prior budget-only probes took 40,338 ms and 40,257 ms.
 
 ## Decision Log
 
@@ -53,7 +60,7 @@ C++ navigation must render a canonical selector without loading every stored fac
 
 ## Outcomes & Retrospective
 
-The selector path no longer needs full FileState hydration when persisted rows are complete. The dedicated test proves this behavior. Persisted global-field linkage also prevents a visibility-build parse. C++ include reachability now retains bounded answers across visibility indexes. Request-local metadata reads reuse the FileState already hydrated by the visibility build. The Phalcon navigation part now completes before `get_symbol_sources`. The remaining slow path renders source that MCP later rejects for size.
+The selector path no longer needs full FileState hydration when persisted rows are complete. The dedicated test proves this behavior. Persisted global-field linkage also prevents a visibility-build parse. C++ include reachability now retains bounded answers across visibility indexes. Request-local metadata reads reuse the FileState already hydrated by the visibility build. The Phalcon navigation part now completes before `get_symbol_sources`. Broad source lookup now stops at the response limit and reuses same-name range groups. This cuts the rejected `PHP_METHOD` source probes from about 40 seconds to about 6.5 seconds.
 
 Focused validation passed: `cargo fmt --check`, the persisted selector test, the six issue-1092 C++ identity tests, the global-field linkage regression, and `cargo clippy -p brokk-bifrost-analysis --all-targets -- -D warnings`. The policy skill is installed, but `list_policies` and `run_policy` are not registered in this task. The required policy result is therefore unavailable.
 
@@ -71,7 +78,7 @@ Change C++ header and implementation evidence in `cpp/identity.rs` to use `Impor
 
 Add a persisted C++ selector behavior test. It will query header and implementation definitions, render their selectors, and assert the canonical result and zero full hydrations.
 
-Give source-block collection an explicit byte budget for MCP requests. It must stop before it allocates all source blocks for a response that MCP will reject. It must keep the existing error contract: an oversized request returns `InvalidParams`, not partial source text.
+Give source-block collection an explicit byte budget for MCP requests. It must stop before it allocates all source blocks for a response that MCP will reject. It must keep the existing error contract: an oversized request returns `InvalidParams`, not partial source text. Cache the `definitions(fq_name)` ranges by source during one source request so a broad macro lookup does not repeat the same candidate scan for every resolved file.
 
 ## Concrete Steps
 

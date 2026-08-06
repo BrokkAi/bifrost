@@ -307,7 +307,13 @@ fn issue_1431_source_block_end_line_counts_cr_only_terminators() {
         .into_iter()
         .find(|unit| unit.fq_name().contains(".m"))
         .expect("method unit");
-    let blocks = super::sources::source_blocks_for_resolved_units(&analyzer, &[unit]);
+    let blocks = get_symbol_sources(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec![unit.fq_name()],
+        },
+    )
+    .sources;
     let block = blocks
         .iter()
         .find(|block| block.text.contains("public void m"))
