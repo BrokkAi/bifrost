@@ -512,3 +512,22 @@ else the language's unit pins are the evidence (Ruby/Kotlin precedent).
   entry states -- 79 items / ~2,749 lines of `get_definition/rust.rs` closure that
   names `IAnalyzer` in 28 members and `RustAnalyzer` by value in 18 -- which the
   `ResolutionSession` lowering does not touch.
+- 2026-08-06 (Js-1): the js_ts prerequisite pass landed (b60cdc87). Two census
+  dispositions were amended during it. (1) `ReceiverFactContext` and
+  `ReceiverFactsFactory` do NOT lower to core, revising the census 3.3
+  disposition: they carry `&dyn IAnalyzer` because the js_ts candidate
+  resolvers reach `cached_jsts_index` (a `resolve_analyzer` downcast) and
+  `type_alias_provider`, and neither has a `CodeUnitIndex` spelling. Revised
+  rule: they are SPI, shim-side permanently, exactly like `LanguageSupport`;
+  the `JsTsReceiverFacts` impl becomes a thin boundary adapter and the logic
+  moves as host-parameterized free functions (the Cpp-2 shim pattern). The
+  four data-carrying companions (`ReceiverFileFacts`, `ReceiverFileSetup`,
+  `ReceiverFileCtx`, `ReceiverFacts`) did lower, as did the bounded walk.
+  (2) Census 3.1 understated `ts_resolve_type_text_to_property_owners` by
+  ~10x: its transitive closure is 64 items / ~1,600 LOC (the
+  `ts_expression_property_owners` cluster), not a verbatim function move.
+  Js-1b clears it as a dedicated pass: cluster to `js_ts/ts_owners.rs`,
+  re-parameterized onto `JsTsAnalyzerHost`, with one shared
+  `resolve_js_ts_host` downcast helper at route boundaries and a host-based
+  `cached_jsts_index_for_host` beside the downcasting framework wrapper.
+  This is the same single blocker behind both Js-1 STOPs.
