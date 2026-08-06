@@ -1,3 +1,4 @@
+use crate::analyzer::cpp::cpp_export_macro_token;
 use crate::analyzer::declaration_range::node_for_exact_range;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::usages::common::same_node;
@@ -3526,6 +3527,127 @@ impl<'a> VisibilityIndex<'a> {
         }
     }
 
+    pub(super) fn structured_class_alias_resolves_to_target(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        visible_from: &ProjectFile,
+        alias: &CodeUnit,
+        target: &CodeUnit,
+    ) -> bool {
+        let Some(owner) = type_owner_of(analyzer, alias).filter(CodeUnit::is_class) else {
+            return false;
+        };
+        let Some(alias_target) = self.structured_alias_target(analyzer, alias) else {
+            return false;
+        };
+        let StructuredAliasTarget::Named {
+            components, global, ..
+        } = &alias_target
+        else {
+            return false;
+        };
+        let lexical_scope = canonical_cpp_scope_components(&owner);
+        match self.resolve_type_components_lexically_for_target(
+            analyzer,
+            visible_from,
+            components,
+            *global,
+            &lexical_scope,
+            target,
+        ) {
+            LexicalTypeResolution::Resolved {
+                unit, candidates, ..
+            } => {
+                same_visible_symbol(&unit, target)
+                    || self.same_template_member_identity(analyzer, &unit, target)
+                    || candidates.iter().any(|candidate| {
+                        same_visible_symbol(candidate, target)
+                            || self.same_template_member_identity(analyzer, candidate, target)
+                    })
+            }
+            LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {
+                self.structured_alias_primary_preserves_target(
+                    analyzer,
+                    visible_from,
+                    alias,
+                    target,
+                ) || self.flattened_macro_namespace_alias_target_matches(
+                    analyzer,
+                    visible_from,
+                    alias,
+                    &alias_target,
+                    target,
+                )
+            }
+        }
+    }
+
+    fn flattened_macro_namespace_alias_target_matches(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        visible_from: &ProjectFile,
+        alias: &CodeUnit,
+        alias_target: &StructuredAliasTarget,
+        target: &CodeUnit,
+    ) -> bool {
+        let StructuredAliasTarget::Named {
+            components,
+            global: false,
+            arguments: None,
+        } = alias_target
+        else {
+            return false;
+        };
+        let Some((target_name, namespace_components)) = components.split_last() else {
+            return false;
+        };
+        if namespace_components.is_empty()
+            || target_name != target.identifier()
+            || alias.source() != target.source()
+            || alias.source() != visible_from
+            || !target.is_class()
+            || declared_type_alias(analyzer, target)
+        {
+            return false;
+        }
+        if self
+            .resolve_structured_alias_target(visible_from, alias, alias_target)
+            .is_some()
+        {
+            return false;
+        }
+
+        let alias_ranges = analyzer.ranges(alias);
+        let target_ranges = analyzer.ranges(target);
+        if alias_ranges.is_empty() || target_ranges.is_empty() {
+            return false;
+        }
+        let alias_start = alias_ranges
+            .iter()
+            .map(|range| range.start_byte)
+            .min()
+            .expect("non-empty alias ranges have a minimum");
+        let Some(prepared) = self.cpp.prepared_syntax(target.source()) else {
+            return false;
+        };
+        let root = prepared.tree().root_node();
+        let has_matching_declaration = target_ranges
+            .iter()
+            .filter(|range| range.end_byte <= alias_start)
+            .filter_map(|range| node_for_exact_range(root, range))
+            .any(|node| {
+                flattened_macro_namespace_components(node, prepared.source())
+                    .is_some_and(|recovered| recovered == namespace_components)
+            });
+        if !has_matching_declaration {
+            return false;
+        }
+
+        let alias_guards = declaration_guard_requirements(analyzer, self.cpp, alias);
+        let target_guards = declaration_guard_requirements(analyzer, self.cpp, target);
+        guard_requirement_sets_match(&alias_guards, &target_guards)
+    }
+
     pub(super) fn template_alias_arguments_preserve_target(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -3555,6 +3677,36 @@ impl<'a> VisibilityIndex<'a> {
         self.cpp_template_metadata
             .get(unit)
             .is_some_and(|metadata| !metadata.specialization_arguments.is_empty())
+    }
+
+    pub(super) fn same_template_owner_identity(&self, left: &CodeUnit, right: &CodeUnit) -> bool {
+        same_visible_symbol(left, right)
+            || self.compatible_primary_template_redeclarations(left, right)
+    }
+
+    pub(super) fn same_template_member_identity(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        left: &CodeUnit,
+        right: &CodeUnit,
+    ) -> bool {
+        if same_visible_symbol(left, right) {
+            return true;
+        }
+        if left.kind() != right.kind()
+            || left.identifier() != right.identifier()
+            || left.signature() != right.signature()
+        {
+            return false;
+        }
+        let (Some(left_owner), Some(right_owner)) =
+            (analyzer.parent_of(left), analyzer.parent_of(right))
+        else {
+            return false;
+        };
+        left_owner.is_class()
+            && right_owner.is_class()
+            && self.same_template_owner_identity(&left_owner, &right_owner)
     }
 
     fn unique_canonical_type_candidate(
@@ -3717,6 +3869,15 @@ impl<'a> VisibilityIndex<'a> {
                     .then(|| target.clone())
                     .or_else(|| current.is_class().then_some(current));
             };
+            if self.flattened_macro_namespace_alias_target_matches(
+                analyzer,
+                visible_from,
+                &current,
+                &alias_target,
+                target,
+            ) {
+                return Some(target.clone());
+            }
             if matches!(alias_target, StructuredAliasTarget::Builtin) {
                 return matched_target
                     .then(|| target.clone())
@@ -3735,6 +3896,9 @@ impl<'a> VisibilityIndex<'a> {
                 && (same_visible_symbol(&primary, target)
                     || self.compatible_primary_template_redeclarations(&primary, target))
             {
+                return Some(target.clone());
+            }
+            if same_visible_symbol(&current, target) {
                 return Some(target.clone());
             }
             if self.cpp_template_metadata.contains_key(&current) {
@@ -3824,9 +3988,7 @@ impl<'a> VisibilityIndex<'a> {
         raw_name: &str,
     ) -> Option<CodeUnit> {
         let normalized = normalize_reference_name(raw_name)?;
-        if !normalized.contains("::")
-            && let Some(namespace) = cpp_namespace_for(declaration)
-        {
+        if let Some(namespace) = cpp_namespace_for(declaration) {
             for prefix in namespace_prefixes(&namespace) {
                 let qualified = format!("{prefix}::{normalized}");
                 let candidates = self.type_candidates(visible_from, &qualified);
@@ -5883,6 +6045,186 @@ fn flattened_macro_namespace_declaration_matches(
         })
 }
 
+fn flattened_macro_namespace_components(
+    declaration: Node<'_>,
+    source: &str,
+) -> Option<Vec<String>> {
+    flattened_macro_function_namespace_components(declaration, source)
+        .or_else(|| flattened_macro_error_namespace_components(declaration, source))
+}
+
+fn flattened_macro_function_namespace_components(
+    declaration: Node<'_>,
+    source: &str,
+) -> Option<Vec<String>> {
+    let body = declaration
+        .parent()
+        .filter(|parent| parent.kind() == "compound_statement")?;
+    let function = body
+        .parent()
+        .filter(|parent| parent.kind() == "function_definition" && parent.has_error())?;
+    if function.child_by_field_name("body") != Some(body) {
+        return None;
+    }
+    let mut cursor = function.walk();
+    let prefix = function
+        .named_children(&mut cursor)
+        .take_while(|child| child.start_byte() < body.start_byte())
+        .filter(|child| child.kind() != "comment")
+        .collect::<Vec<_>>();
+    let begin_index = prefix.iter().rposition(|child| {
+        flattened_macro_sentinel_name(*child, source)
+            .is_some_and(|name| name.ends_with("NAMESPACE_BEGIN"))
+    })?;
+    let mut identifiers = Vec::new();
+    let mut stack = prefix[begin_index + 1..]
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
+    while let Some(current) = stack.pop() {
+        if let Some(identifier) = direct_cpp_identifier_name(current, source) {
+            identifiers.push(identifier);
+            continue;
+        }
+        let mut cursor = current.walk();
+        let children = current.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    let [keyword, namespace_name] = identifiers.as_slice() else {
+        return None;
+    };
+    if keyword != "namespace" || namespace_name.is_empty() || cpp_export_macro_token(namespace_name)
+    {
+        return None;
+    }
+    let mut next = function.next_named_sibling();
+    let next = loop {
+        let candidate = next?;
+        next = candidate.next_named_sibling();
+        if candidate.kind() != "comment" {
+            break candidate;
+        }
+    };
+    if !flattened_macro_sentinel_name(next, source)
+        .is_some_and(|name| name.ends_with("NAMESPACE_END"))
+    {
+        return None;
+    }
+    let mut components = enclosing_namespace_components(declaration, source)?;
+    components.push(namespace_name.clone());
+    Some(components)
+}
+
+fn flattened_macro_error_namespace_components(
+    declaration: Node<'_>,
+    source: &str,
+) -> Option<Vec<String>> {
+    let parent = declaration
+        .parent()
+        .filter(|parent| parent.kind() == "ERROR" && parent.has_error())?;
+    let mut cursor = parent.walk();
+    let siblings = parent.named_children(&mut cursor).collect::<Vec<_>>();
+    let declaration_index = siblings
+        .iter()
+        .position(|candidate| same_node(*candidate, declaration))?;
+    let begin_index = (0..declaration_index).rev().find(|index| {
+        flattened_macro_sentinel_name(siblings[*index], source)
+            .is_some_and(|name| name.ends_with("NAMESPACE_BEGIN"))
+    })?;
+
+    let significant = siblings[begin_index + 1..declaration_index]
+        .iter()
+        .copied()
+        .filter(|node| node.kind() != "comment")
+        .collect::<Vec<_>>();
+    let [namespace_keyword, namespace_name, ..] = significant.as_slice() else {
+        return None;
+    };
+    if direct_cpp_identifier_name(*namespace_keyword, source).as_deref() != Some("namespace") {
+        return None;
+    }
+    let namespace_name = flattened_macro_namespace_name(*namespace_name, source)?;
+    if significant[2..].iter().any(|node| {
+        flattened_macro_sentinel_name(*node, source).is_some_and(|name| {
+            name.ends_with("NAMESPACE_BEGIN") || name.ends_with("NAMESPACE_END")
+        })
+    }) {
+        return None;
+    }
+
+    let mut saw_namespace_close = false;
+    for sibling in siblings.iter().skip(declaration_index + 1).copied() {
+        if sibling.kind() == "comment" {
+            continue;
+        }
+        if !saw_namespace_close {
+            if direct_unmatched_closing_brace(sibling) {
+                saw_namespace_close = true;
+                continue;
+            }
+            if flattened_macro_sentinel_name(sibling, source).is_some() {
+                return None;
+            }
+            continue;
+        }
+        if !flattened_macro_sentinel_name(sibling, source)
+            .is_some_and(|name| name.ends_with("NAMESPACE_END"))
+        {
+            return None;
+        }
+        let mut components = enclosing_namespace_components(declaration, source)?;
+        components.push(namespace_name);
+        return Some(components);
+    }
+    None
+}
+
+fn flattened_macro_sentinel_name(node: Node<'_>, source: &str) -> Option<String> {
+    let candidate = direct_cpp_identifier_name(node, source).or_else(|| {
+        node.child_by_field_name("type")
+            .and_then(|type_node| direct_cpp_identifier_name(type_node, source))
+    })?;
+    (cpp_export_macro_token(&candidate)
+        && (candidate.ends_with("NAMESPACE_BEGIN") || candidate.ends_with("NAMESPACE_END")))
+    .then_some(candidate)
+}
+
+fn flattened_macro_namespace_name(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "ERROR" || node.named_child_count() != 1 {
+        return None;
+    }
+    let name = direct_cpp_identifier_name(node.named_child(0)?, source)?;
+    (!cpp_export_macro_token(&name)).then_some(name)
+}
+
+fn direct_cpp_identifier_name(node: Node<'_>, source: &str) -> Option<String> {
+    if !matches!(
+        node.kind(),
+        "identifier" | "namespace_identifier" | "type_identifier"
+    ) {
+        return None;
+    }
+    let name = normalize_cpp_whitespace(node_text(node, source));
+    (!name.is_empty()).then_some(name)
+}
+
+fn guard_requirement_sets_match(
+    left: &[(usize, HashSet<PreprocessorGuard>)],
+    right: &[(usize, HashSet<PreprocessorGuard>)],
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(_, left_guards)| {
+            right
+                .iter()
+                .any(|(_, right_guards)| left_guards == right_guards)
+        })
+        && right.iter().all(|(_, right_guards)| {
+            left.iter()
+                .any(|(_, left_guards)| right_guards == left_guards)
+        })
+}
+
 fn macro_displaced_cpp_return_type(declaration: Node<'_>, source: &str) -> bool {
     let Some(type_node) = declaration.child_by_field_name("type") else {
         return false;
@@ -6285,19 +6627,33 @@ fn decode_structured_alias_target(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
 ) -> Option<StructuredAliasTarget> {
-    let declaration = analyzer.get_source(unit, false)?;
+    analyzer
+        .get_source(unit, false)
+        .and_then(|declaration| decode_structured_alias_target_source(unit, &declaration, true))
+        .or_else(|| {
+            let signature = unit.signature()?;
+            decode_structured_alias_target_source(unit, signature, false)
+        })
+}
+
+fn decode_structured_alias_target_source(
+    unit: &CodeUnit,
+    declaration: &str,
+    require_top_level: bool,
+) -> Option<StructuredAliasTarget> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
         .ok()?;
-    let tree = parser.parse(&declaration, None)?;
+    let tree = parser.parse(declaration, None)?;
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         let type_node = match node.kind() {
             "type_definition" => {
-                if node
-                    .parent()
-                    .is_none_or(|parent| parent.kind() != "translation_unit")
+                if require_top_level
+                    && node
+                        .parent()
+                        .is_none_or(|parent| parent.kind() != "translation_unit")
                 {
                     let mut cursor = node.walk();
                     stack.extend(node.named_children(&mut cursor));
@@ -6307,22 +6663,23 @@ fn decode_structured_alias_target(
                 let declares_unit = node
                     .children_by_field_name("declarator", &mut declarator_cursor)
                     .any(|declarator| {
-                        extract_typedef_declarator_name(declarator, &declaration)
+                        extract_typedef_declarator_name(declarator, declaration)
                             .is_some_and(|name| name == unit.identifier())
                     });
                 declares_unit.then(|| node.child_by_field_name("type"))??
             }
             "alias_declaration" => {
-                if node
-                    .parent()
-                    .is_none_or(|parent| parent.kind() != "translation_unit")
+                if require_top_level
+                    && node
+                        .parent()
+                        .is_none_or(|parent| parent.kind() != "translation_unit")
                 {
                     let mut cursor = node.walk();
                     stack.extend(node.named_children(&mut cursor));
                     continue;
                 }
                 let name = node.child_by_field_name("name")?;
-                (node_text(name, &declaration) == unit.identifier())
+                (node_text(name, declaration) == unit.identifier())
                     .then(|| node.child_by_field_name("type"))??
             }
             _ => {
@@ -6331,7 +6688,7 @@ fn decode_structured_alias_target(
                 continue;
             }
         };
-        return structured_alias_type_target(type_node, &declaration);
+        return structured_alias_type_target(type_node, declaration);
     }
     None
 }
@@ -9458,6 +9815,61 @@ mod tests {
                 ],
             },
         }
+    }
+
+    fn first_enum_flattened_namespace(source: &str) -> Option<Vec<String>> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("C++ fixture tree");
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "enum_specifier" {
+                return flattened_macro_namespace_components(node, source);
+            }
+            let mut cursor = node.walk();
+            let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+            stack.extend(children.into_iter().rev());
+        }
+        None
+    }
+
+    #[test]
+    fn flattened_namespace_scope_requires_a_complete_sentinel_envelope() {
+        let complete = r#"NLOHMANN_JSON_NAMESPACE_BEGIN
+namespace detail
+{
+enum class value_t { null };
+}
+NLOHMANN_JSON_NAMESPACE_END
+NLOHMANN_JSON_NAMESPACE_BEGIN
+namespace next
+{
+struct next_type {};
+}
+NLOHMANN_JSON_NAMESPACE_END
+"#;
+        assert_eq!(
+            first_enum_flattened_namespace(complete),
+            Some(vec!["detail".to_string()])
+        );
+
+        let stale_end = format!("NLOHMANN_JSON_NAMESPACE_END\n{complete}");
+        assert_eq!(
+            first_enum_flattened_namespace(&stale_end),
+            Some(vec!["detail".to_string()]),
+            "a stale end marker before the begin marker must not replace the intended namespace"
+        );
+
+        let incomplete = r#"NLOHMANN_JSON_NAMESPACE_BEGIN
+namespace detail
+{
+enum class value_t { null };
+}
+struct next_type {};
+"#;
+        assert_eq!(first_enum_flattened_namespace(incomplete), None);
     }
 
     #[test]
