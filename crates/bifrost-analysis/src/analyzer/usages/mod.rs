@@ -13,6 +13,7 @@
 //!   Java, Kotlin, C#, C++, Go, Ruby, and Scala targets.
 
 pub mod call_relations;
+pub mod call_shape;
 mod candidates;
 mod common;
 mod cpp_call_match;

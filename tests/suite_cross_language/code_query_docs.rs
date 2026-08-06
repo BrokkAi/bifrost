@@ -223,10 +223,7 @@ fn query_documentation_tracks_public_contracts() {
     let python_client_source = fs::read_to_string(root.join("bifrost_searchtools/client.py"))
         .expect("read Python client source");
     for required in [
-        "schema version 12",
-        "schema version 11",
-        "schema version 10",
-        "schema version 9",
+        "Version ``1`` is the only supported",
         "occurrence_target",
         "reaching_binding",
         "candidates_of",

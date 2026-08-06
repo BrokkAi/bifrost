@@ -47,6 +47,8 @@ mod usages_cpp_return_tag_shadow_test;
 mod usages_cpp_sentinel_visibility_test;
 mod usages_cpp_source_location_test;
 mod usages_cpp_type_visibility_test;
+mod usages_cpp_wuffs_alias_test;
+mod usages_cpp_wuffs_qualifier_test;
 mod usages_csharp_graph_test;
 mod usages_finder_fallback_test;
 mod usages_go_graph_test;

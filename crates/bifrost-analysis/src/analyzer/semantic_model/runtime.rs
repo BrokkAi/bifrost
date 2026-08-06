@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use semver::{Version, VersionReq};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -100,7 +101,8 @@ pub struct SemanticModelActivationRequest {
     pub limits: SemanticModelRuntimeLimits,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SemanticModelActivationStatus {
     Active,
     Disabled,
@@ -111,7 +113,8 @@ pub enum SemanticModelActivationStatus {
     Unavailable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticModelActivationExplanation {
     pub manifest_digest: String,
     pub pack_id: Option<String>,
@@ -122,7 +125,8 @@ pub struct SemanticModelActivationExplanation {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticModelActivationReport {
     pub explanations: Vec<SemanticModelActivationExplanation>,
     pub suppressed_explanations: usize,
@@ -135,7 +139,8 @@ pub struct SemanticModelActivationReport {
     pub phase_measurements: SemanticModelActivationPhaseMeasurements,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticModelActivationPhaseMeasurements {
     pub selection_nanos: u64,
     pub decode_hydration_nanos: u64,
@@ -842,7 +847,8 @@ pub enum SemanticModelResolutionOutcome {
     Unavailable(SemanticModelActivationReport),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SemanticModelRuntimeLifecycle {
     Cached,
     Built,
