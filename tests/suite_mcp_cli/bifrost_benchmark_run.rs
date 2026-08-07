@@ -378,7 +378,7 @@ definition_queries = [
         );
         assert!(trace.contains("iteration=1"), "trace: {trace}");
         assert!(trace.contains("[bifrost-timing]"), "trace: {trace}");
-        combined_traces.push_str(&trace);
+        combined_traces.push_str(trace);
     }
     for expected in [
         "SearchToolsService::snapshot_for_query",
