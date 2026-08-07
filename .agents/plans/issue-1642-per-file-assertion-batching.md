@@ -19,7 +19,7 @@ Observable outcome: a two-file test project where one file fits a deliberately t
 - [x] (2026-08-07) Milestone 1: restructured `evaluate_assertion_policy` into a per-file loop with per-file completion accounting; added the missing non-empty-path assert to `assertion_generation_query`. `cargo test -p brokk-bifrost-policy` (294 tests) and the 22-test `policy_loop_invariant` suite pass unchanged.
 - [x] (2026-08-07) Milestone 2: four behavior tests in `tests/suite_bench_policy/policy_assertion_per_file_completion.rs` (degradation, multi-file Complete, per-file capability gap, vacuous empty), registered in `main.rs` and the harness manifest. Written by an Opus subagent, reviewed and tightened (helper renamed to say what it asserts; the widened-rule `replace` now asserts it actually changed the fixture text).
 - [x] (2026-08-07) Milestone 3: full `suite_bench_policy` (321 passed), `cargo test -p brokk-bifrost-policy` (294 passed), fmt, and featureless `cargo clippy --workspace --all-targets -- -D warnings` clean. All-features clippy runs before push.
-- [ ] Milestone 4: workspace-scale measurement on this repository (release build), recorded here; decides whether latency needs follow-up work beyond conclusiveness.
+- [x] (2026-08-07) Milestone 4: workspace-scale measurement done (release build); numbers in Artifacts and Notes. The #1642 mechanism is fixed and the 68m49s latency is gone (gate now 28s), but the candidate rule still cannot conclude on this repository for a *different*, newly isolated reason - the subject query's first union branch starves under the fair seed budget waterfall - filed as #1766 with the full evidence. Five naive pack rules are inconclusive at head for the same reason, so #1766 gates #1598's flip.
 
 ## Surprises & Discoveries
 
@@ -60,7 +60,11 @@ Observable outcome: a two-file test project where one file fits a deliberately t
 
 ## Outcomes & Retrospective
 
-To be written as milestones complete.
+All four milestones are done. The #1642 mechanism - single-pipeline row materialization exhausting one shared budget across all subject files - is fixed and proven: the evaluator batches per file with per-file completion accounting, a file that cannot conclude degrades only itself by name, and the degradation semantics are pinned by four behavior tests. The workspace measurement confirms it: no run reports `pipeline_row_budget` any more, and the release gate dropped from 68m49s to 28s.
+
+What the measurement then exposed is that conclusiveness on this repository has a second, independent blocker that the hour-long runtime had been masking: the first union branch of a multi-language subject scan starves under the fair seed budget waterfall (filed as #1766, with the naive pack rules now equally affected at head). #1598's flip therefore remains gated, but on a precisely characterized engine issue rather than on assertion evaluation.
+
+Lessons: (1) the acceptance run is worth doing even when the unit proof is dense - it converted "assertion evaluation is slow and inconclusive" into two separable causes with one fixed and one filed; (2) an early-return that drops the underlying query's diagnostics turns a five-minute diagnosis into a detour - completion reasons alone (`partial_discovery`) were too coarse to name the cause.
 
 ## Context and Orientation
 
@@ -133,7 +137,15 @@ The restructure is a single-function rewrite guarded by an unusually dense behav
 
 ## Artifacts and Notes
 
-The blocking measurement being fixed, from issue #1642: release-build pack run 68m49s wall / 2808s user, exit 2, rule `inconclusive` with `pipeline_row_budget` + `partial_discovery`, "assertion evaluation could not observe a complete row set"; per-crate probes 6s (debug, single rule, `crates/bifrost-core`) vs 2.3s for the naive rules. Milestone 4 records the post-change numbers here.
+The blocking measurement being fixed, from issue #1642: release-build pack run 68m49s wall / 2808s user, exit 2, rule `inconclusive` with `pipeline_row_budget` + `partial_discovery`, "assertion evaluation could not observe a complete row set"; per-crate probes 6s (debug, single rule, `crates/bifrost-core`) vs 2.3s for the naive rules.
+
+Milestone 4 measurements (2026-08-07, release build, Apple Silicon, this change at `79feb64b6`):
+
+    probe  candidate rule only, --root crates/bifrost-core   0.41s wall, complete, 0 findings, exit 0
+    rule   candidate rule only, whole repository             10s wall, inconclusive [partial_discovery]
+    gate   full pack + candidate rule, whole repository      28.4s wall / 44.5s user, exit 2
+
+The 68-minute latency and the `pipeline_row_budget` reason are both gone: no run reports `pipeline_row_budget` anywhere, which is the #1642 mechanism fixed. The remaining `partial_discovery` is a *different*, pre-existing cause isolated during this milestone: the subject query's five-language union caps its first branch (Rust) at 1/5 of the fact-node budget under the `FairSeedBudgetCoordinator` forward waterfall (`crates/bifrost-analysis/src/analyzer/structural/search/mod.rs`), and the Rust branch is rejected at ~403k of 2M facts while the four near-idle branches hold the rest. Reproduced directly with `--query-file` on the rule's selector: `execution_budget_exhausted` "after scanning 174 files, 4481510 bytes, 403158 facts". Five naive built-in rules (`sort-in-loop` among them, 122 findings) are `inconclusive` with `partial_discovery` at head for the same reason - a regression since the 2026-08-05 gate, where the naive rules concluded. Filed as #1766; it now gates the #1598 flip. The assertion evaluator's subject-incomplete early return also discards the subject query's own diagnostics (only the generic "could not observe a complete row set" survives), which is what made this diagnosis require the `--query-file` detour - worth folding into #1766's fix or a small follow-up.
 
 ## Interfaces and Dependencies
 
