@@ -449,6 +449,100 @@ mod tests {
         }
     }
 
+    /// A dependency whose rustdoc run saw `produced` while Cargo resolves
+    /// `resolved`.
+    fn dependency_with_features(
+        path: PathBuf,
+        produced: &[&str],
+        resolved: &[&str],
+    ) -> ResolvedDependency {
+        let mut dependency = dependency(path, "derive");
+        dependency.provenance = produced
+            .iter()
+            .map(|feature| DependencyProvenance {
+                key: "cargo.feature".to_owned(),
+                value: (*feature).to_owned(),
+            })
+            .chain(resolved.iter().map(|feature| DependencyProvenance {
+                key: "cargo.metadata_feature".to_owned(),
+                value: (*feature).to_owned(),
+            }))
+            .collect();
+        dependency
+    }
+
+    fn prepared_completeness(dependency: &ResolvedDependency) -> (Completeness, Vec<String>) {
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &RustDependencyPackAdapter,
+            std::slice::from_ref(dependency),
+            &DependencyPackLimits::default(),
+            None,
+        );
+        let pack = prepared
+            .packs
+            .first()
+            .expect("one dependency produces one pack");
+        (
+            pack.completeness,
+            prepared
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.clone())
+                .collect(),
+        )
+    }
+
+    /// A pack produced without a feature Cargo resolves is missing whatever
+    /// that feature gates, so it must not be trusted to prove an item absent
+    /// (#1625). Recording it partial is how that reaches the diagnostic ladder.
+    #[test]
+    fn a_pack_built_without_a_resolved_feature_is_recorded_partial() {
+        let root = tempfile::tempdir().unwrap();
+        let rustdoc_path = root.path().join("widget.json");
+        fs::write(
+            &rustdoc_path,
+            serde_json::to_vec(&rustdoc_document(false)).unwrap(),
+        )
+        .unwrap();
+
+        let (completeness, codes) = prepared_completeness(&dependency_with_features(
+            rustdoc_path.clone(),
+            &["derive"],
+            &["derive", "serde"],
+        ));
+        assert_eq!(Completeness::Partial, completeness);
+        assert!(
+            codes
+                .iter()
+                .any(|code| code == "rust.rustdoc.feature_set_narrower_than_resolved"),
+            "{codes:#?}"
+        );
+    }
+
+    /// The converse, and the reason the test is containment rather than
+    /// equality: a pack built with *more* features than Cargo resolves still
+    /// documents everything the build can see, so it keeps its complete
+    /// surface and can still prove an item absent.
+    #[test]
+    fn a_pack_built_with_extra_features_keeps_its_complete_surface() {
+        let root = tempfile::tempdir().unwrap();
+        let rustdoc_path = root.path().join("widget.json");
+        fs::write(
+            &rustdoc_path,
+            serde_json::to_vec(&rustdoc_document(false)).unwrap(),
+        )
+        .unwrap();
+
+        let (completeness, codes) = prepared_completeness(&dependency_with_features(
+            rustdoc_path.clone(),
+            &["derive", "serde"],
+            &["derive"],
+        ));
+        assert_eq!(Completeness::Complete, completeness, "{codes:#?}");
+    }
+
     #[test]
     fn exact_rustdoc_pack_reuses_and_activates_without_adding_project_files() {
         let root = tempfile::tempdir().unwrap();
