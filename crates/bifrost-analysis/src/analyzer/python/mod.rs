@@ -11,7 +11,7 @@
 mod adapter;
 mod cache;
 mod clones;
-mod diagnostics;
+pub(crate) mod diagnostics;
 pub mod external;
 mod hierarchy;
 mod imports;
@@ -722,11 +722,7 @@ impl IAnalyzer for PythonAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
-        let diagnostics = diagnostics::collect_python_semantic_diagnostics(self, file, source)
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(file, diagnostics)
+        diagnostics::collect_python_semantic_diagnostics(self, file, source)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

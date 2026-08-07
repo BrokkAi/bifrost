@@ -1123,6 +1123,18 @@ impl IAnalyzer for MultiAnalyzer {
                 self, file, source,
             );
         }
+        // Python's environment proof lives on the analyzer a host activated
+        // packs against, which is this composite one and not the delegate. A
+        // request routed straight to the delegate would see no overlay and no
+        // discovery evidence, and would report every external import as an
+        // unknown boundary.
+        if language_for_file(file) == Language::Python
+            && self.delegates.contains_key(&Language::Python)
+        {
+            return crate::analyzer::python::diagnostics::collect_python_semantic_diagnostics(
+                self, file, source,
+            );
+        }
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().semantic_diagnostics(file, source))
             .unwrap_or_default()

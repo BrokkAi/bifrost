@@ -422,6 +422,44 @@ impl DependencyDiscoveryEvidence {
     }
 }
 
+/// What retained discovery evidence says about one module path when nothing
+/// indexed it.
+///
+/// Resolution-trace boundary refinement and proof-gated diagnostics ask the
+/// same question and must not answer it differently; they only render the
+/// answer differently. The trace collapses everything but "the build knows
+/// nothing about this" into `ExternalDeclaredUnindexed`, while diagnostics
+/// keep truncation apart from a declared-but-unindexed distribution because
+/// the two carry different typed suppression reasons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedDiscoveryVerdict {
+    /// No discovery has run against this analyzer, so nothing is retained.
+    NoDiscovery,
+    /// Discovery could not read everything the build declared, so a miss is
+    /// not proof that the build declares nothing.
+    Truncated,
+    /// The build declares this module, or a module containing it.
+    Declared,
+    /// Discovery ran completely and the build declares nothing containing it.
+    Undeclared,
+}
+
+/// Classify `module_path` against retained discovery evidence. This reads what
+/// the analyzer already holds; it never starts discovery.
+pub fn retained_discovery_verdict(
+    evidence: Option<&DependencyDiscoveryEvidence>,
+    module_path: &str,
+) -> RetainedDiscoveryVerdict {
+    match evidence {
+        None => RetainedDiscoveryVerdict::NoDiscovery,
+        Some(evidence) if evidence.truncated() => RetainedDiscoveryVerdict::Truncated,
+        Some(evidence) if evidence.declares_module_path(module_path) => {
+            RetainedDiscoveryVerdict::Declared
+        }
+        Some(_) => RetainedDiscoveryVerdict::Undeclared,
+    }
+}
+
 /// Read retained discovery evidence for a diagnostic request. A missing value
 /// is incomplete external evidence. This function never starts discovery.
 pub fn dependency_discovery_incomplete_reasons(

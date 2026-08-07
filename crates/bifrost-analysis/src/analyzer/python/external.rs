@@ -471,6 +471,9 @@ struct PythonApiCollector<'a, 'd> {
     diagnostics: &'d mut BoundedProducerDiagnostics,
     types: Vec<TypeFact>,
     members: Vec<MemberFact>,
+    /// `owner.name` for every binding an import already contributed, so a
+    /// conditional import cannot mint one member identity twice.
+    imported_names: std::collections::HashSet<String>,
 }
 
 impl<'a, 'd> PythonApiCollector<'a, 'd> {
@@ -495,6 +498,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             diagnostics,
             types: Vec::new(),
             members: Vec::new(),
+            imported_names: std::collections::HashSet::new(),
         };
         collector.push_type(module.to_owned(), TypeKind::Module, Vec::new(), Vec::new());
         collector
@@ -523,6 +527,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                     self.visit_definition(&mut stack, node, None, owner, class_scope);
                 }
                 "expression_statement" => self.visit_assignment(node, &owner, class_scope),
+                "import_statement" | "import_from_statement" => self.visit_import(node, &owner),
                 "type_alias_statement" => self.visit_type_alias(node, &owner),
                 // Module control blocks do not make declarations dynamic by
                 // themselves. The emitted pack remains a static surface and
@@ -657,6 +662,59 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             false,
             None,
         );
+    }
+
+    /// An import inside a module or class body binds a name on that surface:
+    /// `from .sessions import Session` in `requests/__init__.pyi` is how
+    /// `requests.Session` exists at all. One artifact is produced without a
+    /// view of the modules it imports, so the binding is recorded by name
+    /// alone. That is what an absence proof needs -- "does this surface bind
+    /// that name" -- and recording it is what makes a surface marked complete
+    /// actually complete.
+    ///
+    /// A wildcard binds a set this producer cannot enumerate, so it reports a
+    /// diagnostic instead, which makes the pack partial and stops the surface
+    /// from proving anything absent.
+    fn visit_import(&mut self, node: Node<'_>, owner: &str) {
+        for import in
+            brokk_bifrost_python::imports::python_import_infos_from_node(node, self.source)
+        {
+            if import.is_wildcard {
+                self.diagnostics.warning(
+                    "python.import.wildcard",
+                    Some(self.path.display().to_string()),
+                    format!(
+                        "`{}` binds names this producer cannot enumerate",
+                        import.raw_snippet.trim()
+                    ),
+                );
+                continue;
+            }
+            let Some(name) = import.local_name() else {
+                self.diagnostics.warning(
+                    "python.import.binding",
+                    Some(self.path.display().to_string()),
+                    format!("`{}` binds no single name", import.raw_snippet.trim()),
+                );
+                continue;
+            };
+            // Two branches of a `try`/`except ImportError` pair bind the same
+            // name; recording it twice would mint one identity twice and mark
+            // the surface ambiguous.
+            if !self
+                .imported_names
+                .insert(format!("{owner}.{name}", name = name))
+            {
+                continue;
+            }
+            self.push_member(
+                owner.to_owned(),
+                name.to_owned(),
+                MemberKind::Constant,
+                false,
+                None,
+            );
+        }
     }
 
     fn visit_type_alias(&mut self, node: Node<'_>, owner: &str) {
