@@ -188,9 +188,9 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - Decision: The next campaign builds one analyzer cache per repository, not one cache per evaluation. This decision came from the owner as an instruction during the original campaign setup, but no prior Decision Log entry records it, and the built artifact is a single 96 GiB `bifrost_cache.v15.db` holding every repository's rows.
   Rationale: The 2026-08-07 latency investigation showed the merged database makes the dominant slow query worse: the `instr()` suffix scan covers all 8.3 million C++ rows across every prewarmed repository and filters to the current workspace with a per-row active-blob `EXISTS`, so an Envoy task pays to scan and discard Firefox, Chromium, and gcc rows. A per-repository database shrinks that scan to the repository's own rows, removes cross-repository writer contention on one WAL file, and fits each task's page-cache working set inside the 8 GiB container memory limit instead of competing for one 96 GiB footprint. Per-repository is also Bifrost's native per-workspace cache model; the central shared directory was the deviation. This layout change does not replace the indexed-lookup fix for the scan itself: Firefox's own rows dominate the C++ table, so the two 1,200 s Firefox calls need the query fix regardless.
   Date/Author: 2026-08-07 / Jonathan (instruction), recorded by Fable
-- Decision: Task containers must mount the shared analyzer cache read-only.
-  Rationale: The Idempotence section already required read-only task access, but `codescalebench_agent_engine.py` bind-mounts the cache with `read_only` defaulting to false, so all 10 concurrent task Bifrost processes held writer connections to one WAL database, and the r12 relaunch demonstrably wrote to the WAL during the run. This is a brokkbench fix, tracked as its own workstream.
-  Date/Author: 2026-08-07 / Fable
+- Decision: Task containers keep read-write access to the analyzer cache. The Idempotence section's older "read-only task runs" language is superseded, not the engine.
+  Rationale: Read-only mounts would make complete prewarm a hard precondition and would break tasks that modify files, because incremental analysis must write rows for changed or missing blobs. The 2026-08-07 investigation measured writer contention as a minor term (total concurrency overhead at most 1.3x, dominated by the query defect, not locking), so the read-write mount was not the harm it first appeared to be. The per-repository cache decision above removes most residual writer overlap structurally: concurrent tasks on different repositories write disjoint databases. Known accepted side effect: when two concurrent tasks share one repository, an earlier task's writes can warm rows for a later task, a small ordering wrinkle in comparability rather than a defect.
+  Date/Author: 2026-08-07 / Jonathan (instruction), recorded by Fable
 
 ## Outcomes & Retrospective
 
@@ -251,7 +251,7 @@ If synthetic semantic injection is required, its trace must show the synthetic r
 
 ## Idempotence and Recovery
 
-Dataset audits and reports write to new versioned paths. Rerunning them must replace only derived outputs. Do not delete prior model runs. A stopped evaluation restarts in a new arm directory. Shared Bifrost cache access remains serialized for writers. Read-only task runs can share the database.
+Dataset audits and reports write to new versioned paths. Rerunning them must replace only derived outputs. Do not delete prior model runs. A stopped evaluation restarts in a new arm directory. Task containers keep read-write cache access so incremental analysis can fill missing or changed rows; the per-repository cache layout (see the Decision Log) limits concurrent writers to tasks that share one repository.
 
 The CodeScaleBench checkout contains an untracked `grep_hard/` directory. Do not commit or push it until the audit proves the intended files and the correct repository branch is available.
 
