@@ -100,6 +100,76 @@ fn census_seed_stays_silent_without_a_same_file_declaration() {
     );
 }
 
+fn js_census_differential(
+    files: &[(&str, &str)],
+) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {
+    let mut project = InlineTestProject::with_language(Language::JavaScript);
+    for (path, source) in files {
+        project = project.file(path, *source);
+    }
+    let project = project.build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    run_reference_differential(
+        workspace.analyzer(),
+        &ReferenceDifferentialConfig {
+            corpus_language: "js".to_string(),
+            max_files: 20,
+            max_sites: 1_000,
+            max_candidates_per_file: 1_000,
+            max_source_bytes: 100_000,
+            max_targets: 1_000,
+            max_usage_files: 20,
+            max_usages: 1_000,
+            probe_seed: ProbeSeed::Census,
+            ..ReferenceDifferentialConfig::default()
+        },
+    )
+    .expect("run inline JavaScript census differential")
+}
+
+/// A Flow-typed `.js` file parsed with the plain JavaScript grammar loses its
+/// whole class declaration to tree-sitter error recovery. The census must grade
+/// nothing from that region (#1784): the Flow class-property declaration name
+/// `registries` resolves by bare name through the import binder to another
+/// module's export, which the differential would otherwise report as a missing
+/// reference. The intact part of the same file stays audited.
+#[test]
+fn census_seed_grades_nothing_from_a_misparsed_region() {
+    let install = concat!(
+        "import {registries} from './registries.js';\n",
+        "export default class Install {\n",
+        "  registries: Array<RegistryNames>;\n",
+        "  run(opts: {bailout: boolean}) {\n",
+        "    return registries(opts);\n",
+        "  }\n",
+        "}\n",
+    );
+    let census = js_census_differential(&[
+        ("src/registries.js", "export function registries() {}\n"),
+        ("src/install.js", install),
+    ]);
+
+    let misparsed_region = install
+        .find("export default")
+        .expect("start of the recovered region");
+    let graded: Vec<_> = census
+        .sites
+        .iter()
+        .filter(|site| site.path.ends_with("install.js") && site.start_byte >= misparsed_region)
+        .map(|site| (&site.text, site.start_byte, site.classification))
+        .collect();
+    assert!(
+        graded.is_empty(),
+        "no site may be graded from the ERROR region: {graded:#?}"
+    );
+
+    assert!(
+        census.summary.structured_candidates > 0,
+        "the census must still audit the file: {:#?}",
+        census.summary
+    );
+}
+
 fn rust_differential(
     files: &[(&str, &str)],
 ) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {

@@ -104,7 +104,9 @@ pub fn semantic_token_candidate_ranges(
 /// [`reference_candidate_ranges`] frontier never surfaces. Comment and string
 /// contents are excluded structurally, because they are not identifier-class
 /// leaf nodes. Declaration and local-binding occurrences are recorded here and
-/// filtered downstream by the engine (they are not usage probes).
+/// filtered downstream by the engine (they are not usage probes). Tree-sitter
+/// ERROR subtrees are excluded, because their identifiers are artifacts of
+/// error recovery rather than source occurrences the engine can grade.
 pub fn census_identifier_ranges(
     root: Node<'_>,
     language: Language,
@@ -133,6 +135,19 @@ fn collect_candidate_ranges(
     while let Some(node) = stack.pop() {
         if is_cancelled() {
             return None;
+        }
+        // Tree-sitter error recovery destroys the enclosing declaration nodes,
+        // so the identifiers it leaves behind describe the recovery, not the
+        // source: a Flow class-property name recovers as a bare
+        // `property_identifier` and a Flow type keyword recovers as an
+        // object-pattern binding. The census grades what it proposes, so it
+        // must stop at the ERROR subtree instead of grading misparse fallout.
+        // The test is per-subtree, not per-file: a locally recoverable ERROR
+        // leaves the rest of the file proposed. The index-filtered and
+        // semantic-token frontiers keep their existing reach, because the LSP
+        // still colors and resolves inside a broken edit.
+        if matches!(frontier, CandidateFrontier::Census) && node.is_error() {
+            continue;
         }
         let compound = matches!(
             frontier,
@@ -317,7 +332,7 @@ mod tests {
         ranges.into_iter().map(|range| range.start_byte).collect()
     }
 
-    fn census_offsets(language: Language, path: &str, source: &str) -> Vec<usize> {
+    fn census_ranges(language: Language, path: &str, source: &str) -> Vec<Range> {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
         let file = ProjectFile::new(&root, path);
@@ -328,7 +343,21 @@ mod tests {
         else {
             panic!("census budget exceeded for {language:?}");
         };
-        ranges.into_iter().map(|range| range.start_byte).collect()
+        ranges
+    }
+
+    fn census_offsets(language: Language, path: &str, source: &str) -> Vec<usize> {
+        census_ranges(language, path, source)
+            .into_iter()
+            .map(|range| range.start_byte)
+            .collect()
+    }
+
+    fn census_texts<'a>(language: Language, path: &str, source: &'a str) -> Vec<&'a str> {
+        census_ranges(language, path, source)
+            .into_iter()
+            .map(|range| &source[range.start_byte..range.end_byte])
+            .collect()
     }
 
     #[test]
@@ -361,6 +390,121 @@ mod tests {
                 "census dropped a reference-frontier candidate at {offset}: {go_census:?}"
             );
         }
+    }
+
+    /// Tree-sitter error recovery destroys enclosing declaration nodes: a
+    /// Flow-typed `.js` file parsed with the plain JavaScript grammar loses the
+    /// whole class declaration into one ERROR node. The identifiers inside it
+    /// are misparse fallout, not source references, so the census must not
+    /// propose them (#1784): `registries` is a Flow class-property declaration
+    /// name that forward resolution would chase through an import binder into
+    /// another module, and `boolean` is a Flow type keyword that the JavaScript
+    /// grammar mistakes for an object-pattern binding.
+    #[test]
+    fn census_skips_identifiers_inside_error_subtrees() {
+        let source = concat!(
+            "import {registries} from './registries.js';\n",
+            "export default class Install {\n",
+            "  registries: Array<RegistryNames>;\n",
+            "  run(opts: {bailout: boolean}) {\n",
+            "    return call(opts);\n",
+            "  }\n",
+            "}\n",
+        );
+        let offsets = census_offsets(Language::JavaScript, "install.js", source);
+        let flow_property = source
+            .find("registries: Array")
+            .expect("flow class property");
+        let flow_keyword = source.find("boolean").expect("misparsed flow type keyword");
+        for excluded in [flow_property, flow_keyword] {
+            assert!(
+                !offsets.contains(&excluded),
+                "identifier at byte {excluded} is inside an ERROR subtree and must not be proposed: {:?}",
+                census_texts(Language::JavaScript, "install.js", source)
+            );
+        }
+
+        // Recovery swallows everything from `export` through the closing brace
+        // into a single ERROR node, so the import specifier is the only intact
+        // identifier the file still has.
+        let import_specifier = source.find("registries").expect("import specifier");
+        assert_eq!(
+            offsets,
+            vec![import_specifier],
+            "only the ERROR-free import specifier may be proposed: {:?}",
+            census_texts(Language::JavaScript, "install.js", source)
+        );
+    }
+
+    /// A locally recoverable ERROR must not disqualify the rest of the file.
+    /// Here recovery consumes only `r:`; `P` recovers as a field definition and
+    /// the method body parses cleanly, so every neighbor stays proposed.
+    #[test]
+    fn census_keeps_neighbors_of_a_locally_recoverable_error() {
+        let source = concat!(
+            "class W {\n",
+            "  r: P;\n",
+            "  m() { return call(x); }\n",
+            "}\n",
+            "function after() { return other(); }\n",
+        );
+        let offsets = census_offsets(Language::JavaScript, "widget.js", source);
+        let annotation_name = source.find("r: P").expect("flow annotation name");
+        assert!(
+            !offsets.contains(&annotation_name),
+            "the annotation name inside the ERROR subtree must not be proposed: {:?}",
+            census_texts(Language::JavaScript, "widget.js", source)
+        );
+
+        let expected = vec![
+            source.find('W').expect("class name"),
+            source.find("P;").expect("recovered field definition"),
+            source.find("m()").expect("method name"),
+            source.find("call(x)").expect("call callee"),
+            source.find("x)").expect("call argument"),
+            source.find("after").expect("following function name"),
+            source.find("other()").expect("following call callee"),
+        ];
+        assert_eq!(
+            offsets,
+            expected,
+            "a local ERROR must leave the surrounding file proposed: {:?}",
+            census_texts(Language::JavaScript, "widget.js", source)
+        );
+    }
+
+    /// Tree-sitter MISSING nodes are zero-width fabricated tokens with no
+    /// source text. They need no dedicated frontier rule: the grammars insert
+    /// them as anonymous leaves that the named-child walk never visits, and the
+    /// non-empty range guard would reject them regardless. An inserted token
+    /// also does not contaminate its neighbors, so the real identifiers around
+    /// it stay proposed. Here the JavaScript grammar inserts a MISSING `)`.
+    #[test]
+    fn census_ignores_missing_tokens_without_dropping_their_neighbors() {
+        let source = concat!(
+            "function f() { return call(x; }\n",
+            "function after() { return other(); }\n",
+        );
+        let ranges = census_ranges(Language::JavaScript, "missing.js", source);
+        assert!(
+            ranges.iter().all(|range| range.start_byte < range.end_byte),
+            "a zero-width fabricated token must never become a candidate: {ranges:?}"
+        );
+
+        let offsets: Vec<usize> = ranges.iter().map(|range| range.start_byte).collect();
+        let expected = vec![
+            source.find("f()").expect("function name"),
+            source.find("call").expect("call callee"),
+            source.find("x;").expect("call argument"),
+            source.find("after").expect("following function name"),
+            source.find("other").expect("following call callee"),
+        ];
+        assert_eq!(
+            offsets,
+            expected,
+            "an inserted MISSING token must not disqualify its neighbors: {:?}",
+            census_texts(Language::JavaScript, "missing.js", source)
+        );
     }
 
     #[test]
