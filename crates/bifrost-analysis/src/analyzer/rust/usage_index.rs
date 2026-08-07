@@ -21,16 +21,13 @@ use tree_sitter::Node;
 use super::RustAnalyzer;
 use super::cargo_routes::{RustCargoRouteIndex, RustCargoRouteKind, RustCargoTargetRelation};
 use super::declarations::rust_package_name;
-use super::graph_support::{
-    rust_module_files_from_path, rust_module_files_from_segments,
-    rust_value_constructor_visibilities,
-};
+use super::graph_support::{rust_module_files_from_path, rust_module_files_from_segments};
 use super::imports::{
     RustImportOwner, RustProjectedImport, RustVisibility, resolve_rust_import_package_scoped,
     resolve_rust_module_path_with_crate, resolve_rust_module_segments_with_crate,
     rust_crate_root_package, rust_import_projection,
 };
-use super::usage_queries::RustUsageQueries;
+use super::usage_queries::{RustDeclarationFacts, RustUsageQueries, rust_declaration_facts};
 
 /// How a local binding in an importer refers to its target: a named import
 /// (`use path::Item;`) or a namespace import (`use crate::module;`). A glob
@@ -85,7 +82,7 @@ pub(crate) enum RustReferenceNamespace {
 }
 
 impl RustSymbolNamespace {
-    fn of(analyzer: &RustAnalyzer, declaration: &CodeUnit) -> Option<Self> {
+    pub(super) fn of(analyzer: &RustAnalyzer, declaration: &CodeUnit) -> Option<Self> {
         if analyzer.is_type_alias(declaration) {
             return Some(Self::Type);
         }
@@ -116,10 +113,10 @@ impl RustSymbolNamespace {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RustSymbolIdentity {
-    file: ProjectFile,
-    module: ModuleKey,
-    name: String,
-    namespace: RustSymbolNamespace,
+    pub(super) file: ProjectFile,
+    pub(super) module: ModuleKey,
+    pub(super) name: String,
+    pub(super) namespace: RustSymbolNamespace,
 }
 
 impl RustSymbolIdentity {
@@ -198,7 +195,18 @@ impl ModuleKey {
             && candidate.components.starts_with(&self.components)
     }
 
-    fn parent(&self) -> Option<Self> {
+    /// Heap bytes this key owns, for the memo cache's byte budget.
+    pub(super) fn weight_bytes(&self) -> usize {
+        self.crate_root.len()
+            + self
+                .components
+                .iter()
+                .map(|component| component.len() + std::mem::size_of::<String>())
+                .sum::<usize>()
+            + std::mem::size_of::<Self>()
+    }
+
+    pub(super) fn parent(&self) -> Option<Self> {
         let mut components = self.components.clone();
         components.pop()?;
         Some(Self {
@@ -207,7 +215,7 @@ impl ModuleKey {
         })
     }
 
-    fn with_suffix(&self, suffix: &[String]) -> Self {
+    pub(super) fn with_suffix(&self, suffix: &[String]) -> Self {
         let mut components = Vec::with_capacity(self.components.len() + suffix.len());
         components.extend(self.components.iter().cloned());
         components.extend(suffix.iter().cloned());
@@ -217,7 +225,7 @@ impl ModuleKey {
         }
     }
 
-    fn package(&self) -> String {
+    pub(super) fn package(&self) -> String {
         if self.crate_root.is_empty() {
             self.components.join(".")
         } else if self.components.is_empty() {
@@ -229,13 +237,23 @@ impl ModuleKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Domain {
+pub(super) enum Domain {
     Public,
     Crate(String),
     Module(ModuleKey),
 }
 
 impl Domain {
+    /// Heap bytes this domain owns, for the memo cache's byte budget.
+    pub(super) fn weight_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match self {
+                Self::Public => 0,
+                Self::Crate(crate_root) => crate_root.len(),
+                Self::Module(module) => module.weight_bytes(),
+            }
+    }
+
     fn contains_module(&self, importer: &ModuleKey) -> bool {
         match self {
             Self::Public => true,
@@ -244,7 +262,7 @@ impl Domain {
         }
     }
 
-    fn intersect(&self, other: &Self) -> Option<Self> {
+    pub(super) fn intersect(&self, other: &Self) -> Option<Self> {
         match (self, other) {
             (Self::Public, domain) | (domain, Self::Public) => Some(domain.clone()),
             (Self::Crate(left), Self::Crate(right)) => {
@@ -474,10 +492,6 @@ pub(super) struct RustUsageIndex {
     exports_by_file: HashMap<ProjectFile, ExportIndex>,
     importer_reverse: HashMap<ProjectFile, Vec<RustImportEdge>>,
     declaration_domains: HashMap<RustSymbolIdentity, Vec<Domain>>,
-    /// `declaration_domains` keys bucketed by identity name, so per-reference
-    /// resolution can look up the handful of same-named declarations instead of
-    /// scanning every declaration in the workspace.
-    identities_by_name: HashMap<String, Vec<RustSymbolIdentity>>,
     /// Importer files per imported module, derived from `importer_reverse`, so
     /// `binding_seeds` avoids scanning every import edge per call.
     module_importers: HashMap<ModuleKey, HashSet<ProjectFile>>,
@@ -1193,13 +1207,9 @@ impl RustUsageIndex {
     ) -> Option<Self> {
         /// One file's contribution to the index, collected off-thread and merged
         /// in `files` order so accumulator ordering matches a serial walk.
-        #[derive(Default)]
         struct RustFileFacts {
             declarations: BTreeSet<CodeUnit>,
-            declaration_identities: Vec<(CodeUnit, RustSymbolIdentity)>,
-            declared_module_domains: Vec<(ModuleKey, Domain)>,
-            declaration_domains: Vec<(RustSymbolIdentity, Domain)>,
-            value_constructor_identities: Vec<(CodeUnit, RustSymbolIdentity)>,
+            declarations_facts: RustDeclarationFacts,
             exports: ExportIndex,
             imports: Vec<RustProjectedImport>,
         }
@@ -1247,11 +1257,9 @@ impl RustUsageIndex {
         // par_iter there lets the join steal a job that re-enters the memo.
         let per_file_facts = |file: &ProjectFile| {
             keep_going().then_some(())?;
-            let mut facts = RustFileFacts::default();
             let declarations = analyzer.declarations(file);
-            let prepared = analyzer.prepared_syntax(file);
-            let imports = prepared
-                .as_ref()
+            let imports = analyzer
+                .prepared_syntax(file)
                 .map(|syntax| {
                     rust_import_projection(
                         syntax.tree().root_node(),
@@ -1260,89 +1268,17 @@ impl RustUsageIndex {
                     )
                 })
                 .unwrap_or_default();
-            for declaration in &declarations {
-                keep_going().then_some(())?;
-                let (owner, declared_module) = if declaration.is_module() {
-                    let declared = ModuleKey::new(file, &declaration.fq_name());
-                    let owner = declared
-                        .parent()
-                        .unwrap_or_else(|| ModuleKey::new(file, &rust_package_name(file)));
-                    (owner, Some(declared))
-                } else {
-                    let owner = match analyzer.structural_parent_of(declaration) {
-                        None => ModuleKey::new(file, &rust_package_name(file)),
-                        Some(parent) if parent.is_module() => {
-                            ModuleKey::new(file, &parent.fq_name())
-                        }
-                        Some(_) => continue,
-                    };
-                    (owner, None)
-                };
-                let Some(namespace) = RustSymbolNamespace::of(analyzer, declaration) else {
-                    continue;
-                };
-                let identity = RustSymbolIdentity {
-                    file: file.clone(),
-                    module: owner.clone(),
-                    name: declaration.identifier().to_string(),
-                    namespace,
-                };
-                facts
-                    .declaration_identities
-                    .push((declaration.clone(), identity.clone()));
-                let constructor_domain = prepared.as_ref().and_then(|syntax| {
-                    let node = analyzer.rust_named_declaration_node(
-                        declaration,
-                        syntax.tree().root_node(),
-                        syntax.source(),
-                    )?;
-                    rust_value_constructor_visibilities(node, syntax.source())?
-                        .into_iter()
-                        .map(|visibility| {
-                            direct_import_scope_for_module(file, &owner.package(), visibility)
-                        })
-                        .try_fold(Domain::Public, |effective, domain| {
-                            effective.intersect(&domain?)
-                        })
-                });
-                let declaration_domain = if namespace == RustSymbolNamespace::Macro
-                    && analyzer.is_rust_macro_export_declaration(declaration)
-                {
-                    Some(Domain::Public)
-                } else {
-                    direct_import_scope_for_module(
-                        file,
-                        &owner.package(),
-                        analyzer.rust_declaration_visibility(declaration),
-                    )
-                };
-                if let Some(domain) = declaration_domain {
-                    if let Some(declared_module) = declared_module {
-                        facts
-                            .declared_module_domains
-                            .push((declared_module, domain.clone()));
-                    }
-                    facts
-                        .declaration_domains
-                        .push((identity.clone(), domain.clone()));
-                    if let Some(constructor_domain) = constructor_domain {
-                        let constructor = RustSymbolIdentity {
-                            namespace: RustSymbolNamespace::Value,
-                            ..identity
-                        };
-                        facts
-                            .declaration_domains
-                            .push((constructor.clone(), constructor_domain));
-                        facts
-                            .value_constructor_identities
-                            .push((declaration.clone(), constructor));
-                    }
-                }
-            }
-            facts.exports = analyzer.export_index_of_declarations(file, &declarations);
-            facts.imports = imports;
-            facts.declarations = declarations;
-            Some(facts)
+            // The same derivation the query layer serves from its per-file
+            // cache, so the workspace map below and a query-time answer cannot
+            // disagree about what a file declares (ExecPlan Milestone 2b).
+            let declarations_facts =
+                rust_declaration_facts(analyzer, file, &declarations, keep_going)?;
+            Some(RustFileFacts {
+                exports: analyzer.export_index_of_declarations(file, &declarations),
+                declarations,
+                declarations_facts,
+                imports,
+            })
         };
         let per_file_scope = crate::profiling::scope("RustUsageIndex::build::per_file");
         let file_facts: Vec<RustFileFacts> = if parallel {
@@ -1356,20 +1292,20 @@ impl RustUsageIndex {
 
         for (file_id, (file, facts)) in files.iter().zip(file_facts).enumerate() {
             keep_going().then_some(())?;
-            declaration_identities.extend(facts.declaration_identities);
-            for (declared_module, domain) in facts.declared_module_domains {
+            declaration_identities.extend(facts.declarations_facts.identities);
+            for (declared_module, domain) in facts.declarations_facts.declared_module_domains {
                 declared_module_domains
                     .entry(declared_module)
                     .or_default()
                     .push(domain);
             }
-            for (identity, domain) in facts.declaration_domains {
+            for (identity, domains) in facts.declarations_facts.domains {
                 declaration_domains
                     .entry(identity)
                     .or_default()
-                    .push(domain);
+                    .extend(domains);
             }
-            value_constructor_identities.extend(facts.value_constructor_identities);
+            value_constructor_identities.extend(facts.declarations_facts.value_constructors);
             exports_by_file.insert(file.clone(), facts.exports);
             imports_by_file.insert(file.clone(), facts.imports);
             module_files.index_inline_modules(file_id, &facts.declarations);
@@ -1456,14 +1392,6 @@ impl RustUsageIndex {
         };
         keep_going().then_some(())?;
 
-        let mut identities_by_name: HashMap<String, Vec<RustSymbolIdentity>> = HashMap::default();
-        for identity in declaration_domains.keys() {
-            keep_going().then_some(())?;
-            identities_by_name
-                .entry(identity.name.clone())
-                .or_default()
-                .push(identity.clone());
-        }
         let mut module_importers: HashMap<ModuleKey, HashSet<ProjectFile>> = HashMap::default();
         for edge in importer_reverse.values().flatten() {
             keep_going().then_some(())?;
@@ -1477,7 +1405,6 @@ impl RustUsageIndex {
             exports_by_file,
             importer_reverse,
             declaration_domains,
-            identities_by_name,
             module_importers,
             declaration_identities,
             value_constructor_identities,
@@ -1842,7 +1769,7 @@ fn effective_module_domains(
     effective
 }
 
-fn direct_import_scope_for_module(
+pub(super) fn direct_import_scope_for_module(
     file: &ProjectFile,
     package: &str,
     visibility: RustVisibility,
@@ -2212,6 +2139,7 @@ impl RustAnalyzer {
             return RustReferenceResolution::Unresolved;
         }
         let index = self.usage_index();
+        let queries = RustUsageQueries::new(self);
         let Some(module) = RustUsageIndex::module_at_byte(self, file, byte) else {
             return RustReferenceResolution::Unresolved;
         };
@@ -2326,25 +2254,24 @@ impl RustAnalyzer {
             && namespace != RustReferenceNamespace::Macro
             && (!leading_absolute || leading_absolute_local)
         {
+            // The old lookup was by name across the workspace and then
+            // filtered to this file. Asking the file directly is the same
+            // question with the filter applied first (ExecPlan Milestone 2b).
             matches.extend(
-                index
-                    .identities_by_name
-                    .get(segments[0])
+                queries
+                    .identities_in_file_named(file, segments[0])
                     .into_iter()
-                    .flatten()
-                    .filter(|identity| {
-                        let domains = index
-                            .declaration_domains
-                            .get(*identity)
-                            .expect("identities_by_name entries are declaration_domains keys");
-                        let domains = seeds.identity_domains.get(*identity).unwrap_or(domains);
-                        identity.file == *file
-                            && identity.module == *module
+                    .filter(|(identity, declared_domains)| {
+                        let domains = seeds
+                            .identity_domains
+                            .get(identity)
+                            .unwrap_or(declared_domains);
+                        identity.module == *module
                             && identity.namespace.accepts(namespace)
                             && domains.iter().any(|domain| domain.contains_module(module))
                             && index.declaration_owner_visible_to(self, identity, file, module)
                     })
-                    .cloned(),
+                    .map(|(identity, _)| identity),
             );
             if matches.is_empty() {
                 let scoped_import = scoped_explicit_import(self, file, byte, segments[0]);
@@ -2420,18 +2347,11 @@ impl RustAnalyzer {
                     continue;
                 }
                 matches.extend(
-                    index
-                        .identities_by_name
-                        .get(terminal)
+                    queries
+                        .identities_in_file_named(&resolved.target_file, terminal)
                         .into_iter()
-                        .flatten()
-                        .filter(|identity| {
-                            let domains = index
-                                .declaration_domains
-                                .get(*identity)
-                                .expect("identities_by_name entries are declaration_domains keys");
-                            identity.file == resolved.target_file
-                                && identity.module == resolved.target_module
+                        .filter(|(identity, domains)| {
+                            identity.module == resolved.target_module
                                 && identity.namespace.accepts(namespace)
                                 && domains.iter().any(|domain| domain.contains_module(module))
                                 && index.resolved_declaration_visible_to(
@@ -2442,7 +2362,7 @@ impl RustAnalyzer {
                                     resolved.provenance,
                                 )
                         })
-                        .cloned(),
+                        .map(|(identity, _)| identity),
                 );
                 matches.extend(
                     index
@@ -2501,25 +2421,30 @@ impl RustAnalyzer {
                     },
                 }]
             };
+            // The one site that genuinely searches by name: the module is
+            // resolved but the file that declares the terminal is not known.
+            // `identities_named` answers it with the store's indexed short-name
+            // lookup plus per-candidate verification (ExecPlan Milestone 2b).
+            let named_terminals = if resolved_modules.is_empty() {
+                Vec::new()
+            } else {
+                queries.identities_named(terminal)
+            };
             for resolved in resolved_modules {
                 matches.extend(
-                    index
-                        .identities_by_name
-                        .get(terminal)
-                        .into_iter()
-                        .flatten()
-                        .filter(|identity| {
-                            let domains = index
-                                .declaration_domains
-                                .get(*identity)
-                                .expect("identities_by_name entries are declaration_domains keys");
-                            let domains = seeds.identity_domains.get(*identity).unwrap_or(domains);
+                    named_terminals
+                        .iter()
+                        .filter(|(identity, declared_domains)| {
+                            let domains = seeds
+                                .identity_domains
+                                .get(identity)
+                                .unwrap_or(declared_domains);
                             identity.module == resolved
                                 && identity.namespace.accepts(namespace)
                                 && domains.iter().any(|domain| domain.contains_module(module))
                                 && index.declaration_owner_visible_to(self, identity, file, module)
                         })
-                        .cloned(),
+                        .map(|(identity, _)| identity.clone()),
                 );
             }
         }
@@ -3490,6 +3415,64 @@ mod tests {
             index
                 .export_targets_from_files(&analyzer, &files[..1], "Value")
                 .is_empty()
+        );
+    }
+
+    /// The v2 name lookup must answer with exactly the identities the v1 index
+    /// bucketed under that name, domains included.
+    ///
+    /// `identities_by_name` was a map over every `declaration_domains` key,
+    /// built by walking the whole workspace. Its replacement asks the store's
+    /// indexed short-name lookup for candidate files and verifies each against
+    /// that file's own declaration facts, so what this pins is that the
+    /// candidate set misses no file and that verification drops no identity.
+    #[test]
+    fn identities_named_matches_the_v1_identity_buckets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/lib.rs")
+            .write(
+                "pub mod worker;\n\
+                 pub mod util;\n\
+                 pub struct Shared;\n\
+                 pub fn helper() {}\n",
+            )
+            .expect("write lib.rs");
+        ProjectFile::new(root.clone(), "src/worker.rs")
+            .write(
+                "pub struct Shared(pub u8);\n\
+                 impl Shared {\n    \
+                     pub fn helper(&self) {}\n\
+                 }\n",
+            )
+            .expect("write worker.rs");
+        ProjectFile::new(root.clone(), "src/util.rs")
+            .write(
+                "fn helper() {}\n\
+                 mod inner {\n    \
+                     pub(crate) struct Shared;\n\
+                 }\n",
+            )
+            .expect("write util.rs");
+        let analyzer = analyzer_for(&root);
+        let index = RustUsageIndex::build(&analyzer, false);
+        let queries = RustUsageQueries::new(&analyzer);
+
+        let mut compared = 0;
+        for name in ["Shared", "helper", "worker", "util", "inner"] {
+            let expected: HashMap<_, _> = index
+                .declaration_domains
+                .iter()
+                .filter(|(identity, _)| identity.name == name)
+                .map(|(identity, domains)| (identity.clone(), domains.clone()))
+                .collect();
+            let actual: HashMap<_, _> = queries.identities_named(name).into_iter().collect();
+            assert_eq!(actual, expected, "identities named {name} diverged");
+            compared += expected.len();
+        }
+        assert!(
+            compared >= 6,
+            "the fixture must exercise several identities, compared {compared}"
         );
     }
 

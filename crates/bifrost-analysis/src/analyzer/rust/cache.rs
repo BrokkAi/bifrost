@@ -68,6 +68,52 @@ pub(super) fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeU
     size.min(u32::MAX as usize) as u32
 }
 
+/// Byte weight of one file's declaration identities and domains.
+///
+/// The identity strings dominate: a module key holds a crate root plus one
+/// component per module level, and every entry repeats the declaration's name.
+/// Counting the strings rather than the entries keeps the budget honest for a
+/// file of deeply nested modules.
+pub(super) fn weight_declaration_facts(
+    _key: &ProjectFile,
+    value: &Arc<super::usage_queries::RustDeclarationFacts>,
+) -> u32 {
+    let identity_bytes = |identity: &super::usage_index::RustSymbolIdentity| {
+        identity.name.len()
+            + identity.module.weight_bytes()
+            + size_of::<super::usage_index::RustSymbolIdentity>()
+    };
+    let identities = value
+        .identities
+        .iter()
+        .chain(value.value_constructors.iter())
+        .map(|(declaration, identity)| {
+            declaration.fq_name().len() + identity_bytes(identity) + size_of::<CodeUnit>()
+        })
+        .sum::<usize>();
+    let declared_modules = value
+        .declared_module_domains
+        .iter()
+        .map(|(module, domain)| module.weight_bytes() + domain.weight_bytes())
+        .sum::<usize>();
+    let domains = value
+        .domains
+        .iter()
+        .map(|(identity, domains)| {
+            identity_bytes(identity)
+                + domains
+                    .iter()
+                    .map(super::usage_index::Domain::weight_bytes)
+                    .sum::<usize>()
+        })
+        .sum::<usize>();
+    (identities
+        + declared_modules
+        + domains
+        + size_of::<super::usage_queries::RustDeclarationFacts>())
+    .min(u32::MAX as usize) as u32
+}
+
 /// Byte weight of one blob's persisted Rust usage facts.
 ///
 /// The identifier-occurrence rows dominate: one entry per distinct identifier

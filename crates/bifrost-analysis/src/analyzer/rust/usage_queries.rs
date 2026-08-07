@@ -24,18 +24,23 @@
 //! a path enters, and it is why `facts_of` takes a `ProjectFile` rather than an
 //! `Oid`.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use git2::Oid;
 
-use crate::analyzer::ProjectFile;
+use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::HashSet;
 
 use super::RustAnalyzer;
 use super::declarations::rust_package_name;
 use super::facts::{RUST_OCCURRENCE_CODE, RustExportFact, RustImportTargetFact, RustUsageFacts};
+use super::graph_support::rust_value_constructor_visibilities;
 use super::imports::RustVisibility;
-use super::usage_index::{ModuleKey, RustImportExtent};
+use super::usage_index::{
+    Domain, ModuleKey, RustImportExtent, RustSymbolIdentity, RustSymbolNamespace,
+    direct_import_scope_for_module,
+};
 
 /// One `use` binding of one file, with its module names composed against the
 /// live path and its lexical reach in the shape the usage graph consumes.
@@ -62,6 +67,137 @@ pub(super) struct RustImportBinding {
     pub(super) owner_module: String,
     pub(super) importer_module: ModuleKey,
     pub(super) extent: RustImportExtent,
+}
+
+/// Every symbol identity one file introduces, with the visibility domain each
+/// identity carries.
+///
+/// A per-file product in the plan's classification: deriving it needs the
+/// file's own declarations, their structural parents and their visibility, and
+/// nothing from any other file. The v1 index folded exactly this derivation
+/// into its workspace-wide build; both callers now go through
+/// [`rust_declaration_facts`], so the workspace map and the query-time answer
+/// cannot drift apart.
+#[derive(Debug, Default)]
+pub(super) struct RustDeclarationFacts {
+    /// Declaration -> the identity it introduces, in declaration order. A
+    /// declaration whose visibility does not resolve to a domain still appears
+    /// here; it simply contributes no entry to `domains`.
+    pub(super) identities: Vec<(CodeUnit, RustSymbolIdentity)>,
+    /// Tuple-struct and tuple-variant constructors, which bind a
+    /// value-namespace identity of the declaration's own name under the
+    /// constructor's (possibly narrower) visibility.
+    pub(super) value_constructors: Vec<(CodeUnit, RustSymbolIdentity)>,
+    /// `mod name` declarations of this file, as (declared module, domain).
+    pub(super) declared_module_domains: Vec<(ModuleKey, Domain)>,
+    /// Identity -> the domains it was declared with, grouped in first-appearance
+    /// order. Two declarations can share one identity (a `#[cfg]`-duplicated
+    /// item, say), so the value is a list rather than a single domain.
+    pub(super) domains: Vec<(RustSymbolIdentity, Vec<Domain>)>,
+}
+
+/// Derive one file's declaration facts.
+///
+/// `declarations` is passed in rather than fetched, because both callers
+/// already hold the file's declaration set and re-reading it would double the
+/// store work on the build path.
+///
+/// `None` only when `keep_going` asked to stop.
+pub(super) fn rust_declaration_facts(
+    analyzer: &RustAnalyzer,
+    file: &ProjectFile,
+    declarations: &BTreeSet<CodeUnit>,
+    keep_going: &impl Fn() -> bool,
+) -> Option<RustDeclarationFacts> {
+    let mut facts = RustDeclarationFacts::default();
+    let mut ordered_domains: Vec<(RustSymbolIdentity, Domain)> = Vec::new();
+    let prepared = analyzer.prepared_syntax(file);
+    for declaration in declarations {
+        keep_going().then_some(())?;
+        let (owner, declared_module) = if declaration.is_module() {
+            let declared = ModuleKey::new(file, &declaration.fq_name());
+            let owner = declared
+                .parent()
+                .unwrap_or_else(|| ModuleKey::new(file, &rust_package_name(file)));
+            (owner, Some(declared))
+        } else {
+            let owner = match analyzer.structural_parent_of(declaration) {
+                None => ModuleKey::new(file, &rust_package_name(file)),
+                Some(parent) if parent.is_module() => ModuleKey::new(file, &parent.fq_name()),
+                Some(_) => continue,
+            };
+            (owner, None)
+        };
+        let Some(namespace) = RustSymbolNamespace::of(analyzer, declaration) else {
+            continue;
+        };
+        let identity = RustSymbolIdentity {
+            file: file.clone(),
+            module: owner.clone(),
+            name: declaration.identifier().to_string(),
+            namespace,
+        };
+        facts
+            .identities
+            .push((declaration.clone(), identity.clone()));
+        let constructor_domain = prepared.as_ref().and_then(|syntax| {
+            let node = analyzer.rust_named_declaration_node(
+                declaration,
+                syntax.tree().root_node(),
+                syntax.source(),
+            )?;
+            rust_value_constructor_visibilities(node, syntax.source())?
+                .into_iter()
+                .map(|visibility| {
+                    direct_import_scope_for_module(file, &owner.package(), visibility)
+                })
+                .try_fold(Domain::Public, |effective, domain| {
+                    effective.intersect(&domain?)
+                })
+        });
+        let declaration_domain = if namespace == RustSymbolNamespace::Macro
+            && analyzer.is_rust_macro_export_declaration(declaration)
+        {
+            Some(Domain::Public)
+        } else {
+            direct_import_scope_for_module(
+                file,
+                &owner.package(),
+                analyzer.rust_declaration_visibility(declaration),
+            )
+        };
+        let Some(domain) = declaration_domain else {
+            continue;
+        };
+        if let Some(declared_module) = declared_module {
+            facts
+                .declared_module_domains
+                .push((declared_module, domain.clone()));
+        }
+        ordered_domains.push((identity.clone(), domain));
+        if let Some(constructor_domain) = constructor_domain {
+            let constructor = RustSymbolIdentity {
+                namespace: RustSymbolNamespace::Value,
+                ..identity
+            };
+            ordered_domains.push((constructor.clone(), constructor_domain));
+            facts
+                .value_constructors
+                .push((declaration.clone(), constructor));
+        }
+    }
+    for (identity, domain) in ordered_domains {
+        keep_going().then_some(())?;
+        match facts
+            .domains
+            .iter_mut()
+            .find(|(existing, _)| *existing == identity)
+        {
+            Some((_, domains)) => domains.push(domain),
+            None => facts.domains.push((identity, vec![domain])),
+        }
+    }
+    Some(facts)
 }
 
 /// A stateless view over the store, borrowing the analyzer for its store
@@ -95,6 +231,56 @@ impl<'a> RustUsageQueries<'a> {
 
     fn oid_of(&self, file: &ProjectFile) -> Option<Oid> {
         self.analyzer.live_path_snapshot().oid_for_path(file)
+    }
+
+    /// One file's declaration identities and their domains, memoized.
+    pub(super) fn declaration_facts_of(&self, file: &ProjectFile) -> Arc<RustDeclarationFacts> {
+        self.analyzer.rust_declaration_facts_of(file)
+    }
+
+    /// The identities `file` declares under `name`, with their domains.
+    ///
+    /// A per-file question despite looking like a name search: the caller
+    /// already knows which file it means, so no inverted lookup is involved.
+    pub(super) fn identities_in_file_named(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+    ) -> Vec<(RustSymbolIdentity, Vec<Domain>)> {
+        self.declaration_facts_of(file)
+            .domains
+            .iter()
+            .filter(|(identity, _)| identity.name == name)
+            .cloned()
+            .collect()
+    }
+
+    /// Every declaration identity in the workspace named `name`, with its
+    /// domains.
+    ///
+    /// Candidate lookup plus verification, replacing the v1 index's
+    /// `identities_by_name` map. `lookup_candidates_by_identifier` is the
+    /// store's indexed short-name lookup over `code_units`, so the candidate
+    /// set is the handful of files that declare this identifier rather than
+    /// the workspace; each candidate is then verified against its own
+    /// declaration facts, which decide whether an identity of that name really
+    /// exists there and what visibility it carries. A candidate whose only
+    /// declaration of `name` has no resolvable domain contributes nothing,
+    /// exactly as it contributed no `declaration_domains` key in v1.
+    pub(super) fn identities_named(&self, name: &str) -> Vec<(RustSymbolIdentity, Vec<Domain>)> {
+        let mut candidates: Vec<ProjectFile> = self
+            .analyzer
+            .lookup_candidates_by_identifier(name)
+            .into_iter()
+            .map(|declaration| declaration.source().clone())
+            .filter(|file| self.analyzer.is_analyzed(file))
+            .collect();
+        candidates.sort();
+        candidates.dedup();
+        candidates
+            .iter()
+            .flat_map(|file| self.identities_in_file_named(file, name))
+            .collect()
     }
 
     /// The modules `file` introduces, as `(module, start_byte, end_byte)` with
@@ -544,6 +730,56 @@ mod tests {
         );
         assert_eq!(queries.files_importing_module_path("crate"), vec![worker]);
         assert_eq!(queries.files_importing_module_path("worker"), vec![lib]);
+    }
+
+    /// An inverted hit is a candidate, never an answer. The store's short-name
+    /// index offers every file declaring the identifier, including one whose
+    /// only declaration of that name is a method -- an associated item, not a
+    /// module-scope identity, so v1 never gave it a `declaration_domains` key.
+    /// Returning the candidate unverified would invent an identity in a module
+    /// that does not declare the name.
+    #[test]
+    fn a_candidate_file_without_a_module_scope_identity_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let owner = ProjectFile::new(root.clone(), "src/lib.rs");
+        owner
+            .write("pub mod holder;\npub fn compute() {}\n")
+            .expect("write lib.rs");
+        let holder = ProjectFile::new(root.clone(), "src/holder.rs");
+        holder
+            .write("pub struct Holder;\nimpl Holder {\n    pub fn compute(&self) {}\n}\n")
+            .expect("write holder.rs");
+        let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+        let _ = analyzer.get_analyzed_files();
+        let queries = RustUsageQueries::new(&analyzer);
+
+        assert!(
+            analyzer
+                .lookup_candidates_by_identifier("compute")
+                .iter()
+                .any(|candidate| candidate.source() == &holder),
+            "the method must be offered as a candidate, or the test proves nothing"
+        );
+        let named = queries.identities_named("compute");
+        assert_eq!(named.len(), 1, "identities were {named:?}");
+        assert_eq!(named[0].0.file, owner);
+        assert!(
+            queries
+                .identities_in_file_named(&holder, "compute")
+                .is_empty(),
+            "an associated function declares no module-scope identity"
+        );
+        let holder_identities = queries.identities_in_file_named(&holder, "Holder");
+        assert_eq!(
+            holder_identities
+                .iter()
+                .map(|(identity, _)| identity.namespace)
+                .collect::<HashSet<_>>(),
+            HashSet::from_iter([RustSymbolNamespace::Type, RustSymbolNamespace::Value]),
+            "the module-scope unit struct still declares a type and its \
+             value-namespace constructor: {holder_identities:?}"
+        );
     }
 
     #[test]

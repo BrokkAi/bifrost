@@ -39,8 +39,8 @@ use tree_sitter::Parser;
 use super::js_ts::build_weighted_cache;
 pub(crate) use adapter::RustAdapter;
 use cache::{
-    weight_code_unit_set, weight_export_index, weight_project_file_set, weight_reference_context,
-    weight_rust_usage_facts,
+    weight_code_unit_set, weight_declaration_facts, weight_export_index, weight_project_file_set,
+    weight_reference_context, weight_rust_usage_facts,
 };
 use cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
 use clones::build_rust_clone_candidate_data;
@@ -93,6 +93,11 @@ pub struct RustAnalyzer {
     /// generation component retires the whole cache when extraction semantics
     /// move. Bounded by a byte budget, never by workspace size.
     rust_usage_facts: Cache<RustFactCacheKey, Arc<facts::RustUsageFacts>>,
+    /// One file's declaration identities and their visibility domains. Keyed by
+    /// file rather than by blob because the derivation consults analyzer state
+    /// (structural parents, visibility) and not only the file's bytes; the
+    /// analyzer is replaced wholesale on `update`, so the cache retires with it.
+    declaration_facts: Cache<ProjectFile, Arc<usage_queries::RustDeclarationFacts>>,
     hierarchy_index: Arc<OnceLock<RustHierarchyIndex>>,
     #[allow(dead_code)]
     type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
@@ -146,6 +151,24 @@ impl RustAnalyzer {
         let facts = Arc::new(facts);
         self.rust_usage_facts.insert(key, Arc::clone(&facts));
         Some(facts)
+    }
+
+    /// One file's declaration identities and their visibility domains, derived
+    /// once per file and then served from the bounded cache.
+    fn rust_declaration_facts_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<usage_queries::RustDeclarationFacts> {
+        if let Some(cached) = self.declaration_facts.get(file) {
+            return cached;
+        }
+        let facts = Arc::new(
+            usage_queries::rust_declaration_facts(self, file, &self.declarations(file), &|| true)
+                .expect("uninterrupted Rust declaration-fact derivation"),
+        );
+        self.declaration_facts
+            .insert(file.clone(), Arc::clone(&facts));
+        facts
     }
 
     pub(crate) fn declaration_candidates_by_identifier_limited(
@@ -395,6 +418,7 @@ impl RustAnalyzer {
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(PoolSafeMemo::new()),
             rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
+            declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
@@ -431,6 +455,7 @@ impl RustAnalyzer {
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(PoolSafeMemo::new()),
             rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
+            declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         })
@@ -683,6 +708,7 @@ impl IAnalyzer for RustAnalyzer {
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(PoolSafeMemo::new()),
             rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
+            declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
@@ -709,6 +735,7 @@ impl IAnalyzer for RustAnalyzer {
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(PoolSafeMemo::new()),
             rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
+            declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
