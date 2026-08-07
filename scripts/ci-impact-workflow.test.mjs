@@ -20,7 +20,7 @@ test("CI has the classifier, canonical lint gate, and stable aggregation check",
   assert.match(workflow, /^    needs: \[ci-impact, quick-policy\]\n    if: needs\.ci-impact\.outputs\.mode != 'docs'$/mu);
   assert.match(workflow, /cargo clippy --all-targets --all-features -- -D warnings/u);
   assert.match(workflow, /^  pr-verification:\n    name: PR verification$/mu);
-  assert.match(workflow, /if: \$\{\{ always\(\) \}\}/u);
+  assert.match(workflow, /if: \$\{\{ always\(\) && !cancelled\(\) \}\}/u);
   assert.match(workflow, /LINT_SELECTED: \$\{\{ needs\.ci-impact\.outputs\.mode != 'docs' \}\}/u);
   assert.match(workflow, /check_result 'lint' "\$LINT_SELECTED" "\$LINT_RESULT"/u);
 });

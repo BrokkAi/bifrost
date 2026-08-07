@@ -719,7 +719,7 @@ jobs:
 
   pr-verification:
     name: PR verification
-    if: ${{ always() }}
+    if: ${{ always() && !cancelled() }}
     needs:
       - ci-impact
       - quick-policy
