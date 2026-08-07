@@ -24,6 +24,11 @@ use tree_sitter::Language as TsLanguage;
 use crate::CancellationToken;
 use crate::analyzer::fq_name::{FqName, segment_interner};
 use crate::analyzer::model::MAX_SIGNATURE_METADATA_BLOB_BYTES;
+use crate::analyzer::rust::facts::{
+    RustExportFact, RustIdentifierOccurrence, RustImportTargetFact, RustModuleFact, RustUsageFacts,
+    decode_rust_visibility, encode_rust_visibility,
+};
+use crate::analyzer::rust::imports::RustVisibility;
 use crate::analyzer::structural::materialization::{
     MaterializationRecord, MaterializationRecordPayload,
 };
@@ -3624,6 +3629,344 @@ struct PreparedUnitRow {
     fq_segments: Option<Vec<u8>>,
 }
 
+/// The four `rust_*` fact tables' rows for one blob, converted from
+/// [`crate::analyzer::rust::facts::RustUsageFacts`] and validated for SQLite
+/// binding.
+///
+/// Built during preparation rather than inside the write transaction, like
+/// every other row shape here: the byte-offset conversions are the only thing
+/// that can fail, and failing them must not abort a batch mid-commit. Empty for
+/// every language except Rust.
+#[derive(Debug, Default)]
+struct RustFactRows {
+    exports: Vec<RustExportRow>,
+    import_targets: Vec<RustImportTargetRow>,
+    modules: Vec<RustModuleRow>,
+    /// `(identifier, context_mask)`
+    identifier_occurrences: Vec<(String, i64)>,
+}
+
+/// One `rust_exports` row.
+#[derive(Debug)]
+struct RustExportRow {
+    ordinal: i64,
+    exported_name: Option<String>,
+    source_path: String,
+    imported_name: Option<String>,
+    is_glob: i64,
+}
+
+/// One `rust_modules` row.
+#[derive(Debug)]
+struct RustModuleRow {
+    ordinal: i64,
+    module_name: String,
+    is_inline: i64,
+    start_byte: i64,
+    end_byte: i64,
+}
+
+/// One `rust_import_targets` row. Named fields rather than positional columns
+/// because there are eleven of them at the binding site.
+#[derive(Debug)]
+struct RustImportTargetRow {
+    ordinal: i64,
+    module_path: String,
+    bound_name: Option<String>,
+    imported_name: Option<String>,
+    is_glob: i64,
+    visibility: String,
+    owner_module: String,
+    owner_start: i64,
+    owner_end: i64,
+    local_start: Option<i64>,
+    local_end: Option<i64>,
+}
+
+impl RustFactRows {
+    fn from_facts(facts: &crate::analyzer::rust::facts::RustUsageFacts) -> Result<Self> {
+        let exports = facts
+            .exports
+            .iter()
+            .enumerate()
+            .map(|(ordinal, export)| {
+                Ok(RustExportRow {
+                    ordinal: usize_to_i64(ordinal)?,
+                    exported_name: export.exported_name.clone(),
+                    source_path: export.source_path.clone(),
+                    imported_name: export.imported_name.clone(),
+                    is_glob: bool_to_i64(export.is_glob),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let import_targets = facts
+            .import_targets
+            .iter()
+            .enumerate()
+            .map(|(ordinal, target)| {
+                let (local_start, local_end) = match target.local_extent {
+                    Some((start, end)) => (Some(usize_to_i64(start)?), Some(usize_to_i64(end)?)),
+                    None => (None, None),
+                };
+                Ok(RustImportTargetRow {
+                    ordinal: usize_to_i64(ordinal)?,
+                    module_path: target.module_path.clone(),
+                    bound_name: target.bound_name.clone(),
+                    imported_name: target.imported_name.clone(),
+                    is_glob: bool_to_i64(target.is_glob),
+                    visibility: encode_rust_visibility(&target.visibility),
+                    owner_module: target.owner_module.clone(),
+                    owner_start: usize_to_i64(target.owner_start)?,
+                    owner_end: usize_to_i64(target.owner_end)?,
+                    local_start,
+                    local_end,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let modules = facts
+            .modules
+            .iter()
+            .enumerate()
+            .map(|(ordinal, module)| {
+                Ok(RustModuleRow {
+                    ordinal: usize_to_i64(ordinal)?,
+                    module_name: module.module_name.clone(),
+                    is_inline: bool_to_i64(module.is_inline),
+                    start_byte: usize_to_i64(module.start_byte)?,
+                    end_byte: usize_to_i64(module.end_byte)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let identifier_occurrences = facts
+            .identifier_occurrences
+            .iter()
+            .map(|occurrence| {
+                (
+                    occurrence.identifier.clone(),
+                    i64::from(occurrence.context_mask),
+                )
+            })
+            .collect();
+        Ok(Self {
+            exports,
+            import_targets,
+            modules,
+            identifier_occurrences,
+        })
+    }
+
+    fn logical_rows(&self) -> usize {
+        saturating_sum([
+            self.exports.len(),
+            self.import_targets.len(),
+            self.modules.len(),
+            self.identifier_occurrences.len(),
+        ])
+    }
+
+    fn string_bytes(&self) -> usize {
+        saturating_sum([
+            saturating_sum(self.exports.iter().map(|row| {
+                saturating_sum([
+                    row.exported_name.as_ref().map_or(0, String::len),
+                    row.source_path.len(),
+                    row.imported_name.as_ref().map_or(0, String::len),
+                ])
+            })),
+            saturating_sum(self.import_targets.iter().map(|row| {
+                saturating_sum([
+                    row.module_path.len(),
+                    row.bound_name.as_ref().map_or(0, String::len),
+                    row.imported_name.as_ref().map_or(0, String::len),
+                    row.visibility.len(),
+                    row.owner_module.len(),
+                ])
+            })),
+            saturating_sum(self.modules.iter().map(|row| row.module_name.len())),
+            saturating_sum(
+                self.identifier_occurrences
+                    .iter()
+                    .map(|(identifier, _)| identifier.len()),
+            ),
+        ])
+    }
+}
+
+/// Read access to the per-file Rust usage fact tables.
+///
+/// Milestone 1 of `.agents/plans/rust-usage-index-v2.md` lands the tables and
+/// this reader; Milestone 2's `RustUsageQueries` is the caller. The allow goes
+/// away with that commit -- keeping the reader beside the writer it inverts is
+/// what makes the round trip reviewable in one place.
+#[allow(dead_code)]
+impl AnalyzerStore {
+    /// Every persisted per-file Rust usage fact for one blob.
+    ///
+    /// This is the forward direction of the `rust_*` fact tables: "what does
+    /// this file export, import, declare, and mention". A caller that already
+    /// knows the file reads it directly; a caller searching by name reaches
+    /// these rows through the inverted lookups below and then verifies each
+    /// candidate against its facts.
+    pub(crate) fn rust_usage_facts(&self, oid: Oid, lang: &str) -> Result<RustUsageFacts> {
+        let conn = self.read_conn()?;
+        read_rust_usage_facts(&conn, &oid.to_string(), lang)
+    }
+
+    /// Blobs that import `module_path`, spelled exactly as the importing file
+    /// writes it. The inverted direction of `rust_import_targets`.
+    pub(crate) fn rust_import_target_blobs(
+        &self,
+        lang: &str,
+        module_path: &str,
+    ) -> Result<Vec<Oid>> {
+        self.rust_fact_blobs(
+            "SELECT DISTINCT blob_oid FROM rust_import_targets
+             WHERE lang = ?1 AND module_path = ?2",
+            lang,
+            module_path,
+        )
+    }
+
+    /// Blobs that re-export `exported_name`. The inverted direction of
+    /// `rust_exports`, and the seed of an export-chain walk.
+    pub(crate) fn rust_export_blobs(&self, lang: &str, exported_name: &str) -> Result<Vec<Oid>> {
+        self.rust_fact_blobs(
+            "SELECT DISTINCT blob_oid FROM rust_exports
+             WHERE lang = ?1 AND exported_name = ?2",
+            lang,
+            exported_name,
+        )
+    }
+
+    /// Blobs whose text mentions `identifier`, with the OR of the contexts it
+    /// was seen in. These are CANDIDATES, never usages: a hit means the name
+    /// occurs, and the caller must still resolve it against the candidate's
+    /// own facts. Comparison is case-sensitive, matching the spelling the
+    /// declaration side stores.
+    pub(crate) fn rust_identifier_occurrence_blobs(
+        &self,
+        lang: &str,
+        identifier: &str,
+    ) -> Result<Vec<(Oid, u32)>> {
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT blob_oid, context_mask FROM rust_identifier_occurrences
+             WHERE lang = ?1 AND identifier = ?2",
+        )?;
+        let rows = stmt.query_map(params![lang, identifier], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (oid, context_mask) = row?;
+            out.push((
+                Oid::from_str(&oid)?,
+                u32::try_from(context_mask).map_err(|_| {
+                    StoreError::new(format!(
+                        "occurrence context mask out of range: {context_mask}"
+                    ))
+                })?,
+            ));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    fn rust_fact_blobs(&self, sql: &str, lang: &str, key: &str) -> Result<Vec<Oid>> {
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(sql)?;
+        let rows = stmt.query_map(params![lang, key], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(Oid::from_str(&row?)?);
+        }
+        out.sort();
+        Ok(out)
+    }
+}
+
+/// Write one blob's `rust_*` fact rows. Shared by the prepared and legacy write
+/// paths so both persist exactly the same rows.
+fn insert_rust_fact_rows(
+    tx: &Transaction<'_>,
+    oid: &str,
+    lang: &str,
+    rows: &RustFactRows,
+) -> Result<()> {
+    if !rows.exports.is_empty() {
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO rust_exports(
+               blob_oid, lang, ordinal, exported_name, source_path, imported_name, is_glob
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for row in &rows.exports {
+            stmt.execute(params![
+                oid,
+                lang,
+                row.ordinal,
+                row.exported_name,
+                row.source_path,
+                row.imported_name,
+                row.is_glob,
+            ])?;
+        }
+    }
+    if !rows.import_targets.is_empty() {
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO rust_import_targets(
+               blob_oid, lang, ordinal, module_path, bound_name, imported_name, is_glob,
+               visibility, owner_module, owner_start, owner_end, local_start, local_end
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        )?;
+        for row in &rows.import_targets {
+            stmt.execute(params![
+                oid,
+                lang,
+                row.ordinal,
+                row.module_path,
+                row.bound_name,
+                row.imported_name,
+                row.is_glob,
+                row.visibility,
+                row.owner_module,
+                row.owner_start,
+                row.owner_end,
+                row.local_start,
+                row.local_end,
+            ])?;
+        }
+    }
+    if !rows.modules.is_empty() {
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO rust_modules(
+               blob_oid, lang, ordinal, module_name, is_inline, start_byte, end_byte
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for row in &rows.modules {
+            stmt.execute(params![
+                oid,
+                lang,
+                row.ordinal,
+                row.module_name,
+                row.is_inline,
+                row.start_byte,
+                row.end_byte,
+            ])?;
+        }
+    }
+    if !rows.identifier_occurrences.is_empty() {
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO rust_identifier_occurrences(
+               blob_oid, lang, identifier, context_mask
+             ) VALUES(?1, ?2, ?3, ?4)",
+        )?;
+        for (identifier, context_mask) in &rows.identifier_occurrences {
+            stmt.execute(params![oid, lang, identifier, context_mask])?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(crate) struct PreparedParsedBlob {
     oid: Oid,
@@ -3641,6 +3984,7 @@ pub(crate) struct PreparedParsedBlob {
     import_statements: Vec<(i64, String)>,
     imports: Vec<(i64, Vec<u8>)>,
     scala_exports: Vec<(i64, i64, Vec<u8>)>,
+    rust_facts: RustFactRows,
     type_identifiers: Vec<String>,
     ruby_dispatch_modes: Vec<(i64, i64)>,
     scala_traits: Vec<i64>,
@@ -3951,6 +4295,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
             scala_exports.push((owner_key, usize_to_i64(ordinal)?, serialize_blob(info)?));
         }
     }
+    let rust_facts = RustFactRows::from_facts(&state.rust_usage_facts)?;
     let mut type_identifiers: Vec<_> = state.type_identifiers.iter().cloned().collect();
     type_identifiers.sort();
 
@@ -3970,6 +4315,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         ruby_dispatch_modes.len(),
         scala_traits.len(),
         materialization_records.len(),
+        rust_facts.logical_rows(),
     ]);
     let unit_string_bytes = saturating_sum(units.iter().map(|row| {
         saturating_sum([
@@ -3996,6 +4342,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
                 .map(|(_, statement)| statement.len()),
         ),
         saturating_sum(type_identifiers.iter().map(String::len)),
+        rust_facts.string_bytes(),
     ]);
     let binary_bytes = saturating_sum([
         saturating_sum(signature_metadata.iter().map(|(_, _, bytes)| bytes.len())),
@@ -4033,6 +4380,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         import_statements,
         imports,
         scala_exports,
+        rust_facts,
         type_identifiers,
         ruby_dispatch_modes,
         scala_traits,
@@ -4189,6 +4537,7 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
             stmt.execute(params![oid, lang, row])?;
         }
     );
+    insert_rust_fact_rows(tx, oid, lang, &blob.rust_facts)?;
     tx.execute(
         "INSERT OR IGNORE INTO blob_meta(
            blob_oid, lang, contains_tests, content_package, stored_unit_count,
@@ -4326,6 +4675,12 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
     let (import_statement_count, import_count) = insert_imports(tx, &oid, lang, state)?;
     insert_scala_exports(tx, &oid, lang, &unit_keys, &state.scala_exports)?;
     insert_materialization_records(tx, &oid, lang, &unit_keys, &state.materialization_records)?;
+    insert_rust_fact_rows(
+        tx,
+        &oid,
+        lang,
+        &RustFactRows::from_facts(&state.rust_usage_facts)?,
+    )?;
     let side_counts = PersistedSideTableCounts {
         range_count,
         signature_count,
@@ -4937,6 +5292,9 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
         import_statements,
         imports,
         scala_exports,
+        // Not hydrated: the Rust fact tables are read by blob oid straight from
+        // SQL, never through a materialized `FileState`. See the field's doc.
+        rust_usage_facts: RustUsageFacts::default(),
         raw_supertypes,
         supertype_lookup_paths,
         type_identifiers: meta.type_identifiers,
@@ -5164,6 +5522,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             import_statements,
             imports,
             scala_exports,
+            rust_usage_facts: RustUsageFacts::default(),
             raw_supertypes,
             supertype_lookup_paths,
             type_identifiers: meta.type_identifiers.clone(),
@@ -6677,6 +7036,127 @@ fn insert_materialization_records(
         count += 1;
     }
     Ok(count)
+}
+
+/// Read back one blob's `rust_*` fact rows, in the order they were written.
+///
+/// The inverse of [`insert_rust_fact_rows`], and the only place the persisted
+/// column encodings are decoded. A visibility this build did not write means
+/// the row came from a schema this build does not own, which the schema-version
+/// file name already prevents -- so it is an assertion, not a recovery path.
+#[allow(dead_code)]
+fn read_rust_usage_facts(conn: &Connection, oid: &str, lang: &str) -> Result<RustUsageFacts> {
+    let mut exports = Vec::new();
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT exported_name, source_path, imported_name, is_glob FROM rust_exports
+             WHERE blob_oid = ?1 AND lang = ?2 ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map(params![oid, lang], |row| {
+            Ok(RustExportFact {
+                exported_name: row.get(0)?,
+                source_path: row.get(1)?,
+                imported_name: row.get(2)?,
+                is_glob: row.get::<_, i64>(3)? != 0,
+            })
+        })?;
+        for row in rows {
+            exports.push(row?);
+        }
+    }
+    let mut import_targets = Vec::new();
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT module_path, bound_name, imported_name, is_glob, visibility,
+                    owner_module, owner_start, owner_end, local_start, local_end
+             FROM rust_import_targets
+             WHERE blob_oid = ?1 AND lang = ?2 ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map(params![oid, lang], |row| {
+            Ok((
+                RustImportTargetFact {
+                    module_path: row.get(0)?,
+                    bound_name: row.get(1)?,
+                    imported_name: row.get(2)?,
+                    is_glob: row.get::<_, i64>(3)? != 0,
+                    visibility: RustVisibility::Private,
+                    owner_module: row.get(5)?,
+                    owner_start: 0,
+                    owner_end: 0,
+                    local_extent: None,
+                },
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+            ))
+        })?;
+        for row in rows {
+            let (mut target, visibility, owner_start, owner_end, local_start, local_end) = row?;
+            target.visibility = decode_rust_visibility(&visibility)
+                .unwrap_or_else(|| panic!("unknown persisted Rust visibility: {visibility}"));
+            target.owner_start = i64_to_usize(owner_start)?;
+            target.owner_end = i64_to_usize(owner_end)?;
+            target.local_extent = match (local_start, local_end) {
+                (Some(start), Some(end)) => Some((i64_to_usize(start)?, i64_to_usize(end)?)),
+                (None, None) => None,
+                mismatched => panic!("half-open persisted local import extent: {mismatched:?}"),
+            };
+            import_targets.push(target);
+        }
+    }
+    let mut modules = Vec::new();
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT module_name, is_inline, start_byte, end_byte FROM rust_modules
+             WHERE blob_oid = ?1 AND lang = ?2 ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map(params![oid, lang], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? != 0,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (module_name, is_inline, start_byte, end_byte) = row?;
+            modules.push(RustModuleFact {
+                module_name,
+                is_inline,
+                start_byte: i64_to_usize(start_byte)?,
+                end_byte: i64_to_usize(end_byte)?,
+            });
+        }
+    }
+    let mut identifier_occurrences = Vec::new();
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT identifier, context_mask FROM rust_identifier_occurrences
+             WHERE blob_oid = ?1 AND lang = ?2 ORDER BY identifier",
+        )?;
+        let rows = stmt.query_map(params![oid, lang], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (identifier, context_mask) = row?;
+            identifier_occurrences.push(RustIdentifierOccurrence {
+                identifier,
+                context_mask: u32::try_from(context_mask).map_err(|_| {
+                    StoreError::new(format!(
+                        "occurrence context mask out of range: {context_mask}"
+                    ))
+                })?,
+            });
+        }
+    }
+    Ok(RustUsageFacts {
+        exports,
+        import_targets,
+        modules,
+        identifier_occurrences,
+    })
 }
 
 fn read_materialization_records(
@@ -11908,6 +12388,7 @@ mod tests {
             import_statements: parsed.import_statements,
             imports: parsed.imports,
             scala_exports: parsed.scala_exports,
+            rust_usage_facts: parsed.rust_usage_facts,
             raw_supertypes: parsed.raw_supertypes,
             supertype_lookup_paths: parsed.supertype_lookup_paths,
             type_identifiers: parsed.type_identifiers,
@@ -12356,6 +12837,242 @@ mod tests {
             default_export.1.expect("synthetic default unit").fq_name(),
             "default"
         );
+    }
+
+    /// The fixture the `rust_*` fact-table tests share: one file that
+    /// re-exports, imports (named, glob, aliased, function-local), declares an
+    /// inline and a file module, and mentions identifiers in code, a comment,
+    /// and a string.
+    const RUST_USAGE_FACT_FIXTURE: &str = "\
+pub use alpha::Exported;
+pub use beta::Renamed as Alias;
+pub use gamma::*;
+use delta::Private;
+mod detached;
+mod inline {
+    use crate::Scoped;
+    pub fn helper() {
+        use crate::Local;
+        let _ = \"in_a_string\";
+    }
+}
+// in_a_comment
+";
+
+    fn rust_usage_fact_store(temp: &Path) -> (AnalyzerStore, Oid) {
+        let file = write_file(temp, "src/lib.rs", RUST_USAGE_FACT_FIXTURE);
+        let oid = oid_for(RUST_USAGE_FACT_FIXTURE.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
+            .unwrap();
+        (store, oid)
+    }
+
+    #[test]
+    fn rust_fact_tables_record_exports_imports_modules_and_occurrences() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (store, oid) = rust_usage_fact_store(temp.path());
+        let facts = store.rust_usage_facts(oid, "rust").unwrap();
+
+        let exports: Vec<_> = facts
+            .exports
+            .iter()
+            .map(|export| {
+                (
+                    export.exported_name.as_deref(),
+                    export.source_path.as_str(),
+                    export.imported_name.as_deref(),
+                    export.is_glob,
+                )
+            })
+            .collect();
+        assert_eq!(
+            exports,
+            vec![
+                (Some("Exported"), "alpha", Some("Exported"), false),
+                (Some("Alias"), "beta", Some("Renamed"), false),
+                (None, "gamma", None, true),
+            ],
+            "private and non-root `use` declarations are not exports: {:?}",
+            facts.exports
+        );
+
+        let imports: Vec<_> = facts
+            .import_targets
+            .iter()
+            .map(|target| {
+                (
+                    target.module_path.as_str(),
+                    target.bound_name.as_deref(),
+                    target.is_glob,
+                    target.owner_module.as_str(),
+                    target.local_extent.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            imports,
+            vec![
+                ("alpha", Some("Exported"), false, "", false),
+                ("beta", Some("Alias"), false, "", false),
+                ("gamma", None, true, "", false),
+                ("delta", Some("Private"), false, "", false),
+                ("crate", Some("Scoped"), false, "inline", false),
+                ("crate", Some("Local"), false, "inline", true),
+            ],
+            "import rows were {:?}",
+            facts.import_targets
+        );
+        assert_eq!(
+            facts.import_targets[0].visibility,
+            crate::analyzer::rust::imports::RustVisibility::Public
+        );
+        assert_eq!(
+            facts.import_targets[3].visibility,
+            crate::analyzer::rust::imports::RustVisibility::Private
+        );
+
+        let modules: Vec<_> = facts
+            .modules
+            .iter()
+            .map(|module| (module.module_name.as_str(), module.is_inline))
+            .collect();
+        assert_eq!(
+            modules,
+            vec![("", true), ("detached", false), ("inline", true)],
+            "module rows were {:?}",
+            facts.modules
+        );
+        assert_eq!(facts.modules[0].start_byte, 0);
+        assert_eq!(facts.modules[0].end_byte, RUST_USAGE_FACT_FIXTURE.len());
+
+        let mask = |name: &str| {
+            facts
+                .identifier_occurrences
+                .iter()
+                .find(|occurrence| occurrence.identifier == name)
+                .map(|occurrence| occurrence.context_mask)
+        };
+        assert_eq!(
+            mask("helper"),
+            Some(crate::analyzer::rust::facts::RUST_OCCURRENCE_CODE)
+        );
+        assert_eq!(
+            mask("in_a_comment"),
+            Some(crate::analyzer::rust::facts::RUST_OCCURRENCE_COMMENT)
+        );
+        assert_eq!(
+            mask("in_a_string"),
+            Some(crate::analyzer::rust::facts::RUST_OCCURRENCE_STRING)
+        );
+    }
+
+    #[test]
+    fn rust_fact_tables_answer_the_inverted_name_lookups() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (store, oid) = rust_usage_fact_store(temp.path());
+
+        assert_eq!(store.rust_export_blobs("rust", "Alias").unwrap(), vec![oid]);
+        assert!(
+            store
+                .rust_export_blobs("rust", "Private")
+                .unwrap()
+                .is_empty(),
+            "a private import must not answer an export lookup"
+        );
+        assert_eq!(
+            store.rust_import_target_blobs("rust", "delta").unwrap(),
+            vec![oid]
+        );
+        assert_eq!(
+            store
+                .rust_identifier_occurrence_blobs("rust", "helper")
+                .unwrap(),
+            vec![(oid, crate::analyzer::rust::facts::RUST_OCCURRENCE_CODE)]
+        );
+        assert!(
+            store
+                .rust_identifier_occurrence_blobs("rust", "HELPER")
+                .unwrap()
+                .is_empty(),
+            "identifier lookups are case-sensitive"
+        );
+        assert!(
+            store
+                .rust_identifier_occurrence_blobs("java", "helper")
+                .unwrap()
+                .is_empty(),
+            "identifier lookups are scoped to one language"
+        );
+    }
+
+    #[test]
+    fn rust_fact_rows_cascade_with_their_blob() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (store, oid) = rust_usage_fact_store(temp.path());
+        let count = |store: &AnalyzerStore| {
+            let conn = store.conn.lock().unwrap();
+            [
+                "rust_exports",
+                "rust_import_targets",
+                "rust_modules",
+                "rust_identifier_occurrences",
+            ]
+            .into_iter()
+            .map(|table| {
+                conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE blob_oid = ?1 AND lang = ?2"),
+                    params![oid.to_string(), "rust"],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap()
+            })
+            .sum::<usize>()
+        };
+
+        assert!(count(&store) > 0, "fixture must persist fact rows");
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2",
+                params![oid.to_string(), "rust"],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            count(&store),
+            0,
+            "deleting the blob must cascade every rust_* fact row away"
+        );
+    }
+
+    #[test]
+    fn rust_fact_rows_are_stable_across_a_re_analysis_of_the_same_content() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "src/lib.rs", RUST_USAGE_FACT_FIXTURE);
+        let oid = oid_for(RUST_USAGE_FACT_FIXTURE.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
+            .unwrap();
+        let first = store.rust_usage_facts(oid, "rust").unwrap();
+
+        // Same bytes at a different path: the content key is unchanged, so the
+        // second analysis must produce byte-identical rows. Nothing persisted
+        // here may be path-derived.
+        let moved = write_file(temp.path(), "src/other/lib.rs", RUST_USAGE_FACT_FIXTURE);
+        store
+            .write_parsed_blob(
+                oid,
+                "rust",
+                &RustAdapter,
+                &parse_state(&RustAdapter, &moved),
+            )
+            .unwrap();
+        let second = store.rust_usage_facts(oid, "rust").unwrap();
+
+        assert_eq!(first, second);
     }
 
     fn write_file(root: &Path, rel_path: &str, contents: &str) -> ProjectFile {

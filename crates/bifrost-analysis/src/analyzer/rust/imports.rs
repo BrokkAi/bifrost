@@ -12,7 +12,7 @@ use super::RustAnalyzer;
 use super::declarations::{rust_node_text, rust_package_name};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum RustVisibility {
+pub(crate) enum RustVisibility {
     Private,
     Public,
     Crate,

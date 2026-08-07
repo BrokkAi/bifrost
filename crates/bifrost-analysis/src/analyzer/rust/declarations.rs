@@ -218,6 +218,11 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
         }
     }
 
+    // The per-file usage facts persisted to the `rust_*` fact tables. Extracted
+    // here, from the tree this pass already holds, so nothing re-parses later
+    // to answer a usage query (ExecPlan `.agents/plans/rust-usage-index-v2.md`).
+    parsed.rust_usage_facts = super::facts::extract_rust_usage_facts(root, source);
+
     parsed
 }
 

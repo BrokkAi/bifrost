@@ -616,6 +616,13 @@ pub struct FileState {
     pub(crate) import_statements: Vec<String>,
     pub(crate) imports: Vec<ImportInfo>,
     pub(crate) scala_exports: HashMap<CodeUnit, Vec<crate::analyzer::scala::ScalaExportInfo>>,
+    /// Per-file Rust usage facts on their way to the `rust_*` fact tables (see
+    /// `crate::analyzer::rust::facts`). Empty for every other language, and
+    /// empty on a `FileState` hydrated from the store: the query side reads
+    /// those rows straight from SQL by blob oid rather than through a
+    /// materialized `FileState`, so hydrating them here would be dead weight
+    /// on every cache hit. Same rule as `parse_errors` below.
+    pub(crate) rust_usage_facts: crate::analyzer::rust::facts::RustUsageFacts,
     pub(crate) raw_supertypes: HashMap<CodeUnit, Vec<String>>,
     pub(crate) supertype_lookup_paths: HashMap<CodeUnit, Vec<String>>,
     pub(crate) type_identifiers: HashSet<String>,
@@ -1403,6 +1410,11 @@ pub struct ParsedFile {
     pub import_statements: Vec<String>,
     pub imports: Vec<ImportInfo>,
     pub(crate) scala_exports: HashMap<CodeUnit, Vec<crate::analyzer::scala::ScalaExportInfo>>,
+    /// Per-file Rust usage facts (exports, import targets, modules, identifier
+    /// occurrences) recorded by the Rust walk from the tree it already holds,
+    /// and persisted to the `rust_*` fact tables. Empty for every other
+    /// language. See `crate::analyzer::rust::facts`.
+    pub(crate) rust_usage_facts: crate::analyzer::rust::facts::RustUsageFacts,
     pub raw_supertypes: HashMap<CodeUnit, Vec<String>>,
     pub supertype_lookup_paths: HashMap<CodeUnit, Vec<String>>,
     pub type_identifiers: HashSet<String>,
@@ -1500,6 +1512,7 @@ impl ParsedFile {
             import_statements: Vec::new(),
             imports: Vec::new(),
             scala_exports: HashMap::default(),
+            rust_usage_facts: crate::analyzer::rust::facts::RustUsageFacts::default(),
             raw_supertypes: HashMap::default(),
             supertype_lookup_paths: HashMap::default(),
             type_identifiers: HashSet::default(),
@@ -2432,6 +2445,7 @@ where
             import_statements: parsed.import_statements,
             imports: parsed.imports,
             scala_exports: parsed.scala_exports,
+            rust_usage_facts: parsed.rust_usage_facts,
             raw_supertypes: parsed.raw_supertypes,
             supertype_lookup_paths: parsed.supertype_lookup_paths,
             type_identifiers: parsed.type_identifiers,
@@ -9433,6 +9447,7 @@ mod tests {
             import_statements: Vec::new(),
             imports: Vec::new(),
             scala_exports: HashMap::default(),
+            rust_usage_facts: crate::analyzer::rust::facts::RustUsageFacts::default(),
             raw_supertypes: HashMap::default(),
             supertype_lookup_paths: HashMap::default(),
             type_identifiers: HashSet::default(),
