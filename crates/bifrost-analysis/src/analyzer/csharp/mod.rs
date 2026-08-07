@@ -671,6 +671,14 @@ impl CSharpAnalyzer {
         self.inner.signature_metadata_limited(code_unit, limit)
     }
 
+    pub(crate) fn signatures_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<String> {
+        self.inner.signatures_limited(code_unit, limit)
+    }
+
     pub(crate) fn ranges_limited(
         &self,
         code_unit: &CodeUnit,
@@ -1137,6 +1145,16 @@ impl LanguageSupport for CSharpSupport {
     ) -> Option<LimitedQueryRows<SignatureMetadata>> {
         resolve_analyzer::<CSharpAnalyzer>(analyzer)
             .map(|csharp| csharp.signature_metadata_limited(unit, limit))
+    }
+
+    fn signatures_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<String>> {
+        resolve_analyzer::<CSharpAnalyzer>(analyzer)
+            .map(|csharp| csharp.signatures_limited(unit, limit))
     }
 
     fn declaration_ranges_limited(

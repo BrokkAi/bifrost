@@ -531,7 +531,7 @@ fn definition_candidate_from_range_base(
         signature: unit
             .signature()
             .map(str::to_string)
-            .or_else(|| analyzer.signatures(unit).first().cloned()),
+            .or_else(|| selector_signatures(analyzer, unit).into_iter().next()),
         language: language_name(language),
         canonical_selector: None,
         occurrence_role: None,
@@ -999,6 +999,16 @@ pub(super) fn file_anchored_definition_selector(unit: &CodeUnit) -> String {
     format!("{}#{}", rel_path_string(unit.source()), unit.fq_name())
 }
 
+/// Rendered signatures for selector keying: the language's complete bounded
+/// persisted projection when it provides one, otherwise the analyzer's full
+/// read (which may hydrate the owning `FileState`).
+pub(super) fn selector_signatures(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<String> {
+    language_support(language_for_target(unit))
+        .and_then(|support| support.signatures_limited(analyzer, unit, usize::MAX))
+        .filter(|signatures| signatures.complete)
+        .map_or_else(|| analyzer.signatures(unit), |signatures| signatures.rows)
+}
+
 #[derive(Default)]
 struct CppSelectorFacts {
     signatures: HashMap<CodeUnit, Vec<String>>,
@@ -1016,13 +1026,9 @@ impl CppSelectorFacts {
             .iter()
             .filter(|unit| language_for_target(unit) == Language::Cpp && unit.is_callable())
         {
-            facts.signatures.insert(
-                unit.clone(),
-                support
-                    .signatures_limited(analyzer, unit, usize::MAX)
-                    .filter(|signatures| signatures.complete)
-                    .map_or_else(|| analyzer.signatures(unit), |signatures| signatures.rows),
-            );
+            facts
+                .signatures
+                .insert(unit.clone(), selector_signatures(analyzer, unit));
 
             let metadata = support
                 .signature_metadata_limited(analyzer, unit, usize::MAX)
@@ -1349,7 +1355,7 @@ pub(super) fn distinct_definitions(
         let signature = if language == Language::Cpp && unit.is_callable() {
             cpp_facts.signature_key(unit)
         } else {
-            analyzer.signatures(unit)
+            selector_signatures(analyzer, unit)
         };
         files_by_fqn_signature
             .entry((unit.fq_name(), signature))
@@ -1716,9 +1722,366 @@ pub(super) fn language_name(language: Language) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{AnalyzerConfig, CppAnalyzer, WorkspaceAnalyzer, resolve_analyzer};
+    use crate::analyzer::{
+        AnalyzerConfig, CSharpAnalyzer, CppAnalyzer, GoAnalyzer, JavaAnalyzer, JavascriptAnalyzer,
+        KotlinAnalyzer, PhpAnalyzer, PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
+        TypescriptAnalyzer, WorkspaceAnalyzer, resolve_analyzer,
+    };
     use crate::test_support::AnalyzerFixture;
     use std::sync::Arc;
+
+    /// Prove, for one language, that persisted selector projections carry the
+    /// same grouping as a freshly built workspace and that rendering the
+    /// selectors from a reopened workspace hydrates no `FileState`.
+    fn assert_selector_parity_without_full_hydration(
+        language: Language,
+        files: &[(&str, &str)],
+        lookup: &str,
+        reset_full_hydration_count: impl Fn(&dyn IAnalyzer),
+        full_hydration_count: impl Fn(&dyn IAnalyzer) -> usize,
+    ) {
+        let fixture = AnalyzerFixture::new_for_language(language, files);
+        let fresh = fixture.analyzer.analyzer();
+        let fresh_definitions: Vec<_> = fresh.definitions(lookup).collect();
+        assert!(
+            fresh_definitions.len() >= 2,
+            "{language:?} fixture must produce at least two definitions for `{lookup}`, got {fresh_definitions:?}"
+        );
+        let expected = distinct_definitions(fresh, fresh_definitions);
+
+        let reopened = WorkspaceAnalyzer::build(
+            Arc::new(fixture.test_project().clone()),
+            AnalyzerConfig::default(),
+        );
+        let analyzer = reopened.analyzer();
+        let definitions: Vec<_> = analyzer.definitions(lookup).collect();
+        assert_eq!(
+            expected.iter().map(|(_, units)| units.len()).sum::<usize>(),
+            definitions.len(),
+            "{language:?} reopened workspace must resolve the same definitions"
+        );
+
+        reset_full_hydration_count(analyzer);
+        let groups = distinct_definitions(analyzer, definitions);
+        assert_eq!(
+            expected, groups,
+            "{language:?} selectors must match between a fresh and a reopened workspace"
+        );
+        assert_eq!(
+            0,
+            full_hydration_count(analyzer),
+            "{language:?} selector rendering must not hydrate persisted file states"
+        );
+    }
+
+    #[test]
+    fn go_selectors_match_persisted_projection_without_full_hydration() {
+        assert_selector_parity_without_full_hydration(
+            Language::Go,
+            &[
+                (
+                    "alpha/one.go",
+                    "package alpha\n\nfunc compute(value int) int { return value }\n",
+                ),
+                (
+                    "alpha/two.go",
+                    "package alpha\n\nfunc compute(value int) int { return value }\n",
+                ),
+            ],
+            "alpha.compute",
+            |analyzer| {
+                resolve_analyzer::<GoAnalyzer>(analyzer)
+                    .expect("Go analyzer")
+                    .reset_full_hydration_count_for_test();
+            },
+            |analyzer| {
+                resolve_analyzer::<GoAnalyzer>(analyzer)
+                    .expect("Go analyzer")
+                    .full_hydration_count_for_test()
+            },
+        );
+    }
+
+    #[test]
+    fn python_selectors_match_persisted_projection_without_full_hydration() {
+        assert_selector_parity_without_full_hydration(
+            Language::Python,
+            &[
+                ("alpha.py", "def compute(value):\n    return value\n"),
+                (
+                    "alpha/__init__.py",
+                    "def compute(value):\n    return value\n",
+                ),
+            ],
+            "alpha.compute",
+            |analyzer| {
+                resolve_analyzer::<PythonAnalyzer>(analyzer)
+                    .expect("Python analyzer")
+                    .reset_full_hydration_count_for_test();
+            },
+            |analyzer| {
+                resolve_analyzer::<PythonAnalyzer>(analyzer)
+                    .expect("Python analyzer")
+                    .full_hydration_count_for_test()
+            },
+        );
+    }
+
+    #[test]
+    fn rust_selectors_match_persisted_projection_without_full_hydration() {
+        assert_selector_parity_without_full_hydration(
+            Language::Rust,
+            &[
+                (
+                    "src/alpha.rs",
+                    "pub fn compute(value: i32) -> i32 { value }\n",
+                ),
+                (
+                    "src/alpha/mod.rs",
+                    "pub fn compute(value: i32) -> i32 { value }\n",
+                ),
+            ],
+            "alpha.compute",
+            |analyzer| {
+                resolve_analyzer::<RustAnalyzer>(analyzer)
+                    .expect("Rust analyzer")
+                    .reset_full_hydration_count_for_test();
+            },
+            |analyzer| {
+                resolve_analyzer::<RustAnalyzer>(analyzer)
+                    .expect("Rust analyzer")
+                    .full_hydration_count_for_test()
+            },
+        );
+    }
+
+    #[test]
+    fn kotlin_selectors_match_persisted_projection_without_full_hydration() {
+        assert_selector_parity_without_full_hydration(
+            Language::Kotlin,
+            &[
+                (
+                    "alpha/One.kt",
+                    "package alpha\n\nfun compute(value: Int): Int = value\n",
+                ),
+                (
+                    "alpha/Two.kt",
+                    "package alpha\n\nfun compute(value: Int): Int = value\n",
+                ),
+            ],
+            "alpha.compute",
+            |analyzer| {
+                resolve_analyzer::<KotlinAnalyzer>(analyzer)
+                    .expect("Kotlin analyzer")
+                    .reset_full_hydration_count_for_test();
+            },
+            |analyzer| {
+                resolve_analyzer::<KotlinAnalyzer>(analyzer)
+                    .expect("Kotlin analyzer")
+                    .full_hydration_count_for_test()
+            },
+        );
+    }
+
+    #[test]
+    fn php_selectors_match_persisted_projection_without_full_hydration() {
+        assert_selector_parity_without_full_hydration(
+            Language::Php,
+            &[
+                (
+                    "one.php",
+                    "<?php\nnamespace Alpha;\n\nfunction compute($value) { return $value; }\n",
+                ),
+                (
+                    "two.php",
+                    "<?php\nnamespace Alpha;\n\nfunction compute($value) { return $value; }\n",
+                ),
+            ],
+            "Alpha.compute",
+            |analyzer| {
+                resolve_analyzer::<PhpAnalyzer>(analyzer)
+                    .expect("PHP analyzer")
+                    .reset_full_hydration_count_for_test();
+            },
+            |analyzer| {
+                resolve_analyzer::<PhpAnalyzer>(analyzer)
+                    .expect("PHP analyzer")
+                    .full_hydration_count_for_test()
+            },
+        );
+    }
+
+    #[test]
+    fn ruby_selectors_match_persisted_projection_without_full_hydration() {
+        assert_selector_parity_without_full_hydration(
+            Language::Ruby,
+            &[
+                (
+                    "one.rb",
+                    "module Alpha\n  def self.compute(value)\n    value\n  end\nend\n",
+                ),
+                (
+                    "two.rb",
+                    "module Alpha\n  def self.compute(value)\n    value\n  end\nend\n",
+                ),
+            ],
+            "Alpha.compute",
+            |analyzer| {
+                resolve_analyzer::<RubyAnalyzer>(analyzer)
+                    .expect("Ruby analyzer")
+                    .reset_full_hydration_count_for_test();
+            },
+            |analyzer| {
+                resolve_analyzer::<RubyAnalyzer>(analyzer)
+                    .expect("Ruby analyzer")
+                    .full_hydration_count_for_test()
+            },
+        );
+    }
+
+    #[test]
+    fn csharp_selectors_match_persisted_projection_without_full_hydration() {
+        assert_selector_parity_without_full_hydration(
+            Language::CSharp,
+            &[
+                (
+                    "One.cs",
+                    "namespace Alpha { public partial class Service { public int Compute(int value) { return value; } } }\n",
+                ),
+                (
+                    "Two.cs",
+                    "namespace Alpha { public partial class Service { public int Compute(string value) { return 0; } } }\n",
+                ),
+            ],
+            "Alpha.Service.Compute",
+            |analyzer| {
+                resolve_analyzer::<CSharpAnalyzer>(analyzer)
+                    .expect("C# analyzer")
+                    .reset_full_hydration_count_for_test();
+            },
+            |analyzer| {
+                resolve_analyzer::<CSharpAnalyzer>(analyzer)
+                    .expect("C# analyzer")
+                    .full_hydration_count_for_test()
+            },
+        );
+    }
+
+    #[test]
+    fn scala_selectors_match_persisted_projection_without_full_hydration() {
+        assert_selector_parity_without_full_hydration(
+            Language::Scala,
+            &[
+                (
+                    "alpha/One.scala",
+                    "package alpha\n\nobject Alpha {\n  def compute(value: Int): Int = value\n}\n",
+                ),
+                (
+                    "alpha/Two.scala",
+                    "package alpha\n\nobject Alpha {\n  def compute(value: Int): Int = value\n}\n",
+                ),
+            ],
+            "alpha.Alpha$.compute",
+            |analyzer| {
+                resolve_analyzer::<ScalaAnalyzer>(analyzer)
+                    .expect("Scala analyzer")
+                    .reset_full_hydration_count_for_test();
+            },
+            |analyzer| {
+                resolve_analyzer::<ScalaAnalyzer>(analyzer)
+                    .expect("Scala analyzer")
+                    .full_hydration_count_for_test()
+            },
+        );
+    }
+
+    #[test]
+    fn java_selectors_match_persisted_projection_without_full_hydration() {
+        assert_selector_parity_without_full_hydration(
+            Language::Java,
+            &[
+                (
+                    "alpha/Service.java",
+                    "package alpha;\n\npublic class Service {\n    public int compute(int value) { return value; }\n}\n",
+                ),
+                (
+                    "alpha/ServiceDup.java",
+                    "package alpha;\n\npublic class Service {\n    public int compute(int value) { return value; }\n}\n",
+                ),
+            ],
+            "alpha.Service.compute",
+            |analyzer| {
+                resolve_analyzer::<JavaAnalyzer>(analyzer)
+                    .expect("Java analyzer")
+                    .inner()
+                    .reset_full_hydration_count_for_test();
+            },
+            |analyzer| {
+                resolve_analyzer::<JavaAnalyzer>(analyzer)
+                    .expect("Java analyzer")
+                    .inner()
+                    .full_hydration_count_for_test()
+            },
+        );
+    }
+
+    #[test]
+    fn javascript_selectors_match_persisted_projection_without_full_hydration() {
+        assert_selector_parity_without_full_hydration(
+            Language::JavaScript,
+            &[
+                (
+                    "alpha.js",
+                    "export function compute(value) { return value; }\n",
+                ),
+                (
+                    "beta.js",
+                    "export function compute(value) { return value; }\n",
+                ),
+            ],
+            "compute",
+            |analyzer| {
+                resolve_analyzer::<JavascriptAnalyzer>(analyzer)
+                    .expect("JavaScript analyzer")
+                    .inner()
+                    .reset_full_hydration_count_for_test();
+            },
+            |analyzer| {
+                resolve_analyzer::<JavascriptAnalyzer>(analyzer)
+                    .expect("JavaScript analyzer")
+                    .inner()
+                    .full_hydration_count_for_test()
+            },
+        );
+    }
+
+    #[test]
+    fn typescript_selectors_match_persisted_projection_without_full_hydration() {
+        assert_selector_parity_without_full_hydration(
+            Language::TypeScript,
+            &[
+                (
+                    "alpha.ts",
+                    "export function compute(value: number): number { return value; }\n",
+                ),
+                (
+                    "beta.ts",
+                    "export function compute(value: number): number { return value; }\n",
+                ),
+            ],
+            "compute",
+            |analyzer| {
+                resolve_analyzer::<TypescriptAnalyzer>(analyzer)
+                    .expect("TypeScript analyzer")
+                    .reset_full_hydration_count_for_test();
+            },
+            |analyzer| {
+                resolve_analyzer::<TypescriptAnalyzer>(analyzer)
+                    .expect("TypeScript analyzer")
+                    .full_hydration_count_for_test()
+            },
+        );
+    }
 
     #[test]
     fn cpp_canonical_selectors_use_persisted_facts_without_full_hydration() {

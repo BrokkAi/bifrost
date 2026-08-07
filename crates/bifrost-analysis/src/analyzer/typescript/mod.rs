@@ -286,6 +286,24 @@ impl TypescriptAnalyzer {
         self.inner.ranges_limited(code_unit, limit)
     }
 
+    /// Mirrors the type-alias terminator that `signatures` appends, so a bounded read
+    /// returns the same text as the unbounded one.
+    pub(crate) fn signatures_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<String> {
+        let mut result = self.inner.signatures_limited(code_unit, limit);
+        if self.inner.is_type_alias(code_unit) {
+            for signature in &mut result.rows {
+                if !signature.ends_with(';') {
+                    signature.push(';');
+                }
+            }
+        }
+        result
+    }
+
     #[doc(hidden)]
     pub fn reset_full_hydration_count_for_test(&self) {
         self.inner.reset_full_hydration_count_for_test();
