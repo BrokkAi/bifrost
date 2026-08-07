@@ -73,6 +73,10 @@ impl RustExternalEvidence for RetainedRustDependencies {
         self.crates().publishes_path(segments)
     }
 
+    fn is_module_surface(&self, segments: &[String]) -> bool {
+        self.crates().is_module_surface(segments)
+    }
+
     fn unindexed_boundary(&self, crate_name: &str) -> BoundaryStatus {
         // Retained discovery evidence (#1601): the Cargo dependency graph
         // declares this crate and nothing indexed it, or discovery could not

@@ -26,7 +26,7 @@
 
 use crate::analyzer::semantic_model::{
     SemanticModelCompleteness, SemanticModelOverlay, SemanticModelOverlayDisposition,
-    SemanticModelSymbol, Visibility,
+    SemanticModelSymbol, SemanticModelSymbolKind, Visibility,
 };
 use brokk_bifrost_rust::diagnostics::RustCrateSurface;
 
@@ -100,5 +100,16 @@ impl<'a> RustOverlayCrates<'a> {
     /// public Rust declaration.
     pub(crate) fn publishes_path(&self, segments: &[String]) -> bool {
         self.visible_symbol(&Self::pack_name(segments)).is_some()
+    }
+
+    /// Whether the packs publish `segments` as a module.
+    ///
+    /// Only a module's membership is enumerable from a rustdoc surface. A
+    /// type's associated items are not: the producer skips blanket impls, and
+    /// a trait bound or a `Deref` chain can supply a method that the type's
+    /// own impls never mention, so a miss under a type owner is never proof.
+    pub(crate) fn is_module_surface(&self, segments: &[String]) -> bool {
+        self.visible_symbol(&Self::pack_name(segments))
+            .is_some_and(|symbol| symbol.kind == SemanticModelSymbolKind::Module)
     }
 }

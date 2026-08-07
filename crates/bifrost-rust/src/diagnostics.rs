@@ -83,6 +83,15 @@ pub trait RustExternalEvidence {
     /// includes the leading crate name.
     fn publishes_path(&self, segments: &[String]) -> bool;
 
+    /// Whether the packs publish `segments` as a *module* surface.
+    ///
+    /// A module is the only owner whose membership a pack enumerates
+    /// completely. A type's associated items are not enumerable that way: a
+    /// trait bound or a `Deref` chain puts methods on a type that its own
+    /// `impl` blocks never mention, so a miss under a type owner proves
+    /// nothing even when the crate surface is complete.
+    fn is_module_surface(&self, segments: &[String]) -> bool;
+
     /// How far a lookup for a crate no pack published could see: the retained
     /// Cargo dependency evidence declares it
     /// ([`BoundaryStatus::ExternalDeclaredUnindexed`]) or nothing is known
@@ -101,6 +110,10 @@ impl RustExternalEvidence for UnindexedRustDependencies {
     }
 
     fn publishes_path(&self, _segments: &[String]) -> bool {
+        false
+    }
+
+    fn is_module_surface(&self, _segments: &[String]) -> bool {
         false
     }
 
@@ -516,10 +529,26 @@ impl RustDiagnosticCollector<'_, '_> {
         }
         match self.external.crate_surface(crate_name) {
             // The pack states a complete API surface for this exact crate and
-            // does not publish the item, so the miss is proof.
-            RustCrateSurface::Complete => RustNameProof::Absent {
-                boundary: BoundaryStatus::ExternalIndexed,
-            },
+            // does not publish the item. That is proof only when the owner is
+            // a surface whose membership the pack actually enumerates.
+            RustCrateSurface::Complete => {
+                let (_, owner) = segments
+                    .split_last()
+                    .expect("a non-empty path has a trailing name");
+                // The crate root is itself a module, so a bare `krate::Item`
+                // has an enumerable owner with no owner segments to check.
+                if owner.len() <= 1 || self.external.is_module_surface(owner) {
+                    return RustNameProof::Absent {
+                        boundary: BoundaryStatus::ExternalIndexed,
+                    };
+                }
+                RustNameProof::Incomplete(RustProofGap::Unsupported {
+                    detail: format!(
+                        "`{}` is an indexed Rust type rather than a module, and a trait bound or `Deref` chain can supply an associated item its own impls do not declare",
+                        owner.join("::")
+                    ),
+                })
+            }
             RustCrateSurface::Uncertain { detail } => {
                 RustNameProof::Incomplete(RustProofGap::Unsupported { detail })
             }

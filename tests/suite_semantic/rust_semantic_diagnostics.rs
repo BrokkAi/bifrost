@@ -512,6 +512,50 @@ fn a_glob_import_suppresses_the_bare_names_it_could_supply() {
     );
 }
 
+/// A miss under a *type* owner is never proof, even when the crate surface is
+/// complete. rustdoc skips blanket impls, and a trait bound or a `Deref` chain
+/// can supply an associated item that a type's own impls never mention, so
+/// "this method does not exist" is not something the surface can say. A miss
+/// under a *module* owner stays provable, which is the other half of the rule.
+#[test]
+fn an_associated_item_miss_is_incomplete_while_a_module_item_miss_is_proof() {
+    let fixture = RustFixture::with_pack(
+        &[(
+            "src/lib.rs",
+            "pub fn consume() {\n    widget::Widget::not_an_inherent_item;\n    widget::nested::NotThere;\n}\n",
+        )],
+        "complete",
+    );
+
+    let report = fixture.report("src/lib.rs");
+    assert!(
+        incomplete_reasons(&report).iter().any(|reason| matches!(
+            reason,
+            SemanticDiagnosticIncompleteReason::UnsupportedSemantics { detail }
+                if detail.contains("Deref") && detail.contains("widget::Widget")
+        )),
+        "an associated-item miss must not be proved absent: {:#?}",
+        report.outcomes()
+    );
+    assert!(
+        report.outcomes().iter().any(|outcome| matches!(
+            outcome,
+            SemanticDiagnosticOutcome::Absent(proof)
+                if proof.boundary == BoundaryStatus::ExternalIndexed
+        )),
+        "a module-owned miss stays provable: {:#?}",
+        report.outcomes()
+    );
+    assert!(
+        report
+            .diagnostics()
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("not_an_inherent_item")),
+        "{:#?}",
+        report.diagnostics()
+    );
+}
+
 /// A workspace-local name keeps its workspace proof: the external ladder never
 /// takes over a reference the workspace already explains.
 #[test]
