@@ -18,6 +18,7 @@ pub(crate) mod structural;
 mod tests;
 mod usage_index;
 mod usage_queries;
+mod usage_walks;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
@@ -98,6 +99,10 @@ pub struct RustAnalyzer {
     /// (structural parents, visibility) and not only the file's bytes; the
     /// analyzer is replaced wholesale on `update`, so the cache retires with it.
     declaration_facts: Cache<ProjectFile, Arc<usage_queries::RustDeclarationFacts>>,
+    /// The bounded caches behind the ExecPlan Milestone 2c cross-file walks,
+    /// in one allocation: nine `Cache` handles inline would make this struct
+    /// the outsized variant of `AnalyzerDelegate`.
+    walk_caches: Arc<usage_walks::RustWalkCaches>,
     hierarchy_index: Arc<OnceLock<RustHierarchyIndex>>,
     #[allow(dead_code)]
     type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
@@ -169,6 +174,24 @@ impl RustAnalyzer {
         self.declaration_facts
             .insert(file.clone(), Arc::clone(&facts));
         facts
+    }
+
+    /// Cargo routes for the usage walks. Same memo the forward paths use; the
+    /// walk layer holds the handle for the length of one query instead of
+    /// re-entering the memo per lookup.
+    pub(super) fn cargo_routes_for_usage(&self) -> Arc<RustCargoRouteIndex> {
+        self.cargo_routes()
+    }
+
+    pub(super) fn cargo_routes_for_usage_while(
+        &self,
+        keep_going: &(impl Fn() -> bool + Sync),
+    ) -> Option<Arc<RustCargoRouteIndex>> {
+        self.cargo_routes_while(keep_going)
+    }
+
+    pub(in crate::analyzer::rust) fn walk_caches(&self) -> &Arc<usage_walks::RustWalkCaches> {
+        &self.walk_caches
     }
 
     pub(crate) fn declaration_candidates_by_identifier_limited(
@@ -419,6 +442,7 @@ impl RustAnalyzer {
             usage_index: Arc::new(PoolSafeMemo::new()),
             rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
+            walk_caches: Arc::new(usage_walks::RustWalkCaches::new(memo_budget)),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
@@ -456,6 +480,7 @@ impl RustAnalyzer {
             usage_index: Arc::new(PoolSafeMemo::new()),
             rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
+            walk_caches: Arc::new(usage_walks::RustWalkCaches::new(memo_budget)),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         })
@@ -709,6 +734,7 @@ impl IAnalyzer for RustAnalyzer {
             usage_index: Arc::new(PoolSafeMemo::new()),
             rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
+            walk_caches: Arc::new(usage_walks::RustWalkCaches::new(self.memo_budget)),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
@@ -736,6 +762,7 @@ impl IAnalyzer for RustAnalyzer {
             usage_index: Arc::new(PoolSafeMemo::new()),
             rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
+            walk_caches: Arc::new(usage_walks::RustWalkCaches::new(self.memo_budget)),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }

@@ -361,12 +361,19 @@ mod tests {
             "cancelled cold discovery must not return partial candidates"
         );
         assert!(cancellation.is_cancelled());
+        // Cargo routes are the whole-workspace structure a cold discovery has
+        // to build, and the only one it can publish half-finished. The usage
+        // index used to be the other one; since ExecPlan Milestone 2c the
+        // candidate walk never touches it, so its readiness says nothing about
+        // this path (`.agents/plans/rust-usage-index-v2.md`).
         assert!(!analyzer.cargo_routes_ready_for_test());
-        assert!(!analyzer.usage_index_ready());
 
         let candidates = rust_usage_candidate_files(&analyzer, &target, &CancellationToken::new());
         assert!(candidates.contains(&source));
         assert!(analyzer.cargo_routes_ready_for_test());
-        assert!(analyzer.usage_index_ready());
+        assert!(
+            !analyzer.usage_index_ready(),
+            "candidate discovery must answer from the store-backed walks, not from a built index"
+        );
     }
 }

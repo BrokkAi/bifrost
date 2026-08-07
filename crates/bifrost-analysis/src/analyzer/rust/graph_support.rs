@@ -154,11 +154,11 @@ impl RustPackageFileIndex {
         Self { files, by_package }
     }
 
-    fn contains(&self, file: &ProjectFile) -> bool {
+    pub(super) fn contains(&self, file: &ProjectFile) -> bool {
         self.files.binary_search(file).is_ok()
     }
 
-    fn files_in_package(&self, package: &str) -> impl Iterator<Item = &ProjectFile> {
+    pub(super) fn files_in_package(&self, package: &str) -> impl Iterator<Item = &ProjectFile> {
         self.by_package
             .get(package)
             .into_iter()
@@ -1005,7 +1005,7 @@ impl RustAnalyzer {
     /// as `cargo_routes` — both are pure projections of the analyzed-file set,
     /// so both are rebuilt by `update`/`update_all`/`clone_with_project` and by
     /// nothing else (#1230 item 3).
-    fn package_file_index(&self) -> Arc<RustPackageFileIndex> {
+    pub(super) fn package_file_index(&self) -> Arc<RustPackageFileIndex> {
         self.package_file_index
             .get_or_init(|| Arc::new(RustPackageFileIndex::build(self.get_analyzed_files())))
             .clone()
