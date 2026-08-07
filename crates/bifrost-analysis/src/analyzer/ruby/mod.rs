@@ -1,8 +1,9 @@
 mod adapter;
 mod cache;
 mod clones;
+pub(crate) mod constant_identity;
 mod dependency_discovery;
-mod diagnostics;
+pub(crate) mod diagnostics;
 mod external;
 mod gem_artifact;
 mod hierarchy;
@@ -481,11 +482,7 @@ impl IAnalyzer for RubyAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
-        let diagnostics = diagnostics::collect_ruby_semantic_diagnostics(self, file, source)
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(file, diagnostics)
+        diagnostics::collect_ruby_semantic_diagnostics(self, file, source)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
