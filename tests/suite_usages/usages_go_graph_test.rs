@@ -801,19 +801,179 @@ func Build(album model.Album) model.Album {
     );
 }
 
+/// A method receiver's type is a real mention of that type: gopls lists
+/// `func (r ResourceType) ...` under find-references on `ResourceType`, so the
+/// editor surface must list it too (#1765). It is declaration-adjacent, though,
+/// and counting it would make every type with methods look heavily used, so it
+/// is classified `SelfReceiver` -- editor-visible, absent from the external
+/// usage surface -- exactly as #1638 does for recursive self-calls.
 #[test]
-fn go_graph_strategy_finds_method_receiver_type_references() {
+fn go_receiver_type_mentions_are_editor_visible_self_receiver_hits() {
+    const SOURCE: &str = r#"
+package app
+
+type ResourceType int
+
+func (r ResourceType) String() string {
+    return "resource"
+}
+
+func (r *ResourceType) Reset() {
+    *r = 0
+}
+
+func Describe(value ResourceType) string {
+    return value.String()
+}
+"#;
+    let (project, analyzer) = go_analyzer_with_files(&[("resource.go", SOURCE)]);
+
+    let target = definition(&analyzer, "example.com/app.ResourceType");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = GoUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+
+    let editor_hits = result.all_hits_including_imports();
+    let editor_lines: BTreeSet<_> = editor_hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        BTreeSet::from([6, 10, 14]),
+        editor_lines,
+        "editor find-references must list the value receiver, the pointer receiver and the parameter type: {editor_hits:#?}"
+    );
+
+    let self_hits = self_receiver_hits(&result);
+    let self_lines: BTreeSet<_> = self_hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        BTreeSet::from([6, 10]),
+        self_lines,
+        "both receiver mentions must be classified self_receiver: {self_hits:#?}"
+    );
+    // The recorded span is the type name, not the whole receiver clause.
+    let value_receiver = SOURCE.find("r ResourceType").expect("value receiver") + "r ".len();
+    let pointer_receiver = SOURCE.find("r *ResourceType").expect("pointer receiver") + "r *".len();
+    let self_offsets: BTreeSet<_> = self_hits.iter().map(|hit| hit.start_offset).collect();
+    assert_eq!(
+        BTreeSet::from([value_receiver, pointer_receiver]),
+        self_offsets,
+        "receiver hits must land on the type name: {self_hits:#?}"
+    );
+
+    let external = result
+        .into_either()
+        .expect("receiver mentions must not hide the ordinary parameter type reference");
+    let external_lines: BTreeSet<_> = external.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        BTreeSet::from([14]),
+        external_lines,
+        "only the parameter type is an external usage: {external:#?}"
+    );
+    assert!(
+        external
+            .iter()
+            .all(|hit| hit.file == project.file("resource.go")),
+        "external hits: {external:#?}"
+    );
+}
+
+/// The receiver *binding* declares a variable; it is not a mention of the
+/// receiver type, even when Go lets it be spelled exactly like the type.
+#[test]
+fn go_receiver_binding_name_is_not_a_usage_of_the_receiver_type() {
+    const SOURCE: &str = r#"
+package app
+
+type Config struct{}
+
+func (Config Config) Reload() {}
+"#;
+    let (_project, analyzer) = go_analyzer_with_files(&[("config.go", SOURCE)]);
+
+    let target = definition(&analyzer, "example.com/app.Config");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = GoUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+
+    let editor_hits = result.all_hits_including_imports();
+    let receiver_clause = SOURCE.find("Config Config").expect("receiver clause");
+    let offsets: BTreeSet<_> = editor_hits.iter().map(|hit| hit.start_offset).collect();
+    assert_eq!(
+        BTreeSet::from([receiver_clause + "Config ".len()]),
+        offsets,
+        "only the receiver type, never the receiver binding, is a usage: {editor_hits:#?}"
+    );
+}
+
+/// A generic receiver names its type through `generic_type`, and the type
+/// arguments in that position are the receiver's own type-parameter bindings:
+/// `Stack` is a mention, `T` is a declaration.
+#[test]
+fn go_generic_receiver_type_mention_is_a_self_receiver_hit() {
+    const SOURCE: &str = r#"
+package app
+
+type Stack[T any] struct{}
+
+func (s Stack[T]) Push(value T) {}
+
+func (s *Stack[T]) Pop() {}
+
+func Empty() Stack[int] {
+    return Stack[int]{}
+}
+"#;
+    let (_project, analyzer) = go_analyzer_with_files(&[("stack.go", SOURCE)]);
+
+    let target = definition(&analyzer, "example.com/app.Stack");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = GoUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+
+    let self_hits = self_receiver_hits(&result);
+    let self_lines: BTreeSet<_> = self_hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        BTreeSet::from([6, 8]),
+        self_lines,
+        "both generic receiver mentions must be classified self_receiver: {self_hits:#?}"
+    );
+
+    let external = result
+        .into_either()
+        .expect("generic type uses should resolve");
+    let external_lines: BTreeSet<_> = external.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        BTreeSet::from([10, 11]),
+        external_lines,
+        "only the return type and the composite literal are external usages: {external:#?}"
+    );
+}
+
+/// The receiver mentions are editor-visible but stay off the external surface,
+/// so the ordinary type references remain the only counted usages (#1765
+/// renamed this from `..._excludes_method_receiver_type_attachments`, which
+/// asserted the external surface only).
+#[test]
+fn go_graph_strategy_keeps_method_receiver_types_off_the_external_surface() {
     let (project, analyzer) = go_analyzer_with_files(&[(
         "component.go",
         r#"
 package app
 
 type ComponentPath struct{}
-type OtherPath struct{}
 
 func (ComponentPath) Unnamed() {}
 func (c *ComponentPath) Named() {}
-func (OtherPath) Other() {}
 
 func Build() []ComponentPath {
     var paths []ComponentPath
@@ -825,17 +985,29 @@ func Build() []ComponentPath {
 
     let target = definition(&analyzer, "example.com/app.ComponentPath");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let hits = GoUsageGraphStrategy::new()
-        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+    let result = GoUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+
+    // The unnamed receiver on line 6 and the pointer receiver on line 7 are
+    // editor-visible mentions of the type, and nothing else.
+    let editor_hits = result.all_hits_including_imports();
+    let editor_lines: BTreeSet<_> = editor_hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        BTreeSet::from([6, 7, 9, 10, 11]),
+        editor_lines,
+        "editor hits: {editor_hits:#?}"
+    );
+
+    let hits = result
         .into_either()
-        .expect("receiver type references should resolve");
+        .expect("receiver attachments should not hide ordinary type references");
     let lines: BTreeSet<_> = hits.iter().map(|hit| hit.line).collect();
 
-    assert_eq!(
-        BTreeSet::from([7, 8, 11, 12, 13]),
-        lines,
-        "type hits: {hits:#?}"
-    );
+    assert_eq!(BTreeSet::from([9, 10, 11]), lines, "type hits: {hits:#?}");
     assert!(
         hits.iter()
             .all(|hit| hit.file == project.file("component.go")),

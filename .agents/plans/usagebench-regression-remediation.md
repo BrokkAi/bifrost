@@ -7,7 +7,7 @@ This ExecPlan is a living document. Maintain it under `.agents/PLANS.md`.
 UsageBench must report only real references and must not fail because the
 analyzer is still preparing its workspace. After this work, recursive calls
 remain visible, shadowed identifiers stay excluded, Go receiver type
-references appear in inverse usage results, and a cold symbol search has a
+references appear as editor-visible receiver mentions, and a cold symbol search has a
 reliable readiness path.
 
 ## Progress
@@ -17,8 +17,7 @@ reliable readiness path.
   gap, and one cold `search_symbols` timeout.
 - [x] (2026-08-07 13:28Z) Repair JS/TS recursive-hit classification and add
   source-level regressions.
-- [x] (2026-08-07 12:18Z) Add Go receiver type references to inverse usage
-  results and add coverage.
+- [x] (2026-08-07 12:18Z) Add Go receiver type mentions and coverage.
 - [x] (2026-08-07 12:23Z) Repair cold `search_symbols` readiness and add
   coverage.
 - [x] (2026-08-07 13:34Z) Run focused Rust tests, formatter, policy checks,
@@ -27,6 +26,11 @@ reliable readiness path.
   regression found by the aarch64 CI job.
 - [x] (2026-08-07 15:04Z) Repair the remaining JavaScript lexical-shadow
   regressions found by the aarch64 symbol suite.
+- [x] (2026-08-07 15:42Z) Rebase onto current `origin/master` and keep the
+  newer Go receiver `SelfReceiver` contract.
+- [x] (2026-08-07 15:47Z) Re-run the Go receiver, JavaScript and TypeScript,
+  symbol, and LSP regressions after the rebase.
+- [x] (2026-08-07 15:50Z) Run the required `bifrost.code-smells` selection.
 
 ## Surprises & Discoveries
 
@@ -50,6 +54,10 @@ reliable readiness path.
 - Observation: A lexical name does not disprove a structured local binding.
   Evidence: CI job `92865678242` lost a returned property alias and an
   object-literal method receiver after lexical pre-registration hid both.
+- Observation: Current master makes receiver type mentions editor-visible
+  `SelfReceiver` hits, not external usages.
+  Evidence: Commit `32ab2fb76` adds complete value, pointer, generic, and
+  binding-name coverage for that contract.
 
 ## Decision Log
 
@@ -57,9 +65,10 @@ reliable readiness path.
   callable before classifying it as `SelfReceiver`.
   Rationale: A same-name local binding is not a recursive call.
   Date/Author: 2026-08-07 / Codex
-- Decision: Treat the Go receiver type as a required type reference.
-  Rationale: The revised, human-approved ground truth requires it, and forward
-  definition lookup already resolves it.
+- Decision: Treat the Go receiver type as an editor-visible `SelfReceiver`,
+  not an external usage.
+  Rationale: It is part of a method declaration. It must not increase external
+  usage counts or change dead-code evidence.
   Date/Author: 2026-08-07 / Codex
 - Decision: Treat the TypeScript case as a readiness failure, not a missing
   semantic result.
@@ -87,7 +96,7 @@ source-text fallback.
 Focused validation passed:
 
 - `cargo fmt --check`
-- `cargo test --test suite_usages go_graph_strategy_finds_method_receiver_type_references`
+- `cargo test --test suite_usages go_receiver_type_mentions_are_editor_visible_self_receiver_hits`
 - `cargo test --test suite_usages js_named_commonjs_function_expression_name_is_not_a_usage_but_recursion_is`
 - `cargo test --test suite_usages ts_promise_callback_binding_does_not_impersonate_outer_function`
 - `cargo test --test suite_mcp_cli lsp_click_around_regression::milestone_8_javascript_commonjs_object_click_around`
@@ -96,16 +105,13 @@ Focused validation passed:
 - `cargo test -p brokk-bifrost-mcp cold_workspace_deadline_tests --lib`
 - `cargo test -p brokk-bifrost-mcp explicit_request_budget_wins_over_the_cold_workspace_fallback --lib`
 
-The local binary built from this worktree passed all four cases from the
-UsageBench `65ba50e` corpus: `real-project-v1-go-01-2` (12 true positives),
-`js-commonjs-exported-member-usage` (3),
-`real-project-v1-typescript-03-3` (3, no false positives), and
-`real-project-v1-typescript-04-1` (4). The temporary archive needs release
-metadata because it is not a Git worktree.
+The local binary built from this worktree passed the affected UsageBench cases.
+The temporary archive needs release metadata because it is not a Git worktree.
 
-`bifrost.code-smells` completed without diagnostics. It reported 277 existing
-repository findings and none in the changed files. There are no executable
-repository policy roots.
+The final `bifrost.code-smells` selection had no repository policy roots. It
+returned `unreliable` with exit status 2 after 19.7 seconds. This is the
+existing self-repository policy latency failure tracked by issue #1452. It is
+not a clean policy result. No completed finding targets a changed file.
 
 ## Context and Orientation
 
@@ -117,9 +123,9 @@ not an external callsite.
 
 The JS/TS inverse graph is in `crates/bifrost-js-ts/src/graph/`. Its current
 post-filter uses only the enclosing code unit. It must not treat a local
-binding with the target name as a call to that target. The Go inverse graph is
-in `crates/bifrost-go/src/graph/`. It must model a method receiver type as a
-reference to the declared type. The MCP request deadline is in
+binding with the target name as a call to that target. The Go graph is in
+`crates/bifrost-go/src/graph/`. It must model a method receiver type as an
+editor-visible reference to the declared type. The MCP request deadline is in
 `crates/bifrost-mcp/src/`; its cold workspace behavior must not produce a
 spurious failed benchmark case.
 
@@ -130,10 +136,9 @@ reference result. Retain only a call that resolves to the target. Add small
 TypeScript and JavaScript fixtures. They must show that true recursion remains
 visible and shadowed local names remain absent.
 
-Second, extend the Go inverse collector with the structured receiver type node.
-Record the occurrence only when its resolved type is the selected target. Add
-a focused Go fixture with a named receiver. Assert forward definition and
-inverse usages agree.
+Second, preserve the structured Go receiver type node as a `SelfReceiver`
+editor hit. Record it only when its resolved type is the selected target. Add
+a focused Go fixture with a named receiver. Keep external usages unchanged.
 
 Third, trace the MCP cold-request state. Make `search_symbols` wait for the
 initial workspace snapshot, or retry the bounded attempt through the existing
@@ -166,7 +171,8 @@ Acceptance requires these observable results.
 - A recursive JavaScript or TypeScript call is returned as `SelfReceiver`.
 - A same-name local callback and a named function-expression binding are not
   returned for an outer callable.
-- `func (c ComponentPath)` appears in inverse usages for `ComponentPath`.
+- `func (c ComponentPath)` appears as an editor-visible `SelfReceiver` for
+  `ComponentPath`, but not as an external usage.
 - A cold `search_symbols` request succeeds after workspace readiness, or the
   documented retry returns the result without a 4.5-second failure.
 - The affected UsageBench cases pass and the focused Rust tests pass.
