@@ -36,7 +36,9 @@ use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use tree_sitter::{Node, Parser, Tree};
 
-use crate::graph_support::{CSharpSource, logical_type_count, visible_type_candidates};
+use crate::graph_support::{
+    CSharpSource, first_logical_type_fqn, logical_type_count, visible_type_candidates,
+};
 use crate::imports::{csharp_using_alias_from_node, csharp_using_namespace};
 use crate::syntax::{
     csharp_type_node_identity, csharp_using_directive_is_static, normalize_csharp_type_fragment,
@@ -122,45 +124,6 @@ pub trait CSharpExternalEvidence {
     /// marker this index decodes, so a hit means an instance-member miss might
     /// be an extension call and is therefore not proof of absence.
     fn could_supply_extension_method(&self, namespaces: &[String], name: &str) -> bool;
-}
-
-/// The external surface of an analyzer whose assembly index was never built.
-///
-/// Nothing is knowable through it, which is the honest answer for a request
-/// that arrived before any warm pass. Used by this crate's own tests, where
-/// building an index is exactly what a test must not do.
-pub struct UnindexedCSharpExternal;
-
-impl CSharpExternalEvidence for UnindexedCSharpExternal {
-    fn unreadable(&self) -> Option<SemanticDiagnosticIncompleteReason> {
-        Some(
-            SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
-                boundary: BoundaryStatus::ExternalUnknown,
-            },
-        )
-    }
-
-    fn surface_is_known(&self) -> bool {
-        false
-    }
-
-    fn declares_namespace(&self, _namespace: &str) -> bool {
-        false
-    }
-
-    fn resolve_type(&self, _file: &ProjectFile, _identity: &str) -> CSharpExternalTypes {
-        CSharpExternalTypes::None
-    }
-
-    fn resolve_member(&self, _owner_fqn: &str, _member: &str) -> CSharpMemberSurface {
-        CSharpMemberSurface::IncompleteOwner {
-            detail: "the C# assembly index is not built".to_string(),
-        }
-    }
-
-    fn could_supply_extension_method(&self, _namespaces: &[String], _name: &str) -> bool {
-        false
-    }
 }
 
 /// Collect C# semantic diagnostics and the proof behind each one.
@@ -616,16 +579,39 @@ impl CSharpDiagnosticCollector<'_> {
         receiver: Node<'_>,
         receiver_identity: &str,
     ) -> Result<MemberOwner, SemanticDiagnosticIncompleteReason> {
-        // A static access spells its owner directly.
-        if !receiver_identity.is_empty()
-            && !self.is_uncheckable_type_identity(receiver_identity)
-            && let Some(owner) = self.type_owner(receiver_identity)
-        {
-            return Ok(owner);
+        // A plain identifier is looked up as a value before it is looked up as
+        // a type. That is C#'s own order for `E.I` -- the "Color Color" rule --
+        // and getting it backwards would read `widget.Missing` against the type
+        // named `widget` whenever a local shadows one, and report a member the
+        // value does have as absent.
+        if receiver.kind() == "identifier" {
+            let symbol = node_text(receiver, self.source).trim();
+            match self.declared_type_of_binding(receiver, symbol) {
+                Ok(declared) => {
+                    if is_csharp_dynamic(&declared) {
+                        return Err(SemanticDiagnosticIncompleteReason::DynamicBehavior {
+                            detail: format!("`{symbol}` is declared `dynamic`"),
+                        });
+                    }
+                    return self.type_owner(&declared).ok_or_else(|| {
+                        SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                            detail: format!("receiver `{symbol}` has no uniquely resolved type"),
+                        }
+                    });
+                }
+                // Nothing binds the name as a value, so it may name a type and
+                // this is a static access.
+                Err(unbound) => {
+                    return self
+                        .type_owner(symbol)
+                        .filter(|_| !self.is_uncheckable_type_identity(symbol))
+                        .ok_or(unbound);
+                }
+            }
         }
-        // Otherwise the owner is the receiver expression's type, which this
-        // pass proves only for a plain local, parameter or field read.
-        if receiver.kind() != "identifier" {
+        // A qualified receiver can only be a type or namespace path; the
+        // namespace case was settled before this call.
+        if receiver_identity.is_empty() || self.is_uncheckable_type_identity(receiver_identity) {
             return Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
                 detail: format!(
                     "receiver expression of kind `{}` has no proven C# type",
@@ -633,16 +619,9 @@ impl CSharpDiagnosticCollector<'_> {
                 ),
             });
         }
-        let symbol = node_text(receiver, self.source).trim();
-        let declared = self.declared_type_of_binding(receiver, symbol)?;
-        if is_csharp_dynamic(&declared) {
-            return Err(SemanticDiagnosticIncompleteReason::DynamicBehavior {
-                detail: format!("`{symbol}` is declared `dynamic`"),
-            });
-        }
-        self.type_owner(&declared).ok_or_else(|| {
+        self.type_owner(receiver_identity).ok_or_else(|| {
             SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
-                detail: format!("receiver `{symbol}` has no uniquely resolved type"),
+                detail: format!("receiver `{receiver_identity}` has no uniquely resolved type"),
             }
         })
     }
@@ -687,7 +666,7 @@ impl CSharpDiagnosticCollector<'_> {
     fn type_owner(&self, identity: &str) -> Option<MemberOwner> {
         let candidates = visible_type_candidates(self.csharp, self.file, identity);
         if logical_type_count(&candidates) == 1 {
-            return first_type_fqn(&candidates).map(|fqn| MemberOwner::Workspace { fqn });
+            return first_logical_type_fqn(&candidates).map(|fqn| MemberOwner::Workspace { fqn });
         }
         if !candidates.is_empty() || self.unreadable_external.is_some() {
             return None;
@@ -853,7 +832,7 @@ impl CSharpDiagnosticCollector<'_> {
                 let candidates = visible_type_candidates(self.csharp, self.file, &raw);
                 match logical_type_count(&candidates) {
                     1 => {
-                        let Some(fqn) = first_type_fqn(&candidates) else {
+                        let Some(fqn) = first_logical_type_fqn(&candidates) else {
                             continue;
                         };
                         if !self
@@ -947,10 +926,6 @@ fn describe_reason(reason: &SemanticDiagnosticIncompleteReason) -> String {
         }
         other => format!("the assembly index is unreadable: {other:?}"),
     }
-}
-
-fn first_type_fqn(candidates: &[CodeUnit]) -> Option<String> {
-    crate::graph_support::first_logical_type_fqn(candidates)
 }
 
 /// The identity a `using static X;` directive names.

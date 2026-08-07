@@ -465,6 +465,40 @@ fn an_unresolvable_ancestor_suppresses_the_member_absence() {
 }
 
 #[test]
+fn a_static_member_with_a_known_owner_is_checked_against_that_owner() {
+    let fixture = CSharpFixture::warmed(&[(
+        APP,
+        "namespace App {\n  public class Widget { public static int Count; }\n  public class Host { void Use() { int n = Widget.Count; int m = Widget.Missing; } }\n}\n",
+    )]);
+    let report = fixture.report(APP);
+    assert!(
+        absent_member(&report, "App.Widget", "Missing"),
+        "{report:#?}"
+    );
+    assert_eq!(
+        report.diagnostics().len(),
+        1,
+        "`Count` is declared, so only `Missing` may error: {report:#?}"
+    );
+}
+
+#[test]
+fn a_local_shadowing_a_type_name_is_read_as_the_value_it_binds() {
+    // C#'s "Color Color" rule: in `E.I`, `E` is looked up as a value before it
+    // is looked up as a type. Reading `Gadget.Size` against the *type* `Gadget`
+    // would report a member the local's own type declares as absent.
+    let fixture = CSharpFixture::warmed(&[(
+        APP,
+        "namespace App {\n  public class Widget { public int Size; }\n  public class Gadget { public int Other; }\n  public class Host { void Use() { Widget Gadget = new Widget(); int n = Gadget.Size; } }\n}\n",
+    )]);
+    let report = fixture.report(APP);
+    assert!(
+        report.diagnostics().is_empty(),
+        "the local binding outranks the same-named type: {report:#?}"
+    );
+}
+
+#[test]
 fn an_extension_method_lookalike_suppresses_the_member_absence() {
     let fixture = CSharpFixture::warmed(&[(
         APP,
