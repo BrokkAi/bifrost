@@ -34,7 +34,7 @@ exclude = [
 name = "brokk_bifrost_jvm"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.23" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.24" }
 regex = "1.12.2"
 # Scala's supertype lookup path is stored as its own JSON envelope inside the
 # declaration index, so the type that owns that encoding travels with `serde`.
@@ -66,4 +66,4 @@ test-support = ["brokk-bifrost-core/test-support"]
 # Cargo unifies this with the plain `[dependencies]` entry above for this
 # crate's test targets, which is what makes core's test-support surface exist
 # while this crate's unit tests are built.
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.23", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.24", features = ["test-support"] }

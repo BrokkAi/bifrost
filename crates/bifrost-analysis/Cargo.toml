@@ -16,16 +16,16 @@ publish = true
 name = "brokk_bifrost_analysis"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.23" }
-brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.8.23" }
-brokk-bifrost-csharp = { path = "../bifrost-csharp", version = "=0.8.23" }
-brokk-bifrost-go = { path = "../bifrost-go", version = "=0.8.23" }
-brokk-bifrost-js-ts = { path = "../bifrost-js-ts", version = "=0.8.23" }
-brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.8.23" }
-brokk-bifrost-php = { path = "../bifrost-php", version = "=0.8.23" }
-brokk-bifrost-python = { path = "../bifrost-python", version = "=0.8.23" }
-brokk-bifrost-ruby = { path = "../bifrost-ruby", version = "=0.8.23" }
-brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.8.23" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.24" }
+brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.8.24" }
+brokk-bifrost-csharp = { path = "../bifrost-csharp", version = "=0.8.24" }
+brokk-bifrost-go = { path = "../bifrost-go", version = "=0.8.24" }
+brokk-bifrost-js-ts = { path = "../bifrost-js-ts", version = "=0.8.24" }
+brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.8.24" }
+brokk-bifrost-php = { path = "../bifrost-php", version = "=0.8.24" }
+brokk-bifrost-python = { path = "../bifrost-python", version = "=0.8.24" }
+brokk-bifrost-ruby = { path = "../bifrost-ruby", version = "=0.8.24" }
+brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.8.24" }
 arc-swap = "1.7.1"
 bincode = "1.3.3"
 cap-std = { version = "4.0.2", default-features = false }
@@ -94,13 +94,13 @@ test-support = [
 # Cargo unifies this with the plain `[dependencies]` entry above for this
 # crate's test targets, which is what makes `CancellationToken`'s
 # `cancel_after_checks_for_test` hooks exist while the unit tests are built.
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.23", features = ["test-support"] }
-brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.8.23", features = ["test-support"] }
-brokk-bifrost-go = { path = "../bifrost-go", version = "=0.8.23", features = ["test-support"] }
-brokk-bifrost-js-ts = { path = "../bifrost-js-ts", version = "=0.8.23", features = ["test-support"] }
-brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.8.23", features = ["test-support"] }
-brokk-bifrost-python = { path = "../bifrost-python", version = "=0.8.23", features = ["test-support"] }
-brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.8.23", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.24", features = ["test-support"] }
+brokk-bifrost-cpp = { path = "../bifrost-cpp", version = "=0.8.24", features = ["test-support"] }
+brokk-bifrost-go = { path = "../bifrost-go", version = "=0.8.24", features = ["test-support"] }
+brokk-bifrost-js-ts = { path = "../bifrost-js-ts", version = "=0.8.24", features = ["test-support"] }
+brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.8.24", features = ["test-support"] }
+brokk-bifrost-python = { path = "../bifrost-python", version = "=0.8.24", features = ["test-support"] }
+brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.8.24", features = ["test-support"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 tree-sitter-scala = "=0.25.1"
 

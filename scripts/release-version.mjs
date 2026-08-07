@@ -46,9 +46,18 @@ export function validateWorkspaceVersionInheritance(repoRoot) {
   }
 }
 
-const RELEASED_CARGO_MANIFESTS = [
+export const RELEASED_CARGO_MANIFESTS = [
   "Cargo.toml",
   "crates/bifrost-core/Cargo.toml",
+  "crates/bifrost-cpp/Cargo.toml",
+  "crates/bifrost-csharp/Cargo.toml",
+  "crates/bifrost-go/Cargo.toml",
+  "crates/bifrost-js-ts/Cargo.toml",
+  "crates/bifrost-jvm/Cargo.toml",
+  "crates/bifrost-php/Cargo.toml",
+  "crates/bifrost-python/Cargo.toml",
+  "crates/bifrost-ruby/Cargo.toml",
+  "crates/bifrost-rust/Cargo.toml",
   "crates/bifrost-analysis/Cargo.toml",
   "crates/bifrost-nlp/Cargo.toml",
   "crates/bifrost-policy/Cargo.toml",
