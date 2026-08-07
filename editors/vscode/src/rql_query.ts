@@ -625,6 +625,94 @@ export interface RqlReferenceEdgeResult extends RqlQueryResultBase {
   generation: number;
 }
 
+/**
+ * The mandatory terminal row for one receiver or value analysis site.
+ *
+ * Evidence rows can be empty. This row always states why, and whether that
+ * absence is exhaustive. Do not read an empty evidence relation as "no
+ * values"; read `coverage` instead.
+ */
+export interface RqlReceiverOutcomeResult extends RqlQueryResultBase {
+  result_type: "receiver_outcome";
+  id: string;
+  /** Joins the outcome row to its evidence rows and to the analysis site. */
+  site_id: string;
+  /** Absent when the producer cannot address the site as a facts-arena node. */
+  site_ast_id?: string;
+  language: string;
+  range: RqlResultRange;
+  analysis_kind: string;
+  outcome: string;
+  /** `exhaustive` proves the candidate set; any other value leaves it open. */
+  coverage: string;
+  candidate_count: number;
+  /** True when the retained candidates are a prefix, not the whole set. */
+  candidates_truncated: boolean;
+  reason?: string;
+  limit?: string;
+  /** Present when the language records no semantic support for the analysis. */
+  semantic_unsupported?: string;
+  setup_nodes: number;
+  summary_expansions: number;
+  scope_nodes: number;
+}
+
+/**
+ * One typed receiver value retained for a site.
+ *
+ * Nested factory returns are flattened into a parent-linked chain, so follow
+ * `parent_evidence_id` and `chain_hop` instead of nesting. The row carries no
+ * range and no language: it is evidence about a site, not a second location.
+ */
+export interface RqlReceiverEvidenceResult extends RqlQueryResultBase {
+  result_type: "receiver_evidence";
+  id: string;
+  site_id: string;
+  site_ast_id?: string;
+  /** Absent for a first-hop row; set for each further hop of a chain. */
+  parent_evidence_id?: string;
+  ordinal: number;
+  chain_hop: number;
+  evidence_kind: string;
+  declaration_id?: string;
+  declaration_fq_name?: string;
+  declaration_kind?: string;
+  /** Set when the value came from a factory return. */
+  factory_id?: string;
+  proof: string;
+  completeness: string;
+}
+
+/**
+ * The mandatory member-selection summary row for one reference occurrence,
+ * projected from the production resolver's own candidate trace.
+ *
+ * The row exists even when the file records no trace, so an empty candidate
+ * relation can never masquerade as a proven-empty selection. `coverage` is
+ * `exhaustive` only for a full trace, `open` for a selection-only trace, and
+ * `unsupported` when the language records no trace at all. Under
+ * `selection_only` or `absent`, an absent rejection row says nothing.
+ */
+export interface RqlMemberSelectionResult extends RqlQueryResultBase {
+  result_type: "member_selection";
+  id: string;
+  /** The occurrence's AST identity; the join with occurrence and receiver rows. */
+  site_ast_id: string;
+  language: string;
+  range: RqlResultRange;
+  /** The decoded member spelling at the occurrence. */
+  member: string;
+  role: string;
+  /** `selected`, `unresolved`, or `untraced`. */
+  outcome: string;
+  selected_count: number;
+  candidate_count: number;
+  /** `full`, `selection_only`, or `absent`. */
+  trace_completeness: string;
+  /** `exhaustive`, `open`, or `unsupported`. */
+  coverage: string;
+}
+
 export type RqlQueryResultItem =
   | RqlStructuralMatchResult
   | RqlDeclarationResult
@@ -645,7 +733,10 @@ export type RqlQueryResultItem =
   | RqlLexicalScopeResult
   | RqlBindingResult
   | RqlResolutionCandidateResult
-  | RqlReferenceEdgeResult;
+  | RqlReferenceEdgeResult
+  | RqlReceiverOutcomeResult
+  | RqlReceiverEvidenceResult
+  | RqlMemberSelectionResult;
 
 export interface RqlQueryResponse {
   text: string;
@@ -772,6 +863,12 @@ export function queryResultLabel(result: RqlQueryResultItem): string {
       return candidateName(result.candidate);
     case "reference_edge":
       return result.target.fq_name;
+    case "receiver_outcome":
+      return `${result.analysis_kind}: ${result.outcome}`;
+    case "receiver_evidence":
+      return result.declaration_fq_name ?? result.evidence_kind;
+    case "member_selection":
+      return result.member;
   }
 }
 
@@ -818,6 +915,16 @@ export function queryResultDescription(result: RqlQueryResultItem): string {
       return `${result.tier ?? "unattributed"} · ${result.outcome}${result.rejection_reason ? ` (${result.rejection_reason})` : ""} · ${result.boundary}`;
     case "reference_edge":
       return `${result.edge_provenance} · ${result.reference_kind ?? "unclassified"} · ${result.usage_kind} · ${result.site_class}`;
+    case "receiver_outcome":
+      return (
+        `${result.coverage} · ${result.candidate_count} candidate${result.candidate_count === 1 ? "" : "s"}` +
+        (result.candidates_truncated ? " (truncated)" : "") +
+        ` · ${result.range.start_line}:${result.range.start_column}`
+      );
+    case "receiver_evidence":
+      return `${result.evidence_kind} · hop ${result.chain_hop} · ${result.proof}/${result.completeness}`;
+    case "member_selection":
+      return `${result.outcome} · ${result.selected_count}/${result.candidate_count} · ${result.coverage}`;
     case "structural_match":
     case "declaration":
       return `${result.kind} · ${result.start_line}-${result.end_line}`;
@@ -987,6 +1094,45 @@ export function queryResultTooltip(result: RqlQueryResultItem): string {
           ? "\n\nA declaration site is editor-visible navigation, not a runtime usage."
           : "")
       );
+    case "receiver_outcome":
+      return (
+        `**${result.analysis_kind} outcome** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\n${result.outcome} · coverage ${result.coverage}` +
+        `\n\nCandidates: ${result.candidate_count}` +
+        (result.candidates_truncated ? " (truncated)" : "") +
+        `\n\nSetup nodes ${result.setup_nodes} · summary expansions ${result.summary_expansions} · scope nodes ${result.scope_nodes}` +
+        (result.reason ? `\n\n${result.reason}` : "") +
+        (result.limit ? `\n\nLimit: ${result.limit}` : "") +
+        (result.semantic_unsupported
+          ? `\n\nSemantic support absent: ${result.semantic_unsupported}`
+          : "") +
+        (result.coverage === "exhaustive"
+          ? ""
+          : "\n\nCoverage is not exhaustive, so an absent candidate says nothing.")
+      );
+    case "receiver_evidence":
+      return (
+        `**${result.evidence_kind}** for site \`${result.site_id}\` in ${result.path}` +
+        (result.declaration_fq_name ? `\n\n\`${result.declaration_fq_name}\`` : "") +
+        (result.declaration_kind ? ` (${result.declaration_kind})` : "") +
+        `\n\nOrdinal ${result.ordinal} · chain hop ${result.chain_hop} · ${result.proof}/${result.completeness}` +
+        (result.parent_evidence_id
+          ? `\n\nChained from evidence \`${result.parent_evidence_id}\``
+          : "\n\nFirst hop of its chain") +
+        (result.factory_id ? `\n\nFactory: \`${result.factory_id}\`` : "")
+      );
+    case "member_selection":
+      return (
+        `**${result.member}** (${result.role}) at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\n${result.outcome} · ${result.selected_count} selected of ${result.candidate_count} candidate${result.candidate_count === 1 ? "" : "s"}` +
+        `\n\nTrace ${result.trace_completeness} · coverage ${result.coverage}` +
+        (result.trace_completeness === "selection_only"
+          ? "\n\nThis resolver reports only its selections, so an absent rejection row says nothing."
+          : "") +
+        (result.trace_completeness === "absent"
+          ? "\n\nThis language records no candidate trace, so an absent rejection row says nothing."
+          : "")
+      );
   }
 }
 
@@ -1032,13 +1178,23 @@ export function queryResultIcon(result: RqlQueryResultItem): string {
       return "list-selection";
     case "reference_edge":
       return "arrow-both";
+    case "receiver_outcome":
+      return "pulse";
+    case "receiver_evidence":
+      return "symbol-field";
+    case "member_selection":
+      return "checklist";
   }
 }
 
 export function queryResultRange(result: RqlQueryResultItem): RqlResultRange | undefined {
   switch (result.result_type) {
+    // A receiver-evidence row is evidence about a site, not a second location.
     case "file":
+    case "receiver_evidence":
       return undefined;
+    case "receiver_outcome":
+    case "member_selection":
     case "reference_site":
     case "call_site":
     case "expression_site":

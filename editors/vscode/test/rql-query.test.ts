@@ -18,9 +18,12 @@ import {
   type RqlFlowEndpointResult,
   type RqlFlowWitnessResult,
   type RqlProcedureResult,
+  type RqlMemberSelectionResult,
   type RqlProgramPointResult,
   type RqlQueryRunner,
   type RqlReceiverAnalysisResult,
+  type RqlReceiverEvidenceResult,
+  type RqlReceiverOutcomeResult,
   type RqlReferenceSiteResult,
   type RqlTypestateFindingResult,
   type RqlTypestateWitnessResult
@@ -399,6 +402,126 @@ void test("renders and navigates a receiver-analysis result", () => {
   assert.match(tooltip, /factory makeService/);
   assert.match(tooltip, /allocation Service/);
   assert.deepEqual(queryResultRange(analysis), analysis.range);
+});
+
+void test("renders and navigates a receiver-outcome result", () => {
+  const outcome: RqlReceiverOutcomeResult = {
+    uri: "file:///workspace/src/app.ts",
+    path: "src/app.ts",
+    result_type: "receiver_outcome",
+    id: "outcome-a",
+    site_id: "site-a",
+    site_ast_id: "ast-a",
+    language: "typescript",
+    range: {
+      start_line: 9,
+      start_column: 15,
+      end_line: 9,
+      end_column: 22
+    },
+    analysis_kind: "points_to",
+    outcome: "precise",
+    coverage: "open",
+    candidate_count: 2,
+    candidates_truncated: true,
+    reason: "budget exhausted",
+    limit: "candidate_limit",
+    semantic_unsupported: "typescript records no summary",
+    setup_nodes: 4,
+    summary_expansions: 1,
+    scope_nodes: 3
+  };
+
+  assert.equal(queryResultLabel(outcome), "points_to: precise");
+  assert.equal(queryResultDescription(outcome), "open · 2 candidates (truncated) · 9:15");
+  assert.equal(queryResultIcon(outcome), "pulse");
+  const tooltip = queryResultTooltip(outcome);
+  assert.match(tooltip, /precise · coverage open/);
+  assert.match(tooltip, /Candidates: 2 \(truncated\)/);
+  assert.match(tooltip, /budget exhausted/);
+  assert.match(tooltip, /Limit: candidate_limit/);
+  assert.match(tooltip, /Semantic support absent: typescript records no summary/);
+  assert.match(tooltip, /Coverage is not exhaustive/);
+  assert.deepEqual(queryResultRange(outcome), outcome.range);
+});
+
+void test("renders a receiver-evidence result without a range", () => {
+  const evidence: RqlReceiverEvidenceResult = {
+    uri: "file:///workspace/src/app.ts",
+    path: "src/app.ts",
+    result_type: "receiver_evidence",
+    id: "evidence-b",
+    site_id: "site-a",
+    site_ast_id: "ast-a",
+    parent_evidence_id: "evidence-a",
+    ordinal: 1,
+    chain_hop: 2,
+    evidence_kind: "factory_return",
+    declaration_id: "decl-a",
+    declaration_fq_name: "Service",
+    declaration_kind: "class",
+    factory_id: "makeService",
+    proof: "proven",
+    completeness: "complete"
+  };
+
+  assert.equal(queryResultLabel(evidence), "Service");
+  assert.equal(queryResultDescription(evidence), "factory_return · hop 2 · proven/complete");
+  assert.equal(queryResultIcon(evidence), "symbol-field");
+  const tooltip = queryResultTooltip(evidence);
+  assert.match(tooltip, /site `site-a`/);
+  assert.match(tooltip, /Chained from evidence `evidence-a`/);
+  assert.match(tooltip, /Factory: `makeService`/);
+  assert.equal(queryResultRange(evidence), undefined);
+});
+
+void test("renders a member-selection result and states an absent trace", () => {
+  const selection: RqlMemberSelectionResult = {
+    uri: "file:///workspace/src/app.ts",
+    path: "src/app.ts",
+    result_type: "member_selection",
+    id: "selection-a",
+    site_ast_id: "ast-a",
+    language: "typescript",
+    range: {
+      start_line: 11,
+      start_column: 5,
+      end_line: 11,
+      end_column: 12
+    },
+    member: "connect",
+    role: "call_target",
+    outcome: "untraced",
+    selected_count: 0,
+    candidate_count: 0,
+    trace_completeness: "absent",
+    coverage: "unsupported"
+  };
+
+  assert.equal(queryResultLabel(selection), "connect");
+  assert.equal(queryResultDescription(selection), "untraced · 0/0 · unsupported");
+  assert.equal(queryResultIcon(selection), "checklist");
+  const tooltip = queryResultTooltip(selection);
+  assert.match(tooltip, /call_target/);
+  assert.match(tooltip, /Trace absent · coverage unsupported/);
+  assert.match(
+    tooltip,
+    /This language records no candidate trace, so an absent rejection row says nothing\./
+  );
+  assert.deepEqual(queryResultRange(selection), selection.range);
+
+  const traced: RqlMemberSelectionResult = {
+    ...selection,
+    outcome: "selected",
+    selected_count: 1,
+    candidate_count: 1,
+    trace_completeness: "selection_only",
+    coverage: "open"
+  };
+  assert.match(
+    queryResultTooltip(traced),
+    /This resolver reports only its selections, so an absent rejection row says nothing\./
+  );
 });
 
 void test("renders typestate findings and exposes navigable witness steps", () => {
