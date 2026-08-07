@@ -19,7 +19,7 @@ use brokk_bifrost::usages::get_definition::{
     DefinitionLookupRequest, ResolutionTraceResult, TraceCandidate, TraceCandidateRef,
     resolve_definition_batch_with_trace,
 };
-use brokk_bifrost::{CancellationToken, IAnalyzer, Language, PhpAnalyzer};
+use brokk_bifrost::{CancellationToken, IAnalyzer, Language, PhpAnalyzer, RubyAnalyzer};
 use std::sync::Arc;
 
 /// Resolve the reference spelled `member` at the last occurrence of `needle` in
@@ -352,6 +352,304 @@ fn php_direct_static_member_is_attributed_at_depth_zero() {
             .iter()
             .all(|row| fq_name(row) != "Decoy.build"),
         "{:?}",
+        trace.candidates
+    );
+}
+
+fn ruby_trace(
+    files: &[(&str, &str)],
+    path: &str,
+    needle: &str,
+    member: &str,
+) -> ResolutionTraceResult {
+    let mut project = InlineTestProject::with_language(Language::Ruby);
+    for (name, source) in files {
+        project = project.file(*name, *source);
+    }
+    let project = project.build();
+    let analyzer = RubyAnalyzer::from_project(project.project().clone());
+    let source = files
+        .iter()
+        .find(|(name, _)| *name == path)
+        .expect("the traced file must be part of the fixture")
+        .1;
+    trace_at(&analyzer, &project, path, source, needle, member)
+}
+
+/// A method inherited through two superclass hops: the row names the root
+/// class as the exact owner, states depth two, and renders both `extends`
+/// edges the walk took. The same-name class outside the chain never appears.
+#[test]
+fn ruby_superclass_method_is_attributed_with_owner_depth_and_route() {
+    let trace = ruby_trace(
+        &[(
+            "app.rb",
+            "class Root\n  def run\n  end\nend\n\nclass Base < Root\nend\n\nclass Service < Base\nend\n\nclass Decoy\n  def run\n  end\nend\n\ndef invoke\n  service = Service.new\n  service.run\nend\n",
+        )],
+        "app.rb",
+        "service.run",
+        "run",
+    );
+    let selected = selected(&trace);
+    assert_eq!(selected.len(), 1, "{:?}", trace.candidates);
+    let row = selected[0];
+    assert_eq!(fq_name(row), "Root.run");
+    let member = row.member.as_ref().expect("attributed");
+    assert_eq!(member.owner.fq_name(), "Root");
+    assert_eq!(member.hierarchy_depth, 2);
+    assert_eq!(member.dispatch_tier.label(), "inherited_or_promoted");
+    assert_eq!(
+        route(row),
+        vec![
+            (
+                0,
+                "Service".to_owned(),
+                "Base".to_owned(),
+                "extends".to_owned()
+            ),
+            (
+                1,
+                "Base".to_owned(),
+                "Root".to_owned(),
+                "extends".to_owned()
+            ),
+        ]
+    );
+    assert!(
+        trace
+            .candidates
+            .iter()
+            .all(|row| fq_name(row) != "Decoy.run"),
+        "a same-name method outside the receiver's chain is never considered: {:?}",
+        trace.candidates
+    );
+}
+
+/// The receiver's own method outranks the inherited one: depth zero, the
+/// inherent bucket, an empty route, and no row for the shadowed superclass
+/// method the production walk never reached.
+#[test]
+fn ruby_direct_method_precedence_is_attributed_at_depth_zero() {
+    let trace = ruby_trace(
+        &[(
+            "app.rb",
+            "class Base\n  def run\n  end\nend\n\nclass Service < Base\n  def run\n  end\nend\n\ndef invoke\n  service = Service.new\n  service.run\nend\n",
+        )],
+        "app.rb",
+        "service.run",
+        "run",
+    );
+    let selected = selected(&trace);
+    assert_eq!(selected.len(), 1, "{:?}", trace.candidates);
+    let row = selected[0];
+    assert_eq!(fq_name(row), "Service.run");
+    let member = row.member.as_ref().expect("attributed");
+    assert_eq!(member.owner.fq_name(), "Service");
+    assert_eq!(member.hierarchy_depth, 0);
+    assert_eq!(member.dispatch_tier.label(), "inherent_or_direct");
+    assert!(member.route.is_empty(), "depth zero has no route to walk");
+    assert!(
+        trace
+            .candidates
+            .iter()
+            .all(|row| fq_name(row) != "Base.run"),
+        "the shadowed superclass method is never computed: {:?}",
+        trace.candidates
+    );
+}
+
+/// A module composed in with `include`: the module is the exact owner, one hop
+/// away, in the trait/interface bucket. The near miss is a module with the
+/// same method that the class does not include.
+#[test]
+fn ruby_included_module_method_is_attributed_in_the_mixin_bucket() {
+    let trace = ruby_trace(
+        &[(
+            "app.rb",
+            "module Runnable\n  def run\n  end\nend\n\nmodule Unused\n  def run\n  end\nend\n\nclass Service\n  include Runnable\nend\n\ndef invoke\n  service = Service.new\n  service.run\nend\n",
+        )],
+        "app.rb",
+        "service.run",
+        "run",
+    );
+    let selected = selected(&trace);
+    assert_eq!(selected.len(), 1, "{:?}", trace.candidates);
+    let row = selected[0];
+    assert_eq!(fq_name(row), "Runnable.run");
+    let member = row.member.as_ref().expect("attributed");
+    assert_eq!(member.owner.fq_name(), "Runnable");
+    assert_eq!(member.hierarchy_depth, 1);
+    assert_eq!(member.dispatch_tier.label(), "trait_or_interface");
+    assert_eq!(
+        route(row),
+        vec![(
+            0,
+            "Service".to_owned(),
+            "Runnable".to_owned(),
+            "supertype".to_owned()
+        )]
+    );
+    assert!(
+        trace
+            .candidates
+            .iter()
+            .all(|row| fq_name(row) != "Unused.run"),
+        "a module the class does not include is never considered: {:?}",
+        trace.candidates
+    );
+}
+
+/// `prepend` outranks the class's own method, and the row states the tier the
+/// walk actually used: the prepended module owns the winner one hop away, and
+/// the class's own same-name method is never computed.
+#[test]
+fn ruby_prepended_module_outranks_the_owner_and_says_so() {
+    let trace = ruby_trace(
+        &[(
+            "app.rb",
+            "module Loud\n  def run\n  end\nend\n\nclass Service\n  prepend Loud\n  def run\n  end\nend\n\ndef invoke\n  service = Service.new\n  service.run\nend\n",
+        )],
+        "app.rb",
+        "service.run",
+        "run",
+    );
+    let selected = selected(&trace);
+    assert_eq!(selected.len(), 1, "{:?}", trace.candidates);
+    let row = selected[0];
+    assert_eq!(fq_name(row), "Loud.run");
+    let member = row.member.as_ref().expect("attributed");
+    assert_eq!(member.owner.fq_name(), "Loud");
+    assert_eq!(member.hierarchy_depth, 1);
+    assert_eq!(member.dispatch_tier.label(), "trait_or_interface");
+    assert!(
+        trace
+            .candidates
+            .iter()
+            .all(|row| fq_name(row) != "Service.run"),
+        "the prepended module wins outright, so the owner's method is never \
+         computed: {:?}",
+        trace.candidates
+    );
+}
+
+/// A singleton method reached through the class itself: the class-side seam,
+/// at depth zero, with the same-name instance method of another class never
+/// considered.
+#[test]
+fn ruby_singleton_method_is_attributed_in_the_class_side_bucket() {
+    let trace = ruby_trace(
+        &[(
+            "app.rb",
+            "class Service\n  def self.build\n  end\nend\n\nclass Decoy\n  def build\n  end\nend\n\ndef invoke\n  Service.build\nend\n",
+        )],
+        "app.rb",
+        "Service.build",
+        "build",
+    );
+    let selected = selected(&trace);
+    assert_eq!(selected.len(), 1, "{:?}", trace.candidates);
+    let row = selected[0];
+    assert_eq!(fq_name(row), "Service.build");
+    let member = row.member.as_ref().expect("attributed");
+    assert_eq!(member.owner.fq_name(), "Service");
+    assert_eq!(member.hierarchy_depth, 0);
+    assert_eq!(member.dispatch_tier.label(), "static_or_companion");
+    assert!(member.route.is_empty());
+    assert!(
+        trace
+            .candidates
+            .iter()
+            .all(|row| fq_name(row) != "Decoy.build"),
+        "{:?}",
+        trace.candidates
+    );
+}
+
+/// An inherited singleton method: the class-side bucket and a real hop
+/// distance are independent axes, so the row reports both.
+#[test]
+fn ruby_inherited_singleton_method_keeps_its_hop_distance() {
+    let trace = ruby_trace(
+        &[(
+            "app.rb",
+            "class Base\n  def self.build\n  end\nend\n\nclass Service < Base\nend\n\ndef invoke\n  Service.build\nend\n",
+        )],
+        "app.rb",
+        "Service.build",
+        "build",
+    );
+    let selected = selected(&trace);
+    assert_eq!(selected.len(), 1, "{:?}", trace.candidates);
+    let row = selected[0];
+    assert_eq!(fq_name(row), "Base.build");
+    let member = row.member.as_ref().expect("attributed");
+    assert_eq!(member.owner.fq_name(), "Base");
+    assert_eq!(member.hierarchy_depth, 1);
+    assert_eq!(member.dispatch_tier.label(), "static_or_companion");
+    assert_eq!(
+        route(row),
+        vec![(
+            0,
+            "Service".to_owned(),
+            "Base".to_owned(),
+            "extends".to_owned()
+        )]
+    );
+}
+
+/// A module composed in with `extend` supplies class-side methods: the module
+/// is the owner one hop away, and the mixin origin is what the bucket reports.
+#[test]
+fn ruby_extended_module_method_is_attributed_to_the_module() {
+    let trace = ruby_trace(
+        &[(
+            "app.rb",
+            "module Factory\n  def build\n  end\nend\n\nclass Service\n  extend Factory\nend\n\ndef invoke\n  Service.build\nend\n",
+        )],
+        "app.rb",
+        "Service.build",
+        "build",
+    );
+    let selected = selected(&trace);
+    assert_eq!(selected.len(), 1, "{:?}", trace.candidates);
+    let row = selected[0];
+    assert_eq!(fq_name(row), "Factory.build");
+    let member = row.member.as_ref().expect("attributed");
+    assert_eq!(member.owner.fq_name(), "Factory");
+    assert_eq!(member.hierarchy_depth, 1);
+    assert_eq!(member.dispatch_tier.label(), "trait_or_interface");
+    assert_eq!(
+        route(row),
+        vec![(
+            0,
+            "Service".to_owned(),
+            "Factory".to_owned(),
+            "supertype".to_owned()
+        )]
+    );
+}
+
+/// The expected gap: a bare name that falls through to the top-level scope is
+/// not a member of anything. `resolve_bare_method_candidates` answers it from
+/// the file-identifier index with no owner, so the row stays unattributed
+/// rather than claiming a depth-zero owner it never had.
+#[test]
+fn ruby_top_level_method_stays_unattributed() {
+    let trace = ruby_trace(
+        &[(
+            "app.rb",
+            "def helper\nend\n\nclass Service\n  def run\n    helper\n  end\nend\n",
+        )],
+        "app.rb",
+        "    helper\n",
+        "helper",
+    );
+    let selected = selected(&trace);
+    assert_eq!(selected.len(), 1, "{:?}", trace.candidates);
+    assert_eq!(fq_name(selected[0]), "helper");
+    assert!(
+        selected[0].member.is_none(),
+        "a top-level method belongs to no owner, so nothing is attributed: {:?}",
         trace.candidates
     );
 }
