@@ -1,5 +1,6 @@
-use brokk_bifrost_mcp::mcp_common::{McpRenderOptions, run_stdio_server_with_build_identity};
+use brokk_bifrost_mcp::mcp_common::McpRenderOptions;
 use brokk_bifrost_mcp::mcp_registry::{resolve_server_spec_for_render_options, workspace_is_git};
+use brokk_bifrost_mcp::rmcp_host::run_stdio_server_with_build_identity;
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;

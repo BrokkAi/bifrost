@@ -21,9 +21,8 @@
 //! process, so it is also where the outbound transport-phase timings live:
 //! `mcp_request.response_queue_wait` (result ready until delivery starts) and
 //! `mcp_request.writer_delivery` (serialization and the stdout write). The
-//! hand-written host emits both from its writer thread; the benchmark profile
-//! contract in `src/benchmark/mcp_iteration.rs` requires them from whichever
-//! host serves the session (#1491).
+//! benchmark profile contract in `src/benchmark/mcp_iteration.rs` requires
+//! both phases from the RMCP host (#1491).
 
 use crate::profiling;
 use rmcp::RoleServer;
@@ -100,7 +99,7 @@ where
     }
 }
 
-/// Format a transport-phase timing label the way the hand-written host does:
+/// Format a transport-phase timing label:
 /// `mcp_request.<phase>[<tool>][<request correlation hash>]`.
 ///
 /// The benchmark parser reads the phase and the first bracket; the correlation

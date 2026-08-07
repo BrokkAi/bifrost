@@ -952,9 +952,9 @@ fn run_mcp_fairness_iteration(
 
             // Cancellation is cooperative. Keep its unwind outside the measured
             // latency, but do not let successive samples compound unfinished
-            // scans until the legacy host's bounded admission registry rejects
-            // an otherwise lightweight lookup. rmcp suppresses the cancelled
-            // response, so the timing marker is the shared completion signal.
+            // scans until the analyzer pool rejects an otherwise lightweight
+            // lookup. RMCP suppresses the cancelled response, so the timing
+            // marker is the shared completion signal.
             session
                 .wait_for_stderr_marker(
                     scan_start_cursor,

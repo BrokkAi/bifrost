@@ -349,10 +349,8 @@ enum WorkspaceBindingSource {
 
 /// Per-connection workspace authorization state.
 ///
-/// Unlike the hand-written host this replaces, it carries no protocol
-/// bookkeeping: `rmcp` owns the lifecycle, owns outbound request ids, and
-/// turns `roots/list` into an ordinary awaited call, so there is nothing to
-/// correlate by hand.
+/// RMCP owns the lifecycle, outbound request ids, and `roots/list` calls.
+/// Bifrost therefore keeps only the authorization state.
 struct ConnectionState {
     accepts_client_roots: bool,
     /// What the handshake established, or nothing if it has not happened.
@@ -1741,8 +1739,7 @@ impl ServerHandler for BifrostMcpHandler {
         // The response -- success or execution error -- is ready the moment
         // execute_tool returns; everything after this point is transport. Arm
         // the timing keyed by the wire id so the transport wrapper can emit
-        // `response_queue_wait` and `writer_delivery` when it delivers it,
-        // matching the hand-written host's writer-thread phases (#1491).
+        // `response_queue_wait` and `writer_delivery` when it delivers it.
         self.response_timings
             .arm(context.id.clone(), name, correlation_id);
         Ok(response?.into())
