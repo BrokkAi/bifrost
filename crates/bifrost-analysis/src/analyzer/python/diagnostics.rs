@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use crate::analyzer::python::external::PYTHON_UNENUMERATED_BINDING;
 use crate::analyzer::semantic_model::{
     DependencyDiscoveryEvidence, RetainedDiscoveryVerdict, SemanticModelCompleteness,
     SemanticModelOverlay, SemanticModelOverlayDisposition, SemanticModelSymbol,
@@ -29,6 +30,9 @@ use brokk_bifrost_python::diagnostics::{PythonEnvironmentBoundary, PythonEnviron
 /// The ecosystem every Python declaration identity is minted under, in the
 /// environment pack producer and here.
 const PYTHON_ECOSYSTEM: &str = "python";
+
+/// PEP 562's module-level attribute hook.
+const PYTHON_MODULE_GETATTR: &str = "__getattr__";
 
 pub(crate) fn collect_python_semantic_diagnostics(
     analyzer: &dyn IAnalyzer,
@@ -170,11 +174,26 @@ impl PythonEnvironmentSurface for RetainedPythonEnvironment {
         if members
             .records
             .iter()
-            .any(|record| record.name == "__getattr__")
+            .any(|record| record.name == PYTHON_MODULE_GETATTR)
         {
             return PythonEnvironmentBoundary::Incomplete(
                 SemanticDiagnosticIncompleteReason::DynamicBehavior {
                     detail: format!("Python module `{module_path}` defines `__getattr__`"),
+                },
+            );
+        }
+        // The producer recorded that this surface binds names it could not
+        // enumerate, e.g. a wildcard re-export in the package's `__init__`.
+        if members
+            .records
+            .iter()
+            .any(|record| record.name == PYTHON_UNENUMERATED_BINDING)
+        {
+            return PythonEnvironmentBoundary::Incomplete(
+                SemanticDiagnosticIncompleteReason::DynamicBehavior {
+                    detail: format!(
+                        "Python module `{module_path}` re-exports names its semantic pack could not enumerate"
+                    ),
                 },
             );
         }

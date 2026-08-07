@@ -476,6 +476,17 @@ struct PythonApiCollector<'a, 'd> {
     imported_names: std::collections::HashSet<String>,
 }
 
+/// The member name a Python surface carries when it binds names this producer
+/// cannot enumerate, e.g. `from ._impl import *` in a package's `__init__`.
+///
+/// `*` is not a Python identifier, so this member can never collide with a
+/// real name. Its presence is the module-level fact that the listed members
+/// are not the whole surface. A wildcard is a property of the surface, not a
+/// fault in producing the pack, so it is recorded rather than reported as a
+/// producer diagnostic: a diagnostic would make the production partial and
+/// stop the whole environment from activating.
+pub(crate) const PYTHON_UNENUMERATED_BINDING: &str = "*";
+
 impl<'a, 'd> PythonApiCollector<'a, 'd> {
     fn new(
         module: &'a str,
@@ -672,31 +683,19 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
     /// that name" -- and recording it is what makes a surface marked complete
     /// actually complete.
     ///
-    /// A wildcard binds a set this producer cannot enumerate, so it reports a
-    /// diagnostic instead, which makes the pack partial and stops the surface
-    /// from proving anything absent.
+    /// A wildcard binds a set this producer cannot enumerate, and so does a
+    /// form that spells no single bound name. Either one is recorded as the
+    /// [`PYTHON_UNENUMERATED_BINDING`] member, which is not a Python
+    /// identifier and so can never be confused with a real name. A consumer
+    /// that finds it knows this surface binds more than it lists, and that a
+    /// name missing from it is therefore not proof of absence.
     fn visit_import(&mut self, node: Node<'_>, owner: &str) {
         for import in
             brokk_bifrost_python::imports::python_import_infos_from_node(node, self.source)
         {
-            if import.is_wildcard {
-                self.diagnostics.warning(
-                    "python.import.wildcard",
-                    Some(self.path.display().to_string()),
-                    format!(
-                        "`{}` binds names this producer cannot enumerate",
-                        import.raw_snippet.trim()
-                    ),
-                );
-                continue;
-            }
-            let Some(name) = import.local_name() else {
-                self.diagnostics.warning(
-                    "python.import.binding",
-                    Some(self.path.display().to_string()),
-                    format!("`{}` binds no single name", import.raw_snippet.trim()),
-                );
-                continue;
+            let name = match import.local_name().filter(|_| !import.is_wildcard) {
+                Some(name) => name,
+                None => PYTHON_UNENUMERATED_BINDING,
             };
             // Two branches of a `try`/`except ImportError` pair bind the same
             // name; recording it twice would mint one identity twice and mark
