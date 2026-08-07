@@ -16,6 +16,7 @@ The design transliterates IntelliJ's indexing architecture, verified against `/h
 
 - [x] (2026-08-07) Root cause and measurements recorded on issue #1758; owner rejected monolith persistence and directed an IntelliJ-style redesign.
 - [x] (2026-08-07) IntelliJ mechanism research completed with code citations; synthesis mapped each `RustUsageIndex` product to per-file, inverted-derivable, or genuinely cross-file (report in Artifacts).
+- [x] (2026-08-07 12:05Z) Research report copied to `.agents/docs/intellij-indexing-research-2026-08.md`; Artifacts pointer updated so the plan no longer depends on a session-temporary path.
 - [ ] Milestone 1: per-file Rust usage fact tables in the store, written at analysis time.
 - [ ] Milestone 2: `RustUsageQueries` query-time composition; consumers migrated; v1 index still present but unused.
 - [ ] Milestone 3: invalidation and readiness -- per-file catch-up, bounded-cache clears, no wholesale drop.
@@ -154,7 +155,7 @@ Milestones 1-2 are additive and individually revertable by commit. The consumer 
 
 ## Artifacts and Notes
 
-- IntelliJ research report (design substrate, code-cited): `/tmp/claude-1000/-mnt-optane-bifrost-nlp/b5398767-af2f-42d8-9210-eea66ede9085/scratchpad/intellij-indexing-research-v1.md`. That path is session-temporary: Milestone 1's first commit must copy it to `.agents/docs/intellij-indexing-research-2026-08.md` so the plan stays self-contained, and update this line.
+- IntelliJ research report (design substrate, code-cited): `.agents/docs/intellij-indexing-research-2026-08.md`. It was authored in a session-temporary scratch path and copied into the repository by this plan's first implementation commit, so the plan is now self-contained against the working tree alone.
 - Measurements motivating the plan: issue #1758 and its root-cause comment (2026-08-07); `.agents/docs/codescale-grep-hard-checkpoint-2026-08-07.md`.
 - Key current-code anchors: `rust/usage_index.rs` (the struct, ~472-494), `rust/mod.rs` (memo ~86, drops ~634/660, `build_weighted_cache` ~341), `store/liveness.rs` (`oids_for_files`), `store/gc.rs`, `migrations/cache/0001-current-baseline.sql`.
 
