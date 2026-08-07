@@ -3872,6 +3872,68 @@ impl AnalyzerStore {
         Ok(out)
     }
 
+    /// Test hook: drop every persisted Rust fact row for `lang`, leaving the
+    /// blobs analyzed.
+    ///
+    /// This synthesizes the exact state the Milestone 3 catch-up policy exists
+    /// for -- live files whose blobs carry no fact rows -- which no production
+    /// path can be asked to produce on demand. It follows
+    /// `mark_parsed_blob_incomplete_for_test`, the store's existing way of
+    /// putting itself into a state only recovery code should see.
+    #[cfg(test)]
+    pub(crate) fn delete_rust_facts_for_test(&self, lang: &str) {
+        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        for table in [
+            "rust_exports",
+            "rust_import_targets",
+            "rust_modules",
+            "rust_identifier_occurrences",
+        ] {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE lang = ?1"),
+                params![lang],
+            )
+            .expect("delete rust fact rows");
+        }
+    }
+
+    /// Which of `oids` already carry Rust fact rows.
+    ///
+    /// `rust_modules` is the witness table: every analyzed Rust blob records
+    /// its file-root extent at ordinal 0, so a blob absent from it has no facts
+    /// at all. That is the same rule the reader applies when it treats an empty
+    /// module list as "never analyzed" (`RustAnalyzer::rust_usage_facts_of_blob`).
+    ///
+    /// Chunked set membership over the primary key, following
+    /// `parsed_blob_keys_conn_with_condition`: each chunk is a batch of index
+    /// seeks, so the cost tracks the live file set rather than the table's
+    /// accumulated history.
+    pub(crate) fn blobs_with_rust_facts(&self, lang: &str, oids: &[Oid]) -> Result<HashSet<Oid>> {
+        const OIDS_PER_QUERY: usize = 400;
+        let mut unique: Vec<String> = oids.iter().map(Oid::to_string).collect();
+        unique.sort();
+        unique.dedup();
+        let conn = self.read_conn()?;
+        let mut present = set_with_capacity(unique.len());
+        for chunk in unique.chunks(OIDS_PER_QUERY) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT DISTINCT blob_oid FROM rust_modules
+                 WHERE lang = ? AND blob_oid IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let parameters = std::iter::once(lang).chain(chunk.iter().map(String::as_str));
+            let rows =
+                stmt.query_map(params_from_iter(parameters), |row| row.get::<_, String>(0))?;
+            for row in rows {
+                present.insert(Oid::from_str(&row?)?);
+            }
+        }
+        Ok(present)
+    }
+
     fn rust_fact_blobs(&self, sql: &str, lang: &str, key: &str) -> Result<Vec<Oid>> {
         let conn = self.read_conn()?;
         let mut stmt = conn.prepare_cached(sql)?;

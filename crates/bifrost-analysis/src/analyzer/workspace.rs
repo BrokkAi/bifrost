@@ -479,25 +479,28 @@ impl WorkspaceAnalyzer {
         }
     }
 
-    /// Pre-build the lazily constructed Rust usage/re-export index (plus the
-    /// cargo route index it depends on). It is otherwise charged to whichever
-    /// request first touches the Rust usage graph, which can push a single
-    /// interactive call past its wall-clock budget on a large workspace
-    /// (issues #1416, #1757). A no-op for workspaces without Rust.
-    pub fn warm_rust_usage_index(&self) {
+    /// Bring the persisted per-file Rust usage facts up to date ahead of the
+    /// first query that reads them.
+    ///
+    /// This replaced a workspace-wide index build (issues #1416, #1757, #1758):
+    /// under ExecPlan Milestone 3 there is nothing to build, and the warm's
+    /// only job is to find the live blobs analysis did not persist rows for and
+    /// repair them off the request path. A no-op for workspaces without Rust.
+    pub fn warm_rust_usage_facts(&self) {
         if let Some(rust) =
             crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
         {
-            // The build issues per-file store queries that are only cheap under
-            // request-scoped memoization; without a scope each lookup re-hydrates
-            // (observed ~65s instead of ~3.5s on the Bifrost workspace).
+            // The catch-up issues per-file store queries that are only cheap
+            // under request-scoped memoization; without a scope each lookup
+            // re-hydrates (observed ~65s instead of ~3.5s on the Bifrost
+            // workspace).
             let _scope = crate::analyzer::AnalyzerQueryScope::new(self.analyzer());
-            rust.warm_usage_index();
+            rust.warm_usage_facts();
         }
     }
 
     /// Pre-build every per-file Rust reference context. A whole-workspace
-    /// fan-out, kept separate from [`Self::warm_rust_usage_index`] so a
+    /// fan-out, kept separate from [`Self::warm_rust_usage_facts`] so a
     /// session that does not query the Rust usage graph can leave it out.
     /// A no-op for workspaces without Rust.
     pub fn warm_rust_usage_reference_contexts(&self) {
@@ -509,13 +512,26 @@ impl WorkspaceAnalyzer {
         }
     }
 
-    /// Whether the Rust usage index is built for this generation. Answers
-    /// without blocking behind an in-flight background build, so a caller that
-    /// must not wait for it can ask this first (#1757). Always true for a
-    /// workspace with no Rust: there is no such index to wait for.
-    pub fn rust_usage_index_ready(&self) -> bool {
+    /// Whether a Rust usage query would wait for a fact catch-up batch.
+    ///
+    /// Re-pointed by ExecPlan Milestone 3 from "is the v1 usage index built"
+    /// to "is the catch-up set empty": under v2 nothing is built, and the only
+    /// wait a query can inherit is an above-threshold batch of live blobs whose
+    /// facts are being persisted in the background. Answers without blocking
+    /// behind that batch, which is the point (#1757). Always true for a
+    /// workspace with no Rust.
+    pub fn rust_usage_facts_ready(&self) -> bool {
         crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
-            .is_none_or(|rust| rust.usage_index_ready())
+            .is_none_or(|rust| rust.rust_usage_facts_ready())
+    }
+
+    /// Whether the Rust fact catch-up has run for this generation. The
+    /// warm-ness question, as distinct from the wait question
+    /// [`Self::rust_usage_facts_ready`] answers: a session that never warms and
+    /// never queries is ready but not warm.
+    pub fn rust_usage_facts_warm(&self) -> bool {
+        crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
+            .is_none_or(|rust| rust.rust_usage_facts_warm())
     }
 
     /// Select the execution-semantics provider for the requested file without
@@ -726,12 +742,14 @@ mod tests {
         assert!(multi.query_indexes_warm());
     }
 
-    /// The readiness probe a caller uses to decide whether to wait for the
-    /// background usage-index build (#1757). It must answer `false` before the
-    /// build and `true` after, and it must never be `false` for a workspace
-    /// with no Rust, which has no such index to wait for.
+    /// The two Rust usage predicates a caller can ask a workspace, and the
+    /// distinction ExecPlan Milestone 3 introduced between them: readiness is
+    /// "would a query wait", which a healthy workspace answers `true` even
+    /// before any warm because v2 has nothing to build, and warmth is "has the
+    /// catch-up run for this generation", which only the warm makes true.
+    /// Neither may be `false` for a workspace with no Rust.
     #[test]
-    fn rust_usage_index_readiness_reports_false_before_the_warm_and_true_after() {
+    fn rust_usage_readiness_and_warmth_are_distinct_and_vacuous_without_rust() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         ProjectFile::new(root.clone(), "src/lib.rs")
@@ -743,13 +761,16 @@ mod tests {
 
         let rust: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
         let rust = WorkspaceAnalyzer::build(rust, AnalyzerConfig::default());
-        assert!(!rust.rust_usage_index_ready());
-        rust.warm_rust_usage_index();
-        assert!(rust.rust_usage_index_ready());
+        assert!(rust.rust_usage_facts_ready());
+        assert!(!rust.rust_usage_facts_warm());
+        rust.warm_rust_usage_facts();
+        assert!(rust.rust_usage_facts_ready());
+        assert!(rust.rust_usage_facts_warm());
 
         let java: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
         let java = WorkspaceAnalyzer::build(java, AnalyzerConfig::default());
-        assert!(java.rust_usage_index_ready());
+        assert!(java.rust_usage_facts_ready());
+        assert!(java.rust_usage_facts_warm());
     }
 
     #[test]

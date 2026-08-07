@@ -50,6 +50,17 @@ fn dedicated_build_pool() -> &'static rayon::ThreadPool {
     })
 }
 
+/// Run `task` on [`dedicated_build_pool`] and return immediately.
+///
+/// The background half of the ExecPlan Milestone 3 Rust fact catch-up
+/// (`.agents/plans/rust-usage-index-v2.md`): an above-threshold catch-up batch
+/// must not be billed to the querying thread, and it must not consume a
+/// global-pool worker either, because the query that scheduled it goes straight
+/// back to its own parallel fan-out.
+pub(crate) fn spawn_on_dedicated_build_pool(task: impl FnOnce() + Send + 'static) {
+    dedicated_build_pool().spawn(task);
+}
+
 pub(crate) struct PoolSafeMemo<T> {
     state: Mutex<MemoState<T>>,
     ready: Condvar,
@@ -190,11 +201,17 @@ impl<T> PoolSafeMemo<T> {
 
     /// Build the value on [`dedicated_build_pool`], off the global rayon pool.
     ///
+    /// No production caller since the Rust usage index stopped being built
+    /// (ExecPlan Milestone 3); issue #1772 wants it for the type-hierarchy
+    /// warm, which is the next whole-workspace build to move off the request
+    /// path, so the mechanism and its #1757 regression test stay.
+    ///
     /// Use from a background warm. While this build runs, a global-pool worker
     /// that reaches the same memo waits for it instead of duplicating it
     /// serially: the duplicate is a second whole-workspace build, billed to
     /// whichever request's parallel fan-out touched the index first (#1757).
     /// Returns an already-built or concurrently built value unchanged.
+    #[allow(dead_code)]
     pub(crate) fn get_or_build_on_dedicated_pool(&self, build: impl FnOnce() -> T + Send) -> Arc<T>
     where
         T: Send,

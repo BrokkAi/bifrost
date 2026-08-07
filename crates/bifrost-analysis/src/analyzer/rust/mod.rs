@@ -6,6 +6,7 @@ mod declarations;
 mod dependency_discovery;
 mod diagnostics;
 mod external;
+mod fact_catch_up;
 pub(crate) mod facts;
 pub(crate) mod field_roles;
 mod graph_support;
@@ -99,6 +100,10 @@ pub struct RustAnalyzer {
     /// (structural parents, visibility) and not only the file's bytes; the
     /// analyzer is replaced wholesale on `update`, so the cache retires with it.
     declaration_facts: Cache<ProjectFile, Arc<usage_queries::RustDeclarationFacts>>,
+    /// The ExecPlan Milestone 3 catch-up state for this generation: whether
+    /// the live blobs without persisted Rust facts have been found and
+    /// repaired, and whether a background batch still owes rows.
+    fact_catch_up: Arc<fact_catch_up::RustFactCatchUp>,
     /// The bounded caches behind the ExecPlan Milestone 2c cross-file walks,
     /// in one allocation: nine `Cache` handles inline would make this struct
     /// the outsized variant of `AnalyzerDelegate`.
@@ -254,6 +259,25 @@ impl RustAnalyzer {
     #[cfg(test)]
     pub(crate) fn prepared_syntax_parse_count_for_test(&self, file: &ProjectFile) -> usize {
         self.inner.prepared_syntax_parse_count_for_test(file)
+    }
+
+    /// Whether the v1 `RustUsageIndex` was built for this analyzer. Nothing
+    /// reads that index since ExecPlan Milestone 2c and nothing warms it since
+    /// Milestone 3; this is what the tests that guard those two facts assert
+    /// against. It goes away with the struct in Milestone 5.
+    #[cfg(test)]
+    pub(crate) fn rust_usage_index_built_for_test(&self) -> bool {
+        self.usage_index.is_ready()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hierarchy_index_built_for_test(&self) -> bool {
+        self.hierarchy_index.get().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reference_context_built_for_test(&self, file: &ProjectFile) -> bool {
+        self.reference_contexts.get(file).is_some()
     }
 
     /// Per-instance counters behind the #1230 complexity pins. Each is shared by
@@ -442,6 +466,7 @@ impl RustAnalyzer {
             usage_index: Arc::new(PoolSafeMemo::new()),
             rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
+            fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
             walk_caches: Arc::new(usage_walks::RustWalkCaches::new(memo_budget)),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
@@ -480,6 +505,7 @@ impl RustAnalyzer {
             usage_index: Arc::new(PoolSafeMemo::new()),
             rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
+            fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
             walk_caches: Arc::new(usage_walks::RustWalkCaches::new(memo_budget)),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
@@ -685,27 +711,26 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.languages()
     }
 
-    /// The type-hierarchy and usage indexes each take double-digit seconds to
-    /// build on large workspaces; every other lazy cache on this analyzer
-    /// fills incrementally at acceptable cost.
+    /// The type-hierarchy build takes double-digit seconds on a large
+    /// workspace; every other lazy cache on this analyzer fills incrementally
+    /// at acceptable cost.
     ///
-    /// Warm them on two plain threads, not under `rayon::join`: each build
-    /// parallelizes internally, and running the accessors on pool workers
-    /// would both demote the usage build to its serial pool-safe path and
-    /// block a worker inside the hierarchy `OnceLock` init. Warming them one
-    /// after the other is worse still -- on a 401k-file workspace the
-    /// hierarchy build had not returned 16 minutes in, so the usage index had
-    /// not been started when the first request that needed it arrived and the
-    /// request built it itself (#1757).
+    /// The usage half is no longer a build at all. It was the seventeen-map
+    /// `RustUsageIndex`, which cost minutes and 10.8 GB (#1758); ExecPlan
+    /// Milestone 3 replaced it with the per-file fact catch-up, which finds
+    /// nothing to do on a workspace analysis already persisted. The two still
+    /// run on separate threads rather than one after the other: the hierarchy
+    /// build had not returned 16 minutes into a 401k-file workspace (#1757),
+    /// and neither warm may wait on the other.
     fn warm_query_indexes(&self) {
         std::thread::scope(|scope| {
-            scope.spawn(|| self.warm_usage_index());
+            scope.spawn(|| self.warm_usage_facts());
             self.hierarchy_index();
         });
     }
 
     fn query_indexes_warm(&self) -> bool {
-        self.hierarchy_index.get().is_some() && self.usage_index.is_ready()
+        self.hierarchy_index.get().is_some() && self.rust_usage_facts_warm()
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
@@ -734,6 +759,7 @@ impl IAnalyzer for RustAnalyzer {
             usage_index: Arc::new(PoolSafeMemo::new()),
             rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
+            fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
             walk_caches: Arc::new(usage_walks::RustWalkCaches::new(self.memo_budget)),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
@@ -762,6 +788,7 @@ impl IAnalyzer for RustAnalyzer {
             usage_index: Arc::new(PoolSafeMemo::new()),
             rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
+            fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
             walk_caches: Arc::new(usage_walks::RustWalkCaches::new(self.memo_budget)),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),

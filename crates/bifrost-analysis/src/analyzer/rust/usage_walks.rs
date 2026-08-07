@@ -163,10 +163,15 @@ impl<'a> RustUsageWalks<'a> {
         ))
     }
 
+    /// Every walk starts here, which is why the catch-up does too: a walk
+    /// answers from persisted fact rows, so a live blob without rows would be
+    /// silently absent from the answer rather than slow. ExecPlan Milestone 3;
+    /// one atomic probe once the generation has settled.
     fn with_cargo_routes(
         analyzer: &'a RustAnalyzer,
         cargo_routes: Arc<RustCargoRouteIndex>,
     ) -> Self {
+        analyzer.ensure_rust_facts_caught_up();
         Self {
             analyzer,
             queries: RustUsageQueries::new(analyzer),
@@ -1866,6 +1871,70 @@ mod tests {
                 .any(|route| route.target_module.components == ["real"]),
             "the shorter `routed` alias must not answer: {resolved:?}"
         );
+    }
+
+    /// A file edit applied through the real update path must change the next
+    /// usage answer. Every walk here is memoized, so this is the guard that the
+    /// memo retires with the analyzer: the first query is deliberately made
+    /// before the edit so every cache the second query reads is already
+    /// populated with the pre-edit answer.
+    ///
+    /// The edit also must not cost whole-workspace work, which is the other
+    /// half of Milestone 3 and the `2ba5dda4` counter idiom.
+    #[test]
+    fn a_single_file_edit_is_reflected_by_the_next_usage_query() {
+        let (temp, analyzer) = project(&[
+            (
+                "src/lib.rs",
+                "pub mod service;\npub mod decoy;\npub mod consumer;\n",
+            ),
+            ("src/service.rs", "pub struct Widget;\n"),
+            ("src/decoy.rs", "pub struct Widget;\n"),
+            (
+                "src/consumer.rs",
+                "use crate::decoy::Widget;\npub fn take(_: Widget) {}\n",
+            ),
+        ]);
+        let service = file(&analyzer, "service.rs");
+        let consumer = file(&analyzer, "consumer.rs");
+        let widget_of = |analyzer: &RustAnalyzer| {
+            analyzer
+                .declarations(&service)
+                .into_iter()
+                .find(|declaration| declaration.identifier() == "Widget")
+                .expect("Widget declaration")
+        };
+
+        let before = analyzer.usage_importers(
+            &analyzer.usage_binding_seeds(&BTreeSet::from([widget_of(&analyzer)])),
+        );
+        assert!(
+            !before.contains(&consumer),
+            "before the edit the consumer imports the decoy: {before:?}"
+        );
+
+        consumer
+            .write("use crate::service::Widget;\npub fn take(_: Widget) {}\n")
+            .expect("rewrite the consumer");
+        let updated = analyzer.update(&BTreeSet::from([consumer.clone()]));
+        updated.reset_full_declaration_scan_count_for_test();
+
+        let after = updated
+            .usage_importers(&updated.usage_binding_seeds(&BTreeSet::from([widget_of(&updated)])));
+        assert!(
+            after.contains(&consumer),
+            "the edited import must bind the target: {after:?}"
+        );
+        assert_eq!(
+            updated.full_declaration_scan_count_for_test(),
+            0,
+            "answering after a single-file edit must not scan every declaration"
+        );
+        assert!(
+            updated.rust_usage_facts_ready(),
+            "a single-file edit must never surface a readiness state"
+        );
+        drop(temp);
     }
 
     /// The point of the redesign: a usage question is indexed lookups plus

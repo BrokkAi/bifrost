@@ -493,8 +493,12 @@ mod tests {
         })
     }
 
+    /// The warm covers both halves of a Rust analyzer's per-generation query
+    /// preparation: the type-hierarchy index, which is a real build, and the
+    /// per-file usage-fact catch-up, which replaced the v1 usage-index build
+    /// (ExecPlan Milestone 3). Neither may be left to the first request.
     #[test]
-    fn warm_query_indexes_builds_hierarchy_and_usage_indexes_ahead_of_demand() {
+    fn warm_query_indexes_builds_the_hierarchy_and_catches_up_the_usage_facts() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
             "src/lib.rs",
             r#"
@@ -506,13 +510,17 @@ impl Runnable for Worker {}
 
         assert!(!analyzer.query_indexes_warm());
         assert!(analyzer.hierarchy_index.get().is_none());
-        assert!(analyzer.usage_index.get().is_none());
+        assert!(!analyzer.rust_usage_facts_warm());
 
         analyzer.warm_query_indexes();
 
         assert!(analyzer.query_indexes_warm());
         assert!(analyzer.hierarchy_index.get().is_some());
-        assert!(analyzer.usage_index.get().is_some());
+        assert!(analyzer.rust_usage_facts_warm());
+        assert!(
+            !analyzer.rust_usage_index_built_for_test(),
+            "the warm must not build the v1 usage index"
+        );
 
         let runnable = definition(&analyzer, "Runnable");
         let worker = definition(&analyzer, "Worker");

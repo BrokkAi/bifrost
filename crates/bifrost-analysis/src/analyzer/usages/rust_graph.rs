@@ -372,7 +372,7 @@ mod tests {
         assert!(candidates.contains(&source));
         assert!(analyzer.cargo_routes_ready_for_test());
         assert!(
-            !analyzer.usage_index_ready(),
+            !analyzer.rust_usage_index_built_for_test(),
             "candidate discovery must answer from the store-backed walks, not from a built index"
         );
     }

@@ -337,10 +337,13 @@ pub struct RefreshResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct ActiveWorkspaceResult {
     pub workspace_path: String,
-    /// Whether the workspace's lazily built usage index is finished. The
-    /// server starts that build in the background at workspace startup and
-    /// every tool that needs it blocks until it completes, which is the right
-    /// default; a caller that must not block asks this first (#1757).
+    /// Whether a usage query would wait for background usage-analysis work.
+    /// Under the per-file fact design this is false only while an
+    /// above-threshold catch-up batch is being persisted; a tool that needs
+    /// those facts blocks until it drains, which is the right default, and a
+    /// caller that must not block asks this first (#1757). The field name is
+    /// the tool contract and did not change when the implementation moved off
+    /// the v1 usage index (ExecPlan Milestone 3).
     pub usage_index_ready: bool,
 }
 

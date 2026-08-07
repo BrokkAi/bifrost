@@ -2817,7 +2817,7 @@ impl SearchToolsService {
         let session = guard.as_mut().ok_or_else(Self::closed_error)?;
 
         if resolved == session.snapshot.analyzer().project().root() {
-            let usage_index_ready = session.snapshot.rust_usage_index_ready();
+            let usage_index_ready = session.snapshot.rust_usage_facts_ready();
             return active_workspace_result(&resolved, usage_index_ready);
         }
 
@@ -2858,7 +2858,7 @@ impl SearchToolsService {
         self.advance_workspace_generation();
         let old_session = std::mem::replace(session, new_session);
         session.schedule_index_warm();
-        let usage_index_ready = session.snapshot.rust_usage_index_ready();
+        let usage_index_ready = session.snapshot.rust_usage_facts_ready();
         *root = Some(resolved.clone());
         *self
             .file_listing
@@ -2887,7 +2887,7 @@ impl SearchToolsService {
         let session = guard.as_ref().ok_or_else(Self::closed_error)?;
         active_workspace_result(
             session.snapshot.analyzer().project().root(),
-            session.snapshot.rust_usage_index_ready(),
+            session.snapshot.rust_usage_facts_ready(),
         )
     }
 
@@ -3815,13 +3815,12 @@ fn assemble_session(
     );
     let watcher = start_session_watcher(Arc::clone(&project), update_strategy, watcher_starter)?;
     let snapshot = Arc::new(workspace);
-    // Start the lazy Rust usage index off the request path at workspace
-    // startup (issues #1416, #1757). A server session that never starts the
-    // build bills its whole-workspace construction to whichever request first
-    // touches the Rust usage graph. The build publishes through a
-    // `PoolSafeMemo`, so a request that arrives mid-build waits for it and a
-    // failed build stays unpublished, resurfacing on the first query that
-    // needs the index.
+    // Bring the persisted Rust usage facts up to date off the request path at
+    // workspace startup (issues #1416, #1757, #1758). This used to start a
+    // whole-workspace index build; since ExecPlan Milestone 3 there is no such
+    // build, and the warm's job is to find the live blobs analysis did not
+    // persist fact rows for. A query arriving before it finishes runs the same
+    // catch-up itself, so nothing depends on the warm having won the race.
     //
     // The per-file reference contexts are a separate whole-workspace fan-out
     // that no single request waits on as a unit, and a large C++ workspace can
@@ -3835,7 +3834,7 @@ fn assemble_session(
             .name("bifrost-usage-index-warm".to_string())
             .spawn(move || {
                 let _scope = profiling::scope("mcp_cold.query_index_construction.rust_usage");
-                snapshot.warm_rust_usage_index();
+                snapshot.warm_rust_usage_facts();
                 if warm_reference_contexts {
                     snapshot.warm_rust_usage_reference_contexts();
                 }
@@ -3862,8 +3861,7 @@ fn assemble_session(
 /// The default keeps the interactive behavior for normal sessions. Benchmark
 /// and symbol-only callers can set `BIFROST_WARM_USAGE_ANALYSIS=off` when a
 /// large workspace contains unrelated Rust sources. This never disables the
-/// usage *index* build: leaving that unstarted only moves it into a request
-/// (#1757).
+/// fact catch-up: leaving that unstarted only moves it into a request.
 fn rust_usage_reference_context_warming_enabled() -> bool {
     !matches!(
         std::env::var("BIFROST_WARM_USAGE_ANALYSIS").as_deref(),
@@ -4569,12 +4567,13 @@ mod watcher_startup_tests {
         }
     }
 
-    /// A long-lived server session starts the Rust usage-index build at
-    /// workspace startup, and `get_active_workspace` answers whether it has
-    /// finished. Every other tool blocks until it has; this is how a caller
-    /// that would rather not wait finds out first (#1757).
+    /// A long-lived server session starts the Rust usage-fact catch-up at
+    /// workspace startup, and `get_active_workspace` reports whether a query
+    /// would wait for it. The reported field must track the session's own
+    /// state rather than a constant, in both states (#1757; re-pointed from
+    /// the v1 index build by ExecPlan Milestone 3).
     #[test]
-    fn workspace_startup_starts_the_usage_index_build_and_reports_its_readiness() {
+    fn workspace_startup_runs_the_usage_fact_catch_up_and_reports_its_readiness() {
         let (_temp, root) = workspace("lib.rs", "pub fn root() {}\npub fn run() { root(); }\n");
         let service = SearchToolsService::new_deferred_manual(root).unwrap();
         service.ensure_ready().unwrap();
@@ -4586,7 +4585,7 @@ mod watcher_startup_tests {
                 .unwrap();
             let ready = {
                 let guard = service.session.read().unwrap();
-                guard.as_ref().unwrap().snapshot.rust_usage_index_ready()
+                guard.as_ref().unwrap().snapshot.rust_usage_facts_ready()
             };
             // The probe reports the session's own readiness rather than a
             // constant, in both states.
@@ -4596,7 +4595,7 @@ mod watcher_startup_tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the startup usage-index build never finished"
+                "the startup usage-fact catch-up never finished"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -4604,29 +4603,37 @@ mod watcher_startup_tests {
 
     /// The other half of the trigger: a synchronously constructed service is a
     /// one-shot invocation or an embedded host, which can exit seconds later.
-    /// It must not spend the workspace's whole usage-index build up front on an
-    /// index it may never query (#1758), so the build stays lazy.
+    /// It must not spend startup on Rust usage work it may never query
+    /// (#1758), so the catch-up stays lazy. Warmth, not readiness, is what
+    /// distinguishes the two: v2 has no index to build, so a session that has
+    /// not warmed still reports ready.
     #[test]
-    fn a_one_shot_service_does_not_start_the_usage_index_build_at_startup() {
+    fn a_one_shot_service_does_not_start_the_usage_fact_catch_up_at_startup() {
         let (_temp, root) = workspace("lib.rs", "pub fn root() {}\npub fn run() { root(); }\n");
         let service = SearchToolsService::new_manual_without_semantic_index(root).unwrap();
 
-        // Far longer than this two-declaration workspace needs to build the
-        // index, so a started warm would have published by now.
+        // Far longer than this two-declaration workspace needs for the
+        // catch-up, so a started warm would have settled by now.
         std::thread::sleep(Duration::from_millis(200));
 
         let guard = service.session.read().unwrap();
+        let snapshot = &guard.as_ref().unwrap().snapshot;
         assert!(
-            !guard.as_ref().unwrap().snapshot.rust_usage_index_ready(),
-            "a one-shot service must leave the usage index to the first query that needs it"
+            !snapshot.rust_usage_facts_warm(),
+            "a one-shot service must leave the catch-up to the first query that needs it"
+        );
+        assert!(
+            snapshot.rust_usage_facts_ready(),
+            "with nothing outstanding there is nothing for a caller to wait for"
         );
     }
 
-    /// A tool call that lands while the startup build is still running returns
-    /// the same answer it returns once the index is warm: it waits for the
-    /// background build instead of failing or answering from a partial index.
+    /// A tool call that lands while the startup catch-up is still running
+    /// returns the same answer it returns once the catch-up has settled: it
+    /// runs the same catch-up itself rather than failing or answering from
+    /// partial facts.
     #[test]
-    fn a_request_racing_the_startup_usage_index_build_returns_the_warm_answer() {
+    fn a_request_racing_the_startup_usage_fact_catch_up_returns_the_warm_answer() {
         let (_temp, root) = workspace(
             "lib.rs",
             "pub fn root() {}\npub fn run() { root(); }\npub fn spare() {}\n",
@@ -4641,11 +4648,11 @@ mod watcher_startup_tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while !{
             let guard = service.session.read().unwrap();
-            guard.as_ref().unwrap().snapshot.rust_usage_index_ready()
+            guard.as_ref().unwrap().snapshot.rust_usage_facts_warm()
         } {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the startup usage-index build never finished"
+                "the startup usage-fact catch-up never finished"
             );
             std::thread::sleep(Duration::from_millis(10));
         }

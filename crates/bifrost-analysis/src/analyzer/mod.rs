@@ -165,7 +165,7 @@ pub(crate) use php::{
     PhpFileContext, php_signature_return_type_text, resolve_php_constant, resolve_php_function,
     resolve_php_type,
 };
-pub(crate) use pool_memo::PoolSafeMemo;
+pub(crate) use pool_memo::{PoolSafeMemo, spawn_on_dedicated_build_pool};
 pub use project::{
     BIFROST_IGNORE_FILE_NAME, DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject,
     MultiRootProject, OverlayProject, OverlayRevision, Project, ProjectSourceOrigin,
