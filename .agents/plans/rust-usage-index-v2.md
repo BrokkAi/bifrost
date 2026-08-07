@@ -1,0 +1,163 @@
+# Rust usage index v2: per-file facts in the store, composition at query time
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
+
+This document must be maintained in accordance with `.agents/PLANS.md` at the repository root.
+
+## Purpose / Big Picture
+
+Bifrost's Rust usage analysis today is powered by `RustUsageIndex` (`crates/bifrost-analysis/src/analyzer/rust/usage_index.rs`), a single struct of seventeen workspace-wide `HashMap`s (exports, importer reverse edges, identity maps, module routing, macro ranges) built wholesale into process heap. On a Firefox-scale workspace this build costs minutes and about 10.8 GB of resident memory, and `RustAnalyzer::update` / `update_all` drop the entire index on any file change, so the next query pays a full rebuild. Issue #1758 measured all of this; the owner rejected both "keep it but schedule it better" and "persist the monolith to SQLite", because a persisted monolith still rebuilds as a monolith.
+
+After this change, there is no Rust usage index to build at all. Per-file facts (what a file exports, imports, declares as modules, and which identifiers occur in it) are rows in the per-workspace SQLite store, written by the same pass that already writes `code_units`, keyed by content hash (`blob_oid`) like everything else in the store. Usage questions are answered at query time by indexed lookups over those rows plus short, memoized cross-file walks. A single-file change costs one re-parse and a handful of row inserts -- the old blob's rows simply orphan for the existing GC -- plus clearing a few bounded in-memory caches. Nothing whole-workspace is ever rebuilt, and nothing workspace-sized lives in heap.
+
+The design transliterates IntelliJ's indexing architecture, verified against `/home/jonathan/Projects/intellij-community` at commit `277409ac3905ece64efd598bfeada8fc69fdb4f0` and written up with code citations in the research report (see Artifacts). The rule taken from there: anything that grows with workspace size lives on disk; anything in heap is bounded or soft. You can see v2 working by running the new behavior tests (a usage query answers correctly from a cold store with no build step; a file edit invalidates only that file's contribution), and by the Milestone 4 benchmark showing a large-workspace update-then-query cycle completing in seconds where v1 took minutes.
+
+## Progress
+
+- [x] (2026-08-07) Root cause and measurements recorded on issue #1758; owner rejected monolith persistence and directed an IntelliJ-style redesign.
+- [x] (2026-08-07) IntelliJ mechanism research completed with code citations; synthesis mapped each `RustUsageIndex` product to per-file, inverted-derivable, or genuinely cross-file (report in Artifacts).
+- [ ] Milestone 1: per-file Rust usage fact tables in the store, written at analysis time.
+- [ ] Milestone 2: `RustUsageQueries` query-time composition; consumers migrated; v1 index still present but unused.
+- [ ] Milestone 3: invalidation and readiness -- per-file catch-up, bounded-cache clears, no wholesale drop.
+- [ ] Milestone 4: kill-gate benchmark on a large Rust workspace; gates defined below must pass.
+- [ ] Milestone 5: delete v1 (the seventeen-map struct and its warm machinery), close out issues and docs.
+
+## Surprises & Discoveries
+
+- Observation: Bifrost's store is already most of the IntelliJ shape. `code_units` plus `idx_code_units_lang_short_name` is an inverted name-to-blob index (the `IdIndex` analogue at declaration granularity); `import_statements` / `import_details` already persist per-file import facts; and content-hash keying makes the per-file up-to-date check free, where IntelliJ needs `IndexingStamp` plus a VFS flag. The genuinely missing piece is one inverted table: identifier occurrences.
+  Evidence: `crates/bifrost-core/migrations/cache/0001-current-baseline.sql` and the research report sections 7.2-7.5.
+- Observation: only three of the seventeen `RustUsageIndex` products are genuinely cross-file (module-file resolution, alias routes, transitive export chains), and each is a bounded walk from a seed, not a closure. Everything else is a per-file fact or a per-file fact plus a SQL index.
+  Evidence: classification table in research report section 7.3.
+
+## Decision Log
+
+- Decision: per-file facts in SQLite plus query-time composition, replacing the materialized index entirely. Persisting the materialized graph was rejected.
+  Rationale: a persisted monolith still invalidates as a monolith; the owner's requirements are single-file incremental invalidation, data pulled on demand rather than resident, and no minutes-long rebuild ever. Only decomposing the unit of storage to the file meets all three.
+  Date/Author: 2026-08-07 / Jonathan (direction), Fable (design).
+- Decision: block-until-ready stays the default query behavior; a caller that does not want to block opts in via the readiness probe. This deliberately inverts IntelliJ's throw-by-default (`IndexNotReadyException`).
+  Rationale: owner directive from #1757. IntelliJ throws because its "not ready" can last minutes; under v2 "not ready" means "a small changed-file set has not been re-parsed", so blocking is cheap. Recorded divergence, not an oversight.
+  Date/Author: 2026-08-07 / Jonathan.
+- Decision: adopt IntelliJ's small-change lazy catch-up: below a threshold of changed files, bring them up to date inline on the querying thread; above it, hand the batch to the background pass and let the readiness probe report false meanwhile.
+  Rationale: single-file edits then never surface any readiness state at all (research report section 5.2, `ChangedFilesCollector.ensureUpToDateAsync`, threshold < 20 there).
+  Date/Author: 2026-08-07 / Fable.
+- Decision: Milestone 4 is a kill-gate, not a formality. v1 is deleted only after the benchmark passes; if it fails, the plan stops and the failure is taken back to the owner with numbers.
+  Rationale: the honest risk is query latency moving from a heap probe to indexed SQLite lookups plus per-candidate verification. A high-occurrence identifier is the case that breaks this design if anything does.
+  Date/Author: 2026-08-07 / Fable.
+- Decision: allocator hygiene (`MALLOC_ARENA_MAX`, `malloc_trim`) from #1758 option 1 is deferred until after Milestone 4 measurement.
+  Rationale: v2 removes the 10.8 GB transient that made glibc arena retention matter; re-measure before adding process-global allocator knobs.
+  Date/Author: 2026-08-07 / Fable.
+- Decision: new tables use STRICT, WITHOUT ROWID where the primary key is the natural access path, and ON DELETE CASCADE from `blobs`, matching the store's existing conventions.
+  Rationale: invariants belong in the schema; this is also the store's established style.
+  Date/Author: 2026-08-07 / Fable.
+
+## Outcomes & Retrospective
+
+(To be written at milestone completions.)
+
+## Context and Orientation
+
+The repository is Bifrost, a multi-language code analyzer at `/mnt/optane/bifrost-nlp` (branch `bifrost-nlp-ft`). The per-workspace analysis cache is a SQLite database whose schema lives in numbered migrations under `crates/bifrost-core/migrations/cache/` (baseline `0001-current-baseline.sql`; later migrations add to it). The database file name carries the schema version (`bifrost_cache.v15.db` today); find the constant that produces that number and the migration-registration mechanism before adding a migration, and follow the existing pattern exactly. Adding tables bumps the cache version, which invalidates existing prewarmed caches -- acceptable now, because the next benchmark campaign re-prewarms with per-repository caches anyway (see `.agents/plans/codescalebench-grep-hard-cleanup-eval.md` Decision Log).
+
+Terms. A "blob" is a content-hashed file version; `blobs(blob_oid, lang, generation)` is the root table and every per-file table cascades from it. `Liveness` (`crates/bifrost-analysis/src/analyzer/store/liveness.rs`) maps live workspace files to their current blob oids. "Per-file forward facts" are rows describing one file in isolation. An "inverted index" maps a name to the set of blobs mentioning it -- in SQLite terms, a table with an index on the name column. "Query-time composition" means cross-file answers are computed from per-file rows when asked, with memoization, instead of being precomputed into a global structure.
+
+The current implementation to be replaced: `RustUsageIndex` (`crates/bifrost-analysis/src/analyzer/rust/usage_index.rs`, struct around lines 472-494) with seventeen workspace-wide maps; cached as `usage_index: Arc<PoolSafeMemo<RustUsageIndex>>` on `RustAnalyzer` (`rust/mod.rs` around line 86); dropped wholesale in `update()` and `update_all()` (around lines 634 and 660). Its consumers are the Rust usage paths: `crates/bifrost-analysis/src/analyzer/usages/rust_graph.rs` and `rust/graph_support.rs` (via `seeds_for_target`, `importers_of_seeds`, `matching_edges_for_importer`, and the identity/module lookups). The background-warm machinery from #1757 (`warm_usage_index`, the dedicated build pool in `pool_memo.rs`, the `usage_index_ready` probe on `get_active_workspace`) exists and works; v2 removes the need for the usage warm specifically, while the dedicated pool remains for other long builds (see issue #1772).
+
+Prior decisions that bind this plan: the repo prohibits regex/text fallbacks for structured analysis; backward compatibility is not required; no mode flags to share code; assertions over defensive checks; tests must not download models or start indexer threads (`InlineTestProject`, featureless builds). The research report is the design substrate -- read it in full before implementing (path in Artifacts).
+
+## Plan of Work
+
+### Milestone 1: per-file fact tables, written at analysis time
+
+Scope: after this milestone, analyzing a Rust file persists its usage-relevant facts as rows; nothing reads them yet. This is additive and independently verifiable.
+
+Add a cache migration creating four tables (adapt names/columns to what the extraction actually produces -- the shapes below are the design intent, from research report section 7.5; the implementer owns reconciling them with the real projections in `rust/imports.rs` and `rust/declarations.rs`):
+
+    rust_exports(blob_oid, lang, ordinal, exported_name, source_path, is_glob)
+      -- one row per name this file re-exports or declares pub; source_path verbatim, unresolved
+      -- INDEX on exported_name
+    rust_import_targets(blob_oid, lang, ordinal, module_path, bound_name)
+      -- one row per import binding; module_path as written, unresolved; bound_name NULL for glob
+      -- INDEX on module_path; INDEX on bound_name
+    rust_modules(blob_oid, lang, ordinal, module_name, is_inline, start_byte, end_byte)
+      -- inline and file modules declared in this file
+    rust_identifier_occurrences(blob_oid, lang, identifier, context_mask)
+      -- the IdIndex analogue and the load-bearing new piece: which identifiers occur in this
+      -- file, with a context bitmask (code / comment / string / macro) so query-time
+      -- verification can filter before parsing
+      -- INDEX on (lang, identifier)
+
+All STRICT, WITHOUT ROWID on their natural primary keys, ON DELETE CASCADE from `blobs`, per the Decision Log. Bump the cache schema version through the existing mechanism.
+
+Populate them in the same per-blob persistence pass that writes `code_units` for Rust files. The extraction sources already exist: `rust_import_projection` and the export projection in `rust/imports.rs`, module extents in `rust/graph_support.rs`, and the tree-sitter AST for identifier occurrences. Do not re-parse; extract during the pass that already holds the tree. Occurrences dedupe to one row per (blob, identifier) with an OR-ed context mask.
+
+Tests: analyze a small inline Rust project (`InlineTestProject`), open the store, assert the expected rows for a file with re-exports, imports (named, glob, aliased), an inline module, and identifiers in code vs comments vs strings. Assert cascade: deleting the blob row removes the fact rows. Assert content-key stability: re-analyzing an unchanged file inserts nothing new.
+
+### Milestone 2: query-time composition and consumer migration
+
+Scope: after this milestone, every consumer of `RustUsageIndex` answers from the store; the v1 struct still compiles but nothing calls it (deletion waits for the Milestone 4 gate).
+
+Introduce `RustUsageQueries` (module next to the current `usage_index.rs`): a stateless view over the store plus three bounded caches, replacing the seventeen maps according to the classification in research report section 7.3:
+
+- Per-file products (`exports_by_file`, `origin_routes_by_file`, `module_extents`, `physical_roots`, `declaration_identities`, `value_constructor_identities`, `macro_visible_ranges`): read that file's rows on demand; no cache needed beyond what the store already memoizes per request.
+- Inverted-derivable products (`identities_by_name`, `module_importers`, `importer_reverse`): one indexed SELECT each (`rust_identifier_occurrences`, `rust_import_targets`), mapping blob oids to live files through `Liveness`, then per-candidate verification against that file's rows -- candidates may be false positives, verification is the contract, exactly as IntelliJ re-checks `IdIndex` hits.
+- Genuinely cross-file products (module-file resolution and `physical_owners`, alias routes, transitive export chains, `actual_crate_roots`): bounded walks from a seed over the per-file rows, memoized in three capacity-bounded caches keyed by `(store generation, query key)` so a generation bump invalidates them for free: `module_resolution`, `export_chain`, `resolve`. Use the existing `build_weighted_cache` mechanism from `rust/mod.rs` for byte budgets. `actual_crate_roots` is one row per crate from Cargo metadata; compute on demand and memoize.
+
+Copy IntelliJ's two query-cost mitigations where the call sites allow: narrow candidate sets by locality before verification (target file's directory, then importers, then rest), and early-out processing (stop verifying once the caller's question is answered -- e.g. "is there at least one importer").
+
+Migrate the consumers (`usages/rust_graph.rs`, `graph_support.rs`, and whatever else `rg "usage_index\(\)" crates/` finds) to `RustUsageQueries`. The three entry capabilities to preserve exactly: `seeds_for_target`, `importers_of_seeds`, `matching_edges_for_importer` -- their observable behavior is pinned by the existing Rust usage test suites (`tests/suite_usages/usages_rust_graph_test.rs` and the scan-usages Rust cases), which must pass unchanged. That suite parity is this milestone's acceptance; add focused unit tests only where a v2 code path (candidate verification, memoized walk, generation invalidation) has no existing coverage.
+
+### Milestone 3: invalidation and readiness
+
+Scope: after this milestone, `update()` / `update_all()` no longer drop anything workspace-sized, and readiness reflects the small catch-up set.
+
+In `RustAnalyzer::update` / `update_all`: stop replacing the usage memo (it no longer exists for v2); instead clear the three bounded caches (the `resolve` cache wholesale, the other two by generation-key rotation which is automatic if keyed as specified). Per-file store rows need no action -- changed files get new blob rows through the normal persistence path; stale rows orphan for the existing GC (`store/gc.rs`).
+
+Implement the catch-up policy: a usage query first asks `Liveness` for files whose current oid lacks persisted rust-fact rows (the store's existing generation machinery answers this; follow `oids_for_files` batching). Below the threshold (adopt 20 to start, one constant), parse and persist them inline on the querying thread -- block-until-ready, invisible for single-file edits. At or above it, schedule the batch on the existing background path and have `usage_index_ready` (the #1757 probe on `get_active_workspace`) report false until the batch drains. Re-point the probe's implementation from "is the v1 index built" to "is the rust-fact catch-up set empty"; its tool contract does not change.
+
+Tests: edit one file in an inline project, assert the next usage query answers correctly without any whole-workspace work (structural pin: the store's scan counters from `2ba5dda4`, and assert no full-table scan is charged); assert the probe stays true through a single-file edit and goes false-then-true across a synthetic above-threshold batch.
+
+### Milestone 4: kill-gate benchmark
+
+Scope: this milestone produces numbers, and the plan does not proceed past it on failure.
+
+Environment: a large Rust workspace from the existing campaign sources (`/mnt/T9/repo-clones/.codescale-sources/` has rust compiler and CockroachDB-adjacent trees; the rust compiler tree used in `ccx-incident-131` is the reference). Build two featureless release binaries: the commit before Milestone 2's consumer switch (v1 answering) and HEAD (v2 answering). Use `scripts/with-isolated-cargo-target.sh`; label every cell with binary, cache state, and load, per the house measurement discipline.
+
+Cells, each cold and warm: (a) `scan_usages_by_reference` on a moderate-fan-in symbol; (b) the same on a high-occurrence identifier -- pick the worst by `SELECT identifier, COUNT(*) ... GROUP BY identifier ORDER BY COUNT(*) DESC` over the new table, this is the design-breaking case; (c) single-file edit followed immediately by the query from (a) -- this is v2's headline case, v1 pays its full rebuild here; (d) peak RSS across (a)-(c).
+
+Gates: (1) v2 query latency within 2x of v1 warm and always inside the 5-second product limit for (a); for (b), v2 must stay inside the 5-second limit -- v1's number is reported but not the bar, since v1 buys its speed with the 10.8 GB heap this plan exists to remove; (2) cell (c) completes in under 10 seconds end to end for v2 (v1's number will be minutes; report it); (3) peak RSS for v2 under 4 GB on the reference workspace. On any gate failure: stop, write the numbers into this plan, take it back to the owner.
+
+### Milestone 5: deletion and close-out
+
+Delete `RustUsageIndex`, its seventeen maps, `warm_usage_index`, and the usage-specific warm wiring from #1757 (`warm_rust_usage_index` / `warm_rust_usage_reference_contexts` on `WorkspaceAnalyzer`; the `StartupIndexWarm` machinery stays only if another index still uses it -- check, and if nothing does, delete it too and say so in the commit). The dedicated build pool in `pool_memo.rs` stays (issue #1772 wants it for the hierarchy build). Keep `BIFROST_WARM_USAGE_ANALYSIS` only if the reference-context sweep survives as a separate concern; otherwise remove the env var and its documentation. Update issue #1758 (structural fix landed) and #1757's closing comment if the probe semantics changed. Update the memory file `embedding-backend-sidecar`-style records only if factual claims there went stale. Run the full local gate from CLAUDE.md before the final push.
+
+## Concrete Steps
+
+All commands from the repository root `/mnt/optane/bifrost-nlp`.
+
+Focused iteration (featureless; nothing here touches NLP):
+
+    cargo check -p brokk-bifrost-analysis -p brokk-bifrost-core
+    cargo nextest run -p brokk-bifrost-analysis
+    cargo nextest run --workspace -E 'test(/rust_graph|usage|rust_usage|suite_usages/)'
+
+Before each push: `cargo fmt` and `cargo clippy --workspace --all-targets -- -D warnings` (the `--all-features` comprehensive gate runs at the pre-push checkpoints the main session performs, not per-milestone). Known pre-existing failures are listed in `.agents/plans/searchtools-too-broad-scope-guards.md` (Surprises) plus the two recorded during #1757; verify any new failure against a stash before investigating.
+
+Milestone 4 builds use `scripts/with-isolated-cargo-target.sh`; check disk space first; never write to the shared DW10 cache -- copy to scratch and delete after, announcing both.
+
+## Validation and Acceptance
+
+Milestone acceptance is written into each milestone above. Plan-level acceptance: the existing Rust usage suites pass unchanged on v2; the new invalidation tests demonstrate single-file incrementality with a structural no-full-scan pin; the Milestone 4 gates pass with recorded numbers; and after Milestone 5 the words `RustUsageIndex` and `warm_usage_index` no longer appear in the tree. Every regression-shaped test must be demonstrated to fail against the code state it guards against (stash or pre-milestone commit), per house rule.
+
+## Idempotence and Recovery
+
+Milestones 1-2 are additive and individually revertable by commit. The consumer switch in Milestone 2 is the first behavior-visible commit; if it breaks something the suites missed, revert that single commit -- v1 is still present until Milestone 5. The cache version bump invalidates prewarmed caches by design; do not run it against the shared DW10 cache directory. Milestone 4 is measurement-only. Milestone 5 is the point of no return and sits behind the gate.
+
+## Artifacts and Notes
+
+- IntelliJ research report (design substrate, code-cited): `/tmp/claude-1000/-mnt-optane-bifrost-nlp/b5398767-af2f-42d8-9210-eea66ede9085/scratchpad/intellij-indexing-research-v1.md`. That path is session-temporary: Milestone 1's first commit must copy it to `.agents/docs/intellij-indexing-research-2026-08.md` so the plan stays self-contained, and update this line.
+- Measurements motivating the plan: issue #1758 and its root-cause comment (2026-08-07); `.agents/docs/codescale-grep-hard-checkpoint-2026-08-07.md`.
+- Key current-code anchors: `rust/usage_index.rs` (the struct, ~472-494), `rust/mod.rs` (memo ~86, drops ~634/660, `build_weighted_cache` ~341), `store/liveness.rs` (`oids_for_files`), `store/gc.rs`, `migrations/cache/0001-current-baseline.sql`.
+
+## Interfaces and Dependencies
+
+No new crates. At the end: four new store tables as specified in Milestone 1 (final DDL recorded here when landed); `RustUsageQueries` in `crates/bifrost-analysis/src/analyzer/rust/` exposing at minimum the three preserved capabilities (`seeds_for_target`, `importers_of_seeds`, `matching_edges_for_importer`) plus the per-file and inverted lookups the migrated consumers need; three weighted bounded caches keyed by `(generation, query)`; the catch-up policy with its threshold constant; `usage_index_ready` re-pointed to the catch-up set. `RustUsageIndex` and the usage warm are gone.
