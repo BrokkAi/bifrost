@@ -33035,3 +33035,130 @@ fn python_block_nested_reexport_after_a_declaration_resolves_to_the_later_bindin
         "{value}"
     );
 }
+
+// Issue #1782: JavaScript hoists a `var` binder to its enclosing function, so a
+// use before the declaration, or after a block that declares it, still names
+// the same binder. `let`/`const` keep block scoping and their TDZ.
+fn javascript_var_scoping_definition(source: &str, reference: &str) -> serde_json::Value {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("mod.js", source)
+        .build();
+    let at = source.find(reference).expect("reference marker");
+    lookup(project.root(), &location_reference("mod.js", source, at))
+}
+
+const JAVASCRIPT_VAR_USE_BEFORE_DECLARATION: &str = r#"function outer() {
+    var use = function (value) {
+        return toBigNumber(value);
+    };
+    var toBigNumber = function (number) {
+        return number;
+    };
+    return use;
+}
+"#;
+
+const JAVASCRIPT_LEXICAL_USE_BEFORE_DECLARATION: &str = r#"function outer() {
+    var use = function (value) {
+        return toBigNumber(value);
+    };
+    const toBigNumber = function (number) {
+        return number;
+    };
+    return use;
+}
+"#;
+
+const JAVASCRIPT_FUNCTION_USE_BEFORE_DECLARATION: &str = r#"function outer() {
+    var use = function (value) {
+        return toBigNumber(value);
+    };
+    function toBigNumber(number) {
+        return number;
+    }
+    return use;
+}
+"#;
+
+const JAVASCRIPT_VAR_IN_INNER_BLOCK: &str = r#"function outer(flag) {
+    if (flag) {
+        var toBigNumber = function (number) {
+            return number;
+        };
+    }
+    return toBigNumber(1);
+}
+"#;
+
+const JAVASCRIPT_LEXICAL_IN_INNER_BLOCK: &str = r#"function outer(flag) {
+    if (flag) {
+        const toBigNumber = function (number) {
+            return number;
+        };
+    }
+    return toBigNumber(1);
+}
+"#;
+
+const JAVASCRIPT_VAR_IN_SIBLING_FUNCTION: &str = r#"function first() {
+    var toBigNumber = function (number) {
+        return number;
+    };
+    return toBigNumber;
+}
+
+function second() {
+    return toBigNumber(1);
+}
+"#;
+
+#[test]
+fn javascript_var_binder_hoists_above_its_use_in_the_same_function() {
+    let value =
+        javascript_var_scoping_definition(JAVASCRIPT_VAR_USE_BEFORE_DECLARATION, "toBigNumber(val");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 5, "{value}");
+}
+
+#[test]
+fn javascript_var_binder_in_an_inner_block_resolves_after_that_block() {
+    let value = javascript_var_scoping_definition(JAVASCRIPT_VAR_IN_INNER_BLOCK, "toBigNumber(1)");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 3, "{value}");
+}
+
+#[test]
+fn javascript_function_declaration_hoists_above_its_use_in_the_same_function() {
+    let value = javascript_var_scoping_definition(
+        JAVASCRIPT_FUNCTION_USE_BEFORE_DECLARATION,
+        "toBigNumber(val",
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 5, "{value}");
+}
+
+#[test]
+fn javascript_lexical_binder_used_before_its_declaration_reports_no_definition() {
+    let value = javascript_var_scoping_definition(
+        JAVASCRIPT_LEXICAL_USE_BEFORE_DECLARATION,
+        "toBigNumber(val",
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn javascript_lexical_binder_in_an_inner_block_reports_no_definition_after_that_block() {
+    let value =
+        javascript_var_scoping_definition(JAVASCRIPT_LEXICAL_IN_INNER_BLOCK, "toBigNumber(1)");
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn javascript_var_binder_in_a_sibling_function_reports_no_definition() {
+    let value =
+        javascript_var_scoping_definition(JAVASCRIPT_VAR_IN_SIBLING_FUNCTION, "toBigNumber(1)");
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}

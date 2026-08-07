@@ -446,6 +446,22 @@ fn variable_binding_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
 }
 
 fn enclosing_var_binding_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
+    var_binding_scope_node(node).map(node_scope)
+}
+
+/// The node a `var` binder attaches to: JavaScript hoists `var` to the nearest
+/// enclosing function-like node, or to the program. `None` for a `let`/`const`
+/// declarator, whose binder is block scoped and stays in its TDZ until its
+/// declaration.
+pub fn js_ts_var_declarator_binding_scope<'tree>(declarator: Node<'tree>) -> Option<Node<'tree>> {
+    let declaration = declarator.parent()?;
+    if declaration.kind() != "variable_declaration" {
+        return None;
+    }
+    var_binding_scope_node(declaration)
+}
+
+fn var_binding_scope_node(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = node.parent();
     while let Some(parent) = current {
         if matches!(
@@ -458,7 +474,7 @@ fn enclosing_var_binding_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope
                 | "arrow_function"
                 | "method_definition"
         ) {
-            return Some(node_scope(parent));
+            return Some(parent);
         }
         current = parent.parent();
     }
