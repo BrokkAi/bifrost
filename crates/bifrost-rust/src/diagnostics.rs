@@ -5,14 +5,32 @@
 //! confirms survivors against a core
 //! [`brokk_bifrost_core::analyzer::BoundedDefinitionLookup`]. Neither needs an
 //! analyzer handle, so all of it lives here; `analyzer/rust/diagnostics.rs` in
-//! `brokk-bifrost-analysis` keeps only the downcast that produces those two
+//! `brokk-bifrost-analysis` keeps only the downcast that produces those
 //! arguments, and the tests that need a live analyzer to produce them.
+//!
+//! Every lookup produces an outcome (#1625). A reference that resolves is
+//! recorded as resolved against the surface that explained it, a reference no
+//! complete surface explains becomes an error carrying its
+//! [`brokk_bifrost_core::analyzer::model::SemanticAbsenceProof`], and a
+//! reference the scan declined to judge states the typed reason why. The
+//! previous pass returned only the errors, so a suppression and a clean
+//! resolution were indistinguishable, and every error it did return claimed a
+//! complete workspace-local lexical proof that it had not actually made.
+//!
+//! Nothing here runs `cargo` or `rustdoc`, reads `target/doc`, or triggers pack
+//! production. External facts arrive through [`RustExternalEvidence`], whose
+//! implementations read retained analyzer state only.
 
 use crate::graph_support::RustUsageSource;
-use brokk_bifrost_core::analyzer::model::{ImportInfo, SemanticDiagnostic};
+use crate::proof::{RustNameProof, RustProofGap, record_rust_name_proof};
+use brokk_bifrost_core::analyzer::model::{
+    ImportInfo, SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
+    SemanticDiagnosticReport,
+};
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{
     contains_node, node_range, node_text, same_node,
 };
+use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
 use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportKind};
 use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, ProjectFile, Range};
@@ -26,47 +44,113 @@ pub const MAX_RUST_SEMANTIC_DIAGNOSTIC_BYTES: usize = 512 * 1024;
 pub const MAX_RUST_SEMANTIC_DIAGNOSTICS: usize = 200;
 
 pub const RUST_UNRECOGNIZED_SYMBOL: &str = "rust_unrecognized_symbol";
+pub const RUST_UNRECOGNIZED_CRATE_ITEM: &str = "rust_unrecognized_crate_item";
 pub const RUST_SEMANTIC_DIAGNOSTIC_SOURCE: &str = "bifrost-rust";
 
+/// What the activated Cargo API packs prove about one dependency crate's
+/// exported surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RustSemanticDiagnostic {
-    pub range: Range,
-    pub kind: &'static str,
-    pub message: String,
+pub enum RustCrateSurface {
+    /// No activated pack publishes this crate at all.
+    Unpublished,
+    /// A pack publishes it and records a complete API surface, so a miss
+    /// against it is proof of absence.
+    Complete,
+    /// A pack publishes it but cannot support an absence claim, for the reason
+    /// `detail` names: an explicitly partial surface, a re-export or glob the
+    /// producer could not follow, or a pack whose feature set is not the one
+    /// the workspace resolves.
+    Uncertain { detail: String },
 }
 
-impl From<RustSemanticDiagnostic> for SemanticDiagnostic {
-    fn from(diagnostic: RustSemanticDiagnostic) -> Self {
-        Self {
-            range: diagnostic.range,
-            source: RUST_SEMANTIC_DIAGNOSTIC_SOURCE,
-            kind: diagnostic.kind,
-            message: diagnostic.message,
-        }
+/// The external Rust evidence one diagnostic request may read.
+///
+/// Every method answers from state the analyzer already retains. None of them
+/// may run `cargo` or `rustdoc`, read `target/doc`, or trigger pack production:
+/// a request that cannot see the answer reports incompleteness instead.
+///
+/// `crate_name` is always spelled as the *source* spells it. A dependency that
+/// Cargo renames is published under that spelling as a pack alias, so a renamed
+/// crate needs no separate mapping here, and two same-named crates at different
+/// versions collide into an overlay conflict that answers nothing rather than
+/// picking a winner.
+pub trait RustExternalEvidence {
+    /// How completely the activated packs describe the crate `crate_name`
+    /// names.
+    fn crate_surface(&self, crate_name: &str) -> RustCrateSurface;
+
+    /// Whether the packs publish the item that `segments` names. `segments`
+    /// includes the leading crate name.
+    fn publishes_path(&self, segments: &[String]) -> bool;
+
+    /// How far a lookup for a crate no pack published could see: the retained
+    /// Cargo dependency evidence declares it
+    /// ([`BoundaryStatus::ExternalDeclaredUnindexed`]) or nothing is known
+    /// ([`BoundaryStatus::ExternalUnknown`]).
+    fn unindexed_boundary(&self, crate_name: &str) -> BoundaryStatus;
+}
+
+/// Evidence that has acquired nothing. Every crate is unknown, which is the
+/// honest answer for an analyzer no host has activated packs on.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnindexedRustDependencies;
+
+impl RustExternalEvidence for UnindexedRustDependencies {
+    fn crate_surface(&self, _crate_name: &str) -> RustCrateSurface {
+        RustCrateSurface::Unpublished
+    }
+
+    fn publishes_path(&self, _segments: &[String]) -> bool {
+        false
+    }
+
+    fn unindexed_boundary(&self, _crate_name: &str) -> BoundaryStatus {
+        BoundaryStatus::ExternalUnknown
     }
 }
 
-/// Scan `source` for names no declaration in the workspace explains.
+/// Scan `source` for names no surface explains, recording what each lookup
+/// proved.
 ///
 /// `rust` supplies the per-file reference context and type-alias predicate;
-/// `support` is the declaration lookup survivors are confirmed against. The
-/// caller produces both -- see the analysis-side entry point of the same name.
+/// `support` is the declaration lookup survivors are confirmed against;
+/// `external` answers for crates outside the workspace. The caller produces all
+/// three -- see the analysis-side entry point of the same name.
 pub fn collect_rust_semantic_diagnostics(
     rust: &dyn RustUsageSource,
     support: &dyn BoundedDefinitionLookup,
+    external: &dyn RustExternalEvidence,
     file: &ProjectFile,
     source: &str,
-) -> Vec<RustSemanticDiagnostic> {
+) -> SemanticDiagnosticReport {
+    let mut report = SemanticDiagnosticReport::new();
     if source.len() > MAX_RUST_SEMANTIC_DIAGNOSTIC_BYTES {
-        return Vec::new();
+        report.push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
+        return report;
     }
     let Some(tree) = crate::lexical_scope::parse_rust_tree(source) else {
-        return Vec::new();
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "Rust source did not parse".to_string(),
+            }],
+        );
+        return report;
     };
     let mut parse_errors = Vec::new();
     collect_parse_errors(tree.root_node(), &mut parse_errors);
     if !parse_errors.is_empty() {
-        return Vec::new();
+        // The parse errors themselves reach the host through the analyzer's
+        // parse-diagnostic path. What the semantic report records is that the
+        // tree this pass would have judged is not trustworthy, so no name in
+        // the file was checked at all.
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "Rust source has parse errors".to_string(),
+            }],
+        );
+        return report;
     }
 
     let line_starts = compute_line_starts(source);
@@ -75,26 +159,30 @@ pub fn collect_rust_semantic_diagnostics(
     let mut collector = RustDiagnosticCollector {
         rust,
         support,
+        external,
         file,
         source,
         line_starts: &line_starts,
         root,
         visible_uses,
-        diagnostics: Vec::new(),
+        report,
+        diagnostic_count: 0,
     };
     collector.scan_tree(root);
-    collector.diagnostics
+    collector.report
 }
 
 struct RustDiagnosticCollector<'a, 'tree> {
     rust: &'a dyn RustUsageSource,
     support: &'a dyn BoundedDefinitionLookup,
+    external: &'a dyn RustExternalEvidence,
     file: &'a ProjectFile,
     source: &'a str,
     line_starts: &'a [usize],
     root: Node<'tree>,
     visible_uses: Vec<RustUseBinding>,
-    diagnostics: Vec<RustSemanticDiagnostic>,
+    report: SemanticDiagnosticReport,
+    diagnostic_count: usize,
 }
 
 enum ScanFrame<'tree> {
@@ -109,7 +197,11 @@ impl RustDiagnosticCollector<'_, '_> {
         scopes.enter();
         let mut stack = vec![ScanFrame::Node(root)];
         while let Some(frame) = stack.pop() {
-            if self.diagnostics.len() >= MAX_RUST_SEMANTIC_DIAGNOSTICS {
+            if self.diagnostic_count >= MAX_RUST_SEMANTIC_DIAGNOSTICS {
+                // The scan stopped early, so every name it never reached is
+                // unjudged rather than absent.
+                self.report
+                    .push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
                 break;
             }
             match frame {
@@ -128,7 +220,12 @@ impl RustDiagnosticCollector<'_, '_> {
         scopes: &mut RustScopeStack,
         stack: &mut Vec<ScanFrame<'tree>>,
     ) {
-        if is_subtree_suppressed(node, self.source) {
+        if let Some(gap) = subtree_suppression(node, self.source) {
+            // The whole subtree goes unjudged, so one typed outcome stands for
+            // it rather than one per name inside it.
+            let range = node_range(node, self.line_starts);
+            self.report
+                .push_incomplete(Some(range), vec![gap.into_reason()]);
             return;
         }
         match node.kind() {
@@ -224,25 +321,7 @@ impl RustDiagnosticCollector<'_, '_> {
             return;
         }
         let name = node_text(node, self.source).trim();
-        if self.name_is_known_or_uncertain(name, node, scopes, SymbolKind::Type) {
-            return;
-        }
-        self.push_unrecognized(node, name);
-    }
-
-    fn check_scoped_type_identifier(&mut self, node: Node<'_>, scopes: &RustScopeStack) {
-        if !is_scoped_reference(node) {
-            return;
-        }
-        let Some(name_node) = node.child_by_field_name("name") else {
-            return;
-        };
-        let name = node_text(name_node, self.source).trim();
-        let path = node.child_by_field_name("path");
-        if self.scoped_name_is_known_or_uncertain(path, name, node, scopes, SymbolKind::Type) {
-            return;
-        }
-        self.push_unrecognized(name_node, name);
+        self.record_bare_name(node, name, scopes, SymbolKind::Type);
     }
 
     fn check_value_identifier(&mut self, node: Node<'_>, scopes: &RustScopeStack) {
@@ -250,13 +329,43 @@ impl RustDiagnosticCollector<'_, '_> {
             return;
         }
         let name = node_text(node, self.source).trim();
-        if self.name_is_known_or_uncertain(name, node, scopes, SymbolKind::Value) {
-            return;
-        }
-        self.push_unrecognized(node, name);
+        self.record_bare_name(node, name, scopes, SymbolKind::Value);
+    }
+
+    fn check_scoped_type_identifier(&mut self, node: Node<'_>, scopes: &RustScopeStack) {
+        self.check_scoped_path(node, scopes, SymbolKind::Type);
     }
 
     fn check_scoped_identifier(&mut self, node: Node<'_>, scopes: &RustScopeStack) {
+        self.check_scoped_path(node, scopes, SymbolKind::Value);
+    }
+
+    /// Judge one bare written name and record what the lookup proved.
+    fn record_bare_name(
+        &mut self,
+        node: Node<'_>,
+        name: &str,
+        scopes: &RustScopeStack,
+        kind: SymbolKind,
+    ) {
+        let Some(proof) = self.bare_name_proof(name, node, scopes, kind) else {
+            return;
+        };
+        let rel_path = self.file.rel_path().to_path_buf();
+        let owned = name.to_string();
+        self.record(node, proof, RUST_UNRECOGNIZED_SYMBOL, move |range| {
+            (
+                SemanticDiagnosticDomain::LexicalScope {
+                    file: rel_path,
+                    range,
+                },
+                format!("Unrecognized Rust symbol `{owned}`"),
+            )
+        });
+    }
+
+    /// Judge one `a::b::Name` path and record what the lookup proved.
+    fn check_scoped_path(&mut self, node: Node<'_>, scopes: &RustScopeStack, kind: SymbolKind) {
         if !is_scoped_reference(node) {
             return;
         }
@@ -264,27 +373,89 @@ impl RustDiagnosticCollector<'_, '_> {
             return;
         };
         let name = node_text(name_node, self.source).trim();
-        let path = node.child_by_field_name("path");
-        if self.scoped_name_is_known_or_uncertain(path, name, node, scopes, SymbolKind::Value) {
+        if name.is_empty() {
             return;
         }
-        self.push_unrecognized(name_node, name);
+        let Some(path_node) = node.child_by_field_name("path") else {
+            self.record_bare_name(name_node, name, scopes, kind);
+            return;
+        };
+        // Crate-local roots stay on the workspace surface the reference
+        // context already resolves; everything else may leave the workspace.
+        if is_crate_local_path(path_node, self.source) {
+            let path = node_text(path_node, self.source).trim();
+            let refs = self.rust.reference_context_of(self.file);
+            let resolved = refs
+                .resolve_scoped(path, name)
+                .is_some_and(|resolved| self.fqn_has_matching_declaration(&resolved, kind));
+            let proof = if resolved {
+                RustNameProof::Workspace
+            } else {
+                RustNameProof::Absent {
+                    boundary: BoundaryStatus::WorkspaceLocal,
+                }
+            };
+            let owner = path.to_string();
+            let owned = name.to_string();
+            self.record(name_node, proof, RUST_UNRECOGNIZED_SYMBOL, move |_| {
+                (
+                    SemanticDiagnosticDomain::Module {
+                        name: owner.clone(),
+                    },
+                    format!("Rust module `{owner}` has no item `{owned}`"),
+                )
+            });
+            return;
+        }
+        // A workspace sibling may still answer the path before any dependency
+        // pack is consulted.
+        let path = node_text(path_node, self.source).trim();
+        let refs = self.rust.reference_context_of(self.file);
+        if refs
+            .resolve_scoped(path, name)
+            .is_some_and(|resolved| self.fqn_has_matching_declaration(&resolved, kind))
+        {
+            self.record_resolved(name_node, BoundaryStatus::WorkspaceLocal);
+            return;
+        }
+        let segments = self.dependency_path_segments(node, node.start_byte());
+        let proof = self.external_path_proof(&segments);
+        let owner = segments
+            .split_last()
+            .map(|(_, owner)| owner.join("::"))
+            .unwrap_or_default();
+        let owned = name.to_string();
+        self.record(name_node, proof, RUST_UNRECOGNIZED_CRATE_ITEM, move |_| {
+            (
+                SemanticDiagnosticDomain::Module {
+                    name: owner.clone(),
+                },
+                format!("Rust crate path `{owner}` has no exported item `{owned}`"),
+            )
+        });
     }
 
-    fn name_is_known_or_uncertain(
+    /// What every retained surface proves about one bare written name.
+    ///
+    /// `None` means the name is not a judgeable reference at all (a placeholder
+    /// or an empty token), so no outcome is recorded for it.
+    fn bare_name_proof(
         &self,
         name: &str,
         node: Node<'_>,
         scopes: &RustScopeStack,
         kind: SymbolKind,
-    ) -> bool {
-        if name.is_empty()
-            || name == "_"
-            || scopes.contains(name, kind)
-            || is_rust_builtin_name(name)
-            || is_inside_cfg_gated_item(node, self.source)
-        {
-            return true;
+    ) -> Option<RustNameProof> {
+        if name.is_empty() || name == "_" {
+            return None;
+        }
+        if scopes.contains(name, kind) {
+            return Some(RustNameProof::Workspace);
+        }
+        if is_rust_builtin_name(name) {
+            // The prelude and the primitive types are compiled into the
+            // language itself, so the table that answers them is complete.
+            return Some(RustNameProof::ExternalIndexed);
         }
         let binder = self.visible_import_binder_at(node.start_byte());
         if binder
@@ -292,44 +463,72 @@ impl RustDiagnosticCollector<'_, '_> {
             .values()
             .any(|binding| binding.kind == ImportKind::Glob)
         {
-            return true;
+            // `use foo::*` puts an unknown set of names in scope. Which names
+            // it supplies is exactly what this surface cannot enumerate.
+            return Some(RustNameProof::Incomplete(RustProofGap::Unsupported {
+                detail: format!(
+                    "a glob import in scope could supply `{name}`, and its bound names are not enumerated"
+                ),
+            }));
         }
         if binder.bindings.contains_key(name) {
-            return true;
+            // A `use` binds the name. Whether its target exists is a question
+            // about the crate the import enters, so ask the same ladder a
+            // written path would take.
+            if let Some(segments) = self.imported_path_segments(node.start_byte(), name)
+                && !is_crate_local_root(&segments)
+            {
+                return Some(self.external_path_proof(&segments));
+            }
+            return Some(RustNameProof::Workspace);
         }
         let refs = self.rust.reference_context_of(self.file);
         if let Some(resolved) = refs.resolve_bare(name)
             && self.fqn_has_matching_declaration(resolved, kind)
         {
-            return true;
+            return Some(RustNameProof::Workspace);
         }
-        self.support
+        if self
+            .support
             .file_identifier(self.file, name)
             .into_iter()
             .any(|unit| self.symbol_kind_matches(&unit, kind))
+        {
+            return Some(RustNameProof::Workspace);
+        }
+        Some(RustNameProof::Absent {
+            boundary: BoundaryStatus::WorkspaceLocal,
+        })
     }
 
-    fn scoped_name_is_known_or_uncertain(
-        &self,
-        path_node: Option<Node<'_>>,
-        name: &str,
-        node: Node<'_>,
-        scopes: &RustScopeStack,
-        kind: SymbolKind,
-    ) -> bool {
-        if name.is_empty() || is_inside_cfg_gated_item(node, self.source) {
-            return true;
-        }
-        let Some(path_node) = path_node else {
-            return self.name_is_known_or_uncertain(name, node, scopes, kind);
+    /// The classification ladder for a path that leaves the workspace.
+    ///
+    /// `segments` starts with the crate name as the source spells it, which is
+    /// also the spelling a Cargo rename publishes as a pack alias.
+    fn external_path_proof(&self, segments: &[String]) -> RustNameProof {
+        let Some(crate_name) = segments.first() else {
+            return RustNameProof::Incomplete(RustProofGap::ExternalBoundary {
+                boundary: BoundaryStatus::ExternalUnknown,
+            });
         };
-        if !is_crate_local_path(path_node, self.source) {
-            return true;
+        if self.external.publishes_path(segments) {
+            return RustNameProof::ExternalIndexed;
         }
-        let path = node_text(path_node, self.source).trim();
-        let refs = self.rust.reference_context_of(self.file);
-        refs.resolve_scoped(path, name)
-            .is_some_and(|resolved| self.fqn_has_matching_declaration(&resolved, kind))
+        match self.external.crate_surface(crate_name) {
+            // The pack states a complete API surface for this exact crate and
+            // does not publish the item, so the miss is proof.
+            RustCrateSurface::Complete => RustNameProof::Absent {
+                boundary: BoundaryStatus::ExternalIndexed,
+            },
+            RustCrateSurface::Uncertain { detail } => {
+                RustNameProof::Incomplete(RustProofGap::Unsupported { detail })
+            }
+            RustCrateSurface::Unpublished => {
+                RustNameProof::Incomplete(RustProofGap::ExternalBoundary {
+                    boundary: self.external.unindexed_boundary(crate_name),
+                })
+            }
+        }
     }
 
     fn fqn_has_matching_declaration(&self, fqn: &str, kind: SymbolKind) -> bool {
@@ -367,13 +566,114 @@ impl RustDiagnosticCollector<'_, '_> {
         binder
     }
 
-    fn push_unrecognized(&mut self, node: Node<'_>, name: &str) {
-        self.diagnostics.push(RustSemanticDiagnostic {
-            range: node_range(node, self.line_starts),
-            kind: RUST_UNRECOGNIZED_SYMBOL,
-            message: format!("Unrecognized Rust symbol `{name}`"),
-        });
+    /// The dotted-lookup segments for a written path, with its leading name
+    /// rebased onto whatever a visible `use` binds it to, so `use serde_json as
+    /// json; json::Value` asks the pack about `serde_json::Value`.
+    fn dependency_path_segments(&self, node: Node<'_>, reference_byte: usize) -> Vec<String> {
+        let written = path_segments(node, self.source);
+        let Some((root, rest)) = written.split_first() else {
+            return Vec::new();
+        };
+        let mut segments = self
+            .imported_path_segments(reference_byte, root)
+            .unwrap_or_else(|| vec![root.clone()]);
+        segments.extend_from_slice(rest);
+        segments
     }
+
+    /// The structured path segments of the visible `use` that binds `name`.
+    ///
+    /// Read from the parser's recorded import path, never by splitting the
+    /// import's source text.
+    fn imported_path_segments(&self, reference_byte: usize, name: &str) -> Option<Vec<String>> {
+        let reference_mod =
+            crate::lexical_scope::enclosing_mod_item_range_at(self.root, reference_byte);
+        for visible_use in &self.visible_uses {
+            if visible_use.mod_range != reference_mod {
+                continue;
+            }
+            if visible_use
+                .scope_range
+                .is_some_and(|(start, end)| !(start <= reference_byte && reference_byte < end))
+            {
+                continue;
+            }
+            for import in &visible_use.imports {
+                if import.local_name() != Some(name) {
+                    continue;
+                }
+                if let Some(path) = import.path.as_ref()
+                    && !path.segments.is_empty()
+                {
+                    return Some(path.segments.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Place one proof in the report, minting the diagnostic only on the arm
+    /// that can carry one.
+    fn record(
+        &mut self,
+        node: Node<'_>,
+        proof: RustNameProof,
+        kind: &'static str,
+        absence: impl FnOnce(Range) -> (SemanticDiagnosticDomain, String),
+    ) {
+        let range = node_range(node, self.line_starts);
+        let emitted = record_rust_name_proof(&mut self.report, range, proof, || {
+            let (domain, message) = absence(range);
+            (
+                domain,
+                SemanticDiagnostic {
+                    range,
+                    source: RUST_SEMANTIC_DIAGNOSTIC_SOURCE,
+                    kind,
+                    message,
+                },
+            )
+        });
+        if emitted {
+            self.diagnostic_count += 1;
+        }
+    }
+
+    fn record_resolved(&mut self, node: Node<'_>, boundary: BoundaryStatus) {
+        let range = node_range(node, self.line_starts);
+        self.report.push_resolved(range, boundary);
+    }
+}
+
+/// The `::`-separated segments of a structured path node, read from the
+/// parser's `path` and `name` fields rather than from the source text.
+fn path_segments(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        match candidate.kind() {
+            "scoped_identifier" | "scoped_type_identifier" => {
+                if let Some(name) = candidate.child_by_field_name("name") {
+                    segments.push(node_text(name, source).trim().to_string());
+                }
+                current = candidate.child_by_field_name("path");
+            }
+            "identifier" | "type_identifier" | "crate" | "self" | "super" => {
+                segments.push(node_text(candidate, source).trim().to_string());
+                current = None;
+            }
+            _ => current = None,
+        }
+    }
+    segments.reverse();
+    segments
+}
+
+/// Whether a path stays inside the crate that spells it.
+fn is_crate_local_root(segments: &[String]) -> bool {
+    segments
+        .first()
+        .is_some_and(|root| matches!(root.as_str(), "crate" | "self" | "super"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -593,17 +893,38 @@ fn seed_pattern_bindings(pattern: Node<'_>, source: &str, scopes: &mut RustScope
     }
 }
 
-fn is_subtree_suppressed(node: Node<'_>, source: &str) -> bool {
-    matches!(
-        node.kind(),
-        "macro_invocation"
-            | "macro_definition"
-            | "attribute_item"
-            | "line_comment"
-            | "block_comment"
-    ) || is_inside_attribute(node)
-        || is_inside_macro_invocation(node)
-        || is_inside_cfg_gated_item(node, source)
+/// Why the scan declines to judge any name inside `node`, if it declines.
+///
+/// Each arm is a real limit on what a surface can prove, not a convenience:
+/// a macro synthesizes names no surface declares, an attribute names a
+/// derive whose expansion is likewise generated, and a `cfg` attribute
+/// selects an item set by a configuration this pass does not evaluate.
+/// Comments contain no references, so they are skipped without an outcome.
+fn subtree_suppression(node: Node<'_>, source: &str) -> Option<RustProofGap> {
+    if matches!(node.kind(), "line_comment" | "block_comment") {
+        return None;
+    }
+    if matches!(node.kind(), "macro_invocation" | "macro_definition") {
+        return Some(RustProofGap::Generated {
+            detail: format!(
+                "names inside the Rust {} are produced by macro expansion, which no surface declares",
+                node.kind().replace('_', " ")
+            ),
+        });
+    }
+    if node.kind() == "attribute_item" {
+        return Some(RustProofGap::Generated {
+            detail: "names inside a Rust attribute name a derive or attribute macro whose expansion no surface declares".to_string(),
+        });
+    }
+    if let Some(condition) = enclosing_cfg_condition(node, source) {
+        return Some(RustProofGap::Unsupported {
+            detail: format!(
+                "the item is gated by `{condition}`, and this pass does not evaluate Cargo configuration"
+            ),
+        });
+    }
+    None
 }
 
 fn is_type_reference_identifier(node: Node<'_>) -> bool {
@@ -703,17 +1024,15 @@ fn is_inside_use(node: Node<'_>) -> bool {
     has_ancestor(node, |ancestor| ancestor.kind() == "use_declaration")
 }
 
-fn is_inside_attribute(node: Node<'_>) -> bool {
-    has_ancestor(node, |ancestor| ancestor.kind() == "attribute_item")
-}
-
 fn is_inside_macro_invocation(node: Node<'_>) -> bool {
     has_ancestor(node, |ancestor| {
         matches!(ancestor.kind(), "macro_invocation" | "macro_definition")
     })
 }
 
-fn is_inside_cfg_gated_item(node: Node<'_>, source: &str) -> bool {
+/// The `cfg` attribute gating `node`, named exactly so a suppression reason can
+/// say which configuration it could not evaluate.
+fn enclosing_cfg_condition(node: Node<'_>, source: &str) -> Option<String> {
     let mut current = Some(node);
     while let Some(candidate) = current {
         let mut sibling = candidate.prev_named_sibling();
@@ -723,13 +1042,13 @@ fn is_inside_cfg_gated_item(node: Node<'_>, source: &str) -> bool {
             }
             let text = node_text(prev, source).trim();
             if text.starts_with("#[cfg") || text.starts_with("#![cfg") {
-                return true;
+                return Some(text.to_string());
             }
             sibling = prev.prev_named_sibling();
         }
         current = candidate.parent();
     }
-    false
+    None
 }
 
 fn has_ancestor(node: Node<'_>, predicate: impl Fn(Node<'_>) -> bool) -> bool {
