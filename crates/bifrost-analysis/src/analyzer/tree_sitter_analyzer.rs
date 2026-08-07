@@ -6727,56 +6727,68 @@ where
         // hydrates the full candidate projection for the keys that matched, so
         // signature text, primary ranges, and `CodeUnit` construction cost
         // proportionally to the answer instead of to the workspace (#1199).
-        let name_rows = self.store_query_or_record(
-            self.store_context
-                .store
-                .search_candidate_name_rows_for_langs(
-                    &langs,
-                    self.store_context.generations.as_ref(),
-                    &active_oids,
-                    literal_substrings.as_deref(),
-                    cancellation,
+        let name_rows = {
+            let _scope = profiling::scope("search_symbols.candidates.load_names");
+            self.store_query_or_record(
+                self.store_context
+                    .store
+                    .search_candidate_name_rows_for_langs(
+                        &langs,
+                        self.store_context.generations.as_ref(),
+                        &active_oids,
+                        literal_substrings.as_deref(),
+                        cancellation,
+                    ),
+                format!(
+                    "searching symbol candidates for {} patterns",
+                    patterns.patterns().len()
                 ),
-            format!(
-                "searching symbol candidates for {} patterns",
-                patterns.patterns().len()
-            ),
-        )?;
+            )?
+        };
         let resolver =
             QueryResolver::from_snapshot(self.adapter.as_ref(), self.project.root(), live_snapshot);
         let mut complete = name_rows.complete;
         let mut inspected = name_rows.inspected;
-        let matched = resolver.match_candidate_names_cancellable(
-            &langs,
-            &name_rows.rows,
-            |package_name, short_name| {
-                self.fq_name_matches(package_name, short_name, |name| patterns.is_match(name))
-            },
-            cancellation,
-        );
-        complete &= matched.complete;
-        let rows = self.store_query_or_record(
-            self.store_context.store.search_candidate_rows_for_keys(
+        let matched = {
+            let _scope = profiling::scope("search_symbols.candidates.match_names");
+            resolver.match_candidate_names_cancellable(
                 &langs,
-                self.store_context.generations.as_ref(),
-                &matched.rows,
+                &name_rows.rows,
+                |package_name, short_name| {
+                    self.fq_name_matches(package_name, short_name, |name| patterns.is_match(name))
+                },
                 cancellation,
-            ),
-            format!("hydrating {} matched symbol candidates", matched.rows.len()),
-        )?;
+            )
+        };
+        complete &= matched.complete;
+        let rows = {
+            let _scope = profiling::scope("search_symbols.candidates.hydrate_rows");
+            self.store_query_or_record(
+                self.store_context.store.search_candidate_rows_for_keys(
+                    &langs,
+                    self.store_context.generations.as_ref(),
+                    &matched.rows,
+                    cancellation,
+                ),
+                format!("hydrating {} matched symbol candidates", matched.rows.len()),
+            )?
+        };
         complete &= rows.complete;
         self.search_candidate_hydration_count
             .fetch_add(rows.rows.len(), Ordering::Relaxed);
-        let resolved = resolver.resolve_rows_with_payload_cancellable(
-            rows.rows.into_iter().map(|row| {
-                let is_type_alias = row.candidate.flags.is_type_alias;
-                (
-                    row.candidate,
-                    (row.primary_range, row.in_test_region, is_type_alias),
-                )
-            }),
-            cancellation,
-        );
+        let resolved = {
+            let _scope = profiling::scope("search_symbols.candidates.resolve_rows");
+            resolver.resolve_rows_with_payload_cancellable(
+                rows.rows.into_iter().map(|row| {
+                    let is_type_alias = row.candidate.flags.is_type_alias;
+                    (
+                        row.candidate,
+                        (row.primary_range, row.in_test_region, is_type_alias),
+                    )
+                }),
+                cancellation,
+            )
+        };
         inspected = inspected.saturating_add(resolved.inspected);
         complete &= resolved.complete;
         let mut candidates = BTreeMap::new();

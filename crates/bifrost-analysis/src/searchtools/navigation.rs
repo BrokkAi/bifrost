@@ -473,47 +473,61 @@ pub fn search_symbols_with_cancellation(
                 complete = false;
                 break;
             }
-            let render_context = load_declaration_name_context(analyzer, &file);
+            let render_context = {
+                let _scope =
+                    profiling::scope("searchtools::search_symbols.render.load_declaration_context");
+                load_declaration_name_context(analyzer, &file)
+            };
             let render_context = render_context.as_ref();
+            let (classes, functions, fields, modules, macros) = {
+                let _scope = profiling::scope("searchtools::search_symbols.render.collect_hits");
+                (
+                    collect_ranked_kind_names(
+                        analyzer,
+                        &code_units,
+                        CodeUnitType::Class,
+                        render_context,
+                        semantic_model_overlay.as_deref(),
+                    ),
+                    collect_callable_kind_names(
+                        analyzer,
+                        &code_units,
+                        render_context,
+                        semantic_model_overlay.as_deref(),
+                    ),
+                    collect_ranked_kind_names(
+                        analyzer,
+                        &code_units,
+                        CodeUnitType::Field,
+                        render_context,
+                        semantic_model_overlay.as_deref(),
+                    ),
+                    collect_ranked_kind_names(
+                        analyzer,
+                        &code_units,
+                        CodeUnitType::Module,
+                        render_context,
+                        semantic_model_overlay.as_deref(),
+                    ),
+                    collect_ranked_kind_names(
+                        analyzer,
+                        &code_units,
+                        CodeUnitType::Macro,
+                        render_context,
+                        semantic_model_overlay.as_deref(),
+                    ),
+                )
+            };
             files.push(SearchSymbolsFile {
                 path: rel_path_string(&file),
                 loc: render_context
                     .map(|context| line_count(context.content()))
                     .unwrap_or(0),
-                classes: collect_ranked_kind_names(
-                    analyzer,
-                    &code_units,
-                    CodeUnitType::Class,
-                    render_context,
-                    semantic_model_overlay.as_deref(),
-                ),
-                functions: collect_callable_kind_names(
-                    analyzer,
-                    &code_units,
-                    render_context,
-                    semantic_model_overlay.as_deref(),
-                ),
-                fields: collect_ranked_kind_names(
-                    analyzer,
-                    &code_units,
-                    CodeUnitType::Field,
-                    render_context,
-                    semantic_model_overlay.as_deref(),
-                ),
-                modules: collect_ranked_kind_names(
-                    analyzer,
-                    &code_units,
-                    CodeUnitType::Module,
-                    render_context,
-                    semantic_model_overlay.as_deref(),
-                ),
-                macros: collect_ranked_kind_names(
-                    analyzer,
-                    &code_units,
-                    CodeUnitType::Macro,
-                    render_context,
-                    semantic_model_overlay.as_deref(),
-                ),
+                classes,
+                functions,
+                fields,
+                modules,
+                macros,
             });
         }
         files
@@ -2509,13 +2523,24 @@ pub(super) fn collect_ranked_names_by(
                     .then(|| matched.records[0].provenance.clone())
             });
             let is_type_alias = candidate.is_type_alias;
-            display_signatures(analyzer, &candidate.code_unit)
+            let signatures = {
+                let _scope = profiling::scope(
+                    "searchtools::search_symbols.render.collect_hits.display_signatures",
+                );
+                display_signatures(analyzer, &candidate.code_unit)
+            };
+            let line = {
+                let _scope = profiling::scope(
+                    "searchtools::search_symbols.render.collect_hits.declaration_name_range",
+                );
+                search_symbol_display_range(candidate, render_context).start_line
+            };
+            signatures
                 .into_iter()
                 .map(move |signature| SearchSymbolHit {
                     symbol: display_symbol_for_target(&candidate.code_unit),
                     signature,
-                    line: search_symbol_display_range(analyzer, candidate, render_context)
-                        .start_line,
+                    line,
                     is_type_alias,
                     semantic_model: semantic_model.clone(),
                 })
@@ -2542,12 +2567,12 @@ pub(super) fn load_declaration_name_context(
 }
 
 pub(super) fn search_symbol_display_range(
-    analyzer: &dyn IAnalyzer,
     candidate: &RankedSearchCandidate,
     render_context: Option<&DeclarationNameRangeContext>,
 ) -> Range {
-    let name_range =
-        render_context.and_then(|context| context.name_range(analyzer, &candidate.code_unit));
+    let name_range = render_context.and_then(|context| {
+        context.name_range_for_declaration(&candidate.code_unit, candidate.primary_range)
+    });
     if let Some(mut name_range) = name_range {
         name_range.start_line += 1;
         name_range.end_line += 1;
