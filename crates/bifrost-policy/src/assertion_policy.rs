@@ -336,6 +336,14 @@ pub fn validate_relational_assertion_plan(
                         | DetailedCodeQueryDomain::StructuralMatch,
                         crate::definition::RowExpansionStep::DispatchTargets,
                     ) => DetailedCodeQueryDomain::DispatchTarget,
+                    (
+                        DetailedCodeQueryDomain::Declaration,
+                        crate::definition::RowExpansionStep::MemberFamily,
+                    ) => DetailedCodeQueryDomain::MemberFamily,
+                    (
+                        DetailedCodeQueryDomain::Declaration,
+                        crate::definition::RowExpansionStep::FamilyEdges,
+                    ) => DetailedCodeQueryDomain::MemberFamilyEdge,
                     _ => {
                         return Err(RelationalAssertionPlanError::ExpansionDomainUnavailable {
                             binding: binding.name.as_str().to_string(),

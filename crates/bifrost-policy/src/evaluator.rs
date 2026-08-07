@@ -2218,6 +2218,8 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::CandidateHop
             | QueryValueKind::DispatchOutcome
             | QueryValueKind::DispatchTarget
+            | QueryValueKind::MemberFamily
+            | QueryValueKind::MemberFamilyEdge
             | QueryValueKind::Procedure
             | QueryValueKind::ProgramPoint
             | QueryValueKind::ControlEdge
@@ -2757,7 +2759,9 @@ fn terminal_presentation(
         // hierarchy hop it is an analysis projection, not a position a finding
         // is anchored at; the call site the rows join to is.
         | CodeQueryResultValue::DispatchOutcome { .. }
-        | CodeQueryResultValue::DispatchTarget { .. } => return Err(()),
+        | CodeQueryResultValue::DispatchTarget { .. }
+        | CodeQueryResultValue::MemberFamily { .. }
+        | CodeQueryResultValue::MemberFamilyEdge { .. } => return Err(()),
         CodeQueryResultValue::Occurrence { value } => (
             DetailedCodeQueryDomain::Occurrence,
             value.path.as_str(),
@@ -3412,6 +3416,8 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::CandidateHop { .. } => "candidate_hop",
         CodeQueryResultRef::DispatchOutcome { .. } => "dispatch_outcome",
         CodeQueryResultRef::DispatchTarget { .. } => "dispatch_target",
+        CodeQueryResultRef::MemberFamily { .. } => "member_family",
+        CodeQueryResultRef::MemberFamilyEdge { .. } => "member_family_edge",
         CodeQueryResultRef::ReceiverEvidence { .. } => "receiver_evidence",
         CodeQueryResultRef::CallShape { .. } => "call_shape",
         CodeQueryResultRef::CallArgumentGroup { .. } => "call_argument_group",
@@ -3455,6 +3461,8 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::CandidateHop { path, .. }
         | CodeQueryResultRef::DispatchOutcome { path, .. }
         | CodeQueryResultRef::DispatchTarget { path, .. }
+        | CodeQueryResultRef::MemberFamily { path, .. }
+        | CodeQueryResultRef::MemberFamilyEdge { path, .. }
         | CodeQueryResultRef::Occurrence { path, .. }
         | CodeQueryResultRef::LexicalScope { path, .. }
         | CodeQueryResultRef::Binding { path, .. }
@@ -3520,7 +3528,9 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::MemberSelection
         | DetailedCodeQueryDomain::CandidateHop
         | DetailedCodeQueryDomain::DispatchOutcome
-        | DetailedCodeQueryDomain::DispatchTarget => None,
+        | DetailedCodeQueryDomain::DispatchTarget
+        | DetailedCodeQueryDomain::MemberFamily
+        | DetailedCodeQueryDomain::MemberFamilyEdge => None,
     }
 }
 
@@ -3722,6 +3732,19 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, site_id.as_bytes());
             update_hash(&mut hasher, &ordinal.to_le_bytes());
         }
+        DetailedCodeQueryKey::MemberFamily { id, member_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, member_id.as_bytes());
+        }
+        DetailedCodeQueryKey::MemberFamilyEdge {
+            id,
+            member_id,
+            ordinal,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, member_id.as_bytes());
+            update_hash(&mut hasher, &ordinal.to_le_bytes());
+        }
     }
     let digest: [u8; 32] = hasher.finalize().into();
     let mut encoded = String::with_capacity(64);
@@ -3777,6 +3800,8 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::CandidateHop => "candidate_hop",
         DetailedCodeQueryDomain::DispatchOutcome => "dispatch_outcome",
         DetailedCodeQueryDomain::DispatchTarget => "dispatch_target",
+        DetailedCodeQueryDomain::MemberFamily => "member_family",
+        DetailedCodeQueryDomain::MemberFamilyEdge => "member_family_edge",
         DetailedCodeQueryDomain::Occurrence => "occurrence",
         DetailedCodeQueryDomain::ReferenceEdge => "reference_edge",
         DetailedCodeQueryDomain::LexicalScope => "lexical_scope",

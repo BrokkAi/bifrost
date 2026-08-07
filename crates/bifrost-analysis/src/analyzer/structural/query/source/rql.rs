@@ -657,7 +657,9 @@ fn validate_wrapper(
         | RqlForm::MemberSelection
         | RqlForm::CandidateHierarchy
         | RqlForm::DispatchOutcome
-        | RqlForm::DispatchTargets => {
+        | RqlForm::DispatchTargets
+        | RqlForm::MemberFamily
+        | RqlForm::FamilyEdges => {
             if args.len() != 1 {
                 analysis.error(
                     query.range.clone(),

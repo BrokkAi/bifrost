@@ -1024,6 +1024,8 @@ mod tests {
                 "member_selection",
                 "dispatch_outcome",
                 "dispatch_targets",
+                "member_family",
+                "family_edges",
                 "occurrence_target",
                 "scope_of",
                 "scope_ancestors",

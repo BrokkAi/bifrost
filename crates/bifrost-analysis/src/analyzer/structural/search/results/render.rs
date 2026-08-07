@@ -28,6 +28,8 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::MemberSelection { .. }
                 | CodeQueryResultValue::DispatchOutcome { .. }
                 | CodeQueryResultValue::DispatchTarget { .. }
+                | CodeQueryResultValue::MemberFamily { .. }
+                | CodeQueryResultValue::MemberFamilyEdge { .. }
                 | CodeQueryResultValue::Occurrence { .. }
                 | CodeQueryResultValue::LexicalScope { .. }
                 | CodeQueryResultValue::Binding { .. }
@@ -301,6 +303,47 @@ impl CodeQueryResult {
                                 .as_ref()
                                 .map_or(value.target_path.as_str(), |unit| unit.fq_name.as_str()),
                             value.site_id
+                        ));
+                    }
+                    CodeQueryResultValue::MemberFamily { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [member family; {}; {}] {}overrides={}; implements={}; overridden_by={}; implemented_by={}{}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.outcome,
+                            value.coverage,
+                            value
+                                .reason
+                                .map(|reason| format!("{reason}; "))
+                                .unwrap_or_default(),
+                            value.overrides_count,
+                            value.implements_count,
+                            value.overridden_by_count,
+                            value.implemented_by_count,
+                            value
+                                .family_id
+                                .as_deref()
+                                .map(|id| format!("; family={id}"))
+                                .unwrap_or_default(),
+                        ));
+                    }
+                    CodeQueryResultValue::MemberFamilyEdge { value } => {
+                        out.push_str(&format!(
+                            "[family edge {}; {}; {}; {}] {} -> {}; depth={}\n",
+                            value.ordinal,
+                            value.relation,
+                            value.proof,
+                            value.coverage,
+                            value
+                                .source
+                                .as_ref()
+                                .map_or(value.path.as_str(), |unit| unit.fq_name.as_str()),
+                            value
+                                .target
+                                .as_ref()
+                                .map_or(value.target_id.as_str(), |unit| unit.fq_name.as_str()),
+                            value.hierarchy_depth,
                         ));
                     }
                     CodeQueryResultValue::CallShape { value } => {

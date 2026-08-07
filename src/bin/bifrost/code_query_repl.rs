@@ -1327,6 +1327,50 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.coverage,
                     ));
                 }
+                CodeQueryResultValue::MemberFamily { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {}{}; {}; coverage {}; overrides {}; implements {}; overridden_by {}; implemented_by {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "member family:", use_color),
+                        value.outcome,
+                        value
+                            .reason
+                            .map(|reason| format!(" ({reason})"))
+                            .unwrap_or_default(),
+                        value.capability,
+                        value.coverage,
+                        value.overrides_count,
+                        value.implements_count,
+                        value.overridden_by_count,
+                        value.implemented_by_count,
+                    ));
+                }
+                CodeQueryResultValue::MemberFamilyEdge { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let source = value.source.as_ref().map_or_else(
+                        || sanitize_terminal_text(&value.member_id),
+                        |unit| sanitize_terminal_text(&unit.fq_name),
+                    );
+                    let target = value.target.as_ref().map_or_else(
+                        || sanitize_terminal_text(&value.target_id),
+                        |unit| sanitize_terminal_text(&unit.fq_name),
+                    );
+                    out.push_str(&format!(
+                        "{}\n  {} #{} {} {} {} (depth {}; {}; coverage {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        paint(Style::new().fg(Color::Blue), "family edge:", use_color),
+                        value.ordinal,
+                        source,
+                        value.relation,
+                        target,
+                        value.hierarchy_depth,
+                        value.proof,
+                        value.coverage,
+                    ));
+                }
                 CodeQueryResultValue::ReceiverOutcome { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let site_id = sanitize_terminal_text(&value.site_id);

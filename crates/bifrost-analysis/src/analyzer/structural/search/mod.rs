@@ -91,6 +91,7 @@ mod execution;
 pub(crate) mod expansions;
 mod imports;
 mod materialization;
+mod member_family;
 mod occurrences;
 use edges::{EdgeKey, EdgeTraversalCache, EdgeValue};
 mod paths;
@@ -103,6 +104,7 @@ use environment::{
     BindingKey, BindingValue, CandidateHopKey, CandidateHopValue, CandidateKey, CandidateValue,
     EnvironmentTraversalCache, ScopeKey, ScopeValue,
 };
+use member_family::{MemberFamilyEdgeValue, MemberFamilyValue};
 use occurrences::{OccurrenceKey, OccurrenceTraversalCache, OccurrenceValue};
 use paths::{
     PATH_QUERY_AXES, PathKey, PathTraversalCache, PathValue, RESOLVED_PATH_QUERY_AXES, SegmentKey,
@@ -207,6 +209,8 @@ pub use results::CodeQueryGenerationSite;
 pub use results::CodeQueryImportBinder;
 pub use results::CodeQueryLexicalScope;
 pub use results::CodeQueryMatch;
+pub use results::CodeQueryMemberFamily;
+pub use results::CodeQueryMemberFamilyEdge;
 pub use results::CodeQueryMemberSelection;
 pub use results::CodeQueryOccurrence;
 pub use results::CodeQueryOccurrenceTarget;
@@ -552,6 +556,8 @@ enum PipelineValue {
     MemberSelection(MemberSelectionValue),
     DispatchOutcome(Box<DispatchSiteValue>),
     DispatchTarget(Box<DispatchTargetValue>),
+    MemberFamily(Box<MemberFamilyValue>),
+    MemberFamilyEdge(Box<MemberFamilyEdgeValue>),
     Occurrence(OccurrenceValue),
     LexicalScope(ScopeValue),
     Binding(BindingValue),
@@ -626,6 +632,8 @@ enum PipelineKey {
     MemberSelection(String),
     DispatchOutcome(String),
     DispatchTarget(String),
+    MemberFamily(String),
+    MemberFamilyEdge(String),
     Occurrence(OccurrenceKey),
     LexicalScope(ScopeKey),
     Binding(BindingKey),
@@ -682,6 +690,8 @@ impl PipelineValue {
             Self::MemberSelection(value) => PipelineKey::MemberSelection(value.occurrence.ast_id()),
             Self::DispatchOutcome(value) => PipelineKey::DispatchOutcome(value.site_id.clone()),
             Self::DispatchTarget(value) => PipelineKey::DispatchTarget(value.id()),
+            Self::MemberFamily(value) => PipelineKey::MemberFamily(value.id()),
+            Self::MemberFamilyEdge(value) => PipelineKey::MemberFamilyEdge(value.id()),
             Self::Occurrence(value) => PipelineKey::Occurrence(value.key()),
             Self::LexicalScope(value) => PipelineKey::LexicalScope(value.key()),
             Self::GenerationSite(value) => PipelineKey::GenerationSite(value.key()),
@@ -914,6 +924,8 @@ enum PipelineTraceValue {
     MemberSelection(MemberSelectionValue),
     DispatchOutcome(Box<DispatchSiteValue>),
     DispatchTarget(Box<DispatchTargetValue>),
+    MemberFamily(Box<MemberFamilyValue>),
+    MemberFamilyEdge(Box<MemberFamilyEdgeValue>),
     Occurrence(OccurrenceValue),
     LexicalScope(ScopeValue),
     Binding(BindingValue),
@@ -3165,6 +3177,35 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             provenance: Vec::new(),
         },
+        PipelineValue::MemberFamily(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::MemberFamily,
+            key: DetailedCodeQueryKey::MemberFamily {
+                id: value.id(),
+                member_id: value.member_id.clone(),
+            },
+            file: value.file().clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.member.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+        },
+        PipelineValue::MemberFamilyEdge(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::MemberFamilyEdge,
+            key: DetailedCodeQueryKey::MemberFamilyEdge {
+                id: value.id(),
+                member_id: value.family.member_id.clone(),
+                ordinal: value.ordinal,
+            },
+            file: value.file().clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.family.member.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+        },
         PipelineValue::CandidateHop(value) => {
             let row = &value.occurrence;
             let byte_span = row.range.start_byte..row.range.end_byte;
@@ -3320,6 +3361,8 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::CandidateHop(value) => Some(value.file()),
         PipelineValue::DispatchOutcome(value) => Some(value.file()),
         PipelineValue::DispatchTarget(value) => Some(value.file()),
+        PipelineValue::MemberFamily(value) => Some(value.file()),
+        PipelineValue::MemberFamilyEdge(value) => Some(value.file()),
         PipelineValue::GenerationSite(value) => Some(value.file()),
         PipelineValue::Export(value) => Some(value.file()),
         PipelineValue::DeclarationState(value) => Some(value.file()),
@@ -3457,6 +3500,12 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::DispatchTarget(value) => {
             files.insert(value.file().clone());
         }
+        PipelineValue::MemberFamily(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::MemberFamilyEdge(value) => {
+            files.insert(value.file().clone());
+        }
         PipelineValue::GenerationSite(value) => {
             files.insert(value.file().clone());
         }
@@ -3526,6 +3575,12 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
             files.insert(value.file().clone());
         }
         PipelineTraceValue::DispatchTarget(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::MemberFamily(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::MemberFamilyEdge(value) => {
             files.insert(value.file().clone());
         }
         PipelineTraceValue::GenerationSite(value) => {
@@ -3888,6 +3943,27 @@ fn detailed_trace_provenance_ref(
             },
             value.file(),
             value.site.range,
+            cache,
+        ),
+        PipelineTraceValue::MemberFamily(value) => detailed_environment_provenance_ref(
+            DetailedCodeQueryDomain::MemberFamily,
+            DetailedCodeQueryKey::MemberFamily {
+                id: value.id(),
+                member_id: value.member_id.clone(),
+            },
+            value.file(),
+            value.member.range,
+            cache,
+        ),
+        PipelineTraceValue::MemberFamilyEdge(value) => detailed_environment_provenance_ref(
+            DetailedCodeQueryDomain::MemberFamilyEdge,
+            DetailedCodeQueryKey::MemberFamilyEdge {
+                id: value.id(),
+                member_id: value.family.member_id.clone(),
+                ordinal: value.ordinal,
+            },
+            value.file(),
+            value.family.member.range,
             cache,
         ),
         PipelineTraceValue::CandidateHop(value) => {
@@ -4414,6 +4490,10 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         }
         PipelineValue::DispatchTarget(value) => {
             Some(PipelineTraceValue::DispatchTarget(value.clone()))
+        }
+        PipelineValue::MemberFamily(value) => Some(PipelineTraceValue::MemberFamily(value.clone())),
+        PipelineValue::MemberFamilyEdge(value) => {
+            Some(PipelineTraceValue::MemberFamilyEdge(value.clone()))
         }
         PipelineValue::GenerationSite(value) => {
             Some(PipelineTraceValue::GenerationSite(value.clone()))

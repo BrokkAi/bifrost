@@ -554,6 +554,8 @@ pub(super) fn selected_site_quality(
             | CodeQueryResultValue::CandidateHop { .. }
             | CodeQueryResultValue::DispatchOutcome { .. }
             | CodeQueryResultValue::DispatchTarget { .. }
+            | CodeQueryResultValue::MemberFamily { .. }
+            | CodeQueryResultValue::MemberFamilyEdge { .. }
             | CodeQueryResultValue::ExpressionSite { .. }
             // An occurrence row is an exact parser fact about one token. Its
             // completeness question is per role and is answered by the query's

@@ -278,6 +278,96 @@ pub struct CodeQueryDispatchTarget {
     pub boundary_kind: Option<&'static str>,
 }
 
+/// The mandatory terminal row for one member's canonical method family
+/// (#1477 M4).
+///
+/// Exactly one row exists per member input. Edge rows may be empty, and this
+/// row is what says why: a `proven` family with no edge overrides and
+/// implements nothing, a `no_family` member is one the language excludes
+/// outright (a constructor, a static method, a private method, or a
+/// declaration that is not a method), while `incomplete` and `unsupported`
+/// are honest failures that carry no family id. `coverage` is `exhaustive`
+/// only for the two complete answers, so an exact-set assertion over an
+/// unproven member turns unreliable rather than clean.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryMemberFamily {
+    pub id: String,
+    /// The member's structured canonical identity digest -- the same recipe
+    /// candidate rows use for `canonical_member_id`, never a rendered FQN.
+    pub member_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member: Option<CodeQueryDeclaration>,
+    /// `proven`, `no_family`, `incomplete`, or `unsupported`.
+    pub outcome: &'static str,
+    /// Why the outcome is not `proven`. A proven family states none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// The measured strength of the analyzer's member-identity evidence for
+    /// this member's language.
+    pub capability: &'static str,
+    /// `exhaustive` or `open`.
+    pub coverage: &'static str,
+    /// The canonical family id: a domain-separated digest over the
+    /// deterministically ordered exact family roots plus language identity.
+    /// Absent whenever the family is not proven.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family_id: Option<String>,
+    pub overrides_count: usize,
+    pub implements_count: usize,
+    pub overridden_by_count: usize,
+    pub implemented_by_count: usize,
+    pub edge_count: usize,
+    /// How many exact roots the family id digested.
+    pub root_count: usize,
+}
+
+/// One typed edge of one member's method family (#1477 M4).
+///
+/// Forward rows (`overrides`, `implements`) are the analyzer's direct proof.
+/// Inverse rows (`overridden_by`, `implemented_by`) are the bounded inversion
+/// of those same forward edges, never an independent resolution, so a pair
+/// round-trips: the same two declarations and the same `family_id` appear from
+/// either end.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryMemberFamilyEdge {
+    pub id: String,
+    /// The source member's canonical identity digest.
+    pub member_id: String,
+    pub path: String,
+    pub range: CodeQueryRange,
+    /// Zero-based position among this member's retained edges: forward edges
+    /// first, then inverse edges, each ordered by target identity.
+    pub ordinal: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<CodeQueryDeclaration>,
+    /// The target member's canonical identity digest.
+    pub target_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<CodeQueryDeclaration>,
+    /// `overrides`, `implements`, `overridden_by`, or `implemented_by`.
+    pub relation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family_id: Option<String>,
+    /// Hierarchy hops between the two owners on the route that found the edge.
+    pub hierarchy_depth: usize,
+    /// `proven` when the ancestor held exactly one member of that name and
+    /// recorded arity, so structure alone singled the target out. `unproven`
+    /// when only the recorded parameter-type spellings separated an overload
+    /// set: a spelling is not a resolved or erased type.
+    pub proof: &'static str,
+    /// `complete`. An edge row is only ever emitted from a fully enumerated
+    /// family, because a truncated walk reports `incomplete` and no edges. The
+    /// axis is published anyway so a policy reads one proof/completeness
+    /// vocabulary across the dispatch and family row families.
+    pub completeness: &'static str,
+    /// The owning member's family coverage, repeated on the edge so an edge
+    /// row alone is enough to reject an exact-set claim.
+    pub coverage: &'static str,
+}
+
 /// One typed receiver value retained for a site. Nested factory returns are
 /// flattened into a parent-linked chain instead of nested presentation data.
 #[derive(Debug, Clone, Serialize)]

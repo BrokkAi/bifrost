@@ -1,5 +1,7 @@
 use super::*;
 
+use brokk_bifrost_core::analyzer::structural::resolution::MethodFamilyRelation;
+
 pub(super) fn insert_pipeline_row(
     rows: &mut Vec<PipelineRow>,
     indexes: &mut HashMap<PipelineKey, usize>,
@@ -109,6 +111,12 @@ pub(super) fn render_pipeline_item(
         },
         PipelineValue::DispatchTarget(value) => CodeQueryResultValue::DispatchTarget {
             value: Box::new(render_dispatch_target(analyzer, &value, detail, cache)),
+        },
+        PipelineValue::MemberFamily(value) => CodeQueryResultValue::MemberFamily {
+            value: Box::new(render_member_family(analyzer, &value, detail, cache)),
+        },
+        PipelineValue::MemberFamilyEdge(value) => CodeQueryResultValue::MemberFamilyEdge {
+            value: Box::new(render_member_family_edge(analyzer, &value, detail, cache)),
         },
         PipelineValue::GenerationSite(value) => CodeQueryResultValue::GenerationSite {
             value: Box::new(render_generation_site(analyzer, &value, cache)),
@@ -235,6 +243,12 @@ pub(super) fn render_provenance(
                     }
                     PipelineTraceValue::DispatchTarget(value) => {
                         render_dispatch_target_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::MemberFamily(value) => {
+                        render_member_family_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::MemberFamilyEdge(value) => {
+                        render_member_family_edge_ref(analyzer, value, cache)
                     }
                     PipelineTraceValue::ReferenceEdge(value) => {
                         render_edge_ref(analyzer, value, cache)
@@ -741,6 +755,108 @@ pub(super) fn render_dispatch_target_ref(
     }
 }
 
+/// The mandatory method-family outcome row of one member.
+pub(super) fn render_member_family(
+    analyzer: &dyn IAnalyzer,
+    value: &MemberFamilyValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryMemberFamily {
+    let answer = &value.answer;
+    let count = |relation: MethodFamilyRelation| {
+        value
+            .edges
+            .iter()
+            .filter(|edge| edge.relation == relation)
+            .count()
+    };
+    let file = value.file();
+    CodeQueryMemberFamily {
+        id: value.id(),
+        member_id: value.member_id.clone(),
+        path: rel_path_string(file),
+        language: crate::analyzer::common::language_for_file(file).config_label(),
+        range: render_source_range(analyzer, file, &value.member.range, cache),
+        member: render_unit_declaration(analyzer, &value.member.unit, detail, cache),
+        outcome: answer.outcome.label(),
+        reason: answer.reason.map(|reason| reason.label()),
+        capability: answer.capability.label(),
+        coverage: member_family::family_coverage(answer.outcome),
+        family_id: value.family_id.clone(),
+        overrides_count: count(MethodFamilyRelation::Overrides),
+        implements_count: count(MethodFamilyRelation::Implements),
+        overridden_by_count: count(MethodFamilyRelation::OverriddenBy),
+        implemented_by_count: count(MethodFamilyRelation::ImplementedBy),
+        edge_count: value.edges.len(),
+        root_count: answer.roots.len(),
+    }
+}
+
+/// One typed method-family edge.
+///
+/// Source and target are rendered through the same `render_unit_declaration`
+/// the candidate, hop, and dispatch-target rows use, so the same declaration
+/// renders identically wherever it appears.
+pub(super) fn render_member_family_edge(
+    analyzer: &dyn IAnalyzer,
+    value: &MemberFamilyEdgeValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryMemberFamilyEdge {
+    let family = &value.family;
+    let edge = value.edge();
+    let file = family.file();
+    CodeQueryMemberFamilyEdge {
+        id: value.id(),
+        member_id: family.member_id.clone(),
+        path: rel_path_string(file),
+        range: render_source_range(analyzer, file, &family.member.range, cache),
+        ordinal: value.ordinal,
+        source: render_unit_declaration(analyzer, &family.member.unit, detail, cache),
+        target_id: edge.target_id.clone(),
+        target: render_unit_declaration(analyzer, &edge.target, detail, cache),
+        relation: edge.relation.label(),
+        family_id: family.family_id.clone(),
+        hierarchy_depth: edge.depth,
+        proof: edge.proof,
+        completeness: "complete",
+        coverage: member_family::family_coverage(family.answer.outcome),
+    }
+}
+
+pub(super) fn render_member_family_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &MemberFamilyValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let file = value.file();
+    CodeQueryResultRef::MemberFamily {
+        id: value.id(),
+        member_id: value.member_id.clone(),
+        path: rel_path_string(file),
+        range: render_source_range(analyzer, file, &value.member.range, cache),
+        outcome: value.answer.outcome.label(),
+        coverage: member_family::family_coverage(value.answer.outcome),
+    }
+}
+
+pub(super) fn render_member_family_edge_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &MemberFamilyEdgeValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let family = &value.family;
+    let file = family.file();
+    CodeQueryResultRef::MemberFamilyEdge {
+        id: value.id(),
+        member_id: family.member_id.clone(),
+        path: rel_path_string(file),
+        range: render_source_range(analyzer, file, &family.member.range, cache),
+        ordinal: value.ordinal,
+        relation: value.edge().relation.label(),
+    }
+}
+
 /// One exact hierarchy hop of one traced member candidate.
 ///
 /// The endpoints are rendered through the same `render_unit_declaration` the
@@ -800,7 +916,7 @@ fn render_unit_declaration(
 /// FQN or signature string, so same-spelling decoys with different segment
 /// kinds hash apart and aliases/partial types canonicalized by the analyzer
 /// hash together.
-fn canonical_member_digest(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> String {
+pub(super) fn canonical_member_digest(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> String {
     let identity = crate::analyzer::structural::canonical_identity_of(analyzer, unit);
     let mut hasher = Sha256::new();
     hasher.update(b"bifrost.canonical_member_id.v1");

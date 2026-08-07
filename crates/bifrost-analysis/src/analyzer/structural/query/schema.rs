@@ -407,7 +407,7 @@ query_step_ops! {
     ValueFlow { label: "value_flow", signature: "procedure -> flow_endpoint", description: "Run one registered diagnostic-neutral value-flow plan for the exact procedure root.", semantic: [Procedures, ValueFlow] }
     Taint { label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint] }
     Witness { label: "witness", signature: "typestate_finding|flow_endpoint -> typestate_witness|flow_witness", description: "Project bounded retained evidence from each typestate finding or reached flow endpoint without rerunning analysis." }
-    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis|call_shape|call_argument_group|call_argument|dispatch_outcome|dispatch_target -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, receiver analyses, or dispatch rows to their workspace files." }
+    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis|call_shape|call_argument_group|call_argument|dispatch_outcome|dispatch_target|member_family|member_family_edge -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, receiver analyses, dispatch rows, or method-family rows to their workspace files." }
     ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
     Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
@@ -433,6 +433,8 @@ query_step_ops! {
     MemberSelection { label: "member_selection", signature: "occurrence -> member_selection", description: "Project the mandatory member-selection summary row for each reference occurrence, from the production resolver's own candidate trace." }
     DispatchOutcome { label: "dispatch_outcome", signature: "structural_match|call_site|reference_site|occurrence -> dispatch_outcome", description: "Project the mandatory bounded-dispatch outcome row for each input site: the semantic outcome, the candidate coverage, and the retained target count. Exactly one row per input site, so an unknown, unsupported, over-budget, or cancelled dispatch is stated rather than silently empty.", semantic: [Procedures, Dispatch] }
     DispatchTargets { label: "dispatch_targets", signature: "structural_match|call_site|reference_site|occurrence -> dispatch_target", description: "Project zero or more bounded dispatch target rows for each input site, one per retained dispatch candidate plus one per boundary arm that names a target. Each row keeps the oracle's own proof, completeness, and candidate coverage, so a proven target in an exhaustive set stays distinguishable from an open may-dispatch arm.", semantic: [Procedures, Dispatch] }
+    MemberFamily { label: "member_family", signature: "declaration -> member_family", description: "Project the mandatory canonical method-family outcome row for each member declaration: the family id when the analyzer proves the family, the typed reason when it cannot, the per-relation edge counts, and the coverage. Exactly one row per input declaration, so an unsupported language or an unprovable overload identity is stated rather than silently empty." }
+    FamilyEdges { label: "family_edges", signature: "declaration -> member_family_edge", description: "Project the typed method-family edges of each member declaration: the forward overrides/implements edges the analyzer proves, plus the bounded inversion of those same edges as overridden_by/implemented_by. Emitted only from a proven family, so an unproven or unsupported member yields no edge row and its outcome row says why." }
     OccurrencesOf { label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it." }
     OccurrencesIn { label: "occurrences_in", signature: "structural_match|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or file." }
     OccurrenceTarget { label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences." }
@@ -600,6 +602,8 @@ macro_rules! rql_forms {
                     | Self::MemberSelection
                     | Self::DispatchOutcome
                     | Self::DispatchTargets
+                    | Self::MemberFamily
+                    | Self::FamilyEdges
                     | Self::Occurrences
                     | Self::OccurrencesOf
                     | Self::OccurrencesIn
@@ -1028,6 +1032,22 @@ rql_forms! {
         signature: "(dispatch-targets query)",
         description: (QueryStepOp::DispatchTargets),
         step: DispatchTargets,
+    }
+    MemberFamily {
+        labels: ["member-family", "member_family"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(member-family query)",
+        description: (QueryStepOp::MemberFamily),
+        step: MemberFamily,
+    }
+    FamilyEdges {
+        labels: ["family-edges", "family_edges"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(family-edges query)",
+        description: (QueryStepOp::FamilyEdges),
+        step: FamilyEdges,
     }
     Occurrences {
         labels: ["occurrences", "occurrence"],

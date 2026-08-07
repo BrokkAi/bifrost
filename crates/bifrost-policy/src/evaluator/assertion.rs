@@ -831,6 +831,19 @@ fn evaluate_relational_assertion_policy(
                         binding_queries.push(query);
                         continue;
                     }
+                    RowExpansionStep::MemberFamily | RowExpansionStep::FamilyEdges => {
+                        // Both family steps consume the member declaration rows
+                        // the source binding already produced, so the expansion
+                        // is one appended step rather than a second query.
+                        let mut query = binding_queries[source_index].clone();
+                        query.plan.steps.push(match step {
+                            RowExpansionStep::MemberFamily => QueryStep::MemberFamily,
+                            _ => QueryStep::FamilyEdges,
+                        });
+                        binding_index_by_name.insert(&binding.name, index);
+                        binding_queries.push(query);
+                        continue;
+                    }
                     RowExpansionStep::CandidateHierarchy => {
                         // The hierarchy-hop projection consumes the same
                         // occurrence rows the candidate trace consumes, for

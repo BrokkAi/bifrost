@@ -355,6 +355,14 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryDispatchTarget>,
     },
+    MemberFamily {
+        #[serde(flatten)]
+        value: Box<CodeQueryMemberFamily>,
+    },
+    MemberFamilyEdge {
+        #[serde(flatten)]
+        value: Box<CodeQueryMemberFamilyEdge>,
+    },
     Occurrence {
         #[serde(flatten)]
         value: Box<CodeQueryOccurrence>,

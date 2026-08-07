@@ -1352,6 +1352,8 @@ fn run_rql_query_result(
                     CodeQueryResultValue::ReceiverAnalysis { value } => &value.path,
                     CodeQueryResultValue::ReceiverOutcome { value } => &value.path,
                     CodeQueryResultValue::MemberSelection { value } => &value.path,
+                    CodeQueryResultValue::MemberFamily { value } => &value.path,
+                    CodeQueryResultValue::MemberFamilyEdge { value } => &value.path,
                     CodeQueryResultValue::ReceiverEvidence { value } => &value.path,
                     CodeQueryResultValue::CallShape { value } => &value.path,
                     CodeQueryResultValue::CallArgumentGroup { value } => &value.path,

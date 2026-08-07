@@ -168,6 +168,22 @@ pub enum CodeQueryResultRef {
         ordinal: usize,
         dispatch: &'static str,
     },
+    MemberFamily {
+        id: String,
+        member_id: String,
+        path: String,
+        range: CodeQueryRange,
+        outcome: &'static str,
+        coverage: &'static str,
+    },
+    MemberFamilyEdge {
+        id: String,
+        member_id: String,
+        path: String,
+        range: CodeQueryRange,
+        ordinal: usize,
+        relation: &'static str,
+    },
     CallShape {
         id: String,
         site_id: String,

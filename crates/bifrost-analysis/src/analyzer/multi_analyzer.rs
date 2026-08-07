@@ -589,6 +589,40 @@ impl TypeHierarchyProvider for MultiAnalyzer {
     }
 }
 
+/// Method families across the whole workspace (#1477 M4).
+///
+/// The delegation mirrors `TypeHierarchyProvider`'s, and for the same reason:
+/// a Kotlin class can override a Java method, so the ancestor and descendant
+/// edges a family walk needs are exactly the realm-aware ones only the
+/// multi-analyzer resolves. The per-language relation therefore receives
+/// `self` as its hierarchy source rather than the owning delegate.
+///
+/// Language support is stated per member, never defaulted: a member whose
+/// language has no landed family answers `unsupported`, even though this
+/// composite exposes a provider for the workspace as a whole.
+impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
+    fn member_family_capability(
+        &self,
+        member: &CodeUnit,
+    ) -> crate::analyzer::structural::resolution::MemberFamilyCapability {
+        crate::analyzer::usages::java_member_family_capability(self, member)
+    }
+
+    fn forward_member_family(
+        &self,
+        member: &CodeUnit,
+    ) -> crate::analyzer::usages::MemberFamilyAnswer {
+        crate::analyzer::usages::java_forward_member_family(self, self, member)
+    }
+
+    fn inverse_member_family(
+        &self,
+        member: &CodeUnit,
+    ) -> crate::analyzer::usages::MemberFamilyAnswer {
+        crate::analyzer::usages::java_inverse_member_family(self, self, member)
+    }
+}
+
 impl TypeAliasProvider for MultiAnalyzer {
     fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
         self.delegate_for_code_unit(code_unit)
@@ -1305,6 +1339,13 @@ impl IAnalyzer for MultiAnalyzer {
             .values()
             .any(|delegate| delegate.type_alias_provider().is_some())
             .then_some(self as &dyn TypeAliasProvider)
+    }
+
+    fn member_family_provider(&self) -> Option<&dyn crate::analyzer::usages::MemberFamilyProvider> {
+        self.delegates
+            .values()
+            .any(|delegate| delegate.analyzer().member_family_provider().is_some())
+            .then_some(self as &dyn crate::analyzer::usages::MemberFamilyProvider)
     }
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {

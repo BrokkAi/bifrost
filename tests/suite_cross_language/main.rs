@@ -23,6 +23,7 @@ mod code_query_materialization;
 mod code_query_member_dispatch;
 mod code_query_member_dispatch_rust;
 mod code_query_member_dispatch_ts_python;
+mod code_query_member_family;
 mod code_query_occurrences;
 mod code_query_pipelines;
 mod code_query_public_api;

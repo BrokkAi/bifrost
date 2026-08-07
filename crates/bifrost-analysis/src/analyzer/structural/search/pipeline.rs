@@ -90,6 +90,8 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::CandidateHop(_)
                     | PipelineValue::DispatchOutcome(_)
                     | PipelineValue::DispatchTarget(_)
+                    | PipelineValue::MemberFamily(_)
+                    | PipelineValue::MemberFamilyEdge(_)
                     | PipelineValue::GenerationSite(_)
                     | PipelineValue::Export(_)
                     | PipelineValue::DeclarationState(_)
@@ -152,6 +154,8 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::CandidateHop(_)
                                 | PipelineValue::DispatchOutcome(_)
                                 | PipelineValue::DispatchTarget(_)
+                                | PipelineValue::MemberFamily(_)
+                                | PipelineValue::MemberFamilyEdge(_)
                                 | PipelineValue::GenerationSite(_)
                                 | PipelineValue::Export(_)
                                 | PipelineValue::DeclarationState(_)
@@ -222,6 +226,8 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::CandidateHop(_)
                         | PipelineValue::DispatchOutcome(_)
                         | PipelineValue::DispatchTarget(_)
+                        | PipelineValue::MemberFamily(_)
+                        | PipelineValue::MemberFamilyEdge(_)
                         | PipelineValue::GenerationSite(_)
                         | PipelineValue::Export(_)
                         | PipelineValue::DeclarationState(_)
@@ -1252,6 +1258,16 @@ pub(super) fn apply_pipeline_step(
                     value.file().clone(),
                 ))]
             }
+            (PipelineValue::MemberFamily(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
+            (PipelineValue::MemberFamilyEdge(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
             (PipelineValue::ReceiverOutcome(value), QueryStep::FileOf) => {
                 vec![pipeline_expansion(PipelineValue::File(
                     value.report.site.file.clone(),
@@ -1954,6 +1970,14 @@ pub(super) fn apply_pipeline_step(
                     &mut row_exhausted,
                 )
             }
+            (
+                PipelineValue::Declaration(declaration),
+                QueryStep::MemberFamily | QueryStep::FamilyEdges,
+            ) => member_family::member_family_expansions_for_declaration(
+                analyzer,
+                declaration,
+                matches!(step, QueryStep::FamilyEdges),
+            ),
             (PipelineValue::Occurrence(value), QueryStep::MemberSelection) => {
                 member_selection_expansions(
                     analyzer,

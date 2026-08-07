@@ -27,6 +27,7 @@ pub(crate) mod inverted_edges;
 pub(crate) mod java_graph;
 pub(crate) mod js_ts_graph;
 pub(crate) mod kotlin_graph;
+pub mod member_family;
 pub(crate) mod parsed_tree;
 pub(crate) mod php_graph;
 pub(crate) mod python_graph;
@@ -73,6 +74,10 @@ pub use js_ts_graph::JsTsExportUsageGraphStrategy;
 pub use kotlin_graph::KotlinUsageGraphStrategy;
 pub use local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
+};
+pub use member_family::{
+    MemberFamilyAnswer, MemberFamilyEdge, MemberFamilyProvider, java_forward_member_family,
+    java_inverse_member_family, java_member_family_capability, member_family_id,
 };
 pub use model::{
     CONFIDENCE_THRESHOLD, ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding,

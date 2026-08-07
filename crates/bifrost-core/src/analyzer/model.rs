@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
-use crate::analyzer::structural::resolution::BoundaryStatus;
+use crate::analyzer::structural::resolution::{BoundaryStatus, DeclaredVisibility};
 use crate::hash::{HashMap, HashSet};
 use crate::path_normalization::NormalizePath;
 
@@ -463,6 +463,40 @@ pub struct SignatureMetadata {
     /// usage-edge builder asks once per callee owner.
     #[serde(default)]
     companion_object: bool,
+    /// Whether this callable declares the `static` modifier, read from the
+    /// declaration's modifier nodes rather than from its rendered header.
+    ///
+    /// A language that does not publish the fact leaves it `false`, which is
+    /// why [`Self::callable_modifiers_recorded`] exists: a consumer that must
+    /// distinguish "not static" from "nobody looked" reads that flag first.
+    #[serde(default)]
+    callable_is_static: bool,
+    /// Whether this callable is a constructor rather than a method.
+    #[serde(default)]
+    callable_is_constructor: bool,
+    /// The visibility the callable declares. `Unknown` when the adapter did
+    /// not read modifiers at all.
+    #[serde(default)]
+    callable_declared_visibility: Option<DeclaredVisibility>,
+    /// Whether the adapter that produced this metadata actually inspected the
+    /// callable's modifier nodes. Absent modifiers and unread modifiers are
+    /// different answers, and an override rule must not confuse them.
+    #[serde(default)]
+    callable_modifiers_recorded: bool,
+    /// The declared parameter types of this callable, in order, exactly as the
+    /// declaration's parameter `type` nodes spell them (array dimensions and
+    /// varargs folded in). `None` means the adapter records no per-parameter
+    /// type at all; `Some(vec![])` means a proven-empty parameter list.
+    ///
+    /// These are source spellings, not resolved or erased types: two equal
+    /// spellings in files with different imports are not proof of the same
+    /// type. Consumers must treat this as a discriminator inside an already
+    /// bounded candidate set, never as an identity.
+    #[serde(default)]
+    callable_parameter_types: Option<Vec<String>>,
+    /// Whether this class-like declaration is an interface.
+    #[serde(default)]
+    class_like_is_interface: bool,
 }
 
 /// A parser-derived nominal type name, including the lexical scope in which an
@@ -1637,6 +1671,12 @@ impl SignatureMetadata {
             field_is_static: false,
             field_is_final: false,
             companion_object: false,
+            callable_is_static: false,
+            callable_is_constructor: false,
+            callable_declared_visibility: None,
+            callable_modifiers_recorded: false,
+            callable_parameter_types: None,
+            class_like_is_interface: false,
         }
     }
 
@@ -1668,24 +1708,59 @@ impl SignatureMetadata {
                 ))
             })
             .collect();
-        Self {
-            label,
-            parameters,
-            return_type_text: None,
-            return_type_identity: None,
-            declaration_only: false,
-            callable_arity: None,
-            type_parameters: Vec::new(),
-            bare_return_type_parameter: None,
-            callable_linkage: None,
-            dispatch_extensibility: None,
-            extension_receiver_type: None,
-            extension_receiver_type_identity: None,
-            extension_receiver_is_unconstrained_type_parameter: false,
-            field_is_static: false,
-            field_is_final: false,
-            companion_object: false,
-        }
+        Self::new(label, parameters)
+    }
+
+    /// Record the modifier facts an adapter read from the declaration's own
+    /// modifier nodes. Calling this is what makes
+    /// [`Self::callable_modifiers_recorded`] true, so a consumer can tell a
+    /// declared-absent modifier from an unread one.
+    pub fn with_callable_modifiers(
+        mut self,
+        is_static: bool,
+        is_constructor: bool,
+        visibility: DeclaredVisibility,
+    ) -> Self {
+        self.callable_is_static = is_static;
+        self.callable_is_constructor = is_constructor;
+        self.callable_declared_visibility = Some(visibility);
+        self.callable_modifiers_recorded = true;
+        self
+    }
+
+    /// Record the declaration's per-parameter type spellings, in order.
+    pub fn with_callable_parameter_types(mut self, parameter_types: Vec<String>) -> Self {
+        self.callable_parameter_types = Some(parameter_types);
+        self
+    }
+
+    pub fn with_class_like_interface(mut self, is_interface: bool) -> Self {
+        self.class_like_is_interface = is_interface;
+        self
+    }
+
+    pub fn callable_is_static(&self) -> bool {
+        self.callable_is_static
+    }
+
+    pub fn callable_is_constructor(&self) -> bool {
+        self.callable_is_constructor
+    }
+
+    pub fn callable_declared_visibility(&self) -> Option<DeclaredVisibility> {
+        self.callable_declared_visibility
+    }
+
+    pub fn callable_modifiers_recorded(&self) -> bool {
+        self.callable_modifiers_recorded
+    }
+
+    pub fn callable_parameter_types(&self) -> Option<&[String]> {
+        self.callable_parameter_types.as_deref()
+    }
+
+    pub fn class_like_is_interface(&self) -> bool {
+        self.class_like_is_interface
     }
 
     pub fn with_return_type_text(mut self, return_type_text: Option<impl Into<String>>) -> Self {

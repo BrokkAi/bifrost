@@ -620,6 +620,10 @@ impl IAnalyzer for JavaAnalyzer {
         Some(self)
     }
 
+    fn member_family_provider(&self) -> Option<&dyn crate::analyzer::usages::MemberFamilyProvider> {
+        Some(self)
+    }
+
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
     }
@@ -1075,4 +1079,33 @@ fn java_static_imports_present(analyzer: &dyn IAnalyzer) -> bool {
                     .is_ok_and(|source| source.contains("import static "))
             })
         })
+}
+
+/// Java is the first language family of the #1477 M4 rollout.
+///
+/// Both directions delegate to the shared Java relation with `self` as both
+/// the declaration source and the hierarchy source. The multi-analyzer
+/// overrides the hierarchy argument with its own realm-aware walk, which is why
+/// the relation takes the two separately.
+impl crate::analyzer::usages::MemberFamilyProvider for JavaAnalyzer {
+    fn member_family_capability(
+        &self,
+        member: &CodeUnit,
+    ) -> crate::analyzer::structural::resolution::MemberFamilyCapability {
+        crate::analyzer::usages::java_member_family_capability(self, member)
+    }
+
+    fn forward_member_family(
+        &self,
+        member: &CodeUnit,
+    ) -> crate::analyzer::usages::MemberFamilyAnswer {
+        crate::analyzer::usages::java_forward_member_family(self, self, member)
+    }
+
+    fn inverse_member_family(
+        &self,
+        member: &CodeUnit,
+    ) -> crate::analyzer::usages::MemberFamilyAnswer {
+        crate::analyzer::usages::java_inverse_member_family(self, self, member)
+    }
 }
