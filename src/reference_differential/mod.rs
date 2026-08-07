@@ -641,22 +641,21 @@ fn collect_sampled_sites(
                 census_identifier_ranges(root, language, config.max_candidates_per_file)
             }
         };
-        let ranges =
-            match candidate_ranges {
-                ReferenceCandidateRanges::Complete(ranges) => ranges,
-                ReferenceCandidateRanges::LimitExceeded { limit, .. } => {
-                    summary.candidate_limit_exceeded_files += 1;
-                    summary.candidate_limit_excluded_candidates_lower_bound = summary
-                        .candidate_limit_excluded_candidates_lower_bound
-                        .saturating_add(limit.saturating_add(1) as u64);
-                    file_errors.push(file_error(
-                        &path,
-                        "candidate_limit_exceeded",
-                        &format!("more than {limit} structured identifier candidates"),
-                    ));
-                    continue;
-                }
-            };
+        let ranges = match candidate_ranges {
+            ReferenceCandidateRanges::Complete(ranges) => ranges,
+            ReferenceCandidateRanges::LimitExceeded { limit, .. } => {
+                summary.candidate_limit_exceeded_files += 1;
+                summary.candidate_limit_excluded_candidates_lower_bound = summary
+                    .candidate_limit_excluded_candidates_lower_bound
+                    .saturating_add(limit.saturating_add(1) as u64);
+                file_errors.push(file_error(
+                    &path,
+                    "candidate_limit_exceeded",
+                    &format!("more than {limit} structured identifier candidates"),
+                ));
+                continue;
+            }
+        };
         let declaration_ranges: HashSet<(usize, usize)> = analyzer
             .declarations(file)
             .into_iter()
@@ -1350,9 +1349,9 @@ fn census_site_role(
             .find(|child| child.start_byte() != start || child.end_byte() != end)
             .map(|receiver| &source[receiver.start_byte()..receiver.end_byte()])
             .is_some_and(|text| text == "self" || text == "this");
-        let member_call = parent
-            .parent()
-            .is_some_and(|grandparent| grandparent.kind().contains("call") || grandparent.kind().contains("invocation"));
+        let member_call = parent.parent().is_some_and(|grandparent| {
+            grandparent.kind().contains("call") || grandparent.kind().contains("invocation")
+        });
         if receiver_is_self && member_call {
             return CensusSiteRole::SelfMemberCall;
         }

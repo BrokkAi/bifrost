@@ -1,7 +1,6 @@
 use brokk_bifrost::reference_differential::{
     ExactReferenceSite, ProbeSeed, ReferenceDifferentialConfig, ReferenceDifferentialProgress,
-    TierSelection,
-    ReferenceDifferentialReport, run_reference_differential_with_progress,
+    ReferenceDifferentialReport, TierSelection, run_reference_differential_with_progress,
 };
 use brokk_bifrost::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
 use git2::{Repository, StatusOptions};

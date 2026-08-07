@@ -39,13 +39,16 @@ fn rust_census_differential(
 /// is the core M1 capability: probe sites the index seed cannot reach.
 #[test]
 fn census_seed_proposes_macro_body_occurrence_the_index_seed_excludes() {
-    let source =
-        "macro_rules! call_it { () => { frobnicate() }; }\nfn frobnicate() {}\nfn run() { call_it!(); }\n";
+    let source = "macro_rules! call_it { () => { frobnicate() }; }\nfn frobnicate() {}\nfn run() { call_it!(); }\n";
     let census = rust_census_differential(&[("src/lib.rs", source)]);
     assert!(
         census.sites.iter().all(|site| site.seed == "census"),
         "every census site must be tagged census: {:#?}",
-        census.sites.iter().map(|s| (&s.text, &s.seed)).collect::<Vec<_>>()
+        census
+            .sites
+            .iter()
+            .map(|s| (&s.text, &s.seed))
+            .collect::<Vec<_>>()
     );
     let macro_body_start = source.find("frobnicate()").expect("macro body call");
     assert!(
@@ -54,7 +57,11 @@ fn census_seed_proposes_macro_body_occurrence_the_index_seed_excludes() {
             .iter()
             .any(|site| site.text == "frobnicate" && site.start_byte == macro_body_start),
         "census must propose the macro-body `frobnicate` occurrence: {:#?}",
-        census.sites.iter().map(|s| (&s.text, s.start_byte)).collect::<Vec<_>>()
+        census
+            .sites
+            .iter()
+            .map(|s| (&s.text, s.start_byte))
+            .collect::<Vec<_>>()
     );
     // The census is a superset of the index frontier at the engine level: it
     // samples at least as many sites because it drops the per-language
