@@ -102,9 +102,16 @@ impl ImportAnalysisProvider for CppAnalyzer {
 }
 
 impl CppAnalyzer {
+    /// The path -> file map every include resolution reads.
+    ///
+    /// Sourced from the workspace listing, not from the analyzed set: the index
+    /// only ever answers `by_rel_path`/`by_file_name` lookups, so it needs file
+    /// identity and never a parse product. An include target exists the moment
+    /// the file exists (#1758).
     pub(crate) fn include_target_index(&self) -> &IncludeTargetIndex {
         self.include_target_index.get_or_init(|| {
-            let files = self.inner.all_files();
+            let _scope = crate::profiling::scope("cpp.include_target_index.build");
+            let files = self.inner.workspace_language_files();
             IncludeTargetIndex::build(files.iter())
         })
     }

@@ -2414,3 +2414,94 @@ using ScopedJavaGlobalRef = jni_zero::ScopedJavaGlobalRef<T>;
         Some("using ScopedJavaGlobalRef = jni_zero::ScopedJavaGlobalRef<T>;")
     );
 }
+
+/// Pins include-target resolution across the four shapes the index answers:
+/// a source-relative hit, a project-relative hit, a miss, and a quoted name
+/// that two real workspace files answer. The resolved set is the contract the
+/// #1758 re-sourcing of `IncludeTargetIndex` must not change for files that
+/// are both present and analyzed.
+#[test]
+fn cpp_include_targets_resolve_hit_miss_and_duplicate_basenames() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/main.cpp",
+            concat!(
+                "#include \"helper.h\"\n",
+                "#include \"include/shared.h\"\n",
+                "#include \"nowhere.h\"\n",
+                "#include \"dup.h\"\n",
+                "int main() { return 0; }\n"
+            ),
+        )
+        .file("src/helper.h", "struct Helper {};\n")
+        .file("include/shared.h", "struct Shared {};\n")
+        .file("src/dup.h", "struct SourceRelativeDup {};\n")
+        .file("dup.h", "struct ProjectRelativeDup {};\n")
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let main_cpp = project.file("src/main.cpp");
+
+    let imports = analyzer.import_info_of(&main_cpp);
+    let targets: BTreeSet<ProjectFile> = analyzer
+        .imported_files_from_infos(&main_cpp, &imports)
+        .expect("C++ resolves include targets")
+        .into_iter()
+        .collect();
+
+    assert_eq!(
+        BTreeSet::from([
+            project.file("src/helper.h"),
+            project.file("include/shared.h"),
+            project.file("src/dup.h"),
+            project.file("dup.h"),
+        ]),
+        targets
+    );
+
+    let imported = analyzer.imported_code_units_of(&main_cpp);
+    let short_names: BTreeSet<String> = imported
+        .iter()
+        .map(|unit| unit.short_name().to_string())
+        .collect();
+    assert_eq!(
+        BTreeSet::from([
+            "Helper".to_string(),
+            "Shared".to_string(),
+            "SourceRelativeDup".to_string(),
+            "ProjectRelativeDup".to_string(),
+        ]),
+        short_names
+    );
+}
+
+/// The #1758 superset: `IncludeTargetIndex` reads the workspace file listing,
+/// not the analyzed set, so a header that exists on disk resolves as an
+/// include target even before anything has parsed it. Its declarations are of
+/// course still empty until it is analyzed -- the index answers file identity,
+/// which is all it was ever asked for.
+#[test]
+fn cpp_include_target_resolves_a_present_but_unanalyzed_header() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/main.cpp",
+            "#include \"late.h\"\nint main() { return 0; }\n",
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let main_cpp = project.file("src/main.cpp");
+    let imports = analyzer.import_info_of(&main_cpp);
+    assert_eq!(1, imports.len(), "{imports:?}");
+
+    // Written after the analyzer was built: present in the workspace listing,
+    // absent from the analyzed set.
+    let late_header = project.file("src/late.h");
+    late_header.write("struct Late {};\n").unwrap();
+
+    let targets: BTreeSet<ProjectFile> = analyzer
+        .imported_files_from_infos(&main_cpp, &imports)
+        .expect("C++ resolves include targets")
+        .into_iter()
+        .collect();
+
+    assert_eq!(BTreeSet::from([late_header]), targets);
+}

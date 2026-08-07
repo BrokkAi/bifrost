@@ -7321,6 +7321,35 @@ where
         self.analyzed_live_files()
     }
 
+    /// Every workspace file of this analyzer's language, taken from the
+    /// project's shared file listing.
+    ///
+    /// This is deliberately not `all_files`/`analyzed_live_files`. That path
+    /// validates every candidate blob key against the store -- on the #1758
+    /// workspace, ~97 serial batched SQL round trips over ~38.6k C++ keys,
+    /// 56.6s intrinsic and up to 227s under contention -- which only a caller
+    /// that needs parse products can justify. A caller that needs file
+    /// *identity* (a path -> `ProjectFile` map) reads the listing instead, and
+    /// `all_files_shared` hands back the project's own cached `Arc` rather
+    /// than deep-cloning the set.
+    ///
+    /// The result is a superset of the analyzed set: a file that exists in the
+    /// workspace but has not been parsed yet is still a real workspace file.
+    pub(crate) fn workspace_language_files(&self) -> Vec<ProjectFile> {
+        self.project
+            .all_files_shared()
+            .map(|files| {
+                files
+                    .iter()
+                    .filter(|file| {
+                        crate::analyzer::common::language_for_file(file) == self.adapter.language()
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn class_declarations_in_package(&self, package_name: &str) -> Vec<CodeUnit> {
         let mut matches = self.persisted_top_level_classes_in_package(package_name);
         matches.extend(self.dirty_units_matching(false, |unit| {
