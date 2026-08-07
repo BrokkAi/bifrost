@@ -348,7 +348,7 @@ impl RubyDiagnosticCollector<'_> {
             owner_node,
             self.source,
         );
-        match self.gems.constant_boundary(&owner_path.segments, &terminal) {
+        match self.gems.constant_boundary(&owner_path.segments, terminal) {
             RubyGemBoundary::Indexed => self
                 .report
                 .push_resolved(range, BoundaryStatus::ExternalIndexed),
@@ -364,7 +364,7 @@ impl RubyDiagnosticCollector<'_> {
                     );
                     return;
                 }
-                self.push_absent(range, domain, &terminal, BoundaryStatus::ExternalIndexed);
+                self.push_absent(range, domain, terminal, BoundaryStatus::ExternalIndexed);
             }
             RubyGemBoundary::Unpublished(reason) => {
                 // No pack owns the namespace, so the visible workspace closure
@@ -381,7 +381,7 @@ impl RubyDiagnosticCollector<'_> {
                                 file: self.file.rel_path().to_path_buf(),
                                 range,
                             },
-                            &terminal,
+                            terminal,
                             BoundaryStatus::WorkspaceLocal,
                         ),
                     },

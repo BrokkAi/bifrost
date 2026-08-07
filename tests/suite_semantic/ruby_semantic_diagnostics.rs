@@ -19,6 +19,7 @@ use brokk_bifrost::analyzer::semantic_model::{
     SemanticPackCatalog, SessionPackSource, SessionPackSourceKind, SourceFormat, TypeIdentity,
     acquire_active_semantic_models_with_evidence, compile_source, type_declaration_id,
 };
+use brokk_bifrost::searchtools::{SymbolLookupParams, get_symbol_locations};
 use brokk_bifrost::{
     AnalyzerConfig, CancellationToken, IAnalyzer, Language, Project, RubyAnalyzer,
     WorkspaceAnalyzer,
@@ -895,6 +896,58 @@ fn ruby_gem_pack_same_name_in_two_gems_is_not_a_proof() {
     assert_states(
         &fixture.report("app.rb"),
         "more than one activated gem pack declares",
+    );
+}
+
+/// A diagnostic and a definition must name the same gem declaration.
+///
+/// The pass resolves `Widget::Config` through the identity
+/// `type_declaration_id(rubygems, "Widget::Config")`; navigation must land on
+/// the symbol carrying that same id. Two lanes that agreed only by accident
+/// would let a definition open a constant that a diagnostic then called absent.
+#[test]
+fn ruby_gem_pack_shares_one_identity_with_definition_lookup() {
+    let fixture = GemFixture::new(&[("app.rb", "Widget::Config\n")]);
+    fixture.activate(&[("fixture.ruby.widget", &widget_pack())], None);
+
+    let report = fixture.report("app.rb");
+    assert!(
+        resolved_boundaries(&report).contains(&BoundaryStatus::ExternalIndexed),
+        "the diagnostic lane resolves the constant through the pack: {report:#?}"
+    );
+
+    let overlay = fixture
+        .analyzer
+        .analyzer()
+        .semantic_model_overlay()
+        .expect("an activated overlay");
+    let expected_id = ruby_type_id("Widget::Config");
+    let by_identity = overlay.symbols_with_id(&expected_id);
+    assert_eq!(
+        1,
+        by_identity.records.len(),
+        "the pack publishes the constant under the minted identity"
+    );
+
+    let locations = get_symbol_locations(
+        fixture.analyzer.analyzer(),
+        SymbolLookupParams {
+            symbols: vec!["Widget::Config".to_owned()],
+        },
+    );
+    assert!(
+        locations.not_found.is_empty(),
+        "navigation must find the same constant: {:#?}",
+        locations.not_found
+    );
+    assert_eq!(
+        vec![expected_id],
+        locations
+            .model_locations
+            .iter()
+            .map(|symbol| symbol.id.clone())
+            .collect::<Vec<_>>(),
+        "navigation and the diagnostic lane must land on one declaration identity"
     );
 }
 
