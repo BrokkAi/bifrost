@@ -2318,6 +2318,34 @@ fn issue_1688_unresolvable_qualified_selector_stays_not_found() {
     );
 }
 
+// `has_complete_symbol_lookup_index` is an AND over the workspace's delegates,
+// so one PHP file used to turn the #1688 conclusive-miss gate off for every
+// language. With PhpAnalyzer advertising its (persisted, complete) index, a
+// qualified miss is decided by the identifier index again and never reaches the
+// whole-workspace declaration scan. The PHP symbols themselves must keep
+// resolving, which is what makes the advertisement true.
+#[test]
+fn php_in_a_mixed_workspace_keeps_the_conclusive_miss_gate() {
+    let project = issue_1688_multi_language_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+
+    let resolved = source_for(analyzer, "App/Legacy.run");
+    assert!(resolved.not_found.is_empty(), "{resolved:#?}");
+    assert_eq!(1, resolved.sources.len(), "{resolved:#?}");
+    assert_eq!("src/Legacy.php", resolved.sources[0].path);
+
+    analyzer.reset_full_declaration_scan_count_for_test();
+    let missing = source_for(analyzer, "App/Legacy.neverDeclared");
+
+    assert_eq!(1, missing.not_found.len(), "{missing:#?}");
+    assert_eq!(
+        0,
+        analyzer.full_declaration_scan_count_for_test(),
+        "a qualified miss must stay conclusive on the identifier index, not fall through to a workspace scan"
+    );
+}
+
 // A terminal identifier that two languages both persist must keep reporting the
 // same ambiguity it reported when the stage scanned: the seek narrows the
 // candidate set by terminal segment, which every match of the suffix pattern
