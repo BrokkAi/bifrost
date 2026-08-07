@@ -14,7 +14,9 @@ use brokk_bifrost::analyzer::{
     JvmDependencyDiscoveryMode, SemanticDiagnosticIncompleteReason, SemanticDiagnosticOutcome,
     SemanticDiagnosticReport, SemanticDiagnosticReportStatus, WorkspaceAnalyzer,
 };
-use brokk_bifrost::{AnalyzerConfig, CancellationToken};
+use brokk_bifrost::{
+    AnalyzerConfig, CancellationToken, JvmExternalDependencies, JvmMavenCoordinate, Language,
+};
 use semver::Version;
 
 use crate::common::{BuiltInlineTestProject, InlineTestProject};
@@ -277,6 +279,103 @@ fn an_externally_modelled_type_resolves_in_each_jvm_language() {
 /// The model is consulted at the spelling the language's own import tiers
 /// produce. A file that does not import `com.acme.Widget` must not be silenced
 /// by it just because the simple name matches.
+/// A build that declares an artifact the index could not read is a *different*
+/// suppression from an unconfigured classpath, and it must say so: the name may
+/// well be in the part that was never read, and no model can rule that out,
+/// because the unread artifacts are exactly the ones no activation evidence
+/// covers.
+#[test]
+fn a_declared_but_unreadable_artifact_suppresses_as_declared_unindexed() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "app/Consumer.java",
+            "package app; class Consumer { MissingType value; }",
+        )
+        .build();
+    let mut config = offline_config();
+    // Metadata discovery must run for the unresolved coordinate to be recorded.
+    config.jvm.dependency_discovery.mode = JvmDependencyDiscoveryMode::Metadata;
+    config.jvm.external_dependencies = JvmExternalDependencies {
+        coordinates: vec![JvmMavenCoordinate::new(
+            "com.example",
+            "never-installed",
+            "1.0.0",
+        )],
+        ..JvmExternalDependencies::default()
+    };
+    let analyzer = project.workspace_analyzer(config);
+    activate_widget_model(&analyzer);
+    // The host builds the index; it finds no local artifact for the declared
+    // coordinate and records that as a production diagnostic.
+    analyzer.warm_query_indexes();
+
+    let file = project.file("app/Consumer.java");
+    let source = analyzer.analyzer().project().read_source(&file).unwrap();
+    let report = analyzer.analyzer().semantic_diagnostics(&file, &source);
+
+    assert!(
+        report.diagnostics().is_empty(),
+        "a partially-read classpath cannot prove anything absent: {:#?}",
+        report.diagnostics()
+    );
+    assert!(
+        report.outcomes().iter().any(|outcome| matches!(
+            outcome,
+            SemanticDiagnosticOutcome::Incomplete { reasons, .. }
+                if reasons.iter().any(|reason| matches!(
+                    reason,
+                    SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                        boundary: BoundaryStatus::ExternalDeclaredUnindexed,
+                    }
+                ))
+        )),
+        "the boundary must distinguish a declared-but-unread artifact from an \
+         unconfigured classpath: {:#?}",
+        report.outcomes()
+    );
+}
+
+/// Two wildcard imports supplying one simple name. Java rejects the reference,
+/// so it is ambiguous rather than unrecognized, and both competing routes are
+/// workspace declarations.
+#[test]
+fn a_same_name_wildcard_import_collision_stays_ambiguous_in_java() {
+    let files = [
+        (
+            "src/left/Base.java",
+            "package left;\npublic class Base {}\n",
+        ),
+        (
+            "src/right/Base.java",
+            "package right;\npublic class Base {}\n",
+        ),
+        (
+            "src/app/Consumer.java",
+            "package app;\nimport left.*;\nimport right.*;\nclass Consumer { Base value; }\n",
+        ),
+    ];
+    let (built, analyzer) = jvm_workspace(&files, true);
+    let report = report_for(&analyzer, &built, "src/app/Consumer.java");
+
+    assert!(
+        report.diagnostics().is_empty(),
+        "an ambiguous reference is not an unrecognized one: {:#?}",
+        report.diagnostics()
+    );
+    assert!(
+        report.outcomes().iter().any(|outcome| matches!(
+            outcome,
+            SemanticDiagnosticOutcome::Ambiguous { boundaries, .. }
+                if boundaries.len() == 2
+                    && boundaries
+                        .iter()
+                        .all(|boundary| *boundary == BoundaryStatus::WorkspaceLocal)
+        )),
+        "both competing routes are workspace declarations: {:#?}",
+        report.outcomes()
+    );
+}
+
 #[test]
 fn the_active_model_is_consulted_through_import_tiers_not_by_simple_name() {
     let files = [
