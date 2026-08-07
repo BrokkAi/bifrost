@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { RELEASED_CARGO_MANIFESTS } from "../../../scripts/release-version.mjs";
 
 const execFileAsync = promisify(execFile);
 const testDir = path.dirname(fileURLToPath(import.meta.url));
@@ -100,20 +101,11 @@ async function createFixture(cargoVersion, projectionVersion, lineEnding) {
     "Cargo.toml",
     `[workspace.package]${lineEnding}version = "${cargoVersion}"${lineEnding}${lineEnding}[package]${lineEnding}name = "fixture"${lineEnding}version.workspace = true${lineEnding}`,
   );
-  for (const [relativePath, packageName] of [
-    ["crates/bifrost-core/Cargo.toml", "brokk-bifrost-core"],
-    ["crates/bifrost-analysis/Cargo.toml", "brokk-bifrost-analysis"],
-    ["crates/bifrost-nlp/Cargo.toml", "brokk-bifrost-nlp"],
-    ["crates/bifrost-policy/Cargo.toml", "brokk-bifrost-policy"],
-    ["crates/bifrost-runtime/Cargo.toml", "brokk-bifrost-runtime"],
-    ["crates/bifrost-mcp/Cargo.toml", "brokk-bifrost-mcp"],
-    ["crates/bifrost-lsp/Cargo.toml", "brokk-bifrost-lsp"],
-    ["crates/bifrost-semantic-packs/Cargo.toml", "brokk-bifrost-semantic-packs"],
-  ]) {
+  for (const relativePath of RELEASED_CARGO_MANIFESTS.slice(1)) {
     await writeFixtureFile(
       root,
       relativePath,
-      `[package]${lineEnding}name = "${packageName}"${lineEnding}version.workspace = true${lineEnding}`,
+      `[package]${lineEnding}name = "fixture"${lineEnding}version.workspace = true${lineEnding}`,
     );
   }
   await writeFixtureFile(

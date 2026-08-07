@@ -178,7 +178,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 
 [[package]]
 name = "brokk-bifrost"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "bincode",
  "brokk-bifrost-analysis",
@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-analysis"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "arc-swap",
  "bincode",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-core"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "bincode",
  "git2",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-cpp"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "brokk-bifrost-core",
  "regex",
@@ -329,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-csharp"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "brokk-bifrost-core",
  "regex",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-go"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "brokk-bifrost-core",
  "rayon",
@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-js-ts"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "brokk-bifrost-core",
  "rayon",
@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-jvm"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "brokk-bifrost-core",
  "cc",
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-lsp"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-policy",
@@ -399,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-mcp"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-nlp",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-nlp"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "brokk-bifrost-analysis",
  "fastrq",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-php"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "brokk-bifrost-core",
  "regex",
@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-policy"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "brokk-bifrost-analysis",
  "cap-std",
@@ -472,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-python"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "brokk-bifrost-core",
  "rayon",
@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-ruby"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "brokk-bifrost-core",
  "serde_json",
@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-runtime"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-policy",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-rust"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "brokk-bifrost-core",
  "filetime",
@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-semantic-packs"
-version = "0.8.23"
+version = "0.8.24"
 dependencies = [
  "brokk-bifrost-analysis",
  "semver",

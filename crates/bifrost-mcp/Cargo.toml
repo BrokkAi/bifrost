@@ -17,10 +17,10 @@ default = []
 nlp = ["dep:brokk-bifrost-nlp"]
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.23" }
-brokk-bifrost-nlp = { path = "../bifrost-nlp", version = "=0.8.23", optional = true }
-brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.8.23" }
-brokk-bifrost-runtime = { path = "../bifrost-runtime", version = "=0.8.23" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.24" }
+brokk-bifrost-nlp = { path = "../bifrost-nlp", version = "=0.8.24", optional = true }
+brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.8.24" }
+brokk-bifrost-runtime = { path = "../bifrost-runtime", version = "=0.8.24" }
 git2 = { version = "0.20.2", default-features = false }
 glob = "0.3.3"
 notify = "6.1.1"
@@ -52,6 +52,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 url = { version = "2.5.8", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.23", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.24", features = ["test-support"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 tempfile = "3.23.0"

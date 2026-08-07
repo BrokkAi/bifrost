@@ -16,7 +16,7 @@ publish = true
 name = "brokk_bifrost_cpp"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.23" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.24" }
 regex = "1.12.2"
 serde = { version = "1.0.228", features = ["derive"] }
 # `compile_commands.json` is a JSON array of entries whose `command` field is a
@@ -44,5 +44,5 @@ test-support = ["brokk-bifrost-core/test-support"]
 # Cargo unifies this with the plain `[dependencies]` entry above for this
 # crate's test targets, which is what makes core's declaration-identity
 # comparison probe exist while the declaration-walk unit tests are built.
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.23", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.24", features = ["test-support"] }
 tempfile = "3.23.0"

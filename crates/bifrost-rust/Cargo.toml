@@ -16,7 +16,7 @@ publish = true
 name = "brokk_bifrost_rust"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.23" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.24" }
 glob = "0.3.3"
 moka = { version = "0.12.11", features = ["sync"] }
 rayon = "1.10.0"
@@ -36,7 +36,7 @@ default = []
 test-support = []
 
 [dev-dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.23", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.24", features = ["test-support"] }
 # crate_naming's mtime-invalidation test stamps manifest timestamps directly.
 filetime = "0.2"
 tempfile = "3.23.0"
