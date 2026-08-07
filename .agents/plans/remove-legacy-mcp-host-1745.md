@@ -17,9 +17,9 @@ A user can prove this by starting `bifrost --mcp workspace`, sending an RMCP ini
 - [x] (2026-08-07 07:43Z) Find the `--diff-snapshot-object-dir` MCP contract that the RMCP entry point must keep.
 - [x] (2026-08-07 07:43Z) Write this ExecPlan.
 - [x] (2026-08-07 07:43Z) Port `diff_snapshot_object_dir` to the RMCP standard server entry point.
-- [ ] Remove the selector and all handwritten stdio server code.
-- [ ] Make contracts, support tools, CI, release checks, benchmark, and documentation RMCP-only.
-- [ ] Run focused tests, policy validation, the MCP contract suite, and the interactive benchmark checks.
+- [x] (2026-08-07 08:41Z) Remove the selector and all handwritten stdio server code.
+- [x] (2026-08-07 08:41Z) Make contracts, support tools, CI, release checks, benchmark, and documentation RMCP-only.
+- [x] (2026-08-07 08:41Z) Run focused tests, policy validation, the MCP contract suite, and the interactive benchmark checks.
 
 ## Surprises & Discoveries
 
@@ -31,6 +31,15 @@ A user can prove this by starting `bifrost --mcp workspace`, sending an RMCP ini
 
 - Observation: `mcp_common.rs` is not only old-host code.
   Evidence: `rmcp_host.rs` imports server types, watcher parsing, request budgets, URI conversion, policy correlation, and output fitting from it.
+
+- Observation: A benchmark fake server still put its build identity in `serverInfo`.
+  Evidence: `query_code_empty_fast_response_fails_oracle_and_discards_all_timings` failed after the RMCP-only identity check. The fake now returns the RMCP `_meta` value.
+
+- Observation: The complete policy pack has existing findings outside this change.
+  Evidence: Its final status is `finding`. Every finding in a changed file is an accepted suppression after the two test file reads moved before their assertion loops.
+
+- Observation: The final full-workspace policy call took more than five seconds.
+  Evidence: The call ran for about 11 seconds. Open issue #1452 already records this `run_policy` slow path.
 
 ## Decision Log
 
@@ -46,13 +55,17 @@ A user can prove this by starting `bifrost --mcp workspace`, sending an RMCP ini
   Rationale: The issue requires the coverage to remain. RMCP-specific tests already prove newer protocol behavior.
   Date/Author: 2026-08-07 / Codex.
 
+- Decision: Accept build identity only from the RMCP initialize `_meta` object.
+  Rationale: RMCP cannot put Bifrost vendor data in its closed `serverInfo` structure.
+  Date/Author: 2026-08-07 / Codex.
+
 ## Outcomes & Retrospective
 
-Milestone 1 now preserves the object-directory value in the RMCP service. The old host remains until Milestone 2.
+Every standard MCP launch now uses RMCP. The old JSON-RPC loop, selector, dual-host contracts, and rollback tooling are removed. RMCP retains the trusted diff snapshot directory and its full end-to-end contract coverage.
 
 ## Context and Orientation
 
-`crates/bifrost-mcp/src/mcp_common.rs` contains shared MCP support and the old host. Its `run_stdio_server_with_build_identity` function reads `BIFROST_MCP_RMCP`. When the value is `off`, it runs a hand-written JSON-RPC loop. JSON-RPC is the message format under MCP.
+`crates/bifrost-mcp/src/mcp_common.rs` contains shared MCP support. Its `run_stdio_server` facade forwards standard server launches to RMCP.
 
 `crates/bifrost-mcp/src/rmcp_host.rs` contains the supported host. `run_stdio_server_with_build_identity` starts a standard server. `run_named_workspace_stdio_server_with_build_identity` starts a named-workspace server. Both use `run_stdio_server_impl`.
 
@@ -123,7 +136,9 @@ In `docs/src/content/docs/mcp.md`, remove rollback-host instructions. Describe R
 
 Run these source checks from the repository root:
 
-    rg -n 'BIFROST_MCP_RMCP|BIFROST_BENCHMARK_MCP_RMCP|rmcp_host_enabled' .
+    rg -n -i -g '!scripts/ci-impact-workflow.test.mjs' \
+      -e 'BIFROST_MCP_RMCP' -e 'BIFROST_BENCHMARK_MCP_RMCP' \
+      -e 'rmcp_host_enabled' src crates tests scripts .github docs
     node --test scripts/ci-impact-workflow.test.mjs scripts/release-promotion-workflow.test.mjs
 
 The search must return no production, test, workflow, script, or documentation occurrences. The Node tests must pass.
@@ -187,7 +202,37 @@ Pre-change evidence:
     rmcp_host.rs:1842 starts the named-workspace RMCP server.
     src/bin/bifrost.rs:703 validates and forwards diff_snapshot_object_dir.
 
-Add concise test output and benchmark report paths here during implementation.
+Completed validation:
+
+    cargo test --test suite_mcp_cli -- bifrost_tool_cli::diff_snapshot_object_dir
+    # 5 passed
+
+    cargo check -p brokk-bifrost-mcp
+    # passed
+
+    cargo test -p brokk-bifrost-mcp --test bifrost_mcp_server
+    # 32 passed
+
+    cargo test -p brokk-bifrost-mcp --features nlp
+    # 147 passed; isolated target removed
+
+    cargo test --test mcp_build_identity_facade
+    # 1 passed
+
+    cargo test --test suite_mcp_cli -- bifrost_benchmark_run
+    # 11 passed
+
+    node --test scripts/ci-impact-workflow.test.mjs scripts/release-promotion-workflow.test.mjs
+    # 19 passed
+
+    python3 scripts/mcp-replay.py --help
+    # Shows no stack selector
+
+    cargo fmt --check
+    cargo check --bin bifrost
+    # passed
+
+Final policy validation selected `bifrost.code-smells`. No repository policy root is explicitly configured. The pack has existing workspace findings. Changed-file findings are accepted suppressions only.
 
 ## Interfaces and Dependencies
 
@@ -208,3 +253,5 @@ The function must be backed by RMCP after this change. It must create `SearchToo
 Plan revision: 2026-08-07 07:43Z. Added the required RMCP port for `diff_snapshot_object_dir` after the source audit found the old host owned it.
 
 Plan revision: 2026-08-07 07:43Z. Recorded the completed RMCP object-directory port before host removal.
+
+Plan revision: 2026-08-07 08:41Z. Recorded the completed sole-host implementation, validation, policy review, and known policy latency issue.
