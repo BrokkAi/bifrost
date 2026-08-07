@@ -76,10 +76,15 @@ pub(super) fn evaluate_assertion_policy(
         context.cancellation,
     );
 
-    let mut run_incomplete =
-        incomplete_reasons(&subject.result.completion(), subject.result.truncated);
-    let mut run_failures = failure_reasons(&subject.result.completion());
+    let subject_completion = subject.result.completion();
+    let mut run_failures = failure_reasons(&subject_completion);
+    // Subject discovery is the one run-level completeness question left: if the
+    // selector could not enumerate its subjects, the evaluator does not even
+    // know which files it failed to consider, so per-file attribution is
+    // impossible by construction and the whole run is inconclusive.
+    let subject_incomplete = incomplete_reasons(&subject_completion, subject.result.truncated);
     let mut query_diagnostics = subject.result.diagnostics.clone();
+    let mut total_work = subject.work;
 
     let subjects = match collect_assertion_subjects(&subject.result.results, &subject.evidence) {
         Ok(subjects) => subjects,
@@ -88,19 +93,27 @@ pub(super) fn evaluate_assertion_policy(
         }
     };
 
-    // Two executions per row family, not one. `occurrences-in` over the subject
-    // query would keep a single execution but re-run the subject selector,
-    // giving the run two independent completion verdicts for the same rows;
-    // scoping fresh seeds to the subject files keeps exactly one soundness
-    // accounting per query and charges each file scan once. Each family's
-    // query runs only when an assert asks for it, so a policy that never
-    // mentions candidates never pays for a resolution trace.
-    let mut paths = subjects
-        .iter()
-        .map(|subject| subject.path.as_str())
-        .collect::<Vec<_>>();
-    paths.sort_unstable();
-    paths.dedup();
+    if !run_failures.is_empty() {
+        return failed_policy_run_with_reason(
+            policy,
+            PolicyAnalysisType::Assertion,
+            Vec::new(),
+            run_failures[0],
+            "assertion evaluation could not execute a valid query plan",
+            work_report(total_work, 0, 0),
+            budget,
+        );
+    }
+    if !subject_incomplete.is_empty() {
+        return inconclusive_policy_run_many(
+            policy,
+            PolicyAnalysisType::Assertion,
+            subject_incomplete,
+            "assertion evaluation could not observe a complete row set",
+            work_report(total_work, 0, 0),
+            budget,
+        );
+    }
 
     // Every family needs the occurrence rows, not only the occurrence family:
     // an assert about how a token resolves does not apply to a token that is
@@ -136,256 +149,6 @@ pub(super) fn evaluate_assertion_policy(
         .asserts
         .iter()
         .any(|assertion| matches!(assertion, PolicyAssert::DeclarationState(_)));
-
-    let mut executed = Vec::new();
-    let mut occurrence_rows: Vec<&CodeQueryOccurrence> = Vec::new();
-    let mut candidate_rows: Vec<&CodeQueryResolutionCandidate> = Vec::new();
-    let mut binding_rows: Vec<&CodeQueryBinding> = Vec::new();
-    let mut scope_rows: Vec<&CodeQueryLexicalScope> = Vec::new();
-    let mut generation_rows: Vec<&CodeQueryGenerationSite> = Vec::new();
-
-    let mut queries: Vec<CodeQuery> = Vec::new();
-    // No subjects means no occurrences for any assert to address: every
-    // assert holds vacuously and the verdict is the subject query's own
-    // completion. Building the row-family queries anyway would be worse than
-    // wasteful -- an empty exact-path list is an unrestricted seed, so a
-    // subject-less policy would scan every file in the workspace and inherit
-    // completeness verdicts from files it has nothing to say about.
-    if !paths.is_empty() && !occurrence_roles.is_empty() {
-        match assertion_occurrence_query(&paths, &occurrence_roles, Vec::new(), budget) {
-            Ok(query) => queries.push(query),
-            Err(message) => {
-                return failed_policy_run(policy, PolicyAnalysisType::Assertion, message, budget);
-            }
-        }
-    }
-    if !paths.is_empty() && !candidate_roles.is_empty() {
-        match assertion_occurrence_query(
-            &paths,
-            &candidate_roles,
-            vec![QueryStep::CandidatesOf(CandidateFilter::default())],
-            budget,
-        ) {
-            Ok(query) => queries.push(query),
-            Err(message) => {
-                return failed_policy_run(policy, PolicyAnalysisType::Assertion, message, budget);
-            }
-        }
-    }
-    if !paths.is_empty() && !reaching_roles.is_empty() {
-        match assertion_occurrence_query(
-            &paths,
-            &reaching_roles,
-            vec![QueryStep::ReachingBinding(ReachingBindingOptions::default())],
-            budget,
-        ) {
-            Ok(query) => queries.push(query),
-            Err(message) => {
-                return failed_policy_run(policy, PolicyAnalysisType::Assertion, message, budget);
-            }
-        }
-        match assertion_scope_query(&paths, budget) {
-            Ok(query) => queries.push(query),
-            Err(message) => {
-                return failed_policy_run(policy, PolicyAnalysisType::Assertion, message, budget);
-            }
-        }
-    }
-
-    for query in &queries {
-        let outcome = execute_code_query_detailed_eager_index(
-            context.analyzer,
-            query,
-            budget.query_limits(),
-            context.cancellation,
-        );
-        run_incomplete.extend(incomplete_reasons(
-            &outcome.result.completion(),
-            outcome.result.truncated,
-        ));
-        run_failures.extend(failure_reasons(&outcome.result.completion()));
-        query_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
-        executed.push(outcome);
-    }
-
-    if needs_generation {
-        let query = match assertion_generation_query(&paths, budget) {
-            Ok(query) => query,
-            Err(message) => {
-                return failed_policy_run(policy, PolicyAnalysisType::Assertion, message, budget);
-            }
-        };
-        let mut outcome = execute_code_query_detailed_eager_index(
-            context.analyzer,
-            &query,
-            budget.query_limits(),
-            context.cancellation,
-        );
-        // A dynamic generation site reports the generated-set axis incomplete
-        // at query level, but here that honesty is handled per row: a dynamic
-        // site makes exactly the asserts over it inconclusive (or, under
-        // :forbid-dynamic, the finding), never the whole run.
-        outcome.result.diagnostics.retain(|diagnostic| {
-            diagnostic.code != CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
-        });
-        run_incomplete.extend(incomplete_reasons(
-            &outcome.result.completion(),
-            outcome.result.truncated,
-        ));
-        run_failures.extend(failure_reasons(&outcome.result.completion()));
-        query_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
-        executed.push(outcome);
-    }
-
-    for query in &executed {
-        for item in &query.result.results {
-            match &item.value {
-                CodeQueryResultValue::Occurrence { value } => occurrence_rows.push(value),
-                CodeQueryResultValue::ResolutionCandidate { value } => candidate_rows.push(value),
-                CodeQueryResultValue::Binding { value } => binding_rows.push(value),
-                CodeQueryResultValue::LexicalScope { value } => scope_rows.push(value),
-                CodeQueryResultValue::GenerationSite { value } => generation_rows.push(value),
-                _ => {}
-            }
-        }
-    }
-
-    if subjects
-        .iter()
-        .any(|subject| !subject.captures_without_ast_id.is_empty())
-    {
-        run_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
-    }
-
-    let mut rows_by_ast_id: HashMap<&str, Vec<&CodeQueryOccurrence>> = HashMap::new();
-    for value in occurrence_rows {
-        rows_by_ast_id
-            .entry(value.ast_id.as_str())
-            .or_default()
-            .push(value);
-    }
-    let mut sites_by_ast_id: HashMap<&str, Vec<&CodeQueryGenerationSite>> = HashMap::new();
-    for value in &generation_rows {
-        if let Some(ast_id) = value.ast_id.as_deref() {
-            sites_by_ast_id.entry(ast_id).or_default().push(value);
-        }
-    }
-
-    // Declaration-state rows are derived directly rather than queried: no
-    // seed spans the whole state family, and the rows joined here are exact
-    // per-declaration facts whose completeness the derivation itself states.
-    let mut state_results: Vec<std::sync::Arc<MaterializationFileResult>> = Vec::new();
-    if needs_declaration_state {
-        let files_by_rel: HashMap<String, brokk_bifrost_analysis::analyzer::ProjectFile> = context
-            .analyzer
-            .analyzed_files()
-            .into_iter()
-            .map(|file| (file.rel_path().to_string_lossy().replace('\\', "/"), file))
-            .collect();
-        for path in &paths {
-            let Some(file) = files_by_rel.get(*path) else {
-                run_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
-                continue;
-            };
-            let result = std::sync::Arc::new(materialization_for_file(context.analyzer, file));
-            if !result
-                .completeness
-                .covers(MaterializationAxis::DeclarationState)
-            {
-                run_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
-            }
-            state_results.push(result);
-        }
-    }
-    let mut states_by_ast_id: HashMap<String, Vec<&DeclarationStateRow>> = HashMap::new();
-    for result in &state_results {
-        for row in &result.states {
-            if let Some(ast_id) = row.ast_id() {
-                states_by_ast_id.entry(ast_id).or_default().push(row);
-            }
-        }
-    }
-
-    let mut candidates_by_ast_id: HashMap<&str, Vec<&CodeQueryResolutionCandidate>> =
-        HashMap::new();
-    for value in candidate_rows {
-        candidates_by_ast_id
-            .entry(value.ast_id.as_str())
-            .or_default()
-            .push(value);
-    }
-    // A reaching binding is an answer about one occurrence, and the row says
-    // which one: the join is that identity, never the binding's name. The
-    // identity is path-qualified because a canonical AST id repeats verbatim
-    // across files with identical content, and the binding must only join
-    // occurrences of its own file.
-    let mut bindings_by_occurrence: HashMap<(&str, &str), Vec<&CodeQueryBinding>> = HashMap::new();
-    for value in binding_rows {
-        if let Some(reached_from) = value.reached_from_ast_id.as_deref() {
-            bindings_by_occurrence
-                .entry((value.path.as_str(), reached_from))
-                .or_default()
-                .push(value);
-        }
-    }
-    let mut scopes_by_index: HashMap<(&str, u32), &CodeQueryLexicalScope> = HashMap::new();
-    for value in scope_rows {
-        scopes_by_index.insert((value.path.as_str(), value.index), value);
-    }
-
-    let capability = assertion_capabilities(&query_diagnostics);
-    let adapted = adapt_query_diagnostics(&query_diagnostics, budget.max_diagnostics());
-    let mut diagnostics = adapted.diagnostics;
-    let mut diagnostics_truncated = adapted.truncated;
-    if diagnostics_truncated {
-        run_incomplete.push(PolicyIncompleteReason::ReportRetentionBudget);
-    }
-    if adapted.adaptation_failed {
-        retain_incomplete_diagnostic(
-            &mut diagnostics,
-            &mut diagnostics_truncated,
-            budget.max_diagnostics(),
-            "one or more query diagnostics could not be retained as validated policy diagnostics",
-        );
-    }
-
-    run_incomplete.sort();
-    run_incomplete.dedup();
-    run_failures.sort();
-    run_failures.dedup();
-    let subject_completion = subject.result.completion();
-    let row_completions = executed
-        .iter()
-        .map(|query| query.result.completion())
-        .collect::<Vec<_>>();
-    let total_work = executed.iter().fold(subject.work, |total, query| {
-        total.saturating_add(query.work)
-    });
-    let work = work_report(total_work, 0, 0);
-
-    if !run_failures.is_empty() {
-        return failed_policy_run_with_reason(
-            policy,
-            PolicyAnalysisType::Assertion,
-            Vec::new(),
-            run_failures[0],
-            "assertion evaluation could not execute a valid query plan",
-            work,
-            budget,
-        );
-    }
-    // Soundness rule 1: a verdict over an incomplete row set is never a pass
-    // and never a clean run, so no findings are assembled at all.
-    if !run_incomplete.is_empty() {
-        return inconclusive_policy_run_many(
-            policy,
-            PolicyAnalysisType::Assertion,
-            run_incomplete,
-            "assertion evaluation could not observe a complete row set",
-            work,
-            budget,
-        );
-    }
 
     let metadata = &policy.definition().metadata;
     let message = match &metadata.message {
@@ -424,159 +187,401 @@ pub(super) fn evaluate_assertion_policy(
     });
     let mut identity_support =
         needs_identity_producers.then(|| IdentityAssertSupport::new(context.analyzer));
-
-    let mut findings = Vec::new();
-    // Soundness rule 3: an input a single assert cannot conclude over -- an
-    // unattributed tier, a rejection-dependent assert on a selection-only
-    // trace, a missing selection -- makes the whole run inconclusive with zero
-    // findings, exactly like an incomplete query. The verdicts already
-    // assembled are discarded rather than reported beside an admission.
-    let mut late_incomplete: Vec<PolicyIncompleteReason> = Vec::new();
     let mut edge_assert_context = EdgeAssertContext::new(context.analyzer, context.cancellation);
+
+    // Declaration-state rows are derived directly rather than queried: no
+    // seed spans the whole state family, and the rows joined here are exact
+    // per-declaration facts whose completeness the derivation itself states.
+    let files_by_rel: HashMap<String, brokk_bifrost_analysis::analyzer::ProjectFile> =
+        if needs_declaration_state {
+            context
+                .analyzer
+                .analyzed_files()
+                .into_iter()
+                .map(|file| (file.rel_path().to_string_lossy().replace('\\', "/"), file))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+    // The row families are executed once per subject file, and completion is
+    // accounted per file (#1642): a file whose rows exhaust a budget, or whose
+    // asserts cannot conclude, degrades exactly its own verdict. Its subjects
+    // contribute no findings -- a verdict over an incomplete row set is never
+    // trusted in either direction -- and the run names the file instead of
+    // discarding every other file's conclusions. Row budgets then bound
+    // per-file memory rather than whole-run correctness.
+    //
+    // Two executions per row family per file, not one. `occurrences-in` over
+    // the subject query would keep a single execution but re-run the subject
+    // selector, giving the run two independent completion verdicts for the
+    // same rows; scoping fresh seeds to the subject file keeps exactly one
+    // soundness accounting per query and charges each file scan once. Each
+    // family's query runs only when an assert asks for it, so a policy that
+    // never mentions candidates never pays for a resolution trace.
+    let mut subjects_by_path: HashMap<&str, Vec<&AssertionSubject>> = HashMap::new();
     for subject in &subjects {
-        for assertion in &spec.asserts {
-            // Soundness rule 2: an unbound `:at` is an authoring error, never
-            // a vacuous pass.
-            let Some(ast_ids) = subject.ast_ids(assertion.at()) else {
-                return failed_policy_run_with_reason(
-                    policy,
-                    PolicyAnalysisType::Assertion,
-                    Vec::new(),
-                    PolicyFailureReason::InvalidExecutionPlan,
-                    &format!(
-                        "assert `{}` names capture `{}`, which the subject selector does not bind at {}",
-                        assertion.id(),
-                        assertion.at(),
-                        subject.path.as_str()
-                    ),
-                    work,
-                    budget,
-                );
-            };
-            // A capture that carries no occurrence of the asserted role is not
-            // a subject this assert is about. Only the occurrence family, whose
-            // whole question is how many such rows exist, evaluates anyway.
-            if let Some(role) = assertion.role()
-                && !matches!(assertion, PolicyAssert::Occurrence(_))
-                && !joined_role_rows(&ast_ids, &rows_by_ast_id, role)
-            {
-                continue;
+        subjects_by_path
+            .entry(subject.path.as_str())
+            .or_default()
+            .push(subject);
+    }
+    let mut paths = subjects_by_path.keys().copied().collect::<Vec<_>>();
+    paths.sort_unstable();
+
+    let mut findings: Vec<PolicyFinding> = Vec::new();
+    let mut unconcluded_files: Vec<(&str, Vec<PolicyIncompleteReason>)> = Vec::new();
+    let mut row_completions: Vec<CodeQueryCompletion> = Vec::new();
+
+    for path in paths {
+        let file_subjects = &subjects_by_path[path];
+        let file_paths = [path];
+        let mut queries: Vec<CodeQuery> = Vec::new();
+        if !occurrence_roles.is_empty() {
+            match assertion_occurrence_query(&file_paths, &occurrence_roles, Vec::new(), budget) {
+                Ok(query) => queries.push(query),
+                Err(message) => {
+                    return failed_policy_run(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        message,
+                        budget,
+                    );
+                }
             }
-            let violation = match assertion {
-                PolicyAssert::Occurrence(assertion) => {
-                    evaluate_occurrence_assert(assertion, &ast_ids, &rows_by_ast_id)
+        }
+        if !candidate_roles.is_empty() {
+            match assertion_occurrence_query(
+                &file_paths,
+                &candidate_roles,
+                vec![QueryStep::CandidatesOf(CandidateFilter::default())],
+                budget,
+            ) {
+                Ok(query) => queries.push(query),
+                Err(message) => {
+                    return failed_policy_run(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        message,
+                        budget,
+                    );
                 }
-                PolicyAssert::Resolution(assertion) => evaluate_resolution_assert(
-                    assertion,
-                    &ast_ids,
-                    &candidates_by_ast_id,
-                    &mut late_incomplete,
-                ),
-                PolicyAssert::Boundary(assertion) => evaluate_boundary_assert(
-                    assertion,
-                    &ast_ids,
-                    &candidates_by_ast_id,
-                    &mut late_incomplete,
-                ),
-                PolicyAssert::Generation(assertion) => evaluate_generation_assert(
-                    assertion,
-                    &ast_ids,
-                    &sites_by_ast_id,
-                    &mut late_incomplete,
-                ),
-                PolicyAssert::DeclarationState(assertion) => {
-                    evaluate_declaration_state_assert(assertion, &ast_ids, &states_by_ast_id)
+            }
+        }
+        if !reaching_roles.is_empty() {
+            match assertion_occurrence_query(
+                &file_paths,
+                &reaching_roles,
+                vec![QueryStep::ReachingBinding(ReachingBindingOptions::default())],
+                budget,
+            ) {
+                Ok(query) => queries.push(query),
+                Err(message) => {
+                    return failed_policy_run(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        message,
+                        budget,
+                    );
                 }
-                PolicyAssert::EdgeParity(assertion) => evaluate_edge_parity_assert(
-                    assertion,
-                    &ast_ids,
-                    &rows_by_ast_id,
-                    &mut edge_assert_context,
-                    &mut late_incomplete,
-                ),
-                PolicyAssert::EdgeClass(assertion) => evaluate_edge_class_assert(
-                    assertion,
-                    &ast_ids,
-                    &rows_by_ast_id,
-                    &mut edge_assert_context,
-                    &mut late_incomplete,
-                ),
-                PolicyAssert::Canonical(assertion) => match subject.ast_ids(&assertion.equals) {
-                    Some(equals_ids) => evaluate_canonical_assert(
+            }
+            match assertion_scope_query(&file_paths, budget) {
+                Ok(query) => queries.push(query),
+                Err(message) => {
+                    return failed_policy_run(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        message,
+                        budget,
+                    );
+                }
+            }
+        }
+
+        let mut file_incomplete: Vec<PolicyIncompleteReason> = Vec::new();
+        let mut executed = Vec::new();
+        for query in &queries {
+            let outcome = execute_code_query_detailed_eager_index(
+                context.analyzer,
+                query,
+                budget.query_limits(),
+                context.cancellation,
+            );
+            file_incomplete.extend(incomplete_reasons(
+                &outcome.result.completion(),
+                outcome.result.truncated,
+            ));
+            run_failures.extend(failure_reasons(&outcome.result.completion()));
+            query_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
+            total_work = total_work.saturating_add(outcome.work);
+            row_completions.push(outcome.result.completion());
+            executed.push(outcome);
+        }
+
+        if needs_generation {
+            let query = match assertion_generation_query(&file_paths, budget) {
+                Ok(query) => query,
+                Err(message) => {
+                    return failed_policy_run(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        message,
+                        budget,
+                    );
+                }
+            };
+            let mut outcome = execute_code_query_detailed_eager_index(
+                context.analyzer,
+                &query,
+                budget.query_limits(),
+                context.cancellation,
+            );
+            // A dynamic generation site reports the generated-set axis
+            // incomplete at query level, but here that honesty is handled per
+            // row: a dynamic site makes exactly the asserts over it
+            // inconclusive (or, under :forbid-dynamic, the finding), never the
+            // whole file.
+            outcome.result.diagnostics.retain(|diagnostic| {
+                diagnostic.code != CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
+            });
+            file_incomplete.extend(incomplete_reasons(
+                &outcome.result.completion(),
+                outcome.result.truncated,
+            ));
+            run_failures.extend(failure_reasons(&outcome.result.completion()));
+            query_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
+            total_work = total_work.saturating_add(outcome.work);
+            row_completions.push(outcome.result.completion());
+            executed.push(outcome);
+        }
+
+        if !run_failures.is_empty() {
+            return failed_policy_run_with_reason(
+                policy,
+                PolicyAnalysisType::Assertion,
+                Vec::new(),
+                run_failures[0],
+                "assertion evaluation could not execute a valid query plan",
+                work_report(total_work, 0, 0),
+                budget,
+            );
+        }
+
+        let mut state_results: Vec<std::sync::Arc<MaterializationFileResult>> = Vec::new();
+        if needs_declaration_state {
+            match files_by_rel.get(path) {
+                None => file_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete),
+                Some(file) => {
+                    let result =
+                        std::sync::Arc::new(materialization_for_file(context.analyzer, file));
+                    if !result
+                        .completeness
+                        .covers(MaterializationAxis::DeclarationState)
+                    {
+                        file_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+                    }
+                    state_results.push(result);
+                }
+            }
+        }
+
+        if file_subjects
+            .iter()
+            .any(|subject| !subject.captures_without_ast_id.is_empty())
+        {
+            file_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+        }
+
+        // Soundness rule 1, per file: a verdict over an incomplete row set is
+        // never a pass and never a finding, so this file's asserts are not
+        // evaluated at all and the file is reported as unconcluded.
+        if !file_incomplete.is_empty() {
+            file_incomplete.sort();
+            file_incomplete.dedup();
+            unconcluded_files.push((path, file_incomplete));
+            continue;
+        }
+
+        let mut rows_by_ast_id: HashMap<&str, Vec<&CodeQueryOccurrence>> = HashMap::new();
+        let mut candidates_by_ast_id: HashMap<&str, Vec<&CodeQueryResolutionCandidate>> =
+            HashMap::new();
+        // A reaching binding is an answer about one occurrence, and the row
+        // says which one: the join is that identity, never the binding's name.
+        // The identity is path-qualified because a canonical AST id repeats
+        // verbatim across files with identical content, and the binding must
+        // only join occurrences of its own file.
+        let mut bindings_by_occurrence: HashMap<(&str, &str), Vec<&CodeQueryBinding>> =
+            HashMap::new();
+        let mut scopes_by_index: HashMap<(&str, u32), &CodeQueryLexicalScope> = HashMap::new();
+        let mut sites_by_ast_id: HashMap<&str, Vec<&CodeQueryGenerationSite>> = HashMap::new();
+        for query in &executed {
+            for item in &query.result.results {
+                match &item.value {
+                    CodeQueryResultValue::Occurrence { value } => rows_by_ast_id
+                        .entry(value.ast_id.as_str())
+                        .or_default()
+                        .push(value),
+                    CodeQueryResultValue::ResolutionCandidate { value } => candidates_by_ast_id
+                        .entry(value.ast_id.as_str())
+                        .or_default()
+                        .push(value),
+                    CodeQueryResultValue::Binding { value } => {
+                        if let Some(reached_from) = value.reached_from_ast_id.as_deref() {
+                            bindings_by_occurrence
+                                .entry((value.path.as_str(), reached_from))
+                                .or_default()
+                                .push(value);
+                        }
+                    }
+                    CodeQueryResultValue::LexicalScope { value } => {
+                        scopes_by_index.insert((value.path.as_str(), value.index), value);
+                    }
+                    CodeQueryResultValue::GenerationSite { value } => {
+                        if let Some(ast_id) = value.ast_id.as_deref() {
+                            sites_by_ast_id.entry(ast_id).or_default().push(value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut states_by_ast_id: HashMap<String, Vec<&DeclarationStateRow>> = HashMap::new();
+        for result in &state_results {
+            for row in &result.states {
+                if let Some(ast_id) = row.ast_id() {
+                    states_by_ast_id.entry(ast_id).or_default().push(row);
+                }
+            }
+        }
+
+        // Capability reporting on this file's findings depends on the subject
+        // query plus this file's own row queries, not on gaps another file
+        // surfaced.
+        let mut capability_diagnostics = subject.result.diagnostics.clone();
+        for query in &executed {
+            capability_diagnostics.extend(query.result.diagnostics.iter().cloned());
+        }
+        let capability = assertion_capabilities(&capability_diagnostics);
+
+        let work = work_report(total_work, 0, 0);
+        let mut file_findings: Vec<PolicyFinding> = Vec::new();
+        // Soundness rule 3, per file: an input a single assert cannot conclude
+        // over -- an unattributed tier, a rejection-dependent assert on a
+        // selection-only trace, a missing selection -- makes this *file*
+        // inconclusive with zero findings, exactly like an incomplete query.
+        // The file's assembled verdicts are discarded rather than reported
+        // beside an admission; other files' verdicts stand.
+        let mut late_incomplete: Vec<PolicyIncompleteReason> = Vec::new();
+        for subject in file_subjects.iter().copied() {
+            for assertion in &spec.asserts {
+                // Soundness rule 2: an unbound `:at` is an authoring error,
+                // never a vacuous pass.
+                let Some(ast_ids) = subject.ast_ids(assertion.at()) else {
+                    return failed_policy_run_with_reason(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        Vec::new(),
+                        PolicyFailureReason::InvalidExecutionPlan,
+                        &format!(
+                            "assert `{}` names capture `{}`, which the subject selector does not bind at {}",
+                            assertion.id(),
+                            assertion.at(),
+                            subject.path.as_str()
+                        ),
+                        work,
+                        budget,
+                    );
+                };
+                // A capture that carries no occurrence of the asserted role is
+                // not a subject this assert is about. Only the occurrence
+                // family, whose whole question is how many such rows exist,
+                // evaluates anyway.
+                if let Some(role) = assertion.role()
+                    && !matches!(assertion, PolicyAssert::Occurrence(_))
+                    && !joined_role_rows(&ast_ids, &rows_by_ast_id, role)
+                {
+                    continue;
+                }
+                let violation = match assertion {
+                    PolicyAssert::Occurrence(assertion) => {
+                        evaluate_occurrence_assert(assertion, &ast_ids, &rows_by_ast_id)
+                    }
+                    PolicyAssert::Resolution(assertion) => evaluate_resolution_assert(
                         assertion,
-                        subject,
                         &ast_ids,
-                        &equals_ids,
-                        identity_support
-                            .as_mut()
-                            .expect("identity producers exist when a canonical assert does"),
-                        context,
+                        &candidates_by_ast_id,
                         &mut late_incomplete,
                     ),
-                    None => {
-                        return failed_policy_run_with_reason(
-                            policy,
-                            PolicyAnalysisType::Assertion,
-                            Vec::new(),
-                            PolicyFailureReason::InvalidExecutionPlan,
-                            &format!(
-                                "assert `{}` names capture `{}`, which the subject selector does not bind at {}",
-                                assertion.id,
-                                assertion.equals,
-                                subject.path.as_str()
-                            ),
-                            work,
-                            budget,
-                        );
-                    }
-                },
-                PolicyAssert::Route(assertion) => match subject.ast_ids(&assertion.to) {
-                    Some(to_ids) => evaluate_route_assert(
+                    PolicyAssert::Boundary(assertion) => evaluate_boundary_assert(
                         assertion,
-                        subject,
                         &ast_ids,
-                        &to_ids,
-                        identity_support
-                            .as_mut()
-                            .expect("identity producers exist when a route assert does"),
-                        context,
+                        &candidates_by_ast_id,
                         &mut late_incomplete,
                     ),
-                    None => {
-                        return failed_policy_run_with_reason(
-                            policy,
-                            PolicyAnalysisType::Assertion,
-                            Vec::new(),
-                            PolicyFailureReason::InvalidExecutionPlan,
-                            &format!(
-                                "assert `{}` names capture `{}`, which the subject selector does not bind at {}",
-                                assertion.id,
-                                assertion.to,
-                                subject.path.as_str()
-                            ),
-                            work,
-                            budget,
-                        );
+                    PolicyAssert::Generation(assertion) => evaluate_generation_assert(
+                        assertion,
+                        &ast_ids,
+                        &sites_by_ast_id,
+                        &mut late_incomplete,
+                    ),
+                    PolicyAssert::DeclarationState(assertion) => {
+                        evaluate_declaration_state_assert(assertion, &ast_ids, &states_by_ast_id)
                     }
-                },
-                PolicyAssert::RoundTrip(assertion) => evaluate_round_trip_assert(
-                    assertion,
-                    subject,
-                    &ast_ids,
-                    identity_support
-                        .as_mut()
-                        .expect("identity producers exist when a round-trip assert does"),
-                    context,
-                    &mut late_incomplete,
-                ),
-                PolicyAssert::Reaching(assertion) => {
-                    match subject.ast_ids(&assertion.relative_to) {
-                        Some(_) => evaluate_reaching_assert(
+                    PolicyAssert::EdgeParity(assertion) => evaluate_edge_parity_assert(
+                        assertion,
+                        &ast_ids,
+                        &rows_by_ast_id,
+                        &mut edge_assert_context,
+                        &mut late_incomplete,
+                    ),
+                    PolicyAssert::EdgeClass(assertion) => evaluate_edge_class_assert(
+                        assertion,
+                        &ast_ids,
+                        &rows_by_ast_id,
+                        &mut edge_assert_context,
+                        &mut late_incomplete,
+                    ),
+                    PolicyAssert::Canonical(assertion) => {
+                        match subject.ast_ids(&assertion.equals) {
+                            Some(equals_ids) => evaluate_canonical_assert(
+                                assertion,
+                                subject,
+                                &ast_ids,
+                                &equals_ids,
+                                identity_support.as_mut().expect(
+                                    "identity producers exist when a canonical assert does",
+                                ),
+                                context,
+                                &mut late_incomplete,
+                            ),
+                            None => {
+                                return failed_policy_run_with_reason(
+                                    policy,
+                                    PolicyAnalysisType::Assertion,
+                                    Vec::new(),
+                                    PolicyFailureReason::InvalidExecutionPlan,
+                                    &format!(
+                                        "assert `{}` names capture `{}`, which the subject selector does not bind at {}",
+                                        assertion.id,
+                                        assertion.equals,
+                                        subject.path.as_str()
+                                    ),
+                                    work,
+                                    budget,
+                                );
+                            }
+                        }
+                    }
+                    PolicyAssert::Route(assertion) => match subject.ast_ids(&assertion.to) {
+                        Some(to_ids) => evaluate_route_assert(
                             assertion,
                             subject,
                             &ast_ids,
-                            &bindings_by_occurrence,
-                            &scopes_by_index,
+                            &to_ids,
+                            identity_support
+                                .as_mut()
+                                .expect("identity producers exist when a route assert does"),
+                            context,
                             &mut late_incomplete,
                         ),
                         None => {
@@ -588,149 +593,221 @@ pub(super) fn evaluate_assertion_policy(
                                 &format!(
                                     "assert `{}` names capture `{}`, which the subject selector does not bind at {}",
                                     assertion.id,
-                                    assertion.relative_to,
+                                    assertion.to,
                                     subject.path.as_str()
                                 ),
                                 work,
                                 budget,
                             );
                         }
+                    },
+                    PolicyAssert::RoundTrip(assertion) => evaluate_round_trip_assert(
+                        assertion,
+                        subject,
+                        &ast_ids,
+                        identity_support
+                            .as_mut()
+                            .expect("identity producers exist when a round-trip assert does"),
+                        context,
+                        &mut late_incomplete,
+                    ),
+                    PolicyAssert::Reaching(assertion) => {
+                        match subject.ast_ids(&assertion.relative_to) {
+                            Some(_) => evaluate_reaching_assert(
+                                assertion,
+                                subject,
+                                &ast_ids,
+                                &bindings_by_occurrence,
+                                &scopes_by_index,
+                                &mut late_incomplete,
+                            ),
+                            None => {
+                                return failed_policy_run_with_reason(
+                                    policy,
+                                    PolicyAnalysisType::Assertion,
+                                    Vec::new(),
+                                    PolicyFailureReason::InvalidExecutionPlan,
+                                    &format!(
+                                        "assert `{}` names capture `{}`, which the subject selector does not bind at {}",
+                                        assertion.id,
+                                        assertion.relative_to,
+                                        subject.path.as_str()
+                                    ),
+                                    work,
+                                    budget,
+                                );
+                            }
+                        }
                     }
-                }
-            };
-            let Some(violation) = violation else {
-                continue;
-            };
+                };
+                let Some(violation) = violation else {
+                    continue;
+                };
 
-            let anchor = super::super::finding_identity::AssertionFindingAnchor::new(
-                subject.path.clone(),
-                ast_ids.first().copied().unwrap_or(""),
-                assertion.id().as_str(),
-            );
-            let Ok(evidence) = super::super::finding::AssertionFindingEvidence::try_new(
-                anchor,
-                assertion.kind_label(),
-                assertion.role().map_or("declaration", |role| role.label()),
-                violation.expected_class,
-                violation.expectation.clone(),
-                violation.observed.clone(),
-                violation.actual_count,
-                capability.clone(),
-            ) else {
-                return failed_policy_run_with_reason(
-                    policy,
-                    PolicyAnalysisType::Assertion,
-                    findings,
-                    PolicyFailureReason::InternalInvariant,
-                    "a violated assertion could not be projected into validated policy evidence",
-                    work,
+                let anchor = super::super::finding_identity::AssertionFindingAnchor::new(
+                    subject.path.clone(),
+                    ast_ids.first().copied().unwrap_or(""),
+                    assertion.id().as_str(),
+                );
+                let Ok(evidence) = super::super::finding::AssertionFindingEvidence::try_new(
+                    anchor,
+                    assertion.kind_label(),
+                    assertion.role().map_or("declaration", |role| role.label()),
+                    violation.expected_class,
+                    violation.expectation.clone(),
+                    violation.observed.clone(),
+                    violation.actual_count,
+                    capability.clone(),
+                ) else {
+                    findings.extend(file_findings);
+                    return failed_policy_run_with_reason(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        findings,
+                        PolicyFailureReason::InternalInvariant,
+                        "a violated assertion could not be projected into validated policy evidence",
+                        work,
+                        budget,
+                    );
+                };
+
+                let mut related_truncated = false;
+                let mut omitted_related = 0_u64;
+                let related = match assertion_related_locations(
+                    subject,
+                    &violation,
+                    budget,
+                    &mut related_truncated,
+                    &mut omitted_related,
+                ) {
+                    Ok(related) => related,
+                    Err(()) => {
+                        findings.extend(file_findings);
+                        return failed_policy_run_with_reason(
+                            policy,
+                            PolicyAnalysisType::Assertion,
+                            findings,
+                            PolicyFailureReason::InternalInvariant,
+                            "an evidence row could not be projected into a related policy location",
+                            work,
+                            budget,
+                        );
+                    }
+                };
+
+                let completeness = if related_truncated {
+                    FindingCompleteness::partial(vec![
+                        FindingIncompleteReason::RelatedLocationsTruncated,
+                    ])
+                    .expect("one typed finding-incomplete reason is canonical")
+                } else {
+                    FindingCompleteness::Complete
+                };
+                let proof = ProofMetadata::try_new(
+                    ProofState::Proven,
+                    vec![ProofReason::DirectStructuralMatch],
+                    Vec::new(),
+                )
+                .expect("a proven direct structural match is a canonical proof");
+                let finding = PolicyFinding::try_new(
+                    metadata.id.clone(),
+                    policy.semantic_hash(),
+                    severity,
+                    message.clone(),
+                    classification.clone(),
+                    FindingCertainty::Definite,
+                    completeness,
+                    subject.location.clone(),
+                    related,
+                    related_truncated,
+                    omitted_related,
+                    PolicyFindingEvidence::Assertion { evidence },
+                    false,
+                    0,
+                    None,
+                    None,
+                    proof,
+                    Vec::new(),
+                    false,
+                    0,
                     budget,
                 );
-            };
-
-            let mut related_truncated = false;
-            let mut omitted_related = 0_u64;
-            let related = match assertion_related_locations(
-                subject,
-                &violation,
-                budget,
-                &mut related_truncated,
-                &mut omitted_related,
-            ) {
-                Ok(related) => related,
-                Err(()) => {
-                    return failed_policy_run_with_reason(
-                        policy,
-                        PolicyAnalysisType::Assertion,
-                        findings,
-                        PolicyFailureReason::InternalInvariant,
-                        "an evidence row could not be projected into a related policy location",
-                        work,
-                        budget,
-                    );
-                }
-            };
-
-            let completeness = if related_truncated {
-                FindingCompleteness::partial(vec![
-                    FindingIncompleteReason::RelatedLocationsTruncated,
-                ])
-                .expect("one typed finding-incomplete reason is canonical")
-            } else {
-                FindingCompleteness::Complete
-            };
-            let proof = ProofMetadata::try_new(
-                ProofState::Proven,
-                vec![ProofReason::DirectStructuralMatch],
-                Vec::new(),
-            )
-            .expect("a proven direct structural match is a canonical proof");
-            let finding = PolicyFinding::try_new(
-                metadata.id.clone(),
-                policy.semantic_hash(),
-                severity,
-                message.clone(),
-                classification.clone(),
-                FindingCertainty::Definite,
-                completeness,
-                subject.location.clone(),
-                related,
-                related_truncated,
-                omitted_related,
-                PolicyFindingEvidence::Assertion { evidence },
-                false,
-                0,
-                None,
-                None,
-                proof,
-                Vec::new(),
-                false,
-                0,
-                budget,
-            );
-            match finding {
-                Ok(finding) => findings.push(finding),
-                Err(_) => {
-                    return failed_policy_run_with_reason(
-                        policy,
-                        PolicyAnalysisType::Assertion,
-                        findings,
-                        PolicyFailureReason::InternalInvariant,
-                        "a validated assertion violation could not be retained as a finding",
-                        work,
-                        budget,
-                    );
+                match finding {
+                    Ok(finding) => file_findings.push(finding),
+                    Err(_) => {
+                        findings.extend(file_findings);
+                        return failed_policy_run_with_reason(
+                            policy,
+                            PolicyAnalysisType::Assertion,
+                            findings,
+                            PolicyFailureReason::InternalInvariant,
+                            "a validated assertion violation could not be retained as a finding",
+                            work,
+                            budget,
+                        );
+                    }
                 }
             }
         }
+
+        if late_incomplete.is_empty() {
+            findings.append(&mut file_findings);
+        } else {
+            late_incomplete.sort();
+            late_incomplete.dedup();
+            unconcluded_files.push((path, late_incomplete));
+        }
     }
 
-    if !late_incomplete.is_empty() {
-        late_incomplete.sort();
-        late_incomplete.dedup();
-        return inconclusive_policy_run_many(
-            policy,
-            PolicyAnalysisType::Assertion,
-            late_incomplete,
-            "an assertion could not conclude over the rows the analyzer could state",
-            work,
-            budget,
+    let adapted = adapt_query_diagnostics(&query_diagnostics, budget.max_diagnostics());
+    let mut diagnostics = adapted.diagnostics;
+    let mut diagnostics_truncated = adapted.truncated;
+    let mut run_incomplete: Vec<PolicyIncompleteReason> = unconcluded_files
+        .iter()
+        .flat_map(|(_, reasons)| reasons.iter().copied())
+        .collect();
+    if diagnostics_truncated {
+        run_incomplete.push(PolicyIncompleteReason::ReportRetentionBudget);
+    }
+    if adapted.adaptation_failed {
+        retain_incomplete_diagnostic(
+            &mut diagnostics,
+            &mut diagnostics_truncated,
+            budget.max_diagnostics(),
+            "one or more query diagnostics could not be retained as validated policy diagnostics",
         );
     }
+    if !unconcluded_files.is_empty() {
+        retain_unconcluded_files_diagnostic(
+            &unconcluded_files,
+            &mut diagnostics,
+            &mut diagnostics_truncated,
+            budget.max_diagnostics(),
+        );
+    }
+    run_incomplete.sort();
+    run_incomplete.dedup();
 
-    let mut completion = PolicyRunCompletion::Complete;
-    if let CodeQueryCompletion::ProvenSubset { codes } = &subject_completion {
-        completion = PolicyRunCompletion::proven_subset(codes.clone())
-            .expect("the detailed subject query declared at least one non-exhaustive omission");
-    } else {
-        for row_completion in &row_completions {
-            if let CodeQueryCompletion::ProvenSubset { codes } = row_completion {
-                completion = PolicyRunCompletion::proven_subset(codes.clone())
-                    .expect("a detailed row query declared at least one non-exhaustive omission");
-                break;
+    let completion = if run_incomplete.is_empty() {
+        let mut completion = PolicyRunCompletion::Complete;
+        if let CodeQueryCompletion::ProvenSubset { codes } = &subject_completion {
+            completion = PolicyRunCompletion::proven_subset(codes.clone())
+                .expect("the detailed subject query declared at least one non-exhaustive omission");
+        } else {
+            for row_completion in &row_completions {
+                if let CodeQueryCompletion::ProvenSubset { codes } = row_completion {
+                    completion = PolicyRunCompletion::proven_subset(codes.clone()).expect(
+                        "a detailed row query declared at least one non-exhaustive omission",
+                    );
+                    break;
+                }
             }
         }
-    }
+        completion
+    } else {
+        PolicyRunCompletion::inconclusive(run_incomplete)
+            .expect("typed per-file incomplete reasons are canonical")
+    };
     let work = work_report(total_work, findings.len(), 0);
     finish_assembled_run(
         policy,
@@ -743,6 +820,49 @@ pub(super) fn evaluate_assertion_policy(
         "assertion evaluation produced an invalid policy run",
         budget,
     )
+}
+
+/// Retain one diagnostic that names every file whose verdict this run could
+/// not conclude, with each file's typed reasons. The complete set is listed
+/// unless the report prose bound forces a tail count.
+fn retain_unconcluded_files_diagnostic(
+    unconcluded_files: &[(&str, Vec<PolicyIncompleteReason>)],
+    diagnostics: &mut Vec<PolicyDiagnostic>,
+    diagnostics_truncated: &mut bool,
+    max_diagnostics: usize,
+) {
+    if diagnostics.len() >= max_diagnostics {
+        *diagnostics_truncated = true;
+        return;
+    }
+    // The policy-report prose bound is 4096 bytes; leave room for the tail
+    // note so the message always validates.
+    const MESSAGE_BYTE_BUDGET: usize = 3_900;
+    let mut message = String::from("assertion evaluation could not conclude these subject files: ");
+    let mut listed = 0_usize;
+    for (path, reasons) in unconcluded_files {
+        let entry = format!("{}{path} {reasons:?}", if listed == 0 { "" } else { "; " });
+        if message.len() + entry.len() > MESSAGE_BYTE_BUDGET {
+            break;
+        }
+        message.push_str(&entry);
+        listed += 1;
+    }
+    let omitted = unconcluded_files.len() - listed;
+    if omitted > 0 {
+        message.push_str(&format!(" ... and {omitted} more unconcluded files"));
+    }
+    match PolicyDiagnostic::try_new(
+        PolicyDiagnosticCode::EvaluationFailure,
+        PolicyDiagnosticSeverity::Warning,
+        PolicyDiagnosticImpact::RunIncomplete,
+        &message,
+        None,
+        Vec::new(),
+    ) {
+        Ok(diagnostic) => diagnostics.push(diagnostic),
+        Err(_) => *diagnostics_truncated = true,
+    }
 }
 
 /// Execute a decoded relational assertion plan: run every named query and
@@ -2307,6 +2427,12 @@ fn assertion_generation_query(
     paths: &[&str],
     budget: &PolicyBudget,
 ) -> Result<CodeQuery, &'static str> {
+    // An empty exact-path list is an unrestricted seed; a caller with no
+    // subject files must skip the query instead of scanning the workspace.
+    assert!(
+        !paths.is_empty(),
+        "assertion generation queries require subject paths"
+    );
     let Ok(seed) = GenerationSiteSeed::for_exact_paths(paths.iter().copied()) else {
         return Err("an assertion subject path is not a valid scan pattern");
     };
