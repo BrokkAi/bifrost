@@ -14,8 +14,8 @@ use crate::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, JsTsLexicalBindingScope,
     direct_property_definitions, is_commonjs_require_declarator, is_declaration_identifier,
     is_lexically_nested_type_declaration, is_object_in_member_expression,
-    is_property_key_in_member, nested_type_identifier_parts, pattern_binder_identifiers, slice,
-    static_member_receiver,
+    is_property_key_in_member, js_program_is_external_module, nested_type_identifier_parts,
+    pattern_binder_identifiers, slice, static_member_receiver,
 };
 use crate::ts_owners::ts_resolve_type_text_to_property_owners;
 use crate::type_text::ts_type_annotation_text;
@@ -80,6 +80,18 @@ pub fn scan_files_for_seeds(
     let direct_local_property =
         lookup_only_local_property || exported_local_property_root.is_some();
     let direct_local_property_ranges = direct_local_property.then(|| analyzer.ranges(target));
+    // A definition-lookup-only property has no declaration surface and no export,
+    // so the only structured route to it from another file is the browser-script
+    // global model the forward lookup already owns. Read the admissible receiver
+    // chains once, out of the declaring file's own parse (#1777).
+    let global_property_receivers = if lookup_only_local_property {
+        let member = target_member
+            .as_deref()
+            .expect("a definition-lookup-only property target has a member name");
+        collect_global_property_receivers(analyzer, target, member, language)
+    } else {
+        Vec::new()
+    };
     let target_short = target_seed_identifier(target, target_owner.as_ref());
     let reference_needle = target_member.as_deref().unwrap_or(&target_short);
     let target_owner_source = target_owner.as_ref().map(|owner| owner.source().clone());
@@ -147,26 +159,44 @@ pub fn scan_files_for_seeds(
         }
 
         let root = tree_ref.root_node();
-        let lexical_bindings = ((browser_global_object.is_some() || direct_local_property)
+        // The global-property model needs this file's bindings too: a reading file
+        // that binds the receiver root reads its own object, exactly as it does in
+        // the declaring file.
+        let lexical_bindings = (((browser_global_object.is_some() || direct_local_property)
             && target_self_file)
-            .then(|| JsTsLexicalBindingIndex::build(root, source_str));
-        let browser_global_object = lexical_bindings.as_ref().and_then(|lexical_bindings| {
-            unbound_browser_global_property(analyzer, target, root, source_str, lexical_bindings)
+            || !global_property_receivers.is_empty())
+        .then(|| JsTsLexicalBindingIndex::build(root, source_str));
+        // Both remaining same-file models read the declaring file's byte ranges, so
+        // they stay confined to it however the bindings above were built.
+        let browser_global_object = lexical_bindings
+            .as_ref()
+            .filter(|_| target_self_file)
+            .and_then(|lexical_bindings| {
+                unbound_browser_global_property(
+                    analyzer,
+                    target,
+                    root,
+                    source_str,
+                    lexical_bindings,
+                )
                 .map(|(object, _)| object)
-        });
-        let local_property_definitions = lexical_bindings.as_ref().and_then(|lexical_bindings| {
-            let target_member = target_member.as_deref()?;
-            let target_ranges = direct_local_property_ranges.as_deref()?;
-            let definitions = collect_local_property_definitions(
-                root,
-                source_str,
-                target_ranges,
-                target_member,
-                lexical_bindings,
-                exported_local_property_root,
-            );
-            (!definitions.is_empty()).then_some(definitions)
-        });
+            });
+        let local_property_definitions = lexical_bindings
+            .as_ref()
+            .filter(|_| target_self_file)
+            .and_then(|lexical_bindings| {
+                let target_member = target_member.as_deref()?;
+                let target_ranges = direct_local_property_ranges.as_deref()?;
+                let definitions = collect_local_property_definitions(
+                    root,
+                    source_str,
+                    target_ranges,
+                    target_member,
+                    lexical_bindings,
+                    exported_local_property_root,
+                );
+                (!definitions.is_empty()).then_some(definitions)
+            });
         let definitions = host.usage_definitions();
         let receiver_facts = JsTsReceiverFactProvider::new(
             host,
@@ -189,6 +219,7 @@ pub fn scan_files_for_seeds(
             browser_global_object,
             lookup_only_local_property,
             local_property_definitions,
+            global_property_receivers: &global_property_receivers,
             edges: &edges,
             seeds,
             target_self_file,
@@ -287,6 +318,9 @@ pub struct ScanCtx<'a> {
     /// available for exact, same-file definition lookup and targeted usage scans.
     lookup_only_local_property: bool,
     local_property_definitions: Option<Vec<LocalPropertyDefinition>>,
+    /// Receiver chains the declaring file binds at program scope in a browser
+    /// script, so any other script reading the same chain reads this target.
+    global_property_receivers: &'a [GlobalPropertyReceiver],
     /// Import edges from this file that resolve to the target's seed set.
     edges: &'a [ImportEdge],
     /// Exported names that resolve to the target, including local and re-export aliases.
@@ -321,6 +355,70 @@ struct LocalPropertyDefinition {
     receiver_members: Vec<String>,
     scope: JsTsLexicalBindingScope,
     property_range: Range,
+}
+
+/// A receiver chain (`WLT`, or `WLT.Inner`) whose root the declaring file binds
+/// at program scope in a browser script. Only the spelling crosses the file
+/// boundary: the declaring file's byte ranges mean nothing in a reading file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GlobalPropertyReceiver {
+    root: String,
+    members: Vec<String>,
+}
+
+/// The receiver chains through which another script can read `target_member`
+/// off the target's declaring file.
+///
+/// This is the inverse's half of forward's
+/// `jsts_cross_file_dotted_receiver_has_global_identity`: the declaring file
+/// must be a browser script rather than an external module, and each chain's
+/// root must be one of that script's program-scope bindings -- that is, a
+/// property of the one shared global object.
+fn collect_global_property_receivers(
+    analyzer: &dyn CodeUnitIndex,
+    target: &CodeUnit,
+    target_member: &str,
+    language: Language,
+) -> Vec<GlobalPropertyReceiver> {
+    let Ok(source) = target.source().read_to_string() else {
+        return Vec::new();
+    };
+    let Some(parser_language) = js_ts_tree_sitter_language_for_file(target.source(), language)
+    else {
+        return Vec::new();
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&parser_language).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source.as_str(), None) else {
+        return Vec::new();
+    };
+    let root = tree.root_node();
+    if js_program_is_external_module(root, source.as_str()) {
+        return Vec::new();
+    }
+    let lexical_bindings = JsTsLexicalBindingIndex::build(root, source.as_str());
+    let target_ranges = analyzer.ranges(target);
+    direct_property_definitions(root, source.as_str(), &target_ranges, target_member)
+        .into_iter()
+        .filter(|definition| {
+            lexical_bindings.is_program_binding_at(
+                slice(definition.receiver.root, source.as_str()),
+                definition.receiver.root.start_byte(),
+                root,
+            )
+        })
+        .map(|definition| GlobalPropertyReceiver {
+            root: slice(definition.receiver.root, source.as_str()).to_string(),
+            members: definition
+                .receiver
+                .members
+                .iter()
+                .map(|member| slice(*member, source.as_str()).to_string())
+                .collect(),
+        })
+        .collect()
 }
 
 fn collect_local_property_definitions(
@@ -383,6 +481,36 @@ fn local_property_read_matches(
                 .all(|(expected, actual)| expected == slice(*actual, source))
             && definition.scope == scope
             && definition.property_range.end_byte <= property.start_byte()
+    })
+}
+
+/// Whether `object` spells one of the target's global receiver chains, in a
+/// file that binds none of it.
+///
+/// Forward diverts a locally bound receiver to same-file resolution
+/// (`jsts_exact_local_dotted_candidates`), so a reading file that binds the
+/// root at all is reading its own object and disproves the global read. This
+/// also keeps the declaring file itself on the local-property model, where the
+/// root is bound by construction.
+fn global_property_read_matches(object: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if ctx.global_property_receivers.is_empty() {
+        return false;
+    }
+    let Some(receiver) = static_member_receiver(object, ctx.source) else {
+        return false;
+    };
+    let receiver_root = slice(receiver.root, ctx.source);
+    if ctx.lexically_bound_at(receiver_root, receiver.root.start_byte()) {
+        return false;
+    }
+    ctx.global_property_receivers.iter().any(|chain| {
+        chain.root == receiver_root
+            && chain.members.len() == receiver.members.len()
+            && chain
+                .members
+                .iter()
+                .zip(&receiver.members)
+                .all(|(expected, actual)| expected == slice(*actual, ctx.source))
     })
 }
 
@@ -1397,6 +1525,10 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             ) {
                 record_hit(property, ctx);
             }
+            return;
+        }
+        if global_property_read_matches(object, ctx) {
+            record_hit(property, ctx);
             return;
         }
         if ctx.lookup_only_local_property {

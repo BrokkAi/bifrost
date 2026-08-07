@@ -579,8 +579,12 @@ fn should_union_text_candidates(target: &CodeUnit) -> bool {
     (language == Language::Python && (target.is_function() || target.is_field()) && member)
         // Dynamic instance receivers can cross unresolved emitted-file import
         // boundaries, so the import graph alone cannot prove candidate absence.
+        // A browser-script namespace field (`WLT.Utils = ...`) is read across
+        // files with no import edge at all, so fields need the same union
+        // (#1777). Text search only selects files that spell the identifier;
+        // the JS/TS graph still proves each receiver.
         || (matches!(language, Language::JavaScript | Language::TypeScript)
-            && target.is_function()
+            && (target.is_function() || target.is_field())
             && member
             && !target.short_name().ends_with("$static"))
         // Symbolic Scala methods such as `-` and `<` are commonly visible through

@@ -525,6 +525,58 @@ fn authoritative_js_hits(
     }
 }
 
+fn authoritative_js_hits_across(
+    analyzer: &JavascriptAnalyzer,
+    target: &CodeUnit,
+    candidates: impl IntoIterator<Item = ProjectFile>,
+) -> BTreeSet<brokk_bifrost::usages::UsageHit> {
+    let candidates: brokk_bifrost::hash::HashSet<ProjectFile> = candidates.into_iter().collect();
+    let max_files = candidates.len();
+    let provider = ExplicitCandidateProvider::new(Arc::new(candidates));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            analyzer,
+            std::slice::from_ref(target),
+            Some(&provider),
+            max_files,
+            100,
+        );
+    match query.result {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload.get(target).cloned().unwrap_or_default(),
+        other => panic!("expected authoritative JS usage success, got {other:#?}"),
+    }
+}
+
+/// Usages found through the shipped candidate-selection path (no explicit
+/// scope), which is what `scan_usages` runs.
+fn default_scope_js_hits(
+    analyzer: &JavascriptAnalyzer,
+    target: &CodeUnit,
+) -> BTreeSet<brokk_bifrost::usages::UsageHit> {
+    let query = UsageFinder::new().query(analyzer, std::slice::from_ref(target), 100, 100);
+    match query.result {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload.get(target).cloned().unwrap_or_default(),
+        other => panic!("expected default-scope JS usage success, got {other:#?}"),
+    }
+}
+
+fn hit_sites(hits: &BTreeSet<brokk_bifrost::usages::UsageHit>) -> BTreeSet<(String, usize, usize)> {
+    hits.iter()
+        .map(|hit| {
+            (
+                hit.file.rel_path().to_string_lossy().replace('\\', "/"),
+                hit.start_offset,
+                hit.end_offset,
+            )
+        })
+        .collect()
+}
+
 fn authoritative_ts_hits(
     analyzer: &TypescriptAnalyzer,
     target: &CodeUnit,
@@ -686,6 +738,110 @@ function otherReceiver() { return holder.zqxfoo.bar; }
         ]),
         ranges,
         "the receiver, value, callee and qualified reads are the browser global; the local shadow and the unrelated receiver's property are not: {hits:#?}"
+    );
+}
+
+const NAMESPACE_BASE_JS: &str = r#"var WLT = WLT || {};
+WLT.Utils = (() => ({ markFuzzy: 1 }))();
+function sameFile() { return WLT.Utils; }
+"#;
+
+const NAMESPACE_FULL_JS: &str = r#"function go() { helper(WLT.Utils.markFuzzy); }
+function other() { return WLT.Other; }
+"#;
+
+fn namespace_field_target(analyzer: &JavascriptAnalyzer, base: &ProjectFile) -> CodeUnit {
+    find_js_definition(analyzer, base, "WLT.Utils", |unit| {
+        unit.fq_name() == "WLT.Utils" && unit.is_field()
+    })
+}
+
+/// #1777: `WLT.Utils = ...` under a plain-local root is a definition-lookup-only
+/// unit, and forward resolves a cross-file read of it through the browser-script
+/// global model. The inverse must report the same reads.
+#[test]
+fn js_lookup_only_namespace_field_counts_cross_file_browser_script_read() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file("base.js", NAMESPACE_BASE_JS)
+            .file("full.js", NAMESPACE_FULL_JS)
+            .build()
+    });
+    let base = project.file("base.js");
+    let full = project.file("full.js");
+    let target = namespace_field_target(&analyzer, &base);
+
+    let hits = authoritative_js_hits_across(&analyzer, &target, [base, full]);
+    let (base_start, base_end) = identifier_occurrence_range(NAMESPACE_BASE_JS, "Utils", 1);
+    let (full_start, full_end) = identifier_occurrence_range(NAMESPACE_FULL_JS, "Utils", 0);
+
+    assert_eq!(
+        BTreeSet::from([
+            ("base.js".to_string(), base_start, base_end),
+            ("full.js".to_string(), full_start, full_end),
+        ]),
+        hit_sites(&hits),
+        "the same-file read and the cross-file script read are usages; `WLT.Other` is not: {hits:#?}"
+    );
+}
+
+/// The cross-file admission carries forward's proof, so it must die with it:
+/// an external module's members are not browser-script globals, and a reading
+/// file that binds the receiver root reads its own object.
+#[test]
+fn js_lookup_only_namespace_field_cross_file_read_requires_global_identity() {
+    let external_module_base = format!("{NAMESPACE_BASE_JS}export const z = 1;\n");
+    let shadowing_full = format!("const WLT = {{ Utils: {{}} }};\n{NAMESPACE_FULL_JS}");
+    for (base_source, full_source, reason) in [
+        (
+            external_module_base.as_str(),
+            NAMESPACE_FULL_JS,
+            "an external module's namespace field is not a browser-script global",
+        ),
+        (
+            NAMESPACE_BASE_JS,
+            shadowing_full.as_str(),
+            "a reading file that binds the receiver root reads its own object",
+        ),
+    ] {
+        let (project, analyzer) = js_inline_analyzer(|p| {
+            p.file("base.js", base_source)
+                .file("full.js", full_source)
+                .build()
+        });
+        let base = project.file("base.js");
+        let full = project.file("full.js");
+        let target = namespace_field_target(&analyzer, &base);
+
+        let hits = authoritative_js_hits_across(&analyzer, &target, [base, full]);
+        let (base_start, base_end) = identifier_occurrence_range(base_source, "Utils", 1);
+
+        assert_eq!(
+            BTreeSet::from([("base.js".to_string(), base_start, base_end)]),
+            hit_sites(&hits),
+            "{reason}: {hits:#?}"
+        );
+    }
+}
+
+/// The same read, discovered through the shipped candidate selection rather
+/// than an explicit scope: the reader is in another directory, so only the
+/// text-candidate union puts it in front of the matcher at all.
+#[test]
+fn js_lookup_only_namespace_field_cross_file_read_survives_candidate_selection() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file("static/base.js", NAMESPACE_BASE_JS)
+            .file("app/full.js", NAMESPACE_FULL_JS)
+            .build()
+    });
+    let base = project.file("static/base.js");
+    let target = namespace_field_target(&analyzer, &base);
+
+    let hits = default_scope_js_hits(&analyzer, &target);
+    let (full_start, full_end) = identifier_occurrence_range(NAMESPACE_FULL_JS, "Utils", 0);
+
+    assert!(
+        hit_sites(&hits).contains(&("app/full.js".to_string(), full_start, full_end)),
+        "default candidate selection must reach the cross-directory reader: {hits:#?}"
     );
 }
 
