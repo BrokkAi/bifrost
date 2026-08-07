@@ -17,6 +17,7 @@ mod semantic;
 pub(crate) mod structural;
 mod tests;
 mod usage_index;
+mod usage_queries;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
@@ -39,6 +40,7 @@ use super::js_ts::build_weighted_cache;
 pub(crate) use adapter::RustAdapter;
 use cache::{
     weight_code_unit_set, weight_export_index, weight_project_file_set, weight_reference_context,
+    weight_rust_usage_facts,
 };
 use cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
 use clones::build_rust_clone_candidate_data;
@@ -85,10 +87,20 @@ pub struct RustAnalyzer {
     /// per-export-name recomputation is gone (#1230 item 4).
     module_file_resolution_count: Arc<AtomicUsize>,
     usage_index: Arc<PoolSafeMemo<RustUsageIndex>>,
+    /// One blob's persisted per-file usage facts, memoized per
+    /// `(analysis generation, blob)`. Content-hash keys make the entry
+    /// self-invalidating -- an edited file is a different blob -- and the
+    /// generation component retires the whole cache when extraction semantics
+    /// move. Bounded by a byte budget, never by workspace size.
+    rust_usage_facts: Cache<RustFactCacheKey, Arc<facts::RustUsageFacts>>,
     hierarchy_index: Arc<OnceLock<RustHierarchyIndex>>,
     #[allow(dead_code)]
     type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
 }
+
+/// Cache key for [`RustAnalyzer::rust_usage_facts_of_blob`]: the analysis
+/// generation the rows belong to, and the blob they describe.
+type RustFactCacheKey = (Option<crate::analyzer::store::GenerationId>, git2::Oid);
 
 crate::analyzer::impl_forward_query_provider!(RustAnalyzer);
 
@@ -102,6 +114,38 @@ impl RustAnalyzer {
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
         self.inner.prepared_syntax(file)
+    }
+
+    pub(super) fn analyzer_store(&self) -> &Arc<crate::analyzer::store::AnalyzerStore> {
+        self.inner.analyzer_store()
+    }
+
+    pub(super) fn live_path_snapshot(&self) -> Arc<crate::analyzer::store::liveness::LiveSnapshot> {
+        self.inner.live_path_snapshot()
+    }
+
+    /// One blob's persisted per-file usage facts, read once per
+    /// `(generation, blob)` and then served from the bounded cache.
+    ///
+    /// `None` when the blob has no rows: it was never analyzed under this
+    /// generation, or it is not a Rust blob. Distinguishing "no facts" from
+    /// "empty facts" matters, because an empty Rust file still has a file-root
+    /// module row, so a genuinely analyzed blob is never empty.
+    pub(super) fn rust_usage_facts_of_blob(
+        &self,
+        oid: git2::Oid,
+    ) -> Option<Arc<facts::RustUsageFacts>> {
+        let key: RustFactCacheKey = (self.inner.language_generation("rust"), oid);
+        if let Some(cached) = self.rust_usage_facts.get(&key) {
+            return Some(cached);
+        }
+        let facts = self.analyzer_store().rust_usage_facts(oid, "rust").ok()?;
+        if facts.modules.is_empty() {
+            return None;
+        }
+        let facts = Arc::new(facts);
+        self.rust_usage_facts.insert(key, Arc::clone(&facts));
+        Some(facts)
     }
 
     pub(crate) fn declaration_candidates_by_identifier_limited(
@@ -350,6 +394,7 @@ impl RustAnalyzer {
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(PoolSafeMemo::new()),
+            rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
@@ -385,6 +430,7 @@ impl RustAnalyzer {
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(PoolSafeMemo::new()),
+            rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         })
@@ -636,6 +682,7 @@ impl IAnalyzer for RustAnalyzer {
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(PoolSafeMemo::new()),
+            rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
@@ -661,6 +708,7 @@ impl IAnalyzer for RustAnalyzer {
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(PoolSafeMemo::new()),
+            rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }

@@ -28,8 +28,9 @@ use super::graph_support::{
 use super::imports::{
     RustImportOwner, RustProjectedImport, RustVisibility, resolve_rust_import_package_scoped,
     resolve_rust_module_path_with_crate, resolve_rust_module_segments_with_crate,
-    rust_crate_root_package, rust_import_projection, rust_module_extents,
+    rust_crate_root_package, rust_import_projection,
 };
+use super::usage_queries::RustUsageQueries;
 
 /// How a local binding in an importer refers to its target: a named import
 /// (`use path::Item;`) or a namespace import (`use crate::module;`). A glob
@@ -137,7 +138,7 @@ impl RustSymbolIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum RustImportExtent {
+pub(super) enum RustImportExtent {
     Module {
         start: usize,
         end: usize,
@@ -151,7 +152,7 @@ enum RustImportExtent {
 }
 
 impl RustImportExtent {
-    fn contains(&self, byte: usize) -> bool {
+    pub(super) fn contains(&self, byte: usize) -> bool {
         match self {
             Self::Module { start, end } => *start <= byte && byte < *end,
             Self::LocalOnly {
@@ -165,13 +166,13 @@ impl RustImportExtent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ModuleKey {
+pub(super) struct ModuleKey {
     crate_root: String,
     components: Vec<String>,
 }
 
 impl ModuleKey {
-    fn new(file: &ProjectFile, module: &str) -> Self {
+    pub(super) fn new(file: &ProjectFile, module: &str) -> Self {
         let crate_root = rust_crate_root_package(file);
         let relative = if module == crate_root {
             ""
@@ -483,7 +484,6 @@ pub(super) struct RustUsageIndex {
     declaration_identities: HashMap<CodeUnit, RustSymbolIdentity>,
     value_constructor_identities: HashMap<CodeUnit, RustSymbolIdentity>,
     module_domains: HashMap<ModuleKey, Vec<Domain>>,
-    module_extents: HashMap<ProjectFile, Vec<(ModuleKey, usize, usize)>>,
     physical_roots: HashMap<ProjectFile, ModuleKey>,
     actual_crate_roots: HashSet<ProjectFile>,
     physical_owners: RustPhysicalOwnerIndex,
@@ -1058,13 +1058,20 @@ impl RustUsageIndex {
         matches.next().is_none().then_some(root)
     }
 
-    fn module_at_byte(&self, file: &ProjectFile, byte: usize) -> Option<&ModuleKey> {
-        self.module_extents
-            .get(file)?
-            .iter()
-            .filter(|(_, start, end)| *start <= byte && byte < *end)
-            .min_by_key(|(_, start, end)| end.saturating_sub(*start))
-            .map(|(module, _, _)| module)
+    /// The narrowest module of `file` whose body contains `byte`.
+    ///
+    /// The first product migrated off this index (ExecPlan
+    /// `.agents/plans/rust-usage-index-v2.md`, Milestone 2): module extents are
+    /// a per-file fact, so they are read from `rust_modules` on demand instead
+    /// of being folded into a workspace-wide map at build time. The index no
+    /// longer holds them, and the build no longer opens a syntax tree to
+    /// produce them.
+    fn module_at_byte(
+        analyzer: &RustAnalyzer,
+        file: &ProjectFile,
+        byte: usize,
+    ) -> Option<ModuleKey> {
+        RustUsageQueries::new(analyzer).module_at_byte(file, byte)
     }
 
     fn declaration_owner_visible_to(
@@ -1133,9 +1140,10 @@ impl RustUsageIndex {
         caller_file: &ProjectFile,
         caller_byte: usize,
     ) -> bool {
-        let Some(caller_module) = self.module_at_byte(caller_file, caller_byte) else {
+        let Some(caller_module) = Self::module_at_byte(analyzer, caller_file, caller_byte) else {
             return false;
         };
+        let caller_module = &caller_module;
         let immediate_parent = analyzer.structural_parent_of(declaration);
         let visibility_declaration = immediate_parent
             .as_ref()
@@ -1188,7 +1196,6 @@ impl RustUsageIndex {
         #[derive(Default)]
         struct RustFileFacts {
             declarations: BTreeSet<CodeUnit>,
-            module_extents: Vec<(ModuleKey, usize, usize)>,
             declaration_identities: Vec<(CodeUnit, RustSymbolIdentity)>,
             declared_module_domains: Vec<(ModuleKey, Domain)>,
             declaration_domains: Vec<(RustSymbolIdentity, Domain)>,
@@ -1212,8 +1219,6 @@ impl RustUsageIndex {
         let mut value_constructor_identities: HashMap<CodeUnit, RustSymbolIdentity> =
             HashMap::default();
         let mut declared_module_domains: HashMap<ModuleKey, Vec<Domain>> = HashMap::default();
-        let mut module_extents: HashMap<ProjectFile, Vec<(ModuleKey, usize, usize)>> =
-            HashMap::default();
         let cargo_routes = {
             let _scope = crate::profiling::scope("RustUsageIndex::build::cargo_routes");
             analyzer.cargo_routes_while(keep_going)?
@@ -1248,14 +1253,6 @@ impl RustUsageIndex {
             let imports = prepared
                 .as_ref()
                 .map(|syntax| {
-                    for (module, start, end) in rust_module_extents(
-                        syntax.tree().root_node(),
-                        syntax.source(),
-                        &rust_package_name(file),
-                    ) {
-                        let module_key = ModuleKey::new(file, &module);
-                        facts.module_extents.push((module_key, start, end));
-                    }
                     rust_import_projection(
                         syntax.tree().root_node(),
                         syntax.source(),
@@ -1359,9 +1356,6 @@ impl RustUsageIndex {
 
         for (file_id, (file, facts)) in files.iter().zip(file_facts).enumerate() {
             keep_going().then_some(())?;
-            if !facts.module_extents.is_empty() {
-                module_extents.insert(file.clone(), facts.module_extents);
-            }
             declaration_identities.extend(facts.declaration_identities);
             for (declared_module, domain) in facts.declared_module_domains {
                 declared_module_domains
@@ -1488,7 +1482,6 @@ impl RustUsageIndex {
             declaration_identities,
             value_constructor_identities,
             module_domains,
-            module_extents,
             physical_roots,
             actual_crate_roots,
             physical_owners,
@@ -2090,9 +2083,10 @@ impl RustAnalyzer {
         byte: usize,
     ) -> bool {
         let index = self.usage_index();
-        let Some(module) = index.module_at_byte(file, byte) else {
+        let Some(module) = RustUsageIndex::module_at_byte(self, file, byte) else {
             return false;
         };
+        let module = &module;
         seeds.roots.iter().any(|root| {
             index
                 .declaration_identities
@@ -2130,9 +2124,10 @@ impl RustAnalyzer {
         byte: usize,
     ) -> bool {
         let index = self.usage_index();
-        let Some(module) = index.module_at_byte(file, byte) else {
+        let Some(module) = RustUsageIndex::module_at_byte(self, file, byte) else {
             return false;
         };
+        let module = &module;
         if index.matching_edges_for_importer(file, seeds).any(|edge| {
             edge.importer_module == *module
                 && edge.extent.contains(byte)
@@ -2217,9 +2212,10 @@ impl RustAnalyzer {
             return RustReferenceResolution::Unresolved;
         }
         let index = self.usage_index();
-        let Some(module) = index.module_at_byte(file, byte) else {
+        let Some(module) = RustUsageIndex::module_at_byte(self, file, byte) else {
             return RustReferenceResolution::Unresolved;
         };
+        let module = &module;
         let leading_absolute_local = leading_absolute
             && index
                 .module_files
@@ -2616,8 +2612,8 @@ fn unique_seed_identity_for_fqn(
     dependency_roots: &[ProjectFile],
     namespace: RustReferenceNamespace,
 ) -> Option<RustSymbolIdentity> {
-    let index = analyzer.usage_index();
-    let importer_module = index.module_at_byte(importer, byte)?;
+    let importer_module = RustUsageIndex::module_at_byte(analyzer, importer, byte)?;
+    let importer_module = &importer_module;
     let mut matches = seeds
         .identities
         .iter()
@@ -2701,7 +2697,8 @@ fn scoped_explicit_import(
             ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => continue,
         };
         let index = analyzer.usage_index();
-        let importer_module = index.module_at_byte(file, byte)?;
+        let importer_module = RustUsageIndex::module_at_byte(analyzer, file, byte)?;
+        let importer_module = &importer_module;
         let segments = crate::analyzer::symbol_lookup::parse_symbol_path(
             crate::analyzer::Language::Rust,
             &binding.module_specifier,
@@ -2736,8 +2733,8 @@ fn unique_seed_identity_for_import_targets(
     namespace: RustReferenceNamespace,
     byte: usize,
 ) -> Option<RustSymbolIdentity> {
-    let index = analyzer.usage_index();
-    let importer_module = index.module_at_byte(importer, byte)?;
+    let importer_module = RustUsageIndex::module_at_byte(analyzer, importer, byte)?;
+    let importer_module = &importer_module;
     let mut matches = seeds
         .identities
         .iter()

@@ -11,9 +11,10 @@ use super::cargo_routes::RustCargoTargetRelation;
 use super::declarations::rust_package_name;
 use super::imports::{
     RustVisibility, resolve_rust_module_path_with_crate, rust_crate_root_package,
-    rust_imports_with_visibility_from_use_declaration, rust_item_visibility,
+    rust_item_visibility,
 };
 use super::lexical_scope::{insert_rust_import_binding, parse_rust_tree, visible_import_binder_at};
+use super::usage_queries::RustUsageQueries;
 
 #[derive(Clone, Copy, Debug)]
 struct ReferenceContextInterrupted;
@@ -313,47 +314,32 @@ impl RustAnalyzer {
             );
         }
 
-        if let Some(prepared) = self.prepared_syntax(file) {
-            let source = prepared.source();
-            let root = prepared.tree().root_node();
-            for index_in_root in 0..root.named_child_count() {
-                let Some(node) = root.named_child(index_in_root) else {
-                    continue;
-                };
-                if node.kind() != "use_declaration" {
-                    continue;
-                }
-                for import in rust_imports_with_visibility_from_use_declaration(node, source) {
-                    if matches!(
-                        import.visibility,
-                        RustVisibility::Private | RustVisibility::SelfModule
-                    ) {
-                        continue;
-                    }
-                    if import.info.is_wildcard {
-                        if !import.path.is_empty() {
-                            index.reexport_stars.push(ReexportStar {
-                                module_specifier: import.path.join("::"),
-                            });
-                        }
-                        continue;
-                    }
-                    let Some(imported_name) = import.path.last().cloned() else {
-                        continue;
-                    };
-                    let Some(local_name) = import.info.local_name().map(str::to_string) else {
-                        continue;
-                    };
-                    let module_specifier = import.path[..import.path.len() - 1].join("::");
-                    index.exports_by_name.insert(
-                        local_name,
-                        ExportEntry::ReexportedNamed {
-                            module_specifier,
-                            imported_name,
-                        },
-                    );
-                }
+        // Re-exports come from the persisted per-file facts rather than from a
+        // fresh syntax tree: `pub use` is a per-file fact, and reading the rows
+        // keeps this off the parse path entirely (ExecPlan
+        // `.agents/plans/rust-usage-index-v2.md`, Milestone 2). Local exports
+        // above stay declaration-driven, because whether a declaration is
+        // visible outside its module is a visibility question over
+        // `code_units`, not something the file's `use` list can answer.
+        for export in RustUsageQueries::new(self).re_exports_of(file) {
+            if export.is_glob {
+                index.reexport_stars.push(ReexportStar {
+                    module_specifier: export.source_path,
+                });
+                continue;
             }
+            let (Some(local_name), Some(imported_name)) =
+                (export.exported_name, export.imported_name)
+            else {
+                continue;
+            };
+            index.exports_by_name.insert(
+                local_name,
+                ExportEntry::ReexportedNamed {
+                    module_specifier: export.source_path,
+                    imported_name,
+                },
+            );
         }
 
         index

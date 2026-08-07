@@ -288,7 +288,9 @@ fn extract_exports(import_targets: &[RustImportTargetFact]) -> Vec<RustExportFac
             )
         })
         .filter(|target| !(target.is_glob && target.module_path.is_empty()))
-        .filter(|target| target.is_glob || target.bound_name.is_some())
+        .filter(|target| {
+            target.is_glob || (target.bound_name.is_some() && target.imported_name.is_some())
+        })
         .map(|target| RustExportFact {
             exported_name: target.bound_name.clone(),
             source_path: target.module_path.clone(),

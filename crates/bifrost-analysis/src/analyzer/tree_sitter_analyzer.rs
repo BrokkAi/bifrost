@@ -4692,6 +4692,32 @@ where
         self.store_context.live_paths.snapshot()
     }
 
+    /// The per-workspace analysis store this analyzer reads and writes.
+    ///
+    /// Language modules that answer a question from persisted rows rather than
+    /// from a materialized in-heap index need the store directly; the
+    /// `IAnalyzer` surface deliberately does not carry it.
+    pub(crate) fn analyzer_store(&self) -> &Arc<AnalyzerStore> {
+        &self.store_context.store
+    }
+
+    /// The current file-to-blob mapping, in both directions.
+    ///
+    /// This is how a caller turns a blob oid an inverted store lookup returned
+    /// into the live `ProjectFile`s that currently have those bytes, and how it
+    /// turns a file back into the blob whose rows describe it. Populated with
+    /// or without a git-backed `Liveness` (see `resolve_live_oids`), so a
+    /// store-backed query works in a plain directory too.
+    pub(crate) fn live_path_snapshot(&self) -> Arc<LiveSnapshot> {
+        self.live_snapshot()
+    }
+
+    /// The analysis generation `lang`'s persisted rows belong to. Cache keys
+    /// that mention it are invalidated for free when the generation moves.
+    pub(crate) fn language_generation(&self, lang: &str) -> Option<GenerationId> {
+        self.store_context.generations.get(lang).copied()
+    }
+
     /// The persisted half of [`IAnalyzer::parent_of`] — the owner unit named by
     /// popping `code_unit`'s last fq segment — memoized against the request's
     /// read-cache scope (#1230 item 6).
