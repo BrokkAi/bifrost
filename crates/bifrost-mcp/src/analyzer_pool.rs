@@ -8,14 +8,11 @@
 //! five seconds. Change [`ANALYZER_POOL_CAPACITY`] only with evidence from
 //! that benchmark.
 //!
-//! The pool waits rather than rejects, but the queue is bounded. The previous
-//! hand-written host refused the fifth concurrent request outright, purely
-//! because its single reader thread had nowhere to park a waiter -- nothing
-//! about the analyzer required that, so waiting is the better default. What
-//! that host *also* had, and what must not be lost with it, is a hard bound on
-//! how much unanswered work can pile up: it closed the connection rather than
-//! grow without limit. `rmcp` spawns a task per request and imposes no such
-//! cap, so the bound lives here instead, as a limit on queued waiters.
+//! The pool waits rather than rejects, but the queue is bounded. The analyzer
+//! can wait safely for a permit. It must also bound unanswered work so a
+//! client cannot grow the server without limit. `rmcp` spawns a task per
+//! request and imposes no such cap, so the bound lives here as a limit on
+//! queued waiters.
 
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};

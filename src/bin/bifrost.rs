@@ -9,9 +9,7 @@ mod code_query_repl;
 
 use brokk_bifrost::ToolOutput;
 use brokk_bifrost::lsp::run_lsp_stdio_server;
-use brokk_bifrost::mcp_common::{
-    MCP_RMCP_HOST_ENV, McpRenderOptions, run_stdio_server_with_build_identity,
-};
+use brokk_bifrost::mcp_common::McpRenderOptions;
 use brokk_bifrost::mcp_registry::{
     resolve_server_spec, resolve_server_spec_for_render_options, searchtools_toolset_order,
 };
@@ -25,6 +23,7 @@ use brokk_bifrost::policy::{
 };
 use brokk_bifrost::rmcp_host::{
     NamedWorkspace, run_named_workspace_stdio_server_with_build_identity,
+    run_stdio_server_with_build_identity,
 };
 use brokk_bifrost::scoped_project::create_cli_tool_service;
 use brokk_bifrost::searchtools_render::RenderOptions;
@@ -471,11 +470,6 @@ fn run_inner(
         }
         if mcp_mode.is_none() {
             return Err("--workspace requires --mcp".to_string());
-        }
-        if env::var_os(MCP_RMCP_HOST_ENV).as_deref() != Some(std::ffi::OsStr::new("on")) {
-            return Err(format!(
-                "--workspace requires {MCP_RMCP_HOST_ENV}=on because named routing is available only in the rmcp host"
-            ));
         }
         if diff_snapshot_object_dir.is_some() {
             return Err("--diff-snapshot-object-dir is not available with --workspace".to_string());
@@ -1091,8 +1085,8 @@ USAGE:
 
 OPTIONS:
     --root DIR             Project root to analyze (default: current directory)
-    --workspace NAME=PATH  Named project root for rmcp MCP mode; repeat as needed.
-                           Cannot be combined with --root. Requires BIFROST_MCP_RMCP=on.
+    --workspace NAME=PATH  Named project root for MCP mode; repeat as needed.
+                           Cannot be combined with --root. Requires --mcp.
                            Root and nested .bifrostignore files exclude matching tracked or
                            untracked files from code intelligence, but not file-level tools.
     --diff-snapshot-object-dir DIR
@@ -1171,8 +1165,8 @@ EXAMPLES:
     # MCP server an agent connects to (core toolset), speaking MCP over stdio:
     bifrost --root /path/to/project --mcp core
 
-    # One rmcp server with two fixed named workspaces:
-    BIFROST_MCP_RMCP=on bifrost --workspace api=/src/api --workspace ui=/src/ui --mcp core
+    # One server with two fixed named workspaces:
+    bifrost --workspace api=/src/api --workspace ui=/src/ui --mcp core
 
     # One-shot: run a single tool and print its JSON result, then exit:
     bifrost --root /path/to/project --tool search_symbols --args '{"patterns":["MyClass"]}'

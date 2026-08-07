@@ -31,24 +31,24 @@ test("selected component jobs are gated only by the classifier outputs", () => {
   }
 });
 
-test("MCP contracts run on rmcp and the legacy rollback host", () => {
+test("MCP contracts run once on RMCP", () => {
   const start = workflow.indexOf("  mcp-contract:\n");
   assert.notEqual(start, -1);
   const remainder = workflow.slice(start);
   const nextJob = remainder.slice(1).search(/^  [a-z][a-z0-9-]*:\n/mu);
   const job = nextJob === -1 ? remainder : remainder.slice(0, nextJob + 1);
 
-  assert.match(job, /name: MCP contract \(\$\{\{ matrix\.host \}\}\)/u);
-  assert.match(job, /- host: rmcp\n            selector: 'on'/u);
-  assert.match(job, /- host: legacy rollback\n            selector: 'off'/u);
-  assert.match(job, /BIFROST_MCP_RMCP: \$\{\{ matrix\.selector \}\}/u);
+  assert.match(job, /name: MCP contract/u);
+  assert.match(job, /cargo test -p brokk-bifrost-mcp --features nlp/u);
+  assert.doesNotMatch(job, /matrix|BIFROST_MCP_RMCP/u);
 });
 
-test("the interactive benchmark selects rmcp explicitly", () => {
+test("the interactive benchmark uses the sole MCP host", () => {
   assert.match(
     benchmarkWorkflow,
-    /- name: Run interactive latency gate[\s\S]*?BIFROST_BENCHMARK_MCP_RMCP: 'on'[\s\S]*?scripts\/run-interactive-latency\.sh --profile/u,
+    /- name: Run interactive latency gate[\s\S]*?scripts\/run-interactive-latency\.sh --profile/u,
   );
+  assert.doesNotMatch(benchmarkWorkflow, /BIFROST_BENCHMARK_MCP_RMCP/u);
 });
 
 test("lint fast-fails before Rust-dependent and matrix-heavy validation", () => {
