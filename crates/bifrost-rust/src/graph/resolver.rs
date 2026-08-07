@@ -1228,7 +1228,7 @@ fn trait_visible_at_call_site(
     let lexical_scope = RustLexicalScopeIndex::new(prepared.tree().root_node(), prepared.source());
     names.into_iter().any(|name| {
         let root_shadowed = lexical_scope.name_bound_at(&name, reference_byte)
-            || (lexical_scope.item_bound_at(&name, reference_byte)
+            || (lexical_scope.local_item_bound_at(&name, reference_byte)
                 && !usage_root_declaration_matches_at(rust, file, &seeds, &name, reference_byte)
                 && !usage_local_module_prefix_visible_at(
                     rust,

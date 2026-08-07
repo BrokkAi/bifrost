@@ -12,6 +12,7 @@ use tree_sitter::Node;
 
 use crate::declarations::{rust_node_text, rust_package_name};
 use crate::graph_support::{RustSource, resolve_module_package};
+use crate::lexical_scope::{RustCfgCondition, rust_cfg_condition};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RustVisibility {
@@ -50,6 +51,7 @@ pub enum RustImportOwner {
 pub struct RustProjectedImport {
     pub import: RustImportInfo,
     pub owner: RustImportOwner,
+    pub cfg_condition: RustCfgCondition,
 }
 
 pub fn rust_import_projection(
@@ -62,12 +64,14 @@ pub fn rust_import_projection(
     while let Some(node) = pending.pop() {
         if node.kind() == "use_declaration" {
             let owner = rust_import_owner(node, source, base_module);
+            let cfg_condition = rust_cfg_condition(node, source);
             projected.extend(
                 rust_imports_with_visibility_from_use_declaration(node, source)
                     .into_iter()
                     .map(|import| RustProjectedImport {
                         import,
                         owner: owner.clone(),
+                        cfg_condition: cfg_condition.clone(),
                     }),
             );
             continue;

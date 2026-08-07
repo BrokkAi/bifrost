@@ -12,10 +12,10 @@ An implementer can prove the change by running the focused Rust usage test. Each
 
 - [x] (2026-08-07 11:52Z) Read issue #1377 and its two comments. The second comment adds the nom `recognize` function-scoped import witness.
 - [x] (2026-08-07 11:52Z) Inspected the inverse scan path, the shared Rust resolver, lexical scope handling, existing shadow tests, and the current remote state.
-- [ ] Add the failing behavior tests for both issue witnesses and the required near misses.
-- [ ] Add position-aware import precedence and cfg-alternative candidate handling in the shared Rust resolver.
-- [ ] Update all shared-resolver callers to use the same shadow rule.
-- [ ] Run focused, crate-level, policy, formatting, and lint validation. Record the exact results here.
+- [x] (2026-08-07 12:36Z) Added behavior tests for both issue witnesses. Corrected the cfg fixture to select the call, not the same-named fallback declaration.
+- [x] (2026-08-07 12:36Z) Added position-aware import precedence and cfg-alternative candidate handling in the shared Rust resolver.
+- [x] (2026-08-07 12:36Z) Updated shared-resolver callers to keep function-local item shadows while leaving module items for candidate comparison.
+- [x] (2026-08-07 14:05Z) Passed both issue tests, three qualified-path guards, all 1,544 usage tests, 42 `brokk-bifrost-rust` tests, formatting, and focused Clippy. The required policy run returned `unreliable` with exit 2 because existing fixture findings and incomplete policy results remain in the workspace report.
 
 ## Surprises & Discoveries
 
@@ -34,6 +34,12 @@ An implementer can prove the change by running the focused Rust usage test. Each
 - Observation: A simple import-first rule is not safe. An unconditional module `use` plus a same-named module item is invalid Rust and the existing `local_definition_shadows_imported_rust_name` test intentionally reports no imported hit.
   Evidence: That test is in `tests/suite_usages/usages_rust_graph_test.rs` and currently passes by treating the name as shadowed or ambiguous.
 
+- Observation: The direct cfg parser reads `cfg(feature = "query_apply")` and `cfg(not(feature = "query_apply"))` from tree-sitter nodes.
+  Evidence: `lexical_scope::tests::cfg_condition_reads_direct_feature_and_not_feature_attributes` passes.
+
+- Observation: Bare-name and qualified-path shadow predicates cannot share one broad item rule. Qualified roots need the existing target-aware module-item rule, while bare imported names need the new function-local item rule.
+  Evidence: The full suite exposed `rust_qualified_resolution_respects_module_and_local_import_extents` and `rust_graph_scoped_member_chain_keeps_module_owner_hit`; both pass after separating the predicates.
+
 ## Decision Log
 
 - Decision: Fix the shared target-aware resolver. Do not add a scan-only fallback.
@@ -48,13 +54,17 @@ An implementer can prove the change by running the focused Rust usage test. Each
   Rationale: A false positive inverse edge is worse than an incomplete one. The issue fixture needs `cfg(X)` versus `cfg(not(X))`; unknown cfg syntax must retain the current ambiguity behavior.
   Date/Author: 2026-08-07 / Codex.
 
+- Decision: Support only an atomic cfg predicate and its direct `not(...)` complement. Treat compound, multiple, and malformed cfg forms as unknown.
+  Rationale: The issue requires a direct complement. Unknown forms stay ambiguous and cannot create a false inverse edge.
+  Date/Author: 2026-08-07 / Codex.
+
 - Decision: Keep `RustReferenceResolution` target-aware. A target root is exact when every competing candidate either loses lexical precedence or is proven cfg-incompatible with it. Do not claim one global forward target for cfg-agnostic source.
   Rationale: A call may legitimately refer to different declarations in mutually exclusive builds. An inverse query for either target should retain the call, while overlapping candidates remain ambiguous.
   Date/Author: 2026-08-07 / Codex.
 
 ## Outcomes & Retrospective
 
-Implementation has not started. The intended outcome is a shared Rust resolution rule that gives stable inverse behavior for both issue #1377 witness families and keeps existing shadows conservative.
+The implementation records cfg conditions on imports and declarations. It preserves function-local item shadows, gives visible local-only imports precedence over module items, and lets a target win only when every competing candidate is cfg-incompatible. It keeps qualified-path resolution on its previous target-aware rule. The complete usage suite, crate tests, formatting, and Clippy pass. The policy tool remains an external failed gate because it returned `unreliable`; its findings do not point to these changes.
 
 ## Context and Orientation
 
@@ -86,7 +96,7 @@ Run the two new tests before the resolver changes. Each must fail because the ex
 
 In `crates/bifrost-rust/src/lexical_scope.rs`, add a public query that distinguishes a function-local item from a module item at a byte position. Preserve `item_bound_at` for callers that need the old broad predicate. Store enough owner information on `ItemVisibility` to answer this without reparsing or source-text searching.
 
-In the same module, add a small structured cfg-condition reader. It must walk the `attribute_item` and nested meta-item tree-sitter nodes attached to a `use` declaration or named declaration. Represent an unconditional item explicitly. Represent supported `cfg` expressions as a tree of `all`, `any`, `not`, and atomic predicates. Give the model one operation: `proven_mutually_exclusive(left, right)`. It must return true only when the parsed forms prove that no build can enable both candidates. At minimum it must prove `cfg(X)` and `cfg(not(X))` exclusive, including the feature predicate used by issue #1377. Unsupported or malformed forms must return false and therefore remain competing candidates. Do not use feature flags from the host build; this analysis stays cfg-agnostic.
+In the same module, add a small structured cfg-condition reader. It must walk the `attribute_item` and nested meta-item tree-sitter nodes attached to a `use` declaration or named declaration. Represent an unconditional item explicitly. Support an atomic predicate and its direct `not(...)` complement. Give the model one operation: `proven_mutually_exclusive(left, right)`. It must return true only when the parsed forms prove that no build can enable both candidates. At minimum it must prove `cfg(X)` and `cfg(not(X))` exclusive, including the feature predicate used by issue #1377. Treat compound, multiple, unsupported, and malformed forms as unknown and therefore competing candidates. Do not use feature flags from the host build; this analysis stays cfg-agnostic.
 
 In `crates/bifrost-rust/src/imports.rs`, extend `RustProjectedImport` or its owner metadata so each projected `use` retains its cfg condition. In `crates/bifrost-rust/src/usage_index.rs`, preserve this condition in `RustImportEdge` and `RustOriginRoute`. Build a parallel declaration-condition lookup keyed by the exact declaration identity. If an identity can represent more than one syntactic declaration, retain all conditions and treat them as competing unless their conditions prove exclusivity.
 

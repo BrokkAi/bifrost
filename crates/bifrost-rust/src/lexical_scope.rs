@@ -11,6 +11,80 @@ use crate::imports::{
     rust_import_body, rust_imports_from_use_declaration, split_rust_import_module_and_name,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustCfgCondition {
+    Always,
+    Atom(String),
+    NotAtom(String),
+    Unknown,
+}
+
+impl RustCfgCondition {
+    pub fn proven_mutually_exclusive(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Atom(left), Self::NotAtom(right)) | (Self::NotAtom(left), Self::Atom(right))
+                if left == right
+        )
+    }
+}
+
+pub fn rust_cfg_condition(node: Node<'_>, source: &str) -> RustCfgCondition {
+    let mut condition = RustCfgCondition::Always;
+    let mut sibling = node.prev_named_sibling();
+    while let Some(attribute_item) = sibling {
+        if attribute_item.kind() != "attribute_item" {
+            break;
+        }
+        let Some(attribute) = attribute_item.named_child(0) else {
+            return RustCfgCondition::Unknown;
+        };
+        let Some(path) = attribute.named_child(0) else {
+            return RustCfgCondition::Unknown;
+        };
+        if node_text(path, source).trim() == "cfg" {
+            if condition != RustCfgCondition::Always {
+                return RustCfgCondition::Unknown;
+            }
+            condition = attribute
+                .child_by_field_name("arguments")
+                .and_then(|arguments| rust_cfg_argument_condition(arguments, source))
+                .unwrap_or(RustCfgCondition::Unknown);
+        }
+        sibling = attribute_item.prev_named_sibling();
+    }
+    condition
+}
+
+fn rust_cfg_argument_condition(arguments: Node<'_>, source: &str) -> Option<RustCfgCondition> {
+    if arguments.kind() != "token_tree" {
+        return None;
+    }
+    let mut cursor = arguments.walk();
+    let children = arguments.named_children(&mut cursor).collect::<Vec<_>>();
+    let first = *children.first()?;
+    if node_text(first, source).trim() == "not" {
+        let nested = *children.get(1)?;
+        return (children.len() == 2 && nested.kind() == "token_tree")
+            .then(|| rust_cfg_argument_condition(nested, source))
+            .flatten()
+            .and_then(|condition| match condition {
+                RustCfgCondition::Atom(atom) => Some(RustCfgCondition::NotAtom(atom)),
+                _ => None,
+            });
+    }
+    let last = *children.last()?;
+    (first.kind() == "identifier" && children.len() >= 2)
+        .then(|| {
+            source
+                .get(first.start_byte()..last.end_byte())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(|text| RustCfgCondition::Atom(text.to_string()))
+        })
+        .flatten()
+}
+
 /// Source bytes retained by the shared Rust parse memo. Entries are weighed by
 /// their source length; the parsed trees they hold are several times larger, so
 /// keep this comfortably below the process's memory budget. 32 MiB covers every
@@ -464,6 +538,7 @@ struct ItemVisibility {
     start: usize,
     end: usize,
     module: Option<(usize, usize)>,
+    function: Option<(usize, usize)>,
 }
 
 /// Position-aware Rust binding visibility for one parsed file.
@@ -489,7 +564,7 @@ impl RustLexicalScopeIndex {
             let mut child_scope_end = scope_end;
             match node.kind() {
                 "function_item" => {
-                    index.add_item_binding(node, scope_start, scope_end, source);
+                    index.add_item_binding(node, scope_start, scope_end, source, function);
                     let function_range = (node.start_byte(), node.end_byte());
                     index.functions.push(function_range);
                     child_function = Some(function_range);
@@ -551,10 +626,10 @@ impl RustLexicalScopeIndex {
                     }
                 }
                 "type_item" if !is_associated_type_item(node) => {
-                    index.add_item_binding(node, scope_start, scope_end, source);
+                    index.add_item_binding(node, scope_start, scope_end, source, function);
                 }
                 "struct_item" | "enum_item" | "trait_item" | "mod_item" => {
-                    index.add_item_binding(node, scope_start, scope_end, source);
+                    index.add_item_binding(node, scope_start, scope_end, source, function);
                     if node.kind() == "mod_item" {
                         index.modules.push((node.start_byte(), node.end_byte()));
                     }
@@ -579,6 +654,19 @@ impl RustLexicalScopeIndex {
     }
 
     pub fn item_bound_at(&self, name: &str, byte: usize) -> bool {
+        self.item_visible_at(name, byte, |_| true)
+    }
+
+    pub fn local_item_bound_at(&self, name: &str, byte: usize) -> bool {
+        self.item_visible_at(name, byte, |item| item.function.is_some())
+    }
+
+    fn item_visible_at(
+        &self,
+        name: &str,
+        byte: usize,
+        predicate: impl Fn(&ItemVisibility) -> bool,
+    ) -> bool {
         let module = self
             .modules
             .iter()
@@ -586,9 +674,9 @@ impl RustLexicalScopeIndex {
             .filter(|(start, end)| *start <= byte && byte < *end)
             .min_by_key(|(start, end)| end - start);
         self.items.get(name).is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item.module == module && item.start <= byte && byte < item.end)
+            items.iter().any(|item| {
+                predicate(item) && item.module == module && item.start <= byte && byte < item.end
+            })
         })
     }
 
@@ -661,7 +749,14 @@ impl RustLexicalScopeIndex {
         }
     }
 
-    fn add_item_binding(&mut self, item: Node<'_>, start: usize, end: usize, source: &str) {
+    fn add_item_binding(
+        &mut self,
+        item: Node<'_>,
+        start: usize,
+        end: usize,
+        source: &str,
+        function: Option<(usize, usize)>,
+    ) {
         let Some(name) = item.child_by_field_name("name") else {
             return;
         };
@@ -676,6 +771,7 @@ impl RustLexicalScopeIndex {
                 start,
                 end,
                 module: enclosing_mod_item_range(item),
+                function,
             });
     }
 }
@@ -1027,6 +1123,40 @@ mod selected {
         assert!(
             visited * 4 < total_named_nodes,
             "reference-scoped traversal visited {visited} of {total_named_nodes} named nodes"
+        );
+    }
+
+    #[test]
+    fn cfg_condition_reads_direct_feature_and_not_feature_attributes() {
+        let source = r#"
+#[cfg(feature = "query_apply")]
+use crate::apply::apply_from_stdin;
+
+#[cfg(not(feature = "query_apply"))]
+fn apply_from_stdin() -> u8 { 1 }
+"#;
+        let tree = parse_rust_tree_uncached(source).expect("parse Rust fixture");
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let declarations = root.named_children(&mut cursor).collect::<Vec<_>>();
+        let use_declaration = declarations
+            .iter()
+            .copied()
+            .find(|node| node.kind() == "use_declaration")
+            .expect("use declaration");
+        let function = declarations
+            .iter()
+            .copied()
+            .find(|node| node.kind() == "function_item")
+            .expect("function declaration");
+
+        assert_eq!(
+            rust_cfg_condition(use_declaration, source),
+            RustCfgCondition::Atom("feature = \"query_apply\"".to_string())
+        );
+        assert_eq!(
+            rust_cfg_condition(function, source),
+            RustCfgCondition::NotAtom("feature = \"query_apply\"".to_string())
         );
     }
 }
