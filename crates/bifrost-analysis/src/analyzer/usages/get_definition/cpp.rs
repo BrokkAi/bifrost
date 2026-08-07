@@ -8,10 +8,14 @@ use crate::analyzer::cpp::{
 };
 use crate::analyzer::declaration_range::code_unit_declaration_name_range_for_range;
 use crate::analyzer::resolve_include_targets_with_index;
+use crate::analyzer::structural::resolution::{
+    HierarchyRelation, MemberDispatchTier, PrecedenceTier, RejectionReason,
+};
 use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::usages::cpp_graph::canonical_cpp_scope_components;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{SignatureMetadata, StructuredTypeName};
+use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_cpp::call_match::{
     CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_parameter_type_text,
     cpp_signature_param_types, cpp_type_text_pointer_depth, normalize_cpp_type_name,
@@ -2762,14 +2766,22 @@ fn resolve_cpp_type_without_focused_qualifier(
         if let Some(owner) = owner {
             let type_candidates =
                 cpp_direct_type_member_candidates(analyzer, support, &owner, &member);
+            // The scope-qualified member seam. The owner is the type the
+            // qualifier named and the member is declared on it directly, which
+            // is the whole of what this lookup proves: it never inspects a
+            // `static` specifier, so the attribution below claims a direct
+            // member and never the static/companion bucket.
+            let mut member_trace = trace::recording().then(CppMemberTrace::default);
             let candidates = if declaration_type_context {
                 type_candidates
             } else {
-                let member_candidates = cpp_direct_member_candidates(
+                let member_candidates = cpp_direct_member_candidates_traced(
                     analyzer,
                     support,
                     std::slice::from_ref(&owner),
                     &member,
+                    member_trace.as_mut(),
+                    0,
                 );
                 if member_candidates.is_empty() {
                     type_candidates
@@ -2802,6 +2814,11 @@ fn resolve_cpp_type_without_focused_qualifier(
                 _ => candidates,
             };
             if !candidates.is_empty() {
+                if let Some(state) = member_trace.as_ref() {
+                    // No call shape reaches this seam, so nothing here can
+                    // decide applicability.
+                    state.stage_winners(analyzer, &candidates, None);
+                }
                 return candidates_outcome(candidates);
             }
             if let Some(error) = specialization_failure {
@@ -4840,6 +4857,230 @@ fn cpp_signature_is_type_alias(signature: &str) -> bool {
             && signature.contains('=')
 }
 
+/// The per-candidate attribution the C++ member walk records while it runs,
+/// built only when a trace is being recorded (#1477). The walk decides nothing
+/// from it; it is an emission of facts the walk already holds: the class each
+/// candidate was found on, the base-class depth of that class, and the
+/// first-discovery derivation chain that reached it.
+///
+/// What this state deliberately does *not* hold is whether a member is static.
+/// No C++ member seam in this file has that fact: the declaration store indexes
+/// a static and a non-static member under the same `owner.member` form, and no
+/// structured modifier reaches here. The scope-qualified spelling is not proof
+/// either -- `&Owner::field` and `receiver->Base::method()` take the same form
+/// for non-static members -- so no candidate here claims
+/// [`MemberDispatchTier::StaticOrCompanion`]. A direct member is attributed as
+/// what the lookup proved: a member declared on the named owner itself.
+#[derive(Default)]
+struct CppMemberTrace {
+    /// First-discovery derived class of each base the walk expanded, which
+    /// makes the route reconstruction a bounded walk back to the receiver's own
+    /// type.
+    parents: HashMap<CodeUnit, CodeUnit>,
+    /// Candidate declaration -> (class it was found on, base-class depth).
+    found: HashMap<CodeUnit, (CodeUnit, usize)>,
+}
+
+impl CppMemberTrace {
+    fn record_found(&mut self, candidates: &[CodeUnit], found_on: &CodeUnit, depth: usize) {
+        for candidate in candidates {
+            self.found
+                .entry(candidate.clone())
+                .or_insert_with(|| (found_on.clone(), depth));
+        }
+    }
+
+    /// The exact base-class route from the receiver's own type to the class
+    /// `candidate` was found on, as first-discovery hops. Every hop is a C++
+    /// base-class derivation, which is the one hierarchy edge the language has,
+    /// so every hop is [`HierarchyRelation::Extends`].
+    ///
+    /// The walk is bounded by the recorded depth rather than by the presence of
+    /// a parent link: a recovered translation unit can describe a cyclic
+    /// derivation, and a trace must terminate on one.
+    fn route(&self, candidate: &CodeUnit) -> Vec<trace::HierarchyHopRecord> {
+        let Some((found_on, depth)) = self.found.get(candidate) else {
+            return Vec::new();
+        };
+        let mut chain = vec![found_on.clone()];
+        while chain.len() <= *depth {
+            let Some(parent) = self
+                .parents
+                .get(chain.last().expect("chain is never empty"))
+            else {
+                break;
+            };
+            chain.push(parent.clone());
+        }
+        chain.reverse();
+        debug_assert_eq!(
+            chain.len(),
+            depth + 1,
+            "the first-discovery chain must be exactly the base-class depth"
+        );
+        chain
+            .windows(2)
+            .enumerate()
+            .map(|(hop, pair)| trace::HierarchyHopRecord {
+                hop,
+                from: pair[0].clone(),
+                to: pair[1].clone(),
+                relation: HierarchyRelation::Extends,
+            })
+            .collect()
+    }
+
+    fn enrichment(
+        &self,
+        candidate: &CodeUnit,
+        applicability: ApplicabilityVerdict,
+    ) -> Option<trace::MemberEnrichment> {
+        let (found_on, depth) = self.found.get(candidate)?;
+        let dispatch_tier = if *depth == 0 {
+            MemberDispatchTier::InherentOrDirect
+        } else {
+            MemberDispatchTier::InheritedOrPromoted
+        };
+        Some(trace::MemberEnrichment {
+            owner: found_on.clone(),
+            hierarchy_depth: *depth,
+            dispatch_tier,
+            applicability,
+            route: self.route(candidate),
+        })
+    }
+
+    fn precedence_tier(&self, candidate: &CodeUnit) -> Option<PrecedenceTier> {
+        self.found.get(candidate).map(|(_, depth)| {
+            if *depth == 0 {
+                PrecedenceTier::OwnMember
+            } else {
+                PrecedenceTier::InheritedMember
+            }
+        })
+    }
+
+    /// Record every candidate the walk computed and then discarded.
+    fn record_rejected<'unit>(
+        &self,
+        dropped: impl Iterator<Item = &'unit CodeUnit>,
+        reason: RejectionReason,
+        applicability: ApplicabilityVerdict,
+    ) {
+        for loser in dropped {
+            let mut row = trace::TraceCandidate::rejected(
+                trace::TraceCandidateRef::Unit(loser.clone()),
+                self.precedence_tier(loser),
+                reason,
+            );
+            if let Some(enrichment) = self.enrichment(loser, applicability) {
+                row = row.with_member(enrichment);
+            }
+            trace::record(row);
+        }
+    }
+
+    /// The two discards a call seam makes, recorded with the reason each one
+    /// actually states, plus the staged attribution for the survivors.
+    ///
+    /// A member that is not callable at all lost the declaration space, not the
+    /// call shape, so its row must not defer to the callable axis; one that the
+    /// call-shape filter refused is exactly the #1478 boundary.
+    fn record_call_seam_selection(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        winners: &[CodeUnit],
+        considered: &[CodeUnit],
+        non_callable: &[CodeUnit],
+        arity: Option<usize>,
+    ) {
+        self.record_rejected(
+            non_callable.iter(),
+            RejectionReason::WrongDeclarationSpace,
+            ApplicabilityVerdict::Unknown,
+        );
+        self.record_rejected(
+            considered.iter().filter(|unit| !winners.contains(unit)),
+            RejectionReason::CallableApplicabilityDeferred,
+            ApplicabilityVerdict::Inapplicable,
+        );
+        self.stage_winners(analyzer, winners, arity);
+    }
+
+    /// Stage attribution for `winners` on the outcome the caller is about to
+    /// construct. The applicability verdict is per candidate and states exactly
+    /// what the arity check proved about it, so an overload whose parameter
+    /// list the analyzer never recorded stays `unknown` rather than being
+    /// promoted to `applicable` by surviving a filter that never refused it.
+    fn stage_winners(&self, analyzer: &dyn IAnalyzer, winners: &[CodeUnit], arity: Option<usize>) {
+        let winner_tier = winners
+            .iter()
+            .filter_map(|unit| self.found.get(unit))
+            .map(|(_, depth)| *depth)
+            .min()
+            .map(|depth| {
+                if depth == 0 {
+                    PrecedenceTier::OwnMember
+                } else {
+                    PrecedenceTier::InheritedMember
+                }
+            });
+        if let Some(tier) = winner_tier {
+            trace::stage_tier(tier, winners.iter().map(|unit| unit.fq_name()).collect());
+        }
+        trace::stage_member_context(
+            winners
+                .iter()
+                .filter_map(|unit| {
+                    self.enrichment(unit, cpp_applicability_verdict(analyzer, unit, arity))
+                        .map(|enrichment| (unit.fq_name(), enrichment))
+                })
+                .collect(),
+        );
+    }
+}
+
+/// What the C++ arity check proved about one candidate for one call shape.
+/// `Unknown` covers both "no call shape here" and "this declaration's parameter
+/// list is not recorded", which are the two states the filter tolerates.
+fn cpp_applicability_verdict(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    arity: Option<usize>,
+) -> ApplicabilityVerdict {
+    let Some(expected) = arity else {
+        return ApplicabilityVerdict::Unknown;
+    };
+    match cpp_known_callable_arity(analyzer, unit) {
+        Some(known) if known.accepts(expected) => ApplicabilityVerdict::Applicable,
+        Some(_) => ApplicabilityVerdict::Inapplicable,
+        None => ApplicabilityVerdict::Unknown,
+    }
+}
+
+/// The C++ member lookup itself: the receiver's own members first, and the
+/// contiguous base-class walk only when the receiver declares none.
+fn cpp_member_lookup(
+    ctx: CppLookupCtx<'_, '_>,
+    owners: &[CodeUnit],
+    member: &str,
+    mut member_trace: Option<&mut CppMemberTrace>,
+) -> Vec<CodeUnit> {
+    let candidates = cpp_direct_member_candidates_traced(
+        ctx.analyzer,
+        ctx.support,
+        owners,
+        member,
+        member_trace.as_deref_mut(),
+        0,
+    );
+    if !candidates.is_empty() {
+        return candidates;
+    }
+    let mut seen = HashSet::default();
+    cpp_inherited_member_candidates(ctx, owners, member, &mut seen, member_trace)
+}
+
 fn cpp_member_candidates(
     ctx: CppLookupCtx<'_, '_>,
     owners: Vec<CodeUnit>,
@@ -4847,13 +5088,12 @@ fn cpp_member_candidates(
     arity: Option<usize>,
     arg_types: Option<&[Option<CppType>]>,
 ) -> Vec<CodeUnit> {
-    let mut candidates = cpp_direct_member_candidates(ctx.analyzer, ctx.support, &owners, member);
-    if candidates.is_empty() {
-        let mut seen = HashSet::default();
-        candidates = cpp_inherited_member_candidates(ctx, &owners, member, &mut seen);
-    }
-    candidates = cpp_filter_candidates_by_call(
-        candidates,
+    let mut member_trace = trace::recording().then(CppMemberTrace::default);
+    let found = cpp_member_lookup(ctx, &owners, member, member_trace.as_mut());
+    // Cloned only under a trace: an untraced lookup must allocate nothing extra.
+    let considered = member_trace.is_some().then(|| found.clone());
+    let mut candidates = cpp_filter_candidates_by_call(
+        found,
         arity,
         arg_types,
         ctx.analyzer,
@@ -4862,6 +5102,15 @@ fn cpp_member_candidates(
     );
     sort_units(&mut candidates);
     candidates.dedup();
+    if let Some(state) = member_trace.as_ref() {
+        let considered = considered.expect("a recording walk always keeps its considered set");
+        state.record_rejected(
+            considered.iter().filter(|unit| !candidates.contains(unit)),
+            RejectionReason::CallableApplicabilityDeferred,
+            ApplicabilityVerdict::Inapplicable,
+        );
+        state.stage_winners(ctx.analyzer, &candidates, arity);
+    }
     candidates
 }
 
@@ -4875,14 +5124,19 @@ fn cpp_member_candidates_lazy<F>(
 where
     F: FnOnce() -> Option<Vec<Option<CppType>>>,
 {
-    let mut candidates = cpp_direct_member_candidates(ctx.analyzer, ctx.support, &owners, member);
-    if candidates.is_empty() {
-        let mut seen = HashSet::default();
-        candidates = cpp_inherited_member_candidates(ctx, &owners, member, &mut seen);
-    }
-    candidates.retain(CodeUnit::is_callable);
-    candidates = cpp_filter_candidates_by_call_lazy(
-        candidates,
+    let mut member_trace = trace::recording().then(CppMemberTrace::default);
+    let mut found = cpp_member_lookup(ctx, &owners, member, member_trace.as_mut());
+    let non_callable = member_trace.is_some().then(|| {
+        found
+            .iter()
+            .filter(|unit| !unit.is_callable())
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    found.retain(CodeUnit::is_callable);
+    let considered = member_trace.is_some().then(|| found.clone());
+    let mut candidates = cpp_filter_candidates_by_call_lazy(
+        found,
         arity,
         resolve_arg_types,
         ctx.analyzer,
@@ -4891,6 +5145,15 @@ where
     );
     sort_units(&mut candidates);
     candidates.dedup();
+    if let Some(state) = member_trace.as_ref() {
+        state.record_call_seam_selection(
+            ctx.analyzer,
+            &candidates,
+            &considered.expect("a recording walk always keeps its considered set"),
+            &non_callable.expect("a recording walk always keeps its non-callable set"),
+            arity,
+        );
+    }
     candidates
 }
 
@@ -4904,15 +5167,20 @@ fn cpp_member_candidates_lazy_with_presence<F>(
 where
     F: FnOnce() -> Option<Vec<Option<CppType>>>,
 {
-    let mut candidates = cpp_direct_member_candidates(ctx.analyzer, ctx.support, &owners, member);
-    if candidates.is_empty() {
-        let mut seen = HashSet::default();
-        candidates = cpp_inherited_member_candidates(ctx, &owners, member, &mut seen);
-    }
-    candidates.retain(CodeUnit::is_callable);
-    let had_callable = !candidates.is_empty();
-    candidates = cpp_filter_candidates_by_call_lazy_strict(
-        candidates,
+    let mut member_trace = trace::recording().then(CppMemberTrace::default);
+    let mut found = cpp_member_lookup(ctx, &owners, member, member_trace.as_mut());
+    let non_callable = member_trace.is_some().then(|| {
+        found
+            .iter()
+            .filter(|unit| !unit.is_callable())
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    found.retain(CodeUnit::is_callable);
+    let had_callable = !found.is_empty();
+    let considered = member_trace.is_some().then(|| found.clone());
+    let mut candidates = cpp_filter_candidates_by_call_lazy_strict(
+        found,
         arity,
         resolve_arg_types,
         ctx.analyzer,
@@ -4921,6 +5189,15 @@ where
     );
     sort_units(&mut candidates);
     candidates.dedup();
+    if let Some(state) = member_trace.as_ref() {
+        state.record_call_seam_selection(
+            ctx.analyzer,
+            &candidates,
+            &considered.expect("a recording walk always keeps its considered set"),
+            &non_callable.expect("a recording walk always keeps its non-callable set"),
+            arity,
+        );
+    }
     (candidates, had_callable)
 }
 
@@ -4951,55 +5228,96 @@ fn cpp_direct_member_candidates(
     owners: &[CodeUnit],
     member: &str,
 ) -> Vec<CodeUnit> {
+    cpp_direct_member_candidates_traced(analyzer, support, owners, member, None, 0)
+}
+
+/// The same lookup, telling the trace which owner each candidate came from.
+/// The owner is a fact only this loop holds: the merged result no longer says
+/// which of `owners` answered, which is why the attribution is recorded here
+/// rather than reconstructed by the caller.
+fn cpp_direct_member_candidates_traced(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    owners: &[CodeUnit],
+    member: &str,
+    mut member_trace: Option<&mut CppMemberTrace>,
+    depth: usize,
+) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
     for owner in owners {
-        candidates.extend(
-            support
-                .fqn(&format!("{}.{}", owner.fq_name(), member))
-                .into_iter()
-                .filter(|candidate| {
-                    candidate.source() == owner.source()
-                        || (matches!(
-                            cpp_indexed_callable_linkage(analyzer, candidate),
-                            Some(crate::analyzer::CallableLinkage::External)
-                        ) && cpp_header_body_files_are_related(
-                            analyzer,
-                            owner.source(),
-                            candidate.source(),
-                        ))
-                }),
-        );
+        let found: Vec<CodeUnit> = support
+            .fqn(&format!("{}.{}", owner.fq_name(), member))
+            .into_iter()
+            .filter(|candidate| {
+                candidate.source() == owner.source()
+                    || (matches!(
+                        cpp_indexed_callable_linkage(analyzer, candidate),
+                        Some(crate::analyzer::CallableLinkage::External)
+                    ) && cpp_header_body_files_are_related(
+                        analyzer,
+                        owner.source(),
+                        candidate.source(),
+                    ))
+            })
+            .collect();
+        if let Some(state) = member_trace.as_deref_mut() {
+            state.record_found(&found, owner, depth);
+        }
+        candidates.extend(found);
     }
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
 }
 
+/// The base-class walk, one derivation level at a time, stopping at the first
+/// level that declares the member -- C++ name lookup hides a base declaration
+/// behind a nearer one, so a deeper member is never computed once a nearer
+/// level answered.
+///
+/// The walk is an explicit level loop rather than a recursion: a deep or
+/// recovered derivation chain must not consume Rust stack.
 fn cpp_inherited_member_candidates(
     ctx: CppLookupCtx<'_, '_>,
     owners: &[CodeUnit],
     member: &str,
     seen: &mut HashSet<String>,
+    mut member_trace: Option<&mut CppMemberTrace>,
 ) -> Vec<CodeUnit> {
-    let mut bases = Vec::new();
-    for owner in owners {
-        for base in cpp_direct_base_types(ctx.analyzer, ctx.visibility, ctx.file, owner) {
-            if seen.insert(base.fq_name()) {
-                bases.push(base);
+    let mut level = owners.to_vec();
+    let mut depth = 0usize;
+    loop {
+        let mut bases = Vec::new();
+        for owner in &level {
+            for base in cpp_direct_base_types(ctx.analyzer, ctx.visibility, ctx.file, owner) {
+                if seen.insert(base.fq_name()) {
+                    if let Some(state) = member_trace.as_deref_mut() {
+                        state
+                            .parents
+                            .entry(base.clone())
+                            .or_insert_with(|| owner.clone());
+                    }
+                    bases.push(base);
+                }
             }
         }
+        if bases.is_empty() {
+            return Vec::new();
+        }
+        depth += 1;
+        let direct = cpp_direct_member_candidates_traced(
+            ctx.analyzer,
+            ctx.support,
+            &bases,
+            member,
+            member_trace.as_deref_mut(),
+            depth,
+        );
+        if !direct.is_empty() {
+            return direct;
+        }
+        level = bases;
     }
-    if bases.is_empty() {
-        return Vec::new();
-    }
-    let direct = cpp_direct_member_candidates(ctx.analyzer, ctx.support, &bases, member);
-    if !direct.is_empty() {
-        return direct;
-    }
-    let mut inherited = cpp_inherited_member_candidates(ctx, &bases, member, seen);
-    sort_units(&mut inherited);
-    inherited.dedup();
-    inherited
 }
 
 fn cpp_filter_candidates_by_call(

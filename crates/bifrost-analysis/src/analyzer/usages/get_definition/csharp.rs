@@ -1,6 +1,7 @@
 use super::*;
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::csharp::{graph_support, hierarchy};
+use crate::analyzer::structural::{PrecedenceTier, RejectionReason};
 use crate::analyzer::tree_walk::node_for_exact_range;
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::csharp_graph::{
@@ -16,6 +17,7 @@ use crate::analyzer::{
     csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
     csharp_normalize_full_name, csharp_source_identifier,
 };
+use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_csharp::syntax::{
     csharp_using_directive_is_static, csharp_using_directive_target_node,
 };
@@ -596,6 +598,15 @@ fn resolve_csharp_in_session(
                 explicit_generic_arity,
                 false,
             );
+            // #1477: an extension candidate stays unattributed. The seam below
+            // admits a method by matching its declared receiver spelling
+            // against a *set* of compatible receiver type names -- the
+            // receiver's own type and its supertypes, plus names the workspace
+            // never indexed -- and returns only the declarations. It reports
+            // neither which name matched nor the type it matched, so this side
+            // holds no owner and no hop distance for the find. Attributing the
+            // receiver's own type at depth zero would claim the extension was
+            // declared on it, which an extension of a base type contradicts.
             if outcome.status == DefinitionLookupStatus::NoDefinition && should_try_extensions {
                 let extensions = match definitions.session() {
                     Some(session) => csharp_visible_extension_method_candidates_in_session(
@@ -2144,11 +2155,18 @@ fn csharp_member_outcome(
         );
     };
 
+    // Attribution is built only while a trace records (#1477); the walk itself
+    // reads nothing back from it and decides nothing with it.
+    let mut member_trace = trace::recording().then(CSharpMemberTrace::default);
+
     let mut direct_candidates = Vec::new();
     let mut seen_owner_fqns = HashSet::default();
     for owner in &owners {
         if !definitions.scope_step() {
             break;
+        }
+        if let Some(state) = member_trace.as_mut() {
+            state.record_root(owner);
         }
         let mut parts = definitions.partial_type_parts(owner);
         if parts.is_empty() {
@@ -2160,12 +2178,13 @@ fn csharp_member_outcome(
             }
             let owner_fqn = part.fq_name();
             if seen_owner_fqns.insert(owner_fqn.clone()) {
-                direct_candidates.extend(csharp_non_constructor_member_candidates(
-                    analyzer,
-                    definitions,
-                    &part,
-                    member,
-                ));
+                let found =
+                    csharp_non_constructor_member_candidates(analyzer, definitions, &part, member);
+                if let Some(state) = member_trace.as_mut() {
+                    state.record_root(&part);
+                    state.record_found(&found, &part, 0);
+                }
+                direct_candidates.extend(found);
             }
         }
     }
@@ -2179,6 +2198,9 @@ fn csharp_member_outcome(
     let applicable =
         csharp_filter_candidates_by_arity(analyzer, definitions, &direct_candidates, arity);
     if !applicable.is_empty() {
+        if let Some(state) = member_trace.as_ref() {
+            state.stage_selection(&applicable, csharp_winner_applicability(arity));
+        }
         return candidates_outcome(applicable);
     }
     let mut fallback_candidates = direct_candidates;
@@ -2186,17 +2208,23 @@ fn csharp_member_outcome(
     if let Some(provider) = analyzer.type_hierarchy_provider() {
         let mut seen = HashSet::default();
         let mut level = Vec::new();
+        let mut depth = 0usize;
         for owner in owners {
             if !definitions.scope_step() {
                 break;
             }
             seen.insert(owner.clone());
-            level.extend(definitions.direct_ancestors(provider, &owner));
+            let expanded = definitions.direct_ancestors(provider, &owner);
+            if let Some(state) = member_trace.as_mut() {
+                state.record_expansion(&owner, &expanded);
+            }
+            level.extend(expanded);
         }
         while !level.is_empty() {
             if !definitions.scope_step() {
                 break;
             }
+            depth += 1;
             let mut level_candidates = Vec::new();
             let mut next_level = Vec::new();
             for ancestor in level {
@@ -2206,13 +2234,21 @@ fn csharp_member_outcome(
                 if !seen.insert(ancestor.clone()) {
                     continue;
                 }
-                level_candidates.extend(csharp_non_constructor_member_candidates(
+                let found = csharp_non_constructor_member_candidates(
                     analyzer,
                     definitions,
                     &ancestor,
                     member,
-                ));
-                next_level.extend(definitions.direct_ancestors(provider, &ancestor));
+                );
+                if let Some(state) = member_trace.as_mut() {
+                    state.record_found(&found, &ancestor, depth);
+                }
+                level_candidates.extend(found);
+                let expanded = definitions.direct_ancestors(provider, &ancestor);
+                if let Some(state) = member_trace.as_mut() {
+                    state.record_expansion(&ancestor, &expanded);
+                }
+                next_level.extend(expanded);
             }
             sort_units(&mut level_candidates);
             level_candidates.dedup();
@@ -2224,6 +2260,9 @@ fn csharp_member_outcome(
             let applicable =
                 csharp_filter_candidates_by_arity(analyzer, definitions, &level_candidates, arity);
             if !applicable.is_empty() {
+                if let Some(state) = member_trace.as_ref() {
+                    state.stage_selection(&applicable, csharp_winner_applicability(arity));
+                }
                 return candidates_outcome(applicable);
             }
             if fallback_candidates.is_empty() && !level_candidates.is_empty() {
@@ -2234,6 +2273,15 @@ fn csharp_member_outcome(
     }
     if !fallback_candidates.is_empty() {
         return if fallback_when_inapplicable {
+            if let Some(state) = member_trace.as_ref() {
+                // Bound despite the call shape: the arity filter accepted none
+                // of them, and this seam binds them anyway. The verdict says so.
+                debug_assert!(
+                    arity.is_some(),
+                    "an unknown arity accepts every candidate, so the fallback is unreachable"
+                );
+                state.stage_selection(&fallback_candidates, ApplicabilityVerdict::Inapplicable);
+            }
             candidates_outcome(fallback_candidates)
         } else {
             no_definition(
@@ -2246,6 +2294,208 @@ fn csharp_member_outcome(
         "no_indexed_definition",
         format!("C# member `{member}` is not indexed as a definition"),
     )
+}
+
+/// The verdict a winning C# member candidate carries: the member seams check
+/// the call's argument count and nothing else about the call, so an unknown
+/// arity leaves the callable axis (#1478) unclaimed.
+fn csharp_winner_applicability(arity: Option<usize>) -> ApplicabilityVerdict {
+    if arity.is_some() {
+        ApplicabilityVerdict::Applicable
+    } else {
+        ApplicabilityVerdict::Unknown
+    }
+}
+
+/// Where the C# member walk found one candidate: the exact type it read the
+/// declaration out of, and how many hierarchy hops that type is from the
+/// receiver's own type.
+struct CSharpMemberFind {
+    owner: CodeUnit,
+    depth: usize,
+}
+
+/// The per-candidate attribution the C# member walk records while it runs
+/// (#1477), built only when a trace is being recorded.
+///
+/// It is an emission of facts the walk already holds -- which type each
+/// candidate was read out of, at which breadth-first depth, and through which
+/// first-discovery edges that type was reached. The walk decides nothing from
+/// it, so an untraced lookup allocates none of these maps and takes no extra
+/// step.
+///
+/// Two limits are stated here rather than guessed around.
+///
+/// - Every hop is [`HierarchyRelation::Supertype`]. Both ancestor sources the
+///   walk uses report one undifferentiated supertype list: the unbudgeted path
+///   asks [`TypeHierarchyProvider::get_direct_ancestors`], and the bounded path
+///   resolves the declaration's raw `: A, IB` list. Neither says which entry was
+///   a base class and which an interface, so a C# interface member is
+///   `inherited_or_promoted` at its true depth rather than `trait_or_interface`:
+///   claiming the interface bucket would assert a distinction no layer here
+///   made.
+/// - Nothing claims [`MemberDispatchTier::StaticOrCompanion`]. C# spells a
+///   static access exactly like an instance one (`Type.Member`), so the
+///   reference site cannot state the bucket, and the C# adapter records no
+///   `callable_is_static` signature metadata, so the declaration cannot either.
+#[derive(Default)]
+struct CSharpMemberTrace {
+    /// The types the walk started from: each resolved receiver type and each
+    /// part of a partial one. A route terminates when it reaches one.
+    roots: HashSet<CodeUnit>,
+    /// First-discovery parent of every ancestor the walk expanded, which makes
+    /// the route a bounded walk back to a root.
+    parents: HashMap<CodeUnit, CodeUnit>,
+    found: HashMap<CodeUnit, CSharpMemberFind>,
+    /// Every candidate the walk computed, in discovery order, so a candidate it
+    /// discarded can be reported beside the one it bound.
+    considered: Vec<CodeUnit>,
+}
+
+impl CSharpMemberTrace {
+    fn record_root(&mut self, root: &CodeUnit) {
+        self.roots.insert(root.clone());
+    }
+
+    fn record_expansion(&mut self, owner: &CodeUnit, ancestors: &[CodeUnit]) {
+        for ancestor in ancestors {
+            self.parents
+                .entry(ancestor.clone())
+                .or_insert_with(|| owner.clone());
+        }
+    }
+
+    fn record_found(&mut self, candidates: &[CodeUnit], owner: &CodeUnit, depth: usize) {
+        for candidate in candidates {
+            if self.found.contains_key(candidate) {
+                continue;
+            }
+            self.found.insert(
+                candidate.clone(),
+                CSharpMemberFind {
+                    owner: owner.clone(),
+                    depth,
+                },
+            );
+            self.considered.push(candidate.clone());
+        }
+    }
+
+    /// The exact route from the root the walk descended through to the type
+    /// `candidate` was found on, as the first-discovery edges the walk took.
+    fn route(&self, candidate: &CodeUnit) -> Vec<trace::HierarchyHopRecord> {
+        use crate::analyzer::structural::HierarchyRelation;
+
+        let Some(find) = self.found.get(candidate) else {
+            return Vec::new();
+        };
+        let mut chain = vec![find.owner.clone()];
+        while !self
+            .roots
+            .contains(chain.last().expect("chain is never empty"))
+        {
+            let Some(parent) = self
+                .parents
+                .get(chain.last().expect("chain is never empty"))
+            else {
+                break;
+            };
+            chain.push(parent.clone());
+        }
+        chain.reverse();
+        debug_assert_eq!(
+            chain.len(),
+            find.depth + 1,
+            "the first-discovery chain must be exactly the walk's hop distance"
+        );
+        chain
+            .windows(2)
+            .enumerate()
+            .map(|(hop, pair)| trace::HierarchyHopRecord {
+                hop,
+                from: pair[0].clone(),
+                to: pair[1].clone(),
+                relation: HierarchyRelation::Supertype,
+            })
+            .collect()
+    }
+
+    fn enrichment(
+        &self,
+        candidate: &CodeUnit,
+        applicability: ApplicabilityVerdict,
+    ) -> Option<trace::MemberEnrichment> {
+        use crate::analyzer::structural::MemberDispatchTier;
+
+        let find = self.found.get(candidate)?;
+        let dispatch_tier = if find.depth == 0 {
+            MemberDispatchTier::InherentOrDirect
+        } else {
+            MemberDispatchTier::InheritedOrPromoted
+        };
+        Some(trace::MemberEnrichment {
+            owner: find.owner.clone(),
+            hierarchy_depth: find.depth,
+            dispatch_tier,
+            applicability,
+            route: self.route(candidate),
+        })
+    }
+
+    fn precedence_tier(&self, candidate: &CodeUnit) -> Option<PrecedenceTier> {
+        self.found.get(candidate).map(|find| {
+            if find.depth == 0 {
+                PrecedenceTier::OwnMember
+            } else {
+                PrecedenceTier::InheritedMember
+            }
+        })
+    }
+
+    /// Stage attribution for the candidates the walk is about to bind, and
+    /// record every other candidate it computed as rejected.
+    ///
+    /// A C# member loser here always lost on the call's shape alone -- the
+    /// explicit type-argument count or the argument count -- whose structured
+    /// story belongs to the callable axis (#1478), so the reason defers to it.
+    ///
+    /// This runs only on a return that constructs an outcome from `winners`.
+    /// A member walk that resolves nothing stages nothing, because the caller
+    /// re-runs the walk with a wider fallback and the reference's real answer
+    /// may still come from a different seam entirely.
+    fn stage_selection(&self, winners: &[CodeUnit], applicability: ApplicabilityVerdict) {
+        for loser in self
+            .considered
+            .iter()
+            .filter(|unit| !winners.contains(unit))
+        {
+            let mut row = trace::TraceCandidate::rejected(
+                trace::TraceCandidateRef::Unit(loser.clone()),
+                self.precedence_tier(loser),
+                RejectionReason::CallableApplicabilityDeferred,
+            );
+            if let Some(enrichment) = self.enrichment(loser, ApplicabilityVerdict::Inapplicable) {
+                row = row.with_member(enrichment);
+            }
+            trace::record(row);
+        }
+        if let Some(tier) = winners
+            .iter()
+            .filter_map(|unit| self.precedence_tier(unit))
+            .min()
+        {
+            trace::stage_tier(tier, winners.iter().map(CodeUnit::fq_name).collect());
+        }
+        trace::stage_member_context(
+            winners
+                .iter()
+                .filter_map(|unit| {
+                    self.enrichment(unit, applicability)
+                        .map(|enrichment| (unit.fq_name(), enrichment))
+                })
+                .collect(),
+        );
+    }
 }
 
 fn csharp_non_constructor_member_candidates(

@@ -311,6 +311,34 @@ impl<'a> RubySemanticIndex<'a> {
         receiver: &ReceiverType,
         member: &str,
     ) -> Vec<CodeUnit> {
+        self.method_candidates(support, visible_files, receiver, member, None)
+    }
+
+    /// [`Self::resolve_method_candidates`], reporting where the group it
+    /// returns was found (#1477).
+    ///
+    /// The lookup returns the first non-empty group it reaches, so one owner
+    /// and one edge describe every candidate in that group. A caller that does
+    /// not ask keeps the plain entry point and pays nothing.
+    pub fn resolve_method_candidates_traced(
+        &self,
+        support: &dyn BoundedDefinitionLookup,
+        visible_files: &HashSet<ProjectFile>,
+        receiver: &ReceiverType,
+        member: &str,
+        find: &mut Option<RubyMethodFind>,
+    ) -> Vec<CodeUnit> {
+        self.method_candidates(support, visible_files, receiver, member, Some(find))
+    }
+
+    fn method_candidates(
+        &self,
+        support: &dyn BoundedDefinitionLookup,
+        visible_files: &HashSet<ProjectFile>,
+        receiver: &ReceiverType,
+        member: &str,
+        mut find: Option<&mut Option<RubyMethodFind>>,
+    ) -> Vec<CodeUnit> {
         let visible_files: Vec<ProjectFile> = visible_files.iter().cloned().collect();
         let mut seen = HashSet::default();
         let mut push_owner = |owner: &str, mode: RubyMethodLookupMode, out: &mut Vec<CodeUnit>| {
@@ -337,6 +365,7 @@ impl<'a> RubySemanticIndex<'a> {
                     &receiver.owner_fq_name,
                 ) {
                     let mut prepended = Vec::new();
+                    let mut prepended_from = None;
                     for mixin in self
                         .mixin_owners(
                             support,
@@ -349,20 +378,30 @@ impl<'a> RubySemanticIndex<'a> {
                     {
                         push_owner(&mixin, RubyMethodLookupMode::InstanceMethod, &mut prepended);
                         if !prepended.is_empty() {
+                            prepended_from = Some(mixin);
                             break;
                         }
                     }
                     if !prepended.is_empty() {
+                        record_find(
+                            &mut find,
+                            &owner,
+                            prepended_from,
+                            Some(TypeRelationKind::MixinPrepend),
+                            false,
+                        );
                         return prepended;
                     }
 
                     let mut direct = Vec::new();
                     push_owner(&owner, RubyMethodLookupMode::InstanceMethod, &mut direct);
                     if !direct.is_empty() {
+                        record_find(&mut find, &owner, None, None, false);
                         return direct;
                     }
 
                     let mut included = Vec::new();
+                    let mut included_from = None;
                     for mixin in self
                         .mixin_owners(
                             support,
@@ -375,10 +414,18 @@ impl<'a> RubySemanticIndex<'a> {
                     {
                         push_owner(&mixin, RubyMethodLookupMode::InstanceMethod, &mut included);
                         if !included.is_empty() {
+                            included_from = Some(mixin);
                             break;
                         }
                     }
                     if !included.is_empty() {
+                        record_find(
+                            &mut find,
+                            &owner,
+                            included_from,
+                            Some(TypeRelationKind::MixinInclude),
+                            false,
+                        );
                         return included;
                     }
                 }
@@ -393,10 +440,12 @@ impl<'a> RubySemanticIndex<'a> {
                     let mut direct = Vec::new();
                     push_owner(&owner, RubyMethodLookupMode::SingletonMethod, &mut direct);
                     if !direct.is_empty() {
+                        record_find(&mut find, &owner, None, None, true);
                         return direct;
                     }
 
                     let mut extended = Vec::new();
+                    let mut extended_from = None;
                     for mixin in self
                         .mixin_owners(
                             support,
@@ -409,10 +458,18 @@ impl<'a> RubySemanticIndex<'a> {
                     {
                         push_owner(&mixin, RubyMethodLookupMode::InstanceMethod, &mut extended);
                         if !extended.is_empty() {
+                            extended_from = Some(mixin);
                             break;
                         }
                     }
                     if !extended.is_empty() {
+                        record_find(
+                            &mut find,
+                            &owner,
+                            extended_from,
+                            Some(TypeRelationKind::MixinExtend),
+                            true,
+                        );
                         return extended;
                     }
                 }
@@ -428,12 +485,90 @@ impl<'a> RubySemanticIndex<'a> {
         receiver: &ReceiverType,
         member: &str,
     ) -> Vec<CodeUnit> {
-        let candidates = self.resolve_method_candidates(support, visible_files, receiver, member);
+        self.bare_method_candidates(support, visible_files, receiver, member, None)
+    }
+
+    /// [`Self::resolve_bare_method_candidates`], reporting where the group it
+    /// returns was found (#1477).
+    ///
+    /// A bare name that falls through to the top-level scope reports no find:
+    /// a top-level method belongs to no owner, so there is nothing to
+    /// attribute it to.
+    pub fn resolve_bare_method_candidates_traced(
+        &self,
+        support: &dyn BoundedDefinitionLookup,
+        visible_files: &HashSet<ProjectFile>,
+        receiver: &ReceiverType,
+        member: &str,
+        find: &mut Option<RubyMethodFind>,
+    ) -> Vec<CodeUnit> {
+        self.bare_method_candidates(support, visible_files, receiver, member, Some(find))
+    }
+
+    fn bare_method_candidates(
+        &self,
+        support: &dyn BoundedDefinitionLookup,
+        visible_files: &HashSet<ProjectFile>,
+        receiver: &ReceiverType,
+        member: &str,
+        find: Option<&mut Option<RubyMethodFind>>,
+    ) -> Vec<CodeUnit> {
+        let candidates = self.method_candidates(support, visible_files, receiver, member, find);
         if !candidates.is_empty() || receiver.mode == ReceiverMode::TopLevel {
             return candidates;
         }
         let visible_files: Vec<ProjectFile> = visible_files.iter().cloned().collect();
         self.resolve_top_level_method_candidates(support, &visible_files, member)
+    }
+
+    /// The direct ancestors of `owner`: the exact edges
+    /// [`Self::forward_ancestor_lookup_order`] walks, before it flattens them
+    /// into a lookup order that no longer says which owner reached which.
+    pub fn direct_ancestor_owners(
+        &self,
+        support: &dyn BoundedDefinitionLookup,
+        visible_files: &[ProjectFile],
+        owner: &str,
+    ) -> Vec<String> {
+        if let Some(facts) = self.facts {
+            let mut direct: Vec<String> = facts
+                .ancestors
+                .get(owner)
+                .map(|items| items.iter().cloned().collect())
+                .unwrap_or_default();
+            direct.sort();
+            return direct;
+        }
+        self.forward_owner_facts(support, visible_files, owner)
+            .ancestors
+    }
+
+    /// The mixins `owner` composes in through `kind`, in the order the method
+    /// lookup considers them.
+    pub fn mixin_owners_of(
+        &self,
+        support: &dyn BoundedDefinitionLookup,
+        visible_files: &[ProjectFile],
+        owner: &str,
+        kind: TypeRelationKind,
+    ) -> Vec<String> {
+        self.mixin_owners(support, visible_files, owner, kind)
+    }
+
+    /// The class or module declaration `owner` names, as the lookup resolves
+    /// it: an indexed class or module of that exact fq name, visible from the
+    /// referencing file.
+    pub fn owner_unit(
+        &self,
+        support: &dyn BoundedDefinitionLookup,
+        visible_files: &[ProjectFile],
+        owner: &str,
+    ) -> Option<CodeUnit> {
+        support.fqn(owner).into_iter().find(|unit| {
+            (unit.is_class() || unit.is_module())
+                && unit.fq_name() == owner
+                && visible_files.contains(unit.source())
+        })
     }
 
     fn resolve_top_level_method_candidates(
@@ -555,11 +690,7 @@ impl<'a> RubySemanticIndex<'a> {
         if let Some(cached) = self.forward_owner_facts.borrow().get(owner) {
             return cached.clone();
         }
-        let Some(owner_unit) = support.fqn(owner).into_iter().find(|unit| {
-            (unit.is_class() || unit.is_module())
-                && unit.fq_name() == owner
-                && visible_files.contains(unit.source())
-        }) else {
+        let Some(owner_unit) = self.owner_unit(support, visible_files, owner) else {
             self.forward_owner_facts
                 .borrow_mut()
                 .insert(owner.to_string(), RubyForwardOwnerFacts::default());
@@ -639,6 +770,51 @@ impl<'a> RubySemanticIndex<'a> {
         matches.dedup();
         (matches.len() == 1).then(|| matches.remove(0).fq_name())
     }
+}
+
+/// Where a method lookup found the group of candidates it returned (#1477).
+///
+/// The lookup walks the receiver's ancestor order and returns the first
+/// non-empty group it reaches, so exactly one owner and one edge describe
+/// every candidate in that group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RubyMethodFind {
+    /// The owner in the receiver's ancestor lookup order the group was
+    /// reached from.
+    pub reached_from: String,
+    /// The owner that declares the group: `reached_from` itself, or the module
+    /// `mixin` names.
+    pub owner: String,
+    /// The mixin edge from `reached_from` to `owner`, absent when the group
+    /// was declared by `reached_from` itself.
+    pub mixin: Option<TypeRelationKind>,
+    /// Whether the lookup was on the owner's class side.
+    pub class_side: bool,
+}
+
+/// Record one find, when the caller asked for one. Every argument is a fact
+/// the branch that calls this has just decided; nothing here re-derives one.
+fn record_find(
+    find: &mut Option<&mut Option<RubyMethodFind>>,
+    reached_from: &str,
+    mixin_owner: Option<String>,
+    mixin: Option<TypeRelationKind>,
+    class_side: bool,
+) {
+    let Some(slot) = find.as_deref_mut() else {
+        return;
+    };
+    debug_assert_eq!(
+        mixin_owner.is_some(),
+        mixin.is_some(),
+        "a mixin edge and the module it reaches are recorded together"
+    );
+    *slot = Some(RubyMethodFind {
+        owner: mixin_owner.unwrap_or_else(|| reached_from.to_owned()),
+        reached_from: reached_from.to_owned(),
+        mixin,
+        class_side,
+    });
 }
 
 #[derive(Clone, Copy)]

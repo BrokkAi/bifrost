@@ -20,6 +20,7 @@ mod measure_semantic_summary_taint_lifecycle;
 mod no_stringly_name_parsing;
 mod policy_assertion_conformance;
 mod policy_assertion_evaluation;
+mod policy_assertion_per_file_completion;
 mod policy_docs;
 mod policy_edge_parity_assertions;
 mod policy_identity_assertions;
