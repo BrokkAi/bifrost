@@ -648,18 +648,21 @@ impl CSharpDiagnosticCollector<'_> {
     }
 
     /// The declared type name of a local, parameter or field the receiver
-    /// identifier binds, from the same local-inference seeding the usage graph
-    /// uses.
+    /// identifier binds.
+    ///
+    /// Seeded from the file root with the receiver's own start byte as the
+    /// cutoff, which is what `get_definition`'s
+    /// `csharp_structured_receiver_type_names` does. Seeding from the enclosing
+    /// body instead would miss a field declared after the method that reads it.
     fn declared_type_of_binding(
         &self,
         receiver: Node<'_>,
         symbol: &str,
     ) -> Result<String, SemanticDiagnosticIncompleteReason> {
-        let scope = enclosing_body(receiver);
         let mut bindings = LocalInferenceEngine::<String>::default();
-        crate::graph::resolver::seed_visible_bindings_at(
-            scope,
-            receiver,
+        crate::graph::resolver::seed_bindings_before(
+            file_root(receiver),
+            receiver.start_byte(),
             self.csharp,
             self.file,
             self.source,
@@ -1031,28 +1034,10 @@ fn is_type_reference_position(node: Node<'_>) -> bool {
     }
 }
 
-/// The innermost body or declaration a receiver sits in, which bounds the
-/// local-binding seeding.
-fn enclosing_body(node: Node<'_>) -> Node<'_> {
+/// The file's root node, which bounds the local-binding seeding.
+fn file_root(node: Node<'_>) -> Node<'_> {
     let mut current = node;
     while let Some(parent) = current.parent() {
-        if matches!(
-            parent.kind(),
-            "method_declaration"
-                | "constructor_declaration"
-                | "local_function_statement"
-                | "accessor_declaration"
-                | "lambda_expression"
-                | "anonymous_method_expression"
-                | "class_declaration"
-                | "struct_declaration"
-                | "record_declaration"
-                | "record_struct_declaration"
-                | "interface_declaration"
-                | "compilation_unit"
-        ) {
-            return parent;
-        }
         current = parent;
     }
     current

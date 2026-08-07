@@ -2761,6 +2761,16 @@ fn resolve_typedef_or_ref_type_at_depth(
     }
     let tag = value & 3;
     let index = (value >> 2) as usize;
+    // ECMA-335 II.24.2.6: every TypeDefOrRef row index is 1-based, so index 0
+    // is the nil token and means "no type here". An interface's `Extends` and
+    // `System.Object`'s own are both nil. Without this guard `saturating_sub`
+    // folds the nil token onto row 1, which is the `<Module>` pseudo-type that
+    // holds an assembly's global functions -- so every interface appeared to
+    // extend `<Module>`, and a supertype walk chased a link that does not
+    // exist.
+    if index == 0 {
+        return None;
+    }
     match tag {
         0 => types
             .get(index.saturating_sub(1))

@@ -10,6 +10,9 @@
 //! over a workspace with no dependency inputs that builds an empty index
 //! without touching anything outside the temporary project root.
 
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
 use brokk_bifrost::analyzer::AnalyzerConfig;
 use brokk_bifrost::{Language, WorkspaceAnalyzer};
 use brokk_bifrost_analysis::analyzer::structural::BoundaryStatus;
@@ -21,6 +24,20 @@ use brokk_bifrost_analysis::analyzer::{
 use crate::common::{BuiltInlineTestProject, InlineTestProject};
 
 const APP: &str = "App.cs";
+
+/// The checked-in offline fixture assembly, built once and committed. Its
+/// source is `tests/fixtures/csharp-external/ExternalLibrary.cs`: namespace
+/// `Fixture.Api`, holding `IClient`, `Client<T>`, `Message`, `Status`,
+/// `MessageHandler` and `GenericSurface`. Nothing here builds or downloads it.
+const FIXTURE_ASSEMBLY: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/csharp-external/ExternalLibrary.dll"
+));
+
+/// Where each fixture writes the assembly inside its own temporary project.
+/// `.dll` is a C# dependency input, so rewriting this path is also what the
+/// invalidation test changes.
+const ASSEMBLY_REL: &str = "libs/ExternalLibrary.dll";
 
 struct CSharpFixture {
     project: BuiltInlineTestProject,
@@ -50,12 +67,38 @@ impl CSharpFixture {
         fixture
     }
 
+    /// A workspace whose C# configuration points at one assembly, written into
+    /// the project's own temporary root, with the index warmed off the request
+    /// path. `bytes` is the assembly's content, so a test can hand it a
+    /// deliberately malformed one.
+    fn with_assembly(files: &[(&str, &str)], bytes: &[u8]) -> Self {
+        let mut builder = InlineTestProject::with_language(Language::CSharp);
+        for (path, source) in files {
+            builder = builder.file(*path, *source);
+        }
+        let project = builder.build();
+        let assembly = project.root().join(ASSEMBLY_REL);
+        std::fs::create_dir_all(assembly.parent().expect("assembly has a parent")).unwrap();
+        std::fs::write(&assembly, bytes).unwrap();
+        let mut config = AnalyzerConfig::default();
+        config.csharp.assembly_paths = vec![PathBuf::from(ASSEMBLY_REL)];
+        let analyzer = project.workspace_analyzer(config);
+        analyzer.analyzer().warm_query_indexes();
+        Self { project, analyzer }
+    }
+
     fn report(&self, rel_path: &str) -> SemanticDiagnosticReport {
+        self.report_from(&self.analyzer, rel_path)
+    }
+
+    fn report_from(
+        &self,
+        analyzer: &WorkspaceAnalyzer,
+        rel_path: &str,
+    ) -> SemanticDiagnosticReport {
         let file = self.project.file(rel_path);
         let source = file.read_to_string().expect("read fixture source");
-        self.analyzer
-            .analyzer()
-            .semantic_diagnostics(&file, &source)
+        analyzer.analyzer().semantic_diagnostics(&file, &source)
     }
 }
 
@@ -455,4 +498,177 @@ fn parse_errors_report_a_typed_incomplete_rather_than_an_empty_report() {
         )),
         "{report:#?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The indexed assembly surface
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_indexed_assembly_type_resolves_at_the_external_boundary() {
+    let fixture = CSharpFixture::with_assembly(
+        &[(
+            APP,
+            "using Fixture.Api;\nnamespace App { public class Host { IClient Make() { return null; } } }\n",
+        )],
+        FIXTURE_ASSEMBLY,
+    );
+    let report = fixture.report(APP);
+    assert!(
+        report.diagnostics().is_empty(),
+        "an indexed assembly symbol must never error: {report:#?}"
+    );
+    assert!(
+        resolved_at(&report, BoundaryStatus::ExternalIndexed),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn a_type_absent_from_a_complete_indexed_surface_errors() {
+    let fixture = CSharpFixture::with_assembly(
+        &[(
+            APP,
+            "using Fixture.Api;\nnamespace App { public class Host { Nonexistent Make() { return null; } } }\n",
+        )],
+        FIXTURE_ASSEMBLY,
+    );
+    let report = fixture.report(APP);
+    assert!(absent_type(&report, "Nonexistent"), "{report:#?}");
+    assert!(
+        absence_boundaries(&report).contains(&BoundaryStatus::ExternalIndexed),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn an_internal_assembly_type_is_not_visible_and_stays_absent() {
+    let fixture = CSharpFixture::with_assembly(
+        &[(
+            APP,
+            "using Fixture.Api;\nnamespace App { public class Host { InternalOnly Make() { return null; } } }\n",
+        )],
+        FIXTURE_ASSEMBLY,
+    );
+    let report = fixture.report(APP);
+    assert!(
+        absent_type(&report, "InternalOnly"),
+        "an assembly-internal type is not part of the visible surface: {report:#?}"
+    );
+}
+
+#[test]
+fn a_member_published_by_an_indexed_type_resolves() {
+    let fixture = CSharpFixture::with_assembly(
+        &[(
+            APP,
+            "using Fixture.Api;\nnamespace App { public class Host { void Use(IClient c) { var s = c.Send(null); } } }\n",
+        )],
+        FIXTURE_ASSEMBLY,
+    );
+    let report = fixture.report(APP);
+    assert!(
+        report.diagnostics().is_empty(),
+        "`Send` is published on the indexed interface: {report:#?}"
+    );
+    assert!(
+        resolved_at(&report, BoundaryStatus::ExternalIndexed),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn a_member_absent_from_a_complete_indexed_owner_errors() {
+    let fixture = CSharpFixture::with_assembly(
+        &[(
+            APP,
+            "using Fixture.Api;\nnamespace App { public class Host { void Use(IClient c) { var s = c.Missing; } } }\n",
+        )],
+        FIXTURE_ASSEMBLY,
+    );
+    let report = fixture.report(APP);
+    assert!(
+        absent_member(&report, "Fixture.Api.IClient", "Missing"),
+        "an interface declares no base type, so its indexed surface is whole: {report:#?}"
+    );
+}
+
+#[test]
+fn an_indexed_owner_whose_base_chain_leaves_the_index_cannot_prove_a_member_absent() {
+    let fixture = CSharpFixture::with_assembly(
+        &[(
+            APP,
+            "using Fixture.Api;\nnamespace App { public class Host { void Use(Client<int> c) { var s = c.Missing; } } }\n",
+        )],
+        FIXTURE_ASSEMBLY,
+    );
+    let report = fixture.report(APP);
+    assert!(
+        !absent_member(&report, "Fixture.Api.Client`1", "Missing"),
+        "`Client<T>` extends `System.Object`, which no indexed assembly \
+         declares, so its surface is not complete: {report:#?}"
+    );
+    assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
+}
+
+#[test]
+fn malformed_assembly_metadata_cannot_prove_absence() {
+    let fixture = CSharpFixture::with_assembly(
+        &[(
+            APP,
+            "using Fixture.Api;\nnamespace App { public class Host { Nonexistent Make() { return null; } } }\n",
+        )],
+        b"MZ this is not a CLI assembly",
+    );
+    let report = fixture.report(APP);
+    assert!(
+        report.diagnostics().is_empty(),
+        "an index that could not read its input proves nothing: {report:#?}"
+    );
+    assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
+    assert!(
+        incomplete_reasons(&report).iter().any(|reason| matches!(
+            reason,
+            SemanticDiagnosticIncompleteReason::CorruptSemanticPack { .. }
+                | SemanticDiagnosticIncompleteReason::Truncated
+        )),
+        "{report:#?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Invalidation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn changed_dependency_inputs_withdraw_a_previously_proven_absence() {
+    let fixture = CSharpFixture::with_assembly(
+        &[(
+            APP,
+            "using Fixture.Api;\nnamespace App { public class Host { Nonexistent Make() { return null; } } }\n",
+        )],
+        FIXTURE_ASSEMBLY,
+    );
+    let before = fixture.report(APP);
+    assert!(
+        absent_type(&before, "Nonexistent"),
+        "the absence must be proven before it can be withdrawn: {before:#?}"
+    );
+
+    // Rewriting the assembly is a dependency-input change, which drops the
+    // retained index. The next request peeks at an unbuilt cell and must fall
+    // back to an unknown boundary rather than reusing the old proof.
+    let assembly = fixture.project.file(ASSEMBLY_REL);
+    let updated = fixture.analyzer.update(&BTreeSet::from([assembly]));
+    assert!(
+        !updated.analyzer().query_indexes_warm(),
+        "a changed dependency input must drop the retained assembly index"
+    );
+
+    let after = fixture.report_from(&updated, APP);
+    assert!(
+        after.diagnostics().is_empty(),
+        "the proof must be withdrawn, not carried forward: {after:#?}"
+    );
+    assert_eq!(after.status(), SemanticDiagnosticReportStatus::Incomplete);
 }
