@@ -2383,3 +2383,88 @@ fn issue_1688_terminal_shared_across_languages_keeps_its_ambiguity() {
         result.ambiguous[0].matches
     );
 }
+
+/// A workspace whose qualified selector `Widget.render` is declared by five
+/// Rust modules, so the indexed suffix stage can never return a unique
+/// resolution and fuzzy resolution has to fall through to the ambiguity
+/// decision. `Gauge.calibrate` is the unique twin of that shape, and the Go and
+/// Python files make a per-language cost visible as a per-language count.
+fn issue_1758_ambiguous_selector_project() -> BuiltInlineTestProject {
+    let widget = "pub struct Widget;\n\nimpl Widget {\n    pub fn render(&self) {}\n}\n";
+    InlineTestProject::new()
+        .file("go.mod", "module github.com/example/app\n\ngo 1.22\n")
+        .file("src/left.rs", widget)
+        .file("src/right.rs", widget)
+        .file("src/third.rs", widget)
+        .file("src/fourth.rs", widget)
+        .file("src/fifth.rs", widget)
+        .file(
+            "src/only.rs",
+            "pub struct Gauge;\n\nimpl Gauge {\n    pub fn calibrate(&self) {}\n}\n",
+        )
+        .file(
+            "kvserver/replica.go",
+            "package kvserver\n\ntype Replica struct{}\n\nfunc (r *Replica) handleRaftReady() {}\n",
+        )
+        .file(
+            "analysis/summary.py",
+            "class Report:\n    def render(self):\n        return None\n",
+        )
+        .build()
+}
+
+/// Issue #1758: fuzzy resolution's last stage decided ambiguity by
+/// materializing `get_all_declarations()` -- every declaration of every
+/// workspace language -- and rescanning it. Measured on the reported
+/// workspace: 443.1 s and 4.4 GB for a `Vec` of 3,480,147 `CodeUnit`s, plus a
+/// whole-workspace live-path scan per language inside each of those reads, to
+/// feed a 2.6 s match loop. The stage now decides from the candidates the
+/// indexed suffix stage already matched.
+///
+/// The three outcomes it can reach -- a unique hit, a miss, and an ambiguity
+/// that only this stage reports -- must be unchanged, and none of them may
+/// charge a declaration-table scan.
+#[test]
+fn issue_1758_fuzzy_resolution_decides_ambiguity_without_a_full_declaration_scan() {
+    let project = issue_1758_ambiguous_selector_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+
+    analyzer.reset_full_declaration_scan_count_for_test();
+    let hit = source_for(analyzer, "Gauge.calibrate");
+    assert!(hit.not_found.is_empty(), "{hit:#?}");
+    assert!(hit.ambiguous.is_empty(), "{hit:#?}");
+    assert_eq!(1, hit.sources.len(), "{hit:#?}");
+    assert_eq!("src/only.rs", hit.sources[0].path, "{hit:#?}");
+
+    let miss = source_for(analyzer, "Widget.nosuchmember");
+    assert!(miss.sources.is_empty(), "{miss:#?}");
+    assert!(miss.ambiguous.is_empty(), "{miss:#?}");
+    assert_eq!(1, miss.not_found.len(), "{miss:#?}");
+    assert_eq!("Widget.nosuchmember", miss.not_found[0].input, "{miss:#?}");
+
+    // The stage under test: five declarations answer this selector, so no
+    // indexed stage can return a unique resolution and the ambiguity decision
+    // is what reports them.
+    let ambiguous = source_for(analyzer, "Widget.render");
+    assert!(ambiguous.sources.is_empty(), "{ambiguous:#?}");
+    assert!(ambiguous.not_found.is_empty(), "{ambiguous:#?}");
+    assert_eq!(1, ambiguous.ambiguous.len(), "{ambiguous:#?}");
+    assert_eq!(
+        vec![
+            "fifth.Widget.render".to_string(),
+            "fourth.Widget.render".to_string(),
+            "left.Widget.render".to_string(),
+            "right.Widget.render".to_string(),
+            "third.Widget.render".to_string(),
+        ],
+        ambiguous.ambiguous[0].matches,
+        "{ambiguous:#?}"
+    );
+
+    assert_eq!(
+        0,
+        analyzer.full_declaration_scan_count_for_test(),
+        "deciding fuzzy ambiguity must not read any language's whole declaration table"
+    );
+}

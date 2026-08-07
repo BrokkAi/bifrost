@@ -142,15 +142,49 @@ pub(crate) fn resolve_codeunit_fuzzy_with(
         return resolved;
     }
 
-    if let Some(resolved) = suffix_resolution_from_index(analyzer, trimmed, include) {
-        return resolved;
+    // The indexed suffix stage answers only when its answer is *unique*. A
+    // query several declarations can answer therefore falls through, and the
+    // ambiguity decision below is what reports it. Keep the candidates that
+    // stage already matched instead of throwing them away: they are the same
+    // candidates the ambiguity decision needs.
+    let mut indexed = FuzzyMatches::default();
+    match suffix_stage_from_index(analyzer, trimmed, include) {
+        SuffixStageOutcome::Decided(resolved) => return resolved,
+        SuffixStageOutcome::Undecided(matches) => indexed.merge(matches),
     }
-    if stripped != trimmed
-        && let Some(resolved) = suffix_resolution_from_index(analyzer, &stripped, include)
-    {
-        return resolved;
+    if stripped != trimmed {
+        match suffix_stage_from_index(analyzer, &stripped, include) {
+            SuffixStageOutcome::Decided(resolved) => return resolved,
+            SuffixStageOutcome::Undecided(matches) => indexed.merge(matches),
+        }
     }
 
+    // An analyzer whose indexed lookups cover every persisted declaration has
+    // already seen, in the stage above, every candidate a whole-workspace scan
+    // could match: a full or suffix alias comparison can only succeed when the
+    // query path's tail equals an alias tail, and an alias tail is a spelling
+    // of the persisted `identifier` that the stage seeks (the same reasoning
+    // the #1688 conclusive-miss gate and the #1688 suffix seek rest on).
+    //
+    // Materializing the workspace to re-derive them cost, on the #1758
+    // workspace, 443.1 s and 4.4 GB to build a `Vec` of 3,480,147 `CodeUnit`s
+    // -- plus one whole-workspace live-path scan per language inside each of
+    // those reads, 55 of them at 6.63 s across the request -- to feed a match
+    // loop that takes 2.6 s.
+    if analyzer.has_complete_symbol_lookup_index() {
+        return resolution_from_matches(analyzer, indexed.full, include)
+            .or_else(|| resolution_from_matches(analyzer, indexed.suffix, include))
+            .unwrap_or(CodeUnitResolution::NotFound);
+    }
+
+    // No complete index to seek (in-memory and third-party analyzers, whose
+    // `lookup_candidates_by_*` default to empty): the workspace scan is the
+    // only candidate source they have.
+    let query_inputs = if stripped == trimmed {
+        vec![trimmed]
+    } else {
+        vec![trimmed, stripped.as_str()]
+    };
     let declarations = {
         let _scope = crate::profiling::scope("resolve_codeunit_fuzzy.materialize_declarations");
         analyzer.get_all_declarations()
@@ -161,11 +195,6 @@ pub(crate) fn resolve_codeunit_fuzzy_with(
     ));
     let mut full_matches = BTreeMap::new();
     let mut suffix_matches = BTreeMap::new();
-    let query_inputs = if stripped == trimmed {
-        vec![trimmed]
-    } else {
-        vec![trimmed, stripped.as_str()]
-    };
     // The per-language interpretations plus the terminal segment of each
     // interpretation. Both a full match (`query_paths.contains`) and a suffix
     // match (`path_ends_with`) require the query's terminal segment to equal
@@ -321,11 +350,44 @@ fn matching_definitions(
         .collect()
 }
 
-fn suffix_resolution_from_index(
+/// Declarations one indexed suffix stage matched, keyed by fq name exactly as
+/// [`collect_fuzzy_matches`] keys them: `full` for an alias that equals a query
+/// path, `suffix` for one that ends with it.
+#[derive(Default)]
+struct FuzzyMatches {
+    full: BTreeMap<String, CodeUnit>,
+    suffix: BTreeMap<String, CodeUnit>,
+}
+
+impl FuzzyMatches {
+    /// Union with `other`. The maps dedup by fq name and the first insertion
+    /// wins, matching `insert_match`, so merging the two accepted spellings of
+    /// one query yields the same map a single pass over their union would.
+    fn merge(&mut self, other: Self) {
+        for (fq_name, unit) in other.full {
+            self.full.entry(fq_name).or_insert(unit);
+        }
+        for (fq_name, unit) in other.suffix {
+            self.suffix.entry(fq_name).or_insert(unit);
+        }
+    }
+}
+
+/// What one run of the indexed suffix stage concluded.
+enum SuffixStageOutcome {
+    /// The stage reached a conclusion: return it verbatim. Either a unique
+    /// resolution, or the #1688 conclusive miss.
+    Decided(CodeUnitResolution),
+    /// No unique answer. These are the candidates the stage matched, for the
+    /// caller's ambiguity decision.
+    Undecided(FuzzyMatches),
+}
+
+fn suffix_stage_from_index(
     analyzer: &dyn IAnalyzer,
     symbol: &str,
     include: impl Copy + Fn(&CodeUnit) -> bool,
-) -> Option<CodeUnitResolution> {
+) -> SuffixStageOutcome {
     let _scope = crate::profiling::scope(format!("suffix_resolution_from_index[{symbol}]"));
     let stage1_scope = crate::profiling::scope("suffix_resolution.short_name_stage");
     let mut exact_matches = BTreeMap::new();
@@ -368,16 +430,16 @@ fn suffix_resolution_from_index(
     }
     let no_indexed_matches = exact_matches.is_empty() && exact_suffix_matches.is_empty();
     if let Some(CodeUnitResolution::Resolved(matches)) =
-        unique_resolution_from_matches(analyzer, exact_matches, include)
+        unique_resolution_from_matches(analyzer, &exact_matches, include)
     {
-        return Some(CodeUnitResolution::Resolved(matches));
+        return SuffixStageOutcome::Decided(CodeUnitResolution::Resolved(matches));
     }
 
     // The persisted identifier index is complete for tree-sitter analyzers.
     // If it found no alias for the terminal, the suffix regex cannot find a
     // declaration either. Avoid the unbounded SQLite scan on this miss.
     if analyzer.has_complete_symbol_lookup_index() && no_indexed_matches {
-        return Some(CodeUnitResolution::NotFound);
+        return SuffixStageOutcome::Decided(CodeUnitResolution::NotFound);
     }
 
     drop(stage1_scope);
@@ -416,19 +478,39 @@ fn suffix_resolution_from_index(
         }
     }
 
-    if !full_matches.is_empty() {
-        return unique_resolution_from_matches(analyzer, full_matches, include);
+    let decided = if full_matches.is_empty() {
+        unique_resolution_from_matches(analyzer, &suffix_matches, include)
+    } else {
+        unique_resolution_from_matches(analyzer, &full_matches, include)
+    };
+    if let Some(resolution) = decided {
+        return SuffixStageOutcome::Decided(resolution);
     }
-    unique_resolution_from_matches(analyzer, suffix_matches, include)
+
+    // Both stages matched against the same query paths with the same
+    // `collect_fuzzy_matches`, so their maps union by match kind.
+    let mut matched = FuzzyMatches {
+        full: exact_matches,
+        suffix: exact_suffix_matches,
+    };
+    matched.merge(FuzzyMatches {
+        full: full_matches,
+        suffix: suffix_matches,
+    });
+    SuffixStageOutcome::Undecided(matched)
 }
 
+/// The resolution for `matches` when it names exactly one declaration.
+///
+/// Borrows rather than consumes: the stage that finds no unique answer hands
+/// the same maps to its caller, so only the one-match path pays a copy.
 fn unique_resolution_from_matches(
     analyzer: &dyn IAnalyzer,
-    matches: BTreeMap<String, CodeUnit>,
+    matches: &BTreeMap<String, CodeUnit>,
     include: impl Copy + Fn(&CodeUnit) -> bool,
 ) -> Option<CodeUnitResolution> {
     (matches.len() == 1)
-        .then(|| resolution_from_matches(analyzer, matches, include))
+        .then(|| resolution_from_matches(analyzer, matches.clone(), include))
         .flatten()
 }
 
