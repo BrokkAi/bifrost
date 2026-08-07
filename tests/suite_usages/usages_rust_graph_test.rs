@@ -3127,6 +3127,180 @@ impl Future for Sleep {
     );
 }
 
+// Issue #1750: a sibling-impl `self.len()` call was silently dropped whenever the
+// parent module re-exported the type under the same name (`pub use self::zip::Zip;`)
+// and the defining file glob-imported the parent (`use super::*;`). Receiver typing
+// resolved the impl's spelled `Zip` to the re-export path FQN, which names no indexed
+// declaration; the empty candidate set was then reported as a proven foreign type, so
+// `scan_usages` claimed `verified_absent` with zero unproven hits.
+fn zip_reexport_project(
+    reexport: &str,
+    zip_imports: &str,
+) -> (crate::common::BuiltInlineTestProject, RustAnalyzer, String) {
+    let zip_source = format!(
+        r#"{zip_imports}
+
+pub struct Zip<A, B> {{
+    a: A,
+    b: B,
+}}
+
+impl<A, B> ParallelIterator for Zip<A, B>
+where
+    A: IndexedParallelIterator,
+    B: IndexedParallelIterator,
+{{
+    type Item = (A::Item, B::Item);
+
+    fn opt_len(&self) -> Option<usize> {{
+        Some(self.len())
+    }}
+}}
+
+impl<A, B> IndexedParallelIterator for Zip<A, B>
+where
+    A: IndexedParallelIterator,
+    B: IndexedParallelIterator,
+{{
+    fn len(&self) -> usize {{
+        Ord::min(self.a.len(), self.b.len())
+    }}
+}}
+"#
+    );
+    let iter_mod = format!(
+        r#"mod zip;
+
+{reexport}
+
+pub trait ParallelIterator: Sized + Send {{
+    type Item: Send;
+
+    fn opt_len(&self) -> Option<usize> {{
+        None
+    }}
+}}
+
+pub trait IndexedParallelIterator: ParallelIterator {{
+    fn len(&self) -> usize;
+}}
+"#
+    );
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod iter;\n"),
+        ("src/iter/mod.rs", iter_mod.as_str()),
+        ("src/iter/zip.rs", zip_source.as_str()),
+    ]);
+    (project, analyzer, zip_source)
+}
+
+fn assert_zip_sibling_impl_self_call_is_proven(reexport: &str, zip_imports: &str) {
+    let (project, analyzer, zip_source) = zip_reexport_project(reexport, zip_imports);
+    let file = project.file("src/iter/zip.rs");
+    let target = member(&analyzer, &file, "Zip", "len");
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let call = zip_source.find("Some(self.len())").expect("call site") + "Some(self.".len();
+    let span = (call, call + "len".len());
+
+    let editor_hits = result.all_hits_including_imports();
+    let site_hits: Vec<_> = editor_hits
+        .iter()
+        .filter(|hit| hit.file == file && (hit.start_offset, hit.end_offset) == span)
+        .collect();
+    assert_eq!(
+        1,
+        site_hits.len(),
+        "the sibling-impl `self.len()` call must be a single editor-visible hit \
+         (reexport `{reexport}`, imports `{zip_imports}`): {editor_hits:#?}"
+    );
+    assert_eq!(
+        UsageHitKind::SelfReceiver,
+        site_hits[0].kind,
+        "the sibling-impl `self.len()` call is a self-receiver call: {editor_hits:#?}"
+    );
+    assert!(
+        result.all_hits().is_empty(),
+        "a self-receiver call is excluded from the external usage surface: {:#?}",
+        result.all_hits()
+    );
+}
+
+// Negative control for the same-evidence rule: a receiver that resolves to a genuinely
+// different indexed type carrying the same member name is real evidence of a foreign
+// owner, so the site is refused outright: it appears on no surface, not even the
+// unproven one. Degrading empty resolutions to `Unknown` must not widen this.
+#[test]
+fn rust_foreign_typed_receiver_with_same_member_name_is_refused_on_every_surface() {
+    let source = r#"
+pub struct Other;
+impl Other {
+    pub fn target(&self) {}
+}
+
+pub struct Owner;
+impl Owner {
+    pub fn target(&self) {}
+    pub fn caller(&self, other: Other) {
+        other.target();
+    }
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let file = project.file("src/lib.rs");
+    let target = member(&analyzer, &file, "Owner", "target");
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let call = source.find("other.target()").expect("call site") + "other.".len();
+    let span = (call, call + "target".len());
+
+    assert!(
+        result
+            .all_hits_including_imports()
+            .iter()
+            .all(|hit| (hit.start_offset, hit.end_offset) != span),
+        "a receiver typed to a different declaration is not an `Owner.target` usage: {:#?}",
+        result.all_hits_including_imports()
+    );
+    let FuzzyResult::Success {
+        unproven_by_overload,
+        ..
+    } = &result
+    else {
+        panic!("expected Rust usage success, got {result:#?}");
+    };
+    assert!(
+        unproven_by_overload
+            .values()
+            .flatten()
+            .all(|hit| (hit.start_offset, hit.end_offset) != span),
+        "a proven foreign receiver is refused outright, not left unproven: {unproven_by_overload:#?}"
+    );
+}
+
+#[test]
+fn rust_sibling_impl_self_call_is_proven_under_same_name_glob_reexport() {
+    assert_zip_sibling_impl_self_call_is_proven("pub use self::zip::Zip;", "use super::*;");
+}
+
+// Control from the issue's perturbation matrix: renaming the re-export removed the
+// name collision and the site was already found. It must stay found.
+#[test]
+fn rust_sibling_impl_self_call_is_proven_under_renamed_glob_reexport() {
+    assert_zip_sibling_impl_self_call_is_proven(
+        "pub use self::zip::Zip as ZipAlias;",
+        "use super::*;",
+    );
+}
+
+// Control from the issue's perturbation matrix: an explicit import instead of the glob
+// removed the trigger and the site was already found. It must stay found.
+#[test]
+fn rust_sibling_impl_self_call_is_proven_under_explicit_parent_import() {
+    assert_zip_sibling_impl_self_call_is_proven(
+        "pub use self::zip::Zip;",
+        "use super::{IndexedParallelIterator, ParallelIterator};",
+    );
+}
+
 #[test]
 fn rust_seedless_local_external_hits_still_enforce_usage_cap() {
     let (project, analyzer) = rust_analyzer_with_files(&[(

@@ -97,6 +97,50 @@ impl Run for Worker {}
     );
 }
 
+// Issue #1750: the impl's self type is declared in this file *and* re-exported by the
+// parent module under the same name, so a `use super::*;` glob makes one declaration
+// reachable by two routes. Route multiplicity is not declaration ambiguity: dropping
+// the impl edge here also erased the type's ancestors, which made a sibling-impl
+// `self.method()` call look like a call on a foreign type.
+#[test]
+fn rust_type_hierarchy_resolves_impl_type_reachable_locally_and_through_a_glob_reexport() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod iter;\n"),
+        (
+            "src/iter/mod.rs",
+            r#"
+mod zip;
+
+pub use self::zip::Zip;
+
+pub trait Runnable {}
+"#,
+        ),
+        (
+            "src/iter/zip.rs",
+            r#"
+use super::*;
+
+pub struct Zip;
+
+impl Runnable for Zip {}
+"#,
+        ),
+    ]);
+
+    let runnable = definition(&analyzer, "iter.Runnable");
+    let zip = definition(&analyzer, "iter.zip.Zip");
+
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&zip)),
+        BTreeSet::from(["iter.Runnable".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&runnable)),
+        BTreeSet::from(["iter.zip.Zip".to_string()])
+    );
+}
+
 #[test]
 fn rust_type_hierarchy_resolves_scoped_trait_reference() {
     let (_project, analyzer) = rust_analyzer_with_files(&[

@@ -107,6 +107,14 @@ where
         candidates.extend(imported_units(rust, file, binder, normalized));
     }
 
+    // Ambiguity means *two different declarations*, not two routes to one. A type
+    // declared in this file and also re-exported by its parent module (`pub use
+    // self::zip::Zip;`) is collected twice when the file glob-imports that parent
+    // (`use super::*;`): once locally and once through the binder. Deduplicate by
+    // declaration identity so route multiplicity does not discard the impl edge
+    // (issue #1750).
+    candidates.sort();
+    candidates.dedup();
     let mut matches = candidates.into_iter().filter(predicate);
     let resolved = matches.next()?;
     matches.next().is_none().then_some(resolved)

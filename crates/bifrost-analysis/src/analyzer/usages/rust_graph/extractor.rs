@@ -2027,12 +2027,12 @@ fn receiver_owner_proof(
                 ReceiverOwnerProof::Mismatches
             };
         }
-        let resolved_is_alias = ctx
-            .support
-            .fqn(&fqn)
-            .iter()
-            .any(|unit| ctx.rust.is_type_alias(unit));
-        if !ctx.target_owner_is_trait && !resolved_is_alias {
+        if !ctx.target_owner_is_trait
+            && matches!(
+                foreign_receiver_verdict(ctx.rust, &ctx.support.fqn(&fqn)),
+                ReceiverOwnerProof::Mismatches
+            )
+        {
             return ReceiverOwnerProof::Mismatches;
         }
     }
@@ -2078,13 +2078,26 @@ fn receiver_type_candidates_proof(
             ReceiverOwnerProof::Mismatches
         };
     }
-    let resolved_is_alias = receiver_types
-        .iter()
-        .any(|unit| ctx.rust.is_type_alias(unit));
-    if !ctx.target_owner_is_trait && !resolved_is_alias {
-        ReceiverOwnerProof::Mismatches
-    } else {
+    if ctx.target_owner_is_trait {
+        return ReceiverOwnerProof::Unknown;
+    }
+    foreign_receiver_verdict(ctx.rust, receiver_types)
+}
+
+/// Whether a receiver whose resolved type did not match the owner is *proof* of a
+/// different owner. Only real evidence can refuse a call site: an alias hides the
+/// declaration it stands for, and a type that resolved to no indexed declaration
+/// proves nothing at all.
+///
+/// Claiming `Mismatches` on an empty resolution turned any FQN-identity blind spot
+/// into a false `verified_absent` with zero unproven hits (issue #1750). Empty
+/// evidence therefore stays `Unknown`, which reaches the unproven surface through
+/// `record_unproven_receivers`.
+fn foreign_receiver_verdict(rust: &RustAnalyzer, resolved: &[CodeUnit]) -> ReceiverOwnerProof {
+    if resolved.is_empty() || resolved.iter().any(|unit| rust.is_type_alias(unit)) {
         ReceiverOwnerProof::Unknown
+    } else {
+        ReceiverOwnerProof::Mismatches
     }
 }
 
@@ -3597,6 +3610,51 @@ mod tests {
     use super::*;
     use crate::analyzer::{AnalyzerQueryScope, Language, TestProject};
     use std::sync::Arc;
+
+    // Issue #1750: `Mismatches` refuses a call site outright: it records nothing, not
+    // even an unproven candidate, so `scan_usages` reports `verified_absent`. That
+    // certainty must rest on evidence. A receiver type that resolved to no indexed
+    // declaration is an unresolved name, not a proven foreign owner.
+    #[test]
+    fn issue_1750_receiver_verdict_needs_evidence_to_refuse_a_site() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("lib.rs"),
+            "pub struct Other;\npub type Alias = Other;\n",
+        )
+        .unwrap();
+        let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+        let unit = |fq_name: &str| {
+            analyzer
+                .get_definitions(fq_name)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
+        };
+
+        assert!(
+            matches!(
+                foreign_receiver_verdict(&analyzer, &[unit("Other")]),
+                ReceiverOwnerProof::Mismatches
+            ),
+            "a receiver resolved to a real foreign declaration refuses the site"
+        );
+        assert!(
+            matches!(
+                foreign_receiver_verdict(&analyzer, &[unit("Alias")]),
+                ReceiverOwnerProof::Unknown
+            ),
+            "an alias hides the declaration it stands for, so it cannot refuse the site"
+        );
+        assert!(
+            matches!(
+                foreign_receiver_verdict(&analyzer, &[]),
+                ReceiverOwnerProof::Unknown
+            ),
+            "an empty resolution is no evidence at all and must not refuse the site"
+        );
+    }
 
     #[test]
     fn scan_parses_each_candidate_once_within_query_scope() {
