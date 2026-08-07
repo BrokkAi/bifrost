@@ -1,8 +1,8 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::declaration_range::DeclarationNameRangeContext;
 use crate::analyzer::reference_candidates::{
-    ReferenceCandidateRanges, census_identifier_ranges, reference_candidate_ranges,
-    reference_candidate_requires_point_lookup,
+    CensusBareNameBindings, ReferenceCandidateRanges, census_identifier_ranges,
+    reference_candidate_ranges, reference_candidate_requires_point_lookup,
 };
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::cpp_graph::CppAuthoritativeUsageBatch;
@@ -1368,6 +1368,58 @@ fn census_site_role(
     CensusSiteRole::Other
 }
 
+/// Whether a same-file declaration named `name` is evidence that the BARE call
+/// at `byte` could have bound to it.
+///
+/// Same-file evidence is collected by terminal identifier, so it matches
+/// declarations a bare name can never reach (#1783): a JavaScript
+/// `Lexer.prototype.isNumber` member answered for a bare `isNumber(value)` that
+/// only a receiver could reach, promoting an exploration-grade site to an
+/// actionable tier-1 gap. Whether a bare call reaches an owned member is a
+/// per-language question, so each language answers it explicitly rather than
+/// through one blanket owner test.
+fn bare_call_reaches_same_file_declaration(
+    language: Language,
+    bindings: Option<&CensusBareNameBindings>,
+    name: &str,
+    byte: usize,
+) -> bool {
+    match language {
+        // JavaScript and TypeScript bind a bare name lexically, and nothing
+        // else: object-literal, prototype and class members need a receiver.
+        // The lexical index the forward resolver binds with answers the site
+        // directly, so the census grades against the same notion of scope --
+        // including the local and nested binders an owner test cannot see. The
+        // index models value binders (imports, `var`/`let`/`const`, functions,
+        // classes, parameters, catch clauses); a TypeScript-only binder it does
+        // not model yet, such as an ambient `declare function`, grades its bare
+        // call one tier lower rather than reporting a gap the site cannot show.
+        Language::JavaScript | Language::TypeScript => bindings
+            .expect("a JS/TS census site with a parsed tree carries a bare-name binding index")
+            .is_bound_at(name, byte),
+        // Implicit-receiver languages: a bare call legitimately reaches a
+        // member of the enclosing type, so an owned same-file declaration is
+        // real evidence. Java, C#, Kotlin and Scala reach the enclosing class
+        // through implicit `this` (plus inherited and statically imported
+        // members); Ruby and PHP reach it through implicit `self`/`$this`.
+        Language::Java
+        | Language::CSharp
+        | Language::Kotlin
+        | Language::Scala
+        | Language::Ruby
+        | Language::Php => true,
+        // No lexical-binding index yet, and no cheap sound approximation. An
+        // owner test would be wrong here for two independent reasons: these
+        // analyzers qualify module-scope declarations with the module or
+        // package (Python `src.mod.outer` owns `mod`), so almost nothing is
+        // owner-free, and a bare call still reaches local, nested and imported
+        // binders the declaration index does not spell as owner-free. Keeping
+        // the name-set answer preserves today's recall; the fix for these
+        // languages is a lexical index of their own, not a coarser filter.
+        Language::Python | Language::Rust | Language::Go | Language::Cpp | Language::None => true,
+    }
+}
+
 /// Grade forward-unresolvable census sites into deterministic evidence tiers.
 ///
 /// A census site that forward RESOLVES already flowed through the inverse
@@ -1376,11 +1428,16 @@ fn census_site_role(
 /// the joint-blindness residue:
 ///
 /// - tier 1: a `self`/`this`-receiver member call or a bare call of name N,
-///   whose declaration exists in the same file. Forward found nothing yet the
-///   declaration is indexed in the same file -- a high-precision forward gap.
+///   whose declaration exists in the same file AND is reachable from the site.
+///   Forward found nothing yet the declaration is indexed in the same file -- a
+///   high-precision forward gap.
 /// - tier 2: some same-file declaration of N exists, but the occurrence is a
 ///   weaker reference role (member access on another receiver, value/type use).
-/// - tier 3: no same-file declaration of N; exploration-grade.
+/// - tier 3: no same-file declaration of N reaches the site; exploration-grade.
+///
+/// Reachability is what [`bare_call_reaches_same_file_declaration`] decides: a
+/// same-file name match is not by itself evidence that a BARE call could have
+/// bound to that declaration (#1783).
 ///
 /// A selected tier-1/2 site becomes `Missing` (actionable). Tier 3 (and any
 /// unselected tier) stays `Inconclusive`. The site's `tier` is always recorded.
@@ -1422,20 +1479,29 @@ fn classify_census_gaps(
         let context = DeclarationNameRangeContext::new(&file, source);
         let root = context.root_node();
         let content = context.content();
+        let language = language_for_file(&file);
+        let bindings = root.and_then(|root| CensusBareNameBindings::build(root, content, language));
         for index in indexes {
             let record = &mut records[index];
             let name = record.text.clone();
-            let has_same_file_decl = same_file_names.contains(&name);
             let role = root
                 .map(|root| census_site_role(root, content, record.start_byte, record.end_byte))
                 .unwrap_or(CensusSiteRole::Other);
-            let tier = if has_same_file_decl
+            let same_file_evidence = same_file_names.contains(&name)
+                && (role != CensusSiteRole::BareCall
+                    || bare_call_reaches_same_file_declaration(
+                        language,
+                        bindings.as_ref(),
+                        &name,
+                        record.start_byte,
+                    ));
+            let tier = if same_file_evidence
                 && matches!(
                     role,
                     CensusSiteRole::SelfMemberCall | CensusSiteRole::BareCall
                 ) {
                 1
-            } else if has_same_file_decl {
+            } else if same_file_evidence {
                 2
             } else {
                 3

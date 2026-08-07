@@ -1,5 +1,6 @@
 use crate::analyzer::cpp::cpp_is_range_for_binding_name;
 use crate::analyzer::{Language, Range};
+use brokk_bifrost_js_ts::syntax::JsTsLexicalBindingIndex;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +115,39 @@ pub fn census_identifier_ranges(
 ) -> ReferenceCandidateRanges {
     collect_candidate_ranges(root, language, limit, CandidateFrontier::Census, &|| false)
         .expect("non-cancellable collection cannot be cancelled")
+}
+
+/// Per-file answer to "could a BARE occurrence of this name, at this byte, bind
+/// to something declared in this file?".
+///
+/// The census grades a forward-unresolvable occurrence by asking whether the
+/// file declares the name (#1783). A name match alone is too weak for a bare
+/// call: in JavaScript a `Lexer.prototype.isNumber` member is reachable only
+/// through a receiver, so it is not evidence for a bare `isNumber(value)` that
+/// could never bind to it. Scope, not name, decides -- and scope is a
+/// per-language question, so a language without a lexical index says so by
+/// answering `None` here instead of pretending nothing is bound.
+pub struct CensusBareNameBindings {
+    lexical: JsTsLexicalBindingIndex,
+}
+
+impl CensusBareNameBindings {
+    /// `None` when the language has no lexical-binding index. JavaScript and
+    /// TypeScript share the one the forward resolver already uses, so the
+    /// census grades bare calls against the same notion of scope the resolver
+    /// binds them with.
+    pub fn build(root: Node<'_>, source: &str, language: Language) -> Option<Self> {
+        match language {
+            Language::JavaScript | Language::TypeScript => Some(Self {
+                lexical: JsTsLexicalBindingIndex::build(root, source),
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn is_bound_at(&self, name: &str, byte: usize) -> bool {
+        self.lexical.is_bound_at(name, byte)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -358,6 +392,52 @@ mod tests {
             .into_iter()
             .map(|range| &source[range.start_byte..range.end_byte])
             .collect()
+    }
+
+    /// The bindability answer the census grades bare calls with (#1783): a
+    /// module-scope binder is reachable by bare name anywhere it is in scope,
+    /// while a prototype/object-literal member of the same name is reachable
+    /// only through a receiver and therefore is not bound at a bare call site.
+    #[test]
+    fn census_bare_name_bindings_answer_js_lexical_scope() {
+        let source = concat!(
+            "var toBigNumber = function(value) { return value; };\n",
+            "function Lexer() {}\n",
+            "Lexer.prototype = {\n",
+            "  isNumber: function(ch) { return ch >= '0'; },\n",
+            "};\n",
+            "function parseValue(value) {\n",
+            "  return isNumber(toBigNumber(value));\n",
+            "}\n",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, "parse.js");
+        let tree = parse_tree_for_language(&file, Language::JavaScript, source).expect("js tree");
+        let bindings =
+            CensusBareNameBindings::build(tree.root_node(), source, Language::JavaScript)
+                .expect("JavaScript answers bare-name bindability");
+
+        let bound_site = source.find("toBigNumber(value)").expect("bound call site");
+        assert!(
+            bindings.is_bound_at("toBigNumber", bound_site),
+            "a module-scope `var` binder is bound at a bare call inside a later function"
+        );
+
+        let member_site = source
+            .find("isNumber(toBigNumber")
+            .expect("member call site");
+        assert!(
+            !bindings.is_bound_at("isNumber", member_site),
+            "an object-literal member is not a lexical binding of its bare name"
+        );
+
+        // Languages without a lexical-binding index say so, rather than
+        // answering "not bound" and pruning their evidence.
+        assert!(
+            CensusBareNameBindings::build(tree.root_node(), source, Language::Java).is_none(),
+            "only JavaScript and TypeScript answer bare-name bindability today"
+        );
     }
 
     #[test]

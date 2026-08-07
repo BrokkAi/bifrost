@@ -170,6 +170,129 @@ fn census_seed_grades_nothing_from_a_misparsed_region() {
     );
 }
 
+/// A prototype/object-literal member is reachable only through a receiver, so
+/// it is not evidence that a BARE call of the same name could have bound to it
+/// (#1783). The angular.js witness: `src/ng/parse.js` declares
+/// `Lexer.prototype.isNumber` and calls a bare `isNumber(value)` that resolves
+/// to a different module's export; the census graded the unresolved bare call
+/// tier 1 purely because the terminal segment of the member's fq name matched.
+/// The bare name is not lexically bound in the file, so the site is
+/// exploration-grade (tier 3), not an actionable forward gap.
+///
+/// The positive face of this contract -- a bare call that IS lexically bound in
+/// the file yet forward cannot resolve -- has no honest inline witness after
+/// #1782 taught the resolver `var` hoisting: every in-file lexical binder the
+/// census can see is now one the forward resolver also follows, so the shape
+/// would have to be a fresh forward bug. It is pinned instead by the direct
+/// unit test on the bindability answer in
+/// `bifrost-analysis/src/analyzer/reference_candidates.rs`.
+#[test]
+fn census_bare_call_is_not_graded_from_a_member_it_cannot_bind() {
+    let parse = concat!(
+        "function Lexer() {}\n",
+        "Lexer.prototype = {\n",
+        "  isNumber: function(ch) {\n",
+        "    return ch >= '0' && ch <= '9';\n",
+        "  },\n",
+        "};\n",
+        "function parseValue(value) {\n",
+        "  return isNumber(value);\n",
+        "}\n",
+    );
+    let census = js_census_differential(&[("src/parse.js", parse)]);
+
+    let bare_call_start = parse.find("isNumber(value)").expect("bare call site");
+    let site = census
+        .sites
+        .iter()
+        .find(|site| site.start_byte == bare_call_start)
+        .unwrap_or_else(|| panic!("census must propose the bare call: {:#?}", census.sites));
+    assert_eq!(
+        site.forward_status, "no_definition",
+        "witness requires a forward-unresolvable bare call: {site:#?}"
+    );
+    assert_eq!(
+        site.tier,
+        Some(3),
+        "a member the bare name cannot bind is not same-file evidence: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Inconclusive,
+        "an unbindable member must not produce a missing finding: {site:#?}"
+    );
+}
+
+fn java_census_differential(
+    files: &[(&str, &str)],
+) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {
+    let mut project = InlineTestProject::with_language(Language::Java);
+    for (path, source) in files {
+        project = project.file(path, *source);
+    }
+    let project = project.build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    run_reference_differential(
+        workspace.analyzer(),
+        &ReferenceDifferentialConfig {
+            corpus_language: "java".to_string(),
+            max_files: 20,
+            max_sites: 1_000,
+            max_candidates_per_file: 1_000,
+            max_source_bytes: 100_000,
+            max_targets: 1_000,
+            max_usage_files: 20,
+            max_usages: 1_000,
+            probe_seed: ProbeSeed::Census,
+            ..ReferenceDifferentialConfig::default()
+        },
+    )
+    .expect("run inline Java census differential")
+}
+
+/// The control for #1783: a Java bare call reaches an enclosing-class method
+/// through implicit `this`, so an OWNED same-file member is legitimate evidence
+/// there and must keep grading exactly as before -- the JS bindability answer
+/// must not become a blanket owner filter. The witness is a bare `helper()`
+/// inside a nested class, which the forward resolver misses while
+/// `Inner.helper` is indexed in the same file. It grades tier 2 rather than
+/// tier 1 because `census_site_role` reads a bare-call callee from a
+/// `function`/`callee` field, which Java's `method_invocation` spells as
+/// `name`; that is a separate grading gap and this test pins today's answer.
+#[test]
+fn census_java_bare_call_keeps_owned_member_evidence() {
+    let source = concat!(
+        "class Inner {\n",
+        "  void helper() {}\n",
+        "  class Nested {\n",
+        "    void go() { helper(); }\n",
+        "  }\n",
+        "}\n",
+    );
+    let census = java_census_differential(&[("Inner.java", source)]);
+
+    let call_start = source.find("helper();").expect("bare call site");
+    let site = census
+        .sites
+        .iter()
+        .find(|site| site.start_byte == call_start)
+        .unwrap_or_else(|| panic!("census must propose the bare call: {:#?}", census.sites));
+    assert_eq!(
+        site.forward_status, "no_definition",
+        "witness requires a forward-unresolvable bare call: {site:#?}"
+    );
+    assert_eq!(
+        site.tier,
+        Some(2),
+        "an owned same-class method stays same-file evidence in Java: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Missing,
+        "Java grading must not change: {site:#?}"
+    );
+}
+
 fn rust_differential(
     files: &[(&str, &str)],
 ) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {
