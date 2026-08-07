@@ -690,6 +690,29 @@ pub(in crate::analyzer::usages) fn boundary_evidence(
                 (BoundaryStatus::ExternalUnknown, None)
             }
         }
+        Language::Go => {
+            // Go's boundary evidence is the same pair the Python and JS/TS arm
+            // reads, resolved through the shared Go package identity so a
+            // trace, a definition, and a diagnostic classify one import path
+            // identically. Import paths are slash-separated, so the declared
+            // check walks them by segment rather than by dot.
+            let overlay = analyzer.semantic_model_overlay();
+            let packages =
+                crate::analyzer::go::package_identity::GoOverlayPackages::new(overlay.as_deref());
+            if let Some(symbol) = packages.unique_symbol(name) {
+                return (BoundaryStatus::ExternalIndexed, Some(symbol.id.clone()));
+            }
+            let declared = analyzer
+                .dependency_discovery_evidence(Language::Go)
+                .is_some_and(|evidence| {
+                    evidence.truncated() || evidence.declares_go_import_path(name)
+                });
+            if declared {
+                (BoundaryStatus::ExternalDeclaredUnindexed, None)
+            } else {
+                (BoundaryStatus::ExternalUnknown, None)
+            }
+        }
         _ => (BoundaryStatus::ExternalUnknown, None),
     }
 }

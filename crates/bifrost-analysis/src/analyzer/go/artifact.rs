@@ -241,6 +241,31 @@ fn produce_go_facts<'a>(
     let entries = entries.into_iter().collect::<HashMap<_, _>>();
     let mut parsed_sources = Vec::new();
     for package in packages {
+        // A package whose surface the toolchain reported but this producer
+        // does not model keeps the pack explicitly partial. Both conditions
+        // hide exported declarations: cgo files declare Go surface this
+        // producer cannot parse, and a build constraint excluded the ignored
+        // files from this target's build. Absence proofs read the resulting
+        // completeness, so a member miss against such a package is suppressed
+        // rather than reported (#1623). Test files never contribute exported
+        // API, so an excluded `_test.go` does not reduce the surface.
+        let constrained = package
+            .ignored_go_files
+            .iter()
+            .filter(|path| !path.ends_with("_test.go"))
+            .chain(package.cgo_files.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !constrained.is_empty() {
+            diagnostics.warning(
+                "go.constrained_surface",
+                Some(package.import_path.clone()),
+                format!(
+                    "Go package {} has sources this producer does not model, so its exported surface is explicitly partial: {constrained:?}",
+                    package.import_path
+                ),
+            );
+        }
         for path in &package.files {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 diagnostics.error(

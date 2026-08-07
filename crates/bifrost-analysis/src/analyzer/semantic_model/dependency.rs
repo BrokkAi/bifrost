@@ -420,6 +420,34 @@ impl DependencyDiscoveryEvidence {
         }
         false
     }
+
+    /// Whether the build declares the Go module that `import_path` routes
+    /// through: an exact declared identity, or one reached by walking the
+    /// slash-separated import path back toward its module root
+    /// (`github.com/pkg/errors/internal` is declared when the
+    /// `github.com/pkg/errors` module is).
+    ///
+    /// Go import paths are slash-separated, so [`Self::declares_module_path`]'s
+    /// dotted walk cannot answer this: `github.com/pkg/errors/internal` splits
+    /// on `.` into `github`, which names nothing. The declared identities are
+    /// the module paths discovery itself recorded, so segment-prefix
+    /// containment is their defined structure, not a re-parse of source text.
+    pub fn declares_go_import_path(&self, import_path: &str) -> bool {
+        if import_path.is_empty() {
+            return false;
+        }
+        if self.declared_modules.contains(import_path) {
+            return true;
+        }
+        let mut prefix = import_path;
+        while let Some((head, _)) = prefix.rsplit_once('/') {
+            if self.declared_modules.contains(head) {
+                return true;
+            }
+            prefix = head;
+        }
+        false
+    }
 }
 
 /// Read retained discovery evidence for a diagnostic request. A missing value

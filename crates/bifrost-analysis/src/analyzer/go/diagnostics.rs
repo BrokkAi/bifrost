@@ -1,36 +1,99 @@
 //! The analysis-side entry point for Go's semantic diagnostics.
 //!
 //! The language logic lives in [`brokk_bifrost_go::diagnostics`]. What stays
-//! here is the one downcast that turns an `&dyn IAnalyzer` into the arguments
-//! that function takes: the Go graph source, the memoized package-clause map,
-//! and the bounded definition lookup.
+//! here is the downcast that turns an `&dyn IAnalyzer` into the arguments that
+//! function takes: the file's resolved import bindings, the bounded definition
+//! lookup, and the external evidence view of the activated exact API packs and
+//! the retained Go module graph.
+//!
+//! `brokk-bifrost-go` cannot name `SemanticModelOverlay`, so the overlay
+//! crosses the crate boundary as the [`GoExternalEvidence`] trait, the same
+//! shape Java's `JavaSource::external_boundary_evidence` uses.
+//!
+//! Every fact this reads is state the analyzer already retains. A diagnostic
+//! request must never run `go`, walk a module cache, or start dependency
+//! discovery: state it cannot see becomes a typed incomplete reason.
 
+use crate::analyzer::go::package_identity::GoOverlayPackages;
+use crate::analyzer::semantic_model::{DependencyDiscoveryEvidence, SemanticModelOverlay};
+use crate::analyzer::structural::resolution::BoundaryStatus;
 use crate::analyzer::usages::go_graph::go_graph_source;
-use crate::analyzer::{GoAnalyzer, IAnalyzer, ProjectFile, resolve_analyzer};
-use brokk_bifrost_go::diagnostics::GoSemanticDiagnostic;
+use crate::analyzer::{
+    GoAnalyzer, IAnalyzer, Language, ProjectFile, SemanticDiagnosticReport, resolve_analyzer,
+};
+use brokk_bifrost_go::diagnostics::{GoExternalEvidence, GoPackageSurface};
+use brokk_bifrost_go::graph::resolver::resolve_go_import_bindings;
+use std::sync::Arc;
 
 pub(crate) fn collect_go_semantic_diagnostics(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
-) -> Vec<GoSemanticDiagnostic> {
+) -> SemanticDiagnosticReport {
     let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
-        return Vec::new();
+        return SemanticDiagnosticReport::new();
     };
+    let external = AnalyzerGoExternalEvidence {
+        overlay: analyzer.semantic_model_overlay(),
+        discovery: analyzer.dependency_discovery_evidence(Language::Go),
+    };
+    let bindings = resolve_go_import_bindings(
+        go_graph_source(go),
+        file,
+        go.package_clause_names(),
+        |import_path| external.packages().declared_package_name(import_path),
+    );
     let support = analyzer.global_usage_definition_index();
     brokk_bifrost_go::diagnostics::collect_go_semantic_diagnostics(
-        go_graph_source(go),
-        go.package_clause_names(),
-        &support,
-        file,
-        source,
+        &bindings, &support, &external, file, source,
     )
+}
+
+/// The retained external Go state one diagnostic request may read.
+struct AnalyzerGoExternalEvidence {
+    overlay: Option<Arc<SemanticModelOverlay>>,
+    discovery: Option<Arc<DependencyDiscoveryEvidence>>,
+}
+
+impl AnalyzerGoExternalEvidence {
+    fn packages(&self) -> GoOverlayPackages<'_> {
+        GoOverlayPackages::new(self.overlay.as_deref())
+    }
+}
+
+impl GoExternalEvidence for AnalyzerGoExternalEvidence {
+    fn package_surface(&self, import_path: &str) -> GoPackageSurface {
+        self.packages().package_surface(import_path)
+    }
+
+    fn publishes_member(&self, import_path: &str, member: &str) -> bool {
+        self.packages().publishes_member(import_path, member)
+    }
+
+    fn unindexed_boundary(&self, import_path: &str) -> BoundaryStatus {
+        // Retained discovery evidence (#1601): the module graph declares the
+        // module this import routes through and nothing indexed it, or
+        // discovery could not read everything the build declared, so the
+        // package may well be there. Where no discovery has run, nothing is
+        // retained and `ExternalUnknown` is the honest answer.
+        let declared = self.discovery.as_ref().is_some_and(|evidence| {
+            evidence.truncated() || evidence.declares_go_import_path(import_path)
+        });
+        if declared {
+            BoundaryStatus::ExternalDeclaredUnindexed
+        } else {
+            BoundaryStatus::ExternalUnknown
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::collect_go_semantic_diagnostics;
-    use crate::analyzer::{GoAnalyzer, Language, ProjectFile, TestProject};
+    use crate::analyzer::{
+        GoAnalyzer, Language, ProjectFile, SemanticDiagnostic, SemanticDiagnosticReport,
+        TestProject,
+    };
     use brokk_bifrost_go::diagnostics::{
         GO_UNRECOGNIZED_PACKAGE_MEMBER, GO_UNRECOGNIZED_SYMBOL, MAX_GO_SEMANTIC_DIAGNOSTICS,
     };
@@ -47,13 +110,14 @@ mod tests {
             ProjectFile::new(self.root.clone(), rel_path)
         }
 
-        fn diagnostics_for(
-            &self,
-            rel_path: &str,
-        ) -> Vec<brokk_bifrost_go::diagnostics::GoSemanticDiagnostic> {
+        fn report_for(&self, rel_path: &str) -> SemanticDiagnosticReport {
             let file = self.file(rel_path);
             let source = file.read_to_string().expect("read source");
             collect_go_semantic_diagnostics(&self.analyzer, &file, &source)
+        }
+
+        fn diagnostics_for(&self, rel_path: &str) -> Vec<SemanticDiagnostic> {
+            self.report_for(rel_path).into_diagnostics()
         }
     }
 

@@ -5,6 +5,7 @@ mod clones;
 mod dependency_discovery;
 pub(crate) mod diagnostics;
 mod imports;
+pub(crate) mod package_identity;
 mod semantic;
 use crate::analyzer::Range;
 
@@ -605,11 +606,10 @@ impl IAnalyzer for GoAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
-        let diagnostics = diagnostics::collect_go_semantic_diagnostics(self, file, source)
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(file, diagnostics)
+        // The Go collector builds the complete report itself: it is the only
+        // caller that knows which of its lookups checked a workspace lexical
+        // scope, an indexed external package surface, or nothing at all.
+        diagnostics::collect_go_semantic_diagnostics(self, file, source)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

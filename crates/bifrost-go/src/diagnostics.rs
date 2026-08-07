@@ -1,23 +1,31 @@
-//! Go's semantic diagnostics: unrecognized symbols and unrecognized workspace
-//! package members.
+//! Go's semantic diagnostics: every name a Go file spells, classified as
+//! resolved, absent with a complete proof, or suppressed with a typed reason.
 //!
-//! The analyzer facts this needs are two core capability traits -- a
-//! [`BoundedDefinitionLookup`] for "is this fqn indexed" and the
-//! [`GoGraphSource`] the import resolver already takes -- plus the Go
-//! package-clause map. `analyzer/go/diagnostics.rs` in
-//! `brokk-bifrost-analysis` keeps the downcast that produces them.
+//! The analyzer facts this needs are a [`BoundedDefinitionLookup`] for "is this
+//! fqn indexed in the workspace", the file's resolved [`GoImportBindings`], and
+//! a [`GoExternalEvidence`] view of the activated exact API packs and the
+//! retained module graph. `analyzer/go/diagnostics.rs` in
+//! `brokk-bifrost-analysis` keeps the downcast that produces them, because this
+//! crate cannot name `SemanticModelOverlay`.
+//!
+//! No path here may run the Go toolchain, walk a module cache, or start
+//! dependency discovery. State a request cannot read is a typed
+//! [`SemanticDiagnosticIncompleteReason`], never a guess and never an error.
 
-use brokk_bifrost_core::analyzer::model::SemanticDiagnostic;
+use brokk_bifrost_core::analyzer::model::{
+    SemanticAbsenceProof, SemanticDiagnostic, SemanticDiagnosticDomain,
+    SemanticDiagnosticIncompleteReason, SemanticDiagnosticReport,
+};
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{
     ScopeStack, contains_node, node_range, node_text, same_node,
 };
+use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
 use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, ProjectFile, Range};
-use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use tree_sitter::{Node, Parser, Tree};
 
-use crate::graph::resolver::{GoGraphSource, resolve_go_import_namespaces};
+use crate::graph::resolver::GoImportBindings;
 use crate::packages::{GO_MODULE_SCOPE_SEGMENT, canonical_go_package_name};
 
 pub const GO_UNRECOGNIZED_SYMBOL: &str = "go_unrecognized_symbol";
@@ -26,58 +34,87 @@ pub const GO_SEMANTIC_DIAGNOSTIC_SOURCE: &str = "bifrost-go";
 const MAX_GO_SEMANTIC_DIAGNOSTIC_BYTES: usize = 512 * 1024;
 pub const MAX_GO_SEMANTIC_DIAGNOSTICS: usize = 200;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GoSemanticDiagnostic {
-    pub range: Range,
-    pub kind: &'static str,
-    pub message: String,
+/// What the activated exact API packs prove about one Go package's exported
+/// surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoPackageSurface {
+    /// No activated pack publishes this import path at all.
+    Unpublished,
+    /// A pack publishes it and records its exported surface as complete, so a
+    /// member miss against it is proof of absence.
+    Complete,
+    /// A pack publishes it but recorded its surface as explicitly partial: the
+    /// producer could not model generated sources, cgo files, or files a build
+    /// constraint excluded. A member miss against it proves nothing.
+    Partial,
 }
 
-impl From<GoSemanticDiagnostic> for SemanticDiagnostic {
-    fn from(diagnostic: GoSemanticDiagnostic) -> Self {
-        Self {
-            range: diagnostic.range,
-            source: GO_SEMANTIC_DIAGNOSTIC_SOURCE,
-            kind: diagnostic.kind,
-            message: diagnostic.message,
-        }
-    }
+/// The external Go evidence one diagnostic request may read.
+///
+/// Every method answers from state the analyzer already retains. None of them
+/// may run `go`, read a module cache, or trigger dependency discovery: a
+/// request that cannot see the answer reports incompleteness instead.
+pub trait GoExternalEvidence {
+    /// How completely the activated packs describe `import_path`.
+    fn package_surface(&self, import_path: &str) -> GoPackageSurface;
+
+    /// Whether the packs publish `member` as a visible, public declaration of
+    /// `import_path`.
+    fn publishes_member(&self, import_path: &str, member: &str) -> bool;
+
+    /// How far a lookup for an import path no pack published could see: the
+    /// retained module graph declares it ([`BoundaryStatus::ExternalDeclaredUnindexed`])
+    /// or nothing is known ([`BoundaryStatus::ExternalUnknown`]).
+    fn unindexed_boundary(&self, import_path: &str) -> BoundaryStatus;
 }
 
 pub fn collect_go_semantic_diagnostics(
-    graph_source: GoGraphSource<'_>,
-    package_clause_names: &HashMap<ProjectFile, String>,
+    bindings: &GoImportBindings,
     support: &dyn BoundedDefinitionLookup,
+    external: &dyn GoExternalEvidence,
     file: &ProjectFile,
     source: &str,
-) -> Vec<GoSemanticDiagnostic> {
+) -> SemanticDiagnosticReport {
+    let mut report = SemanticDiagnosticReport::new();
     if source.len() > MAX_GO_SEMANTIC_DIAGNOSTIC_BYTES {
-        return Vec::new();
+        report.push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
+        return report;
     }
     let Some(tree) = parse_go_tree(source) else {
-        return Vec::new();
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "Go parser is unavailable".to_string(),
+            }],
+        );
+        return report;
     };
     let mut parse_errors = Vec::new();
     collect_parse_errors(tree.root_node(), &mut parse_errors);
     if !parse_errors.is_empty() {
-        return Vec::new();
+        // A malformed file is a parse problem, reported through the LSP parse
+        // path. Its name lookups are meaningless, so this request checked
+        // nothing and claims nothing.
+        return report;
     }
 
     let line_starts = compute_line_starts(source);
-    let imports = GoImportNamespaces::new(graph_source, package_clause_names, file);
     let package_name = declared_package_name(tree.root_node(), source)
         .map(|declared| canonical_go_package_name(file, &declared))
         .unwrap_or_default();
     let mut collector = GoDiagnosticCollector {
         support,
+        external,
         source,
+        rel_path: file.rel_path().to_path_buf(),
         line_starts: &line_starts,
         package_name,
-        imports,
-        diagnostics: Vec::new(),
+        imports: bindings,
+        report,
+        diagnostic_count: 0,
     };
     collector.scan_tree(tree.root_node());
-    collector.diagnostics
+    collector.report
 }
 
 fn parse_go_tree(source: &str) -> Option<Tree> {
@@ -88,11 +125,25 @@ fn parse_go_tree(source: &str) -> Option<Tree> {
 
 struct GoDiagnosticCollector<'a> {
     support: &'a dyn BoundedDefinitionLookup,
+    external: &'a dyn GoExternalEvidence,
     source: &'a str,
+    rel_path: std::path::PathBuf,
     line_starts: &'a [usize],
     package_name: String,
-    imports: GoImportNamespaces,
-    diagnostics: Vec<GoSemanticDiagnostic>,
+    imports: &'a GoImportBindings,
+    report: SemanticDiagnosticReport,
+    diagnostic_count: usize,
+}
+
+/// What the external evidence says about one reference, decided before the
+/// report is touched so the decision reads only immutable state.
+enum ExternalOutcome {
+    /// A pack publishes this name.
+    Published,
+    /// Every checked package surface is complete and none publishes it.
+    ProvenAbsent { owner: String },
+    /// At least one checked surface cannot support a claim.
+    Suppressed(Vec<SemanticDiagnosticIncompleteReason>),
 }
 
 enum ScanFrame<'tree> {
@@ -107,7 +158,9 @@ impl GoDiagnosticCollector<'_> {
         let mut scopes = ScopeStack::default();
         let mut stack = vec![ScanFrame::Node(root)];
         while let Some(frame) = stack.pop() {
-            if self.diagnostics.len() >= MAX_GO_SEMANTIC_DIAGNOSTICS {
+            if self.diagnostic_count >= MAX_GO_SEMANTIC_DIAGNOSTICS {
+                self.report
+                    .push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
                 break;
             }
             match frame {
@@ -288,13 +341,30 @@ impl GoDiagnosticCollector<'_> {
         }
         let name = node_text(node, self.source);
         if self.name_is_known(name, scopes) {
+            self.push_resolved(node, BoundaryStatus::WorkspaceLocal);
             return;
         }
-        self.push_diagnostic(
-            node,
-            GO_UNRECOGNIZED_SYMBOL,
-            format!("unrecognized Go symbol `{name}`"),
-        );
+        // A dot-imported external package can supply this bare name, and only
+        // the activated packs can say so.
+        match self.external_dot_outcome(name) {
+            ExternalOutcome::Published => {
+                self.push_resolved(node, BoundaryStatus::ExternalIndexed);
+            }
+            ExternalOutcome::Suppressed(reasons) => self.push_incomplete(node, reasons),
+            ExternalOutcome::ProvenAbsent { .. } => {
+                let range = node_range(node, self.line_starts);
+                self.push_absent(
+                    range,
+                    SemanticDiagnosticDomain::LexicalScope {
+                        file: self.rel_path.clone(),
+                        range,
+                    },
+                    BoundaryStatus::WorkspaceLocal,
+                    GO_UNRECOGNIZED_SYMBOL,
+                    format!("unrecognized Go symbol `{name}`"),
+                );
+            }
+        }
     }
 
     fn check_selector(&mut self, node: Node<'_>, scopes: &ScopeStack) {
@@ -307,24 +377,160 @@ impl GoDiagnosticCollector<'_> {
             return;
         }
         if scopes.contains(&qualifier) {
+            // The qualifier is a value, not a package. This request checked no
+            // package surface, so it claims nothing: member resolution through
+            // an embedded struct's promoted fields and methods is
+            // `get_definition`'s structured job, not a name-absence proof.
             return;
         }
-        if let Some(packages) = self.imports.alias_packages.get(&qualifier) {
+        if let Some(packages) = self.imports.workspace.get(&qualifier) {
             if packages
                 .iter()
                 .any(|package| self.package_has_member(package, &field))
             {
+                self.push_resolved(field_node, BoundaryStatus::WorkspaceLocal);
                 return;
             }
             let Some(package) = packages.first().filter(|_| packages.len() == 1) else {
+                // The same local name binds several workspace packages, so no
+                // single package surface answers this member.
+                self.push_ambiguous(field_node, packages.len());
                 return;
             };
-            self.push_diagnostic(
-                field_node,
+            let range = node_range(field_node, self.line_starts);
+            let owner = package.clone();
+            self.push_absent(
+                range,
+                SemanticDiagnosticDomain::MemberSurface {
+                    owner: owner.clone(),
+                    member: field.clone(),
+                },
+                BoundaryStatus::WorkspaceLocal,
                 GO_UNRECOGNIZED_PACKAGE_MEMBER,
-                format!("Go package `{package}` has no indexed member `{field}`"),
+                format!("Go package `{owner}` has no indexed member `{field}`"),
             );
+            return;
         }
+        let Some(paths) = self.imports.external.get(&qualifier) else {
+            return;
+        };
+        let Some(import_path) = paths.first().filter(|_| paths.len() == 1) else {
+            // One local name for several external import paths cannot identify
+            // a package, and an arbitrary winner would be a false claim.
+            self.push_ambiguous(field_node, paths.len());
+            return;
+        };
+        match self.external_member_outcome(import_path, &field) {
+            ExternalOutcome::Published => {
+                self.push_resolved(field_node, BoundaryStatus::ExternalIndexed);
+            }
+            ExternalOutcome::Suppressed(reasons) => self.push_incomplete(field_node, reasons),
+            ExternalOutcome::ProvenAbsent { owner } => {
+                let range = node_range(field_node, self.line_starts);
+                self.push_absent(
+                    range,
+                    SemanticDiagnosticDomain::MemberSurface {
+                        owner: owner.clone(),
+                        member: field.clone(),
+                    },
+                    BoundaryStatus::ExternalIndexed,
+                    GO_UNRECOGNIZED_PACKAGE_MEMBER,
+                    format!("Go package `{owner}` has no exported member `{field}`"),
+                );
+            }
+        }
+    }
+
+    /// Classify `member` of one external `import_path` against the activated
+    /// packs and the retained module graph. Reads immutable state only.
+    fn external_member_outcome(&self, import_path: &str, member: &str) -> ExternalOutcome {
+        if self.external.publishes_member(import_path, member) {
+            return ExternalOutcome::Published;
+        }
+        match self.external.package_surface(import_path) {
+            GoPackageSurface::Complete => ExternalOutcome::ProvenAbsent {
+                owner: import_path.to_string(),
+            },
+            GoPackageSurface::Partial => {
+                ExternalOutcome::Suppressed(vec![partial_surface_reason(import_path)])
+            }
+            GoPackageSurface::Unpublished => ExternalOutcome::Suppressed(vec![
+                SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                    boundary: self.external.unindexed_boundary(import_path),
+                },
+            ]),
+        }
+    }
+
+    /// Classify a bare `name` against every dot-imported external package.
+    /// With no external dot import the workspace lexical surface stands on its
+    /// own, which is the `ProvenAbsent` answer for an empty check.
+    fn external_dot_outcome(&self, name: &str) -> ExternalOutcome {
+        let mut reasons = Vec::new();
+        for import_path in &self.imports.dot_external {
+            if self.external.publishes_member(import_path, name) {
+                return ExternalOutcome::Published;
+            }
+            match self.external.package_surface(import_path) {
+                GoPackageSurface::Complete => {}
+                GoPackageSurface::Partial => reasons.push(partial_surface_reason(import_path)),
+                GoPackageSurface::Unpublished => reasons.push(
+                    SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                        boundary: self.external.unindexed_boundary(import_path),
+                    },
+                ),
+            }
+        }
+        if reasons.is_empty() {
+            return ExternalOutcome::ProvenAbsent {
+                owner: self.package_name.clone(),
+            };
+        }
+        ExternalOutcome::Suppressed(reasons)
+    }
+
+    fn push_resolved(&mut self, node: Node<'_>, boundary: BoundaryStatus) {
+        let range = node_range(node, self.line_starts);
+        self.report.push_resolved(range, boundary);
+    }
+
+    fn push_ambiguous(&mut self, node: Node<'_>, count: usize) {
+        let range = node_range(node, self.line_starts);
+        self.report
+            .push_ambiguous(range, vec![BoundaryStatus::WorkspaceLocal; count]);
+    }
+
+    fn push_incomplete(
+        &mut self,
+        node: Node<'_>,
+        reasons: Vec<SemanticDiagnosticIncompleteReason>,
+    ) {
+        let range = node_range(node, self.line_starts);
+        self.report.push_incomplete(Some(range), reasons);
+    }
+
+    fn push_absent(
+        &mut self,
+        range: Range,
+        domain: SemanticDiagnosticDomain,
+        boundary: BoundaryStatus,
+        kind: &'static str,
+        message: String,
+    ) {
+        self.report.push_absent(
+            SemanticAbsenceProof {
+                range,
+                domain,
+                boundary,
+            },
+            SemanticDiagnostic {
+                range,
+                source: GO_SEMANTIC_DIAGNOSTIC_SOURCE,
+                kind,
+                message,
+            },
+        );
+        self.diagnostic_count += 1;
     }
 
     fn is_standalone_reference(&self, node: Node<'_>) -> bool {
@@ -357,8 +563,13 @@ impl GoDiagnosticCollector<'_> {
 
     fn name_is_known(&self, name: &str, scopes: &ScopeStack) -> bool {
         scopes.contains(name)
-            || self.imports.alias_packages.contains_key(name)
-            || self.imports.has_dot_member(name, self.support)
+            || self.imports.workspace.contains_key(name)
+            || self.imports.external.contains_key(name)
+            || self
+                .imports
+                .dot_workspace
+                .iter()
+                .any(|package| self.package_has_member(package, name))
             || self.package_has_member(&self.package_name, name)
     }
 
@@ -369,42 +580,17 @@ impl GoDiagnosticCollector<'_> {
                 .fqn(&format!("{package}.{}.{name}", GO_MODULE_SCOPE_SEGMENT))
                 .is_empty()
     }
-
-    fn push_diagnostic(&mut self, node: Node<'_>, kind: &'static str, message: String) {
-        self.diagnostics.push(GoSemanticDiagnostic {
-            range: node_range(node, self.line_starts),
-            kind,
-            message,
-        });
-    }
 }
 
-struct GoImportNamespaces {
-    alias_packages: HashMap<String, Vec<String>>,
-    dot_packages: Vec<String>,
-}
-
-impl GoImportNamespaces {
-    fn new(
-        graph_source: GoGraphSource<'_>,
-        package_clause_names: &HashMap<ProjectFile, String>,
-        file: &ProjectFile,
-    ) -> Self {
-        let (alias_packages, dot_packages) =
-            resolve_go_import_namespaces(graph_source, file, package_clause_names);
-        Self {
-            alias_packages,
-            dot_packages,
-        }
-    }
-
-    fn has_dot_member(&self, name: &str, support: &dyn BoundedDefinitionLookup) -> bool {
-        self.dot_packages.iter().any(|package| {
-            !support.fqn(&format!("{package}.{name}")).is_empty()
-                || !support
-                    .fqn(&format!("{package}.{}.{name}", GO_MODULE_SCOPE_SEGMENT))
-                    .is_empty()
-        })
+/// A pack that recorded its own surface as partial cannot support an absence
+/// claim about it. The Go producer marks a package partial when it could not
+/// model a generated source, a cgo file, or a file a build constraint
+/// excluded, so the honest report names that surface rather than the member.
+fn partial_surface_reason(import_path: &str) -> SemanticDiagnosticIncompleteReason {
+    SemanticDiagnosticIncompleteReason::UnsupportedGeneratedSurface {
+        detail: format!(
+            "the exact API pack for Go package `{import_path}` records an explicitly partial exported surface (generated, cgo, or build-constrained sources)"
+        ),
     }
 }
 

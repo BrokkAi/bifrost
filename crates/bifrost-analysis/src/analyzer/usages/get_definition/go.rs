@@ -179,12 +179,10 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
     }
 
     fn external_import_name(&self, import_path: &str) -> Option<String> {
-        let overlay = self.semantic_model_overlay.as_ref()?;
-        let matched = overlay.symbols_named(import_path);
-        (matched.disposition
-            == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
-            .then(|| matched.records[0].aliases.first().cloned())
-            .flatten()
+        crate::analyzer::go::package_identity::GoOverlayPackages::new(
+            self.semantic_model_overlay.as_deref(),
+        )
+        .declared_package_name(import_path)
     }
 }
 
@@ -1118,15 +1116,20 @@ fn go_model_package_selector_outcome(
         .take(selector.focus_segment)
         .map(|member| go_node_text(*member, source))
         .collect::<Vec<_>>();
-    let qualified = format!("{package}.{}", members.join("."));
-    let mut candidates = vec![qualified];
+    let mut candidates = vec![format!("{package}.{}", members.join("."))];
     if selector.focus_segment == 1 {
-        candidates.push(format!(
-            "{package}.{}.{}",
-            crate::analyzer::GO_MODULE_SCOPE_SEGMENT,
-            members[0]
-        ));
+        // A package-scope function, variable, or constant is published under
+        // the module-scope name as well. Semantic diagnostics search the same
+        // pair through the same helper, so a definition can never resolve a
+        // member that a diagnostic then calls absent.
+        candidates.extend(
+            crate::analyzer::go::package_identity::GoOverlayPackages::member_candidates(
+                package,
+                &members[0],
+            ),
+        );
     }
+    candidates.dedup();
     go_model_symbol_outcome(analyzer, site, candidates)
 }
 
@@ -1136,17 +1139,9 @@ fn go_model_symbol_outcome(
     candidates: impl IntoIterator<Item = String>,
 ) -> Option<DefinitionLookupOutcome> {
     let overlay = analyzer.semantic_model_overlay()?;
+    let packages = crate::analyzer::go::package_identity::GoOverlayPackages::new(Some(&overlay));
     for candidate in candidates {
-        let matched = overlay.symbols_named(&candidate);
-        let visible = matched
-            .records
-            .iter()
-            .filter(|symbol| {
-                symbol.language == "go"
-                    && symbol.visibility == crate::analyzer::semantic_model::Visibility::Public
-            })
-            .collect::<Vec<_>>();
-        if visible.len() != 1 {
+        if packages.visible_symbol(&candidate).is_none() {
             continue;
         }
         let mut reference = site.clone();
