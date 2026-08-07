@@ -43,6 +43,10 @@ use std::sync::Arc;
 
 use crate::java::declarations::{collect_type_identifiers, parse_tree};
 use crate::java::imports::{import_package, non_static_import_path, static_import_path};
+use crate::proof::JvmRetainedExternalIndex;
+
+/// The package whose types every Java file sees without importing them.
+const JAVA_IMPLICIT_IMPORT_PACKAGE: &str = "java.lang";
 
 /// The analyzer-resident products Java's language logic resolves through, on
 /// top of the three core capability traits it reads declarations, imports and
@@ -90,11 +94,25 @@ pub trait JavaSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProv
     /// How far a lookup for `name` from `file` could see past the workspace, and
     /// the external type it landed on when it landed on one. See this module's
     /// note: the index behind it stays in `brokk-bifrost-analysis`.
+    ///
+    /// This is the *resolver's* question, and it builds the external index on
+    /// demand to answer it. Diagnostics must not: see the two `retained_`
+    /// members below.
     fn external_boundary_evidence(
         &self,
         file: &ProjectFile,
         name: &str,
     ) -> (BoundaryStatus, Option<String>);
+
+    /// What the analyzer has retained of the JVM dependency surface, read
+    /// without building it. See [`crate::proof`] on why a diagnostic peeks.
+    fn retained_external_index(&self) -> JvmRetainedExternalIndex;
+
+    /// Whether the retained external index holds `fqn` visibly from
+    /// `access_package`. Reads; never builds. Answers `false` for an unbuilt
+    /// index, which [`Self::retained_external_index`] reports separately so the
+    /// caller can tell "not there" from "nothing to look in".
+    fn retained_external_holds_qualified_name(&self, fqn: &str, access_package: &str) -> bool;
 
     /// Stage `tier` as the tier a type-name lookup for `normalized` resolved at.
     fn trace_type_name_tier(&self, normalized: &str, units: &[CodeUnit], tier: PrecedenceTier);
@@ -329,6 +347,78 @@ pub fn resolve_java_type_name_with(
         );
     }
     unit.into_iter().collect()
+}
+
+/// Every fully-qualified name Java's type-name tiers could give `raw_name` at
+/// `file`, strongest tier first.
+///
+/// [`resolve_java_type_name_with`] answers with workspace [`CodeUnit`]s. An
+/// external surface has no `CodeUnit` and must never be handed a fabricated one
+/// (#1619), so this walks the same tiers and yields the spellings themselves,
+/// leaving the caller to ask whichever index it holds. The single-type import
+/// tier is terminal here exactly as it is there: an explicit import claims the
+/// spelling whether or not its target is indexed, so the tiers below it are
+/// never reachable for that name.
+///
+/// The last entry is the `java.lang` type of the same name. The `CodeUnit`
+/// walker has no such tier because a workspace does not declare `java.lang`;
+/// an external surface is precisely where those types live.
+pub fn java_type_name_candidate_fqns(
+    source: &dyn JavaSource,
+    file: &ProjectFile,
+    raw_name: &str,
+) -> Vec<String> {
+    let normalized = raw_name.trim();
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    if normalized.contains('.') {
+        candidates.push(normalized.to_string());
+    }
+
+    let imports = source.import_info_of(file);
+    for import in &imports {
+        let Some(import_path) = non_static_import_path(import) else {
+            continue;
+        };
+        if import.is_wildcard {
+            continue;
+        }
+        let Some(imported_name) = import.identifier.as_deref() else {
+            continue;
+        };
+        if normalized == imported_name {
+            candidates.push(import_path.render_segments("."));
+            return candidates;
+        }
+        if let Some(rest) = normalized
+            .strip_prefix(imported_name)
+            .and_then(|rest| rest.strip_prefix('.'))
+        {
+            candidates.push(format!("{}.{rest}", import_path.render_segments(".")));
+            return candidates;
+        }
+    }
+
+    for import in &imports {
+        let Some(import_path) = non_static_import_path(import) else {
+            continue;
+        };
+        if !import.is_wildcard {
+            continue;
+        }
+        candidates.push(format!("{}.{normalized}", import_path.render_segments(".")));
+    }
+
+    candidates.push(java_same_package_fqn(source, file, normalized));
+    if java_file_is_in_default_package(source, file) {
+        candidates.push(normalized.to_string());
+    }
+    candidates.push(format!("{JAVA_IMPLICIT_IMPORT_PACKAGE}.{normalized}"));
+    candidates.dedup();
+    candidates
 }
 
 fn forward_source_type_by_fqn(source: &dyn JavaSource, fqn: &str) -> Option<CodeUnit> {

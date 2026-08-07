@@ -33,6 +33,7 @@ mod go_semantic_diagnostics;
 mod icfg_contract;
 mod java_semantic_diagnostics;
 mod js_ts_dependency_semantic_pack;
+mod jvm_diagnostic_proof;
 mod jvm_standard_library_pack;
 mod kotlin_dependency_semantic_pack;
 mod kotlin_semantic_diagnostics;

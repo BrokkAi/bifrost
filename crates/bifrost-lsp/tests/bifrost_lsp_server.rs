@@ -7767,7 +7767,22 @@ func Run() {
 }
 
 #[test]
-fn bifrost_lsp_server_scala_semantic_diagnostics_are_runtime_opt_in() {
+/// The runtime toggle still gates Scala's semantic pass, and #1619 adds a
+/// second gate on top of it: the pass may publish an unrecognized symbol only
+/// where structured analysis proved the name absent.
+///
+/// A bare workspace has no configured classpath and no activated dependency
+/// model, so nothing past the workspace has been read and `MissingType` may
+/// well be a JDK or dependency type. Publishing it would be exactly the false
+/// positive #1615 exists to prevent, so an enabled pass correctly publishes
+/// nothing here.
+///
+/// The positive case -- a proved absence reaching a client -- needs activated
+/// dependency packs. The LSP host does not activate them yet; the MCP service
+/// does, through `acquire_active_semantic_models`. Until the LSP does too, the
+/// error-producing half is pinned in process by
+/// `tests/suite_semantic/jvm_diagnostic_proof.rs`.
+fn bifrost_lsp_server_scala_unproved_symbols_are_never_published() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::write(
@@ -7816,11 +7831,11 @@ fn bifrost_lsp_server_scala_semantic_diagnostics_are_runtime_opt_in() {
         published["params"]["diagnostics"]
             .as_array()
             .is_some_and(|items| {
-                items.iter().any(|item| {
-                    item["source"] == "bifrost-scala" && item["code"] == "scala_unrecognized_symbol"
-                })
+                items
+                    .iter()
+                    .all(|item| item["code"] != "scala_unrecognized_symbol")
             }),
-        "expected Scala unknown-type publish diagnostic: {published}"
+        "an enabled pass must still not publish a name it cannot prove absent: {published}"
     );
 
     server.notify_value(json!({
@@ -7830,14 +7845,14 @@ fn bifrost_lsp_server_scala_semantic_diagnostics_are_runtime_opt_in() {
         "params": {"textDocument": {"uri": uri}}
     }));
     let enabled = server.read_message();
-    let items = enabled["result"]["items"]
-        .as_array()
-        .unwrap_or_else(|| panic!("expected diagnostics after enabling Scala linting: {enabled}"));
+    let items = enabled["result"]["items"].as_array().unwrap_or_else(|| {
+        panic!("expected an items array after enabling Scala linting: {enabled}")
+    });
     assert!(
-        items.iter().any(|item| {
-            item["source"] == "bifrost-scala" && item["code"] == "scala_unrecognized_symbol"
-        }),
-        "expected Scala unknown-type diagnostic: {enabled}"
+        items
+            .iter()
+            .all(|item| item["code"] != "scala_unrecognized_symbol"),
+        "the pull route must agree with the push route: {enabled}"
     );
 }
 
@@ -8287,7 +8302,9 @@ fn bifrost_lsp_server_ruby_semantic_diagnostics_are_constant_only() {
 }
 
 #[test]
-fn bifrost_lsp_server_kotlin_semantic_diagnostics_are_runtime_opt_in() {
+/// Kotlin's half of the same contract. See
+/// [`bifrost_lsp_server_scala_unproved_symbols_are_never_published`].
+fn bifrost_lsp_server_kotlin_unproved_symbols_are_never_published() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::write(
@@ -8336,12 +8353,11 @@ fn bifrost_lsp_server_kotlin_semantic_diagnostics_are_runtime_opt_in() {
         published["params"]["diagnostics"]
             .as_array()
             .is_some_and(|items| {
-                items.iter().any(|item| {
-                    item["source"] == "bifrost-kotlin"
-                        && item["code"] == "kotlin_unrecognized_symbol"
-                })
+                items
+                    .iter()
+                    .all(|item| item["code"] != "kotlin_unrecognized_symbol")
             }),
-        "expected Kotlin unknown-type publish diagnostic: {published}"
+        "an enabled pass must still not publish a name it cannot prove absent: {published}"
     );
 
     server.notify_value(json!({
@@ -8351,18 +8367,14 @@ fn bifrost_lsp_server_kotlin_semantic_diagnostics_are_runtime_opt_in() {
         "params": {"textDocument": {"uri": uri}}
     }));
     let enabled = server.read_message();
-    let items = enabled["result"]["items"]
-        .as_array()
-        .unwrap_or_else(|| panic!("expected diagnostics after enabling Kotlin linting: {enabled}"));
+    let items = enabled["result"]["items"].as_array().unwrap_or_else(|| {
+        panic!("expected an items array after enabling Kotlin linting: {enabled}")
+    });
     assert!(
-        items.iter().any(|item| {
-            item["source"] == "bifrost-kotlin"
-                && item["code"] == "kotlin_unrecognized_symbol"
-                && item["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("MissingType"))
-        }),
-        "expected Kotlin unknown-type diagnostic: {enabled}"
+        items
+            .iter()
+            .all(|item| item["code"] != "kotlin_unrecognized_symbol"),
+        "the pull route must agree with the push route: {enabled}"
     );
 
     server.notify_value(json!({"jsonrpc": "2.0", "id": 4, "method": "shutdown"}));

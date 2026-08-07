@@ -42,6 +42,7 @@ use std::sync::Arc;
 use crate::analyzer::java::imports::JavaTypeResolution;
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
+use crate::analyzer::jvm::retained_external_index_state;
 use crate::analyzer::structural::resolution::{BoundaryStatus, PrecedenceTier};
 pub(crate) use adapter::JavaAdapter;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
@@ -55,6 +56,7 @@ use brokk_bifrost_jvm::java::graph_support::{
     resolve_java_forward_type_name, resolve_java_forward_type_name_candidates,
 };
 use brokk_bifrost_jvm::java::test_detection::detect_test_assertion_smells_java;
+use brokk_bifrost_jvm::proof::JvmRetainedExternalIndex;
 use cache::JavaMemoCaches;
 use clones::build_clone_candidate_data;
 
@@ -345,6 +347,18 @@ impl JavaSource for JavaAnalyzer {
         JavaAnalyzer::external_boundary_evidence(self, file, name)
     }
 
+    fn retained_external_index(&self) -> JvmRetainedExternalIndex {
+        retained_external_index_state(self.external_index.get())
+    }
+
+    fn retained_external_holds_qualified_name(&self, fqn: &str, access_package: &str) -> bool {
+        self.external_index.get().is_some_and(|external| {
+            external
+                .resolve_qualified_name(fqn, access_package)
+                .is_some()
+        })
+    }
+
     fn trace_type_name_tier(&self, normalized: &str, units: &[CodeUnit], tier: PrecedenceTier) {
         imports::trace_tier(normalized, units, tier);
     }
@@ -539,6 +553,20 @@ impl IAnalyzer for JavaAnalyzer {
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
         diagnostics::collect_java_semantic_diagnostics(self, file, source)
+    }
+
+    /// Build the jar-backed external declaration index off the request path.
+    ///
+    /// #1615 forbids a diagnostic request from reading jars, so the proof-gated
+    /// ladder peeks at this cell and calls an unbuilt one an unknown boundary.
+    /// This is the hook that fills it: `IndexWarmer` runs it on a background
+    /// thread for the generation, and the once-lock makes it idempotent.
+    fn warm_query_indexes(&self) {
+        self.external_declaration_index();
+    }
+
+    fn query_indexes_warm(&self) -> bool {
+        self.external_index.get().is_some()
     }
 
     fn invalidate_cached_file_identities(&self) {

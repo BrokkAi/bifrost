@@ -8,6 +8,7 @@
 //! Java file name a Kotlin or Scala sibling's type without being reported as
 //! unrecognized.
 
+use crate::analyzer::jvm::JvmOverlayModel;
 use crate::analyzer::{IAnalyzer, JavaAnalyzer, ProjectFile, SemanticDiagnosticReport};
 
 pub(crate) fn collect_java_semantic_diagnostics(
@@ -21,7 +22,7 @@ pub(crate) fn collect_java_semantic_diagnostics(
     brokk_bifrost_jvm::java::diagnostics::collect_java_semantic_diagnostics(
         java,
         &analyzer.global_usage_definition_index(),
-        analyzer.semantic_model_overlay().is_some(),
+        &JvmOverlayModel(analyzer.semantic_model_overlay()),
         file,
         source,
     )

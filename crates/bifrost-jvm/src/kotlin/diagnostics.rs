@@ -1,29 +1,31 @@
-//! Kotlin semantic diagnostics (#1243).
+//! Kotlin semantic diagnostics (#1243, proof-gated by #1619).
 //!
-//! Collects high-confidence unresolved-type diagnostics only: an unqualified
-//! type reference is reported iff it resolves through NEITHER the file's
-//! imports, its own package, star imports, Kotlin's default imports, the
-//! wider JVM source realm (when a realm view is supplied — see
-//! [`collect_kotlin_semantic_diagnostics`]'s `realm` parameter), NOR the
-//! external dependency index. Anything reachable only through an
-//! unconfigured classpath stays silent — that is the suppression contract
-//! documented in `kotlin/mod.rs`'s module header — and a name that Kotlin
-//! itself would reject as *ambiguous* (two star imports binding the same
-//! spelling to different owners) is likewise never reported as unrecognized:
-//! ambiguity is a real, structurally-known answer, not evidence that nothing
-//! was found.
+//! Every unqualified type reference a Kotlin file spells is classified through
+//! [`kotlin_type_name_proof`]: the file's imports, its own package, star
+//! imports, Kotlin's default imports, the wider JVM source realm (when a realm
+//! view is supplied -- see [`collect_kotlin_semantic_diagnostics`]'s `realm`
+//! parameter), the retained external dependency index, and the active
+//! dependency model, in that order.
+//!
+//! What used to be silence is now a typed outcome. A name reachable only
+//! through an unconfigured or unread classpath was suppressed before and is
+//! suppressed still, but the report now says why:
+//! `MissingDependencyDiscovery` naming the exact boundary. A name Kotlin itself
+//! would reject as *ambiguous* -- two star imports binding one spelling to
+//! different owners -- records `Ambiguous`, because ambiguity is a real,
+//! structurally-known answer, not evidence that nothing was found. Only a name
+//! that every retained surface was able to miss becomes an error.
 //!
 //! Members, functions, and properties are deliberately not diagnosed here:
 //! Kotlin resolves those through overload sets, extension-function scope, and
 //! operator conventions this module does not model, so a wrong answer there
-//! is far likelier than for a bare type name.
-//!
-//! The `SemanticDiagnostic` this lowers into and the analyzer that supplies the
-//! enclosing-declaration lookup both stay in `brokk-bifrost-analysis`, so the
-//! collector below hands back its own record and takes the enclosing owner's
-//! scope as a `&dyn CodeUnitIndex` query.
+//! is far likelier than for a bare type name. See [`crate::proof`] on why no
+//! JVM language can claim a `MemberSurface` domain today.
 
-use brokk_bifrost_core::analyzer::model::{ImportInfo, Range, SemanticDiagnostic};
+use brokk_bifrost_core::analyzer::model::{
+    ImportInfo, SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
+    SemanticDiagnosticReport,
+};
 use brokk_bifrost_core::analyzer::semantic_diagnostics::node_range;
 use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
 use brokk_bifrost_core::analyzer::{CodeUnitIndex, ProjectFile};
@@ -32,9 +34,8 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::kotlin::graph_support::KotlinSource;
 use crate::kotlin::syntax::{kotlin_enclosing_import_header, kotlin_type_spelling};
-use crate::kotlin::types::{
-    KotlinNameScope, kotlin_scope_owners_for, kotlin_type_name_definitely_unresolved_in_realm,
-};
+use crate::kotlin::types::{KotlinNameScope, kotlin_scope_owners_for, kotlin_type_name_proof};
+use crate::proof::{JvmActiveSemanticModel, record_jvm_name_proof};
 use crate::realm::JvmSourceRealm;
 
 pub const KOTLIN_UNRECOGNIZED_SYMBOL: &str = "kotlin_unrecognized_symbol";
@@ -42,51 +43,52 @@ pub const KOTLIN_SEMANTIC_DIAGNOSTIC_SOURCE: &str = "bifrost-kotlin";
 const MAX_KOTLIN_SEMANTIC_DIAGNOSTIC_BYTES: usize = 512 * 1024;
 const MAX_KOTLIN_SEMANTIC_DIAGNOSTICS: usize = 200;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KotlinSemanticDiagnostic {
-    pub range: Range,
-    pub kind: &'static str,
-    pub message: String,
-}
-
-impl From<KotlinSemanticDiagnostic> for SemanticDiagnostic {
-    fn from(diagnostic: KotlinSemanticDiagnostic) -> Self {
-        Self {
-            range: diagnostic.range,
-            source: KOTLIN_SEMANTIC_DIAGNOSTIC_SOURCE,
-            kind: diagnostic.kind,
-            message: diagnostic.message,
-        }
-    }
-}
-
-/// Collect high-confidence Kotlin unresolved-type diagnostics for `file`.
+/// Collect proof-gated Kotlin unresolved-type diagnostics for `file`.
 ///
 /// `realm` widens resolution across the whole JVM source realm (Java/Scala
 /// siblings in the same workspace) when supplied by `MultiAnalyzer`; a bare
 /// `KotlinAnalyzer` passes `None` and resolves against its own declarations
-/// and the external dependency index only.
+/// and the retained dependency surfaces only.
 ///
 /// `owners` is the dispatching analyzer's enclosing-declaration lookup, which
 /// in a mixed workspace crosses language boundaries; `kotlin` is the Kotlin
-/// analyzer's own resolution surface.
+/// analyzer's own resolution surface; `model` is the dispatching analyzer's
+/// active dependency model.
 pub fn collect_kotlin_semantic_diagnostics(
     owners: &dyn CodeUnitIndex,
     kotlin: &dyn KotlinSource,
     file: &ProjectFile,
     source: &str,
     realm: Option<&JvmSourceRealm<'_>>,
-) -> Vec<KotlinSemanticDiagnostic> {
+    model: &dyn JvmActiveSemanticModel,
+) -> SemanticDiagnosticReport {
+    let mut report = SemanticDiagnosticReport::new();
     if source.len() > MAX_KOTLIN_SEMANTIC_DIAGNOSTIC_BYTES {
-        return Vec::new();
+        report.push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
+        return report;
     }
     let Some(tree) = parse_kotlin_tree(source) else {
-        return Vec::new();
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "Kotlin source did not parse".to_string(),
+            }],
+        );
+        return report;
     };
     let mut parse_errors = Vec::new();
     collect_parse_errors(tree.root_node(), &mut parse_errors);
     if !parse_errors.is_empty() {
-        return Vec::new();
+        // A file the parser could not read has no reliable reference sites, so
+        // no name in it can be proved absent. The LSP still publishes the parse
+        // errors themselves through its own path.
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: format!("Kotlin source has {} parse errors", parse_errors.len()),
+            }],
+        );
+        return report;
     }
 
     let line_starts = compute_line_starts(source);
@@ -95,16 +97,18 @@ pub fn collect_kotlin_semantic_diagnostics(
     let mut collector = KotlinDiagnosticCollector {
         owners,
         kotlin,
+        model,
         file,
         source,
         line_starts: &line_starts,
         package_name,
         imports,
         realm,
-        diagnostics: Vec::new(),
+        report,
+        errors: 0,
     };
     collector.scan_tree(tree.root_node());
-    collector.diagnostics
+    collector.report
 }
 
 fn parse_kotlin_tree(source: &str) -> Option<Tree> {
@@ -118,20 +122,24 @@ fn parse_kotlin_tree(source: &str) -> Option<Tree> {
 struct KotlinDiagnosticCollector<'a> {
     owners: &'a dyn CodeUnitIndex,
     kotlin: &'a dyn KotlinSource,
+    model: &'a dyn JvmActiveSemanticModel,
     file: &'a ProjectFile,
     source: &'a str,
     line_starts: &'a [usize],
     package_name: String,
     imports: Vec<ImportInfo>,
     realm: Option<&'a JvmSourceRealm<'a>>,
-    diagnostics: Vec<KotlinSemanticDiagnostic>,
+    report: SemanticDiagnosticReport,
+    errors: usize,
 }
 
 impl KotlinDiagnosticCollector<'_> {
     fn scan_tree(&mut self, root: Node<'_>) {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            if self.diagnostics.len() >= MAX_KOTLIN_SEMANTIC_DIAGNOSTICS {
+            if self.errors >= MAX_KOTLIN_SEMANTIC_DIAGNOSTICS {
+                self.report
+                    .push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
                 break;
             }
             if node.kind() == "user_type" && kotlin_enclosing_import_header(node).is_none() {
@@ -164,14 +172,20 @@ impl KotlinDiagnosticCollector<'_> {
             imports: &self.imports,
             scope_owners,
         };
-        if !kotlin_type_name_definitely_unresolved_in_realm(self.kotlin, &scope, &name, self.realm)
-        {
-            return;
+        let proof = kotlin_type_name_proof(self.kotlin, &scope, &name, self.realm, self.model);
+        let range = node_range(node, self.line_starts);
+        if record_jvm_name_proof(&mut self.report, range, proof, || {
+            (
+                SemanticDiagnosticDomain::Type { name: name.clone() },
+                SemanticDiagnostic {
+                    range,
+                    source: KOTLIN_SEMANTIC_DIAGNOSTIC_SOURCE,
+                    kind: KOTLIN_UNRECOGNIZED_SYMBOL,
+                    message: format!("Unrecognized Kotlin type `{name}`"),
+                },
+            )
+        }) {
+            self.errors += 1;
         }
-        self.diagnostics.push(KotlinSemanticDiagnostic {
-            range: node_range(node, self.line_starts),
-            kind: KOTLIN_UNRECOGNIZED_SYMBOL,
-            message: format!("Unrecognized Kotlin type `{name}`"),
-        });
     }
 }
