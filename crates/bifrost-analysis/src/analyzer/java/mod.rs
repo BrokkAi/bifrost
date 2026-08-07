@@ -899,6 +899,16 @@ impl LanguageSupport for JavaSupport {
             .map(|java| java.inner().ranges_limited(unit, limit))
     }
 
+    fn signatures_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<String>> {
+        resolve_analyzer::<JavaAnalyzer>(analyzer)
+            .map(|java| java.inner().signatures_limited(unit, limit))
+    }
+
     fn forward_query_provider<'a>(
         &self,
         analyzer: &'a dyn IAnalyzer,
