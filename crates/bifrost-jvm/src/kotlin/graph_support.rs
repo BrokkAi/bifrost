@@ -30,6 +30,8 @@ use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
 use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
+use crate::proof::JvmRetainedExternalIndex;
+
 /// The analyzer-resident products Kotlin's language logic resolves through, on
 /// top of the two core capability traits it reads declarations and imports
 /// with. The analyzer is the only implementor and every method forwards to one
@@ -61,9 +63,23 @@ pub trait KotlinSource: CodeUnitIndex + ImportAnalysisProvider {
 
     /// Whether the shared JVM dependency index holds nothing. See this module's
     /// note: the index behind it stays in `brokk-bifrost-analysis`.
+    ///
+    /// This and [`Self::external_qualified_name_exists`] are the *resolver's*
+    /// questions: they build the index on demand to answer. Diagnostics must
+    /// not, so they ask the two `retained_` members below instead.
     fn external_index_is_empty(&self) -> bool;
 
     /// Whether the shared JVM dependency index resolves `fqn` as seen from a
     /// file declaring `access_package`. See [`Self::external_index_is_empty`].
     fn external_qualified_name_exists(&self, fqn: &str, access_package: &str) -> bool;
+
+    /// What the analyzer has retained of the JVM dependency surface, read
+    /// without building it. See [`crate::proof`] on why a diagnostic peeks.
+    fn retained_external_index(&self) -> JvmRetainedExternalIndex;
+
+    /// [`Self::external_qualified_name_exists`] against the retained index
+    /// only. Answers `false` for an unbuilt index, which
+    /// [`Self::retained_external_index`] reports separately so the caller can
+    /// tell "not there" from "nothing to look in".
+    fn retained_external_qualified_name_exists(&self, fqn: &str, access_package: &str) -> bool;
 }

@@ -8,9 +8,9 @@ use crate::analyzer::{
     ImportAnalysisProvider, ImportInfo, ImportReachability, JavaAnalyzer, JavascriptAnalyzer,
     KotlinAnalyzer, Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range,
     RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch,
-    SemanticDiagnostic, SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
-    TypeHierarchyProvider, TypescriptAnalyzer,
+    SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
+    TypescriptAnalyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
@@ -1100,26 +1100,38 @@ impl IAnalyzer for MultiAnalyzer {
         // that realm view (see `kotlin_realm`), so this is the one place the
         // widening happens rather than inside `KotlinAnalyzer` itself.
         if language_for_file(file) == Language::Kotlin
-            && let Some((kotlin, realm)) = self.kotlin_realm()
+            && self.delegates.contains_key(&Language::Kotlin)
         {
-            let diagnostics =
-                crate::analyzer::kotlin::diagnostics::collect_kotlin_semantic_diagnostics(
-                    kotlin,
-                    file,
-                    source,
-                    Some(&realm),
-                )
-                .into_iter()
-                .map(SemanticDiagnostic::from)
-                .collect();
-            return crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(
+            // Every Kotlin file routes here, not only one with Java or Scala
+            // peers: the realm widens *resolution*, but the active dependency
+            // model that decides whether a miss is provable is published on the
+            // dispatcher either way. Falling through to the delegate for a
+            // Kotlin-only workspace would read its empty overlay and suppress
+            // every unknown name.
+            //
+            // `self`, not the Kotlin delegate, for the same reason -- plus the
+            // enclosing-declaration lookup, which crosses languages. The shim
+            // downcasts to the Kotlin analyzer itself.
+            let realm = self.kotlin_realm().map(|(_, realm)| realm);
+            return crate::analyzer::kotlin::diagnostics::collect_kotlin_semantic_diagnostics(
+                self,
                 file,
-                diagnostics,
+                source,
+                realm.as_ref(),
             );
         }
         if language_for_file(file) == Language::Java && self.delegates.contains_key(&Language::Java)
         {
             return crate::analyzer::java::diagnostics::collect_java_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        // Scala's own ladder is delegate-resident, but the active dependency
+        // model it must not claim absence past is published on the dispatcher.
+        if language_for_file(file) == Language::Scala
+            && self.delegates.contains_key(&Language::Scala)
+        {
+            return crate::analyzer::scala::diagnostics::collect_scala_semantic_diagnostics(
                 self, file, source,
             );
         }
