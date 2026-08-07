@@ -2,6 +2,7 @@ use crate::imports::{
     CommonJsRequireBindingKind, commonjs_require_module_specifier_from_declarator,
     parse_commonjs_require_bindings_from_node,
 };
+use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
 use brokk_bifrost_core::analyzer::usages::model::{ImportBinding, ImportKind};
 use brokk_bifrost_core::analyzer::{Language, ProjectFile, Range};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -406,6 +407,49 @@ pub fn static_member_receiver<'tree>(
     Some(JsTsStaticMemberReceiver {
         root: current,
         members,
+    })
+}
+
+/// The identifier at the root of a static member chain (`module` in
+/// `module.exports.foo`).
+fn static_member_root(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "identifier" => return Some(node),
+            "member_expression" => node = node.child_by_field_name("object")?,
+            _ => return None,
+        }
+    }
+}
+
+/// Whether this program is an external module rather than a browser script:
+/// it carries an ESM import/export, a `require(...)` call, or a CommonJS
+/// `exports` / `module.exports` assignment.
+///
+/// A browser script's top-level `var` is a property of the one shared global
+/// object, so a later script sees it; a module's top-level binding is
+/// file-private. That is the whole reason an unexported `NS.Field = ...` can
+/// be read from another file at all, so the forward definition lookup
+/// (`jsts_cross_file_dotted_receiver_has_global_identity`) and the inverse
+/// usage scan must decide it the same way -- hence one function here rather
+/// than one per direction.
+pub fn js_program_is_external_module(root: Node<'_>, source: &str) -> bool {
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor).any(|statement| {
+        matches!(statement.kind(), "import_statement" | "export_statement")
+            || subtree_contains(statement, |node| {
+                (node.kind() == "call_expression"
+                    && node.child_by_field_name("function").is_some_and(|callee| {
+                        callee.kind() == "identifier" && slice(callee, source) == "require"
+                    }))
+                    || (node.kind() == "assignment_expression"
+                        && node
+                            .child_by_field_name("left")
+                            .and_then(static_member_root)
+                            .is_some_and(|root| {
+                                matches!(slice(root, source), "exports" | "module")
+                            }))
+            })
     })
 }
 

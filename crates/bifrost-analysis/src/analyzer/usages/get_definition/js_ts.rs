@@ -12,7 +12,8 @@ use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::syntax::parse_js_ts_tree;
 use brokk_bifrost_js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, MAX_STATIC_IMPORT_BINDINGS_PER_NAME,
-    direct_property_definitions, is_declaration_identifier, is_explicit_object_literal_key, slice,
+    direct_property_definitions, is_declaration_identifier, is_explicit_object_literal_key,
+    js_program_is_external_module, slice,
 };
 /// The receiver-owner / type-text cluster this route drives now lives beside the
 /// rest of the JS/TS language logic, so the usage graph can call it without
@@ -1268,7 +1269,7 @@ fn jsts_cross_file_dotted_receiver_has_global_identity(
         return false;
     };
     let root = tree.root_node();
-    if jsts_program_is_external_module(root, &source) {
+    if js_program_is_external_module(root, &source) {
         return false;
     }
     analyzer.ranges(candidate).iter().any(|range| {
@@ -1278,36 +1279,6 @@ fn jsts_cross_file_dotted_receiver_has_global_identity(
                 end_byte: root.end_byte(),
             })
     })
-}
-
-fn jsts_program_is_external_module(root: Node<'_>, source: &str) -> bool {
-    let mut cursor = root.walk();
-    root.named_children(&mut cursor).any(|statement| {
-        matches!(statement.kind(), "import_statement" | "export_statement")
-            || subtree_contains(statement, |node| {
-                (node.kind() == "call_expression"
-                    && node.child_by_field_name("function").is_some_and(|callee| {
-                        callee.kind() == "identifier" && node_text(callee, source) == "require"
-                    }))
-                    || (node.kind() == "assignment_expression"
-                        && node
-                            .child_by_field_name("left")
-                            .and_then(jsts_static_member_root)
-                            .is_some_and(|root| {
-                                matches!(node_text(root, source), "exports" | "module")
-                            }))
-            })
-    })
-}
-
-fn jsts_static_member_root(mut node: Node<'_>) -> Option<Node<'_>> {
-    loop {
-        match node.kind() {
-            "identifier" => return Some(node),
-            "member_expression" => node = node.child_by_field_name("object")?,
-            _ => return None,
-        }
-    }
 }
 
 fn ts_exact_global_dotted_candidates(
