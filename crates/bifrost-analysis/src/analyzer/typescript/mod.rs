@@ -648,12 +648,7 @@ impl IAnalyzer for TypescriptAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
-        let diagnostics =
-            collect_typescript_semantic_diagnostics(self, file, source, &self.alias_resolver)
-                .into_iter()
-                .map(Into::into)
-                .collect();
-        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(file, diagnostics)
+        collect_typescript_semantic_diagnostics(self, file, source)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

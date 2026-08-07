@@ -510,6 +510,28 @@ pub fn retained_discovery_verdict(
     }
 }
 
+/// Whether retained discovery evidence can still account for `module_path`:
+/// the build declares it, or discovery could not read everything the build
+/// declared, so a miss is not proof of absence.
+///
+/// A caller that hits here is at [`BoundaryStatus::ExternalDeclaredUnindexed`];
+/// one that misses, with no other evidence, is at
+/// [`BoundaryStatus::ExternalUnknown`]. Where no discovery has run, nothing is
+/// retained and the honest answer is `false`. This function never starts
+/// discovery.
+///
+/// [`BoundaryStatus::ExternalDeclaredUnindexed`]: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed
+/// [`BoundaryStatus::ExternalUnknown`]: crate::analyzer::structural::BoundaryStatus::ExternalUnknown
+pub fn retained_evidence_declares(
+    evidence: Option<&DependencyDiscoveryEvidence>,
+    module_path: &str,
+) -> bool {
+    matches!(
+        retained_discovery_verdict(evidence, module_path),
+        RetainedDiscoveryVerdict::Truncated | RetainedDiscoveryVerdict::Declared
+    )
+}
+
 /// Read retained discovery evidence for a diagnostic request. A missing value
 /// is incomplete external evidence. This function never starts discovery.
 pub fn dependency_discovery_incomplete_reasons(

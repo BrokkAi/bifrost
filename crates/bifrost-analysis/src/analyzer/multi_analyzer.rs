@@ -1167,6 +1167,22 @@ impl IAnalyzer for MultiAnalyzer {
                 self, file, source,
             );
         }
+        // JS/TS diagnostics judge external imports against the activated npm
+        // declaration surface and the retained npm discovery evidence (#1620).
+        // Both hang off the analyzer that owns the workspace snapshot, which is
+        // this one: a delegate passed on its own carries no snapshot caches and
+        // would report every npm import as an unknown boundary.
+        let language = language_for_file(file);
+        if language == Language::JavaScript && self.delegates.contains_key(&Language::JavaScript) {
+            return crate::analyzer::js_ts::diagnostics::collect_javascript_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        if language == Language::TypeScript && self.delegates.contains_key(&Language::TypeScript) {
+            return crate::analyzer::js_ts::diagnostics::collect_typescript_semantic_diagnostics(
+                self, file, source,
+            );
+        }
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().semantic_diagnostics(file, source))
             .unwrap_or_default()

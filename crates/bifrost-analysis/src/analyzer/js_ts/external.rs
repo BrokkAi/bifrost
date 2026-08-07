@@ -537,6 +537,12 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                         Some(self.artifact_path.clone()),
                         "declaration re-export has no locally resolvable declaration",
                     );
+                } else if is_export_assignment(node) {
+                    self.diagnostics.warning(
+                        "typescript.export_assignment.unsupported",
+                        Some(self.artifact_path.clone()),
+                        "declaration uses `export =`, which replaces the module's export shape",
+                    );
                 }
             }
             "ambient_declaration" | "statement_block" => {
@@ -991,6 +997,23 @@ fn explicit_export_aliases(root: Node<'_>, source: &str) -> HashMap<String, Vec<
         }
     }
     aliases
+}
+
+/// Whether an `export_statement` is a TypeScript export assignment (`export = X`).
+///
+/// An export assignment republishes one declaration as the module's entire
+/// export shape, so `import { member } from 'pkg'` reaches `X`'s members rather
+/// than the module's. This producer records declarations under their own names
+/// and cannot express that re-rooting, so the surface it emits would answer a
+/// named import wrongly. Reporting it keeps the pack partial, which stops a
+/// consumer from proving a name absent from a shape the pack never had.
+///
+/// The grammar gives an export assignment no `declaration`, `source` or `value`
+/// field; its `=` token is what separates it from a re-export clause.
+fn is_export_assignment(node: Node<'_>) -> bool {
+    (0..node.child_count())
+        .filter_map(|index| node.child(index))
+        .any(|child| child.kind() == "=")
 }
 
 fn is_global_internal_module(node: Node<'_>, source: &str) -> bool {
