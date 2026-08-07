@@ -837,6 +837,7 @@ pub struct CodeQueryPhysicalNode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct CodeQuerySemanticRequest {
     pub procedures: bool,
+    pub dispatch: bool,
     pub program_points: bool,
     pub control_edges: bool,
     pub typestate: bool,
@@ -853,6 +854,7 @@ impl CodeQuerySemanticRequest {
         for facet in facets {
             match facet {
                 QuerySemanticFacet::Procedures => request.procedures = true,
+                QuerySemanticFacet::Dispatch => request.dispatch = true,
                 QuerySemanticFacet::ProgramPoints => request.program_points = true,
                 QuerySemanticFacet::ControlEdges => request.control_edges = true,
                 QuerySemanticFacet::Typestate => request.typestate = true,
@@ -1253,6 +1255,7 @@ mod tests {
             vec![
                 CodeQuerySemanticRequest {
                     procedures: true,
+                    dispatch: false,
                     program_points: false,
                     control_edges: false,
                     typestate: false,
@@ -1261,6 +1264,7 @@ mod tests {
                 },
                 CodeQuerySemanticRequest {
                     procedures: true,
+                    dispatch: false,
                     program_points: true,
                     control_edges: false,
                     typestate: false,
@@ -1269,6 +1273,7 @@ mod tests {
                 },
                 CodeQuerySemanticRequest {
                     procedures: true,
+                    dispatch: false,
                     program_points: true,
                     control_edges: true,
                     typestate: false,
@@ -1306,6 +1311,7 @@ mod tests {
             vec![
                 CodeQuerySemanticRequest {
                     procedures: true,
+                    dispatch: false,
                     program_points: false,
                     control_edges: false,
                     typestate: false,
@@ -1314,6 +1320,7 @@ mod tests {
                 },
                 CodeQuerySemanticRequest {
                     procedures: true,
+                    dispatch: false,
                     program_points: false,
                     control_edges: false,
                     typestate: true,
@@ -1351,6 +1358,7 @@ mod tests {
             vec![
                 CodeQuerySemanticRequest {
                     procedures: true,
+                    dispatch: false,
                     program_points: false,
                     control_edges: false,
                     typestate: false,
@@ -1359,6 +1367,7 @@ mod tests {
                 },
                 CodeQuerySemanticRequest {
                     procedures: true,
+                    dispatch: false,
                     program_points: false,
                     control_edges: false,
                     typestate: false,

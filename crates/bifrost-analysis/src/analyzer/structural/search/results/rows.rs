@@ -100,6 +100,8 @@ pub enum DetailedCodeQueryDomain {
     CallArgument,
     ReceiverEvidence,
     MemberSelection,
+    DispatchOutcome,
+    DispatchTarget,
     Occurrence,
     LexicalScope,
     Binding,
@@ -135,6 +137,8 @@ pub const ALL_DETAILED_CODE_QUERY_DOMAINS: &[DetailedCodeQueryDomain] = &[
     DetailedCodeQueryDomain::CallArgument,
     DetailedCodeQueryDomain::ReceiverEvidence,
     DetailedCodeQueryDomain::MemberSelection,
+    DetailedCodeQueryDomain::DispatchOutcome,
+    DetailedCodeQueryDomain::DispatchTarget,
     DetailedCodeQueryDomain::Occurrence,
     DetailedCodeQueryDomain::LexicalScope,
     DetailedCodeQueryDomain::Binding,
@@ -278,6 +282,8 @@ impl DetailedCodeQueryDomain {
             QueryValueKind::CallArgument => Self::CallArgument,
             QueryValueKind::ReceiverEvidence => Self::ReceiverEvidence,
             QueryValueKind::MemberSelection => Self::MemberSelection,
+            QueryValueKind::DispatchOutcome => Self::DispatchOutcome,
+            QueryValueKind::DispatchTarget => Self::DispatchTarget,
             QueryValueKind::Occurrence => Self::Occurrence,
             QueryValueKind::LexicalScope => Self::LexicalScope,
             QueryValueKind::Binding => Self::Binding,
@@ -316,6 +322,8 @@ impl DetailedCodeQueryDomain {
             Self::CallArgument => "call_argument",
             Self::ReceiverEvidence => "receiver_evidence",
             Self::MemberSelection => "member_selection",
+            Self::DispatchOutcome => "dispatch_outcome",
+            Self::DispatchTarget => "dispatch_target",
             Self::Occurrence => "occurrence",
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
@@ -449,6 +457,31 @@ impl DetailedCodeQueryDomain {
                 CodeQueryRowField::optional("factory_id", Scalar::DeclarationIdentity),
                 CodeQueryRowField::required("proof", Scalar::ConstrainedEnum),
                 CodeQueryRowField::required("completeness", Scalar::ConstrainedEnum),
+            ],
+            Self::DispatchOutcome => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("site_id", Scalar::StableId),
+                CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
+                CodeQueryRowField::required("outcome", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("call_site_count", Scalar::Integer),
+                CodeQueryRowField::required("target_count", Scalar::Integer),
+                CodeQueryRowField::required("targets_truncated", Scalar::Boolean),
+                CodeQueryRowField::optional("semantic_unsupported", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("exceeded_limit", Scalar::ConstrainedEnum),
+            ],
+            Self::DispatchTarget => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("site_id", Scalar::StableId),
+                CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
+                CodeQueryRowField::required("ordinal", Scalar::Integer),
+                CodeQueryRowField::required("target_id", Scalar::StableId),
+                CodeQueryRowField::optional("target_declaration_id", Scalar::DeclarationIdentity),
+                CodeQueryRowField::required("proof", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("completeness", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("dispatch", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("boundary_kind", Scalar::ConstrainedEnum),
             ],
             Self::CallShape => code_query_row_fields![
                 CodeQueryRowField::required("id", Scalar::StableId),
@@ -629,6 +662,8 @@ impl CodeQueryResultValue {
             Self::ReceiverAnalysis { value } => Some(value.range),
             Self::ReceiverOutcome { value } => Some(value.range),
             Self::MemberSelection { value } => Some(value.range),
+            Self::DispatchOutcome { value } => Some(value.range),
+            Self::DispatchTarget { .. } => None,
             Self::CallShape { value } => Some(value.range),
             Self::CallArgumentGroup { value } => Some(value.range),
             Self::CallArgument { value } => Some(value.range),
@@ -669,6 +704,8 @@ impl CodeQueryResultValue {
             Self::CallArgumentGroup { .. } => DetailedCodeQueryDomain::CallArgumentGroup,
             Self::CallArgument { .. } => DetailedCodeQueryDomain::CallArgument,
             Self::MemberSelection { .. } => DetailedCodeQueryDomain::MemberSelection,
+            Self::DispatchOutcome { .. } => DetailedCodeQueryDomain::DispatchOutcome,
+            Self::DispatchTarget { .. } => DetailedCodeQueryDomain::DispatchTarget,
             Self::Occurrence { .. } => DetailedCodeQueryDomain::Occurrence,
             Self::LexicalScope { .. } => DetailedCodeQueryDomain::LexicalScope,
             Self::Binding { .. } => DetailedCodeQueryDomain::Binding,
@@ -965,6 +1002,69 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::CallArgument { value }, "spread") => {
             Some(Scalar::Boolean(value.spread))
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "site_ast_id") => {
+            value.site_ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "outcome") => {
+            Some(Scalar::ConstrainedEnum(value.outcome))
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "call_site_count") => {
+            Some(Scalar::Integer(value.call_site_count as u64))
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "target_count") => {
+            Some(Scalar::Integer(value.target_count as u64))
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "targets_truncated") => {
+            Some(Scalar::Boolean(value.targets_truncated))
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "semantic_unsupported") => {
+            value.semantic_unsupported.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "exceeded_limit") => {
+            value.exceeded_limit.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::DispatchTarget { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "site_ast_id") => {
+            value.site_ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "ordinal") => {
+            Some(Scalar::Integer(value.ordinal as u64))
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "target_id") => {
+            Some(Scalar::StableId(&value.target_id))
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "target_declaration_id") => value
+            .target_declaration
+            .as_ref()
+            .and_then(|declaration| declaration.id.as_deref())
+            .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::DispatchTarget { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "dispatch") => {
+            Some(Scalar::ConstrainedEnum(value.dispatch))
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "boundary_kind") => {
+            value.boundary_kind.map(Scalar::ConstrainedEnum)
         }
         (CodeQueryResultValue::ReceiverEvidence { value }, "id") => {
             Some(Scalar::StableId(&value.id))
@@ -1374,6 +1474,15 @@ pub enum DetailedCodeQueryKey {
         id: String,
         site_id: String,
     },
+    DispatchOutcome {
+        id: String,
+        site_id: String,
+    },
+    DispatchTarget {
+        id: String,
+        site_id: String,
+        ordinal: usize,
+    },
     CallShape {
         id: String,
         site_id: String,
@@ -1538,6 +1647,14 @@ impl DetailedCodeQueryResult {
                         | (
                             DetailedCodeQueryDomain::ReceiverEvidence,
                             DetailedCodeQueryKey::ReceiverEvidence { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::DispatchOutcome,
+                            DetailedCodeQueryKey::DispatchOutcome { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::DispatchTarget,
+                            DetailedCodeQueryKey::DispatchTarget { .. }
                         )
                         | (
                             DetailedCodeQueryDomain::CallShape,
@@ -1722,6 +1839,8 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::ReceiverAnalysis { .. }
         | CodeQueryResultValue::ReceiverOutcome { .. }
         | CodeQueryResultValue::ReceiverEvidence { .. }
+        | CodeQueryResultValue::DispatchOutcome { .. }
+        | CodeQueryResultValue::DispatchTarget { .. }
         | CodeQueryResultValue::CallShape { .. }
         | CodeQueryResultValue::CallArgumentGroup { .. }
         | CodeQueryResultValue::CallArgument { .. }
@@ -1781,6 +1900,8 @@ fn assert_detailed_terminal_identities(
                 | DetailedCodeQueryDomain::ReceiverAnalysis
                 | DetailedCodeQueryDomain::ReceiverOutcome
                 | DetailedCodeQueryDomain::ReceiverEvidence
+                | DetailedCodeQueryDomain::DispatchOutcome
+                | DetailedCodeQueryDomain::DispatchTarget
                 | DetailedCodeQueryDomain::CallShape
                 | DetailedCodeQueryDomain::CallArgumentGroup
                 | DetailedCodeQueryDomain::CallArgument
@@ -1839,6 +1960,8 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::ReceiverAnalysis { .. }
         | DetailedCodeQueryKey::ReceiverOutcome { .. }
         | DetailedCodeQueryKey::ReceiverEvidence { .. }
+        | DetailedCodeQueryKey::DispatchOutcome { .. }
+        | DetailedCodeQueryKey::DispatchTarget { .. }
         | DetailedCodeQueryKey::CallShape { .. }
         | DetailedCodeQueryKey::CallArgumentGroup { .. }
         | DetailedCodeQueryKey::CallArgument { .. }

@@ -189,6 +189,95 @@ pub struct CodeQueryMemberSelection {
     pub coverage: &'static str,
 }
 
+/// The mandatory terminal row for one bounded-dispatch site (#1477 M4).
+///
+/// Exactly one row exists per input site. Target rows may be empty, but this
+/// row always states the semantic outcome that produced that emptiness and
+/// whether the retained target set is exhaustive. `coverage` is `exhaustive`
+/// only when the workspace oracle itself reported exhaustive coverage across
+/// every located call site and every target set; an unknown, unsupported,
+/// over-budget, or cancelled dispatch is never exhaustive, so a policy
+/// completeness gate turns an exact-set assertion over such a site unreliable
+/// instead of clean.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryDispatchOutcome {
+    pub id: String,
+    pub site_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    /// The `SemanticOutcome` variant the dispatch seam published:
+    /// `resolved`, `ambiguous`, `unproven`, `unknown`, `unsupported`,
+    /// `exceeded_budget`, or `cancelled`.
+    pub outcome: &'static str,
+    /// The oracle's own `CandidateCoverage`: `exhaustive`, `open`, or
+    /// `truncated`.
+    pub coverage: &'static str,
+    /// Exact semantic call sites located inside the input range. Zero means
+    /// the position holds no call the semantic artifact retained, which is
+    /// why the outcome is `unknown` rather than a proven-empty target set.
+    pub call_site_count: usize,
+    /// Retained target rows for this site, counting boundary arms that name a
+    /// target as well as materialized candidates.
+    pub target_count: usize,
+    pub targets_truncated: bool,
+    /// The unsupported semantic capability, when the outcome is `unsupported`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_unsupported: Option<&'static str>,
+    /// The exceeded semantic budget dimension, when the outcome is
+    /// `exceeded_budget`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exceeded_limit: Option<&'static str>,
+}
+
+/// One bounded dispatch arm of one call site (#1477 M4).
+///
+/// A row is either a materialized candidate (`boundary_kind` absent) or a
+/// boundary arm the oracle named a target for (`boundary_kind` present, and
+/// the workspace holds no body to render). `proof` and `completeness` are the
+/// oracle's own per-arm quality; `coverage` is the site's candidate coverage.
+/// `dispatch` is the honest conjunction of those three axes and never
+/// upgrades: it is `proven_dispatch` only for a proven, complete arm inside an
+/// exhaustive set, and `may_dispatch` otherwise. The three fields are kept
+/// separate so an assertion can read either the conjunction or the exact axis
+/// that made an arm open.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryDispatchTarget {
+    pub id: String,
+    pub site_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_ast_id: Option<String>,
+    pub path: String,
+    /// Zero-based position of this arm among the site's retained arms.
+    pub ordinal: usize,
+    /// The arm's semantic identity: a domain-separated digest over the
+    /// target's artifact fingerprint and semantic locator. Never an arena id.
+    pub target_id: String,
+    /// The workspace-relative path the target locator names.
+    pub target_path: String,
+    /// The target rendered as a workspace declaration, when the workspace can
+    /// still locate one for the exact procedure. Absent for an external or
+    /// unmaterialized arm, and for a materialized procedure whose declaration
+    /// the workspace no longer indexes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_declaration: Option<CodeQueryDeclaration>,
+    /// `proven` or `unproven`, exactly as the dispatch oracle stated it.
+    pub proof: &'static str,
+    /// `complete` or `partial`, exactly as the dispatch oracle stated it.
+    pub completeness: &'static str,
+    /// The owning site's candidate coverage, repeated on the arm so a target
+    /// row alone is enough to reject an exact-set claim.
+    pub coverage: &'static str,
+    /// `proven_dispatch` or `may_dispatch`.
+    pub dispatch: &'static str,
+    /// The typed boundary kind, when this arm is a boundary rather than a
+    /// materialized candidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boundary_kind: Option<&'static str>,
+}
+
 /// One typed receiver value retained for a site. Nested factory returns are
 /// flattened into a parent-linked chain instead of nested presentation data.
 #[derive(Debug, Clone, Serialize)]

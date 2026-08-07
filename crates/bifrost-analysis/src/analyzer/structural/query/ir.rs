@@ -67,6 +67,8 @@ pub enum QueryValueKind {
     CallArgumentGroup,
     CallArgument,
     MemberSelection,
+    DispatchOutcome,
+    DispatchTarget,
     Occurrence,
     LexicalScope,
     Binding,
@@ -104,6 +106,8 @@ impl QueryValueKind {
             Self::CallArgumentGroup => "call_argument_group",
             Self::CallArgument => "call_argument",
             Self::MemberSelection => "member_selection",
+            Self::DispatchOutcome => "dispatch_outcome",
+            Self::DispatchTarget => "dispatch_target",
             Self::Occurrence => "occurrence",
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
@@ -270,6 +274,8 @@ pub enum QueryStep {
     CallArgumentGroups,
     CallArguments,
     MemberSelection,
+    DispatchOutcome,
+    DispatchTargets,
     OccurrencesOf(OccurrenceFilter),
     OccurrencesIn(OccurrenceFilter),
     OccurrenceTarget,
@@ -753,6 +759,8 @@ impl QueryStep {
             Self::CallArgumentGroups => QueryStepOp::CallArgumentGroups,
             Self::CallArguments => QueryStepOp::CallArguments,
             Self::MemberSelection => QueryStepOp::MemberSelection,
+            Self::DispatchOutcome => QueryStepOp::DispatchOutcome,
+            Self::DispatchTargets => QueryStepOp::DispatchTargets,
             Self::OccurrencesOf(_) => QueryStepOp::OccurrencesOf,
             Self::OccurrencesIn(_) => QueryStepOp::OccurrencesIn,
             Self::OccurrenceTarget => QueryStepOp::OccurrenceTarget,
@@ -823,6 +831,8 @@ impl QueryStep {
             QueryStepOp::CallArgumentGroups => Some(Self::CallArgumentGroups),
             QueryStepOp::CallArguments => Some(Self::CallArguments),
             QueryStepOp::MemberSelection => Some(Self::MemberSelection),
+            QueryStepOp::DispatchOutcome => Some(Self::DispatchOutcome),
+            QueryStepOp::DispatchTargets => Some(Self::DispatchTargets),
             QueryStepOp::OccurrencesOf => Some(Self::OccurrencesOf(OccurrenceFilter::default())),
             QueryStepOp::OccurrencesIn => Some(Self::OccurrencesIn(OccurrenceFilter::default())),
             QueryStepOp::OccurrenceTarget => Some(Self::OccurrenceTarget),
@@ -899,6 +909,8 @@ impl QueryStep {
                 | QueryValueKind::CallArgumentGroup
                 | QueryValueKind::CallArgument
                 | QueryValueKind::MemberSelection
+                | QueryValueKind::DispatchOutcome
+                | QueryValueKind::DispatchTarget
                 | QueryValueKind::Occurrence
                 | QueryValueKind::LexicalScope
                 | QueryValueKind::Binding
@@ -967,6 +979,20 @@ impl QueryStep {
             (Self::MemberSelection, QueryValueKind::Occurrence) => {
                 Some(QueryValueKind::MemberSelection)
             }
+            (
+                Self::DispatchOutcome,
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::CallSite
+                | QueryValueKind::ReferenceSite
+                | QueryValueKind::Occurrence,
+            ) => Some(QueryValueKind::DispatchOutcome),
+            (
+                Self::DispatchTargets,
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::CallSite
+                | QueryValueKind::ReferenceSite
+                | QueryValueKind::Occurrence,
+            ) => Some(QueryValueKind::DispatchTarget),
             (Self::OccurrencesOf(_), QueryValueKind::Declaration) => {
                 Some(QueryValueKind::Occurrence)
             }
@@ -1093,6 +1119,9 @@ pub(super) fn validate_query_steps(
             QueryStep::CallArgumentGroups => "call_shape",
             QueryStep::CallArguments => "call_argument_group",
             QueryStep::MemberSelection => "occurrence",
+            QueryStep::DispatchOutcome | QueryStep::DispatchTargets => {
+                "structural_match, call_site, reference_site, or occurrence"
+            }
             QueryStep::OccurrencesOf(_) => "declaration",
             QueryStep::OccurrencesIn(_) => "structural_match or file",
             QueryStep::OccurrenceTarget => "occurrence",

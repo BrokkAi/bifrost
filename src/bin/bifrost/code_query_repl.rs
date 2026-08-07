@@ -1290,6 +1290,43 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.relation,
                     ));
                 }
+                CodeQueryResultValue::DispatchOutcome { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {}; coverage {}; calls {}; targets {}{}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "dispatch outcome:", use_color),
+                        value.outcome,
+                        value.coverage,
+                        value.call_site_count,
+                        value.target_count,
+                        if value.targets_truncated {
+                            " (truncated)"
+                        } else {
+                            ""
+                        },
+                    ));
+                }
+                CodeQueryResultValue::DispatchTarget { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let target = value.target_declaration.as_ref().map_or_else(
+                        || sanitize_terminal_text(&value.target_path),
+                        |unit| sanitize_terminal_text(&unit.fq_name),
+                    );
+                    out.push_str(&format!(
+                        "{}\n  {} #{} {} -> {} ({}; {}; coverage {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        paint(Style::new().fg(Color::Blue), "dispatch target:", use_color),
+                        value.ordinal,
+                        value.boundary_kind.unwrap_or("candidate"),
+                        target,
+                        value.dispatch,
+                        value.proof,
+                        value.coverage,
+                    ));
+                }
                 CodeQueryResultValue::ReceiverOutcome { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let site_id = sanitize_terminal_text(&value.site_id);

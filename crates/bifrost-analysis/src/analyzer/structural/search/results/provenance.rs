@@ -152,6 +152,22 @@ pub enum CodeQueryResultRef {
         range: CodeQueryRange,
         evidence_kind: &'static str,
     },
+    DispatchOutcome {
+        id: String,
+        site_id: String,
+        path: String,
+        range: CodeQueryRange,
+        outcome: &'static str,
+        coverage: &'static str,
+    },
+    DispatchTarget {
+        id: String,
+        site_id: String,
+        path: String,
+        range: CodeQueryRange,
+        ordinal: usize,
+        dispatch: &'static str,
+    },
     CallShape {
         id: String,
         site_id: String,

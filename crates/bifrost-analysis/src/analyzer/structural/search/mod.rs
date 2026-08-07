@@ -84,6 +84,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 mod call_shape;
+mod dispatch;
 mod edges;
 mod environment;
 mod execution;
@@ -97,6 +98,7 @@ mod pipeline;
 mod receiver;
 mod relations;
 mod render;
+use dispatch::{DispatchSiteValue, DispatchTargetValue};
 use environment::{
     BindingKey, BindingValue, CandidateHopKey, CandidateHopValue, CandidateKey, CandidateValue,
     EnvironmentTraversalCache, ScopeKey, ScopeValue,
@@ -178,6 +180,8 @@ pub use results::CodeQueryDeclarationState;
 pub use results::CodeQueryDiagnostic;
 pub use results::CodeQueryDiagnosticCode;
 pub use results::CodeQueryDiagnosticImpact;
+pub use results::CodeQueryDispatchOutcome;
+pub use results::CodeQueryDispatchTarget;
 pub use results::CodeQueryExecutionLimits;
 pub use results::CodeQueryExecutionWork;
 pub use results::CodeQueryExport;
@@ -546,6 +550,8 @@ enum PipelineValue {
     CallArgumentGroup(CallArgumentGroupValue),
     CallArgument(CallArgumentValue),
     MemberSelection(MemberSelectionValue),
+    DispatchOutcome(Box<DispatchSiteValue>),
+    DispatchTarget(Box<DispatchTargetValue>),
     Occurrence(OccurrenceValue),
     LexicalScope(ScopeValue),
     Binding(BindingValue),
@@ -618,6 +624,8 @@ enum PipelineKey {
     CallArgumentGroup(String),
     CallArgument(String),
     MemberSelection(String),
+    DispatchOutcome(String),
+    DispatchTarget(String),
     Occurrence(OccurrenceKey),
     LexicalScope(ScopeKey),
     Binding(BindingKey),
@@ -672,6 +680,8 @@ impl PipelineValue {
                     .clone(),
             ),
             Self::MemberSelection(value) => PipelineKey::MemberSelection(value.occurrence.ast_id()),
+            Self::DispatchOutcome(value) => PipelineKey::DispatchOutcome(value.site_id.clone()),
+            Self::DispatchTarget(value) => PipelineKey::DispatchTarget(value.id()),
             Self::Occurrence(value) => PipelineKey::Occurrence(value.key()),
             Self::LexicalScope(value) => PipelineKey::LexicalScope(value.key()),
             Self::GenerationSite(value) => PipelineKey::GenerationSite(value.key()),
@@ -902,6 +912,8 @@ enum PipelineTraceValue {
     CallArgumentGroup(CallArgumentGroupValue),
     CallArgument(CallArgumentValue),
     MemberSelection(MemberSelectionValue),
+    DispatchOutcome(Box<DispatchSiteValue>),
+    DispatchTarget(Box<DispatchTargetValue>),
     Occurrence(OccurrenceValue),
     LexicalScope(ScopeValue),
     Binding(BindingValue),
@@ -2100,6 +2112,39 @@ pub fn execute_code_query_detailed_eager_index(
     )
 }
 
+/// `execute_code_query_detailed_eager_index` with the generation-bound
+/// workspace semantic services attached.
+///
+/// A relational assertion binding that expands into a semantic row family
+/// (the #1477 dispatch rows) needs the workspace oracles; without them the
+/// step reports `SemanticWorkspaceRequired` and the plan is invalid.
+pub fn execute_code_query_detailed_eager_index_workspace(
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+) -> DetailedCodeQueryResult {
+    let access_mode = match benchmark_structural_access_mode() {
+        StructuralAccessMode::ScanOnly => StructuralAccessMode::ScanOnly,
+        _ => StructuralAccessMode::EagerAuto,
+    };
+    execute_internal_with_analysis_strategy(
+        workspace.analyzer(),
+        Some(workspace),
+        None,
+        0,
+        query,
+        limits,
+        cancellation,
+        None,
+        false,
+        UnionExecutionStrategy::Auto,
+        CODE_QUERY_SCHEDULER_WORKERS,
+        access_mode,
+        None,
+    )
+}
+
 /// Internal opt-in profile entry point used by the M2 measurement harness.
 /// Public query surfaces remain unchanged until the explicit M5 rollout.
 #[cfg(test)]
@@ -3091,6 +3136,35 @@ fn detailed_evidence_for_pipeline_value(
                 provenance: Vec::new(),
             }
         }
+        PipelineValue::DispatchOutcome(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::DispatchOutcome,
+            key: DetailedCodeQueryKey::DispatchOutcome {
+                id: value.site_id.clone(),
+                site_id: value.site_id.clone(),
+            },
+            file: value.file().clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+        },
+        PipelineValue::DispatchTarget(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::DispatchTarget,
+            key: DetailedCodeQueryKey::DispatchTarget {
+                id: value.id(),
+                site_id: value.site.site_id.clone(),
+                ordinal: value.ordinal,
+            },
+            file: value.file().clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.site.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+        },
         PipelineValue::CandidateHop(value) => {
             let row = &value.occurrence;
             let byte_span = row.range.start_byte..row.range.end_byte;
@@ -3244,6 +3318,8 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::Binding(value) => Some(value.file()),
         PipelineValue::ResolutionCandidate(value) => Some(value.file()),
         PipelineValue::CandidateHop(value) => Some(value.file()),
+        PipelineValue::DispatchOutcome(value) => Some(value.file()),
+        PipelineValue::DispatchTarget(value) => Some(value.file()),
         PipelineValue::GenerationSite(value) => Some(value.file()),
         PipelineValue::Export(value) => Some(value.file()),
         PipelineValue::DeclarationState(value) => Some(value.file()),
@@ -3375,6 +3451,12 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::CandidateHop(value) => {
             files.insert(value.file().clone());
         }
+        PipelineValue::DispatchOutcome(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::DispatchTarget(value) => {
+            files.insert(value.file().clone());
+        }
         PipelineValue::GenerationSite(value) => {
             files.insert(value.file().clone());
         }
@@ -3438,6 +3520,12 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
             files.insert(value.file().clone());
         }
         PipelineTraceValue::CandidateHop(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::DispatchOutcome(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::DispatchTarget(value) => {
             files.insert(value.file().clone());
         }
         PipelineTraceValue::GenerationSite(value) => {
@@ -3781,6 +3869,27 @@ fn detailed_trace_provenance_ref(
                 cache,
             )
         }
+        PipelineTraceValue::DispatchOutcome(value) => detailed_environment_provenance_ref(
+            DetailedCodeQueryDomain::DispatchOutcome,
+            DetailedCodeQueryKey::DispatchOutcome {
+                id: value.site_id.clone(),
+                site_id: value.site_id.clone(),
+            },
+            value.file(),
+            value.range,
+            cache,
+        ),
+        PipelineTraceValue::DispatchTarget(value) => detailed_environment_provenance_ref(
+            DetailedCodeQueryDomain::DispatchTarget,
+            DetailedCodeQueryKey::DispatchTarget {
+                id: value.id(),
+                site_id: value.site.site_id.clone(),
+                ordinal: value.ordinal,
+            },
+            value.file(),
+            value.site.range,
+            cache,
+        ),
         PipelineTraceValue::CandidateHop(value) => {
             let row = &value.occurrence;
             detailed_environment_provenance_ref(
@@ -4300,6 +4409,12 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
             Some(PipelineTraceValue::ResolutionCandidate(value.clone()))
         }
         PipelineValue::CandidateHop(value) => Some(PipelineTraceValue::CandidateHop(value.clone())),
+        PipelineValue::DispatchOutcome(value) => {
+            Some(PipelineTraceValue::DispatchOutcome(value.clone()))
+        }
+        PipelineValue::DispatchTarget(value) => {
+            Some(PipelineTraceValue::DispatchTarget(value.clone()))
+        }
         PipelineValue::GenerationSite(value) => {
             Some(PipelineTraceValue::GenerationSite(value.clone()))
         }

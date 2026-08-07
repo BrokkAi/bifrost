@@ -1022,6 +1022,8 @@ mod tests {
                 "call_argument_groups",
                 "call_arguments",
                 "member_selection",
+                "dispatch_outcome",
+                "dispatch_targets",
                 "occurrence_target",
                 "scope_of",
                 "scope_ancestors",

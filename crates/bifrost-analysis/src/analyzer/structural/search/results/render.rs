@@ -26,6 +26,8 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::CallArgumentGroup { .. }
                 | CodeQueryResultValue::CallArgument { .. }
                 | CodeQueryResultValue::MemberSelection { .. }
+                | CodeQueryResultValue::DispatchOutcome { .. }
+                | CodeQueryResultValue::DispatchTarget { .. }
                 | CodeQueryResultValue::Occurrence { .. }
                 | CodeQueryResultValue::LexicalScope { .. }
                 | CodeQueryResultValue::Binding { .. }
@@ -265,6 +267,40 @@ impl CodeQueryResult {
                             value.completeness,
                             value.site_id,
                             value.id
+                        ));
+                    }
+                    CodeQueryResultValue::DispatchOutcome { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [dispatch outcome; {}; {}] calls={}; targets={}{}; site={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.outcome,
+                            value.coverage,
+                            value.call_site_count,
+                            value.target_count,
+                            if value.targets_truncated {
+                                " (truncated)"
+                            } else {
+                                ""
+                            },
+                            value.site_id
+                        ));
+                    }
+                    CodeQueryResultValue::DispatchTarget { value } => {
+                        out.push_str(&format!(
+                            "[dispatch target {}; {}; {}; {}; {}] {} -> {}; site={}\n",
+                            value.ordinal,
+                            value.dispatch,
+                            value.proof,
+                            value.completeness,
+                            value.coverage,
+                            value.boundary_kind.unwrap_or("candidate"),
+                            value
+                                .target_declaration
+                                .as_ref()
+                                .map_or(value.target_path.as_str(), |unit| unit.fq_name.as_str()),
+                            value.site_id
                         ));
                     }
                     CodeQueryResultValue::CallShape { value } => {

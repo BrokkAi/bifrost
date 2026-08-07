@@ -87,6 +87,57 @@ fn evaluate(source: &str, analyzer: &dyn IAnalyzer, budget: &mut PolicyBudget) -
         .expect("relational assertion evaluation")
 }
 
+/// Evaluate against a full workspace snapshot, which the semantic row
+/// families (the #1477 M4 dispatch expansions) require.
+fn evaluate_with_workspace(
+    source: &str,
+    workspace: &brokk_bifrost::analyzer::WorkspaceAnalyzer,
+    budget: &mut PolicyBudget,
+) -> PolicyRun {
+    let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+        CatalogRegistryLimits::default(),
+    ));
+    let mut registry =
+        PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
+    registry
+        .register_policy_bytes(
+            PolicySourceIdentity::new("test:relational"),
+            source.as_bytes(),
+        )
+        .expect("valid relational assertion policy");
+    let policy = registry.policies().next().expect("one policy");
+    DefaultPolicyEvaluator::new()
+        .evaluate(
+            policy,
+            &PolicyEvaluationContext {
+                analyzer: workspace.analyzer(),
+                workspace: Some(workspace),
+                cancellation: None,
+                cvss_overlays: &[],
+                organizational_risk: &[],
+            },
+            budget,
+        )
+        .expect("relational assertion evaluation")
+}
+
+/// A Java workspace snapshot for the semantic row families.
+fn java_workspace(
+    source: &str,
+) -> (
+    crate::common::BuiltInlineTestProject,
+    brokk_bifrost::analyzer::WorkspaceAnalyzer,
+) {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("App.java", source)
+        .build();
+    let workspace = brokk_bifrost::analyzer::WorkspaceAnalyzer::build(
+        project.project_dyn(),
+        brokk_bifrost::AnalyzerConfig::default(),
+    );
+    (project, workspace)
+}
+
 fn typescript(source: &str) -> (crate::common::BuiltInlineTestProject, TypescriptAnalyzer) {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file("widget.ts", source)
@@ -349,5 +400,69 @@ fn a_truncated_relational_binding_is_inconclusive() {
     assert!(
         run.findings().is_empty(),
         "an incomplete row set never yields a verdict"
+    );
+}
+
+/// The #1477 M4 open-world honesty rule as an executable policy: every call
+/// site must dispatch to exactly one proven target. A closed monomorphic call
+/// satisfies it; an open interface receiver must not, because its arms stay
+/// `may_dispatch` inside a non-exhaustive set. This is also the executable
+/// proof that `dispatch-outcome` and `dispatch-targets` are usable relational
+/// expansions.
+const EXACTLY_ONE_PROVEN_DISPATCH: &str = r#"(policy
+  :id "test.relational.proven-dispatch"
+  :name "Every call has exactly one proven dispatch target"
+  :message "a call site must dispatch to exactly one proven target"
+  :severity error
+  :analysis (analysis
+    :type assertion
+    (bind :name site :query (rql (occurrences :role [member_position])))
+    (bind :name outcome :from site :step dispatch-outcome)
+    (bind :name target :from site :step dispatch-targets)
+    (join :left site :right outcome :on ((ast_id site_ast_id)))
+    (join :left site :right target :on ((ast_id site_ast_id)))
+    (group :name by-site :by (outcome.site_id)
+      (aggregate :name proven :op count
+                 :where ((target.dispatch eq proven_dispatch))))
+    (assert :group by-site :value proven :cardinality (exactly 1))))"#;
+
+/// Clean: a closed monomorphic call has one proven target in an exhaustive
+/// set, so the exact-set assertion holds.
+#[test]
+fn dispatch_expansions_are_clean_on_a_closed_monomorphic_call() {
+    let (_project, workspace) = java_workspace(
+        "public class App {\n  static int helper() { return 1; }\n  static int caller() { return helper(); }\n}\n",
+    );
+    let run = evaluate_with_workspace(
+        EXACTLY_ONE_PROVEN_DISPATCH,
+        &workspace,
+        &mut PolicyBudget::default(),
+    );
+    assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+    assert!(run.findings().is_empty(), "{:?}", run.findings());
+}
+
+/// Open-world dispatch never satisfies an exact-set assertion. The interface
+/// receiver's arm stays `may_dispatch`, so the proven count is zero and the
+/// site is reported instead of passing.
+#[test]
+fn open_world_dispatch_never_satisfies_the_exact_set_assertion() {
+    let (_project, workspace) = java_workspace(
+        "interface Shape { int area(); }\nclass Square implements Shape { public int area() { return 1; } }\nclass Circle implements Shape { public int area() { return 2; } }\npublic class App {\n  static int caller(Shape shape) { return shape.area(); }\n}\n",
+    );
+    let run = evaluate_with_workspace(
+        EXACTLY_ONE_PROVEN_DISPATCH,
+        &workspace,
+        &mut PolicyBudget::default(),
+    );
+    assert_eq!(run.findings().len(), 1, "{:?}", run.findings());
+    let PolicyFindingEvidence::Assertion { evidence } = run.findings()[0].evidence() else {
+        panic!("relational assertion policies produce assertion evidence");
+    };
+    assert_eq!(evidence.expectation(), "(exactly 1)");
+    assert_eq!(
+        evidence.actual_count(),
+        0,
+        "an open arm must never be counted as a proven dispatch"
     );
 }

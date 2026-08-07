@@ -88,6 +88,8 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::Binding(_)
                     | PipelineValue::ResolutionCandidate(_)
                     | PipelineValue::CandidateHop(_)
+                    | PipelineValue::DispatchOutcome(_)
+                    | PipelineValue::DispatchTarget(_)
                     | PipelineValue::GenerationSite(_)
                     | PipelineValue::Export(_)
                     | PipelineValue::DeclarationState(_)
@@ -148,6 +150,8 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::Binding(_)
                                 | PipelineValue::ResolutionCandidate(_)
                                 | PipelineValue::CandidateHop(_)
+                                | PipelineValue::DispatchOutcome(_)
+                                | PipelineValue::DispatchTarget(_)
                                 | PipelineValue::GenerationSite(_)
                                 | PipelineValue::Export(_)
                                 | PipelineValue::DeclarationState(_)
@@ -216,6 +220,8 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::Binding(_)
                         | PipelineValue::ResolutionCandidate(_)
                         | PipelineValue::CandidateHop(_)
+                        | PipelineValue::DispatchOutcome(_)
+                        | PipelineValue::DispatchTarget(_)
                         | PipelineValue::GenerationSite(_)
                         | PipelineValue::Export(_)
                         | PipelineValue::DeclarationState(_)
@@ -1236,6 +1242,16 @@ pub(super) fn apply_pipeline_step(
                     value.report.site.file.clone(),
                 ))]
             }
+            (PipelineValue::DispatchOutcome(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
+            (PipelineValue::DispatchTarget(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
             (PipelineValue::ReceiverOutcome(value), QueryStep::FileOf) => {
                 vec![pipeline_expansion(PipelineValue::File(
                     value.report.site.file.clone(),
@@ -1663,6 +1679,62 @@ pub(super) fn apply_pipeline_step(
                     &mut row_exhausted,
                 )
             }
+            (
+                PipelineValue::StructuralMatch(seed),
+                QueryStep::DispatchOutcome | QueryStep::DispatchTargets,
+            ) => dispatch::dispatch_expansions_for_input(
+                analyzer,
+                semantic
+                    .as_mut()
+                    .expect("semantic context exists for semantic steps"),
+                &row.traces,
+                &seed.file,
+                seed_range(seed),
+                None,
+                matches!(step, QueryStep::DispatchTargets),
+            ),
+            (
+                PipelineValue::CallSite(site),
+                QueryStep::DispatchOutcome | QueryStep::DispatchTargets,
+            ) => dispatch::dispatch_expansions_for_input(
+                analyzer,
+                semantic
+                    .as_mut()
+                    .expect("semantic context exists for semantic steps"),
+                &row.traces,
+                &site.0.file,
+                site.0.range,
+                None,
+                matches!(step, QueryStep::DispatchTargets),
+            ),
+            (
+                PipelineValue::ReferenceSite(site),
+                QueryStep::DispatchOutcome | QueryStep::DispatchTargets,
+            ) => dispatch::dispatch_expansions_for_input(
+                analyzer,
+                semantic
+                    .as_mut()
+                    .expect("semantic context exists for semantic steps"),
+                &row.traces,
+                &site.file,
+                site.range,
+                None,
+                matches!(step, QueryStep::DispatchTargets),
+            ),
+            (
+                PipelineValue::Occurrence(value),
+                QueryStep::DispatchOutcome | QueryStep::DispatchTargets,
+            ) => dispatch::dispatch_expansions_for_input(
+                analyzer,
+                semantic
+                    .as_mut()
+                    .expect("semantic context exists for semantic steps"),
+                &row.traces,
+                value.file(),
+                value.row.range,
+                Some(value.row.ast_id()),
+                matches!(step, QueryStep::DispatchTargets),
+            ),
             (PipelineValue::CallShape(value), QueryStep::CallArgumentGroups) => {
                 call_shape::call_argument_group_expansions(value)
             }

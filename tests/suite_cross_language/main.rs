@@ -15,6 +15,7 @@ pub mod value_flow_scenarios;
 
 mod code_query_candidate_hierarchy;
 mod code_query_cpp_receiver;
+mod code_query_dispatch_rows;
 mod code_query_docs;
 mod code_query_edge_conformance;
 mod code_query_lexical_environment;

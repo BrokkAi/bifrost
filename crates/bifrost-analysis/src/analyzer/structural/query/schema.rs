@@ -386,6 +386,7 @@ macro_rules! query_step_ops {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuerySemanticFacet {
     Procedures,
+    Dispatch,
     ProgramPoints,
     ControlEdges,
     Typestate,
@@ -406,7 +407,7 @@ query_step_ops! {
     ValueFlow { label: "value_flow", signature: "procedure -> flow_endpoint", description: "Run one registered diagnostic-neutral value-flow plan for the exact procedure root.", semantic: [Procedures, ValueFlow] }
     Taint { label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint] }
     Witness { label: "witness", signature: "typestate_finding|flow_endpoint -> typestate_witness|flow_witness", description: "Project bounded retained evidence from each typestate finding or reached flow endpoint without rerunning analysis." }
-    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis|call_shape|call_argument_group|call_argument -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, or receiver analyses to their workspace files." }
+    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis|call_shape|call_argument_group|call_argument|dispatch_outcome|dispatch_target -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, receiver analyses, or dispatch rows to their workspace files." }
     ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
     Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
@@ -430,6 +431,8 @@ query_step_ops! {
     CallArgumentGroups { label: "call_argument_groups", signature: "call_shape -> call_argument_group", description: "Project the ordered argument-list group rows of each call shape." }
     CallArguments { label: "call_arguments", signature: "call_argument_group -> call_argument", description: "Project the ordered argument rows of each argument-list group." }
     MemberSelection { label: "member_selection", signature: "occurrence -> member_selection", description: "Project the mandatory member-selection summary row for each reference occurrence, from the production resolver's own candidate trace." }
+    DispatchOutcome { label: "dispatch_outcome", signature: "structural_match|call_site|reference_site|occurrence -> dispatch_outcome", description: "Project the mandatory bounded-dispatch outcome row for each input site: the semantic outcome, the candidate coverage, and the retained target count. Exactly one row per input site, so an unknown, unsupported, over-budget, or cancelled dispatch is stated rather than silently empty.", semantic: [Procedures, Dispatch] }
+    DispatchTargets { label: "dispatch_targets", signature: "structural_match|call_site|reference_site|occurrence -> dispatch_target", description: "Project zero or more bounded dispatch target rows for each input site, one per retained dispatch candidate plus one per boundary arm that names a target. Each row keeps the oracle's own proof, completeness, and candidate coverage, so a proven target in an exhaustive set stays distinguishable from an open may-dispatch arm.", semantic: [Procedures, Dispatch] }
     OccurrencesOf { label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it." }
     OccurrencesIn { label: "occurrences_in", signature: "structural_match|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or file." }
     OccurrenceTarget { label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences." }
@@ -595,6 +598,8 @@ macro_rules! rql_forms {
                     | Self::CallArgumentGroups
                     | Self::CallArguments
                     | Self::MemberSelection
+                    | Self::DispatchOutcome
+                    | Self::DispatchTargets
                     | Self::Occurrences
                     | Self::OccurrencesOf
                     | Self::OccurrencesIn
@@ -1007,6 +1012,22 @@ rql_forms! {
         signature: "(member-selection query)",
         description: (QueryStepOp::MemberSelection),
         step: MemberSelection,
+    }
+    DispatchOutcome {
+        labels: ["dispatch-outcome", "dispatch_outcome"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(dispatch-outcome query)",
+        description: (QueryStepOp::DispatchOutcome),
+        step: DispatchOutcome,
+    }
+    DispatchTargets {
+        labels: ["dispatch-targets", "dispatch_targets"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(dispatch-targets query)",
+        description: (QueryStepOp::DispatchTargets),
+        step: DispatchTargets,
     }
     Occurrences {
         labels: ["occurrences", "occurrence"],

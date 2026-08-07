@@ -104,6 +104,12 @@ pub(super) fn render_pipeline_item(
         PipelineValue::CandidateHop(value) => CodeQueryResultValue::CandidateHop {
             value: Box::new(render_candidate_hop(analyzer, &value, detail, cache)),
         },
+        PipelineValue::DispatchOutcome(value) => CodeQueryResultValue::DispatchOutcome {
+            value: Box::new(render_dispatch_outcome(analyzer, &value, cache)),
+        },
+        PipelineValue::DispatchTarget(value) => CodeQueryResultValue::DispatchTarget {
+            value: Box::new(render_dispatch_target(analyzer, &value, detail, cache)),
+        },
         PipelineValue::GenerationSite(value) => CodeQueryResultValue::GenerationSite {
             value: Box::new(render_generation_site(analyzer, &value, cache)),
         },
@@ -223,6 +229,12 @@ pub(super) fn render_provenance(
                     }
                     PipelineTraceValue::CandidateHop(value) => {
                         render_candidate_hop_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::DispatchOutcome(value) => {
+                        render_dispatch_outcome_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::DispatchTarget(value) => {
+                        render_dispatch_target_ref(analyzer, value, cache)
                     }
                     PipelineTraceValue::ReferenceEdge(value) => {
                         render_edge_ref(analyzer, value, cache)
@@ -639,6 +651,94 @@ pub(super) fn render_resolution_candidate(
         .as_ref()
         .and_then(|member| render_unit_declaration(analyzer, &member.owner, detail, cache));
     environment::public_candidate(value, range, candidate, canonical_member_id, owner)
+}
+
+/// The mandatory dispatch outcome row of one site.
+pub(super) fn render_dispatch_outcome(
+    analyzer: &dyn IAnalyzer,
+    value: &DispatchSiteValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryDispatchOutcome {
+    let answer = &value.answer;
+    CodeQueryDispatchOutcome {
+        id: value.site_id.clone(),
+        site_id: value.site_id.clone(),
+        site_ast_id: value.site_ast_id.clone(),
+        path: rel_path_string(&value.file),
+        language: crate::analyzer::common::language_for_file(&value.file).config_label(),
+        range: render_source_range(analyzer, &value.file, &value.range, cache),
+        outcome: answer.outcome,
+        coverage: answer.coverage.label(),
+        call_site_count: answer.call_site_count,
+        target_count: answer.arms.len(),
+        targets_truncated: answer.coverage.is_truncated(),
+        semantic_unsupported: answer.semantic_unsupported,
+        exceeded_limit: answer.exceeded_limit,
+    }
+}
+
+/// One bounded dispatch arm of one site.
+///
+/// The target declaration is rendered through the same `render_unit_declaration`
+/// the candidate and hop rows use, so a dispatch target and a member candidate
+/// naming the same declaration render identically.
+pub(super) fn render_dispatch_target(
+    analyzer: &dyn IAnalyzer,
+    value: &DispatchTargetValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryDispatchTarget {
+    let site = &value.site;
+    let arm = value.arm();
+    CodeQueryDispatchTarget {
+        id: value.id(),
+        site_id: site.site_id.clone(),
+        site_ast_id: site.site_ast_id.clone(),
+        path: rel_path_string(&site.file),
+        ordinal: value.ordinal,
+        target_id: arm.target_id.clone(),
+        target_path: arm.target_path.clone(),
+        target_declaration: arm
+            .target_unit
+            .as_ref()
+            .and_then(|unit| render_unit_declaration(analyzer, unit, detail, cache)),
+        proof: arm.proof,
+        completeness: arm.completeness,
+        coverage: site.answer.coverage.label(),
+        dispatch: site.answer.dispatch_label(arm),
+        boundary_kind: arm.boundary_kind,
+    }
+}
+
+pub(super) fn render_dispatch_outcome_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &DispatchSiteValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    CodeQueryResultRef::DispatchOutcome {
+        id: value.site_id.clone(),
+        site_id: value.site_id.clone(),
+        path: rel_path_string(&value.file),
+        range: render_source_range(analyzer, &value.file, &value.range, cache),
+        outcome: value.answer.outcome,
+        coverage: value.answer.coverage.label(),
+    }
+}
+
+pub(super) fn render_dispatch_target_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &DispatchTargetValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let site = &value.site;
+    CodeQueryResultRef::DispatchTarget {
+        id: value.id(),
+        site_id: site.site_id.clone(),
+        path: rel_path_string(&site.file),
+        range: render_source_range(analyzer, &site.file, &site.range, cache),
+        ordinal: value.ordinal,
+        dispatch: site.answer.dispatch_label(value.arm()),
+    }
 }
 
 /// One exact hierarchy hop of one traced member candidate.

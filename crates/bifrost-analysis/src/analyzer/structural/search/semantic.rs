@@ -218,6 +218,162 @@ impl<'a> SemanticQueryContext<'a> {
         CfgQueryAdapter { context: self }
     }
 
+    /// Bounded dispatch for one exact source position.
+    ///
+    /// The answer is the workspace oracle's own, projected into the row
+    /// vocabulary without re-deriving anything. Materialization runs through
+    /// this context first so the query's file and retained-byte budgets stay
+    /// authoritative and one file reports one diagnostic; the oracle then
+    /// shares this context's semantic budget and cancellation token.
+    ///
+    /// The result is total: a gate, a provider failure, or an interrupted
+    /// dispatch still returns a typed answer, because the mandatory outcome
+    /// row must exist for every input site.
+    pub(super) fn dispatch_at_source(
+        &mut self,
+        file: &ProjectFile,
+        range: crate::analyzer::Range,
+    ) -> super::dispatch::DispatchSiteAnswer {
+        use super::dispatch::{DispatchArm, DispatchSiteAnswer};
+
+        if self
+            .cancellation
+            .is_some_and(crate::cancellation::CancellationToken::is_cancelled)
+        {
+            return DispatchSiteAnswer::interrupted("cancelled", None, None);
+        }
+        if self.materialize(file).is_none() {
+            let (outcome, unsupported) = self.materialization_gate(file);
+            return DispatchSiteAnswer::interrupted(outcome, unsupported, None);
+        }
+
+        let workspace = self.workspace;
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        let oracle = workspace.semantic_oracle_provider();
+        let outcome = match oracle.dispatch_at_source(
+            file,
+            range,
+            &mut SemanticRequest::new(&mut self.budget, cancellation),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let reason = error.to_string();
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::SemanticProviderFailed,
+                    CodeQueryDiagnosticImpact::Incomplete,
+                    file,
+                    &reason,
+                );
+                return DispatchSiteAnswer::interrupted("unknown", None, None);
+            }
+        };
+
+        let label = match &outcome {
+            SemanticOutcome::Complete { .. } => "resolved",
+            SemanticOutcome::Ambiguous { .. } => "ambiguous",
+            SemanticOutcome::Unknown { .. } => "unknown",
+            SemanticOutcome::Unsupported { .. } => "unsupported",
+            SemanticOutcome::Unproven { .. } => "unproven",
+            SemanticOutcome::ExceededBudget { .. } => "exceeded_budget",
+            SemanticOutcome::Cancelled { .. } => "cancelled",
+        };
+        let semantic_unsupported = match &outcome {
+            SemanticOutcome::Unsupported { capability, .. } => Some(capability.label()),
+            _ => None,
+        };
+        let exceeded_limit = outcome
+            .budget_exceeded()
+            .map(|exceeded| exceeded.dimension().label());
+        if matches!(outcome, SemanticOutcome::ExceededBudget { .. }) {
+            self.budget_exhausted = true;
+        }
+        let Some(result) = outcome.available_value() else {
+            return DispatchSiteAnswer::interrupted(label, semantic_unsupported, exceeded_limit);
+        };
+
+        let coverage = result.coverage();
+        let mut arms = Vec::new();
+        for observation in result.observations() {
+            for candidate in observation.dispatch().candidates() {
+                let target = candidate.target();
+                let locator = target.semantics().locator();
+                arms.push(DispatchArm {
+                    target_id: super::dispatch::target_identity(
+                        Some(target.artifact().key().public_fingerprint().to_string()).as_deref(),
+                        locator,
+                    ),
+                    target_path: locator.path().as_str().to_string(),
+                    target_unit: self.definition_for_locator(locator),
+                    proof: candidate.proof().label(),
+                    completeness: candidate.completeness().label(),
+                    boundary_kind: None,
+                });
+            }
+            for boundary in observation.dispatch().boundaries() {
+                // An unresolved or truncated residual arm names no target. It
+                // is already reflected in the site's coverage; inventing a row
+                // for it would claim a target that does not exist.
+                let Some(locator) = boundary.kind.target_locator() else {
+                    continue;
+                };
+                let fingerprint = boundary
+                    .exact_external_target()
+                    .map(|target| target.artifact().public_fingerprint().to_string());
+                arms.push(DispatchArm {
+                    target_id: super::dispatch::target_identity(fingerprint.as_deref(), locator),
+                    target_path: locator.path().as_str().to_string(),
+                    target_unit: self.definition_for_locator(locator),
+                    proof: boundary.proof.label(),
+                    completeness: boundary.completeness.label(),
+                    boundary_kind: Some(boundary.kind.label()),
+                });
+            }
+        }
+        DispatchSiteAnswer {
+            outcome: label,
+            coverage,
+            call_site_count: result.observations().len(),
+            semantic_unsupported,
+            exceeded_limit,
+            arms,
+        }
+    }
+
+    /// The typed reason [`Self::materialize`] refused, so a mandatory row can
+    /// state it instead of reporting a bare unknown.
+    fn materialization_gate(&self, file: &ProjectFile) -> (&'static str, Option<&'static str>) {
+        match self.cache.get(file) {
+            Some(CachedSemanticMaterialization::FileBudgetExhausted)
+            | Some(CachedSemanticMaterialization::RetainedBudgetExhausted) => {
+                ("exceeded_budget", None)
+            }
+            Some(CachedSemanticMaterialization::Outcome { outcome, .. }) => match outcome {
+                SemanticOutcome::Cancelled { .. } => ("cancelled", None),
+                SemanticOutcome::Unsupported { capability, .. } => {
+                    ("unsupported", Some(capability.label()))
+                }
+                SemanticOutcome::ExceededBudget { .. } => ("exceeded_budget", None),
+                _ => ("unknown", None),
+            },
+            Some(CachedSemanticMaterialization::ProviderFailed(_)) | None => ("unknown", None),
+        }
+    }
+
+    /// The workspace declaration for one semantic procedure locator, or `None`
+    /// when the workspace no longer indexes a callable declaration that the
+    /// locator's own span aligns with.
+    ///
+    /// The lookup is span-structural, never name-based: an exactly aligned
+    /// declaration wins, and otherwise the smallest declaration whose own
+    /// range contains the procedure's anchor span does.
+    fn definition_for_locator(
+        &self,
+        locator: &SemanticLocator,
+    ) -> Option<crate::analyzer::CodeUnit> {
+        let file = super::witness_projection::locator_file(self.workspace, locator);
+        super::dispatch::declaration_at_locator(self.workspace.analyzer(), locator, &file)
+    }
+
     pub(super) fn procedure_of_match(&mut self, seed: &SeedMatch) -> Vec<SemanticProcedureValue> {
         let ranges = [seed_range(seed)];
         let Some((artifact, source, quality)) = self.materialize(&seed.file) else {
@@ -1450,6 +1606,12 @@ fn semantic_wire_digest(artifact: &SemanticArtifact, domain: &[u8]) -> LengthDel
     digest.push(artifact.key().public_fingerprint().as_bytes());
     digest.push(domain);
     digest
+}
+
+/// The shared locator digest recipe, exposed for row families outside this
+/// module that identify a semantic target by its locator.
+pub(super) fn push_locator_bytes(digest: &mut LengthDelimitedDigest, locator: &SemanticLocator) {
+    push_locator(digest, locator);
 }
 
 fn push_locator(digest: &mut LengthDelimitedDigest, locator: &SemanticLocator) {
