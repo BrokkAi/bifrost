@@ -12,7 +12,7 @@
 mod adapter;
 mod clones;
 pub mod dependency_discovery;
-mod diagnostics;
+pub(crate) mod diagnostics;
 mod external;
 mod semantic;
 mod source_artifact;
@@ -538,11 +538,9 @@ impl IAnalyzer for PhpAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
-        let diagnostics = diagnostics::collect_php_semantic_diagnostics(self, file, source)
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(file, diagnostics)
+        // The collector now states its own proof for every reference, so the
+        // blanket workspace-local wrapper would overstate what it checked.
+        diagnostics::collect_php_semantic_diagnostics(self, file, source)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

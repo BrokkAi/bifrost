@@ -22,7 +22,8 @@ pub use brokk_bifrost_analysis::{
     JavascriptAnalyzer, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
     JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalDependencies, JvmMavenCoordinate,
     KotlinAnalyzer, Language, MultiAnalyzer, MultiRootProject, NavigationOperation, OverlayProject,
-    ParseError, ParseErrorKind, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer,
+    ParseError, ParseErrorKind, PhpAnalyzer, PhpAnalyzerConfig, PhpDependencyApiEvidence,
+    PhpDependencyPackAdapter, Project, ProjectFile, PythonAnalyzer,
     PythonSemanticModelWorkspaceContext, Range, RenderedSummary, RubyAnalyzer, RubyAnalyzerConfig,
     RubyDependencyApiEvidence, RubyDependencyPackAdapter, RubyGemApiArtifact, RustAnalyzer,
     RustAnalyzerConfig, RustDependencyApiEvidence, RustDependencyPackAdapter,
@@ -30,8 +31,9 @@ pub use brokk_bifrost_analysis::{
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,
     TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
     WorkspaceAnalyzer, collect_workspace_files, execute_request, execute_request_with_cancellation,
-    execute_request_with_limits, resolve_ruby_semantic_pack_dependencies,
-    resolve_rust_semantic_pack_dependencies, summarize_inputs,
+    execute_request_with_limits, resolve_php_semantic_pack_dependencies,
+    resolve_ruby_semantic_pack_dependencies, resolve_rust_semantic_pack_dependencies,
+    summarize_inputs,
 };
 pub use brokk_bifrost_analysis::{
     analyzer, cache_db, cache_gc, cancellation, code_quality, compact_graph, diff_analysis,

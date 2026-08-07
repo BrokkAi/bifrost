@@ -1123,6 +1123,16 @@ impl IAnalyzer for MultiAnalyzer {
                 self, file, source,
             );
         }
+        // PHP's proof ladder reads the semantic-model overlay and the retained
+        // Composer discovery evidence, and only the dispatching analyzer holds
+        // them. Delegating to the `PhpAnalyzer` would hand the collector a view
+        // with no indexed dependencies, so every vendor symbol would look
+        // unknown even with an active pack.
+        if language_for_file(file) == Language::Php && self.delegates.contains_key(&Language::Php) {
+            return crate::analyzer::php::diagnostics::collect_php_semantic_diagnostics(
+                self, file, source,
+            );
+        }
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().semantic_diagnostics(file, source))
             .unwrap_or_default()

@@ -9,16 +9,21 @@
 use crate::aliases::{
     PhpFileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
 };
+use crate::external_surface::{PhpExternalSurface, PhpExternalSymbol};
 use crate::graph_support::{
     PhpSource, php_direct_declared_class_parent, php_file_context_from_source,
 };
 use brokk_bifrost_core::analyzer::model::{Range, SemanticDiagnostic};
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{node_range, node_text};
+use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceEngine, SymbolResolution,
 };
-use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, ProjectFile};
+use brokk_bifrost_core::analyzer::{
+    BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, ProjectFile, SemanticAbsenceProof,
+    SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason, SemanticDiagnosticReport,
+};
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use tree_sitter::{Node, Parser, Tree};
@@ -47,30 +52,58 @@ impl From<PhpSemanticDiagnostic> for SemanticDiagnostic {
     }
 }
 
-/// Conservative PHP unresolved-reference diagnostics.
+/// Proof-gated PHP unresolved-reference diagnostics.
 ///
-/// This pass intentionally stays inside Bifrost's indexed PHP model. It reports
-/// only references whose namespace/member owner is already known to the
-/// analyzer, and it suppresses dynamic PHP behavior such as variable class
-/// names, variable function names, variable member names, magic members, and
-/// external Composer/vendor symbols that are not indexed by this workspace.
+/// Every reference this pass visits produces a typed outcome. A name resolves
+/// in the workspace or in an indexed Composer pack, it is proved absent from a
+/// surface that was complete enough to prove it, or the lookup reports the
+/// typed reason it could not finish. Dynamic PHP behavior -- a variable class
+/// name, a variable function or member name, a magic `__call` or `__get` owner
+/// -- is recorded as incomplete rather than passed over in silence.
+///
+/// This function reads only retained analyzer state. It never starts dependency
+/// discovery and never touches a vendor tree.
 pub fn collect_php_semantic_diagnostics(
     php: &dyn PhpSource,
     index: &dyn CodeUnitIndex,
     support: &dyn BoundedDefinitionLookup,
+    external: &dyn PhpExternalSurface,
     file: &ProjectFile,
     source: &str,
-) -> Vec<PhpSemanticDiagnostic> {
+) -> SemanticDiagnosticReport {
+    let mut report = SemanticDiagnosticReport::new();
     if source.len() > MAX_PHP_SEMANTIC_DIAGNOSTIC_BYTES {
-        return Vec::new();
+        report.push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
+        return report;
     }
-    let Some(tree) = parse_php_tree(source) else {
-        return Vec::new();
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+        .is_err()
+    {
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "PHP parser is unavailable".to_owned(),
+            }],
+        );
+        return report;
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "PHP source did not parse".to_owned(),
+            }],
+        );
+        return report;
     };
     let mut parse_errors = Vec::new();
     collect_parse_errors(tree.root_node(), &mut parse_errors);
     if !parse_errors.is_empty() {
-        return Vec::new();
+        // A malformed file belongs to the parse-diagnostic path. The semantic
+        // pass reports nothing about it, and says nothing incomplete either.
+        return report;
     }
 
     let line_starts = compute_line_starts(source);
@@ -79,14 +112,17 @@ pub fn collect_php_semantic_diagnostics(
         php,
         index,
         support,
+        external,
         file,
         source,
         line_starts: &line_starts,
         ctx,
-        diagnostics: Vec::new(),
+        report,
+        published: 0,
+        truncated: false,
     };
     collector.scan_tree(tree.root_node());
-    collector.diagnostics
+    collector.report
 }
 
 fn parse_php_tree(source: &str) -> Option<Tree> {
@@ -101,11 +137,16 @@ struct PhpDiagnosticCollector<'a> {
     php: &'a dyn PhpSource,
     index: &'a dyn CodeUnitIndex,
     support: &'a dyn BoundedDefinitionLookup,
+    external: &'a dyn PhpExternalSurface,
     file: &'a ProjectFile,
     source: &'a str,
     line_starts: &'a [usize],
     ctx: PhpFileContext,
-    diagnostics: Vec<PhpSemanticDiagnostic>,
+    report: SemanticDiagnosticReport,
+    /// Published errors, which is what the cap bounds. Resolved and incomplete
+    /// outcomes are cheap and are not limited.
+    published: usize,
+    truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +169,7 @@ impl PhpDiagnosticCollector<'_> {
     fn scan_tree(&mut self, root: Node<'_>) {
         let mut scopes = vec![root];
         while let Some(scope) = scopes.pop() {
-            if self.diagnostics.len() >= MAX_PHP_SEMANTIC_DIAGNOSTICS {
+            if self.at_capacity() {
                 break;
             }
             let mut bindings = LocalInferenceEngine::default();
@@ -147,7 +188,7 @@ impl PhpDiagnosticCollector<'_> {
     ) {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            if self.diagnostics.len() >= MAX_PHP_SEMANTIC_DIAGNOSTICS {
+            if self.at_capacity() {
                 break;
             }
             if node != root && is_local_scope(node) {
@@ -200,11 +241,11 @@ impl PhpDiagnosticCollector<'_> {
 
     fn check_reference(&mut self, node: Node<'_>, bindings: &LocalInferenceEngine<String>) {
         match node.kind() {
-            "object_creation_expression" => {
-                if let Some(type_node) = object_creation_type(node) {
-                    self.check_symbol(type_node, SymbolKind::Type);
-                }
-            }
+            "object_creation_expression" => match object_creation_type(node) {
+                Some(type_node) => self.check_symbol(type_node, SymbolKind::Type),
+                // `new $className()` names its class at run time.
+                None => self.push_dynamic(node, "PHP object creation names its class at run time"),
+            },
             "named_type" => {
                 let raw = qualified_candidate_text(node, self.source);
                 if !is_builtin_php_type(&raw) && !is_in_object_creation(node) {
@@ -212,10 +253,13 @@ impl PhpDiagnosticCollector<'_> {
                 }
             }
             "function_call_expression" => {
-                if let Some(function) = node.child_by_field_name("function")
-                    && matches!(function.kind(), "name" | "qualified_name")
-                {
-                    self.check_symbol(function, SymbolKind::Function);
+                if let Some(function) = node.child_by_field_name("function") {
+                    if matches!(function.kind(), "name" | "qualified_name") {
+                        self.check_symbol(function, SymbolKind::Function);
+                    } else if function.kind() == "variable_name" {
+                        // `$callable()` names its callee at run time.
+                        self.push_dynamic(function, "PHP call names its callable at run time");
+                    }
                 }
             }
             "class_constant_access_expression"
@@ -245,21 +289,35 @@ impl PhpDiagnosticCollector<'_> {
         if raw.is_empty() {
             return;
         }
+        let range = node_range(node, self.line_starts);
         if is_dynamic_php_name(&raw) {
+            self.push_dynamic_range(range, &format!("PHP name `{raw}` is chosen at run time"));
             return;
         }
+        // A built-in language type, function, or constant is part of the PHP
+        // runtime surface rather than any indexed package.
         if matches!(kind, SymbolKind::Type) && is_builtin_php_type(&raw) {
+            self.report
+                .push_resolved(range, BoundaryStatus::ExternalIndexed);
             return;
         }
         if matches!(kind, SymbolKind::Function) && is_builtin_php_function(&raw) {
+            self.report
+                .push_resolved(range, BoundaryStatus::ExternalIndexed);
             return;
         }
         if matches!(kind, SymbolKind::Constant) && is_builtin_php_constant(&raw) {
+            self.report
+                .push_resolved(range, BoundaryStatus::ExternalIndexed);
             return;
         }
         if matches!(kind, SymbolKind::Function | SymbolKind::Constant)
             && is_unqualified_php_name(&raw)
         {
+            // PHP falls back to the global namespace for an unqualified
+            // function or constant. Bifrost does not index the whole built-in
+            // global surface, so this lookup is unfinished, not absent.
+            self.push_missing_discovery(range, BoundaryStatus::ExternalUnknown);
             return;
         }
         let fqn = match kind {
@@ -271,21 +329,67 @@ impl PhpDiagnosticCollector<'_> {
             return;
         };
         if !self.support.fqn(&fqn).is_empty() {
+            self.report
+                .push_resolved(range, BoundaryStatus::WorkspaceLocal);
             return;
         }
-        if !self.fqn_is_workspace_bounded(&fqn) {
-            return;
+        match self.external.lookup_type(&fqn) {
+            PhpExternalSymbol::Indexed { .. } => {
+                self.report
+                    .push_resolved(range, BoundaryStatus::ExternalIndexed);
+                return;
+            }
+            // Two Composer packages can install the same class name. Naming the
+            // conflict is honest; picking a winner would not be.
+            PhpExternalSymbol::Ambiguous => {
+                self.report.push_ambiguous(
+                    range,
+                    vec![
+                        BoundaryStatus::ExternalIndexed,
+                        BoundaryStatus::ExternalIndexed,
+                    ],
+                );
+                return;
+            }
+            PhpExternalSymbol::Absent => {}
         }
         let label = match kind {
             SymbolKind::Type => "type",
             SymbolKind::Function => "function",
             SymbolKind::Constant => "constant",
         };
-        self.push_diagnostic(
-            node,
-            PHP_UNRECOGNIZED_SYMBOL,
-            format!("Unrecognized PHP {label} `{raw}`"),
-        );
+        let diagnostic = SemanticDiagnostic {
+            range,
+            source: PHP_SEMANTIC_DIAGNOSTIC_SOURCE,
+            kind: PHP_UNRECOGNIZED_SYMBOL,
+            message: format!("Unrecognized PHP {label} `{raw}`"),
+        };
+        let namespace = diagnostic_namespace(&fqn);
+        let domain = match kind {
+            SymbolKind::Type => SemanticDiagnosticDomain::Type { name: fqn.clone() },
+            // A namespaced function or constant is a member of its namespace,
+            // and the namespace surface is what the lookup checked.
+            SymbolKind::Function | SymbolKind::Constant => SemanticDiagnosticDomain::Module {
+                name: namespace.clone(),
+            },
+        };
+        if self.fqn_is_workspace_bounded(&fqn) {
+            self.publish_absence(range, domain, BoundaryStatus::WorkspaceLocal, diagnostic);
+            return;
+        }
+        // Completeness is checked before declaration, because the two are not
+        // exclusive: the build declares an indexed package too. Asking
+        // "declared?" first would let every fully indexed package fall into
+        // `ExternalDeclaredUnindexed` and never prove anything absent.
+        if self.external.namespace_surface_is_complete(&namespace) {
+            self.publish_absence(range, domain, BoundaryStatus::ExternalIndexed, diagnostic);
+            return;
+        }
+        if self.external.declares_unindexed(&fqn) {
+            self.push_missing_discovery(range, BoundaryStatus::ExternalDeclaredUnindexed);
+            return;
+        }
+        self.push_unknown_boundary(range);
     }
 
     fn check_static_member(&mut self, node: Node<'_>) {
@@ -293,16 +397,22 @@ impl PhpDiagnosticCollector<'_> {
             return;
         };
         let Some(member_name) = static_member_identifier(node, member, self.source) else {
+            // `Owner::$$name` and `Owner::{$name}` choose the member at run time.
+            self.push_dynamic(member, "PHP static member is named at run time");
             return;
         };
         if member_name.is_empty() {
             return;
         }
         let owner = self.static_scope_fqn(scope);
-        if owner
-            .as_deref()
-            .is_none_or(|owner| !self.support.fqn_exists(owner))
-        {
+        // An owner the workspace does not declare may still be an indexed
+        // Composer type, in which case the member check can continue against
+        // the external surface.
+        let owner_is_known = owner.as_deref().is_some_and(|owner| {
+            self.support.fqn_exists(owner)
+                || !matches!(self.external.lookup_type(owner), PhpExternalSymbol::Absent)
+        });
+        if !owner_is_known {
             self.check_symbol(scope, SymbolKind::Type);
             return;
         }
@@ -323,6 +433,8 @@ impl PhpDiagnosticCollector<'_> {
             return;
         };
         let Some(member_name) = literal_member_identifier(member, self.source) else {
+            // `$object->$name()` chooses the member at run time.
+            self.push_dynamic(member, "PHP instance member is named at run time");
             return;
         };
         if member_name.is_empty() {
@@ -350,31 +462,99 @@ impl PhpDiagnosticCollector<'_> {
         member_name: &str,
         kind: MemberAccessKind,
     ) {
+        let range = node_range(member_node, self.line_starts);
         let Some(owner) = owner else {
+            // The receiver's type is not statically known, so there is no owner
+            // surface to check the member against.
+            self.push_dynamic_range(range, "PHP receiver type is not statically known");
             return;
         };
-        if !self.support.fqn_exists(&owner) {
+        let diagnostic = SemanticDiagnostic {
+            range,
+            source: PHP_SEMANTIC_DIAGNOSTIC_SOURCE,
+            kind: PHP_UNRECOGNIZED_MEMBER,
+            message: format!("Unrecognized PHP member `{member_name}` on `{owner}`"),
+        };
+        let domain = SemanticDiagnosticDomain::MemberSurface {
+            owner: owner.clone(),
+            member: member_name.to_owned(),
+        };
+
+        if self.support.fqn_exists(&owner) {
+            if self.class_has_trait_use(&owner) || self.has_magic_member_boundary(&owner, kind) {
+                self.push_dynamic_range(
+                    range,
+                    &format!("PHP owner `{owner}` resolves members at run time"),
+                );
+                return;
+            }
+            let fqn = format!("{owner}.{member_name}");
+            if !self.support.fqn(&fqn).is_empty()
+                || !self
+                    .inherited_member_candidates(&owner, member_name)
+                    .is_empty()
+            {
+                self.report
+                    .push_resolved(range, BoundaryStatus::WorkspaceLocal);
+                return;
+            }
+            if self.fqn_is_workspace_bounded(&owner) {
+                self.publish_absence(range, domain, BoundaryStatus::WorkspaceLocal, diagnostic);
+            } else {
+                self.push_unknown_boundary(range);
+            }
             return;
         }
-        if self.class_has_trait_use(&owner) || self.has_magic_member_boundary(&owner, kind) {
-            return;
+
+        // An external owner. A member is provable only when the owner resolved
+        // uniquely and its package surface is complete.
+        match self.external.lookup_type(&owner) {
+            PhpExternalSymbol::Indexed {
+                id,
+                surface_complete,
+            } => match self.external.lookup_member(&id, member_name) {
+                PhpExternalSymbol::Indexed { .. } => {
+                    self.report
+                        .push_resolved(range, BoundaryStatus::ExternalIndexed);
+                }
+                PhpExternalSymbol::Ambiguous => {
+                    self.report.push_ambiguous(
+                        range,
+                        vec![
+                            BoundaryStatus::ExternalIndexed,
+                            BoundaryStatus::ExternalIndexed,
+                        ],
+                    );
+                }
+                PhpExternalSymbol::Absent if surface_complete => {
+                    self.publish_absence(
+                        range,
+                        domain,
+                        BoundaryStatus::ExternalIndexed,
+                        diagnostic,
+                    );
+                }
+                PhpExternalSymbol::Absent => {
+                    self.push_missing_discovery(range, BoundaryStatus::ExternalDeclaredUnindexed);
+                }
+            },
+            PhpExternalSymbol::Ambiguous => {
+                self.report.push_ambiguous(
+                    range,
+                    vec![
+                        BoundaryStatus::ExternalIndexed,
+                        BoundaryStatus::ExternalIndexed,
+                    ],
+                );
+            }
+            PhpExternalSymbol::Absent => {
+                if self.external.declares_unindexed(&owner) {
+                    self.push_missing_discovery(range, BoundaryStatus::ExternalDeclaredUnindexed);
+                } else {
+                    self.push_unknown_boundary(range);
+                }
+            }
         }
-        let fqn = format!("{owner}.{member_name}");
-        if !self.support.fqn(&fqn).is_empty()
-            || !self
-                .inherited_member_candidates(&owner, member_name)
-                .is_empty()
-        {
-            return;
-        }
-        if !self.fqn_is_workspace_bounded(&owner) {
-            return;
-        }
-        self.push_diagnostic(
-            member_node,
-            PHP_UNRECOGNIZED_MEMBER,
-            format!("Unrecognized PHP member `{member_name}` on `{owner}`"),
-        );
     }
 
     fn inherited_member_candidates(&self, owner_fqn: &str, member: &str) -> Vec<String> {
@@ -499,15 +679,75 @@ impl PhpDiagnosticCollector<'_> {
         self.support.package_exists(&namespace)
     }
 
-    fn push_diagnostic(&mut self, node: Node<'_>, kind: &'static str, message: String) {
-        if self.diagnostics.len() >= MAX_PHP_SEMANTIC_DIAGNOSTICS {
+    /// Publish an error together with the proof that licenses it.
+    fn publish_absence(
+        &mut self,
+        range: Range,
+        domain: SemanticDiagnosticDomain,
+        boundary: BoundaryStatus,
+        diagnostic: SemanticDiagnostic,
+    ) {
+        if self.at_capacity() {
             return;
         }
-        self.diagnostics.push(PhpSemanticDiagnostic {
-            range: node_range(node, self.line_starts),
-            kind,
-            message,
-        });
+        self.report.push_absent(
+            SemanticAbsenceProof {
+                range,
+                domain,
+                boundary,
+            },
+            diagnostic,
+        );
+        self.published = self.published.saturating_add(1);
+    }
+
+    fn push_dynamic(&mut self, node: Node<'_>, detail: &str) {
+        let range = node_range(node, self.line_starts);
+        self.push_dynamic_range(range, detail);
+    }
+
+    fn push_dynamic_range(&mut self, range: Range, detail: &str) {
+        self.report.push_incomplete(
+            Some(range),
+            vec![SemanticDiagnosticIncompleteReason::DynamicBehavior {
+                detail: detail.to_owned(),
+            }],
+        );
+    }
+
+    fn push_missing_discovery(&mut self, range: Range, boundary: BoundaryStatus) {
+        self.report.push_incomplete(
+            Some(range),
+            vec![SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery { boundary }],
+        );
+    }
+
+    /// Nothing indexed the name and the build does not declare an owner for it.
+    /// Retained discovery evidence explains why, when a host retained any.
+    fn push_unknown_boundary(&mut self, range: Range) {
+        let mut reasons = self.external.discovery_incomplete_reasons();
+        if reasons.is_empty() {
+            reasons.push(
+                SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                    boundary: BoundaryStatus::ExternalUnknown,
+                },
+            );
+        }
+        self.report.push_incomplete(Some(range), reasons);
+    }
+
+    /// Whether the published-error cap is reached, recording the truncation the
+    /// first time it is.
+    fn at_capacity(&mut self) -> bool {
+        if self.published < MAX_PHP_SEMANTIC_DIAGNOSTICS {
+            return false;
+        }
+        if !self.truncated {
+            self.truncated = true;
+            self.report
+                .push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
+        }
+        true
     }
 }
 
