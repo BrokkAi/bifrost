@@ -677,13 +677,13 @@ pub(in crate::analyzer::usages) fn boundary_evidence(
             // discovery could not read everything the build declared, so the
             // name may well be there. Where no discovery has run, nothing is
             // retained and `ExternalUnknown` remains the honest answer.
-            let declared = analyzer
-                .dependency_discovery_evidence(language)
-                .is_some_and(|evidence| {
-                    evidence.truncated()
-                        || evidence.declares_module_path(name)
-                        || declared_import_route(analyzer, file, language, name, &evidence)
-                });
+            let evidence = analyzer.dependency_discovery_evidence(language);
+            let declared = crate::analyzer::semantic_model::retained_evidence_declares(
+                evidence.as_deref(),
+                name,
+            ) || evidence.is_some_and(|evidence| {
+                declared_import_route(analyzer, file, language, name, &evidence)
+            });
             if declared {
                 (BoundaryStatus::ExternalDeclaredUnindexed, None)
             } else {
