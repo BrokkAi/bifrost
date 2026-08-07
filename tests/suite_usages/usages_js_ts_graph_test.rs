@@ -4365,14 +4365,16 @@ fn multi_copy_sites(
             unproven_by_overload,
             ..
         } => (
-            hit_sites(hits_by_overload.into_values().flatten()),
-            hit_sites(unproven_by_overload.into_values().flatten()),
+            candidate_hit_sites(hits_by_overload.into_values().flatten()),
+            candidate_hit_sites(unproven_by_overload.into_values().flatten()),
         ),
         other => panic!("expected Success, got {other:#?}"),
     }
 }
 
-fn hit_sites(hits: impl IntoIterator<Item = brokk_bifrost::usages::UsageHit>) -> HitSites {
+fn candidate_hit_sites(
+    hits: impl IntoIterator<Item = brokk_bifrost::usages::UsageHit>,
+) -> HitSites {
     hits.into_iter()
         .map(|hit| {
             (

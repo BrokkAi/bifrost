@@ -13,8 +13,10 @@ use crate::analyzer::usages::common::{classify_recursive_hits, language_for_targ
 use crate::analyzer::usages::inverted_edges::{
     UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output, parse_and_collect,
 };
-use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
-use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::model::FuzzyResult;
+use crate::analyzer::usages::outcome::{
+    CandidateUsageHits, GraphFailureReason, GraphUsageOutcome, union_candidate_usages,
+};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer,
@@ -26,7 +28,6 @@ use brokk_bifrost_python::graph::extractor::{build_python_graph, scan_files_for_
 use brokk_bifrost_python::graph::inverted::PythonEdgeScan;
 use brokk_bifrost_python::graph::resolver::{infer_export_names, infer_usage_seeds};
 use brokk_bifrost_python::usage_index::usage_importer_files;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub(in crate::analyzer::usages) use brokk_bifrost_python::graph::extractor::{
@@ -155,6 +156,9 @@ pub(crate) fn python_usage_candidate_files(
     usage_importer_files(py, &seeds)
 }
 
+/// The strategy name every Python usage diagnostic reports.
+const PYTHON_STRATEGY: &str = "PythonExportUsageGraphStrategy";
+
 pub(crate) struct PythonQueryResolver<'a> {
     py: &'a PythonAnalyzer,
 }
@@ -173,75 +177,62 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        let Some(target) = overloads.first() else {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        };
         let py = self.py;
         let candidate_files = scan_scope.candidate_files();
 
-        let graph = build_python_graph(candidate_files, target.source(), scan_scope.cancellation());
-        if scan_scope.is_cancelled() {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        }
-        let seed_names = infer_export_names(py, target);
-        if seed_names.is_empty() {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::NoGraphSeed("no export seed resolved"),
-                "PythonExportUsageGraphStrategy",
-            );
-        }
+        // One reference can name several declarations -- two vendored copies of
+        // a package give their modules the same import path, so every item in
+        // them carries the same fully qualified name (#1791). The graph is
+        // seeded from the candidate's own file, so each candidate gets its own
+        // scan and the group answers with their union.
+        union_candidate_usages(overloads, max_usages, |target| {
+            let graph =
+                build_python_graph(candidate_files, target.source(), scan_scope.cancellation());
+            if scan_scope.is_cancelled() {
+                return Ok(CandidateUsageHits::default());
+            }
+            let seed_names = infer_export_names(py, target);
+            if seed_names.is_empty() {
+                return Err(GraphFailureReason::NoGraphSeed("no export seed resolved")
+                    .diagnostic(target.fq_name(), PYTHON_STRATEGY));
+            }
 
-        let seeds = infer_usage_seeds(py, target, seed_names);
-        if seeds.is_empty() {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::NoGraphSeed("export graph produced no seeds"),
-                "PythonExportUsageGraphStrategy",
-            );
-        }
+            let seeds = infer_usage_seeds(py, target, seed_names);
+            if seeds.is_empty() {
+                return Err(
+                    GraphFailureReason::NoGraphSeed("export graph produced no seeds")
+                        .diagnostic(target.fq_name(), PYTHON_STRATEGY),
+                );
+            }
 
-        let mut scan_files = graph.scan_files(candidate_files, target.source());
-        if scan_scope.is_authoritative() {
-            scan_files.retain(|file| scan_scope.allows(file));
-        }
+            let mut scan_files = graph.scan_files(candidate_files, target.source());
+            if scan_scope.is_authoritative() {
+                scan_files.retain(|file| scan_scope.allows(file));
+            }
 
-        let scan_result = with_python_graph_source(analyzer, |source| {
-            scan_files_for_seeds(
-                &source,
-                py,
-                &graph,
-                &scan_files,
-                target,
-                &seeds,
-                scan_scope.cancellation(),
-            )
-        });
-        // A proven hit inside the target itself is a recursive call (#1638):
-        // kept, classified `SelfReceiver`. The unproven channel still drops
-        // them -- an unproven recursive call is not evidence of anything.
-        let hits = classify_recursive_hits(analyzer, scan_result.hits, target);
-        let unproven_hits: BTreeSet<UsageHit> = scan_result
-            .unproven_hits
-            .into_iter()
-            .filter(|hit| &hit.enclosing != target)
-            .collect();
-
-        let external_callsites = crate::analyzer::usages::common::external_usage_hit_count(&hits);
-        if external_callsites > max_usages {
-            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-                short_name: target.short_name().to_string(),
-                total_callsites: external_callsites,
-                limit: max_usages,
-                sample_hits: hits,
+            let scan_result = with_python_graph_source(analyzer, |source| {
+                scan_files_for_seeds(
+                    &source,
+                    py,
+                    &graph,
+                    &scan_files,
+                    target,
+                    &seeds,
+                    scan_scope.cancellation(),
+                )
             });
-        }
-
-        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
-            target.clone(),
-            hits,
-            unproven_hits,
-        ))
+            // A proven hit inside the target itself is a recursive call (#1638):
+            // kept, classified `SelfReceiver`. The unproven channel still drops
+            // them -- an unproven recursive call is not evidence of anything.
+            Ok(CandidateUsageHits {
+                hits: classify_recursive_hits(analyzer, scan_result.hits, target),
+                unproven_hits: scan_result
+                    .unproven_hits
+                    .into_iter()
+                    .filter(|hit| &hit.enclosing != target)
+                    .collect(),
+            })
+        })
     }
 }
 
@@ -306,7 +297,7 @@ impl GraphUsageAnalyzer for PythonExportUsageGraphStrategy {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::UnsupportedTargetLanguage("target is not Python"),
-                "PythonExportUsageGraphStrategy",
+                PYTHON_STRATEGY,
             );
         }
 
@@ -316,7 +307,7 @@ impl GraphUsageAnalyzer for PythonExportUsageGraphStrategy {
                 GraphFailureReason::MissingAnalyzerCapability(
                     "analyzer does not expose PythonAnalyzer",
                 ),
-                "PythonExportUsageGraphStrategy",
+                PYTHON_STRATEGY,
             );
         };
 
