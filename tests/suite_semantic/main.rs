@@ -21,6 +21,7 @@ mod dataflow_fixtures;
 #[path = "../common/memory_benchmark.rs"]
 mod memory_benchmark;
 
+mod cpp_semantic_diagnostics;
 mod dataflow_clients;
 mod dataflow_ide;
 mod dataflow_summaries;
