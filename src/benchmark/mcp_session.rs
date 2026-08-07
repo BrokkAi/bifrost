@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use brokk_bifrost_mcp::benchmark_api::{
     BENCHMARK_MCP_REQUEST_BUDGET_SECS, BENCHMARK_PROFILE_BOUNDARY_MARKER,
     BENCHMARK_PROFILE_BOUNDARY_METHOD, MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV, MCP_FILE_WATCHER_ENV,
-    MCP_RMCP_HOST_ENV,
 };
 
 const STDERR_TAIL_CAPACITY_BYTES: usize = 256 * 1024;
@@ -24,7 +23,6 @@ const MCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_BUFFERED_MCP_RESPONSES: usize = 16;
 const BENCHMARK_QUERY_ACCESS_ENV: &str = "BIFROST_BENCHMARK_QUERY_CODE_ACCESS";
 const SERVER_QUERY_ACCESS_ENV: &str = "BIFROST_QUERY_CODE_ACCESS_MODE";
-const BENCHMARK_MCP_RMCP_ENV: &str = "BIFROST_BENCHMARK_MCP_RMCP";
 
 #[derive(Debug, Clone, Copy)]
 pub struct StderrCursor {
@@ -610,13 +608,6 @@ impl McpSession {
         } else if let Some(access_mode) = std::env::var_os(BENCHMARK_QUERY_ACCESS_ENV) {
             command.env(SERVER_QUERY_ACCESS_ENV, access_mode);
         }
-        // Which MCP host serves the session changes what a benchmark measures,
-        // so an ambient dogfooding shell must never choose it silently (#1491).
-        // Only the explicit benchmark-facing selector may set it.
-        command.env_remove(MCP_RMCP_HOST_ENV);
-        if let Some(host) = std::env::var_os(BENCHMARK_MCP_RMCP_ENV) {
-            command.env(MCP_RMCP_HOST_ENV, host);
-        }
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -884,17 +875,10 @@ impl McpSession {
 }
 
 fn validate_server_build_identity(response: &Value) -> Result<(), String> {
-    // Two locations during the issue #1328 MCP host migration. The rmcp host
-    // publishes the identity in the initialize result's `_meta`, because
-    // rmcp's `serverInfo` is a closed struct with no room for a vendor field;
-    // the hand-written host still puts it on `serverInfo` itself. Accepting
-    // either is what lets the latency benchmark run against both hosts -- and
-    // the analyzer pool's capacity is only allowed to change on evidence from
-    // that benchmark, so it has to be runnable against the host that has the
-    // pool.
+    // RMCP publishes the identity in the initialize result's `_meta`, because
+    // rmcp's `serverInfo` is a closed struct with no room for a vendor field.
     let server_identity = response
-        .pointer("/result/serverInfo/buildIdentity")
-        .or_else(|| response.pointer("/result/_meta/io.bifrost~1build-identity"))
+        .pointer("/result/_meta/io.bifrost~1build-identity")
         .and_then(Value::as_str)
         .ok_or_else(|| {
             "bifrost MCP initialize response omitted its build identity; rebuild the server binary"
@@ -1320,22 +1304,6 @@ mod tests {
         let error = validate_server_build_identity(&missing)
             .expect_err("missing identity must be rejected");
         assert!(error.contains("omitted its build identity"), "{error}");
-
-        let stale = json!({
-            "result": {"serverInfo": {"buildIdentity": "stale-binary"}}
-        });
-        let error =
-            validate_server_build_identity(&stale).expect_err("stale server must be rejected");
-        assert!(error.contains("stale-binary"), "{error}");
-        assert!(error.contains(crate::BIFROST_BUILD_IDENTITY), "{error}");
-
-        // Both hosts must satisfy this. The hand-written stack reports the
-        // identity on `serverInfo`; the rmcp host reports it in the initialize
-        // result's `_meta`, because rmcp's `serverInfo` has no vendor field.
-        let legacy_location = json!({
-            "result": {"serverInfo": {"buildIdentity": crate::BIFROST_BUILD_IDENTITY}}
-        });
-        validate_server_build_identity(&legacy_location).expect("matching server identity");
 
         let meta_location = json!({
             "result": {

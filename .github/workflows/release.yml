@@ -369,8 +369,6 @@ jobs:
 
       - name: Smoke staged agent plugin with built binary
         shell: bash
-        env:
-          BIFROST_MCP_RMCP: 'on'
         run: >
           node scripts/smoke-agent-plugin-release.mjs
           --plugin-dir "${RUNNER_TEMP}/bifrost-agent-prepublish/bifrost-agent"
@@ -1189,8 +1187,6 @@ jobs:
 
       - name: Smoke packaged launcher and MCP
         shell: bash
-        env:
-          BIFROST_MCP_RMCP: 'on'
         run: >
           node scripts/smoke-agent-plugin-release.mjs
           --plugin-dir "${RUNNER_TEMP}/bifrost-agent-release/bifrost-agent"
