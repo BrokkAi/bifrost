@@ -64,6 +64,7 @@ use crate::lsp::capabilities::server_capabilities;
 use crate::lsp::conversion::{
     byte_offset_to_position, path_to_uri_string, position_to_byte_offset, uri_to_path,
 };
+use crate::lsp::dependency_packs::{self, DependencyPackActivation, DependencyPackActivator};
 use crate::lsp::handlers::util::{
     project_file_for_abs_path, project_file_for_uri as resolve_project_file,
     project_file_for_uri_allow_missing as resolve_project_file_allow_missing,
@@ -159,9 +160,14 @@ pub(crate) fn run_with_connection(
     // Readiness is already reported; warming stays optional and off the
     // request path (#1582).
     state.schedule_index_warm();
+    // Dependency-pack proof is what lets an unrecognized-symbol diagnostic
+    // prove absence instead of reporting a typed suppression. It is equally
+    // optional and equally off the request path (#1628).
+    state.schedule_dependency_pack_activation();
     state.register_runtime_configuration(&connection)?;
 
     let result = main_loop(&connection, &mut state, pending_messages);
+    state.dependency_packs.shutdown();
     state.request_jobs.cancel_all_and_join();
     state.formatting_jobs.cancel_all();
     state
@@ -228,10 +234,55 @@ fn main_loop(
             return Ok(());
         }
     }
-    for msg in &connection.receiver {
-        if handle_message(connection, state, msg)? {
-            return Ok(());
+    // Cloned up front so the select below borrows no server state: every
+    // mutation still happens on this thread, inside the handlers.
+    let activations = state.dependency_packs.completions();
+    loop {
+        crossbeam_channel::select! {
+            recv(connection.receiver) -> msg => match msg {
+                Ok(msg) => {
+                    if handle_message(connection, state, msg)? {
+                        return Ok(());
+                    }
+                }
+                // The client disconnected without `shutdown`/`exit`.
+                Err(_) => return Ok(()),
+            },
+            recv(activations) -> activation => match activation {
+                Ok(activation) => handle_dependency_pack_activation(connection, state, activation)?,
+                // Unreachable while `state` owns the activator, which owns the
+                // sender; treat it as a closed session either way.
+                Err(_) => return Ok(()),
+            },
         }
+    }
+}
+
+/// Apply one completed background activation. The activation itself published
+/// its proof into the analyzer; this only decides what the client must see.
+fn handle_dependency_pack_activation(
+    connection: &Connection,
+    state: &mut ServerState,
+    activation: DependencyPackActivation,
+) -> Result<(), String> {
+    if activation.generation != state.dependency_pack_generation {
+        // A newer schedule already superseded this answer and will deliver its
+        // own; refreshing now would publish against proof about to be replaced.
+        return Ok(());
+    }
+    if let Some(detail) = activation.incomplete_detail.as_deref() {
+        // Not an error: the collectors keep their typed suppressions, so an
+        // incomplete activation costs recall, never a wrong diagnostic.
+        eprintln!(
+            "[bifrost-lsp] dependency-pack activation for {:?} was incomplete: {detail}",
+            activation.ecosystems
+        );
+    }
+    if !activation.refresh_required {
+        return Ok(());
+    }
+    for uri in state.published_diagnostic_uris.clone() {
+        publish_diagnostics_for_state(connection, state, &uri)?;
     }
     Ok(())
 }
@@ -1782,6 +1833,7 @@ fn handle_notification(
                 changed.insert(file);
                 state.workspace = state.workspace.update(&changed);
                 state.schedule_index_warm();
+                state.schedule_dependency_pack_activation();
                 publish_diagnostics_for_state(connection, state, &document.uri)?;
             } else if let Some(abs_path) = uri_to_path(&document.uri) {
                 let abs_path = abs_path
@@ -1891,6 +1943,8 @@ fn handle_notification(
                 let mut changed = BTreeSet::new();
                 changed.insert(file);
                 state.workspace = state.workspace.update(&changed);
+                state.invalidate_dependency_packs_for(&changed);
+                state.schedule_dependency_pack_activation();
                 // Push diagnostics for clients that don't poll the pull-model
                 // textDocument/diagnostic endpoint. Clients that DO poll just
                 // receive the same items twice, which is benign. Skip when
@@ -1949,6 +2003,10 @@ fn handle_notification(
             }
             if !changed.is_empty() {
                 state.workspace = state.workspace.update(&changed);
+                // A changed lockfile or manifest withdraws the proof built from
+                // its previous content, so the next activation cannot reuse it.
+                state.invalidate_dependency_packs_for(&changed);
+                state.schedule_dependency_pack_activation();
                 // The new analyzer generation has no retained dependency proof
                 // until the host activation lifecycle publishes it. Refresh all
                 // prior diagnostic documents now, so stale errors cannot remain.
@@ -2065,6 +2123,14 @@ fn apply_runtime_configuration_value(
         publish_empty_diagnostics(connection, &uri)?;
     }
     if semantic_diagnostics_changed {
+        if state.runtime_configuration.unrecognized_symbol_diagnostics {
+            state.schedule_dependency_pack_activation();
+        } else {
+            // Turning the opt-in off makes any in-flight discovery pointless.
+            // Cancelling is safe by contract: a cancelled activation publishes
+            // nothing and therefore cannot clobber a prior complete overlay.
+            state.dependency_packs.cancel();
+        }
         for uri in state.published_diagnostic_uris.clone() {
             publish_diagnostics_for_state(connection, state, &uri)?;
         }
@@ -2091,6 +2157,17 @@ pub(crate) struct ServerState {
     /// usage-backed request (documentHighlight, references, hierarchy) does
     /// not pay for index construction.
     index_warmer: Arc<IndexWarmer>,
+    /// Background host-owned dependency-pack activation (#1628). Scheduled
+    /// only while `unrecognized_symbol_diagnostics` is enabled, and only at
+    /// the points that install a new analyzer generation — a new generation
+    /// starts with no published pack proof, so without re-activation every
+    /// dependency-backed diagnostic would fall back to a typed suppression.
+    /// Deliberately not scheduled per `didChange` keystroke, for the same
+    /// reason `index_warmer` is not.
+    dependency_packs: Arc<DependencyPackActivator>,
+    /// The latest activation scheduled through `dependency_packs`. A
+    /// completion carrying an older generation has been superseded.
+    dependency_pack_generation: u64,
     /// The `OverlayProject` is shared with the analyzer (via `Arc<dyn Project>`
     /// inside `WorkspaceAnalyzer`) and with request-time read paths in
     /// `handlers::util::read_document_for_uri`. did{Open,Change,Close}
@@ -2875,6 +2952,8 @@ impl ServerState {
             python_pack,
             workspace,
             index_warmer: IndexWarmer::new(),
+            dependency_packs: DependencyPackActivator::new(),
+            dependency_pack_generation: 0,
             overlay,
             completion_cache: completion::CompletionCache::new(),
             rejected_didchange_log: ThrottledLog::new(
@@ -2899,6 +2978,49 @@ impl ServerState {
     /// shares the generation's lazy-index cells with `self.workspace`.
     fn schedule_index_warm(&self) {
         self.index_warmer.schedule(Arc::new(self.workspace.clone()));
+    }
+
+    /// Queue a background dependency-pack activation for the current snapshot
+    /// (#1628). A no-op while the client has not opted into unrecognized-symbol
+    /// diagnostics: without that opt-in no published proof can reach a client,
+    /// so discovering it would be pure cost.
+    ///
+    /// Never called from a request handler. A diagnostic that arrives before
+    /// the activation lands reports the collectors' typed suppressions, which
+    /// is the correct answer for a session that cannot yet see its
+    /// dependencies.
+    fn schedule_dependency_pack_activation(&mut self) {
+        if !self.runtime_configuration.unrecognized_symbol_diagnostics {
+            return;
+        }
+        let languages = self.workspace.analyzer().languages();
+        let ecosystems = dependency_packs::ecosystems_for_languages(&languages);
+        if ecosystems.is_empty() {
+            return;
+        }
+        self.dependency_pack_generation = self.dependency_packs.schedule(
+            Arc::new(self.workspace.clone()),
+            lsp_analyzer_config(self.python_pack.as_ref()),
+            ecosystems,
+        );
+    }
+
+    /// Withdraw published pack proof for the ecosystems whose declared
+    /// dependency inputs `changed` touches, then re-activate. Returns whether
+    /// anything was invalidated.
+    fn invalidate_dependency_packs_for(&mut self, changed: &BTreeSet<ProjectFile>) -> bool {
+        let mut ecosystems = BTreeSet::new();
+        for file in changed {
+            let Some(name) = file.rel_path().file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            ecosystems.extend(dependency_packs::ecosystems_for_dependency_input(name));
+        }
+        if ecosystems.is_empty() {
+            return false;
+        }
+        let ecosystems = ecosystems.into_iter().collect::<Vec<_>>();
+        self.workspace.invalidate_dependency_pack_state(&ecosystems)
     }
 
     fn register_runtime_configuration(&mut self, connection: &Connection) -> Result<(), String> {
@@ -3065,6 +3187,7 @@ impl ServerState {
         drop(old_workspace);
         drop(old_overlay);
         self.schedule_index_warm();
+        self.schedule_dependency_pack_activation();
         Ok(prepared.stale_diagnostics)
     }
 
@@ -3461,17 +3584,25 @@ fn uri_belongs_to_project(project: &dyn Project, uri: &Uri) -> bool {
     project_file_for_abs_path(project, &path).is_some()
 }
 
+/// The analyzer configuration this session analyzes and activates with. One
+/// function so the workspace build and the background dependency-pack
+/// activation cannot drift apart on, for example, the configured Python
+/// environment.
+fn lsp_analyzer_config(python_pack: Option<&LspPythonPackConfig>) -> AnalyzerConfig {
+    AnalyzerConfig {
+        python: PythonAnalyzerConfig {
+            environment: python_pack.map(|pack| pack.environment.clone()),
+        },
+        ..Default::default()
+    }
+}
+
 fn build_workspace_for_lsp(
     project: Arc<dyn Project>,
     progress: Option<&StartupProgress>,
     python_pack: Option<&LspPythonPackConfig>,
 ) -> Result<WorkspaceAnalyzer, String> {
-    let config = AnalyzerConfig {
-        python: PythonAnalyzerConfig {
-            environment: python_pack.map(|pack| pack.environment.clone()),
-        },
-        ..Default::default()
-    };
+    let config = lsp_analyzer_config(python_pack);
     let workspace = match progress {
         Some(progress) => {
             let progress = progress.clone_for_callback();

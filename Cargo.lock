@@ -383,6 +383,7 @@ dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-policy",
  "brokk-bifrost-runtime",
+ "crossbeam-channel",
  "glob",
  "libc",
  "lsp-server",

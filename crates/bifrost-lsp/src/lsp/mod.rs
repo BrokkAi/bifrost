@@ -9,6 +9,7 @@
 
 mod capabilities;
 pub mod conversion;
+pub(crate) mod dependency_packs;
 pub(crate) mod handlers;
 mod progress;
 mod request_context;
