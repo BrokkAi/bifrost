@@ -835,6 +835,7 @@ struct WorkspaceSession {
     snapshot: Arc<WorkspaceAnalyzer>,
     document_root: Arc<WorkspaceRoot>,
     watcher: SessionWatcher,
+    usage_index_warm: Option<JoinHandle<()>>,
     index_warmer: Arc<IndexWarmer>,
     #[cfg(feature = "nlp")]
     semantic: Option<Arc<SemanticIndexer>>,
@@ -1000,6 +1001,17 @@ impl WorkspaceSession {
         #[cfg(feature = "nlp")]
         if let Some(semantic) = &self.semantic {
             semantic.close();
+        }
+    }
+}
+
+impl Drop for WorkspaceSession {
+    fn drop(&mut self) {
+        let Some(handle) = self.usage_index_warm.take() else {
+            return;
+        };
+        if let Err(panic) = handle.join() {
+            eprintln!("bifrost usage-index warm thread panicked: {panic:?}");
         }
     }
 }
@@ -3778,16 +3790,18 @@ fn assemble_session(
     // longer pays whole-workspace index construction inside its wall-clock
     // budget. The PoolSafeMemo backing the index keeps a failed build
     // unpublished, so any panic here resurfaces on the first query that needs it.
-    {
+    let usage_index_warm = {
         let snapshot = Arc::clone(&snapshot);
-        std::thread::Builder::new()
-            .name("bifrost-usage-index-warm".to_string())
-            .spawn(move || {
-                let _scope = profiling::scope("mcp_cold.query_index_construction.rust_usage");
-                snapshot.warm_usage_analysis();
-            })
-            .map_err(|error| format!("Failed to spawn usage-index warm thread: {error}"))?;
-    }
+        Some(
+            std::thread::Builder::new()
+                .name("bifrost-usage-index-warm".to_string())
+                .spawn(move || {
+                    let _scope = profiling::scope("mcp_cold.query_index_construction.rust_usage");
+                    snapshot.warm_usage_analysis();
+                })
+                .map_err(|error| format!("Failed to spawn usage-index warm thread: {error}"))?,
+        )
+    };
     #[cfg(feature = "nlp")]
     let semantic = maybe_start_semantic(semantic_indexing, &snapshot);
     #[cfg(not(feature = "nlp"))]
@@ -3796,6 +3810,7 @@ fn assemble_session(
         snapshot,
         document_root,
         watcher,
+        usage_index_warm,
         index_warmer: IndexWarmer::new(),
         #[cfg(feature = "nlp")]
         semantic,
@@ -4792,6 +4807,7 @@ public partial class MudDialogContainer
                 snapshot: Arc::new(workspace),
                 document_root: Arc::new(WorkspaceRoot::open(project.root()).unwrap()),
                 watcher: SessionWatcher::Disabled,
+                usage_index_warm: None,
                 index_warmer: IndexWarmer::new(),
                 #[cfg(feature = "nlp")]
                 semantic: None,
@@ -5690,6 +5706,7 @@ mod tests {
                 snapshot,
                 document_root: Arc::new(WorkspaceRoot::open(dir.path()).unwrap()),
                 watcher: SessionWatcher::Disabled,
+                usage_index_warm: None,
                 index_warmer: IndexWarmer::new(),
                 semantic: Some(indexer.clone()),
             })),
