@@ -1813,6 +1813,7 @@ pub fn run_stdio_server_with_build_identity(
     root: Option<PathBuf>,
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
+    diff_snapshot_object_dir: Option<PathBuf>,
     build_identity: &str,
 ) -> Result<(), String> {
     // Explicit roots build in the background. Rootless servers answer
@@ -1822,12 +1823,17 @@ pub fn run_stdio_server_with_build_identity(
 
     let accepts_client_roots = root.is_none();
     let watch_files = file_watching_enabled(std::env::var_os(MCP_FILE_WATCHER_ENV).as_deref())?;
-    let service = Arc::new(match (root, watch_files) {
+    let service = match (root, watch_files) {
         (Some(root), true) => SearchToolsService::new_deferred(root)?,
         (Some(root), false) => SearchToolsService::new_deferred_manual(root)?,
         (None, true) => SearchToolsService::new_unbound(),
         (None, false) => SearchToolsService::new_unbound_manual(),
-    });
+    };
+    let service = match diff_snapshot_object_dir {
+        Some(dir) => service.with_diff_snapshot_object_dir(dir),
+        None => service,
+    };
+    let service = Arc::new(service);
     run_stdio_server_impl(
         service,
         None,

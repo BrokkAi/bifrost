@@ -417,6 +417,7 @@ pub fn run_stdio_server_with_build_identity(
             root,
             render_options,
             spec,
+            diff_snapshot_object_dir,
             build_identity,
         );
     }
