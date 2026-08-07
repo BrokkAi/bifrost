@@ -17752,6 +17752,120 @@ fn python_namespace_import_resolves_to_definition() {
 }
 
 #[test]
+fn python_fstring_interpolation_call_resolves_to_same_file_definition() {
+    let source = concat!(
+        "def d(value):\n",
+        "    return value.decode()\n",
+        "\n",
+        "\n",
+        "def parse(request_line):\n",
+        "    raise ValueError(f\"invalid HTTP request line: {d(request_line)}\")\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("http11.py", source)
+        .build();
+    let reference = source
+        .find("{d(request_line)}")
+        .expect("interpolation hole")
+        + 1;
+
+    let value = lookup(
+        project.root(),
+        &location_reference("http11.py", source, reference),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "http11.d",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_fstring_interpolation_attribute_call_resolves_to_definition() {
+    let source = concat!(
+        "class Holder:\n",
+        "    def render(self):\n",
+        "        return \"x\"\n",
+        "\n",
+        "\n",
+        "def show(obj: Holder):\n",
+        "    return f\"value: {obj.render()}\"\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("holder.py", source)
+        .build();
+    let reference = source
+        .find("obj.render()")
+        .expect("interpolated attribute call")
+        + "obj.".len();
+
+    let value = lookup(
+        project.root(),
+        &location_reference("holder.py", source, reference),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "holder.Holder.render",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_fstring_format_spec_interpolation_resolves_to_definition() {
+    let source = concat!(
+        "def width():\n",
+        "    return 3\n",
+        "\n",
+        "\n",
+        "def render(value):\n",
+        "    return f\"{value:{width()}}\"\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("fmt.py", source)
+        .build();
+    let reference = source.find("width()}}").expect("format-spec interpolation");
+
+    let value = lookup(
+        project.root(),
+        &location_reference("fmt.py", source, reference),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "fmt.width",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_plain_string_identifier_text_does_not_resolve_to_definition() {
+    let source = concat!(
+        "def d(value):\n",
+        "    return value\n",
+        "\n",
+        "\n",
+        "def parse(request_line):\n",
+        "    raise ValueError(\"invalid d(request_line) here\")\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("plain.py", source)
+        .build();
+    let reference = source
+        .find("invalid d(request_line)")
+        .expect("plain string text")
+        + "invalid ".len();
+
+    let value = lookup(
+        project.root(),
+        &location_reference("plain.py", source, reference),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn python_attribute_object_resolves_to_namespace_not_member() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("pkg/util.py", "def helper():\n    pass\n")

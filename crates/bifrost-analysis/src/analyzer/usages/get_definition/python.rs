@@ -2614,6 +2614,14 @@ fn python_is_non_reference_context(node: Node<'_>) -> bool {
     let deferred_annotation = node.kind() == "string_content" && python_node_is_in_annotation(node);
     let mut parent = Some(node);
     while let Some(current) = parent {
+        // An f-string interpolation hole holds ordinary expression nodes, so the
+        // enclosing `string` does not make them opaque. The walk is bottom-up, so
+        // reaching the hole before any `string` proves no nested string literal
+        // separates the node from the code context. `format_expression` is the
+        // same hole inside a format specifier (`f"{value:{width}}"`).
+        if matches!(current.kind(), "interpolation" | "format_expression") {
+            return false;
+        }
         if deferred_annotation && matches!(current.kind(), "string" | "string_content") {
             parent = current.parent();
             continue;

@@ -3615,3 +3615,91 @@ fn class_field_default_argument_resolves_in_owner_class_scope() {
         "the default is evaluated in the class body; the method body is not",
     );
 }
+
+#[test]
+fn fstring_interpolation_call_is_a_usage() {
+    let source = concat!(
+        "def d(value):\n",
+        "    return value.decode()\n",
+        "\n",
+        "\n",
+        "def parse(request_line):\n",
+        "    raise ValueError(f\"invalid HTTP request line: {d(request_line)}\")\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("http11.py", source)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "http11.d");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve the interpolated call");
+
+    let lines: Vec<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(lines, vec![6], "{hits:#?}");
+    let hit = hits.iter().next().expect("one interpolated call hit");
+    let call = source
+        .find("{d(request_line)}")
+        .expect("interpolation hole")
+        + 1;
+    assert_eq!(
+        (hit.start_offset, hit.end_offset),
+        (call, call + 1),
+        "{hit:#?}"
+    );
+}
+
+#[test]
+fn fstring_interpolation_attribute_call_is_a_member_usage() {
+    let source = concat!(
+        "class Holder:\n",
+        "    def render(self):\n",
+        "        return \"x\"\n",
+        "\n",
+        "\n",
+        "def show(obj: Holder):\n",
+        "    return f\"value: {obj.render()}\"\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("holder.py", source)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "holder.Holder.render");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve the interpolated member call");
+
+    let lines: Vec<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(lines, vec![7], "{hits:#?}");
+}
+
+#[test]
+fn plain_string_identifier_text_is_not_a_usage() {
+    let source = concat!(
+        "def d(value):\n",
+        "    return value\n",
+        "\n",
+        "\n",
+        "def parse(request_line):\n",
+        "    raise ValueError(\"invalid d(request_line) here\")\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("plain.py", source)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "plain.d");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should succeed for the plain-string control");
+
+    assert!(hits.is_empty(), "plain string text is not code: {hits:#?}");
+}
