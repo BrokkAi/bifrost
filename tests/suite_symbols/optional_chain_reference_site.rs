@@ -86,6 +86,72 @@ fn javascript_optional_chain_reference_site_keeps_the_whole_receiver_chain() {
     assert_eq!(non_chain, "bare");
 }
 
+/// #1792: a caret on a chain segment other than the last one names the chain
+/// that ends at that segment, and an optional-chaining operator before the
+/// caret must not change that. The canonical chain text drops the `?`, so it is
+/// one byte shorter than its source span per operator; mapping the caret onto
+/// the text by byte arithmetic missed every segment after an operator, left the
+/// whole chain in place, and resolved the caret to the chain's leaf instead.
+#[test]
+fn javascript_optional_chain_reference_site_stops_at_the_focused_segment() {
+    let source = r#"export function render(row, plain) {
+  const optionalMiddle = row?.dataset.raw;
+  const plainMiddle = plain.dataset.raw;
+  const doubleMiddle = row?.dataset?.raw;
+  const optionalRoot = row?.dataset.raw;
+  return [optionalMiddle, plainMiddle, doubleMiddle, optionalRoot];
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("focus.js", source)
+        .build();
+    let root = project.root();
+    let segment_start = |chain: &str, segment: &str| {
+        source.find(chain).expect("fixture chain") + chain.find(segment).expect("fixture segment")
+    };
+
+    assert_eq!(
+        site_target(
+            root,
+            "focus.js",
+            source,
+            segment_start("row?.dataset.raw;\n  const plainMiddle", "dataset"),
+        ),
+        "row.dataset",
+        "a caret on `dataset` names `row.dataset`, not the whole `row.dataset.raw`"
+    );
+    assert_eq!(
+        site_target(
+            root,
+            "focus.js",
+            source,
+            segment_start("plain.dataset.raw", "dataset"),
+        ),
+        "plain.dataset",
+        "the plain spelling of the same caret is the control"
+    );
+    assert_eq!(
+        site_target(
+            root,
+            "focus.js",
+            source,
+            segment_start("row?.dataset?.raw", "dataset"),
+        ),
+        "row.dataset",
+        "two operators skew the text by two bytes, and still name `row.dataset`"
+    );
+    assert_eq!(
+        site_target(
+            root,
+            "focus.js",
+            source,
+            segment_start("row?.dataset.raw;\n  return", "row"),
+        ),
+        "row",
+        "a caret on the chain root names the root alone"
+    );
+}
+
 #[test]
 fn typescript_optional_chain_reference_site_keeps_the_whole_receiver_chain() {
     let source = r#"export function render(al: any): unknown {

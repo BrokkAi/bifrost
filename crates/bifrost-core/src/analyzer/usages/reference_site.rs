@@ -422,7 +422,7 @@ fn is_member_access_wrapper(node: Node<'_>, language: Language) -> bool {
 /// or `this`. A node with named children is a compound expression -- a call, a
 /// subscript, a construction -- and a chain that reaches one is not a plain
 /// dotted path.
-fn simple_reference_name<'source>(
+pub fn simple_reference_name<'source>(
     node: Node<'_>,
     source: &'source str,
     language: Language,

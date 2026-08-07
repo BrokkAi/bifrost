@@ -4498,3 +4498,73 @@ fn multi_copy_site_lines() -> (HitSite, HitSite, HitSite) {
         ),
     )
 }
+// --- issue #1792: optional-chain reads of a local property ---
+//
+// `?.` is an `optional_chain` child that sits between a member expression's
+// `object` and `property` fields, so every receiver-chain walk that reads those
+// fields already steps over it. These two tests pin that down: the inverse
+// matcher reports an optional-chain read of the same field its plain spelling
+// reports, in every operator position, and still rejects a different chain.
+// The reported witness of #1792 was a forward defect instead -- a caret on a
+// chain segment after a `?.` named the whole chain -- and is pinned by
+// `tests/suite_symbols/optional_chain_reference_site.rs`.
+
+#[test]
+fn js_optional_chain_reads_of_a_declarator_minted_property_are_usages() {
+    let source = r#"function shapes(host) {
+  host.chain = { key: 1 };
+  const plain = host.chain.key;
+  const optionalRoot = host?.chain.key;
+  const optionalMember = host.chain?.key;
+  const optionalBoth = host?.chain?.key;
+  const nearMiss = host?.other.key;
+  return [plain, optionalRoot, optionalMember, optionalBoth, nearMiss];
+}
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("shapes.js", source).build());
+    let file = project.file("shapes.js");
+    let target = find_js_definition(&analyzer, &file, "host.chain.key", |cu| cu.is_field());
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+
+    assert_eq!(
+        reference_lines(&hits),
+        BTreeSet::from([
+            line_number_of(source, "const plain ="),
+            line_number_of(source, "const optionalRoot ="),
+            line_number_of(source, "const optionalMember ="),
+            line_number_of(source, "const optionalBoth ="),
+        ]),
+        "every optional spelling of `host.chain.key` reads it, and `host?.other.key` does not: {hits:#?}"
+    );
+}
+
+#[test]
+fn js_optional_chain_reads_of_a_member_assignment_minted_property_are_usages() {
+    let source = r#"function shapes(row, data) {
+  row.dataset.raw = JSON.stringify(data);
+  const plain = row.dataset.raw;
+  const optionalRoot = row?.dataset.raw;
+  const optionalMember = row.dataset?.raw;
+  const optionalBoth = row?.dataset?.raw;
+  const nearMiss = row?.other.raw;
+  return [plain, optionalRoot, optionalMember, optionalBoth, nearMiss];
+}
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("dataset.js", source).build());
+    let file = project.file("dataset.js");
+    let target = find_js_definition(&analyzer, &file, "row.dataset.raw", |cu| cu.is_field());
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+
+    assert_eq!(
+        reference_lines(&hits),
+        BTreeSet::from([
+            line_number_of(source, "const plain ="),
+            line_number_of(source, "const optionalRoot ="),
+            line_number_of(source, "const optionalMember ="),
+            line_number_of(source, "const optionalBoth ="),
+        ]),
+        "every optional spelling of `row.dataset.raw` reads it, and `row?.other.raw` does not: {hits:#?}"
+    );
+}
