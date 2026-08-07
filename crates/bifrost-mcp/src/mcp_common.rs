@@ -59,7 +59,15 @@ pub(crate) fn mcp_analyzer_request_budget() -> Option<Duration> {
 }
 
 pub(crate) fn mcp_request_deadline(accepted_at: Instant, cold_workspace: bool) -> Option<Instant> {
-    mcp_analyzer_request_budget()
+    mcp_request_deadline_with_budget(accepted_at, cold_workspace, mcp_analyzer_request_budget())
+}
+
+fn mcp_request_deadline_with_budget(
+    accepted_at: Instant,
+    cold_workspace: bool,
+    configured_budget: Option<Duration>,
+) -> Option<Instant> {
+    configured_budget
         .or(cold_workspace.then_some(COLD_WORKSPACE_REQUEST_BUDGET))
         .map(|budget| accepted_at + budget)
 }
@@ -1004,6 +1012,24 @@ mod shared_tests {
         assert_eq!(
             mcp_analyzer_request_budget_secs(Some("600".to_string())),
             Some(600)
+        );
+    }
+
+    #[test]
+    fn explicit_request_budget_wins_over_the_cold_workspace_fallback() {
+        let accepted_at = Instant::now();
+        let configured_budget = Duration::from_secs(8);
+
+        let configured =
+            mcp_request_deadline_with_budget(accepted_at, true, Some(configured_budget))
+                .expect("configured budget should set a deadline");
+        assert_eq!(configured.duration_since(accepted_at), configured_budget);
+
+        let fallback = mcp_request_deadline_with_budget(accepted_at, true, None)
+            .expect("cold workspace should use its fallback deadline");
+        assert_eq!(
+            fallback.duration_since(accepted_at),
+            COLD_WORKSPACE_REQUEST_BUDGET
         );
     }
 
