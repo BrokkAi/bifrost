@@ -61,11 +61,12 @@ fn activation_request() -> SemanticModelActivationRequest {
 
 /// The npm packages every complete-surface case shares.
 ///
-/// `widget` carries an ordinary named surface plus two declaration merges;
-/// `@scope/widget` proves a scoped package is a separate surface from the
-/// unscoped package whose tail matches it; `deep` routes an `exports` subpath;
-/// `@types/left-pad` proves a companion types package serves the module name it
-/// describes rather than its own package name.
+/// `widget` carries an ordinary named surface plus a declaration merge and a
+/// renamed export; `@scope/widget` proves a scoped package is a separate
+/// surface from the unscoped package whose tail matches it; `deep` routes one
+/// `exports` subpath to declarations and leaves another behind runtime-only
+/// conditions; `left-pad` and `@types/left-pad` both carry the module
+/// coordinate `left-pad`, so that module's surface is their union.
 fn complete_surface_packages() -> Vec<(&'static str, String)> {
     vec![
         (".gitignore", "node_modules/\n".to_string()),
@@ -78,6 +79,7 @@ fn complete_surface_packages() -> Vec<(&'static str, String)> {
                 "node_modules/widget": { "version": "2.1.0" },
                 "node_modules/@scope/widget": { "version": "1.0.0" },
                 "node_modules/deep": { "version": "1.0.0" },
+                "node_modules/left-pad": { "version": "1.3.0" },
                 "node_modules/@types/left-pad": { "version": "1.3.0" }
               }
             }"#
@@ -113,7 +115,8 @@ export { Local as Public };
               "version": "1.0.0",
               "exports": {
                 ".": { "types": "./index.d.ts" },
-                "./extra": { "types": "./extra.d.ts" }
+                "./extra": { "types": "./extra.d.ts" },
+                "./runtime": { "import": "./runtime.mjs", "require": "./runtime.cjs" }
               }
             }"#
             .to_string(),
@@ -125,6 +128,15 @@ export { Local as Public };
         (
             "node_modules/deep/extra.d.ts",
             "export interface Extra { id: string }\n".to_string(),
+        ),
+        (
+            "node_modules/left-pad/package.json",
+            r#"{ "name": "left-pad", "version": "1.3.0", "types": "index.d.ts" }"#.to_string(),
+        ),
+        (
+            "node_modules/left-pad/index.d.ts",
+            "export declare function padStart(value: string, length: number): string;\n"
+                .to_string(),
         ),
         (
             "node_modules/@types/left-pad/package.json",
@@ -566,11 +578,110 @@ fn invalidating_npm_dependency_state_refreshes_diagnostics() {
 }
 
 #[test]
-fn a_partial_declaration_surface_suppresses_instead_of_proving_absence() {
+fn a_declared_subpath_behind_runtime_only_conditions_suppresses() {
+    // `deep`'s `./runtime` export names runtime targets and no `types`
+    // condition, so the pack routes no declarations for it. An export map the
+    // pack could not follow must suppress rather than prove a name absent.
+    let workspace =
+        typescript_workspace("import { Anything } from 'deep/runtime';\nexport { Anything };\n");
+    let report = workspace.report("src/app.ts");
+    assert!(
+        report.diagnostics().is_empty(),
+        "{:#?}",
+        missing_export_messages(&report)
+    );
+    assert!(
+        suppressed_at_boundary(&report, BoundaryStatus::ExternalDeclaredUnindexed),
+        "{:#?}",
+        report.outcomes()
+    );
+}
+
+#[test]
+fn two_packs_carrying_one_module_coordinate_share_its_surface() {
+    // `left-pad` ships its own declarations and `@types/left-pad` describes the
+    // same module. Both packs carry the module coordinate `left-pad`, so the
+    // module's surface is their union: a name from either pack resolves, and
+    // only a name neither declares is proved absent.
+    let workspace = typescript_workspace(
+        "import { padStart, leftPad, neitherPack } from 'left-pad';\n\
+         export { padStart, leftPad, neitherPack };\n",
+    );
+    let report = workspace.report("src/app.ts");
+    let messages = missing_export_messages(&report);
+    assert_eq!(1, messages.len(), "{messages:#?}");
+    assert!(messages[0].contains("neitherPack"), "{messages:#?}");
+}
+
+/// Activate npm packs through the same discovery, preparation and acquisition
+/// steps `WorkspaceAnalyzer::activate_dependency_packs` runs, without its
+/// all-or-nothing gate.
+///
+/// That gate refuses a partial preparation outright, which would leave nothing
+/// activated and make every partial-surface case indistinguishable from an
+/// unindexed one. Going through the steps directly is what lets a partial pack
+/// reach the overlay, which is the state these cases are about.
+fn activate_partial_packs(
+    project: &BuiltInlineTestProject,
+) -> (WorkspaceAnalyzer, SemanticPackCatalog) {
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let limits = DependencyPackLimits::default();
+    let discovery = resolve_js_ts_semantic_pack_dependencies(
+        &JsTsDependencyDiscoveryConfig::default(),
+        Arc::clone(&project.project_dyn()).as_ref(),
+        &limits,
+        None,
+    );
+    assert!(discovery.complete, "{:#?}", discovery.diagnostics);
+    let prepared = prepare_discovered_dependency_semantic_packs(
+        &catalog,
+        &JsTsDependencyPackAdapter,
+        discovery,
+        &limits,
+        None,
+    );
+    assert!(
+        !prepared.complete,
+        "a surface the producer could not follow must make preparation partial"
+    );
+    let request = prepared
+        .compose_activation_request(activation_request())
+        .expect("a partial pack still composes activation evidence");
+    let SemanticModelRuntimeOutcome::Ready { .. } = acquire_active_semantic_models(
+        analyzer.analyzer(),
+        &catalog,
+        None,
+        &request,
+        &CancellationToken::default(),
+    ) else {
+        panic!("the partial npm pack must activate");
+    };
+    (analyzer, catalog)
+}
+
+fn assert_partial_surface_suppresses(project: &BuiltInlineTestProject) {
+    let (analyzer, _catalog) = activate_partial_packs(project);
+    let file = project.file("src/app.ts");
+    let source = analyzer.analyzer().project().read_source(&file).unwrap();
+    let report = analyzer.analyzer().semantic_diagnostics(&file, &source);
+    assert!(
+        report.diagnostics().is_empty(),
+        "a partial surface must not prove absence: {:#?}",
+        missing_export_messages(&report)
+    );
+    assert!(
+        suppressed_at_boundary(&report, BoundaryStatus::ExternalDeclaredUnindexed),
+        "{:#?}",
+        report.outcomes()
+    );
+}
+
+#[test]
+fn an_unresolved_re_export_chain_suppresses_instead_of_proving_absence() {
     // `export * from './inner'` is a re-export the declaration producer cannot
     // follow, so the pack it produces is partial. A name the partial surface
-    // does not carry may well be behind that re-export, so it must not be
-    // reported missing.
+    // does not carry may well be behind that re-export.
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(".gitignore", "node_modules/\n")
         .file(
@@ -600,55 +711,47 @@ fn a_partial_declaration_surface_suppresses_instead_of_proving_absence() {
             "import { Local, Inner } from 'reexporter';\nexport type { Local, Inner };\n",
         )
         .build();
+    assert_partial_surface_suppresses(&project);
+}
 
-    // The workspace activation path refuses a partial preparation outright, so
-    // the partial pack is activated through the same discovery, preparation and
-    // acquisition steps that path runs, without its all-or-nothing gate.
-    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
-    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-    let limits = DependencyPackLimits::default();
-    let discovery = resolve_js_ts_semantic_pack_dependencies(
-        &JsTsDependencyDiscoveryConfig::default(),
-        Arc::clone(&project.project_dyn()).as_ref(),
-        &limits,
-        None,
-    );
-    assert!(discovery.complete, "{:#?}", discovery.diagnostics);
-    let prepared = prepare_discovered_dependency_semantic_packs(
-        &catalog,
-        &JsTsDependencyPackAdapter,
-        discovery,
-        &limits,
-        None,
-    );
-    assert!(
-        !prepared.complete,
-        "an unresolved re-export must make preparation partial"
-    );
-    let request = prepared
-        .compose_activation_request(activation_request())
-        .expect("a partial pack still composes activation evidence");
-    let SemanticModelRuntimeOutcome::Ready { .. } = acquire_active_semantic_models(
-        analyzer.analyzer(),
-        &catalog,
-        None,
-        &request,
-        &CancellationToken::default(),
-    ) else {
-        panic!("the partial npm pack must activate");
-    };
-
-    let file = project.file("src/app.ts");
-    let source = analyzer.analyzer().project().read_source(&file).unwrap();
-    let report = analyzer.analyzer().semantic_diagnostics(&file, &source);
-    assert!(
-        report.diagnostics().is_empty(),
-        "a partial surface must not prove absence: {:#?}",
-        missing_export_messages(&report)
-    );
-    assert!(
-        suppressed_at_boundary(&report, BoundaryStatus::ExternalDeclaredUnindexed),
-        "{:#?}",
-        report.outcomes()
-    );
+#[test]
+fn an_export_assignment_suppresses_instead_of_proving_absence() {
+    // `export = Api` republishes one declaration as the module's whole export
+    // shape, so `import { call }` reaches `Api`'s members rather than the
+    // module's. The producer records declarations under their own names and
+    // cannot express that re-rooting.
+    //
+    // The file also declares `helper` the ordinary way, which is what makes the
+    // hazard reachable: the pack has declarations, so it is produced and
+    // activated, and its surface carries `helper` but not `call`. Without the
+    // producer reporting the export assignment the pack would read complete and
+    // `call` would be a false error against a module that really does export it.
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(".gitignore", "node_modules/\n")
+        .file(
+            "package-lock.json",
+            r#"{
+              "lockfileVersion": 3,
+              "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/legacy": { "version": "1.0.0" }
+              }
+            }"#,
+        )
+        .file(
+            "node_modules/legacy/package.json",
+            r#"{ "name": "legacy", "version": "1.0.0", "types": "index.d.ts" }"#,
+        )
+        .file(
+            "node_modules/legacy/index.d.ts",
+            "export declare function helper(): void;\n\
+             declare namespace Api {\n  function call(value: string): string;\n}\n\
+             export = Api;\n",
+        )
+        .file(
+            "src/app.ts",
+            "import { call } from 'legacy';\nexport { call };\n",
+        )
+        .build();
+    assert_partial_surface_suppresses(&project);
 }

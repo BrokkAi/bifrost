@@ -91,8 +91,12 @@ struct RetainedNpmSurface {
     discovery: Option<Arc<DependencyDiscoveryEvidence>>,
 }
 
-/// Whether every pack contributing a module's surface is complete.
+/// The activated surface of one module specifier.
 struct ModuleSurface {
+    /// The root module types every contributing pack declared for the
+    /// specifier. Their members are the module's own exports.
+    roots: Vec<String>,
+    /// Whether every contributing pack is complete.
     complete: bool,
 }
 
@@ -115,36 +119,52 @@ impl RetainedNpmSurface {
     /// complete only when every contributing pack is.
     fn module_surface(&self, module_specifier: &str) -> Option<ModuleSurface> {
         let overlay = self.overlay.as_ref()?;
-        let mut surface: Option<ModuleSurface> = None;
+        let mut roots = Vec::new();
+        let mut complete = true;
         for symbol in overlay.symbols_named(module_specifier).records {
             if symbol.kind != SemanticModelSymbolKind::Module
                 || symbol.qualified_name != module_specifier
             {
                 continue;
             }
-            let complete = symbol.provenance.completeness == SemanticModelCompleteness::Complete;
-            surface = Some(match surface {
-                Some(existing) => ModuleSurface {
-                    complete: existing.complete && complete,
-                },
-                None => ModuleSurface { complete },
-            });
+            roots.push(symbol.id.clone());
+            complete &= symbol.provenance.completeness == SemanticModelCompleteness::Complete;
         }
-        surface
+        (!roots.is_empty()).then_some(ModuleSurface { roots, complete })
     }
 
-    /// Whether the activated surface for `module_specifier` declares `name`.
+    /// Whether the activated surface of `module_specifier` declares `name`.
     ///
-    /// A pack qualifies every declaration with the module that reaches it, and
-    /// the overlay indexes each symbol under its bare name, its qualified name,
-    /// and every alias -- including the module-qualified alias an
-    /// `export { local as Public }` records. Asking for the qualified name is
-    /// therefore an exact question about one module's surface, not a global
-    /// name search.
-    fn exports_name(&self, module_specifier: &str, name: &str) -> bool {
+    /// Two structured relations answer this, because a pack records a module's
+    /// own exports and the types nested under it differently.
+    ///
+    /// A function, constant or other value export is a member owned by the
+    /// module's root type, so it is read through the overlay's owner index. It
+    /// deliberately is not read by qualified name: when more than one pack
+    /// declares the same module the root type identity conflicts, the overlay
+    /// stops resolving the owner to its qualified name, and every member of
+    /// that module would silently stop matching -- which is exactly the
+    /// `left-pad` plus `@types/left-pad` case.
+    ///
+    /// A nested type keeps the module-qualified name the pack gave it, so it is
+    /// read by that name. The overlay indexes each symbol under its bare name,
+    /// its qualified name and every alias, including the module-qualified alias
+    /// an `export { local as Public }` records, so this stays an exact question
+    /// about one module rather than a global name search.
+    fn exports_name(&self, surface: &ModuleSurface, module_specifier: &str, name: &str) -> bool {
         let Some(overlay) = self.overlay.as_ref() else {
             return false;
         };
+        let declares_member = surface.roots.iter().any(|root| {
+            overlay
+                .members_of(root)
+                .records
+                .iter()
+                .any(|member| member.name == name || member.aliases.iter().any(|a| a == name))
+        });
+        if declares_member {
+            return true;
+        }
         let qualified = format!("{module_specifier}.{name}");
         overlay
             .symbols_named(&qualified)
@@ -200,7 +220,7 @@ impl JsTsExternalSurfaceEvidence for TypeScriptNpmSurface {
     ) -> JsTsExportedNameEvidence {
         match self.0.module_surface(module_specifier) {
             Some(surface) => {
-                if self.0.exports_name(module_specifier, name) {
+                if self.0.exports_name(&surface, module_specifier, name) {
                     JsTsExportedNameEvidence::Indexed
                 } else if surface.complete {
                     JsTsExportedNameEvidence::AbsentFromCompleteSurface
@@ -238,10 +258,10 @@ impl JsTsExternalSurfaceEvidence for JavaScriptNpmSurface {
         module_specifier: &str,
         name: &str,
     ) -> JsTsExportedNameEvidence {
-        if self.0.exports_name(module_specifier, name) {
-            return JsTsExportedNameEvidence::Indexed;
-        }
         match self.0.module_surface(module_specifier) {
+            Some(surface) if self.0.exports_name(&surface, module_specifier, name) => {
+                JsTsExportedNameEvidence::Indexed
+            }
             Some(_) => JsTsExportedNameEvidence::Undecided(vec![
                 SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
                     detail: format!(
@@ -263,7 +283,7 @@ mod tests {
     use super::{collect_javascript_semantic_diagnostics, collect_typescript_semantic_diagnostics};
     use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::{
-        AliasResolver, JavascriptAnalyzer, Language, ProjectFile, TestProject, TypescriptAnalyzer,
+        JavascriptAnalyzer, Language, ProjectFile, TestProject, TypescriptAnalyzer,
     };
     use brokk_bifrost_js_ts::diagnostics::JS_TS_UNRECOGNIZED_SYMBOL;
     use std::path::PathBuf;
@@ -273,7 +293,6 @@ mod tests {
         _temp: tempfile::TempDir,
         analyzer: A,
         root: PathBuf,
-        aliases: AliasResolver,
     }
 
     fn javascript_project(files: &[(&str, &str)]) -> JsTsFixture<JavascriptAnalyzer> {
@@ -284,12 +303,10 @@ mod tests {
         }
         let analyzer =
             JavascriptAnalyzer::from_project(TestProject::new(root.clone(), Language::JavaScript));
-        let aliases = AliasResolver::new(root.clone());
         JsTsFixture {
             _temp: temp,
             analyzer,
             root,
-            aliases,
         }
     }
 
@@ -301,19 +318,17 @@ mod tests {
         }
         let analyzer =
             TypescriptAnalyzer::from_project(TestProject::new(root.clone(), Language::TypeScript));
-        let aliases = AliasResolver::new(root.clone());
         JsTsFixture {
             _temp: temp,
             analyzer,
             root,
-            aliases,
         }
     }
 
     fn js_diagnostics(fixture: &JsTsFixture<JavascriptAnalyzer>, rel_path: &str) -> Vec<String> {
         let file = ProjectFile::new(fixture.root.clone(), rel_path);
         let source = fixture.analyzer.project().read_source(&file).unwrap();
-        collect_javascript_semantic_diagnostics(&fixture.analyzer, &file, &source, &fixture.aliases)
+        collect_javascript_semantic_diagnostics(&fixture.analyzer, &file, &source)
             .into_iter()
             .map(|diagnostic| diagnostic.message)
             .collect()
@@ -322,7 +337,7 @@ mod tests {
     fn ts_diagnostics(fixture: &JsTsFixture<TypescriptAnalyzer>, rel_path: &str) -> Vec<String> {
         let file = ProjectFile::new(fixture.root.clone(), rel_path);
         let source = fixture.analyzer.project().read_source(&file).unwrap();
-        collect_typescript_semantic_diagnostics(&fixture.analyzer, &file, &source, &fixture.aliases)
+        collect_typescript_semantic_diagnostics(&fixture.analyzer, &file, &source)
             .into_iter()
             .map(|diagnostic| diagnostic.message)
             .collect()
@@ -446,12 +461,7 @@ mod tests {
         let fixture = javascript_project(&[("app.js", &source)]);
         let file = ProjectFile::new(fixture.root.clone(), "app.js");
         let source = fixture.analyzer.project().read_source(&file).unwrap();
-        let report = collect_javascript_semantic_diagnostics(
-            &fixture.analyzer,
-            &file,
-            &source,
-            &fixture.aliases,
-        );
+        let report = collect_javascript_semantic_diagnostics(&fixture.analyzer, &file, &source);
         assert_eq!(200, report.diagnostics().len());
         assert!(
             report
