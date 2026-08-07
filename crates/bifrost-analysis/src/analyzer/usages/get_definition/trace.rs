@@ -680,9 +680,13 @@ pub(in crate::analyzer::usages) fn boundary_evidence(
             let declared = analyzer
                 .dependency_discovery_evidence(language)
                 .is_some_and(|evidence| {
-                    evidence.truncated()
-                        || evidence.declares_module_path(name)
-                        || declared_import_route(analyzer, file, language, name, &evidence)
+                    use crate::analyzer::semantic_model::{
+                        RetainedDiscoveryVerdict, retained_discovery_verdict,
+                    };
+                    matches!(
+                        retained_discovery_verdict(Some(&evidence), name),
+                        RetainedDiscoveryVerdict::Truncated | RetainedDiscoveryVerdict::Declared
+                    ) || declared_import_route(analyzer, file, language, name, &evidence)
                 });
             if declared {
                 (BoundaryStatus::ExternalDeclaredUnindexed, None)
