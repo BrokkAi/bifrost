@@ -53,15 +53,17 @@ pub use analyzer::{
     JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
     JvmExternalDependencies, JvmMavenCoordinate, JvmStandardLibraryDiscoveryConfig, KotlinAnalyzer,
     Language, MultiAnalyzer, MultiRootProject, OverlayProject, ParseError, ParseErrorKind,
-    PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, PythonSemanticModelWorkspaceContext, Range,
-    RubyAnalyzer, RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyDependencyPackAdapter,
-    RubyGemApiArtifact, RustAnalyzer, RustAnalyzerConfig, RustDependencyApiEvidence,
-    RustDependencyPackAdapter, RustPackageApiArtifact, RustSelectedTarget, RustdocJsonPackProducer,
-    ScalaAnalyzer, SourceContent, SourceIngestionError, SourceIngestionKind, TestAssertionAnalysis,
+    PhpAnalyzer, PhpAnalyzerConfig, PhpDependencyApiEvidence, PhpDependencyPackAdapter, Project,
+    ProjectFile, PythonAnalyzer, PythonSemanticModelWorkspaceContext, Range, RubyAnalyzer,
+    RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyDependencyPackAdapter, RubyGemApiArtifact,
+    RustAnalyzer, RustAnalyzerConfig, RustDependencyApiEvidence, RustDependencyPackAdapter,
+    RustPackageApiArtifact, RustSelectedTarget, RustdocJsonPackProducer, ScalaAnalyzer,
+    SourceContent, SourceIngestionError, SourceIngestionKind, TestAssertionAnalysis,
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,
     TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
     WorkspaceAnalyzer, WorkspaceFileListingCache, collect_workspace_files, ingest_source_bytes,
-    resolve_ruby_semantic_pack_dependencies, resolve_rust_semantic_pack_dependencies,
+    resolve_php_semantic_pack_dependencies, resolve_ruby_semantic_pack_dependencies,
+    resolve_rust_semantic_pack_dependencies,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use analyzer::{

@@ -3,31 +3,168 @@
 //! The language logic lives in [`brokk_bifrost_php::diagnostics`]. What stays
 //! here is the one downcast that turns an `&dyn IAnalyzer` into the arguments
 //! that function takes -- the PHP analysis source, the dispatching analyzer's
-//! declaration index, and the bounded definition lookup -- plus the
-//! analyzer-bound fixture suite, which needs a real `PhpAnalyzer` over a
-//! `TestProject`.
+//! declaration index, and the bounded definition lookup -- the implementation
+//! of the external-surface window over the semantic-model overlay and retained
+//! discovery evidence, and the analyzer-bound fixture suite, which needs a real
+//! `PhpAnalyzer` over a `TestProject`.
 
-use crate::analyzer::{IAnalyzer, PhpAnalyzer, ProjectFile, resolve_analyzer};
-use brokk_bifrost_php::diagnostics::PhpSemanticDiagnostic;
+use std::sync::Arc;
+
+use crate::analyzer::semantic_model::{
+    DependencyDiscoveryEvidence, SemanticModelCompleteness, SemanticModelOverlay,
+    SemanticModelSymbol, SemanticModelSymbolKind, dependency_discovery_incomplete_reasons,
+};
+use crate::analyzer::{
+    IAnalyzer, Language, PhpAnalyzer, ProjectFile, SemanticDiagnosticIncompleteReason,
+    SemanticDiagnosticReport, resolve_analyzer,
+};
+use brokk_bifrost_php::external_surface::{PhpExternalSurface, PhpExternalSymbol};
 
 pub(crate) fn collect_php_semantic_diagnostics(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
-) -> Vec<PhpSemanticDiagnostic> {
+) -> SemanticDiagnosticReport {
     let Some(php) = resolve_analyzer::<PhpAnalyzer>(analyzer) else {
-        return Vec::new();
+        return SemanticDiagnosticReport::new();
     };
     let support = analyzer.global_usage_definition_index();
+    // Both reads are of state a host already published. Neither starts
+    // dependency discovery nor touches a vendor tree.
+    let external = AnalyzerPhpExternalSurface {
+        overlay: analyzer.semantic_model_overlay(),
+        evidence: analyzer.dependency_discovery_evidence(Language::Php),
+    };
     brokk_bifrost_php::diagnostics::collect_php_semantic_diagnostics(
-        php, analyzer, &support, file, source,
+        php, analyzer, &support, &external, file, source,
     )
+}
+
+/// The overlay and discovery evidence an analyzer already holds, presented as
+/// the narrow window PHP's collector reads.
+struct AnalyzerPhpExternalSurface {
+    overlay: Option<Arc<SemanticModelOverlay>>,
+    evidence: Option<Arc<DependencyDiscoveryEvidence>>,
+}
+
+impl AnalyzerPhpExternalSurface {
+    /// PHP declarations in the overlay whose qualified name is exactly `fqn`.
+    ///
+    /// Matching on the qualified name keeps a terminal-name posting for an
+    /// unrelated symbol from answering a fully qualified question.
+    fn php_symbols_named<'a>(
+        overlay: &'a SemanticModelOverlay,
+        fqn: &str,
+    ) -> Vec<&'a SemanticModelSymbol> {
+        overlay
+            .symbols_named(fqn)
+            .records
+            .into_iter()
+            .filter(|symbol| symbol.language == "php" && symbol.qualified_name == fqn)
+            .collect()
+    }
+
+    fn classify(records: &[&SemanticModelSymbol]) -> PhpExternalSymbol {
+        match records {
+            [] => PhpExternalSymbol::Absent,
+            [symbol] if !symbol.provenance.ambiguous => PhpExternalSymbol::Indexed {
+                id: symbol.id.clone(),
+                surface_complete: symbol.provenance.completeness
+                    == SemanticModelCompleteness::Complete,
+            },
+            _ => PhpExternalSymbol::Ambiguous,
+        }
+    }
+}
+
+impl PhpExternalSurface for AnalyzerPhpExternalSurface {
+    fn lookup_type(&self, fqn: &str) -> PhpExternalSymbol {
+        let Some(overlay) = &self.overlay else {
+            return PhpExternalSymbol::Absent;
+        };
+        let records = Self::php_symbols_named(overlay, fqn);
+        // A namespace scaffold is not a type a reference can name.
+        let records = records
+            .into_iter()
+            .filter(|symbol| symbol.kind != SemanticModelSymbolKind::Module)
+            .collect::<Vec<_>>();
+        Self::classify(&records)
+    }
+
+    fn lookup_member(&self, owner_id: &str, member: &str) -> PhpExternalSymbol {
+        let Some(overlay) = &self.overlay else {
+            return PhpExternalSymbol::Absent;
+        };
+        let mut owners = vec![owner_id.to_owned()];
+        // A member can be inherited, so the owner's ancestors are part of the
+        // surface the lookup must check before reporting the member absent.
+        if let Some(owner) = overlay.symbols_with_id(owner_id).records.first() {
+            owners.extend(
+                overlay
+                    .ancestors_of(owner)
+                    .records
+                    .iter()
+                    .map(|ancestor| ancestor.id.clone()),
+            );
+        }
+        let mut found = Vec::new();
+        for owner in &owners {
+            found.extend(
+                overlay
+                    .members_of(owner)
+                    .records
+                    .into_iter()
+                    .filter(|symbol| symbol.name == member),
+            );
+        }
+        Self::classify(&found)
+    }
+
+    fn namespace_surface_is_complete(&self, namespace_fq: &str) -> bool {
+        let Some(overlay) = &self.overlay else {
+            return false;
+        };
+        if namespace_fq.is_empty() {
+            return false;
+        }
+        // A complete PSR-4 surface for `Vendor\Widget\` also covers every
+        // namespace below it, so walk back toward the root.
+        let mut candidate = namespace_fq;
+        loop {
+            let covered = Self::php_symbols_named(overlay, candidate)
+                .into_iter()
+                .any(|symbol| {
+                    symbol.kind == SemanticModelSymbolKind::Module
+                        && symbol.provenance.completeness == SemanticModelCompleteness::Complete
+                });
+            if covered {
+                return true;
+            }
+            match candidate.rsplit_once('.') {
+                Some((head, _)) => candidate = head,
+                None => return false,
+            }
+        }
+    }
+
+    fn declares_unindexed(&self, fqn: &str) -> bool {
+        self.evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.declares_module_path(fqn))
+    }
+
+    fn discovery_incomplete_reasons(&self) -> Vec<SemanticDiagnosticIncompleteReason> {
+        dependency_discovery_incomplete_reasons(self.evidence.as_deref())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::collect_php_semantic_diagnostics;
-    use crate::analyzer::{Language, PhpAnalyzer, ProjectFile, TestProject};
+    use crate::analyzer::{
+        Language, PhpAnalyzer, ProjectFile, SemanticDiagnostic, SemanticDiagnosticOutcome,
+        TestProject,
+    };
     use brokk_bifrost_php::diagnostics::{PHP_UNRECOGNIZED_MEMBER, PHP_UNRECOGNIZED_SYMBOL};
     use tempfile::TempDir;
 
@@ -42,7 +179,11 @@ mod tests {
             ProjectFile::new(self.root.clone(), rel_path)
         }
 
-        fn diagnostics_for(&self, rel_path: &str) -> Vec<super::PhpSemanticDiagnostic> {
+        fn diagnostics_for(&self, rel_path: &str) -> Vec<SemanticDiagnostic> {
+            self.report_for(rel_path).into_diagnostics()
+        }
+
+        fn report_for(&self, rel_path: &str) -> crate::analyzer::SemanticDiagnosticReport {
             let file = self.file(rel_path);
             let source = file.read_to_string().expect("read source");
             collect_php_semantic_diagnostics(&self.analyzer, &file, &source)
@@ -343,7 +484,10 @@ function run(): void {
     }
 
     #[test]
-    fn php_semantic_diagnostics_suppress_external_vendor_boundaries() {
+    fn php_semantic_diagnostics_record_an_unknown_vendor_boundary_without_erroring() {
+        // Nothing indexed `Vendor\Package` and no host ran Composer discovery,
+        // so the reference must stay silent -- but the report now says why
+        // instead of dropping the reference on the floor.
         let fixture = fixture(&[(
             "src/Service.php",
             r#"<?php
@@ -355,7 +499,53 @@ class Service {
 "#,
         )]);
 
-        let diagnostics = fixture.diagnostics_for("src/Service.php");
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let report = fixture.report_for("src/Service.php");
+
+        assert!(report.diagnostics().is_empty(), "{:#?}", report.outcomes());
+        assert!(
+            report.outcomes().iter().any(|outcome| matches!(
+                outcome,
+                SemanticDiagnosticOutcome::Incomplete { reasons, .. }
+                    if reasons.iter().any(|reason| matches!(
+                        reason,
+                        crate::analyzer::SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery { .. }
+                    ))
+            )),
+            "{:#?}",
+            report.outcomes()
+        );
+    }
+
+    #[test]
+    fn php_semantic_diagnostics_record_dynamic_behavior_instead_of_silence() {
+        let fixture = fixture(&[(
+            "src/Dynamic.php",
+            r#"<?php
+namespace App;
+
+class Anchor {}
+
+function run($target, $method, $className): void {
+    $target->$method();
+    new $className();
+}
+"#,
+        )]);
+
+        let report = fixture.report_for("src/Dynamic.php");
+
+        assert!(report.diagnostics().is_empty(), "{:#?}", report.outcomes());
+        assert!(
+            report.outcomes().iter().any(|outcome| matches!(
+                outcome,
+                SemanticDiagnosticOutcome::Incomplete { reasons, .. }
+                    if reasons.iter().any(|reason| matches!(
+                        reason,
+                        crate::analyzer::SemanticDiagnosticIncompleteReason::DynamicBehavior { .. }
+                    ))
+            )),
+            "{:#?}",
+            report.outcomes()
+        );
     }
 }
