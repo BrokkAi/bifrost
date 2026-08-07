@@ -256,6 +256,44 @@ fn installed_distribution_symbols_never_error() {
 }
 
 #[test]
+fn a_member_of_an_indexed_type_states_why_it_was_not_judged() {
+    // The owner of `theta.Klass.method` is a type, not a module surface.
+    // Proving a type's member absent needs the owner's whole inherited
+    // surface, which this pass does not resolve, so it says so rather than
+    // guessing either way.
+    let environment = Environment::new()
+        .standard_library_module("re.pyi", "def compile(pattern: str) -> str: ...\n")
+        .distribution(
+            "theta",
+            "theta",
+            true,
+            &[(
+                "__init__.pyi",
+                "class Klass:\n    def method(self) -> None: ...\n",
+            )],
+        );
+    let fixture = activate(
+        environment,
+        "import theta\n\n\ndef run():\n    return theta.Klass.method\n",
+    );
+
+    let report = fixture.report();
+    assert!(report.diagnostics().is_empty(), "{report:#?}");
+    assert!(
+        resolved_at(&report, BoundaryStatus::ExternalIndexed),
+        "the module and the type it declares both resolve: {report:#?}"
+    );
+    assert!(
+        incomplete_reasons(&report).iter().any(|reason| matches!(
+            reason,
+            SemanticDiagnosticIncompleteReason::UnsupportedSemantics { detail }
+                if detail.contains("not a module surface")
+        )),
+        "{report:#?}"
+    );
+}
+
+#[test]
 fn complete_stub_proves_a_missing_exported_name() {
     let environment = Environment::new()
         .standard_library_module("re.pyi", "def compile(pattern: str) -> str: ...\n");
