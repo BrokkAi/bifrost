@@ -63,6 +63,7 @@ mod reference_differential_backlog_test;
 mod ruby_dependency_semantic_pack;
 mod ruby_semantic_diagnostics;
 mod rust_dependency_semantic_pack;
+mod rust_semantic_diagnostics;
 mod scala_semantic_diagnostics;
 mod semantic_cfg_contract;
 mod semantic_diagnostic_proof_conformance;

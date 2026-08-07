@@ -2,8 +2,9 @@ mod adapter;
 mod cache;
 mod cargo_routes;
 mod clones;
+pub(crate) mod crate_identity;
 mod dependency_discovery;
-mod diagnostics;
+pub(crate) mod diagnostics;
 mod external;
 mod graph_support;
 mod hierarchy;
@@ -833,11 +834,7 @@ impl IAnalyzer for RustAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
-        let diagnostics = diagnostics::collect_rust_semantic_diagnostics(self, file, source)
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(file, diagnostics)
+        diagnostics::collect_rust_semantic_diagnostics(self, file, source)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
