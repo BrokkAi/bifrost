@@ -13,6 +13,10 @@ use brokk_bifrost::{
     RubyDependencyApiEvidence, RubyDependencyPackAdapter, RubyGemApiArtifact, WorkspaceAnalyzer,
     resolve_ruby_semantic_pack_dependencies,
 };
+use brokk_bifrost_analysis::analyzer::structural::BoundaryStatus;
+use brokk_bifrost_analysis::analyzer::{
+    SemanticDiagnosticIncompleteReason, SemanticDiagnosticOutcome,
+};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use semver::Version;
@@ -26,7 +30,10 @@ const LOCKFILE: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    widg
 fn exact_ruby_gem_prepares_activates_and_navigates_without_workspace_files() {
     let fixture = InlineTestProject::with_language(Language::Ruby)
         .file("Gemfile.lock", LOCKFILE)
-        .file("main.rb", "Widget.new.call('x')\n")
+        // Line 1 carries the navigation assertions below, which are line- and
+        // column-addressed. Line 2 is the constant path the diagnostics lane
+        // classifies against the same activated pack (#1624).
+        .file("main.rb", "Widget.new.call('x')\nWidget::Missing\n")
         .build();
     let archives = tempfile::tempdir().unwrap();
     let archive = gem_archive(&[
@@ -292,6 +299,33 @@ end
     );
     assert_eq!(usages.results[0].status, ScanUsagesStatus::Found);
     assert!(!usages.results[0].model_relations.is_empty());
+
+    // #1624: the diagnostics lane must find this gem's declarations under the
+    // identity the *real* producer minted from the archive's RBS, not merely
+    // under one an authored fixture agreed to. A verdict that named a missing
+    // dependency would mean the identity lookup missed the pack entirely.
+    let main = fixture.file("main.rb");
+    let main_source = project.read_source(&main).unwrap();
+    let report = analyzer
+        .analyzer()
+        .semantic_diagnostics(&main, &main_source);
+    let reached_the_pack = report.outcomes().iter().any(|outcome| match outcome {
+        SemanticDiagnosticOutcome::Absent(proof) => {
+            proof.boundary == BoundaryStatus::ExternalIndexed
+        }
+        SemanticDiagnosticOutcome::Incomplete { reasons, .. } => reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                SemanticDiagnosticIncompleteReason::UnsupportedSemantics { detail }
+                    if detail.contains("Widget")
+            )
+        }),
+        _ => false,
+    });
+    assert!(
+        reached_the_pack,
+        "`Widget::Missing` must be classified against the activated gem pack: {report:#?}"
+    );
 
     let (type_count, member_count, relation_count) = active
         .shards()
