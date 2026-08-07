@@ -41,6 +41,7 @@ mod cross_language_receiver_definition;
 mod cross_language_return_type_definition;
 mod cross_language_self_usages;
 mod language_reach_in_gate;
+mod member_dispatch_csharp;
 mod member_dispatch_php_ruby;
 mod structural_search_cross_language;
 mod structural_search_planner;
