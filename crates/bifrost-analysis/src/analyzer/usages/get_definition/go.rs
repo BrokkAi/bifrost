@@ -2390,6 +2390,13 @@ fn go_indexed_field_lookup_with_method_set(
         pointer_receivers: root_pointer_receivers,
         parent: None,
     }];
+    // Built only while a trace records (#1477): it mirrors the promotion paths
+    // this walk expands and the path each candidate is found on, and decides
+    // nothing.
+    let mut member_trace = trace::recording().then(GoPromotionTrace::default);
+    if let Some(state) = member_trace.as_mut() {
+        state.push_path(owner_fqn, None);
+    }
     let mut frontier = vec![0];
     while !frontier.is_empty() {
         let mut candidates = Vec::new();
@@ -2398,28 +2405,47 @@ fn go_indexed_field_lookup_with_method_set(
                 return GoDefinitionMemberLookup::Missing;
             }
             let path = &paths[path_index];
-            candidates.extend(
-                support
-                    .members_for_owner_name(&path.owner, field)
-                    .into_iter()
-                    .filter(|candidate| {
-                        path.pointer_receivers.is_none_or(|pointer_receivers| {
-                            go_member_in_method_set(analyzer, support, candidate, pointer_receivers)
-                        })
-                    }),
-            );
+            for candidate in support.members_for_owner_name(&path.owner, field) {
+                let verdict = match path.pointer_receivers {
+                    Some(pointer_receivers) => {
+                        go_member_in_method_set(analyzer, support, &candidate, pointer_receivers)
+                    }
+                    None => GoMethodSetVerdict::UNCHECKED,
+                };
+                if let Some(state) = member_trace.as_mut() {
+                    state.record(&candidate, path_index, verdict.interface_method());
+                }
+                if verdict.admits() {
+                    candidates.push(candidate);
+                } else if let (GoMethodSetVerdict::OutsideMethodSet, Some(state)) =
+                    (verdict, member_trace.as_ref())
+                {
+                    // The method-set filter computed this candidate and threw
+                    // it away; the row states that, with the same owner and
+                    // route an admitted candidate gets. An `Undecided` verdict
+                    // records nothing: the filter never reached a reason.
+                    state.record_rejection(analyzer, &candidate);
+                }
+            }
         }
         sort_units(&mut candidates);
         match candidates.len() {
             0 => {}
             1 => {
-                return GoDefinitionMemberLookup::Unique(
-                    candidates
-                        .pop()
-                        .expect("single Go member candidate was checked"),
-                );
+                let candidate = candidates
+                    .pop()
+                    .expect("single Go member candidate was checked");
+                if let Some(state) = member_trace.as_ref() {
+                    state.stage_selection(analyzer, std::slice::from_ref(&candidate));
+                }
+                return GoDefinitionMemberLookup::Unique(candidate);
             }
-            _ => return GoDefinitionMemberLookup::Ambiguous(candidates),
+            _ => {
+                if let Some(state) = member_trace.as_ref() {
+                    state.stage_selection(analyzer, &candidates);
+                }
+                return GoDefinitionMemberLookup::Ambiguous(candidates);
+            }
         }
         let mut next = Vec::new();
         for path_index in frontier {
@@ -2458,6 +2484,9 @@ fn go_indexed_field_lookup_with_method_set(
                     continue;
                 }
                 let embedded_index = paths.len();
+                if let Some(state) = member_trace.as_mut() {
+                    state.push_path(&embedded_owner, Some(path_index));
+                }
                 paths.push(PromotionPath {
                     owner: embedded_owner,
                     pointer_receivers: embedded_pointer_receivers,
@@ -2471,32 +2500,248 @@ fn go_indexed_field_lookup_with_method_set(
     GoDefinitionMemberLookup::Missing
 }
 
+/// What the Go method-set filter decided about one candidate.
+///
+/// A function candidate that declares no receiver is exactly an interface
+/// method element. The filter computes that to keep open dispatch visible, so
+/// `interface_method` is a fact it already holds rather than a second structure
+/// asked what kind of type the owner is.
+#[derive(Clone, Copy)]
+enum GoMethodSetVerdict {
+    /// The candidate is in the receiver's method set.
+    InMethodSet { interface_method: bool },
+    /// The candidate declares a pointer receiver, and the receiver this lookup
+    /// has is neither a pointer nor addressable, so the method is not in its
+    /// method set.
+    OutsideMethodSet,
+    /// The filter ran out of scope budget before it could decide. The candidate
+    /// is not admitted, and nothing may be claimed about why.
+    Undecided,
+}
+
+impl GoMethodSetVerdict {
+    /// The verdict for a lookup with no inferred receiver. The production walk
+    /// applies no method-set filter there, so it admits the candidate and
+    /// observes nothing about the candidate's receiver declaration.
+    const UNCHECKED: Self = Self::InMethodSet {
+        interface_method: false,
+    };
+
+    const fn admits(self) -> bool {
+        matches!(self, Self::InMethodSet { .. })
+    }
+
+    const fn interface_method(self) -> bool {
+        matches!(
+            self,
+            Self::InMethodSet {
+                interface_method: true
+            }
+        )
+    }
+}
+
 fn go_member_in_method_set(
     analyzer: &dyn IAnalyzer,
     support: &dyn GoDefinitionProvider,
     candidate: &CodeUnit,
     pointer_receivers: bool,
-) -> bool {
+) -> GoMethodSetVerdict {
     if !candidate.is_function() {
-        return true;
+        return GoMethodSetVerdict::UNCHECKED;
     }
     let mut saw_receiver = false;
     for metadata in support.signature_metadata(analyzer, candidate) {
         if !support.scope_step() {
-            return false;
+            return GoMethodSetVerdict::Undecided;
         }
         let Some(receiver) = metadata.extension_receiver_type_identity() else {
             continue;
         };
         saw_receiver = true;
         if !receiver.is_pointer() || pointer_receivers {
-            return true;
+            return GoMethodSetVerdict::InMethodSet {
+                interface_method: false,
+            };
         }
     }
     // Interface methods have no concrete receiver declaration. Their open
     // dispatch remains visible rather than being mistaken for a pointer-only
     // concrete method.
-    !saw_receiver
+    if saw_receiver {
+        GoMethodSetVerdict::OutsideMethodSet
+    } else {
+        GoMethodSetVerdict::InMethodSet {
+            interface_method: true,
+        }
+    }
+}
+
+/// The member attribution the Go promotion walk records while it runs (#1477).
+///
+/// [`go_indexed_field_lookup_with_method_set`] is a breadth-first walk over
+/// promotion paths, and every path already names the owner it searches and the
+/// path whose embedded field introduced it. This mirrors those two facts in the
+/// walk's own index order, plus the path each candidate was found on, so owner,
+/// depth and route are read off the walk instead of being rediscovered from its
+/// flattened result. It decides nothing.
+///
+/// Applicability stays `Unknown`: the walk selects by owner, name and method
+/// set and never inspects the call shape, so claiming anything else would
+/// invent a check the resolver did not perform (#1478).
+#[derive(Default)]
+struct GoPromotionTrace {
+    /// One entry per promotion path, in the walk's index order: the owner
+    /// fully-qualified name the path searches, and the path it was embedded in.
+    paths: Vec<(String, Option<usize>)>,
+    /// Candidate declaration -> the promotion path it was found on, and whether
+    /// the method-set filter proved it declares no receiver.
+    found: Vec<(CodeUnit, usize, bool)>,
+}
+
+impl GoPromotionTrace {
+    fn push_path(&mut self, owner_fqn: &str, parent: Option<usize>) {
+        self.paths.push((owner_fqn.to_owned(), parent));
+    }
+
+    /// First discovery wins, exactly as the breadth-first walk does: a name
+    /// reached at two depths is the shallower one's.
+    fn record(&mut self, candidate: &CodeUnit, path_index: usize, interface_method: bool) {
+        if self.found.iter().any(|(unit, ..)| unit == candidate) {
+            return;
+        }
+        self.found
+            .push((candidate.clone(), path_index, interface_method));
+    }
+
+    /// The promotion paths from the root owner to `path_index`, root first.
+    fn chain(&self, path_index: usize) -> Vec<usize> {
+        let mut chain = vec![path_index];
+        while let Some(parent) = self.paths[*chain.last().expect("a chain is never empty")].1 {
+            chain.push(parent);
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// The declaration `owner_fqn` names, read straight from the Go store.
+    ///
+    /// The read deliberately bypasses [`GoDefinitionProvider`]: a provider
+    /// lookup is charged against the resolution session's scope budget, so a
+    /// recording run would spend budget the untraced run does not and a request
+    /// near its limit could answer differently while recording. An owner name
+    /// that does not name exactly one declaration leaves the candidate
+    /// unattributed rather than attributed to a guess.
+    fn owner_unit(analyzer: &dyn IAnalyzer, owner_fqn: &str) -> Option<CodeUnit> {
+        let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+        let mut units: Vec<CodeUnit> = go.definitions(owner_fqn).collect();
+        sort_units(&mut units);
+        units.dedup();
+        (units.len() == 1).then(|| units.pop()).flatten()
+    }
+
+    /// The attribution for `candidate`, or `None` when an owner on its route
+    /// does not name exactly one declaration.
+    fn enrichment(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidate: &CodeUnit,
+    ) -> Option<trace::MemberEnrichment> {
+        use crate::analyzer::structural::{HierarchyRelation, MemberDispatchTier};
+        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
+        let (_, path_index, interface_method) =
+            self.found.iter().find(|(unit, ..)| unit == candidate)?;
+        let owners = self
+            .chain(*path_index)
+            .into_iter()
+            .map(|index| Self::owner_unit(analyzer, &self.paths[index].0))
+            .collect::<Option<Vec<CodeUnit>>>()?;
+        let depth = owners.len() - 1;
+        // Every hop this walk takes is a Go embedded field or embedded
+        // interface, which is the one relation the walk expands.
+        let route = owners
+            .windows(2)
+            .enumerate()
+            .map(|(hop, pair)| trace::HierarchyHopRecord {
+                hop,
+                from: pair[0].clone(),
+                to: pair[1].clone(),
+                relation: HierarchyRelation::Embedded,
+            })
+            .collect();
+        let dispatch_tier = if *interface_method {
+            MemberDispatchTier::TraitOrInterface
+        } else if depth == 0 {
+            MemberDispatchTier::InherentOrDirect
+        } else {
+            MemberDispatchTier::InheritedOrPromoted
+        };
+        Some(trace::MemberEnrichment {
+            owner: owners[depth].clone(),
+            hierarchy_depth: depth,
+            dispatch_tier,
+            applicability: ApplicabilityVerdict::Unknown,
+            route,
+        })
+    }
+
+    /// Stage attribution for the candidates the walk is about to return, for
+    /// the outcome constructor the caller reaches next.
+    fn stage_selection(&self, analyzer: &dyn IAnalyzer, winners: &[CodeUnit]) {
+        use crate::analyzer::structural::PrecedenceTier;
+
+        let by_fq_name: Vec<(String, trace::MemberEnrichment)> = winners
+            .iter()
+            .filter_map(|unit| {
+                self.enrichment(analyzer, unit)
+                    .map(|enrichment| (unit.fq_name(), enrichment))
+            })
+            .collect();
+        let winner_tier = by_fq_name
+            .iter()
+            .map(|(_, enrichment)| enrichment.hierarchy_depth)
+            .min()
+            .map(|depth| {
+                if depth == 0 {
+                    PrecedenceTier::OwnMember
+                } else {
+                    PrecedenceTier::InheritedMember
+                }
+            });
+        if let Some(tier) = winner_tier {
+            trace::stage_tier(tier, winners.iter().map(|unit| unit.fq_name()).collect());
+        }
+        trace::stage_member_context(by_fq_name);
+    }
+
+    /// Record a candidate the method-set filter computed and discarded.
+    ///
+    /// Go's method set is a declaration space: a method declared on `*T` is not
+    /// in `T`'s method set at all, which is what
+    /// [`RejectionReason::WrongDeclarationSpace`] names. It is not a visibility
+    /// rule and not a call-shape rule, so neither of those reasons applies.
+    fn record_rejection(&self, analyzer: &dyn IAnalyzer, candidate: &CodeUnit) {
+        use crate::analyzer::structural::{PrecedenceTier, RejectionReason};
+
+        let enrichment = self.enrichment(analyzer, candidate);
+        let tier = enrichment.as_ref().map(|enrichment| {
+            if enrichment.hierarchy_depth == 0 {
+                PrecedenceTier::OwnMember
+            } else {
+                PrecedenceTier::InheritedMember
+            }
+        });
+        let mut row = trace::TraceCandidate::rejected(
+            trace::TraceCandidateRef::Unit(candidate.clone()),
+            tier,
+            RejectionReason::WrongDeclarationSpace,
+        );
+        if let Some(enrichment) = enrichment {
+            row = row.with_member(enrichment);
+        }
+        trace::record(row);
+    }
 }
 
 fn go_embedded_method_set_types(

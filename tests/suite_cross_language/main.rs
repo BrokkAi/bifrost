@@ -21,6 +21,7 @@ mod code_query_edge_conformance;
 mod code_query_lexical_environment;
 mod code_query_materialization;
 mod code_query_member_dispatch;
+mod code_query_member_dispatch_go;
 mod code_query_member_dispatch_rust;
 mod code_query_member_dispatch_ts_python;
 mod code_query_member_family;
