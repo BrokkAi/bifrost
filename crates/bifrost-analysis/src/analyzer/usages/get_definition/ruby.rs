@@ -4,6 +4,7 @@ use crate::analyzer::RubyMethodDispatchMode;
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner_bounded;
 use crate::analyzer::ruby::{RubyFieldScope, RubyNamePath, ruby_field_short_name};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use brokk_bifrost_ruby::graph::resolver::{ReceiverType, RubyMethodFind};
 
 pub(crate) struct RubyDefinitionProvider<'a> {
     ruby: &'a RubyAnalyzer,
@@ -1297,13 +1298,33 @@ fn ruby_method_outcome(
         );
     };
 
-    let candidates = if call
+    let bare = call
         .and_then(|call| call.child_by_field_name("receiver"))
-        .is_none()
-    {
-        semantic.resolve_bare_method_candidates(support, visible_files, &receiver, member)
-    } else {
-        semantic.resolve_method_candidates(support, visible_files, &receiver, member)
+        .is_none();
+    // The traced entry points report where the winning group was found
+    // (#1477). An untraced lookup takes the plain ones and records nothing.
+    let mut find = None;
+    let candidates = match (bare, trace::recording()) {
+        (true, true) => semantic.resolve_bare_method_candidates_traced(
+            support,
+            visible_files,
+            &receiver,
+            member,
+            &mut find,
+        ),
+        (true, false) => {
+            semantic.resolve_bare_method_candidates(support, visible_files, &receiver, member)
+        }
+        (false, true) => semantic.resolve_method_candidates_traced(
+            support,
+            visible_files,
+            &receiver,
+            member,
+            &mut find,
+        ),
+        (false, false) => {
+            semantic.resolve_method_candidates(support, visible_files, &receiver, member)
+        }
     };
 
     if candidates.is_empty() {
@@ -1312,7 +1333,167 @@ fn ruby_method_outcome(
             format!("Ruby method `{member}` did not resolve to an indexed definition"),
         );
     }
+    if let Some(find) = find {
+        ruby_stage_member_attribution(
+            semantic,
+            support,
+            visible_files,
+            &receiver,
+            &find,
+            &candidates,
+        );
+    }
     candidates_outcome(candidates)
+}
+
+/// The route the Ruby method walk took from the receiver's own owner to the
+/// owner it found the winning group on (#1477).
+///
+/// `forward_ancestor_lookup_order` flattens its walk to a lookup order that no
+/// longer says which owner reached which. This repeats that walk over the same
+/// direct-ancestor edges, in the same order and with the same visited-set
+/// deduplication, and retains the first-discovery parent. It decides nothing:
+/// the production lookup consumed its own order unchanged.
+#[derive(Default)]
+struct RubyOwnerRoutes {
+    parents: HashMap<String, String>,
+}
+
+impl RubyOwnerRoutes {
+    fn build(
+        semantic: &RubySemanticIndex<'_>,
+        support: &dyn BoundedDefinitionLookup,
+        visible_files: &[ProjectFile],
+        base: &str,
+    ) -> Self {
+        let mut routes = Self::default();
+        let mut visited: HashSet<String> = HashSet::default();
+        visited.insert(base.to_owned());
+        let mut stack: Vec<(String, String)> = semantic
+            .direct_ancestor_owners(support, visible_files, base)
+            .into_iter()
+            .rev()
+            .map(|ancestor| (ancestor, base.to_owned()))
+            .collect();
+        while let Some((owner, parent)) = stack.pop() {
+            if !visited.insert(owner.clone()) {
+                continue;
+            }
+            routes.parents.insert(owner.clone(), parent);
+            let mut next = semantic.direct_ancestor_owners(support, visible_files, &owner);
+            next.reverse();
+            stack.extend(next.into_iter().map(|ancestor| (ancestor, owner.clone())));
+        }
+        routes
+    }
+
+    /// The owner chain from `base` to `owner`, `base` first. `None` when the
+    /// walk never reached `owner`, which leaves the candidates unattributed
+    /// rather than attributed to a route this seam cannot name.
+    fn chain(&self, base: &str, owner: &str) -> Option<Vec<String>> {
+        let mut chain = vec![owner.to_owned()];
+        while chain.last().is_some_and(|last| last != base) {
+            let parent = self
+                .parents
+                .get(chain.last().expect("chain is never empty"))?;
+            chain.push(parent.clone());
+        }
+        chain.reverse();
+        Some(chain)
+    }
+}
+
+/// Stage the attribution for the group the Ruby method lookup returned.
+///
+/// The lookup returns the first non-empty group it reaches, so one owner, one
+/// hop distance and one bucket describe every candidate in it.
+fn ruby_stage_member_attribution(
+    semantic: &RubySemanticIndex<'_>,
+    support: &dyn BoundedDefinitionLookup,
+    visible_files: &HashSet<ProjectFile>,
+    receiver: &ReceiverType,
+    find: &RubyMethodFind,
+    winners: &[CodeUnit],
+) {
+    use crate::analyzer::structural::{HierarchyRelation, MemberDispatchTier, PrecedenceTier};
+    use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
+    let visible: Vec<ProjectFile> = visible_files.iter().cloned().collect();
+    let routes = RubyOwnerRoutes::build(semantic, support, &visible, &receiver.owner_fq_name);
+    let Some(mut chain) = routes.chain(&receiver.owner_fq_name, &find.reached_from) else {
+        return;
+    };
+    // A mixin is one further edge off the ancestor the walk had reached.
+    if find.mixin.is_some() {
+        chain.push(find.owner.clone());
+    }
+    let mut units = Vec::with_capacity(chain.len());
+    for name in &chain {
+        let Some(unit) = semantic.owner_unit(support, &visible, name) else {
+            return;
+        };
+        units.push(unit);
+    }
+    let owner = units
+        .last()
+        .expect("the chain always names its owner")
+        .clone();
+    let mixin_hop = find.mixin.is_some().then(|| units.len() - 2);
+    let route: Vec<trace::HierarchyHopRecord> = units
+        .windows(2)
+        .enumerate()
+        .map(|(hop, pair)| trace::HierarchyHopRecord {
+            hop,
+            from: pair[0].clone(),
+            to: pair[1].clone(),
+            // A superclass edge is an extension. The hierarchy vocabulary has
+            // no mixin edge, so a composed-in module takes the
+            // undifferentiated one rather than claiming to be something else.
+            relation: if mixin_hop == Some(hop) {
+                HierarchyRelation::Supertype
+            } else {
+                HierarchyRelation::Extends
+            },
+        })
+        .collect();
+    let depth = route.len();
+    // A module composed in through include/prepend/extend is Ruby's
+    // trait/interface seam whichever side it was reached from; a class-side
+    // lookup that found the method on the class itself is the companion seam.
+    let dispatch_tier = match find.mixin {
+        Some(_) => MemberDispatchTier::TraitOrInterface,
+        None if find.class_side => MemberDispatchTier::StaticOrCompanion,
+        None if depth == 0 => MemberDispatchTier::InherentOrDirect,
+        None => MemberDispatchTier::InheritedOrPromoted,
+    };
+    trace::stage_tier(
+        if depth == 0 {
+            PrecedenceTier::OwnMember
+        } else {
+            PrecedenceTier::InheritedMember
+        },
+        winners.iter().map(CodeUnit::fq_name).collect(),
+    );
+    trace::stage_member_context(
+        winners
+            .iter()
+            .map(|unit| {
+                (
+                    unit.fq_name(),
+                    trace::MemberEnrichment {
+                        owner: owner.clone(),
+                        hierarchy_depth: depth,
+                        dispatch_tier,
+                        // The Ruby method lookup selects by owner, name and
+                        // dispatch mode and never inspects the call shape, so
+                        // the callable axis (#1478) stays unclaimed.
+                        applicability: ApplicabilityVerdict::Unknown,
+                        route: route.clone(),
+                    },
+                )
+            })
+            .collect(),
+    );
 }
 
 struct RubyLookupContext<'a> {

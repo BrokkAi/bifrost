@@ -406,9 +406,21 @@ fn resolve_php_with_session(
         }
         Some(PhpReferenceNode::StaticMember { scope, name }) => {
             let member = php_node_text(name, source).trim_start_matches('$');
+            // `self::`, `static::` and `parent::` spell the enclosing
+            // hierarchy rather than a named class's companion side, so only an
+            // explicitly named scope is the static access form.
+            let scope_text = php_node_text(scope, source);
+            let access = if ["self", "static", "parent"]
+                .into_iter()
+                .any(|keyword| scope_text.eq_ignore_ascii_case(keyword))
+            {
+                PhpMemberAccess::Instance
+            } else {
+                PhpMemberAccess::StaticScope
+            };
             let owner =
                 php_static_scope_fqn(php, support, scope, source, &ctx, &enclosing, session);
-            php_member_outcome(php, support, owner, member, session)
+            php_member_outcome(php, support, owner, member, access, session)
         }
         Some(PhpReferenceNode::InstanceMember { object, name }) => {
             let member = php_node_text(name, source).trim_start_matches('$');
@@ -426,7 +438,14 @@ fn resolve_php_with_session(
             let owner = php_instance_receiver_fqn(
                 php, analyzer, support, object, source, &enclosing, &bindings, &ctx, session,
             );
-            php_member_outcome(php, support, owner, member, session)
+            php_member_outcome(
+                php,
+                support,
+                owner,
+                member,
+                PhpMemberAccess::Instance,
+                session,
+            )
         }
         None => no_definition(
             "unsupported_php_reference_shape",
@@ -864,11 +883,25 @@ fn php_fqn_outcome(
     )
 }
 
+/// The access form the PHP resolver reached a member through.
+///
+/// PHP's `::` scope access is the language's own static/companion seam, and it
+/// is the one bucket fact the reference site itself states. Every other access
+/// takes its bucket from the owner the walk found the member on. The relative
+/// scopes (`self`, `static`, `parent`) are deliberately *not* static access
+/// here: they name the enclosing hierarchy, not a companion side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhpMemberAccess {
+    Instance,
+    StaticScope,
+}
+
 fn php_member_outcome(
     php: &PhpAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     owner: Option<String>,
     member: &str,
+    access: PhpMemberAccess,
     session: Option<&ResolutionSession>,
 ) -> DefinitionLookupOutcome {
     let Some(owner) = owner else {
@@ -879,11 +912,28 @@ fn php_member_outcome(
     };
     let fqn = format!("{owner}.{member}");
     let candidates = php_fqn_candidates(support, &fqn);
+    // Attribution is built only while a trace records (#1477); the walk itself
+    // consumes nothing from it.
+    let mut member_trace = trace::recording().then(|| PhpMemberTrace::rooted(support, &owner));
     if !candidates.is_empty() {
+        if let Some(state) = member_trace.as_mut() {
+            state.record_found(&candidates, &owner, 0);
+            state.stage(php, &candidates, access);
+        }
         return candidates_outcome(candidates);
     }
-    let inherited = php_inherited_member_candidates(php, support, &owner, member, session);
+    let inherited = php_inherited_member_candidates(
+        php,
+        support,
+        &owner,
+        member,
+        session,
+        member_trace.as_mut(),
+    );
     if !inherited.is_empty() {
+        if let Some(state) = member_trace.as_mut() {
+            state.stage(php, &inherited, access);
+        }
         return candidates_outcome(inherited);
     }
     // gated on the owner's workspace-namespace check fused into
@@ -904,24 +954,37 @@ fn php_inherited_member_candidates(
     owner_fqn: &str,
     member: &str,
     session: Option<&ResolutionSession>,
+    mut member_trace: Option<&mut PhpMemberTrace>,
 ) -> Vec<CodeUnit> {
     let mut seen = HashSet::default();
     let mut level = php_direct_member_owner_fqns(php, support, owner_fqn, session);
+    if let Some(state) = member_trace.as_deref_mut() {
+        state.record_level(owner_fqn, &level);
+    }
     seen.insert(owner_fqn.to_string());
+    let mut depth = 0usize;
     while !level.is_empty() {
+        depth += 1;
         let mut level_candidates = Vec::new();
         let mut next_level = Vec::new();
-        for ancestor in level {
+        for (ancestor, unit) in level {
             if session.is_some_and(|session| !session.scope_step()) {
                 return Vec::new();
             }
             if !seen.insert(ancestor.clone()) {
                 continue;
             }
-            level_candidates.extend(php_fqn_candidates(support, &format!("{ancestor}.{member}")));
-            next_level.extend(php_direct_member_owner_fqns(
-                php, support, &ancestor, session,
-            ));
+            let found = php_fqn_candidates(support, &format!("{ancestor}.{member}"));
+            if let Some(state) = member_trace.as_deref_mut() {
+                state.record_owner(&ancestor, unit);
+                state.record_found(&found, &ancestor, depth);
+            }
+            level_candidates.extend(found);
+            let expanded = php_direct_member_owner_fqns(php, support, &ancestor, session);
+            if let Some(state) = member_trace.as_deref_mut() {
+                state.record_level(&ancestor, &expanded);
+            }
+            next_level.extend(expanded);
         }
         sort_units(&mut level_candidates);
         level_candidates.dedup();
@@ -933,12 +996,18 @@ fn php_inherited_member_candidates(
     Vec::new()
 }
 
+/// The indexed direct ancestors of `owner_fqn`, each paired with the
+/// fully-qualified name the walk addresses it by.
+///
+/// The declaration travels with the name because the walk already holds it:
+/// the fq name is derived from that very unit, and the indexed-ness filter
+/// below is the same lookup the untraced walk always performed.
 fn php_direct_member_owner_fqns(
     php: &PhpAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     owner_fqn: &str,
     session: Option<&ResolutionSession>,
-) -> Vec<String> {
+) -> Vec<(String, CodeUnit)> {
     if session.is_some_and(|session| !session.summary_step()) {
         return Vec::new();
     }
@@ -952,9 +1021,195 @@ fn php_direct_member_owner_fqns(
     };
     ancestors
         .into_iter()
-        .map(|ancestor| ancestor.fq_name())
-        .filter(|ancestor| !php_fqn_candidates(support, ancestor).is_empty())
+        .filter_map(|ancestor| {
+            let fqn = ancestor.fq_name();
+            (!php_fqn_candidates(support, &fqn).is_empty()).then_some((fqn, ancestor))
+        })
         .collect()
+}
+
+/// The per-candidate attribution the PHP member walk records while it runs
+/// (#1477): which hierarchy owner each candidate was found on, at which BFS
+/// depth, and through which first-discovery parent chain.
+///
+/// It is an emission of facts the walk already holds. The walk decides nothing
+/// from it, and it is constructed only while [`trace::recording`] is true, so
+/// an untraced lookup allocates none of these maps.
+#[derive(Default)]
+struct PhpMemberTrace {
+    /// The receiver's own owner: the fq name the direct lookup asked about and,
+    /// where the workspace indexes it, its declaration. Without the
+    /// declaration there is no route base, so every candidate stays
+    /// unattributed rather than attributed to an owner this seam cannot name.
+    base_fqn: String,
+    base_unit: Option<CodeUnit>,
+    /// First-discovery parent of each ancestor fq name the walk expanded.
+    parents: HashMap<String, String>,
+    /// The indexed declaration each ancestor fq name on the walk names.
+    units: HashMap<String, CodeUnit>,
+    /// Candidate declaration -> (owner fq name it was found on, BFS depth).
+    found: HashMap<CodeUnit, (String, usize)>,
+}
+
+impl PhpMemberTrace {
+    fn rooted(support: &dyn BoundedDefinitionLookup, owner_fqn: &str) -> Self {
+        Self {
+            base_fqn: owner_fqn.to_owned(),
+            base_unit: php_fqn_candidates(support, owner_fqn).into_iter().next(),
+            ..Self::default()
+        }
+    }
+
+    /// Retain the first-discovery parent of every ancestor one expansion
+    /// produced, which is what makes the route a bounded walk back to the base.
+    fn record_level(&mut self, parent_fqn: &str, level: &[(String, CodeUnit)]) {
+        for (fqn, unit) in level {
+            self.parents
+                .entry(fqn.clone())
+                .or_insert_with(|| parent_fqn.to_owned());
+            self.units
+                .entry(fqn.clone())
+                .or_insert_with(|| unit.clone());
+        }
+    }
+
+    fn record_owner(&mut self, fqn: &str, unit: CodeUnit) {
+        self.units.entry(fqn.to_owned()).or_insert(unit);
+    }
+
+    fn record_found(&mut self, candidates: &[CodeUnit], owner_fqn: &str, depth: usize) {
+        for candidate in candidates {
+            self.found
+                .entry(candidate.clone())
+                .or_insert_with(|| (owner_fqn.to_owned(), depth));
+        }
+    }
+
+    /// The exact hierarchy route from the base owner to `owner_fqn`, as
+    /// first-discovery hops. PHP indexes `extends`, `implements` and `use`
+    /// through one undifferentiated raw-supertype list, so no hop may claim to
+    /// be more than [`HierarchyRelation::Supertype`].
+    fn route(&self, owner_fqn: &str, depth: usize) -> Option<Vec<trace::HierarchyHopRecord>> {
+        use crate::analyzer::structural::HierarchyRelation;
+
+        let base = self.base_unit.as_ref()?;
+        let mut chain = vec![owner_fqn.to_owned()];
+        while chain.last().is_some_and(|last| *last != self.base_fqn) {
+            let parent = self
+                .parents
+                .get(chain.last().expect("chain is never empty"))?;
+            chain.push(parent.clone());
+        }
+        chain.reverse();
+        debug_assert_eq!(
+            chain.len(),
+            depth + 1,
+            "the first-discovery chain must be exactly the walk's hop distance"
+        );
+        let mut route = Vec::with_capacity(depth);
+        for (hop, pair) in chain.windows(2).enumerate() {
+            let from = if pair[0] == self.base_fqn {
+                base.clone()
+            } else {
+                self.units.get(&pair[0])?.clone()
+            };
+            route.push(trace::HierarchyHopRecord {
+                hop,
+                from,
+                to: self.units.get(&pair[1])?.clone(),
+                relation: HierarchyRelation::Supertype,
+            });
+        }
+        Some(route)
+    }
+
+    /// The bucket a find belongs to.
+    ///
+    /// A `::` access is PHP's static/companion seam whatever the walk found,
+    /// and says so. Otherwise the owner's own declaration decides: a member
+    /// composed in from a trait or declared by an interface is the
+    /// trait/interface bucket, and a member of a base class is the inherited
+    /// one. Depth is the independent axis and is never folded into the bucket.
+    fn dispatch_tier(
+        &self,
+        php: &PhpAnalyzer,
+        owner: &CodeUnit,
+        depth: usize,
+        access: PhpMemberAccess,
+    ) -> crate::analyzer::structural::MemberDispatchTier {
+        use crate::analyzer::structural::MemberDispatchTier;
+        use brokk_bifrost_php::graph_support::php_is_trait;
+
+        if access == PhpMemberAccess::StaticScope {
+            return MemberDispatchTier::StaticOrCompanion;
+        }
+        if depth == 0 {
+            return MemberDispatchTier::InherentOrDirect;
+        }
+        if php_is_interface(php, owner) || php_is_trait(php, owner) {
+            MemberDispatchTier::TraitOrInterface
+        } else {
+            MemberDispatchTier::InheritedOrPromoted
+        }
+    }
+
+    fn enrichment(
+        &self,
+        php: &PhpAnalyzer,
+        candidate: &CodeUnit,
+        access: PhpMemberAccess,
+    ) -> Option<trace::MemberEnrichment> {
+        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
+        let (owner_fqn, depth) = self.found.get(candidate)?;
+        let owner = if *depth == 0 {
+            self.base_unit.clone()?
+        } else {
+            self.units.get(owner_fqn)?.clone()
+        };
+        let route = self.route(owner_fqn, *depth)?;
+        Some(trace::MemberEnrichment {
+            owner: owner.clone(),
+            hierarchy_depth: *depth,
+            dispatch_tier: self.dispatch_tier(php, &owner, *depth, access),
+            // The PHP member seams select by owner and name and never inspect
+            // the call shape, so the callable axis (#1478) stays unclaimed.
+            applicability: ApplicabilityVerdict::Unknown,
+            route,
+        })
+    }
+
+    /// Stage the attribution for the outcome constructor the caller is about to
+    /// reach. The PHP walk returns the whole level it first found candidates
+    /// on and discards nothing, so it records no rejected rows.
+    fn stage(&self, php: &PhpAnalyzer, winners: &[CodeUnit], access: PhpMemberAccess) {
+        use crate::analyzer::structural::PrecedenceTier;
+
+        let winner_tier = winners
+            .iter()
+            .filter_map(|unit| self.found.get(unit))
+            .map(|(_, depth)| *depth)
+            .min()
+            .map(|depth| {
+                if depth == 0 {
+                    PrecedenceTier::OwnMember
+                } else {
+                    PrecedenceTier::InheritedMember
+                }
+            });
+        if let Some(tier) = winner_tier {
+            trace::stage_tier(tier, winners.iter().map(CodeUnit::fq_name).collect());
+        }
+        trace::stage_member_context(
+            winners
+                .iter()
+                .filter_map(|unit| {
+                    self.enrichment(php, unit, access)
+                        .map(|enrichment| (unit.fq_name(), enrichment))
+                })
+                .collect(),
+        );
+    }
 }
 
 fn php_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn: &str) -> bool {
@@ -1574,7 +1829,10 @@ fn php_unique_member_candidate_bounded(
 ) -> Option<CodeUnit> {
     let mut candidates = php_fqn_candidates(support, &format!("{owner}.{member}"));
     if candidates.is_empty() {
-        candidates = php_inherited_member_candidates(php, support, owner, member, Some(session));
+        // A receiver-type probe, not the reference's own member answer: its
+        // candidates never become the outcome, so it stages no attribution.
+        candidates =
+            php_inherited_member_candidates(php, support, owner, member, Some(session), None);
     }
     candidates.retain(kind);
     sort_units(&mut candidates);
@@ -1724,7 +1982,9 @@ fn php_member_call_return_type_fqn(
     }
     let mut candidates = php_fqn_candidates(support, &format!("{owner}.{member}"));
     if candidates.is_empty() {
-        candidates = php_inherited_member_candidates(php, support, &owner, member, session);
+        // A return-type probe for a receiver, not the reference's own member
+        // answer, so it stages no attribution.
+        candidates = php_inherited_member_candidates(php, support, &owner, member, session, None);
     }
     candidates.retain(CodeUnit::is_function);
     sort_units(&mut candidates);

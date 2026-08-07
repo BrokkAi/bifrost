@@ -347,6 +347,26 @@ pub(crate) fn stage_member_context(by_fq_name: Vec<(String, MemberEnrichment)>) 
     });
 }
 
+/// The member attribution the walk that ran most recently staged, exactly as it
+/// staged it.
+///
+/// This is a read-back of one walk's own record, never a reconstruction: a
+/// language whose applicability filter runs *after* the member walk returned
+/// (Scala) needs the walk's owner, depth and route to state a rejected row for
+/// a candidate the walk attributed and the filter then discarded. The map is
+/// the walk's record, so reading it there reports the same facts the winner's
+/// row reports.
+pub(crate) fn staged_member_context() -> Vec<(String, MemberEnrichment)> {
+    with_recorder(|recorder| {
+        recorder
+            .pending_member
+            .as_ref()
+            .map(|pending| pending.by_fq_name.clone())
+            .unwrap_or_default()
+    })
+    .unwrap_or_default()
+}
+
 /// Take the staged member attribution for `unit` if the staged map names it.
 /// The whole map is dropped when the first consuming constructor's candidates
 /// do not intersect it, mirroring [`take_tier_for`].
