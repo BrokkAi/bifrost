@@ -51,7 +51,11 @@ pub(crate) fn resolve_enclosing_codeunits(analyzer: &dyn IAnalyzer, input: &str)
                     analyzer.lookup_candidates_by_identifier(terminal)
                 } else {
                     analyzer
-                        .search_definitions_with_literal(&pattern, terminal, language)
+                        .search_definitions_by_suffix_pattern(
+                            &pattern,
+                            &suffix_terminal_identifiers(owner_path),
+                            language,
+                        )
                         .into_iter()
                         .collect()
                 };
@@ -392,9 +396,11 @@ fn suffix_resolution_from_index(
             if pattern.is_empty() {
                 continue;
             }
-            let terminal = query_path.last().expect("non-empty suffix pattern path");
-            for candidate in analyzer.search_definitions_with_literal(&pattern, terminal, language)
-            {
+            for candidate in analyzer.search_definitions_by_suffix_pattern(
+                &pattern,
+                &suffix_terminal_identifiers(query_path),
+                language,
+            ) {
                 if code_unit_language(&candidate) != language || !include(&candidate) {
                     continue;
                 }
@@ -454,6 +460,34 @@ fn suffix_search_pattern(language: Language, query_path: &[String]) -> String {
     pattern.push_str(r"\$?");
     pattern.push('$');
     pattern
+}
+
+/// Every spelling of `query_path`'s tail that one persisted `identifier` value
+/// can hold, so a store can answer `suffix_search_pattern` by seeking its
+/// `(lang, identifier)` index instead of reading every declaration it has for
+/// the language (#1688).
+///
+/// The pattern accepts any of `. :: / \ + $` between segments, but a store
+/// segments `identifier` structurally, and the nesting sigils live *inside* a
+/// segment: `pkg.Foo$Bar` is one declaration named `Foo$Bar`, `N.Outer+Inner`
+/// one named `Outer+Inner`. Both alias back to the dotted spelling, because
+/// `parse_symbol_path` splits an indexed name on those sigils too, so both must
+/// be seekable. The pattern also admits a trailing sigil on the terminal (a
+/// scala object is indexed as `Foo$`), which every spelling can carry.
+fn suffix_terminal_identifiers(query_path: &[String]) -> Vec<String> {
+    const NESTING_SIGILS: [&str; 2] = ["$", "+"];
+
+    let terminal = query_path.last().expect("a suffix query path has segments");
+    let mut spellings = vec![terminal.clone()];
+    for tail_len in 2..=query_path.len() {
+        let tail = &query_path[query_path.len() - tail_len..];
+        spellings.extend(NESTING_SIGILS.iter().map(|sigil| tail.join(sigil)));
+    }
+    let sigil_free = spellings.len();
+    for index in 0..sigil_free {
+        spellings.push(format!("{}$", spellings[index]));
+    }
+    spellings
 }
 
 fn collect_fuzzy_matches(
@@ -920,7 +954,14 @@ fn is_symbol_path_delimiter_at(value: &str) -> bool {
 fn flush_segment(language: Language, current: &mut String, segments: &mut Vec<String>) {
     let trimmed = current.trim();
     if !trimmed.is_empty() {
-        segments.push(normalized_client_symbol_segment(language, trimmed));
+        // Normalization can consume a segment whole (`r#` alone is a bare raw-
+        // identifier escape with no identifier). An empty segment is not a name
+        // any index holds, and it would give the suffix stage a pattern with no
+        // terminal to seek on, so drop it here rather than downstream.
+        let normalized = normalized_client_symbol_segment(language, trimmed);
+        if !normalized.is_empty() {
+            segments.push(normalized);
+        }
     }
     current.clear();
 }

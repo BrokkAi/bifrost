@@ -655,22 +655,24 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
-    /// `search_definitions` for one language's non-literal `pattern` whose
-    /// every match is nevertheless guaranteed by the caller to contain
-    /// `required_literal` as a substring. Persisted stores use the literal as
-    /// a substring prefilter instead of regex-scanning the whole declaration
-    /// index, and multi-language workspaces route to `language`'s delegate
-    /// alone instead of fanning the query out to every delegate -- the
-    /// generated suffix patterns of symbol lookup are built per language and
-    /// always require their terminal segment verbatim, and the combination of
-    /// a whole-index regex scan fanned out per language pair made
-    /// unresolvable symbol targets take seconds (#1430, #1419).
-    /// Implementations that cannot exploit the hints fall back to a plain
-    /// `search_definitions`; callers must still filter candidates by language.
-    fn search_definitions_with_literal(
+    /// `search_definitions` for one language's suffix `pattern`, the shape
+    /// `symbol_lookup::suffix_search_pattern` builds: every fully-qualified
+    /// name the pattern can match *ends* at the query path's tail, on a
+    /// separator boundary. `terminal_identifiers`, from
+    /// `symbol_lookup::suffix_terminal_identifiers`, is every way one persisted
+    /// `identifier` value can spell that tail.
+    ///
+    /// That lets a persisted store answer with an index seek on
+    /// `code_units.identifier` instead of regex-scanning every declaration of
+    /// the language (#1688), and lets a multi-language workspace route to
+    /// `language`'s delegate alone instead of fanning the query out to every
+    /// delegate (#1430, #1419). Callers must still filter candidates by
+    /// language; implementations that cannot exploit the hints fall back to a
+    /// plain `search_definitions`.
+    fn search_definitions_by_suffix_pattern(
         &self,
         pattern: &str,
-        _required_literal: &str,
+        _terminal_identifiers: &[String],
         _language: Language,
     ) -> BTreeSet<CodeUnit> {
         self.search_definitions(pattern, false)

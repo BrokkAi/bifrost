@@ -1200,10 +1200,10 @@ impl IAnalyzer for MultiAnalyzer {
             })
     }
 
-    fn search_definitions_with_literal(
+    fn search_definitions_by_suffix_pattern(
         &self,
         pattern: &str,
-        required_literal: &str,
+        terminal_identifiers: &[String],
         language: Language,
     ) -> BTreeSet<CodeUnit> {
         // The pattern is language-specific, so only that language's delegate
@@ -1212,9 +1212,9 @@ impl IAnalyzer for MultiAnalyzer {
         self.delegates
             .get(&language)
             .map(|delegate| {
-                delegate.analyzer().search_definitions_with_literal(
+                delegate.analyzer().search_definitions_by_suffix_pattern(
                     pattern,
-                    required_literal,
+                    terminal_identifiers,
                     language,
                 )
             })

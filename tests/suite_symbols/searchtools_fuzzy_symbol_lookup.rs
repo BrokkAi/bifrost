@@ -1,7 +1,8 @@
-use crate::common::InlineTestProject;
+use crate::common::{BuiltInlineTestProject, InlineTestProject};
 use brokk_bifrost::{
-    CSharpAnalyzer, CancellationToken, CppAnalyzer, GoAnalyzer, IAnalyzer, JavaAnalyzer,
-    JavascriptAnalyzer, Language, PhpAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
+    AnalyzerConfig, CSharpAnalyzer, CancellationToken, CppAnalyzer, GoAnalyzer, IAnalyzer,
+    JavaAnalyzer, JavascriptAnalyzer, Language, PhpAnalyzer, RustAnalyzer, ScalaAnalyzer,
+    TypescriptAnalyzer,
     searchtools::{
         ScanUsagesByReferenceParams, ScanUsagesEntry, ScanUsagesResult, ScanUsagesStatus,
         SearchSymbolsParams, SymbolLookupParams, SymbolSourcesResult, get_symbol_ancestors,
@@ -2243,4 +2244,114 @@ fn source_for(analyzer: &dyn IAnalyzer, symbol: &str) -> SymbolSourcesResult {
             symbols: vec![symbol.to_string()],
         },
     )
+}
+
+/// A multi-language workspace whose Go target is spelled with a foreign owner
+/// separator, so the short-name stage of symbol lookup can only offer it as a
+/// *suffix* match and resolution falls through to the suffix-pattern stage.
+/// The PHP file keeps `has_complete_symbol_lookup_index` false workspace-wide,
+/// which is what let the pattern stage run at all on the measured corpora.
+fn issue_1688_multi_language_project() -> BuiltInlineTestProject {
+    InlineTestProject::new()
+        .file("go.mod", "module github.com/example/app\n\ngo 1.22\n")
+        .file(
+            "kvserver/replica.go",
+            "package kvserver\n\ntype Replica struct{}\n\nfunc (r *Replica) handleRaftReady() {}\n",
+        )
+        .file(
+            "analysis/summary.py",
+            "class Report:\n    def render(self):\n        return None\n",
+        )
+        .file(
+            "src/util.cpp",
+            "namespace util {\nvoid compute();\n}\nvoid util::compute() {}\n",
+        )
+        .file(
+            "src/Legacy.php",
+            "<?php\nnamespace App;\nclass Legacy {\n    public function run() {}\n}\n",
+        )
+        .build()
+}
+
+// Issue #1688: the suffix-pattern stage asked each language's store for
+// candidates by regex, which the store can only answer by reading every
+// declaration it holds for that language -- once per workspace language, for a
+// query that returns one unit. The stage now seeks the persisted terminal
+// identifier instead. The selector must resolve exactly as before, and no
+// language may pay a full declaration scan for it.
+#[test]
+fn issue_1688_qualified_go_selector_resolves_without_a_full_declaration_scan() {
+    let project = issue_1688_multi_language_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    analyzer.reset_full_declaration_scan_count_for_test();
+
+    let result = source_for(analyzer, "kvserver/Replica.handleRaftReady");
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert!(result.ambiguous.is_empty(), "{result:#?}");
+    assert_eq!(1, result.sources.len(), "{result:#?}");
+    assert_eq!("kvserver/replica.go", result.sources[0].path);
+    assert_eq!(
+        0,
+        analyzer.full_declaration_scan_count_for_test(),
+        "resolving one qualified selector must not read any language's whole declaration table"
+    );
+}
+
+// The same stage on a total miss: still conclusive, still no full scan.
+#[test]
+fn issue_1688_unresolvable_qualified_selector_stays_not_found() {
+    let project = issue_1688_multi_language_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    analyzer.reset_full_declaration_scan_count_for_test();
+
+    let result = source_for(analyzer, "kvserver/Replica.handleRaftNotReady");
+
+    assert!(result.sources.is_empty(), "{result:#?}");
+    assert!(result.ambiguous.is_empty(), "{result:#?}");
+    assert_eq!(1, result.not_found.len(), "{result:#?}");
+    assert_eq!(
+        "kvserver/Replica.handleRaftNotReady",
+        result.not_found[0].input
+    );
+}
+
+// A terminal identifier that two languages both persist must keep reporting the
+// same ambiguity it reported when the stage scanned: the seek narrows the
+// candidate set by terminal segment, which every match of the suffix pattern
+// carries by construction, so both languages' declarations still arrive.
+#[test]
+fn issue_1688_terminal_shared_across_languages_keeps_its_ambiguity() {
+    let project = InlineTestProject::new()
+        .file("go.mod", "module github.com/example/app\n\ngo 1.22\n")
+        .file(
+            "kvserver/replica.go",
+            "package kvserver\n\ntype Replica struct{}\n\nfunc (r *Replica) handleRaftReady() {}\n",
+        )
+        .file(
+            "src/replica.cpp",
+            "namespace kvserver {\nclass Replica {\npublic:\n    void handleRaftReady();\n};\nvoid Replica::handleRaftReady() {}\n}\n",
+        )
+        .file(
+            "src/Legacy.php",
+            "<?php\nnamespace App;\nclass Legacy {\n    public function run() {}\n}\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+
+    let result = source_for(analyzer, "Replica.handleRaftReady");
+
+    assert!(result.sources.is_empty(), "{result:#?}");
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert_eq!(1, result.ambiguous.len(), "{result:#?}");
+    assert_eq!(
+        vec![
+            "github.com/example/app/kvserver.Replica.handleRaftReady".to_string(),
+            "kvserver.Replica.handleRaftReady".to_string(),
+        ],
+        result.ambiguous[0].matches
+    );
 }

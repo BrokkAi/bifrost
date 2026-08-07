@@ -6524,19 +6524,79 @@ where
             .any(|unit| unit.package_name() == package)
     }
 
+    /// The persisted path of `search_definitions_by_suffix_pattern`. Its
+    /// contract (see `IAnalyzer`) is that every fully-qualified name `pattern`
+    /// can match ends at the query path's tail, and that
+    /// `terminal_identifiers` holds every way one persisted `identifier` can
+    /// spell that tail. `idx_code_units_lang_identifier_lookup` indexes
+    /// `(lang, identifier)`, so the candidate set is one seek per spelling
+    /// rather than the whole-table walk
+    /// `declaration_candidate_rows_by_pattern_for_langs` performs (#1688). On
+    /// the CodeScale shared cache that walk reads 8.3 M `cpp` rows, each with a
+    /// `WITHOUT ROWID` primary-key probe and a correlated active-blob EXISTS,
+    /// once per workspace language, to return a handful of units: 194 s for one
+    /// Go selector on Kubernetes, over 600 s on Firefox. The seeks answer the
+    /// same selectors in 12.9 s and 0.55 s.
+    ///
+    /// The compiled regex stays authoritative over what is returned. Two
+    /// candidate-set differences from the walk are deliberate:
+    ///
+    /// * `identifier IN (...)` is case sensitive while the regex is not, so the
+    ///   tail must be spelled in its indexed case. Every other indexed lookup
+    ///   `symbol_lookup` performs (`lookup_candidates_by_identifier`) already
+    ///   requires that, and the stage that runs before this one is one of them.
+    /// * The identifier index covers definition-lookup-only units as well as
+    ///   declarations (#1088), so this stage now sees the same membership as
+    ///   the short-name stage before it. `dirty_units_matching` widens to match,
+    ///   for the reason `lookup_declarations_by_identifier` widens: an unsaved
+    ///   edit must not make a unit less visible than its persisted counterpart.
+    fn sql_search_definitions_by_suffix_pattern(
+        &self,
+        pattern: &str,
+        terminal_identifiers: &[String],
+    ) -> Option<BTreeSet<CodeUnit>> {
+        assert!(
+            !pattern.is_empty() && !terminal_identifiers.is_empty(),
+            "suffix search needs a pattern and its terminal identifiers, got {pattern:?} and {terminal_identifiers:?}"
+        );
+        let _scope = crate::profiling::scope(format!(
+            "sql_search_definitions_by_suffix_pattern{terminal_identifiers:?}"
+        ));
+        let compiled = RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+            .ok()?;
+        let spellings: Vec<&str> = terminal_identifiers.iter().map(String::as_str).collect();
+        let rows = self.store_query_or_record(
+            self.store_context
+                .store
+                .declaration_candidate_rows_by_identifiers_for_langs(
+                    &self.storage_language_keys_for_queries(),
+                    self.store_context.generations.as_ref(),
+                    &spellings,
+                ),
+            format!("searching definitions with terminal identifiers {terminal_identifiers:?}"),
+        )?;
+        let mut out: BTreeSet<_> = self
+            .resolve_candidate_rows(rows)
+            .into_iter()
+            .filter(|unit| self.fq_pattern_matches(unit, &compiled))
+            .collect();
+        out.extend(
+            self.dirty_units_matching(true, |unit| self.fq_pattern_matches(unit, &compiled)),
+        );
+        out.extend(
+            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
+                self.fq_pattern_matches(unit, &compiled)
+            })?,
+        );
+        Some(out)
+    }
+
     fn sql_search_definitions(
         &self,
         pattern: &str,
         auto_quote: bool,
-    ) -> Option<BTreeSet<CodeUnit>> {
-        self.sql_search_definitions_with_literal(pattern, auto_quote, None)
-    }
-
-    fn sql_search_definitions_with_literal(
-        &self,
-        pattern: &str,
-        auto_quote: bool,
-        required_literal: Option<&str>,
     ) -> Option<BTreeSet<CodeUnit>> {
         if pattern.is_empty() {
             return Some(BTreeSet::new());
@@ -6556,12 +6616,9 @@ where
             .build()
             .ok()?;
         let storage_languages = self.storage_language_keys_for_queries();
-        // A bare-literal pattern is its own substring prefilter; otherwise a
-        // caller-supplied required literal serves the same role for patterns
-        // the caller proves always contain it (regex filtering below stays
-        // authoritative either way).
-        let substring_prefilter = literal_ascii_search_substring(&pattern)
-            .or_else(|| required_literal.and_then(literal_ascii_search_substring));
+        // A bare-literal pattern is its own substring prefilter (regex
+        // filtering below stays authoritative either way).
+        let substring_prefilter = literal_ascii_search_substring(&pattern);
         let _scope = crate::profiling::scope(format!(
             "sql_search_definitions[{pattern}][substring_prefilter={}]",
             substring_prefilter.is_some()
@@ -6585,6 +6642,13 @@ where
                 format!("searching definitions for `{pattern}`"),
             )?
         } else {
+            // Nothing in the pattern narrows the store, so it can only answer
+            // by reading every declaration of every language in play. Charge
+            // that as the full scan it is: symbol lookup must never land here
+            // (its suffix patterns carry their terminal identifiers and take
+            // the indexed path above), so a test can pin that with the counter.
+            self.full_declaration_scan_count
+                .fetch_add(1, Ordering::Relaxed);
             self.store_query_or_record(
                 self.store_context
                     .store
@@ -8391,13 +8455,13 @@ where
             .unwrap_or_default()
     }
 
-    fn search_definitions_with_literal(
+    fn search_definitions_by_suffix_pattern(
         &self,
         pattern: &str,
-        required_literal: &str,
+        terminal_identifiers: &[String],
         _language: Language,
     ) -> BTreeSet<CodeUnit> {
-        self.sql_search_definitions_with_literal(pattern, false, Some(required_literal))
+        self.sql_search_definitions_by_suffix_pattern(pattern, terminal_identifiers)
             .unwrap_or_default()
     }
 

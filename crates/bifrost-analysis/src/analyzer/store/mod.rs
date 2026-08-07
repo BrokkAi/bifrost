@@ -2501,24 +2501,48 @@ impl AnalyzerStore {
         generations: &HashMap<String, GenerationId>,
         identifier: &str,
     ) -> Result<Vec<CandidateRow>> {
+        self.declaration_candidate_rows_by_identifiers_for_langs(langs, generations, &[identifier])
+    }
+
+    /// The several-spelling form of the above, for the suffix-pattern stage of
+    /// symbol lookup: one query path can be spelled by more than one persisted
+    /// `identifier` (`Foo.Bar` also matches the declaration indexed as
+    /// `Foo$Bar`), and an `IN` list seeks the same `(lang, identifier)` index
+    /// once per spelling instead of reading the whole declaration table once
+    /// per language (#1688).
+    pub(crate) fn declaration_candidate_rows_by_identifiers_for_langs(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        identifiers: &[&str],
+    ) -> Result<Vec<CandidateRow>> {
+        assert!(
+            !identifiers.is_empty(),
+            "a suffix query path always spells at least its terminal segment"
+        );
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        // `?1` is the language, so the spellings start at `?2`.
+        let placeholders = (0..identifiers.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
         let sql = candidate_rows_sql_with_membership(
             "units",
             "FROM code_units AS units
              JOIN blob_meta AS meta
                ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
-            "units.lang = ?1 AND units.identifier = ?2",
+            &format!("units.lang = ?1 AND units.identifier IN ({placeholders})"),
             "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
             "units.blob_oid, units.unit_key",
         );
-        let rows = candidate_rows_for_languages(
-            &tx,
-            langs.iter().map(String::as_str),
-            &sql,
-            &[&identifier],
-        )?;
+        let values: Vec<&dyn ToSql> = identifiers
+            .iter()
+            .map(|identifier| identifier as &dyn ToSql)
+            .collect();
+        let rows =
+            candidate_rows_for_languages(&tx, langs.iter().map(String::as_str), &sql, &values)?;
         tx.commit()?;
         Ok(rows)
     }
