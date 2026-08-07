@@ -26,10 +26,15 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::CallArgumentGroup { .. }
                 | CodeQueryResultValue::CallArgument { .. }
                 | CodeQueryResultValue::MemberSelection { .. }
+                | CodeQueryResultValue::DispatchOutcome { .. }
+                | CodeQueryResultValue::DispatchTarget { .. }
+                | CodeQueryResultValue::MemberFamily { .. }
+                | CodeQueryResultValue::MemberFamilyEdge { .. }
                 | CodeQueryResultValue::Occurrence { .. }
                 | CodeQueryResultValue::LexicalScope { .. }
                 | CodeQueryResultValue::Binding { .. }
                 | CodeQueryResultValue::ResolutionCandidate { .. }
+                | CodeQueryResultValue::CandidateHop { .. }
                 | CodeQueryResultValue::GenerationSite { .. }
                 | CodeQueryResultValue::Export { .. }
                 | CodeQueryResultValue::DeclarationState { .. }
@@ -266,6 +271,81 @@ impl CodeQueryResult {
                             value.id
                         ));
                     }
+                    CodeQueryResultValue::DispatchOutcome { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [dispatch outcome; {}; {}] calls={}; targets={}{}; site={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.outcome,
+                            value.coverage,
+                            value.call_site_count,
+                            value.target_count,
+                            if value.targets_truncated {
+                                " (truncated)"
+                            } else {
+                                ""
+                            },
+                            value.site_id
+                        ));
+                    }
+                    CodeQueryResultValue::DispatchTarget { value } => {
+                        out.push_str(&format!(
+                            "[dispatch target {}; {}; {}; {}; {}] {} -> {}; site={}\n",
+                            value.ordinal,
+                            value.dispatch,
+                            value.proof,
+                            value.completeness,
+                            value.coverage,
+                            value.boundary_kind.unwrap_or("candidate"),
+                            value
+                                .target_declaration
+                                .as_ref()
+                                .map_or(value.target_path.as_str(), |unit| unit.fq_name.as_str()),
+                            value.site_id
+                        ));
+                    }
+                    CodeQueryResultValue::MemberFamily { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [member family; {}; {}] {}overrides={}; implements={}; overridden_by={}; implemented_by={}{}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.outcome,
+                            value.coverage,
+                            value
+                                .reason
+                                .map(|reason| format!("{reason}; "))
+                                .unwrap_or_default(),
+                            value.overrides_count,
+                            value.implements_count,
+                            value.overridden_by_count,
+                            value.implemented_by_count,
+                            value
+                                .family_id
+                                .as_deref()
+                                .map(|id| format!("; family={id}"))
+                                .unwrap_or_default(),
+                        ));
+                    }
+                    CodeQueryResultValue::MemberFamilyEdge { value } => {
+                        out.push_str(&format!(
+                            "[family edge {}; {}; {}; {}] {} -> {}; depth={}\n",
+                            value.ordinal,
+                            value.relation,
+                            value.proof,
+                            value.coverage,
+                            value
+                                .source
+                                .as_ref()
+                                .map_or(value.path.as_str(), |unit| unit.fq_name.as_str()),
+                            value
+                                .target
+                                .as_ref()
+                                .map_or(value.target_id.as_str(), |unit| unit.fq_name.as_str()),
+                            value.hierarchy_depth,
+                        ));
+                    }
                     CodeQueryResultValue::CallShape { value } => {
                         out.push_str(&format!(
                             "{}:{}:{} [call shape; {}; {}] groups={}; site={}\n",
@@ -445,6 +525,38 @@ impl CodeQueryResult {
                             "  boundary {}, trace {}\n",
                             value.boundary, value.trace_completeness
                         ));
+                        if let (Some(owner), Some(depth), Some(tier), Some(applicability)) = (
+                            value.owner.as_ref(),
+                            value.hierarchy_depth,
+                            value.dispatch_tier,
+                            value.applicability,
+                        ) {
+                            out.push_str(&format!(
+                                "  owner {} at depth {depth}, tier {tier}, {applicability}\n",
+                                owner.fq_name,
+                            ));
+                        }
+                    }
+                    CodeQueryResultValue::CandidateHop { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [candidate_hop] hop {}: {} -> {} ({})\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.hop,
+                            value
+                                .from
+                                .as_ref()
+                                .map(|unit| unit.fq_name.as_str())
+                                .unwrap_or("<unlocatable>"),
+                            value
+                                .to
+                                .as_ref()
+                                .map(|unit| unit.fq_name.as_str())
+                                .unwrap_or("<unlocatable>"),
+                            value.relation,
+                        ));
+                        out.push_str(&format!("  candidate {}\n", value.candidate_id));
                     }
                     CodeQueryResultValue::ReferenceEdge { value } => {
                         out.push_str(&format!(

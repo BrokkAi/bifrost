@@ -818,6 +818,42 @@ fn evaluate_relational_assertion_policy(
                         binding_queries.push(query);
                         continue;
                     }
+                    RowExpansionStep::DispatchOutcome | RowExpansionStep::DispatchTargets => {
+                        // Both dispatch steps consume the same site rows the
+                        // source binding already produced, so the expansion is
+                        // one appended step, not a second query.
+                        let mut query = binding_queries[source_index].clone();
+                        query.plan.steps.push(match step {
+                            RowExpansionStep::DispatchOutcome => QueryStep::DispatchOutcome,
+                            _ => QueryStep::DispatchTargets,
+                        });
+                        binding_index_by_name.insert(&binding.name, index);
+                        binding_queries.push(query);
+                        continue;
+                    }
+                    RowExpansionStep::MemberFamily | RowExpansionStep::FamilyEdges => {
+                        // Both family steps consume the member declaration rows
+                        // the source binding already produced, so the expansion
+                        // is one appended step rather than a second query.
+                        let mut query = binding_queries[source_index].clone();
+                        query.plan.steps.push(match step {
+                            RowExpansionStep::MemberFamily => QueryStep::MemberFamily,
+                            _ => QueryStep::FamilyEdges,
+                        });
+                        binding_index_by_name.insert(&binding.name, index);
+                        binding_queries.push(query);
+                        continue;
+                    }
+                    RowExpansionStep::CandidateHierarchy => {
+                        // The hierarchy-hop projection consumes the same
+                        // occurrence rows the candidate trace consumes, for
+                        // the same reason.
+                        let mut query = binding_queries[source_index].clone();
+                        query.plan.steps.push(QueryStep::CandidateHierarchy);
+                        binding_index_by_name.insert(&binding.name, index);
+                        binding_queries.push(query);
+                        continue;
+                    }
                     other => {
                         return failed_policy_run(
                             policy,
@@ -860,12 +896,24 @@ fn evaluate_relational_assertion_policy(
     let mut executed = Vec::with_capacity(binding_queries.len());
     let mut total_work: Option<CodeQueryExecutionWork> = None;
     for query in &binding_queries {
-        let outcome = execute_code_query_detailed_eager_index(
-            context.analyzer,
-            query,
-            budget.query_limits(),
-            context.cancellation,
-        );
+        // A binding that expands into a semantic row family (the #1477
+        // dispatch rows) needs the generation-bound workspace oracles. Use
+        // them whenever the evaluation context carries a workspace; the
+        // analyzer-only path stays exactly as it was otherwise.
+        let outcome = match context.workspace {
+            Some(workspace) => execute_code_query_detailed_eager_index_workspace(
+                workspace,
+                query,
+                budget.query_limits(),
+                context.cancellation,
+            ),
+            None => execute_code_query_detailed_eager_index(
+                context.analyzer,
+                query,
+                budget.query_limits(),
+                context.cancellation,
+            ),
+        };
         run_incomplete.extend(incomplete_reasons(
             &outcome.result.completion(),
             outcome.result.truncated,

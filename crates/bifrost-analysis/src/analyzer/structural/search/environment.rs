@@ -25,11 +25,12 @@ use super::super::occurrences::OccurrenceRole;
 use super::super::query::{BindingFilter, CandidateFilter, ScopeFilter};
 use super::super::resolution::EnvironmentAxis;
 use super::results::{
-    CodeQueryBinding, CodeQueryCandidateRef, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
-    CodeQueryDiagnosticImpact, CodeQueryImportBinder, CodeQueryLexicalScope, CodeQueryRange,
-    CodeQueryResolutionCandidate,
+    CodeQueryBinding, CodeQueryCandidateHop, CodeQueryCandidateRef, CodeQueryDeclaration,
+    CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryImportBinder,
+    CodeQueryLexicalScope, CodeQueryRange, CodeQueryResolutionCandidate,
 };
 use crate::analyzer::semantic::LengthDelimitedDigest;
+use crate::analyzer::usages::get_definition::trace::HierarchyHopRecord;
 use crate::analyzer::usages::get_definition::{
     ResolutionTraceResult, TraceCandidate, TraceCandidateRef,
 };
@@ -44,6 +45,8 @@ const SCOPE_ID_DOMAIN: &[u8] = b"bifrost.code_query.lexical_scope.v1";
 const BINDING_ID_DOMAIN: &[u8] = b"bifrost.code_query.binding.v1";
 /// Domain separator for a resolution-candidate row's stable id.
 const CANDIDATE_ID_DOMAIN: &[u8] = b"bifrost.code_query.resolution_candidate.v1";
+/// Domain separator for a candidate-hierarchy hop row's stable id.
+const CANDIDATE_HOP_ID_DOMAIN: &[u8] = b"bifrost.code_query.candidate_hop.v1";
 
 /// Per-request memo of derived environments plus the diagnostics already
 /// reported, so one file is derived once and one axis gap is reported once.
@@ -341,13 +344,74 @@ impl CandidateValue {
     }
 
     pub(super) fn id(&self) -> String {
-        let mut digest = LengthDelimitedDigest::new(CANDIDATE_ID_DOMAIN);
+        candidate_row_id(&self.occurrence, self.ordinal)
+    }
+}
+
+/// The stable id of one resolution-candidate row.
+///
+/// Hop rows derive their `candidate_id` through this same function rather than
+/// through a parallel scheme, so `candidate_hop.candidate_id` is string-equal
+/// to the `resolution_candidate.id` of the candidate the hop belongs to and an
+/// RQLP join between the two domains lands.
+fn candidate_row_id(occurrence: &OccurrenceRow, ordinal: usize) -> String {
+    let mut digest = LengthDelimitedDigest::new(CANDIDATE_ID_DOMAIN);
+    digest.push(occurrence.content_identity.as_bytes());
+    digest.push(&occurrence.node.to_le_bytes());
+    digest.push(occurrence.role.label().as_bytes());
+    digest.push(&ordinal.to_le_bytes());
+    digest.finish().to_string()
+}
+
+/// One hierarchy hop of one traced member candidate, travelling through the
+/// pipeline.
+#[derive(Debug, Clone)]
+pub(super) struct CandidateHopValue {
+    /// The reference occurrence whose resolution the owning candidate explains.
+    pub(super) occurrence: Arc<OccurrenceRow>,
+    /// The owning candidate's ordinal in its reference's trace, which is what
+    /// makes `candidate_id` equal to that candidate row's own id.
+    pub(super) ordinal: usize,
+    pub(super) hop: Arc<HierarchyHopRecord>,
+}
+
+impl CandidateHopValue {
+    pub(super) fn key(&self) -> CandidateHopKey {
+        CandidateHopKey {
+            file: self.occurrence.file.clone(),
+            node: self.occurrence.node,
+            role: self.occurrence.role,
+            ordinal: self.ordinal,
+            hop: self.hop.hop,
+        }
+    }
+
+    pub(super) fn file(&self) -> &ProjectFile {
+        &self.occurrence.file
+    }
+
+    pub(super) fn id(&self) -> String {
+        let mut digest = LengthDelimitedDigest::new(CANDIDATE_HOP_ID_DOMAIN);
         digest.push(self.occurrence.content_identity.as_bytes());
         digest.push(&self.occurrence.node.to_le_bytes());
         digest.push(self.occurrence.role.label().as_bytes());
         digest.push(&self.ordinal.to_le_bytes());
+        digest.push(&self.hop.hop.to_le_bytes());
         digest.finish().to_string()
     }
+
+    pub(super) fn candidate_id(&self) -> String {
+        candidate_row_id(&self.occurrence, self.ordinal)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct CandidateHopKey {
+    pub(super) file: ProjectFile,
+    pub(super) node: u32,
+    pub(super) role: OccurrenceRole,
+    pub(super) ordinal: usize,
+    pub(super) hop: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -448,9 +512,11 @@ pub(super) fn public_candidate(
     range: CodeQueryRange,
     candidate: CodeQueryCandidateRef,
     canonical_member_id: Option<String>,
+    owner: Option<CodeQueryDeclaration>,
 ) -> CodeQueryResolutionCandidate {
     let row = &value.occurrence;
     let trace = &value.candidate;
+    let member = trace.member.as_deref();
     CodeQueryResolutionCandidate {
         id: value.id(),
         ast_id: row.ast_id(),
@@ -469,6 +535,35 @@ pub(super) fn public_candidate(
         candidate,
         external_target: trace.external_target.clone(),
         canonical_member_id,
+        owner,
+        hierarchy_depth: member.map(|member| member.hierarchy_depth),
+        dispatch_tier: member.map(|member| member.dispatch_tier.label()),
+        applicability: member.map(|member| member.applicability.label()),
+    }
+}
+
+/// The public projection of one hierarchy-hop row, minus the declaration
+/// rendering its endpoints need, which only the engine can do.
+pub(super) fn public_candidate_hop(
+    value: &CandidateHopValue,
+    range: CodeQueryRange,
+    from: Option<CodeQueryDeclaration>,
+    to: Option<CodeQueryDeclaration>,
+) -> CodeQueryCandidateHop {
+    let row = &value.occurrence;
+    CodeQueryCandidateHop {
+        id: value.id(),
+        candidate_id: value.candidate_id(),
+        ast_id: row.ast_id(),
+        path: super::rel_path_string(&row.file),
+        language: crate::analyzer::common::language_for_file(&row.file).config_label(),
+        range,
+        start_byte: row.range.start_byte,
+        end_byte: row.range.end_byte,
+        hop: value.hop.hop,
+        relation: value.hop.relation.label(),
+        from,
+        to,
     }
 }
 

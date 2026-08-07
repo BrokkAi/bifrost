@@ -1,5 +1,7 @@
 use super::*;
 
+use brokk_bifrost_core::analyzer::structural::resolution::MethodFamilyRelation;
+
 pub(super) fn insert_pipeline_row(
     rows: &mut Vec<PipelineRow>,
     indexes: &mut HashMap<PipelineKey, usize>,
@@ -100,6 +102,21 @@ pub(super) fn render_pipeline_item(
         },
         PipelineValue::ResolutionCandidate(value) => CodeQueryResultValue::ResolutionCandidate {
             value: Box::new(render_resolution_candidate(analyzer, &value, detail, cache)),
+        },
+        PipelineValue::CandidateHop(value) => CodeQueryResultValue::CandidateHop {
+            value: Box::new(render_candidate_hop(analyzer, &value, detail, cache)),
+        },
+        PipelineValue::DispatchOutcome(value) => CodeQueryResultValue::DispatchOutcome {
+            value: Box::new(render_dispatch_outcome(analyzer, &value, cache)),
+        },
+        PipelineValue::DispatchTarget(value) => CodeQueryResultValue::DispatchTarget {
+            value: Box::new(render_dispatch_target(analyzer, &value, detail, cache)),
+        },
+        PipelineValue::MemberFamily(value) => CodeQueryResultValue::MemberFamily {
+            value: Box::new(render_member_family(analyzer, &value, detail, cache)),
+        },
+        PipelineValue::MemberFamilyEdge(value) => CodeQueryResultValue::MemberFamilyEdge {
+            value: Box::new(render_member_family_edge(analyzer, &value, detail, cache)),
         },
         PipelineValue::GenerationSite(value) => CodeQueryResultValue::GenerationSite {
             value: Box::new(render_generation_site(analyzer, &value, cache)),
@@ -217,6 +234,21 @@ pub(super) fn render_provenance(
                     }
                     PipelineTraceValue::ResolutionCandidate(value) => {
                         render_candidate_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::CandidateHop(value) => {
+                        render_candidate_hop_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::DispatchOutcome(value) => {
+                        render_dispatch_outcome_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::DispatchTarget(value) => {
+                        render_dispatch_target_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::MemberFamily(value) => {
+                        render_member_family_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::MemberFamilyEdge(value) => {
+                        render_member_family_edge_ref(analyzer, value, cache)
                     }
                     PipelineTraceValue::ReferenceEdge(value) => {
                         render_edge_ref(analyzer, value, cache)
@@ -583,17 +615,9 @@ pub(super) fn render_resolution_candidate(
     let range = render_source_range(analyzer, &occurrence.file, &occurrence.range, cache);
     let candidate = match &value.candidate.candidate {
         TraceCandidateRef::Unit(unit) => {
-            let declaration = analyzer
-                .ranges_of(unit)
-                .into_iter()
-                .min_by_key(primary_range_key)
-                .map(|range| DeclarationValue {
-                    unit: unit.clone(),
-                    range,
-                });
-            match declaration {
+            match render_unit_declaration(analyzer, unit, detail, cache) {
                 Some(declaration) => CodeQueryCandidateRef::Unit {
-                    unit: Box::new(render_declaration(analyzer, &declaration, detail, cache)),
+                    unit: Box::new(declaration),
                 },
                 // A candidate whose unit the workspace can no longer locate is
                 // reported as an external route rather than dropped: the
@@ -635,7 +659,255 @@ pub(super) fn render_resolution_candidate(
     };
     let canonical_member_id = environment::candidate_unit(&value.candidate.candidate)
         .map(|unit| canonical_member_digest(analyzer, unit));
-    environment::public_candidate(value, range, candidate, canonical_member_id)
+    let owner = value
+        .candidate
+        .member
+        .as_ref()
+        .and_then(|member| render_unit_declaration(analyzer, &member.owner, detail, cache));
+    environment::public_candidate(value, range, candidate, canonical_member_id, owner)
+}
+
+/// The mandatory dispatch outcome row of one site.
+pub(super) fn render_dispatch_outcome(
+    analyzer: &dyn IAnalyzer,
+    value: &DispatchSiteValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryDispatchOutcome {
+    let answer = &value.answer;
+    CodeQueryDispatchOutcome {
+        id: value.site_id.clone(),
+        site_id: value.site_id.clone(),
+        site_ast_id: value.site_ast_id.clone(),
+        path: rel_path_string(&value.file),
+        language: crate::analyzer::common::language_for_file(&value.file).config_label(),
+        range: render_source_range(analyzer, &value.file, &value.range, cache),
+        outcome: answer.outcome,
+        coverage: answer.coverage.label(),
+        call_site_count: answer.call_site_count,
+        target_count: answer.arms.len(),
+        targets_truncated: answer.coverage.is_truncated(),
+        semantic_unsupported: answer.semantic_unsupported,
+        exceeded_limit: answer.exceeded_limit,
+    }
+}
+
+/// One bounded dispatch arm of one site.
+///
+/// The target declaration is rendered through the same `render_unit_declaration`
+/// the candidate and hop rows use, so a dispatch target and a member candidate
+/// naming the same declaration render identically.
+pub(super) fn render_dispatch_target(
+    analyzer: &dyn IAnalyzer,
+    value: &DispatchTargetValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryDispatchTarget {
+    let site = &value.site;
+    let arm = value.arm();
+    CodeQueryDispatchTarget {
+        id: value.id(),
+        site_id: site.site_id.clone(),
+        site_ast_id: site.site_ast_id.clone(),
+        path: rel_path_string(&site.file),
+        ordinal: value.ordinal,
+        target_id: arm.target_id.clone(),
+        target_path: arm.target_path.clone(),
+        target_declaration: arm
+            .target_unit
+            .as_ref()
+            .and_then(|unit| render_unit_declaration(analyzer, unit, detail, cache)),
+        proof: arm.proof,
+        completeness: arm.completeness,
+        coverage: site.answer.coverage.label(),
+        dispatch: site.answer.dispatch_label(arm),
+        boundary_kind: arm.boundary_kind,
+    }
+}
+
+pub(super) fn render_dispatch_outcome_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &DispatchSiteValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    CodeQueryResultRef::DispatchOutcome {
+        id: value.site_id.clone(),
+        site_id: value.site_id.clone(),
+        path: rel_path_string(&value.file),
+        range: render_source_range(analyzer, &value.file, &value.range, cache),
+        outcome: value.answer.outcome,
+        coverage: value.answer.coverage.label(),
+    }
+}
+
+pub(super) fn render_dispatch_target_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &DispatchTargetValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let site = &value.site;
+    CodeQueryResultRef::DispatchTarget {
+        id: value.id(),
+        site_id: site.site_id.clone(),
+        path: rel_path_string(&site.file),
+        range: render_source_range(analyzer, &site.file, &site.range, cache),
+        ordinal: value.ordinal,
+        dispatch: site.answer.dispatch_label(value.arm()),
+    }
+}
+
+/// The mandatory method-family outcome row of one member.
+pub(super) fn render_member_family(
+    analyzer: &dyn IAnalyzer,
+    value: &MemberFamilyValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryMemberFamily {
+    let answer = &value.answer;
+    let count = |relation: MethodFamilyRelation| {
+        value
+            .edges
+            .iter()
+            .filter(|edge| edge.relation == relation)
+            .count()
+    };
+    let file = value.file();
+    CodeQueryMemberFamily {
+        id: value.id(),
+        member_id: value.member_id.clone(),
+        path: rel_path_string(file),
+        language: crate::analyzer::common::language_for_file(file).config_label(),
+        range: render_source_range(analyzer, file, &value.member.range, cache),
+        member: render_unit_declaration(analyzer, &value.member.unit, detail, cache),
+        outcome: answer.outcome.label(),
+        reason: answer.reason.map(|reason| reason.label()),
+        capability: answer.capability.label(),
+        coverage: member_family::family_coverage(answer.outcome),
+        family_id: value.family_id.clone(),
+        overrides_count: count(MethodFamilyRelation::Overrides),
+        implements_count: count(MethodFamilyRelation::Implements),
+        overridden_by_count: count(MethodFamilyRelation::OverriddenBy),
+        implemented_by_count: count(MethodFamilyRelation::ImplementedBy),
+        edge_count: value.edges.len(),
+        root_count: answer.roots.len(),
+    }
+}
+
+/// One typed method-family edge.
+///
+/// Source and target are rendered through the same `render_unit_declaration`
+/// the candidate, hop, and dispatch-target rows use, so the same declaration
+/// renders identically wherever it appears.
+pub(super) fn render_member_family_edge(
+    analyzer: &dyn IAnalyzer,
+    value: &MemberFamilyEdgeValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryMemberFamilyEdge {
+    let family = &value.family;
+    let edge = value.edge();
+    let file = family.file();
+    CodeQueryMemberFamilyEdge {
+        id: value.id(),
+        member_id: family.member_id.clone(),
+        path: rel_path_string(file),
+        range: render_source_range(analyzer, file, &family.member.range, cache),
+        ordinal: value.ordinal,
+        source: render_unit_declaration(analyzer, &family.member.unit, detail, cache),
+        target_id: edge.target_id.clone(),
+        target: render_unit_declaration(analyzer, &edge.target, detail, cache),
+        relation: edge.relation.label(),
+        family_id: family.family_id.clone(),
+        hierarchy_depth: edge.depth,
+        proof: edge.proof,
+        completeness: "complete",
+        coverage: member_family::family_coverage(family.answer.outcome),
+    }
+}
+
+pub(super) fn render_member_family_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &MemberFamilyValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let file = value.file();
+    CodeQueryResultRef::MemberFamily {
+        id: value.id(),
+        member_id: value.member_id.clone(),
+        path: rel_path_string(file),
+        range: render_source_range(analyzer, file, &value.member.range, cache),
+        outcome: value.answer.outcome.label(),
+        coverage: member_family::family_coverage(value.answer.outcome),
+    }
+}
+
+pub(super) fn render_member_family_edge_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &MemberFamilyEdgeValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let family = &value.family;
+    let file = family.file();
+    CodeQueryResultRef::MemberFamilyEdge {
+        id: value.id(),
+        member_id: family.member_id.clone(),
+        path: rel_path_string(file),
+        range: render_source_range(analyzer, file, &family.member.range, cache),
+        ordinal: value.ordinal,
+        relation: value.edge().relation.label(),
+    }
+}
+
+/// One exact hierarchy hop of one traced member candidate.
+///
+/// The endpoints are rendered through the same `render_unit_declaration` the
+/// candidate row's `owner` uses, so a hop's `to` at the last hop and the
+/// candidate's `owner` are the same rendered declaration.
+pub(super) fn render_candidate_hop(
+    analyzer: &dyn IAnalyzer,
+    value: &CandidateHopValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCandidateHop {
+    let occurrence = &value.occurrence;
+    let range = render_source_range(analyzer, &occurrence.file, &occurrence.range, cache);
+    let from = render_unit_declaration(analyzer, &value.hop.from, detail, cache);
+    let to = render_unit_declaration(analyzer, &value.hop.to, detail, cache);
+    environment::public_candidate_hop(value, range, from, to)
+}
+
+pub(super) fn render_candidate_hop_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &CandidateHopValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let occurrence = &value.occurrence;
+    CodeQueryResultRef::CandidateHop {
+        id: value.id(),
+        candidate_id: value.candidate_id(),
+        path: rel_path_string(&occurrence.file),
+        range: render_source_range(analyzer, &occurrence.file, &occurrence.range, cache),
+        hop: value.hop.hop,
+        relation: value.hop.relation.label(),
+    }
+}
+
+/// Render one workspace declaration for a row field, or `None` when the
+/// workspace can no longer locate the unit.
+fn render_unit_declaration(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> Option<CodeQueryDeclaration> {
+    analyzer
+        .ranges_of(unit)
+        .into_iter()
+        .min_by_key(primary_range_key)
+        .map(|range| DeclarationValue {
+            unit: unit.clone(),
+            range,
+        })
+        .map(|declaration| render_declaration(analyzer, &declaration, detail, cache))
 }
 
 /// A stable, domain-separated digest of one declaration's #1475 canonical
@@ -644,7 +916,7 @@ pub(super) fn render_resolution_candidate(
 /// FQN or signature string, so same-spelling decoys with different segment
 /// kinds hash apart and aliases/partial types canonicalized by the analyzer
 /// hash together.
-fn canonical_member_digest(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> String {
+pub(super) fn canonical_member_digest(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> String {
     let identity = crate::analyzer::structural::canonical_identity_of(analyzer, unit);
     let mut hasher = Sha256::new();
     hasher.update(b"bifrost.canonical_member_id.v1");

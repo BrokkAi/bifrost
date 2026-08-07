@@ -485,6 +485,16 @@ pub enum CandidateCoverage {
 }
 
 impl CandidateCoverage {
+    /// The stable public spelling of this coverage, for row projections that
+    /// must report the oracle's own vocabulary instead of a re-derived one.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Exhaustive => "exhaustive",
+            Self::Open => "open",
+            Self::Truncated => "truncated",
+        }
+    }
+
     pub const fn is_exhaustive(self) -> bool {
         matches!(self, Self::Exhaustive)
     }

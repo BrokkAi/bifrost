@@ -40,6 +40,60 @@ struct JsTsAliasCandidateKey {
     ranges: Vec<Range>,
 }
 
+/// The member attribution the JS/TS member lookups accumulate while they run
+/// (#1477).
+///
+/// Every candidate here was found by asking the index for
+/// `<receiver fq>.<member>` (or its `$static` companion form), so the receiver
+/// *is* the owner and the walk took no hierarchy hop. This route performs no
+/// superclass or interface walk at all -- a member declared only on a base
+/// class does not resolve through it -- so no seam in this file can name an
+/// inherited owner, and none claims one.
+///
+/// Applicability stays `Unknown`: these lookups select by owner and name and
+/// never inspect the call shape.
+#[derive(Default)]
+struct JsTsMemberFinds {
+    by_fq_name: Vec<(String, trace::MemberEnrichment)>,
+}
+
+impl JsTsMemberFinds {
+    fn record(
+        &mut self,
+        owner: &CodeUnit,
+        found: &[CodeUnit],
+        dispatch_tier: crate::analyzer::structural::MemberDispatchTier,
+    ) {
+        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
+        if !trace::recording() {
+            return;
+        }
+        for candidate in found {
+            self.by_fq_name.push((
+                candidate.fq_name(),
+                trace::MemberEnrichment {
+                    owner: owner.clone(),
+                    hierarchy_depth: 0,
+                    dispatch_tier,
+                    applicability: ApplicabilityVerdict::Unknown,
+                    route: Vec::new(),
+                },
+            ));
+        }
+    }
+
+    /// Stage the attribution for the outcome constructor the caller is about to
+    /// reach. Staging nothing leaves the rows unattributed, which is what an
+    /// unrecorded trace and an uninstrumented lookup must both look like.
+    fn stage(&self) {
+        if self.by_fq_name.is_empty() {
+            return;
+        }
+        trace::stage_member_context(self.by_fq_name.clone());
+    }
+}
+
 fn js_ts_candidates_outcome(
     analyzer: &dyn IAnalyzer,
     candidates: Vec<CodeUnit>,
@@ -256,6 +310,12 @@ pub(super) fn resolve_js_ts(
             }
             same_file
         };
+        // One accumulator per candidate set, staged at the return that reports
+        // that exact set (#1477). The JavaScript fallback below goes through the
+        // shared `jsts_member_candidates`, whose per-receiver split is not
+        // recoverable from its flattened result, so those candidates stay
+        // unattributed rather than attributed to a guess.
+        let mut generic_finds = JsTsMemberFinds::default();
         let generic_member_candidates =
             if language == Language::JavaScript && imported_receiver_binding {
                 jsts_file_scoped_member_candidates(
@@ -264,6 +324,7 @@ pub(super) fn resolve_js_ts(
                     receiver_candidates,
                     name,
                     value_position,
+                    &mut generic_finds,
                 )
             } else if language == Language::TypeScript {
                 ts_member_candidates(
@@ -273,6 +334,7 @@ pub(super) fn resolve_js_ts(
                     receiver_candidates,
                     name,
                     value_position,
+                    &mut generic_finds,
                 )
             } else {
                 jsts_member_candidates(host, support, receiver_candidates, name, value_position)
@@ -314,6 +376,7 @@ pub(super) fn resolve_js_ts(
             );
         }
         if (imported_receiver_binding || program_binding) && !generic_member_candidates.is_empty() {
+            generic_finds.stage();
             return js_ts_candidates_outcome(analyzer, generic_member_candidates);
         }
         match jsts_receiver_provider_member_candidates(
@@ -374,6 +437,7 @@ pub(super) fn resolve_js_ts(
             site.range.start_byte,
             0,
         );
+        let mut new_receiver_finds = JsTsMemberFinds::default();
         let new_receiver_member_candidates = if language == Language::TypeScript {
             ts_member_candidates(
                 analyzer,
@@ -382,14 +446,17 @@ pub(super) fn resolve_js_ts(
                 new_receiver_candidates,
                 name,
                 value_position,
+                &mut new_receiver_finds,
             )
         } else {
             jsts_member_candidates(host, support, new_receiver_candidates, name, value_position)
         };
         if !new_receiver_member_candidates.is_empty() {
+            new_receiver_finds.stage();
             return js_ts_candidates_outcome(analyzer, new_receiver_member_candidates);
         }
         if !generic_member_candidates.is_empty() {
+            generic_finds.stage();
             return js_ts_candidates_outcome(analyzer, generic_member_candidates);
         }
         let exact_same_file = jsts_unproven_same_file_dotted_candidates(dotted_lookup);
@@ -400,6 +467,7 @@ pub(super) fn resolve_js_ts(
             let inferred_receivers = ts_local_receiver_owner_candidates(
                 host, support, file, source, tree, site, imports, aliases, qualifier,
             );
+            let mut inferred_finds = JsTsMemberFinds::default();
             let inferred_member_candidates = ts_member_candidates(
                 analyzer,
                 host,
@@ -407,21 +475,26 @@ pub(super) fn resolve_js_ts(
                 inferred_receivers,
                 name,
                 value_position,
+                &mut inferred_finds,
             );
             if !inferred_member_candidates.is_empty() {
+                inferred_finds.stage();
                 return js_ts_candidates_outcome(analyzer, inferred_member_candidates);
             }
             let inferred_receivers = ts_local_receiver_owner_candidates(
                 host, support, file, source, tree, site, imports, aliases, qualifier,
             );
+            let mut inferred_finds = JsTsMemberFinds::default();
             let inferred_member_candidates = jsts_file_scoped_member_candidates(
                 host,
                 support,
                 inferred_receivers,
                 name,
                 value_position,
+                &mut inferred_finds,
             );
             if !inferred_member_candidates.is_empty() {
+                inferred_finds.stage();
                 return js_ts_candidates_outcome(analyzer, inferred_member_candidates);
             }
             if let Some(receiver_type) = ts_global_object_receiver_type(qualifier) {
@@ -430,6 +503,7 @@ pub(super) fn resolve_js_ts(
                     .into_iter()
                     .filter(|unit| jsts_unit_is_type_only(host, unit))
                     .collect();
+                let mut global_finds = JsTsMemberFinds::default();
                 let global_member_candidates = ts_member_candidates(
                     analyzer,
                     host,
@@ -437,8 +511,10 @@ pub(super) fn resolve_js_ts(
                     global_receivers,
                     name,
                     value_position,
+                    &mut global_finds,
                 );
                 if !global_member_candidates.is_empty() {
+                    global_finds.stage();
                     return js_ts_candidates_outcome(analyzer, global_member_candidates);
                 }
             }
@@ -738,7 +814,10 @@ fn ts_contextual_object_literal_key_candidates(
     }
     let owners =
         ts_contextual_object_literal_owners(host, support, file, source, imports, aliases, object);
-    ts_member_candidates(analyzer, host, support, owners, &name, true)
+    let mut finds = JsTsMemberFinds::default();
+    let members = ts_member_candidates(analyzer, host, support, owners, &name, true, &mut finds);
+    finds.stage();
+    members
 }
 
 fn ts_object_literal_property_at_key<'tree>(
@@ -1680,12 +1759,25 @@ fn jsts_construction_receiver_members(
     let member = &source[property.start_byte()..property.end_byte()];
     let receiver_candidates =
         jsts_value_space_candidates(host, support.file_identifier(file, class_name));
+    let mut finds = JsTsMemberFinds::default();
     let members = if language == Language::TypeScript {
-        ts_member_candidates(analyzer, host, support, receiver_candidates, member, true)
+        ts_member_candidates(
+            analyzer,
+            host,
+            support,
+            receiver_candidates,
+            member,
+            true,
+            &mut finds,
+        )
     } else {
         jsts_member_candidates(host, support, receiver_candidates, member, true)
     };
-    (!members.is_empty()).then_some(members)
+    if members.is_empty() {
+        return None;
+    }
+    finds.stage();
+    Some(members)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1737,16 +1829,21 @@ fn jsts_file_scoped_member_candidates(
     receiver_candidates: Vec<CodeUnit>,
     member: &str,
     value_position: bool,
+    finds: &mut JsTsMemberFinds,
 ) -> Vec<CodeUnit> {
+    use crate::analyzer::structural::MemberDispatchTier;
+
     let mut candidates = Vec::new();
     for receiver in receiver_candidates {
-        candidates.extend(jsts_file_scoped_dotted_candidates(
+        let found = jsts_file_scoped_dotted_candidates(
             host,
             support,
             receiver.source(),
             &format!("{}.{}", receiver.fq_name(), member),
             value_position,
-        ));
+        );
+        finds.record(&receiver, &found, MemberDispatchTier::InherentOrDirect);
+        candidates.extend(found);
     }
     candidates
 }
@@ -1758,7 +1855,10 @@ fn ts_member_candidates(
     receiver_candidates: Vec<CodeUnit>,
     member: &str,
     value_position: bool,
+    finds: &mut JsTsMemberFinds,
 ) -> Vec<CodeUnit> {
+    use crate::analyzer::structural::MemberDispatchTier;
+
     let mut candidates = Vec::new();
     for receiver in receiver_candidates {
         let plain_fqn = format!("{}.{}", receiver.fq_name(), member);
@@ -1772,6 +1872,10 @@ fn ts_member_candidates(
             &plain_fqn,
             value_position,
         );
+        // The tier follows the form the lookup answered from: the plain member
+        // form is a direct member of the receiver, the `$static` form is the
+        // receiver's static/companion side (#1477).
+        let mut tier = MemberDispatchTier::InherentOrDirect;
         if static_access {
             let static_members = jsts_file_scoped_dotted_candidates(
                 host,
@@ -1782,6 +1886,7 @@ fn ts_member_candidates(
             );
             if !static_members.is_empty() {
                 members = static_members;
+                tier = MemberDispatchTier::StaticOrCompanion;
             }
         } else if members.is_empty() {
             members = jsts_file_scoped_dotted_candidates(
@@ -1791,7 +1896,9 @@ fn ts_member_candidates(
                 &static_fqn,
                 value_position,
             );
+            tier = MemberDispatchTier::StaticOrCompanion;
         }
+        finds.record(&receiver, &members, tier);
 
         let has_synthetic = members.iter().any(CodeUnit::is_synthetic);
         if has_synthetic

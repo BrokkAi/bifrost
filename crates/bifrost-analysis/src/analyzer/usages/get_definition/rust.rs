@@ -1,5 +1,6 @@
 use super::*;
 use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::TypeHierarchyProvider;
 use crate::analyzer::rust::rust_focused_use_path;
 use crate::analyzer::rust::{canonical_rust_hierarchy_type, usage_crate_export_targets};
 use crate::analyzer::rust::{
@@ -11,15 +12,19 @@ use crate::analyzer::rust::{
     resolve_rust_import_package_scoped, resolve_rust_module_segments_with_crate,
     rust_crate_root_package, rust_package_name,
 };
+use crate::analyzer::structural::resolution::{HierarchyRelation, MemberDispatchTier};
 use crate::analyzer::usages::rust_graph::{
     RustDefinitionProvider, resolve_rust_path_fqn, rust_smallest_named_node_covering,
 };
 use crate::analyzer::{RustReferenceContext, SignatureMetadata, StructuredTypeIdentity};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_rust::field_roles::{
     RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
 };
-use brokk_bifrost_rust::graph_support::RustUsageSource;
+use brokk_bifrost_rust::graph_support::{
+    RustUsageSource, is_rust_trait_declaration, is_rust_trait_impl_member_declaration,
+};
 use brokk_bifrost_rust::lexical_scope;
 use std::cell::RefCell;
 
@@ -4119,8 +4124,20 @@ fn resolve_rust_field(
             ));
         };
         let member_kind = rust_field_expression_member_kind(support, field_expression)?;
-        let candidates =
-            rust_member_candidates(support.members_for_owner_name(&owner, member), member_kind);
+        let member_trace = RustMemberTrace::begin(analyzer, &owner);
+        let considered = support.members_for_owner_name(&owner, member);
+        let candidates = match member_trace.as_ref() {
+            // Same filter, kept as a partition so the namespace losers the
+            // untraced path drops are still named while the seam holds them.
+            Some(state) => {
+                let (candidates, rejected): (Vec<CodeUnit>, Vec<CodeUnit>) = considered
+                    .into_iter()
+                    .partition(|unit| rust_member_kind_matches(unit, member_kind));
+                state.stage_direct(&candidates, &rejected);
+                candidates
+            }
+            None => rust_member_candidates(considered, member_kind),
+        };
         if candidates.is_empty()
             && !support.is_bounded()
             && member_kind == RustMemberKind::Function
@@ -4146,6 +4163,9 @@ fn resolve_rust_field(
                     | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
                 };
             if !trait_candidates.is_empty() {
+                if let Some(state) = member_trace.as_ref() {
+                    state.stage_trait(&trait_candidates);
+                }
                 return Some(candidates_outcome(trait_candidates));
             }
         }
@@ -4288,8 +4308,18 @@ fn rust_token_tree_dotted_member_outcome(
     } else {
         RustMemberKind::Field
     };
-    let mut candidates =
-        rust_member_candidates(support.fqn(&format!("{owner}.{member}")), member_kind);
+    let member_trace = RustMemberTrace::begin(analyzer, &owner);
+    let considered = support.fqn(&format!("{owner}.{member}"));
+    let mut candidates = match member_trace.as_ref() {
+        Some(state) => {
+            let (candidates, rejected): (Vec<CodeUnit>, Vec<CodeUnit>) = considered
+                .into_iter()
+                .partition(|unit| rust_member_kind_matches(unit, member_kind));
+            state.stage_direct(&candidates, &rejected);
+            candidates
+        }
+        None => rust_member_candidates(considered, member_kind),
+    };
     if candidates.is_empty() && member_kind == RustMemberKind::Function {
         let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
         let refs = support.forward_reference_context(rust, file)?;
@@ -4312,6 +4342,9 @@ fn rust_token_tree_dotted_member_outcome(
                 | ReceiverAnalysisOutcome::Unsupported { .. }
                 | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
             };
+        if let Some(state) = member_trace.as_ref() {
+            state.stage_trait(&candidates);
+        }
     }
     if candidates.is_empty() {
         Some(no_definition(
@@ -4489,14 +4522,161 @@ fn rust_field_expression_member_kind(
     }
 }
 
+fn rust_member_kind_matches(unit: &CodeUnit, kind: RustMemberKind) -> bool {
+    match kind {
+        RustMemberKind::Field => unit.is_field(),
+        RustMemberKind::Function => unit.is_function(),
+    }
+}
+
 fn rust_member_candidates(candidates: Vec<CodeUnit>, kind: RustMemberKind) -> Vec<CodeUnit> {
     candidates
         .into_iter()
-        .filter(|unit| match kind {
-            RustMemberKind::Field => unit.is_field(),
-            RustMemberKind::Function => unit.is_function(),
-        })
+        .filter(|unit| rust_member_kind_matches(unit, kind))
         .collect()
+}
+
+/// The per-candidate member attribution the Rust `receiver.member` seams record
+/// while they run (#1477).
+///
+/// It is built only while a trace is being recorded, and only from facts the
+/// seam that builds it already holds: the receiver type the resolver looked the
+/// member up on, and -- for the trait fallback -- the ancestor the production
+/// walk expanded to reach it. Nothing here decides anything; the walk is
+/// unchanged whether or not a recorder is installed.
+///
+/// Rust's two member seams are attributed differently on purpose:
+///
+/// - The direct lookup asks the declaration store for `owner.member`. It walks
+///   no hierarchy, so every candidate it admits is depth zero with an empty
+///   route. Its dispatch bucket is still not always the inherent one: a member
+///   an `impl Trait for Type` block declares is indexed under `Type` and found
+///   here, and the tree-sitter shape of its declaration is what says so.
+/// - The trait fallback runs only when the direct lookup found nothing. It
+///   expands the owner's direct ancestors and takes members declared by one of
+///   them, which is exactly one hierarchy hop across an implementation edge.
+struct RustMemberTrace<'a> {
+    rust: &'a RustAnalyzer,
+    /// The receiver's declared owner type, named by the same filters the trait
+    /// fallback uses to pick its walk root. `None` when the owner name does not
+    /// identify exactly one hierarchy-bearing non-trait declaration, which
+    /// leaves the seam's candidates unattributed rather than guessed.
+    owner: Option<CodeUnit>,
+}
+
+impl<'a> RustMemberTrace<'a> {
+    /// `None` when nothing is recording, or when the analyzer is not the Rust
+    /// analyzer whose hierarchy the attribution reads.
+    ///
+    /// The owner lookup deliberately goes to the analyzer's store rather than
+    /// through `RustDefinitionProvider`. A provider lookup is charged against
+    /// the resolution session's scope budget, so a recording run would spend
+    /// budget the untraced run does not spend, and a request near its
+    /// scope-node limit would exhaust the budget inside the real member lookup
+    /// and answer differently while recording. The trace must explain the
+    /// decision the product made, never change it, so every read this type
+    /// performs -- this one, `get_direct_ancestors`, `structural_parent_of`,
+    /// `parent_of` -- is a session-free store read. `definitions` is an exact
+    /// indexed FQN lookup, so leaving it uncharged does not hide unbounded
+    /// work either.
+    fn begin(analyzer: &'a dyn IAnalyzer, owner_fqn: &str) -> Option<Self> {
+        if !trace::recording() {
+            return None;
+        }
+        let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
+        // Deduplicated exactly as the provider deduplicates its own store
+        // results, so "names exactly one owner" means the same thing here as it
+        // did when this lookup went through the provider.
+        let mut declarations: Vec<CodeUnit> = rust.definitions(owner_fqn).collect();
+        sort_units(&mut declarations);
+        declarations.dedup();
+        let mut owners = declarations
+            .into_iter()
+            .filter(|unit| rust.supports_type_hierarchy(unit))
+            .filter(|unit| !is_rust_trait_declaration(rust, unit));
+        let owner = owners.next().filter(|_| owners.next().is_none());
+        Some(Self { rust, owner })
+    }
+
+    fn direct_enrichment(&self, owner: &CodeUnit, unit: &CodeUnit) -> trace::MemberEnrichment {
+        let dispatch_tier = if is_rust_trait_impl_member_declaration(self.rust, unit) {
+            MemberDispatchTier::TraitOrInterface
+        } else {
+            MemberDispatchTier::InherentOrDirect
+        };
+        trace::MemberEnrichment {
+            owner: owner.clone(),
+            hierarchy_depth: 0,
+            dispatch_tier,
+            // The Rust member seams check the member's namespace and nothing
+            // about the call shape, so the applicability axis (#1478) is
+            // untested here, which is what `Unknown` states.
+            applicability: ApplicabilityVerdict::Unknown,
+            route: Vec::new(),
+        }
+    }
+
+    /// Stage attribution for the candidates the direct-owner lookup admitted,
+    /// and record the ones its namespace filter discarded while the seam still
+    /// knows them.
+    fn stage_direct(&self, selected: &[CodeUnit], rejected: &[CodeUnit]) {
+        let Some(owner) = self.owner.as_ref() else {
+            return;
+        };
+        for loser in rejected {
+            trace::record(
+                trace::TraceCandidate::rejected(
+                    trace::TraceCandidateRef::Unit(loser.clone()),
+                    None,
+                    RejectionReason::WrongNamespace,
+                )
+                .with_member(self.direct_enrichment(owner, loser)),
+            );
+        }
+        trace::stage_member_context(
+            selected
+                .iter()
+                .map(|unit| (unit.fq_name(), self.direct_enrichment(owner, unit)))
+                .collect(),
+        );
+    }
+
+    /// Stage attribution for the candidates the trait fallback admitted. A
+    /// candidate whose declaring ancestor cannot be confirmed -- the same
+    /// parent-of-candidate identity the fallback itself filtered on, checked
+    /// against the same direct-ancestor set it expanded -- is left
+    /// unattributed instead of being given a route it may not have taken.
+    fn stage_trait(&self, selected: &[CodeUnit]) {
+        let Some(owner) = self.owner.as_ref() else {
+            return;
+        };
+        let ancestors = self.rust.get_direct_ancestors(owner);
+        trace::stage_member_context(
+            selected
+                .iter()
+                .filter_map(|unit| {
+                    let found_on = self
+                        .rust
+                        .structural_parent_of(unit)
+                        .or_else(|| self.rust.parent_of(unit))
+                        .filter(|parent| ancestors.contains(parent))?;
+                    let enrichment = trace::MemberEnrichment {
+                        owner: found_on.clone(),
+                        hierarchy_depth: 1,
+                        dispatch_tier: MemberDispatchTier::TraitOrInterface,
+                        applicability: ApplicabilityVerdict::Unknown,
+                        route: vec![trace::HierarchyHopRecord {
+                            hop: 0,
+                            from: owner.clone(),
+                            to: found_on,
+                            relation: HierarchyRelation::TraitImpl,
+                        }],
+                    };
+                    Some((unit.fq_name(), enrichment))
+                })
+                .collect(),
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6714,6 +6894,91 @@ fn use_service(service: Service) {
                 [definition] if definition.fq_name() == "Service.run"
             ),
             "{value:#?}"
+        );
+    }
+
+    /// The #1477 member trace is emission-only: recording explains the decision
+    /// the resolver made and must never change it. Under a bounded session the
+    /// only way it could is by spending scope budget, because a request that
+    /// runs out of budget answers `Exceeded` with no definitions. So the pin is
+    /// exact: at *every* scope-node budget from one up to the amount the
+    /// unrecorded lookup spends, the recorded run must charge the same work and
+    /// reach the same answer. A budget-charging owner lookup in the trace fails
+    /// this at the budgets near the top of the range, where the extra charge is
+    /// what exhausts the budget inside the real member lookup.
+    #[test]
+    fn recording_a_member_lookup_charges_the_same_bounded_budget() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum Answer {
+            Complete(DefinitionLookupStatus, Vec<String>),
+            Exceeded(ReceiverBudgetLimit),
+            Cancelled,
+        }
+
+        let (fixture, file, source, tree, site) = member_fixture();
+        let resolve = |max_scope_nodes: usize| {
+            let outcome = resolve_rust_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                &source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget {
+                    max_scope_nodes,
+                    ..ReceiverAnalysisBudget::default()
+                },
+                None,
+            );
+            let work = outcome.work();
+            let answer = match outcome {
+                BoundedResolution::Complete { value, .. } => Answer::Complete(
+                    value.status,
+                    value
+                        .definitions
+                        .iter()
+                        .map(|definition| definition.fq_name())
+                        .collect(),
+                ),
+                BoundedResolution::Exceeded { limit, .. } => Answer::Exceeded(limit),
+                BoundedResolution::Cancelled { .. } => Answer::Cancelled,
+            };
+            (answer, work)
+        };
+
+        let spent = {
+            let (answer, work) = resolve(ReceiverAnalysisBudget::default().max_scope_nodes);
+            assert_eq!(
+                answer,
+                Answer::Complete(
+                    DefinitionLookupStatus::Resolved,
+                    vec!["Service.run".to_string()]
+                )
+            );
+            assert!(work.scope_nodes > 0);
+            work.scope_nodes
+        };
+
+        for max_scope_nodes in 1..=spent {
+            let untraced = resolve(max_scope_nodes);
+            let traced = {
+                let _recorder = trace::TraceSession::install();
+                assert!(trace::recording());
+                resolve(max_scope_nodes)
+            };
+            assert_eq!(
+                traced, untraced,
+                "recording changed the answer or the charged work at a scope budget of {max_scope_nodes}"
+            );
+        }
+
+        // The range is only a real test if its top end actually resolves the
+        // member, which is what makes the budgets just below it the tight ones.
+        assert_eq!(
+            resolve(spent).0,
+            Answer::Complete(
+                DefinitionLookupStatus::Resolved,
+                vec!["Service.run".to_string()]
+            )
         );
     }
 

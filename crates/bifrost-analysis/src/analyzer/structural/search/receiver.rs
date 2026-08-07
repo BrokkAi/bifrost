@@ -596,21 +596,33 @@ pub(super) fn receiver_site_identity(
     digest.push(&report.site.range.end_byte.to_le_bytes());
     let site_id = digest.finish().to_string();
 
-    let site_ast_id = facts.and_then(|facts| {
-        let mut exact = facts.nodes().iter().enumerate().filter(|(_, node)| {
-            node.range.start_byte == report.site.range.start_byte
-                && node.range.end_byte == report.site.range.end_byte
-        });
-        let (node, _) = exact.next()?;
-        if exact.next().is_some() {
-            return None;
-        }
-        Some(super::super::occurrence_rows::ast_id(
-            content_identity,
-            u32::try_from(node).expect("facts arena node IDs fit u32"),
-        ))
-    });
+    let site_ast_id =
+        facts.and_then(|facts| site_ast_id_for_range(facts, content_identity, report.site.range));
     (site_id, site_ast_id)
+}
+
+/// The AST identity of the one facts-arena node whose span is exactly `range`.
+///
+/// `None` when no node has that exact span or when more than one does: an
+/// ambiguous position must not claim an exact AST identity. Every site family
+/// mints `site_ast_id` here, so a receiver row, a dispatch row, and an
+/// occurrence row over the same token carry byte-identical identities.
+pub(super) fn site_ast_id_for_range(
+    facts: &FileFacts,
+    content_identity: ContentIdentity,
+    range: Range,
+) -> Option<String> {
+    let mut exact = facts.nodes().iter().enumerate().filter(|(_, node)| {
+        node.range.start_byte == range.start_byte && node.range.end_byte == range.end_byte
+    });
+    let (node, _) = exact.next()?;
+    if exact.next().is_some() {
+        return None;
+    }
+    Some(super::super::occurrence_rows::ast_id(
+        content_identity,
+        u32::try_from(node).expect("facts arena node IDs fit u32"),
+    ))
 }
 
 pub(super) fn record_receiver_pipeline_output_omission(

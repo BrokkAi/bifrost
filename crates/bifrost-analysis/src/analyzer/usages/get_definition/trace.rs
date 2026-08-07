@@ -35,10 +35,12 @@
 use super::{DefinitionLookupOutcome, DefinitionLookupStatus, resolve_definition_requests_traced};
 use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::structural::resolution::{
-    BoundaryStatus, CandidateOutcome, DeclaredVisibility, PrecedenceTier, RejectionReason,
+    BoundaryStatus, CandidateOutcome, DeclaredVisibility, HierarchyRelation, MemberDispatchTier,
+    PrecedenceTier, RejectionReason,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::cancellation::CancellationToken;
+use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -89,6 +91,37 @@ pub enum TraceCandidateRef {
 /// identifier and must never behave like one.
 pub const WILDCARD_ROUTE_NAME: &str = "*";
 
+/// One exact hierarchy edge on one candidate's route (#1477): hop `hop` took
+/// the walk from `from` to `to`. A candidate's route is contiguous, starts at
+/// the receiver's declared owner, and terminates at the candidate's owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HierarchyHopRecord {
+    pub hop: usize,
+    pub from: CodeUnit,
+    pub to: CodeUnit,
+    pub relation: HierarchyRelation,
+}
+
+/// Member-selection attribution for one candidate (#1477): the exact owner the
+/// resolver found the member on, how many hierarchy hops away that owner is,
+/// which language-neutral dispatch bucket the find belongs to, whether the
+/// candidate is applicable to the call shape as far as this seam checked, and
+/// the exact hierarchy route.
+///
+/// Like the tier, this is recorded where the resolver already holds the fact
+/// and never reconstructed afterwards: a candidate without enrichment is
+/// unattributed, not depth zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberEnrichment {
+    pub owner: CodeUnit,
+    pub hierarchy_depth: usize,
+    pub dispatch_tier: MemberDispatchTier,
+    pub applicability: ApplicabilityVerdict,
+    /// Empty exactly when `hierarchy_depth` is zero: a direct member has no
+    /// route to walk.
+    pub route: Vec<HierarchyHopRecord>,
+}
+
 /// One candidate the resolver considered for one reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceCandidate {
@@ -103,6 +136,9 @@ pub struct TraceCandidate {
     /// The fully-qualified external type a boundary refinement resolved, set
     /// only when `boundary` is [`BoundaryStatus::ExternalIndexed`].
     pub external_target: Option<String>,
+    /// Member-selection attribution, present only when the seam that recorded
+    /// the candidate is a member lookup that knows its owner and route.
+    pub member: Option<Box<MemberEnrichment>>,
 }
 
 impl TraceCandidate {
@@ -115,6 +151,7 @@ impl TraceCandidate {
             boundary: BoundaryStatus::WorkspaceLocal,
             visibility: DeclaredVisibility::Unknown,
             external_target: None,
+            member: None,
         }
     }
 
@@ -131,11 +168,17 @@ impl TraceCandidate {
             boundary: BoundaryStatus::WorkspaceLocal,
             visibility: DeclaredVisibility::Unknown,
             external_target: None,
+            member: None,
         }
     }
 
     pub fn with_boundary(mut self, boundary: BoundaryStatus) -> Self {
         self.boundary = boundary;
+        self
+    }
+
+    pub fn with_member(mut self, member: MemberEnrichment) -> Self {
+        self.member = Some(Box::new(member));
         self
     }
 
@@ -245,10 +288,20 @@ struct PendingSelection {
     fq_names: Vec<String>,
 }
 
+/// Member attribution a member-lookup seam has staged for the outcome
+/// constructor it is about to reach, keyed by the candidate's fully-qualified
+/// name. Consumed under the same discipline as [`PendingSelection`]: only by a
+/// constructor whose candidates the map names, and dropped otherwise.
+#[derive(Debug, Clone, Default)]
+struct PendingMemberContext {
+    by_fq_name: Vec<(String, MemberEnrichment)>,
+}
+
 #[derive(Debug, Default)]
 struct Recorder {
     candidates: Vec<TraceCandidate>,
     pending: Option<PendingSelection>,
+    pending_member: Option<PendingMemberContext>,
     /// The reference name the currently instrumented deep path is resolving.
     /// Deep emission sites compare against it so that a nested lookup for a
     /// different name (a receiver type, an owner) cannot be attributed to this
@@ -283,6 +336,28 @@ pub(crate) fn record_all(rows: impl IntoIterator<Item = TraceCandidate>) {
 /// `fq_names`.
 pub(crate) fn stage_tier(tier: PrecedenceTier, fq_names: Vec<String>) {
     with_recorder(|recorder| recorder.pending = Some(PendingSelection { tier, fq_names }));
+}
+
+/// Stage member attribution for the next outcome constructor whose candidates
+/// the map names. Callers guard with [`recording`] before building the
+/// entries, so an untraced lookup allocates nothing.
+pub(crate) fn stage_member_context(by_fq_name: Vec<(String, MemberEnrichment)>) {
+    with_recorder(|recorder| {
+        recorder.pending_member = Some(PendingMemberContext { by_fq_name });
+    });
+}
+
+/// Take the staged member attribution for `unit` if the staged map names it.
+/// The whole map is dropped when the first consuming constructor's candidates
+/// do not intersect it, mirroring [`take_tier_for`].
+fn take_member_for(recorder: &mut Recorder, unit: &CodeUnit) -> Option<MemberEnrichment> {
+    let pending = recorder.pending_member.as_ref()?;
+    let fq = unit.fq_name();
+    pending
+        .by_fq_name
+        .iter()
+        .find(|(name, _)| *name == fq)
+        .map(|(_, enrichment)| enrichment.clone())
 }
 
 /// Take the staged tier if it was staged for one of `units`. A staged tier that
@@ -329,7 +404,7 @@ pub(crate) fn deep_scope_is(name: &str) -> bool {
 pub(super) struct TraceSession;
 
 impl TraceSession {
-    fn install() -> Self {
+    pub(super) fn install() -> Self {
         RECORDER.with(|recorder| *recorder.borrow_mut() = Some(Recorder::default()));
         Self
     }
@@ -338,6 +413,7 @@ impl TraceSession {
     pub(super) fn take_request(&self) -> Vec<TraceCandidate> {
         with_recorder(|recorder| {
             recorder.pending = None;
+            recorder.pending_member = None;
             std::mem::take(&mut recorder.candidates)
         })
         .unwrap_or_default()
@@ -360,11 +436,24 @@ pub(super) fn record_selected_units(outcome: &DefinitionLookupOutcome) {
         return;
     }
     let tier = take_tier_for(&outcome.definitions);
-    let rows: Vec<TraceCandidate> = outcome
-        .definitions
-        .iter()
-        .map(|unit| TraceCandidate::selected(TraceCandidateRef::Unit(unit.clone()), tier))
-        .collect();
+    let rows: Vec<TraceCandidate> = with_recorder(|recorder| {
+        let rows: Vec<TraceCandidate> = outcome
+            .definitions
+            .iter()
+            .map(|unit| {
+                let mut row = TraceCandidate::selected(TraceCandidateRef::Unit(unit.clone()), tier);
+                if let Some(enrichment) = take_member_for(recorder, unit) {
+                    row = row.with_member(enrichment);
+                }
+                row
+            })
+            .collect();
+        // The staged member context belonged to this lookup whether or not it
+        // matched; a stale map must never attribute a later, unrelated lookup.
+        recorder.pending_member = None;
+        rows
+    })
+    .unwrap_or_default();
     debug_assert_selection_agrees(&rows, outcome);
     record_all(rows);
 }

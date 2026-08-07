@@ -15,7 +15,7 @@ pub(crate) use dispatch::{exact_source_for_procedure, procedures_for_definition_
 // Policy lowering resolves authored source ranges to procedures through these
 // two, so they are public where the rest of dispatch stays crate-internal.
 pub use dispatch::{ProcedureRangeLookupStatus, procedures_for_source_ranges};
-pub use source::SourcePointsToResult;
+pub use source::{SourceDispatchObservation, SourceDispatchResult, SourcePointsToResult};
 
 use std::fmt;
 

@@ -1,6 +1,6 @@
 use super::{
-    TypeLookupOutcome, candidates_outcome, candidates_outcome_with_target_kind, no_type,
-    type_reference_outcome,
+    TypeLookupDiagnostic, TypeLookupOutcome, TypeLookupStatus, TypeLookupType, candidates_outcome,
+    candidates_outcome_with_target_kind, no_type, type_reference_outcome,
 };
 use crate::analyzer::js_ts::providers::resolve_js_ts_source;
 use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
@@ -192,6 +192,22 @@ fn resolve_declared_type_text(
     target_kind: TypeLookupTargetKind,
 ) -> TypeLookupOutcome {
     let type_text = ts_type_annotation_text(type_node, source);
+    // A union or intersection annotation names more than one type. Its arms
+    // come from the annotation's own `union_type`/`intersection_type` nodes, so
+    // every arm stays visible; the text scan below sees only the first one and
+    // would report a two-arm receiver as one precise type (#1477).
+    if let Some(outcome) = multi_arm_annotation_outcome(
+        host,
+        support,
+        file,
+        source,
+        imports,
+        aliases,
+        type_node,
+        target_kind.clone(),
+    ) {
+        return outcome;
+    }
     if let Some((type_name, candidates)) =
         qualified_imported_type_candidates(host, support, file, type_node, source, imports, aliases)
     {
@@ -634,6 +650,213 @@ fn declaration_pattern_node(node: Node<'_>) -> Option<Node<'_>> {
             )
         })
     })
+}
+
+/// The outcome for an annotation that names more than one type, or `None` when
+/// the annotation is not a union/intersection at all.
+///
+/// Returning `None` only for the one-arm case is what keeps every ordinary
+/// annotation on exactly the path it took before: this seam only adds the arms
+/// a single-name answer was hiding.
+///
+/// Once the tree says the annotation names two or more arms, this function
+/// always answers. Falling through would hand the caller's
+/// `leading_type_identifier` text scan the whole union text, and that scan
+/// reports its first identifier as one precise type -- which is exactly the
+/// misrepresentation this seam exists to remove. A partly resolved union
+/// (`ServiceA | ExternalLibService` with only `ServiceA` indexed) therefore
+/// stays `Ambiguous`, and an `unresolved_type_arm` diagnostic names the arms
+/// that no indexed definition backs, so the open arm is stated rather than
+/// erased (#1477).
+#[allow(clippy::too_many_arguments)]
+fn multi_arm_annotation_outcome(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    type_node: Node<'_>,
+    target_kind: TypeLookupTargetKind,
+) -> Option<TypeLookupOutcome> {
+    let arms = annotation_type_arms(type_node);
+    if arms.len() < 2 {
+        return None;
+    }
+    let mut types: Vec<TypeLookupType> = Vec::new();
+    let mut open_arms: Vec<String> = Vec::new();
+    for arm in arms {
+        let Some((fqn, definitions)) =
+            arm_type_candidates(host, support, file, source, imports, aliases, arm)
+        else {
+            if arm_can_denote_a_definition(arm) {
+                open_arms.push(ts_type_annotation_text(arm, source));
+            }
+            continue;
+        };
+        if types
+            .iter()
+            .any(|existing| existing.fqn == fqn && existing.definitions == definitions)
+        {
+            continue;
+        }
+        types.push(TypeLookupType { fqn, definitions });
+    }
+
+    if types.is_empty() {
+        if open_arms.is_empty() {
+            // Every arm is a primitive or literal: nothing nominal was hidden,
+            // so the annotation keeps the path it had before this seam existed.
+            return None;
+        }
+        return Some(TypeLookupOutcome {
+            status: TypeLookupStatus::NoType,
+            reference: None,
+            types,
+            diagnostics: vec![TypeLookupDiagnostic {
+                kind: "unresolved_type_arm".to_string(),
+                message: format!(
+                    "no arm of this multi-arm type annotation resolved to an indexed \
+                     TypeScript type: {open_arms:?}"
+                ),
+            }],
+            target_kind,
+        });
+    }
+
+    // `A | A`, or `A | null`, is the only way two arms collapse to one type with
+    // nothing left open, and that answer really is precise.
+    let ambiguous = types.len() > 1 || !open_arms.is_empty();
+    let mut diagnostics = Vec::new();
+    if ambiguous {
+        diagnostics.push(TypeLookupDiagnostic {
+            kind: "ambiguous_type".to_string(),
+            message: "reference resolved to multiple possible types".to_string(),
+        });
+    }
+    if !open_arms.is_empty() {
+        diagnostics.push(TypeLookupDiagnostic {
+            kind: "unresolved_type_arm".to_string(),
+            message: format!(
+                "these arms of the type annotation did not resolve to an indexed \
+                 TypeScript type, so the resolved arms are not the complete set: \
+                 {open_arms:?}"
+            ),
+        });
+    }
+    Some(TypeLookupOutcome {
+        status: if ambiguous {
+            TypeLookupStatus::Ambiguous
+        } else {
+            TypeLookupStatus::Resolved
+        },
+        reference: None,
+        types,
+        diagnostics,
+        target_kind,
+    })
+}
+
+/// Whether an unresolved arm could still name something the index does not
+/// hold.
+///
+/// A primitive (`string`), a literal (`null`, `undefined`, `"a"`), `this`, and a
+/// template literal type each denote a shape the grammar itself fixes -- no
+/// class or interface hides behind them, so their failure to resolve leaves the
+/// remaining arms complete. Every other arm shape can denote a declaration
+/// (a nominal name, an unindexed dependency, a structural `{ run(): void }`),
+/// so an unresolved one keeps the answer open.
+fn arm_can_denote_a_definition(arm: Node<'_>) -> bool {
+    !matches!(
+        arm.kind(),
+        "predefined_type"
+            | "literal_type"
+            | "existential_type"
+            | "this_type"
+            | "template_literal_type"
+    )
+}
+
+/// The arms one type annotation names, read from the tree.
+///
+/// A `union_type` or `intersection_type` contributes each of its arms (nested
+/// ones flattened, since `A | (B | C)` names three types); every other
+/// annotation is one arm, which is what makes the single-type case indexable
+/// by the same helper without changing its answer.
+fn annotation_type_arms<'tree>(type_node: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut pending = vec![unwrap_type_annotation(type_node)];
+    let mut arms = Vec::new();
+    let mut index = 0usize;
+    while index < pending.len() {
+        let node = pending[index];
+        index += 1;
+        match node.kind() {
+            "union_type" | "intersection_type" | "parenthesized_type" => {
+                let mut cursor = node.walk();
+                let children: Vec<_> = node.named_children(&mut cursor).collect();
+                pending.extend(children);
+            }
+            _ => arms.push(node),
+        }
+    }
+    arms
+}
+
+/// Strip the `type_annotation` wrapper (`: T`) so the arms come from the type
+/// itself rather than from the colon-prefixed annotation node.
+fn unwrap_type_annotation(node: Node<'_>) -> Node<'_> {
+    if !matches!(
+        node.kind(),
+        "type_annotation" | "opting_type_annotation" | "omitting_type_annotation"
+    ) {
+        return node;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).next().unwrap_or(node)
+}
+
+/// The named type one arm resolves to, through the same three lookups the
+/// single-type path uses on a whole annotation: a namespace-qualified imported
+/// type first, then the arm's own type name, then the property owners its type
+/// text expands to (which is what unwraps a `Promise<Service>` arm).
+///
+/// Running all three per arm is what lets the multi-arm seam answer for every
+/// annotation it claims: an arm is unresolved only when the single-type path
+/// would also have failed on that arm alone.
+fn arm_type_candidates(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    arm: Node<'_>,
+) -> Option<(String, Vec<CodeUnit>)> {
+    if let Some(qualified) =
+        qualified_imported_type_candidates(host, support, file, arm, source, imports, aliases)
+    {
+        return Some(qualified);
+    }
+    let arm_text = ts_type_annotation_text(arm, source);
+    if let Some(type_name) = leading_type_identifier(&arm_text) {
+        let candidates = identifier_candidates(
+            host,
+            support,
+            file,
+            Language::TypeScript,
+            imports,
+            aliases,
+            type_name,
+            false,
+        );
+        if !candidates.is_empty() {
+            return Some((type_name.to_string(), candidates));
+        }
+    }
+    let owners = prefer_type_definitions(ts_resolve_type_text_to_property_owners(
+        host, support, file, source, imports, aliases, &arm_text, 0,
+    ));
+    (!owners.is_empty()).then(|| (type_lookup_name(&owners, &arm_text), owners))
 }
 
 fn leading_type_identifier(text: &str) -> Option<&str> {

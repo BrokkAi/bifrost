@@ -561,6 +561,16 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         None
     }
 
+    /// Exact method-family edges for one member (#1477 M4).
+    ///
+    /// `None` is the honest default: a language whose analyzer has not landed
+    /// an override/implements relation says so, and the query layer reports an
+    /// `unsupported` outcome instead of an empty exhaustive answer. There is
+    /// deliberately no default `supported` implementation.
+    fn member_family_provider(&self) -> Option<&dyn crate::analyzer::usages::MemberFamilyProvider> {
+        None
+    }
+
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         None
     }

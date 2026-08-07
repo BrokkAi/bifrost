@@ -243,6 +243,13 @@ class SearchToolsClient:
         answer includes editor-only rows. A forward query in a language whose
         adapter has no forward projection reports ``edge_axis_unsupported``
         rather than an empty answer.
+        Receiver and member analysis adds ``receiver_outcome``,
+        ``receiver_evidence``, and ``member_selection`` rows.
+        ``receiver_outcome`` is the mandatory per-site outcome row that states
+        the coverage of an empty evidence set, ``receiver_evidence`` rows are
+        parent-linked chain hops rather than nested values, and
+        ``member_selection`` is the mandatory per-occurrence selection summary,
+        which exists even when the language records no candidate trace.
         Hierarchy steps are direct by default and accept a positive ``depth`` or
         ``transitive=True``. Declaration results are limited to declarations
         indexed by the workspace analyzer. Pass exactly one of ``pattern``,

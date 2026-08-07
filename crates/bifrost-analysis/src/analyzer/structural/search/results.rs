@@ -347,6 +347,22 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryMemberSelection>,
     },
+    DispatchOutcome {
+        #[serde(flatten)]
+        value: Box<CodeQueryDispatchOutcome>,
+    },
+    DispatchTarget {
+        #[serde(flatten)]
+        value: Box<CodeQueryDispatchTarget>,
+    },
+    MemberFamily {
+        #[serde(flatten)]
+        value: Box<CodeQueryMemberFamily>,
+    },
+    MemberFamilyEdge {
+        #[serde(flatten)]
+        value: Box<CodeQueryMemberFamilyEdge>,
+    },
     Occurrence {
         #[serde(flatten)]
         value: Box<CodeQueryOccurrence>,
@@ -362,6 +378,10 @@ pub enum CodeQueryResultValue {
     ResolutionCandidate {
         #[serde(flatten)]
         value: Box<CodeQueryResolutionCandidate>,
+    },
+    CandidateHop {
+        #[serde(flatten)]
+        value: Box<CodeQueryCandidateHop>,
     },
     GenerationSite {
         #[serde(flatten)]
