@@ -22,18 +22,24 @@ pub struct ResolvedReferenceSite {
     pub focus_end_byte: usize,
 }
 
+/// `root` is the parsed root node of `source`, or `None` when the file did not
+/// parse. It supplies the member-access chain around the selection, which the
+/// byte scan in [`expand_reference_expression`] cannot see across an
+/// optional-chaining operator (#1781).
 pub fn resolve_reference_site(
     request: &SourceLocationRequest,
     source: &str,
+    root: Option<Node<'_>>,
 ) -> Result<ResolvedReferenceSite, String> {
     let line_starts = compute_line_starts(source);
-    resolve_reference_site_with_line_starts(request, source, &line_starts)
+    resolve_reference_site_with_line_starts(request, source, &line_starts, root)
 }
 
 pub fn resolve_reference_site_with_line_starts(
     request: &SourceLocationRequest,
     source: &str,
     line_starts: &[usize],
+    root: Option<Node<'_>>,
 ) -> Result<ResolvedReferenceSite, String> {
     let language = language_for_file(&request.file);
     // A Rust raw identifier (`r#type`) is one token whose `r#` escape prefix
@@ -111,15 +117,30 @@ pub fn resolve_reference_site_with_line_starts(
         _ => return Err("provide either start_byte or line/column".to_string()),
     };
 
-    let (start, end) =
+    let (scanned_start, scanned_end) =
         expand_reference_expression(source, selection_start, selection_end, language);
-    if start >= end {
+    if scanned_start >= scanned_end {
         return Err("reference selection is empty".to_string());
     }
-    if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+    if !source.is_char_boundary(scanned_start) || !source.is_char_boundary(scanned_end) {
         return Err("reference selection does not align to UTF-8 character boundaries".to_string());
     }
-    let text = source[start..end].trim().to_string();
+    // The parsed chain replaces the scan only when it covers what the scan
+    // found, so the scan's `::` paths and trailing separators are never
+    // narrowed by a member-access node that stops earlier.
+    let chain = root
+        .and_then(|root| {
+            member_access_chain(root, source, selection_start, selection_end, language)
+        })
+        .filter(|chain| chain.start <= scanned_start && chain.end >= scanned_end);
+    let (start, end, text) = match chain {
+        Some(chain) => (chain.start, chain.end, chain.text),
+        None => (
+            scanned_start,
+            scanned_end,
+            source[scanned_start..scanned_end].trim().to_string(),
+        ),
+    };
     if text.is_empty() {
         return Err("reference selection is blank".to_string());
     }
@@ -316,6 +337,166 @@ fn expand_reference_expression(
     (left, right)
 }
 
+/// One `receiver.member` step of a dotted member-access chain.
+struct MemberAccess<'tree> {
+    receiver: Node<'tree>,
+    member: Node<'tree>,
+}
+
+/// The dotted member-access chain that covers `[start, end)`.
+struct MemberAccessChain {
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+/// The receiver and member of a dot-separated member access, or `None` when
+/// `node` is not one in `language`.
+///
+/// Only a grammar that spells an optional-chaining member access needs an
+/// entry here. [`expand_reference_expression`] already spans a plain `a.b.c`
+/// chain, and it truncates exactly the chains whose operator carries a `?`,
+/// because `?` is not an identifier byte (#1781). A grammar whose member
+/// operator is not `.` at all -- PHP's `->`, C++'s `->` -- is deliberately
+/// absent: an entry for it would widen every member site of that language
+/// rather than repair the optional ones.
+fn member_access_parts<'tree>(
+    node: Node<'tree>,
+    language: Language,
+) -> Option<MemberAccess<'tree>> {
+    match (language, node.kind()) {
+        // `a.b` and `a?.b`; the `?.` is an `optional_chain` child between the
+        // `object` and `property` fields.
+        (Language::JavaScript | Language::TypeScript, "member_expression") => Some(MemberAccess {
+            receiver: node.child_by_field_name("object")?,
+            member: node.child_by_field_name("property")?,
+        }),
+        (Language::CSharp, "member_access_expression") => Some(MemberAccess {
+            receiver: node.child_by_field_name("expression")?,
+            member: node.child_by_field_name("name")?,
+        }),
+        // C# spells `a?.b` as a conditional access whose member lives in a
+        // separate `member_binding_expression`.
+        (Language::CSharp, "conditional_access_expression") => {
+            let receiver = node.child_by_field_name("condition")?;
+            let mut cursor = node.walk();
+            let binding = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "member_binding_expression")?;
+            Some(MemberAccess {
+                receiver,
+                member: binding.child_by_field_name("name")?,
+            })
+        }
+        // Kotlin spells both `a.b` and `a?.b` as a navigation expression whose
+        // member lives in a `navigation_suffix`.
+        (Language::Kotlin, "navigation_expression") => {
+            let mut cursor = node.walk();
+            let receiver = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() != "navigation_suffix")?;
+            let mut cursor = node.walk();
+            let suffix = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "navigation_suffix")?;
+            let mut cursor = suffix.walk();
+            Some(MemberAccess {
+                receiver,
+                member: suffix.named_children(&mut cursor).next()?,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether `node` only wraps the member half of a member access, so the ascent
+/// in [`member_access_chain`] must pass through it to reach the access itself.
+fn is_member_access_wrapper(node: Node<'_>, language: Language) -> bool {
+    matches!(
+        (language, node.kind()),
+        (Language::CSharp, "member_binding_expression") | (Language::Kotlin, "navigation_suffix")
+    )
+}
+
+/// The text of `node` when it is a single reference name such as `box`, `text`
+/// or `this`. A node with named children is a compound expression -- a call, a
+/// subscript, a construction -- and a chain that reaches one is not a plain
+/// dotted path.
+fn simple_reference_name<'source>(
+    node: Node<'_>,
+    source: &'source str,
+    language: Language,
+) -> Option<&'source str> {
+    if node.named_child_count() != 0 {
+        return None;
+    }
+    let text = source.get(node.start_byte()..node.end_byte())?;
+    (!text.is_empty() && text.bytes().all(|byte| is_ident_byte(byte, language))).then_some(text)
+}
+
+/// The dotted member-access chain around `[start, end)`, read from the tree.
+///
+/// The chain text is rebuilt from the member names instead of sliced out of the
+/// source, so `al.box?.text` reports `al.box.text`: every consumer separates
+/// the qualifier from the member by splitting the site text on `.`, and an
+/// embedded `?` would hand them the qualifier `box?`.
+///
+/// `None` means the selection is not part of a plain dotted chain -- either the
+/// language has no entry in [`member_access_parts`], or some link of the chain
+/// is a call, a subscript or another compound expression that a dotted text
+/// cannot name. The caller then keeps the byte-scanned bounds.
+fn member_access_chain(
+    root: Node<'_>,
+    source: &str,
+    start: usize,
+    end: usize,
+    language: Language,
+) -> Option<MemberAccessChain> {
+    let mut current = smallest_named_node_covering(root, start, end)?;
+    while let Some(parent) = current.parent() {
+        if is_member_access_wrapper(parent, language) {
+            current = parent;
+            continue;
+        }
+        let Some(access) = member_access_parts(parent, language) else {
+            break;
+        };
+        // The selection, not `current`, decides: a wrapper the ascent stepped
+        // through spans its own operator (C# `.Text`) and so is wider than the
+        // member name it holds.
+        let covers_selection =
+            |side: Node<'_>| side.start_byte() <= start && end <= side.end_byte();
+        if !covers_selection(access.receiver) && !covers_selection(access.member) {
+            break;
+        }
+        current = parent;
+    }
+
+    let chain = current;
+    let mut names = Vec::new();
+    loop {
+        match member_access_parts(current, language) {
+            Some(access) => {
+                names.push(simple_reference_name(access.member, source, language)?);
+                current = access.receiver;
+            }
+            None => {
+                names.push(simple_reference_name(current, source, language)?);
+                break;
+            }
+        }
+    }
+    if names.len() < 2 {
+        return None;
+    }
+    names.reverse();
+    Some(MemberAccessChain {
+        start: chain.start_byte(),
+        end: chain.end_byte(),
+        text: names.join("."),
+    })
+}
+
 fn is_ident_byte(byte: u8, language: Language) -> bool {
     byte == b'_'
         || (language == Language::Ruby && byte == b'@')
@@ -448,6 +629,7 @@ mod tests {
                 end_byte: Some(start + 1),
             },
             source,
+            None,
         )
         .expect("symbolic reference site");
 

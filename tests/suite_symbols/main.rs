@@ -15,6 +15,7 @@ mod csharp_constructor_resolution;
 mod diff_analysis_test;
 mod get_definition_test;
 mod most_relevant_files;
+mod optional_chain_reference_site;
 mod reusable_summaries;
 mod searchtools_definition_selectors;
 mod searchtools_fuzzy_symbol_lookup;

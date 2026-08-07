@@ -2914,7 +2914,13 @@ fn java_definition_at(
         scope_nodes: 1,
         ..ReceiverAnalysisWork::default()
     };
-    let Some(site) = java_reference_site(file, input.source, input.line_starts, node) else {
+    let Some(site) = java_reference_site(
+        file,
+        input.source,
+        input.line_starts,
+        input.tree.root_node(),
+        node,
+    ) else {
         return BoundedResolution::Complete {
             value: DefinitionLookupOutcome {
                 status: DefinitionLookupStatus::InvalidLocation,
@@ -2968,7 +2974,13 @@ fn java_type_outcome_at(
         scope_nodes: 1,
         ..ReceiverAnalysisWork::default()
     };
-    let Some(site) = java_reference_site(file, input.source, input.line_starts, node) else {
+    let Some(site) = java_reference_site(
+        file,
+        input.source,
+        input.line_starts,
+        input.tree.root_node(),
+        node,
+    ) else {
         return BoundedResolution::Complete {
             value: TypeLookupOutcome {
                 status: TypeLookupStatus::InvalidLocation,
@@ -3022,6 +3034,7 @@ fn java_reference_site(
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
+    root: Node<'_>,
     node: Node<'_>,
 ) -> Option<crate::analyzer::usages::reference_site::ResolvedReferenceSite> {
     resolve_reference_site_with_line_starts(
@@ -3034,6 +3047,7 @@ fn java_reference_site(
         },
         source,
         line_starts,
+        Some(root),
     )
     .ok()
 }

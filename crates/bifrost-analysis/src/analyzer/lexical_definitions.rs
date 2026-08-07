@@ -5,6 +5,7 @@
 //! symbol graph.  Resolving them from the current syntax tree keeps overlays
 //! authoritative and avoids adding short-lived lexical facts to the store.
 
+use brokk_bifrost_js_ts::syntax::js_ts_var_declarator_binding_scope;
 use tree_sitter::Node;
 
 use super::languages::language_support;
@@ -591,8 +592,9 @@ fn parameter_bindings_with_step<'tree>(
 
 /// The local binder in `scope` that a read of `identifier` at `focus_start`
 /// resolves to. The nearest declaration whose bound name precedes the focus
-/// wins; a hoisted declaration name (JS/TS function or class) is the fallback
-/// because source order does not limit its visibility.
+/// wins; a hoisted declaration name (JS/TS function or class, or a JS/TS `var`
+/// binder anywhere in the enclosing callable) is the fallback because source
+/// order does not limit its visibility.
 fn scope_matching_local(
     language: Language,
     scope: Node<'_>,
@@ -662,7 +664,10 @@ fn scope_matching_local(
         }
         push_named_children(node, &mut stack);
     }
-    let (name, declaration) = nearest_before.or(first_any).or(hoisted)?;
+    let (name, declaration) = nearest_before
+        .or(first_any)
+        .or(hoisted)
+        .or_else(|| js_ts_hoisted_var_binder(language, scope, source, focus_start, identifier))?;
     Some(LexicalDefinition {
         identifier: identifier.to_owned(),
         kind: local_declaration_kind(declaration.kind()),
@@ -708,6 +713,60 @@ fn js_ts_scope_declaration_matches(
     }
     node.child_by_field_name("name")
         .is_some_and(|name| identifier_matches(language, name, source, identifier))
+}
+
+/// The `var` binder for `identifier` that JS/TS hoists over `scope`.
+///
+/// `scope_matching_local` reads declarations in source order and prunes nested
+/// blocks, which is right for `let`/`const` but wrong for `var`: a `var` binds
+/// to its enclosing callable, so it is visible before its declaration and after
+/// the inner block that declares it. Nested callables are pruned because a
+/// `var` inside one binds there instead; `js_ts_var_declarator_binding_scope`
+/// stays the authority on both the `var`-versus-lexical distinction and the
+/// scope a binder attaches to.
+fn js_ts_hoisted_var_binder<'tree>(
+    language: Language,
+    scope: Node<'tree>,
+    source: &str,
+    focus_start: usize,
+    identifier: &str,
+) -> Option<(Node<'tree>, Node<'tree>)> {
+    if !matches!(language, Language::JavaScript | Language::TypeScript) {
+        return None;
+    }
+    let mut nearest_before: Option<(Node<'tree>, Node<'tree>)> = None;
+    let mut earliest_after: Option<(Node<'tree>, Node<'tree>)> = None;
+    let mut stack = Vec::new();
+    push_named_children(scope, &mut stack);
+    while let Some(node) = stack.pop() {
+        if is_parameter_owner(language, node.kind()) {
+            continue;
+        }
+        if node.kind() == "variable_declarator"
+            && js_ts_var_declarator_binding_scope(node).is_some_and(|binding_scope| {
+                binding_scope.start_byte() <= scope.start_byte()
+                    && scope.end_byte() <= binding_scope.end_byte()
+            })
+        {
+            for name in binding_name_nodes(language, node, false) {
+                if !identifier_matches(language, name, source, identifier) {
+                    continue;
+                }
+                if name.start_byte() < focus_start {
+                    if nearest_before.is_none_or(|(best, _)| name.start_byte() > best.start_byte())
+                    {
+                        nearest_before = Some((name, node));
+                    }
+                } else if earliest_after
+                    .is_none_or(|(best, _)| name.start_byte() < best.start_byte())
+                {
+                    earliest_after = Some((name, node));
+                }
+            }
+        }
+        push_named_children(node, &mut stack);
+    }
+    nearest_before.or(earliest_after)
 }
 
 fn scala_enumerator_binding_visible_at(enumerator: Node<'_>, focus_start: usize) -> bool {

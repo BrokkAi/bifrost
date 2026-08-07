@@ -3909,3 +3909,208 @@ fn ts_module_renamed_binders_from_unresolved_import_call_resolve_uses() {
         "every read of the renamed binder must be listed, and storeTheme's must not: {hits:#?}"
     );
 }
+
+// --- issue #1780: object-literal keys minted under a member assignment ---
+//
+// `X.y = { key: ... }` mints the field `X.y.key`, and the forward side resolves
+// `X.y.key` reads to it. Before #1780 the inverse never reported those reads,
+// because the definition side accepted an object literal only as the value of a
+// `variable_declarator` and only for a bare receiver.
+
+/// The one-based number of the first line that contains `needle`, matching the
+/// `UsageHit::line` convention.
+fn line_number_of(source: &str, needle: &str) -> usize {
+    let offset = source
+        .find(needle)
+        .unwrap_or_else(|| panic!("fixture line not found: {needle}"));
+    source[..offset]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
+}
+
+fn reference_lines(hits: &BTreeSet<brokk_bifrost::usages::UsageHit>) -> BTreeSet<usize> {
+    hits.iter()
+        .filter(|hit| hit.kind == UsageHitKind::Reference)
+        .map(|hit| hit.line)
+        .collect()
+}
+
+const MEMBER_ASSIGNMENT_LITERAL_SOURCE: &str = r#"const viaDeclarator = { key: 1 };
+const readDeclarator = viaDeclarator.key;
+const host = {};
+host.viaAssignment = { key: 2 };
+const readAssignment = host.viaAssignment.key;
+const readAssignmentAgain = host.viaAssignment.key;
+const nearMissProperty = host.viaAssignment.other;
+host.otherBranch = { key: 3 };
+const nearMissBranch = host.otherBranch.key;
+const rival = {};
+rival.viaAssignment = { key: 4 };
+const nearMissReceiver = rival.viaAssignment.key;
+"#;
+
+#[test]
+fn js_object_literal_key_under_member_assignment_reports_its_reads() {
+    let source = MEMBER_ASSIGNMENT_LITERAL_SOURCE;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("p8.js", source).build());
+    let file = project.file("p8.js");
+    let target = find_js_definition(&analyzer, &file, "host.viaAssignment.key", |cu| {
+        cu.is_field()
+    });
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+
+    assert_eq!(
+        reference_lines(&hits),
+        BTreeSet::from([
+            line_number_of(source, "const readAssignment ="),
+            line_number_of(source, "const readAssignmentAgain ="),
+        ]),
+        "every read of the assignment-minted key must be listed, and no other receiver's: {hits:#?}"
+    );
+}
+
+#[test]
+fn js_object_literal_key_under_variable_declarator_still_reports_its_reads() {
+    let source = MEMBER_ASSIGNMENT_LITERAL_SOURCE;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("p8.js", source).build());
+    let file = project.file("p8.js");
+    let target = find_js_target(&analyzer, &file, |cu| {
+        cu.is_field() && cu.fq_name() == "p8.js.viaDeclarator.key"
+    });
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+
+    assert_eq!(
+        reference_lines(&hits),
+        BTreeSet::from([line_number_of(source, "const readDeclarator =")]),
+        "the declarator-minted key keeps exactly its own read: {hits:#?}"
+    );
+}
+
+#[test]
+fn js_object_literal_key_under_member_assignment_forward_resolves_its_reads() {
+    let source = MEMBER_ASSIGNMENT_LITERAL_SOURCE;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("p8.js", source).build());
+    let _ = project;
+
+    let read_line = line_number_of(source, "const readAssignment =");
+    let column = "const readAssignment = host.viaAssignment.".chars().count() + 1;
+    let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "p8.js".to_string(),
+                line: Some(read_line),
+                column: Some(column),
+            }],
+        },
+    );
+
+    assert_eq!(forward.results[0].status, "resolved", "{forward:#?}");
+    assert!(
+        forward.results[0]
+            .definitions
+            .iter()
+            .any(|definition| definition.fqn.as_deref() == Some("host.viaAssignment.key")),
+        "the read must still forward-resolve to the assignment-minted key: {forward:#?}"
+    );
+}
+
+#[test]
+fn js_object_literal_key_under_nested_member_assignment_reports_its_reads() {
+    let source = r#"const innerFieldRef = {};
+innerFieldRef.acls = {};
+innerFieldRef.acls.rules = { max: 1, min: 2 };
+const readDeep = innerFieldRef.acls.rules.max;
+const nearMissDepth = innerFieldRef.acls.max;
+const readDeepAgain = innerFieldRef.acls.rules.max;
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("state.js", source).build());
+    let file = project.file("state.js");
+    let target = find_js_definition(&analyzer, &file, "innerFieldRef.acls.rules.max", |cu| {
+        cu.is_field()
+    });
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+
+    assert_eq!(
+        reference_lines(&hits),
+        BTreeSet::from([
+            line_number_of(source, "const readDeep ="),
+            line_number_of(source, "const readDeepAgain ="),
+        ]),
+        "a two-member receiver chain must match element-wise, not by root alone: {hits:#?}"
+    );
+}
+
+#[test]
+fn js_object_literal_keys_under_parameter_member_assignments_report_their_reads() {
+    let source = r#"function buildState(stateData, al, value) {
+  stateData.icmp = { type: null, code: null };
+  const kind = stateData.icmp.type;
+  const code = stateData.icmp.code;
+  al.description = { text: value };
+  return [kind, code, al.description.text];
+}
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("fields.js", source).build());
+    let file = project.file("fields.js");
+
+    let icmp_type = find_js_definition(&analyzer, &file, "stateData.icmp.type", |cu| cu.is_field());
+    let icmp_type_hits = authoritative_js_hits(&analyzer, &icmp_type, file.clone());
+    assert_eq!(
+        reference_lines(&icmp_type_hits),
+        BTreeSet::from([line_number_of(source, "const kind =")]),
+        "`stateData.icmp.type` must list its read and not the sibling `.code` read: {icmp_type_hits:#?}"
+    );
+
+    let description_text =
+        find_js_definition(&analyzer, &file, "al.description.text", |cu| cu.is_field());
+    let description_text_hits = authoritative_js_hits(&analyzer, &description_text, file);
+    assert_eq!(
+        reference_lines(&description_text_hits),
+        BTreeSet::from([line_number_of(source, "  return [kind, code,")]),
+        "`al.description.text` must list the read that follows the write: {description_text_hits:#?}"
+    );
+}
+
+/// A chained receiver must not be exported as if the imported binding owned the
+/// property directly. Seeding importers with `host` for the target
+/// `host.viaAssignment.key` reports `imported.key`, which is not that field, and
+/// still misses `imported.viaAssignment.key`; the bare-receiver restriction in
+/// `exported_local_property_binding` is what keeps that from happening.
+#[test]
+fn js_object_literal_key_under_member_assignment_reports_no_importer_property_of_the_root() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "state.js",
+            "export const host = {};\nhost.viaAssignment = { key: 2 };\n",
+        )
+        .file(
+            "consumer.js",
+            r#"import { host } from "./state.js";
+export function nearMiss() {
+  return host.key;
+}
+"#,
+        )
+        .build()
+    });
+    let file = project.file("state.js");
+    let target = find_js_definition(&analyzer, &file, "host.viaAssignment.key", |cu| {
+        cu.is_field()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != project.file("consumer.js")),
+        "`imported.key` is a different property from `host.viaAssignment.key`: {hits:#?}"
+    );
+}

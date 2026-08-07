@@ -152,7 +152,16 @@ fn resolve_one<'a>(
             }
         },
     };
-    let site = match resolve_reference_site(&request.as_source_location(), &source) {
+    let tree = if request.source.is_some() {
+        parse_tree_for_type_lookup(&file, language, &source)
+    } else {
+        context.tree(&file, language, &source)
+    };
+    let site = match resolve_reference_site(
+        &request.as_source_location(),
+        &source,
+        tree.as_ref().map(Tree::root_node),
+    ) {
         Ok(site) => site,
         Err(message) => {
             return diagnostic_outcome(
@@ -174,11 +183,6 @@ fn resolve_one<'a>(
         );
     };
 
-    let tree = if request.source.is_some() {
-        parse_tree_for_type_lookup(&file, language, &source)
-    } else {
-        context.tree(&file, language, &source)
-    };
     let resolved = resolver.resolve_type(TypeLookupQuery {
         analyzer,
         support: &context.support,
