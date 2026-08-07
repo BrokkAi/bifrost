@@ -666,6 +666,23 @@ fn evaluate_policy_inputs_with_limits(
     )
 }
 
+/// Total on-disk size and count of the analyzed files in one workspace snapshot.
+///
+/// A file the analyzer knows about but whose metadata is no longer readable
+/// contributes zero bytes; its scan will charge nothing either.
+fn analyzed_source_volume(workspace: &WorkspaceAnalyzer) -> (u64, usize) {
+    let files = workspace.analyzer().analyzed_files();
+    let bytes = files
+        .iter()
+        .map(|file| {
+            std::fs::metadata(file.abs_path())
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        })
+        .sum();
+    (bytes, files.len())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_prepared_policy_inputs(
     root: &Path,
@@ -922,6 +939,17 @@ fn evaluate_prepared_policy_inputs(
 
     let mut runs = HashMap::with_capacity(runnable_ids.len());
     let workspace = supplied_workspace.or(owned_analyzer.as_ref());
+    // A policy subject scan is Theta(workspace facts), so the scan lanes must
+    // follow the audited workspace (#1771).  Scaling is a per-lane max, so an
+    // explicitly widened caller budget survives and an explicitly narrowed one
+    // is raised back to the fixed defaults.
+    let per_policy_budget = match workspace {
+        Some(workspace) => {
+            let (bytes, files) = analyzed_source_volume(workspace);
+            batch_budget.per_policy().scaled_for_workspace(bytes, files)
+        }
+        None => *batch_budget.per_policy(),
+    };
     let uncancelled = CancellationToken::default();
     let semantic_cancellation = cancellation.unwrap_or(&uncancelled);
     let active_semantic_models = match semantic_models {
@@ -960,7 +988,7 @@ fn evaluate_prepared_policy_inputs(
             workspace,
             active_semantic_models,
             cancellation,
-            batch_budget.per_policy(),
+            &per_policy_budget,
         )
     });
     let typestate = ProductionTypestatePolicyEvaluator::default();
@@ -1002,7 +1030,7 @@ fn evaluate_prepared_policy_inputs(
         if policy_deadline_reached(cancellation)? {
             deadline_stage.get_or_insert(PolicyExecutionStage::PolicyEvaluation);
         }
-        let mut evaluation_budget = *batch_budget.per_policy();
+        let mut evaluation_budget = per_policy_budget;
         let context = PolicyEvaluationContext {
             analyzer: workspace.map(WorkspaceAnalyzer::analyzer).ok_or_else(|| {
                 PolicyCoordinatorError::new(format!(
