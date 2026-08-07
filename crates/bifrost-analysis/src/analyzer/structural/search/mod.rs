@@ -98,8 +98,8 @@ mod receiver;
 mod relations;
 mod render;
 use environment::{
-    BindingKey, BindingValue, CandidateKey, CandidateValue, EnvironmentTraversalCache, ScopeKey,
-    ScopeValue,
+    BindingKey, BindingValue, CandidateHopKey, CandidateHopValue, CandidateKey, CandidateValue,
+    EnvironmentTraversalCache, ScopeKey, ScopeValue,
 };
 use occurrences::{OccurrenceKey, OccurrenceTraversalCache, OccurrenceValue};
 use paths::{
@@ -168,6 +168,7 @@ pub use results::CodeQueryCallArgumentGroup;
 pub use results::CodeQueryCallShape;
 pub use results::CodeQueryCallShapeArgument;
 pub use results::CodeQueryCallSite;
+pub use results::CodeQueryCandidateHop;
 pub use results::CodeQueryCandidateRef;
 pub use results::CodeQueryCapture;
 pub use results::CodeQueryCompletion;
@@ -549,6 +550,7 @@ enum PipelineValue {
     LexicalScope(ScopeValue),
     Binding(BindingValue),
     ResolutionCandidate(Box<CandidateValue>),
+    CandidateHop(Box<CandidateHopValue>),
     GenerationSite(materialization::GenerationSiteValue),
     Export(materialization::ExportValue),
     DeclarationState(materialization::DeclarationStateValue),
@@ -620,6 +622,7 @@ enum PipelineKey {
     LexicalScope(ScopeKey),
     Binding(BindingKey),
     ResolutionCandidate(CandidateKey),
+    CandidateHop(CandidateHopKey),
     GenerationSite(materialization::GenerationSiteKey),
     Export(materialization::ExportKey),
     DeclarationState(materialization::DeclarationStateKey),
@@ -676,6 +679,7 @@ impl PipelineValue {
             Self::DeclarationState(value) => PipelineKey::DeclarationState(value.key()),
             Self::Binding(value) => PipelineKey::Binding(value.key()),
             Self::ResolutionCandidate(value) => PipelineKey::ResolutionCandidate(value.key()),
+            Self::CandidateHop(value) => PipelineKey::CandidateHop(value.key()),
             Self::ReferenceEdge(value) => PipelineKey::ReferenceEdge(value.key()),
             Self::QualifiedPath(value) => PipelineKey::QualifiedPath(value.key()),
             Self::PathSegment(value) => PipelineKey::PathSegment(value.key()),
@@ -902,6 +906,7 @@ enum PipelineTraceValue {
     LexicalScope(ScopeValue),
     Binding(BindingValue),
     ResolutionCandidate(Box<CandidateValue>),
+    CandidateHop(Box<CandidateHopValue>),
     GenerationSite(materialization::GenerationSiteValue),
     Export(materialization::ExportValue),
     DeclarationState(materialization::DeclarationStateValue),
@@ -3086,6 +3091,29 @@ fn detailed_evidence_for_pipeline_value(
                 provenance: Vec::new(),
             }
         }
+        PipelineValue::CandidateHop(value) => {
+            let row = &value.occurrence;
+            let byte_span = row.range.start_byte..row.range.end_byte;
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::CandidateHop,
+                key: DetailedCodeQueryKey::CandidateHop {
+                    id: value.id(),
+                    candidate_id: value.candidate_id(),
+                    hop: value.hop.hop,
+                },
+                file: row.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: row
+                    .enclosing
+                    .as_ref()
+                    .and_then(|unit| stable_owner_candidate_for_unit(&row.file, unit)),
+                provenance: Vec::new(),
+            }
+        }
         PipelineValue::ResolutionCandidate(value) => {
             let row = &value.occurrence;
             let byte_span = row.range.start_byte..row.range.end_byte;
@@ -3215,6 +3243,7 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::PathSegment(value) => Some(value.file()),
         PipelineValue::Binding(value) => Some(value.file()),
         PipelineValue::ResolutionCandidate(value) => Some(value.file()),
+        PipelineValue::CandidateHop(value) => Some(value.file()),
         PipelineValue::GenerationSite(value) => Some(value.file()),
         PipelineValue::Export(value) => Some(value.file()),
         PipelineValue::DeclarationState(value) => Some(value.file()),
@@ -3343,6 +3372,9 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::ResolutionCandidate(value) => {
             files.insert(value.file().clone());
         }
+        PipelineValue::CandidateHop(value) => {
+            files.insert(value.file().clone());
+        }
         PipelineValue::GenerationSite(value) => {
             files.insert(value.file().clone());
         }
@@ -3403,6 +3435,9 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
             files.insert(value.file().clone());
         }
         PipelineTraceValue::ResolutionCandidate(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::CandidateHop(value) => {
             files.insert(value.file().clone());
         }
         PipelineTraceValue::GenerationSite(value) => {
@@ -3740,6 +3775,20 @@ fn detailed_trace_provenance_ref(
                     id: value.id(),
                     ast_id: row.ast_id(),
                     ordinal: value.ordinal,
+                },
+                &row.file,
+                row.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::CandidateHop(value) => {
+            let row = &value.occurrence;
+            detailed_environment_provenance_ref(
+                DetailedCodeQueryDomain::CandidateHop,
+                DetailedCodeQueryKey::CandidateHop {
+                    id: value.id(),
+                    candidate_id: value.candidate_id(),
+                    hop: value.hop.hop,
                 },
                 &row.file,
                 row.range,
@@ -4250,6 +4299,7 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::ResolutionCandidate(value) => {
             Some(PipelineTraceValue::ResolutionCandidate(value.clone()))
         }
+        PipelineValue::CandidateHop(value) => Some(PipelineTraceValue::CandidateHop(value.clone())),
         PipelineValue::GenerationSite(value) => {
             Some(PipelineTraceValue::GenerationSite(value.clone()))
         }

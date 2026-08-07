@@ -2215,6 +2215,7 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::CallArgumentGroup
             | QueryValueKind::CallArgument
             | QueryValueKind::MemberSelection
+            | QueryValueKind::CandidateHop
             | QueryValueKind::Procedure
             | QueryValueKind::ProgramPoint
             | QueryValueKind::ControlEdge
@@ -2745,7 +2746,11 @@ fn terminal_presentation(
         | CodeQueryResultValue::CallShape { .. }
         | CodeQueryResultValue::CallArgumentGroup { .. }
         | CodeQueryResultValue::CallArgument { .. }
-        | CodeQueryResultValue::MemberSelection { .. } => return Err(()),
+        | CodeQueryResultValue::MemberSelection { .. }
+        // A hierarchy hop explains part of one candidate's route. It is an
+        // analysis projection, not a position a finding is anchored at; the
+        // candidate row it joins to is.
+        | CodeQueryResultValue::CandidateHop { .. } => return Err(()),
         CodeQueryResultValue::Occurrence { value } => (
             DetailedCodeQueryDomain::Occurrence,
             value.path.as_str(),
@@ -3397,6 +3402,7 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::ReceiverAnalysis { .. } => "receiver_analysis",
         CodeQueryResultRef::ReceiverOutcome { .. } => "receiver_outcome",
         CodeQueryResultRef::MemberSelection { .. } => "member_selection",
+        CodeQueryResultRef::CandidateHop { .. } => "candidate_hop",
         CodeQueryResultRef::ReceiverEvidence { .. } => "receiver_evidence",
         CodeQueryResultRef::CallShape { .. } => "call_shape",
         CodeQueryResultRef::CallArgumentGroup { .. } => "call_argument_group",
@@ -3437,6 +3443,7 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::CallArgumentGroup { path, .. }
         | CodeQueryResultRef::CallArgument { path, .. }
         | CodeQueryResultRef::MemberSelection { path, .. }
+        | CodeQueryResultRef::CandidateHop { path, .. }
         | CodeQueryResultRef::Occurrence { path, .. }
         | CodeQueryResultRef::LexicalScope { path, .. }
         | CodeQueryResultRef::Binding { path, .. }
@@ -3499,7 +3506,8 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::CallShape
         | DetailedCodeQueryDomain::CallArgumentGroup
         | DetailedCodeQueryDomain::CallArgument
-        | DetailedCodeQueryDomain::MemberSelection => None,
+        | DetailedCodeQueryDomain::MemberSelection
+        | DetailedCodeQueryDomain::CandidateHop => None,
     }
 }
 
@@ -3679,6 +3687,15 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, site_ast_id.as_bytes());
         }
+        DetailedCodeQueryKey::CandidateHop {
+            id,
+            candidate_id,
+            hop,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, candidate_id.as_bytes());
+            update_hash(&mut hasher, &hop.to_le_bytes());
+        }
     }
     let digest: [u8; 32] = hasher.finalize().into();
     let mut encoded = String::with_capacity(64);
@@ -3731,6 +3748,7 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::CallArgumentGroup => "call_argument_group",
         DetailedCodeQueryDomain::CallArgument => "call_argument",
         DetailedCodeQueryDomain::MemberSelection => "member_selection",
+        DetailedCodeQueryDomain::CandidateHop => "candidate_hop",
         DetailedCodeQueryDomain::Occurrence => "occurrence",
         DetailedCodeQueryDomain::ReferenceEdge => "reference_edge",
         DetailedCodeQueryDomain::LexicalScope => "lexical_scope",

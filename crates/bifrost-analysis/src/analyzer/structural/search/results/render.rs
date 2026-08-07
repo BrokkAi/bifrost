@@ -30,6 +30,7 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::LexicalScope { .. }
                 | CodeQueryResultValue::Binding { .. }
                 | CodeQueryResultValue::ResolutionCandidate { .. }
+                | CodeQueryResultValue::CandidateHop { .. }
                 | CodeQueryResultValue::GenerationSite { .. }
                 | CodeQueryResultValue::Export { .. }
                 | CodeQueryResultValue::DeclarationState { .. }
@@ -456,6 +457,27 @@ impl CodeQueryResult {
                                 owner.fq_name,
                             ));
                         }
+                    }
+                    CodeQueryResultValue::CandidateHop { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [candidate_hop] hop {}: {} -> {} ({})\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.hop,
+                            value
+                                .from
+                                .as_ref()
+                                .map(|unit| unit.fq_name.as_str())
+                                .unwrap_or("<unlocatable>"),
+                            value
+                                .to
+                                .as_ref()
+                                .map(|unit| unit.fq_name.as_str())
+                                .unwrap_or("<unlocatable>"),
+                            value.relation,
+                        ));
+                        out.push_str(&format!("  candidate {}\n", value.candidate_id));
                     }
                     CodeQueryResultValue::ReferenceEdge { value } => {
                         out.push_str(&format!(

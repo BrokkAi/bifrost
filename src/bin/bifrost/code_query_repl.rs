@@ -1266,6 +1266,30 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         if value.candidate_count == 1 { "" } else { "s" },
                     ));
                 }
+                CodeQueryResultValue::CandidateHop { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let from = value
+                        .from
+                        .as_ref()
+                        .map(|unit| sanitize_terminal_text(&unit.fq_name))
+                        .unwrap_or_else(|| "<unlocatable>".to_string());
+                    let to = value
+                        .to
+                        .as_ref()
+                        .map(|unit| sanitize_terminal_text(&unit.fq_name))
+                        .unwrap_or_else(|| "<unlocatable>".to_string());
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} hop {}: {} -> {} ({})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "candidate hop:", use_color),
+                        value.hop,
+                        from,
+                        to,
+                        value.relation,
+                    ));
+                }
                 CodeQueryResultValue::ReceiverOutcome { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let site_id = sanitize_terminal_text(&value.site_id);

@@ -87,6 +87,7 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::LexicalScope(_)
                     | PipelineValue::Binding(_)
                     | PipelineValue::ResolutionCandidate(_)
+                    | PipelineValue::CandidateHop(_)
                     | PipelineValue::GenerationSite(_)
                     | PipelineValue::Export(_)
                     | PipelineValue::DeclarationState(_)
@@ -146,6 +147,7 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::LexicalScope(_)
                                 | PipelineValue::Binding(_)
                                 | PipelineValue::ResolutionCandidate(_)
+                                | PipelineValue::CandidateHop(_)
                                 | PipelineValue::GenerationSite(_)
                                 | PipelineValue::Export(_)
                                 | PipelineValue::DeclarationState(_)
@@ -213,6 +215,7 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::LexicalScope(_)
                         | PipelineValue::Binding(_)
                         | PipelineValue::ResolutionCandidate(_)
+                        | PipelineValue::CandidateHop(_)
                         | PipelineValue::GenerationSite(_)
                         | PipelineValue::Export(_)
                         | PipelineValue::DeclarationState(_)
@@ -1867,6 +1870,15 @@ pub(super) fn apply_pipeline_step(
                     filter,
                     cancellation,
                     diagnostics,
+                    &mut row_exhausted,
+                )
+            }
+            (PipelineValue::Occurrence(value), QueryStep::CandidateHierarchy) => {
+                candidate_hierarchy_expansions(
+                    analyzer,
+                    environment_cache,
+                    &value.row,
+                    cancellation,
                     &mut row_exhausted,
                 )
             }

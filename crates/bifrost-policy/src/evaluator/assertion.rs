@@ -818,6 +818,16 @@ fn evaluate_relational_assertion_policy(
                         binding_queries.push(query);
                         continue;
                     }
+                    RowExpansionStep::CandidateHierarchy => {
+                        // The hierarchy-hop projection consumes the same
+                        // occurrence rows the candidate trace consumes, for
+                        // the same reason.
+                        let mut query = binding_queries[source_index].clone();
+                        query.plan.steps.push(QueryStep::CandidateHierarchy);
+                        binding_index_by_name.insert(&binding.name, index);
+                        binding_queries.push(query);
+                        continue;
+                    }
                     other => {
                         return failed_policy_run(
                             policy,

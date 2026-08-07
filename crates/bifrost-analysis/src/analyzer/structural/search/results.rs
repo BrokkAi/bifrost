@@ -363,6 +363,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryResolutionCandidate>,
     },
+    CandidateHop {
+        #[serde(flatten)]
+        value: Box<CodeQueryCandidateHop>,
+    },
     GenerationSite {
         #[serde(flatten)]
         value: Box<CodeQueryGenerationSite>,

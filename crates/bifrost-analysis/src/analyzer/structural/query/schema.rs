@@ -439,6 +439,7 @@ query_step_ops! {
     ReachingBinding { label: "reaching_binding", signature: "occurrence -> binding", description: "Return the binding of the occurrence's name that is in effect at its exact position." }
     BindingOccurrence { label: "binding_occurrence", signature: "binding -> occurrence", description: "Return the binder-class occurrence row of each binding's declaring token." }
     CandidatesOf { label: "candidates_of", signature: "occurrence -> resolution_candidate", description: "Return the candidates the resolver considered for each reference-class occurrence, with tier, outcome, and boundary." }
+    CandidateHierarchy { label: "candidate_hierarchy", signature: "occurrence -> candidate_hop", description: "Return the exact hierarchy hops each traced member candidate of a reference occurrence was found through. A depth-zero candidate contributes no hop, and a candidate the resolver recorded without member attribution contributes none either -- absence here is unattributed, never a claim that no hierarchy was walked; the mandatory outcome story is member_selection's." }
     CandidateTarget { label: "candidate_target", signature: "resolution_candidate -> declaration", description: "Project the workspace declarations of unit-backed resolution candidates." }
     EdgesOf { label: "edges_of", signature: "declaration -> reference_edge", description: "Return the canonical inverse reference edges of each declaration: every usage site the usage index enumerates, with kind, proof, usage kind, and owner relation." }
     EdgesFrom { label: "edges_from", signature: "occurrence -> reference_edge", description: "Return the canonical forward reference edges of each occurrence: the resolver's own resolved targets for that exact token, with kind, proof, usage kind, and owner relation." }
@@ -609,6 +610,7 @@ macro_rules! rql_forms {
                     | Self::ReachingBinding
                     | Self::BindingOccurrence
                     | Self::CandidatesOf
+                    | Self::CandidateHierarchy
                     | Self::GenerationSites
                     | Self::Exports
                     | Self::Generates
@@ -1121,6 +1123,14 @@ rql_forms! {
         signature: "(candidates-of [:tier ...] [:outcome ...] [:boundary ...] query)",
         description: (QueryStepOp::CandidatesOf),
         step: CandidatesOf,
+    }
+    CandidateHierarchy {
+        labels: ["candidate-hierarchy", "candidate_hierarchy"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(candidate-hierarchy query)",
+        description: (QueryStepOp::CandidateHierarchy),
+        step: CandidateHierarchy,
     }
     CandidateTarget {
         labels: ["candidate-target", "candidate_target"],

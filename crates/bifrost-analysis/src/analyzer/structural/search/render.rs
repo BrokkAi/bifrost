@@ -101,6 +101,9 @@ pub(super) fn render_pipeline_item(
         PipelineValue::ResolutionCandidate(value) => CodeQueryResultValue::ResolutionCandidate {
             value: Box::new(render_resolution_candidate(analyzer, &value, detail, cache)),
         },
+        PipelineValue::CandidateHop(value) => CodeQueryResultValue::CandidateHop {
+            value: Box::new(render_candidate_hop(analyzer, &value, detail, cache)),
+        },
         PipelineValue::GenerationSite(value) => CodeQueryResultValue::GenerationSite {
             value: Box::new(render_generation_site(analyzer, &value, cache)),
         },
@@ -217,6 +220,9 @@ pub(super) fn render_provenance(
                     }
                     PipelineTraceValue::ResolutionCandidate(value) => {
                         render_candidate_ref(analyzer, value, cache)
+                    }
+                    PipelineTraceValue::CandidateHop(value) => {
+                        render_candidate_hop_ref(analyzer, value, cache)
                     }
                     PipelineTraceValue::ReferenceEdge(value) => {
                         render_edge_ref(analyzer, value, cache)
@@ -633,6 +639,40 @@ pub(super) fn render_resolution_candidate(
         .as_ref()
         .and_then(|member| render_unit_declaration(analyzer, &member.owner, detail, cache));
     environment::public_candidate(value, range, candidate, canonical_member_id, owner)
+}
+
+/// One exact hierarchy hop of one traced member candidate.
+///
+/// The endpoints are rendered through the same `render_unit_declaration` the
+/// candidate row's `owner` uses, so a hop's `to` at the last hop and the
+/// candidate's `owner` are the same rendered declaration.
+pub(super) fn render_candidate_hop(
+    analyzer: &dyn IAnalyzer,
+    value: &CandidateHopValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCandidateHop {
+    let occurrence = &value.occurrence;
+    let range = render_source_range(analyzer, &occurrence.file, &occurrence.range, cache);
+    let from = render_unit_declaration(analyzer, &value.hop.from, detail, cache);
+    let to = render_unit_declaration(analyzer, &value.hop.to, detail, cache);
+    environment::public_candidate_hop(value, range, from, to)
+}
+
+pub(super) fn render_candidate_hop_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &CandidateHopValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let occurrence = &value.occurrence;
+    CodeQueryResultRef::CandidateHop {
+        id: value.id(),
+        candidate_id: value.candidate_id(),
+        path: rel_path_string(&occurrence.file),
+        range: render_source_range(analyzer, &occurrence.file, &occurrence.range, cache),
+        hop: value.hop.hop,
+        relation: value.hop.relation.label(),
+    }
 }
 
 /// Render one workspace declaration for a row field, or `None` when the

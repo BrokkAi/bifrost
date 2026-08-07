@@ -222,6 +222,7 @@ Steps execute in array order and are validated before the workspace is searched:
 | `reaching_binding` | occurrence | binding | The binding of the occurrence's name in effect at its exact position; accepts `include_shadowed`. |
 | `binding_occurrence` | binding | occurrence | The binder-class occurrence row of the binding's declaring token. |
 | `candidates_of` | occurrence | resolution candidate | Candidates the resolver considered; accepts `tier`, `outcome`, and `boundary`. |
+| `candidate_hierarchy` | occurrence | candidate hop | The exact hierarchy hops each traced member candidate was found through. Each row's `candidate_id` equals the `id` of the `resolution_candidate` row it belongs to, so the two domains join on that field. A depth-zero (direct) candidate emits zero hop rows, and a candidate the resolver recorded without member attribution emits none either -- zero rows is never a claim that no hierarchy was walked, and the mandatory per-occurrence outcome stays `member_selection`'s. |
 | `candidate_target` | resolution candidate | declaration | Workspace declarations of unit-backed candidates; partial by construction. |
 | `edges_of` | declaration | reference edge | The inverse projection: every usage site the usage index enumerates for the declaration; accepts `reference_kinds`, `proof`, `surface`, `usage`, `relation`, and `site_class`. |
 | `edges_from` | occurrence | reference edge | The forward projection: the resolver's own resolved targets for that exact token; accepts the same six filters. |

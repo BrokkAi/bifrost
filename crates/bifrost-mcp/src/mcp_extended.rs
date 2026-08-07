@@ -1026,6 +1026,7 @@ mod tests {
                 "scope_of",
                 "scope_ancestors",
                 "binding_occurrence",
+                "candidate_hierarchy",
                 "candidate_target",
                 "edge_target",
                 "segment_target",

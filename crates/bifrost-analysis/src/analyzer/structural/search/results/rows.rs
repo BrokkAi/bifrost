@@ -104,6 +104,7 @@ pub enum DetailedCodeQueryDomain {
     LexicalScope,
     Binding,
     ResolutionCandidate,
+    CandidateHop,
     GenerationSite,
     Export,
     DeclarationState,
@@ -138,6 +139,7 @@ pub const ALL_DETAILED_CODE_QUERY_DOMAINS: &[DetailedCodeQueryDomain] = &[
     DetailedCodeQueryDomain::LexicalScope,
     DetailedCodeQueryDomain::Binding,
     DetailedCodeQueryDomain::ResolutionCandidate,
+    DetailedCodeQueryDomain::CandidateHop,
     DetailedCodeQueryDomain::GenerationSite,
     DetailedCodeQueryDomain::Export,
     DetailedCodeQueryDomain::DeclarationState,
@@ -280,6 +282,7 @@ impl DetailedCodeQueryDomain {
             QueryValueKind::LexicalScope => Self::LexicalScope,
             QueryValueKind::Binding => Self::Binding,
             QueryValueKind::ResolutionCandidate => Self::ResolutionCandidate,
+            QueryValueKind::CandidateHop => Self::CandidateHop,
             QueryValueKind::GenerationSite => Self::GenerationSite,
             QueryValueKind::Export => Self::Export,
             QueryValueKind::DeclarationState => Self::DeclarationState,
@@ -317,6 +320,7 @@ impl DetailedCodeQueryDomain {
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
             Self::ResolutionCandidate => "resolution_candidate",
+            Self::CandidateHop => "candidate_hop",
             Self::GenerationSite => "generation_site",
             Self::Export => "export",
             Self::DeclarationState => "declaration_state",
@@ -527,6 +531,15 @@ impl DetailedCodeQueryDomain {
                 CodeQueryRowField::optional("dispatch_tier", Scalar::ConstrainedEnum),
                 CodeQueryRowField::optional("applicability", Scalar::ConstrainedEnum),
             ],
+            Self::CandidateHop => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("candidate_id", Scalar::StableId),
+                CodeQueryRowField::required("ast_id", Scalar::StableId),
+                CodeQueryRowField::required("hop", Scalar::Integer),
+                CodeQueryRowField::required("relation", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("from_id", Scalar::DeclarationIdentity),
+                CodeQueryRowField::optional("to_id", Scalar::DeclarationIdentity),
+            ],
             Self::GenerationSite => code_query_row_fields![
                 CodeQueryRowField::required("id", Scalar::StableId),
                 CodeQueryRowField::optional("ast_id", Scalar::StableId),
@@ -623,6 +636,7 @@ impl CodeQueryResultValue {
             Self::LexicalScope { value } => Some(value.range),
             Self::Binding { value } => Some(value.range),
             Self::ResolutionCandidate { value } => Some(value.range),
+            Self::CandidateHop { value } => Some(value.range),
             Self::GenerationSite { value } => Some(value.range),
             Self::Export { value } => Some(value.range),
             Self::DeclarationState { value } => value.range,
@@ -659,6 +673,7 @@ impl CodeQueryResultValue {
             Self::LexicalScope { .. } => DetailedCodeQueryDomain::LexicalScope,
             Self::Binding { .. } => DetailedCodeQueryDomain::Binding,
             Self::ResolutionCandidate { .. } => DetailedCodeQueryDomain::ResolutionCandidate,
+            Self::CandidateHop { .. } => DetailedCodeQueryDomain::CandidateHop,
             Self::GenerationSite { .. } => DetailedCodeQueryDomain::GenerationSite,
             Self::Export { .. } => DetailedCodeQueryDomain::Export,
             Self::DeclarationState { .. } => DetailedCodeQueryDomain::DeclarationState,
@@ -1142,6 +1157,29 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::ResolutionCandidate { value }, "applicability") => {
             value.applicability.map(Scalar::ConstrainedEnum)
         }
+        (CodeQueryResultValue::CandidateHop { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::CandidateHop { value }, "candidate_id") => {
+            Some(Scalar::StableId(&value.candidate_id))
+        }
+        (CodeQueryResultValue::CandidateHop { value }, "ast_id") => {
+            Some(Scalar::StableId(&value.ast_id))
+        }
+        (CodeQueryResultValue::CandidateHop { value }, "hop") => {
+            Some(Scalar::Integer(value.hop as u64))
+        }
+        (CodeQueryResultValue::CandidateHop { value }, "relation") => {
+            Some(Scalar::ConstrainedEnum(value.relation))
+        }
+        (CodeQueryResultValue::CandidateHop { value }, "from_id") => value
+            .from
+            .as_ref()
+            .and_then(|unit| unit.id.as_deref())
+            .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::CandidateHop { value }, "to_id") => value
+            .to
+            .as_ref()
+            .and_then(|unit| unit.id.as_deref())
+            .map(Scalar::DeclarationIdentity),
         (CodeQueryResultValue::GenerationSite { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::GenerationSite { value }, "ast_id") => {
             value.ast_id.as_deref().map(Scalar::StableId)
@@ -1372,6 +1410,11 @@ pub enum DetailedCodeQueryKey {
         ast_id: String,
         ordinal: usize,
     },
+    CandidateHop {
+        id: String,
+        candidate_id: String,
+        hop: usize,
+    },
     GenerationSite {
         id: String,
         ast_id: Option<String>,
@@ -1529,6 +1572,10 @@ impl DetailedCodeQueryResult {
                             DetailedCodeQueryKey::ResolutionCandidate { .. }
                         )
                         | (
+                            DetailedCodeQueryDomain::CandidateHop,
+                            DetailedCodeQueryKey::CandidateHop { .. }
+                        )
+                        | (
                             DetailedCodeQueryDomain::GenerationSite,
                             DetailedCodeQueryKey::GenerationSite { .. }
                         )
@@ -1683,6 +1730,7 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::LexicalScope { .. }
         | CodeQueryResultValue::Binding { .. }
         | CodeQueryResultValue::ResolutionCandidate { .. }
+        | CodeQueryResultValue::CandidateHop { .. }
         | CodeQueryResultValue::GenerationSite { .. }
         | CodeQueryResultValue::Export { .. }
         | CodeQueryResultValue::DeclarationState { .. }
@@ -1745,6 +1793,7 @@ fn assert_detailed_terminal_identities(
                 | DetailedCodeQueryDomain::LexicalScope
                 | DetailedCodeQueryDomain::Binding
                 | DetailedCodeQueryDomain::ResolutionCandidate
+                | DetailedCodeQueryDomain::CandidateHop
                 // The three materialization domains are identified by their
                 // own content-scoped digests too (#1476).
                 | DetailedCodeQueryDomain::GenerationSite
@@ -1798,6 +1847,7 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::LexicalScope { .. }
         | DetailedCodeQueryKey::Binding { .. }
         | DetailedCodeQueryKey::ResolutionCandidate { .. }
+        | DetailedCodeQueryKey::CandidateHop { .. }
         | DetailedCodeQueryKey::GenerationSite { .. }
         | DetailedCodeQueryKey::Export { .. }
         | DetailedCodeQueryKey::DeclarationState { .. }

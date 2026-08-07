@@ -17,7 +17,7 @@ use brokk_bifrost::policy::{
     PolicyRegistry, PolicyRegistryLimits, PolicyRun, PolicyRunCompletion, PolicySourceIdentity,
     TaintCatalogRegistry,
 };
-use brokk_bifrost::{IAnalyzer, Language, TypescriptAnalyzer};
+use brokk_bifrost::{IAnalyzer, JavaAnalyzer, Language, TypescriptAnalyzer};
 
 /// `render` is declared once and never read.
 const CORRECT_SOURCE: &str = "export function render(): number {\n  return 1;\n}\n";
@@ -92,6 +92,14 @@ fn typescript(source: &str) -> (crate::common::BuiltInlineTestProject, Typescrip
         .file("widget.ts", source)
         .build();
     let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    (project, analyzer)
+}
+
+fn java(source: &str) -> (crate::common::BuiltInlineTestProject, JavaAnalyzer) {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("App.java", source)
+        .build();
+    let analyzer = JavaAnalyzer::from_project(project.project().clone());
     (project, analyzer)
 }
 
@@ -264,6 +272,55 @@ fn member_selection_invariant_is_unreliable_on_a_truncated_binding() {
         run.completion()
     );
     assert!(run.findings().is_empty());
+}
+
+/// The #1477 hierarchy-route invariant: every traced member candidate's route
+/// is exactly as long as the hierarchy distance the resolver walked. The plan
+/// binds sites, expands them into hop rows through the production trace, and
+/// asserts the per-candidate hop count. This is also the executable proof that
+/// `candidate-hierarchy` is a usable relational expansion.
+const TWO_HOP_ROUTE: &str = r#"(policy
+  :id "test.relational.candidate-route-length"
+  :name "The inherited member is reached in exactly two hops"
+  :message "the resolver's hierarchy route must be exactly two hops long"
+  :severity error
+  :analysis (analysis
+    :type assertion
+    (bind :name site :query (rql (occurrences :role [member_position])))
+    (bind :name hop :from site :step candidate-hierarchy)
+    (join :left site :right hop :on ((ast_id ast_id)))
+    (group :name by-candidate :by (hop.candidate_id)
+      (aggregate :name hops :op count))
+    (assert :group by-candidate :value hops :cardinality (exactly 2))))"#;
+
+/// Clean: the candidate is found two supertypes up, so its route has exactly
+/// two hop rows.
+#[test]
+fn candidate_hierarchy_expansion_is_clean_on_the_two_hop_route() {
+    let (_project, analyzer) = java(
+        "class Root { void run() {} }\nclass Base extends Root { }\nclass Service extends Base { }\nclass Caller {\n    void call(Service service) { service.run(); }\n}\n",
+    );
+    let run = evaluate(TWO_HOP_ROUTE, &analyzer, &mut PolicyBudget::default());
+    assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+    assert!(run.findings().is_empty(), "{:?}", run.findings());
+}
+
+/// Finding: a direct member is reached in zero hops, so the only group that
+/// exists is the one-hop route of the *other* site, and the zero-hop candidate
+/// contributes no group at all. A one-hop fixture therefore violates.
+#[test]
+fn candidate_hierarchy_expansion_reports_a_route_of_the_wrong_length() {
+    let (_project, analyzer) = java(
+        "class Root { void run() {} }\nclass Service extends Root { }\nclass Caller {\n    void call(Service service) { service.run(); }\n}\n",
+    );
+    let run = evaluate(TWO_HOP_ROUTE, &analyzer, &mut PolicyBudget::default());
+    assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+    assert_eq!(run.findings().len(), 1, "{:?}", run.findings());
+    let PolicyFindingEvidence::Assertion { evidence } = run.findings()[0].evidence() else {
+        panic!("relational assertion policies produce assertion evidence");
+    };
+    assert_eq!(evidence.expectation(), "(exactly 2)");
+    assert_eq!(evidence.actual_count(), 1);
 }
 
 /// A truncated binding row set is never a verdict: the relational plan reports

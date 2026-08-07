@@ -217,6 +217,14 @@ pub enum CodeQueryResultRef {
         tier: Option<&'static str>,
         outcome: &'static str,
     },
+    CandidateHop {
+        id: String,
+        candidate_id: String,
+        path: String,
+        range: CodeQueryRange,
+        hop: usize,
+        relation: &'static str,
+    },
     ReferenceEdge {
         id: String,
         #[serde(skip_serializing_if = "Option::is_none")]

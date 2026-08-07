@@ -318,6 +318,10 @@ pub fn validate_relational_assertion_plan(
                         DetailedCodeQueryDomain::Occurrence,
                         crate::definition::RowExpansionStep::MemberSelection,
                     ) => DetailedCodeQueryDomain::MemberSelection,
+                    (
+                        DetailedCodeQueryDomain::Occurrence,
+                        crate::definition::RowExpansionStep::CandidateHierarchy,
+                    ) => DetailedCodeQueryDomain::CandidateHop,
                     _ => {
                         return Err(RelationalAssertionPlanError::ExpansionDomainUnavailable {
                             binding: binding.name.as_str().to_string(),

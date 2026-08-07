@@ -228,6 +228,46 @@ pub struct CodeQueryResolutionCandidate {
     pub applicability: Option<&'static str>,
 }
 
+/// One exact hierarchy hop on one member candidate's route (#1477).
+///
+/// One row is one edge the production resolver's own member walk took, so a
+/// candidate found at depth `n` contributes exactly `n` rows, numbered `0`
+/// through `n - 1`, contiguous, starting at the receiver's declared owner and
+/// terminating at the candidate's owner. A depth-zero (direct) candidate
+/// contributes no row, and a candidate the resolver recorded without member
+/// attribution contributes none either. Zero rows is therefore never a claim
+/// that no hierarchy was walked; the mandatory per-occurrence outcome is the
+/// `member_selection` summary's job, not this domain's.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryCandidateHop {
+    pub id: String,
+    /// The exact `id` of the `resolution_candidate` row this hop belongs to.
+    /// Both ids are derived by the same function, so string equality is the
+    /// join between the two domains.
+    pub candidate_id: String,
+    /// The AST identity of the *reference* occurrence the owning candidate was
+    /// considered for, which is what a capture over that token joins on.
+    pub ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    /// The reference occurrence's source range: a hop explains part of the
+    /// resolution of that position.
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    /// Zero-based position of this hop on its candidate's route.
+    pub hop: usize,
+    /// The kind of hierarchy edge, as the provider that recorded it stated it.
+    pub relation: &'static str,
+    /// The type the hop left. `None` when the workspace can no longer locate
+    /// the recorded unit, which is a stated rendering gap, not an absent hop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<CodeQueryDeclaration>,
+    /// The type the hop reached, under the same rule as `from`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<CodeQueryDeclaration>,
+}
+
 /// One canonical reference edge (#1479).
 ///
 /// The same row shape whichever producer derived it: `provenance` says which

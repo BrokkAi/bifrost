@@ -71,6 +71,7 @@ pub enum QueryValueKind {
     LexicalScope,
     Binding,
     ResolutionCandidate,
+    CandidateHop,
     ReferenceEdge,
     QualifiedPath,
     PathSegment,
@@ -107,6 +108,7 @@ impl QueryValueKind {
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
             Self::ResolutionCandidate => "resolution_candidate",
+            Self::CandidateHop => "candidate_hop",
             Self::ReferenceEdge => "reference_edge",
             Self::QualifiedPath => "qualified_path",
             Self::PathSegment => "path_segment",
@@ -277,6 +279,7 @@ pub enum QueryStep {
     ReachingBinding(ReachingBindingOptions),
     BindingOccurrence,
     CandidatesOf(CandidateFilter),
+    CandidateHierarchy,
     CandidateTarget,
     EdgesOf(EdgeFilter),
     EdgesFrom(EdgeFilter),
@@ -759,6 +762,7 @@ impl QueryStep {
             Self::ReachingBinding(_) => QueryStepOp::ReachingBinding,
             Self::BindingOccurrence => QueryStepOp::BindingOccurrence,
             Self::CandidatesOf(_) => QueryStepOp::CandidatesOf,
+            Self::CandidateHierarchy => QueryStepOp::CandidateHierarchy,
             Self::Generates => QueryStepOp::Generates,
             Self::GeneratedBy => QueryStepOp::GeneratedBy,
             Self::DeclarationStateOf(_) => QueryStepOp::DeclarationStateOf,
@@ -830,6 +834,7 @@ impl QueryStep {
             }
             QueryStepOp::BindingOccurrence => Some(Self::BindingOccurrence),
             QueryStepOp::CandidatesOf => Some(Self::CandidatesOf(CandidateFilter::default())),
+            QueryStepOp::CandidateHierarchy => Some(Self::CandidateHierarchy),
             QueryStepOp::CandidateTarget => Some(Self::CandidateTarget),
             QueryStepOp::EdgesOf => Some(Self::EdgesOf(EdgeFilter::default())),
             QueryStepOp::EdgesFrom => Some(Self::EdgesFrom(EdgeFilter::default())),
@@ -989,6 +994,9 @@ impl QueryStep {
             (Self::CandidatesOf(_), QueryValueKind::Occurrence) => {
                 Some(QueryValueKind::ResolutionCandidate)
             }
+            (Self::CandidateHierarchy, QueryValueKind::Occurrence) => {
+                Some(QueryValueKind::CandidateHop)
+            }
             (Self::SegmentsOf(_), QueryValueKind::QualifiedPath) => {
                 Some(QueryValueKind::PathSegment)
             }
@@ -1094,6 +1102,7 @@ pub(super) fn validate_query_steps(
             QueryStep::ReachingBinding(_) => "occurrence",
             QueryStep::BindingOccurrence => "binding",
             QueryStep::CandidatesOf(_) => "occurrence",
+            QueryStep::CandidateHierarchy => "occurrence",
             QueryStep::CandidateTarget => "resolution_candidate",
             QueryStep::EdgesOf(_) => "declaration",
             QueryStep::EdgesFrom(_) => "occurrence",
