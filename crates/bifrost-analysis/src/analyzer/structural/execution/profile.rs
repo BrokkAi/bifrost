@@ -687,6 +687,9 @@ pub struct CodeQueryProfile {
     pub result: CodeQueryResult,
     pub explain: CodeQueryExplain,
     pub timings_ns: CodeQueryProfileTimings,
+    /// Whole-request timings collected by an MCP transport. Core execution
+    /// leaves these values at zero.
+    pub request_timings_ns: CodeQueryProfileRequestTimings,
     pub work: CodeQueryProfileWork,
     pub cache_layers: Vec<CodeQueryProfileCacheLayer>,
     pub access_path: CodeQueryAccessPathProfile,
@@ -717,6 +720,7 @@ impl CodeQueryProfile {
                 rendering: profile.rendering_ns,
                 total: profile.total_elapsed_ns,
             },
+            request_timings_ns: CodeQueryProfileRequestTimings::default(),
             work: CodeQueryProfileWork::from_internal(profile.work),
             cache_layers: CodeQueryProfileCacheLayer::from_internal(profile.cache),
             access_path: CodeQueryAccessPathProfile::from_internal(profile.access_path),
@@ -828,6 +832,21 @@ pub struct CodeQueryProfileTimings {
     pub planning: u64,
     pub execution: u64,
     pub rendering: u64,
+    pub total: u64,
+}
+
+/// Whole-request timing collected by a transport around CodeQuery execution.
+///
+/// `workspace_ready` includes snapshot acquisition and any wait for a deferred
+/// workspace build. `preparation` covers the remaining request setup before
+/// input decoding. Core CodeQuery timings remain in `timings_ns`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct CodeQueryProfileRequestTimings {
+    pub workspace_ready: u64,
+    pub preparation: u64,
+    pub input_decode: u64,
+    pub query_execution: u64,
+    pub rendering_serialization: u64,
     pub total: u64,
 }
 
