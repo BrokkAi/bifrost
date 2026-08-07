@@ -427,9 +427,6 @@ impl ScanCtx<'_> {
     }
 
     fn binds_target_value(&self, ident: &str) -> bool {
-        if self.is_lexically_shadowed(ident) {
-            return false;
-        }
         self.binding_engine
             .resolve_symbol(ident)
             .as_precise()
@@ -437,9 +434,6 @@ impl ScanCtx<'_> {
     }
 
     fn binds_target_object(&self, ident: &str) -> bool {
-        if self.is_lexically_shadowed(ident) {
-            return false;
-        }
         self.binding_engine
             .resolve_symbol(ident)
             .as_precise()
@@ -511,7 +505,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         ctx.scope_stack.push(HashMap::default());
         register_scope_parameters(node, ctx);
     }
-    if kind == "program" || kind == "statement_block" {
+    if kind == "statement_block" {
         register_scope_binding_shadows(node, ctx);
     }
     register_lexical_type_shadow(node, ctx);
@@ -587,6 +581,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// Read direct declaration nodes before their scope body, so a same-named local
 /// callback cannot resolve to an outer queried target before its declaration.
 fn register_scope_binding_shadows(scope: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let retains_owner_member_binding = scope_is_target_owner_body(scope, ctx);
     let mut cursor = scope.walk();
     for child in scope.named_children(&mut cursor) {
         let declaration = child
@@ -611,6 +606,10 @@ fn register_scope_binding_shadows(scope: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         continue;
                     }
                     if let Some(pattern) = declarator.child_by_field_name("name") {
+                        if retains_owner_member_binding && pattern_binds_target_member(pattern, ctx)
+                        {
+                            continue;
+                        }
                         register_lexical_pattern_shadows(pattern, ctx);
                     }
                 }
@@ -618,6 +617,49 @@ fn register_scope_binding_shadows(scope: Node<'_>, ctx: &mut ScanCtx<'_>) {
             _ => {}
         }
     }
+}
+
+fn scope_is_target_owner_body(scope: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if ctx.target_member.is_none() {
+        return false;
+    }
+    let Some(owner) = ctx.target_owner else {
+        return false;
+    };
+    let Some(body_owner) = scope.parent() else {
+        return false;
+    };
+    if !matches!(
+        body_owner.kind(),
+        "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
+    ) {
+        return false;
+    }
+    let owner_range = Range {
+        start_byte: body_owner.start_byte(),
+        end_byte: body_owner.end_byte(),
+        start_line: 0,
+        end_line: 0,
+    };
+    ctx.analyzer
+        .ranges(owner)
+        .iter()
+        .any(|range| range_within(&owner_range, range))
+}
+
+fn pattern_binds_target_member(pattern: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(target_member) = ctx.target_member else {
+        return false;
+    };
+    matches!(
+        pattern.kind(),
+        "identifier" | "shorthand_property_identifier_pattern"
+    ) && slice(pattern, ctx.source) == target_member
 }
 
 /// A named function expression binds its name only inside its own body. Its

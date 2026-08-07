@@ -25,6 +25,8 @@ reliable readiness path.
   and the four affected UsageBench cases.
 - [x] (2026-08-07 14:12Z) Repair the related CommonJS LSP click-around
   regression found by the aarch64 CI job.
+- [x] (2026-08-07 15:04Z) Repair the remaining JavaScript lexical-shadow
+  regressions found by the aarch64 symbol suite.
 
 ## Surprises & Discoveries
 
@@ -45,6 +47,9 @@ reliable readiness path.
 - Observation: A CommonJS destructuring binding can be an imported target.
   Evidence: CI job `92859509677` lost `widget.render()` after it marked the
   `Widget` binding from `require("./lib")` as a local shadow.
+- Observation: A lexical name does not disprove a structured local binding.
+  Evidence: CI job `92865678242` lost a returned property alias and an
+  object-literal method receiver after lexical pre-registration hid both.
 
 ## Decision Log
 
@@ -68,6 +73,11 @@ reliable readiness path.
   shadow it. A CommonJS named function expression needs its own recursive
   binding preserved.
   Date/Author: 2026-08-07 / Codex
+- Decision: Restrict lexical pre-registration to statement blocks. Preserve
+  target-owner bindings and structured target value and object facts.
+  Rationale: A shadow filter can suppress heuristic matching, but it cannot
+  override a binding proven by the local inference engine.
+  Date/Author: 2026-08-07 / Codex
 
 ## Outcomes & Retrospective
 
@@ -81,6 +91,8 @@ Focused validation passed:
 - `cargo test --test suite_usages js_named_commonjs_function_expression_name_is_not_a_usage_but_recursion_is`
 - `cargo test --test suite_usages ts_promise_callback_binding_does_not_impersonate_outer_function`
 - `cargo test --test suite_mcp_cli lsp_click_around_regression::milestone_8_javascript_commonjs_object_click_around`
+- `cargo test --test suite_symbols scan_usages_by_reference_preserves_javascript_property_alias_provenance`
+- `cargo test --test suite_symbols scan_usages_location_target_selects_js_object_literal_method`
 - `cargo test -p brokk-bifrost-mcp cold_workspace_deadline_tests --lib`
 - `cargo test -p brokk-bifrost-mcp explicit_request_budget_wins_over_the_cold_workspace_fallback --lib`
 
