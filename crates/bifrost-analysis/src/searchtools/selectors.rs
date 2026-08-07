@@ -1,18 +1,10 @@
 use super::navigation::*;
 use super::*;
-// Registry allowlist entry (milestone 1f). These stay named rather than becoming a
-// `LanguageSupport` capability: the operation is "decide which of several same-fqn
-// callables is the canonical one, and whether an occurrence is a declaration or a
-// definition", and its evidence is the C++ header/implementation split
-// (`cpp_header_body_files_are_related`). Turning that into a shared capability would be a
-// four-method trait with exactly one implementer and no second language able to answer
-// honestly -- Rust trait-vs-impl and C# `partial` have the shape but not the include-graph
-// evidence the answers rest on. When a second implementer exists this is the seam to
-// generalize; until then the capability would be C++ wearing a generic name.
-use crate::analyzer::{
-    CallableLinkage, CppAnalyzer, CppCallableUnitRole, cpp_callable_unit_role,
-    cpp_header_body_files_are_related, cpp_indexed_callable_linkage, resolve_analyzer,
-};
+// The canonical-selector decision stays C++ specific. Its header and implementation
+// evidence has no equivalent in another supported language. Bounded selector projections
+// use the generic language capability, which keeps the framework out of C++ analyzer internals.
+use crate::analyzer::languages::language_support;
+use crate::analyzer::{CallableLinkage, CppCallableUnitRole, cpp_header_body_files_are_related};
 
 pub(super) type DefinitionCandidateKey = (
     String,
@@ -1017,30 +1009,28 @@ struct CppSelectorFacts {
 
 impl CppSelectorFacts {
     fn load(analyzer: &dyn IAnalyzer, units: &[CodeUnit]) -> Self {
-        let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
-            return Self::load_through_analyzer(analyzer, units);
-        };
+        let support =
+            language_support(Language::Cpp).expect("C++ language support must be registered");
         let mut facts = Self::default();
         for unit in units
             .iter()
             .filter(|unit| language_for_target(unit) == Language::Cpp && unit.is_callable())
         {
-            let signatures = cpp.signatures_limited(unit, usize::MAX);
             facts.signatures.insert(
                 unit.clone(),
-                if signatures.complete {
-                    signatures.rows
-                } else {
-                    analyzer.signatures(unit)
-                },
+                support
+                    .signatures_limited(analyzer, unit, usize::MAX)
+                    .filter(|signatures| signatures.complete)
+                    .map_or_else(|| analyzer.signatures(unit), |signatures| signatures.rows),
             );
 
-            let metadata = cpp.signature_metadata_limited(unit, usize::MAX);
-            let metadata = if metadata.complete {
-                metadata.rows
-            } else {
-                analyzer.signature_metadata(unit)
-            };
+            let metadata = support
+                .signature_metadata_limited(analyzer, unit, usize::MAX)
+                .filter(|metadata| metadata.complete)
+                .map_or_else(
+                    || analyzer.signature_metadata(unit),
+                    |metadata| metadata.rows,
+                );
             facts
                 .roles
                 .insert(unit.clone(), cpp_callable_role_from_metadata(&metadata));
@@ -1048,46 +1038,14 @@ impl CppSelectorFacts {
                 .linkages
                 .insert(unit.clone(), cpp_callable_linkage_from_metadata(&metadata));
 
-            let ranges = cpp.ranges_limited(unit, usize::MAX);
-            let first_range_start = if ranges.complete {
-                ranges.rows.into_iter().map(|range| range.start_byte).min()
-            } else {
-                analyzer
-                    .ranges(unit)
-                    .into_iter()
-                    .map(|range| range.start_byte)
-                    .min()
-            };
-            if let Some(first_range_start) = first_range_start {
-                facts
-                    .first_range_starts
-                    .insert(unit.clone(), first_range_start);
-            }
-        }
-        facts
-    }
-
-    fn load_through_analyzer(analyzer: &dyn IAnalyzer, units: &[CodeUnit]) -> Self {
-        let mut facts = Self::default();
-        for unit in units
-            .iter()
-            .filter(|unit| language_for_target(unit) == Language::Cpp && unit.is_callable())
-        {
-            facts
-                .signatures
-                .insert(unit.clone(), analyzer.signatures(unit));
-            facts
-                .roles
-                .insert(unit.clone(), cpp_callable_unit_role(analyzer, unit));
-            facts
-                .linkages
-                .insert(unit.clone(), cpp_indexed_callable_linkage(analyzer, unit));
-            if let Some(first_range_start) = analyzer
-                .ranges(unit)
+            let first_range_start = support
+                .declaration_ranges_limited(analyzer, unit, usize::MAX)
+                .filter(|ranges| ranges.complete)
+                .map_or_else(|| analyzer.ranges(unit), |ranges| ranges.rows)
                 .into_iter()
                 .map(|range| range.start_byte)
-                .min()
-            {
+                .min();
+            if let Some(first_range_start) = first_range_start {
                 facts
                     .first_range_starts
                     .insert(unit.clone(), first_range_start);
@@ -1758,7 +1716,7 @@ pub(super) fn language_name(language: Language) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{AnalyzerConfig, CppAnalyzer, WorkspaceAnalyzer};
+    use crate::analyzer::{AnalyzerConfig, CppAnalyzer, WorkspaceAnalyzer, resolve_analyzer};
     use crate::test_support::AnalyzerFixture;
     use std::sync::Arc;
 

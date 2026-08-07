@@ -64,8 +64,8 @@ pub(crate) use brokk_bifrost_cpp::declarations::{
     cpp_sentinel_recovered_classes, is_direct_recovered_exported_class_field_declaration, node_text,
 };
 pub(crate) use brokk_bifrost_cpp::identity::{
-    CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole, cpp_callable_unit_role,
-    cpp_indexed_callable_linkage, cpp_is_range_for_binding_name, cpp_occurrence_role_for_range,
+    CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole, cpp_indexed_callable_linkage,
+    cpp_is_range_for_binding_name, cpp_occurrence_role_for_range,
 };
 pub(crate) use identity::{
     cpp_callable_definitions_share_identity_evidence, cpp_header_body_files_are_related,
@@ -1103,6 +1103,15 @@ impl LanguageSupport for CppSupport {
     ) -> Option<LimitedQueryRows<SignatureMetadata>> {
         resolve_analyzer::<CppAnalyzer>(analyzer)
             .map(|cpp| cpp.signature_metadata_limited(unit, limit))
+    }
+
+    fn signatures_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<String>> {
+        resolve_analyzer::<CppAnalyzer>(analyzer).map(|cpp| cpp.signatures_limited(unit, limit))
     }
 
     fn declaration_ranges_limited(

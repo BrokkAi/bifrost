@@ -81,6 +81,18 @@ pub(crate) trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// Rendered signatures this language's analyzer holds for `unit`, visiting at most
+    /// `limit` rows. `None` means the workspace does not analyze this language, or the
+    /// language keeps no direct signature projection.
+    fn signatures_limited(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _unit: &CodeUnit,
+        _limit: usize,
+    ) -> Option<LimitedQueryRows<String>> {
+        None
+    }
+
     /// Declaration ranges this language's analyzer holds for `unit`, visiting at most
     /// `limit` rows. No default: every registered language answers this, and a silent
     /// `None` would report every receiver in that language as budget-exceeded.
@@ -729,8 +741,9 @@ mod tests {
     /// refactor exists to delete. Three capabilities are therefore absent here rather than
     /// forgotten, because none answers anything without a built workspace:
     /// `candidate_augmentation` needs an analyzer and a target, and
-    /// `signature_metadata_limited` and `declaration_ranges_limited` need an analyzer and a
-    /// `CodeUnit`. Each is pinned by its own behavior test instead.
+    /// `signature_metadata_limited`, `signatures_limited`, and
+    /// `declaration_ranges_limited` need an analyzer and a `CodeUnit`. Each is pinned by its
+    /// own behavior test instead.
     const CAPABILITY_MATRIX: &str = "\
 language   | ecosystem            | pass   | sep | strategy | bulk   | recv | facts | type | hl
 Java       | Jvm                  | Java   | .   | yes      | Java   | -    | -     | yes  | yes
