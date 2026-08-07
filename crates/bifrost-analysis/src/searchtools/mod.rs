@@ -337,6 +337,11 @@ pub struct RefreshResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct ActiveWorkspaceResult {
     pub workspace_path: String,
+    /// Whether the workspace's lazily built usage index is finished. The
+    /// server starts that build in the background at workspace startup and
+    /// every tool that needs it blocks until it completes, which is the right
+    /// default; a caller that must not block asks this first (#1757).
+    pub usage_index_ready: bool,
 }
 
 pub fn refresh_result(analyzer: &dyn IAnalyzer) -> RefreshResult {

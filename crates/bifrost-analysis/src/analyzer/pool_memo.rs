@@ -11,11 +11,44 @@
 //! instead of duplicating it -- a background warmer and the first request no
 //! longer race two whole-workspace builds against each other. Only rayon
 //! workers fall back to a duplicate serial build (first write wins).
+//!
+//! A background warm can lift that last restriction with
+//! [`PoolSafeMemo::get_or_build_on_dedicated_pool`]: the build runs on a pool of
+//! this module's own, so it reaches completion without any global-pool worker
+//! and a global-pool worker that reaches the same memo can wait for it. Without
+//! that, a whole-workspace index build started off the request path is still
+//! duplicated -- serially -- by the first request whose parallel fan-out
+//! touches the index (issue #1757).
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::cell::Cell;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 const CANCELLABLE_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+
+thread_local! {
+    /// Set on every worker of [`dedicated_build_pool`]. Such a worker is running
+    /// a dedicated build's own parallelism, so it must never park on a memo: the
+    /// build it would wait for can be the very build whose jobs it is running
+    /// (the issue #549 shape, one pool inwards).
+    static ON_DEDICATED_BUILD_POOL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The rayon pool that background index builds run on.
+///
+/// A build here consumes no worker of the global pool, which is what lets a
+/// global-pool worker park on it instead of duplicating it serially. Built once
+/// per process; its workers sleep while no build is in flight.
+fn dedicated_build_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|index| format!("bifrost-index-build-{index}"))
+            .start_handler(|_| ON_DEDICATED_BUILD_POOL.with(|flag| flag.set(true)))
+            .build()
+            .expect("dedicated index-build pool")
+    })
+}
 
 pub(crate) struct PoolSafeMemo<T> {
     state: Mutex<MemoState<T>>,
@@ -25,11 +58,29 @@ pub(crate) struct PoolSafeMemo<T> {
 struct MemoState<T> {
     value: Option<Arc<T>>,
     builders: usize,
+    /// Of `builders`, how many run on [`dedicated_build_pool`].
+    dedicated_builders: usize,
+}
+
+impl<T> MemoState<T> {
+    /// Whether the calling thread may park on an in-flight build.
+    ///
+    /// Off the rayon pool: always -- parking cannot starve a rayon build. On a
+    /// global-pool worker: only while a dedicated-pool build is in flight,
+    /// because that build reaches its value without this worker. On a
+    /// dedicated-pool worker: never.
+    fn parking_is_safe(&self) -> bool {
+        if rayon::current_thread_index().is_none() {
+            return true;
+        }
+        !ON_DEDICATED_BUILD_POOL.with(Cell::get) && self.dedicated_builders > 0
+    }
 }
 
 /// Releases one builder claim and wakes waiters when a build finishes.
 struct BuildingGuard<'a, T> {
     memo: &'a PoolSafeMemo<T>,
+    dedicated: bool,
 }
 
 impl<T> Drop for BuildingGuard<'_, T> {
@@ -37,6 +88,13 @@ impl<T> Drop for BuildingGuard<'_, T> {
         let mut state = self.memo.state.lock().expect("pool memo poisoned");
         assert!(state.builders > 0, "pool memo builder count underflow");
         state.builders -= 1;
+        if self.dedicated {
+            assert!(
+                state.dedicated_builders > 0,
+                "pool memo dedicated builder count underflow"
+            );
+            state.dedicated_builders -= 1;
+        }
         self.memo.ready.notify_all();
     }
 }
@@ -47,6 +105,7 @@ impl<T> PoolSafeMemo<T> {
             state: Mutex::new(MemoState {
                 value: None,
                 builders: 0,
+                dedicated_builders: 0,
             }),
             ready: Condvar::new(),
         }
@@ -72,21 +131,24 @@ impl<T> PoolSafeMemo<T> {
 
     /// Wait for an in-flight build when this caller may block, or claim the
     /// builder role. Returns the value if one became available while waiting.
-    /// Rayon workers never wait: parking a worker on a build whose `par_iter`
+    /// A rayon worker only waits for a build running on
+    /// [`dedicated_build_pool`]: parking a worker on a build whose `par_iter`
     /// join may steal a job that re-enters this memo deadlocks the pool, so
-    /// they duplicate the build serially instead (first write wins).
-    fn wait_or_claim_build(&self) -> Option<Arc<T>> {
-        let on_pool = rayon::current_thread_index().is_some();
+    /// otherwise it duplicates the build serially (first write wins).
+    fn wait_or_claim_build(&self, claim: BuildClaim) -> Option<Arc<T>> {
         let mut state = self.state.lock().expect("pool memo poisoned");
         loop {
             if let Some(value) = state.value.as_ref() {
                 return Some(Arc::clone(value));
             }
-            if state.builders > 0 && !on_pool {
+            if state.builders > 0 && state.parking_is_safe() {
                 state = self.ready.wait(state).expect("pool memo poisoned");
                 continue;
             }
             state.builders += 1;
+            if claim == BuildClaim::Dedicated {
+                state.dedicated_builders += 1;
+            }
             return None;
         }
     }
@@ -98,7 +160,6 @@ impl<T> PoolSafeMemo<T> {
     /// the condition-variable path and gives cancellation a bounded polling
     /// interval. Rayon workers retain the duplicate serial-build rule.
     fn wait_or_claim_build_while(&self, keep_going: &impl Fn() -> bool) -> Option<Option<Arc<T>>> {
-        let on_pool = rayon::current_thread_index().is_some();
         let mut state = self.state.lock().expect("pool memo poisoned");
         loop {
             if let Some(value) = state.value.as_ref() {
@@ -107,7 +168,7 @@ impl<T> PoolSafeMemo<T> {
             if !keep_going() {
                 return None;
             }
-            if state.builders > 0 && !on_pool {
+            if state.builders > 0 && state.parking_is_safe() {
                 (state, _) = self
                     .ready
                     .wait_timeout(state, CANCELLABLE_WAIT_INTERVAL)
@@ -127,6 +188,35 @@ impl<T> PoolSafeMemo<T> {
         self.get_or_build_with_policy(build_parallel, build_serial, BuildPolicy::PoolSafe)
     }
 
+    /// Build the value on [`dedicated_build_pool`], off the global rayon pool.
+    ///
+    /// Use from a background warm. While this build runs, a global-pool worker
+    /// that reaches the same memo waits for it instead of duplicating it
+    /// serially: the duplicate is a second whole-workspace build, billed to
+    /// whichever request's parallel fan-out touched the index first (#1757).
+    /// Returns an already-built or concurrently built value unchanged.
+    pub(crate) fn get_or_build_on_dedicated_pool(&self, build: impl FnOnce() -> T + Send) -> Arc<T>
+    where
+        T: Send,
+    {
+        if let Some(value) = self.wait_or_claim_build(BuildClaim::Dedicated) {
+            return value;
+        }
+        let _guard = BuildingGuard {
+            memo: self,
+            dedicated: true,
+        };
+
+        let built = Arc::new(dedicated_build_pool().install(build));
+
+        let mut state = self.state.lock().expect("pool memo poisoned");
+        if let Some(existing) = state.value.as_ref() {
+            return Arc::clone(existing);
+        }
+        state.value = Some(Arc::clone(&built));
+        built
+    }
+
     /// Build the value with the parallel builder even when called from a rayon
     /// worker. Use only from orchestration code that prewarms a cache before
     /// starting its own nested parallel scan.
@@ -144,10 +234,13 @@ impl<T> PoolSafeMemo<T> {
         build_serial: impl FnOnce() -> T,
         policy: BuildPolicy,
     ) -> Arc<T> {
-        if let Some(value) = self.wait_or_claim_build() {
+        if let Some(value) = self.wait_or_claim_build(BuildClaim::Shared) {
             return value;
         }
-        let _guard = BuildingGuard { memo: self };
+        let _guard = BuildingGuard {
+            memo: self,
+            dedicated: false,
+        };
 
         let built = Arc::new(match policy {
             BuildPolicy::ForceParallel => build_parallel(),
@@ -168,10 +261,13 @@ impl<T> PoolSafeMemo<T> {
         build_parallel: impl FnOnce() -> Result<T, E>,
         build_serial: impl FnOnce() -> Result<T, E>,
     ) -> Result<Arc<T>, E> {
-        if let Some(value) = self.wait_or_claim_build() {
+        if let Some(value) = self.wait_or_claim_build(BuildClaim::Shared) {
             return Ok(value);
         }
-        let _guard = BuildingGuard { memo: self };
+        let _guard = BuildingGuard {
+            memo: self,
+            dedicated: false,
+        };
 
         let built = Arc::new(if rayon::current_thread_index().is_some() {
             build_serial()?
@@ -200,7 +296,10 @@ impl<T> PoolSafeMemo<T> {
         if let Some(value) = self.wait_or_claim_build_while(keep_going)? {
             return Some(value);
         }
-        let _guard = BuildingGuard { memo: self };
+        let _guard = BuildingGuard {
+            memo: self,
+            dedicated: false,
+        };
 
         let built = Arc::new(if rayon::current_thread_index().is_some() {
             build_serial()?
@@ -226,6 +325,14 @@ impl<T> PoolSafeMemo<T> {
 enum BuildPolicy {
     PoolSafe,
     ForceParallel,
+}
+
+/// Which pool a claimed build will run on. A `Dedicated` claim is what tells
+/// global-pool waiters that parking on this build is safe.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuildClaim {
+    Shared,
+    Dedicated,
 }
 
 impl<T> Default for PoolSafeMemo<T> {
@@ -533,6 +640,88 @@ mod tests {
         let primary = primary.join().expect("primary should finish");
         let follower = follower.join().expect("follower should finish");
         assert!(Arc::ptr_eq(&primary, &follower));
+    }
+
+    /// The #1757 guarantee: while a dedicated-pool build is in flight, a
+    /// global-pool worker that reaches the memo waits for that build instead
+    /// of duplicating it. The duplicate is what billed a whole-workspace Rust
+    /// usage-index build to a `get_symbol_sources` request's own fan-out.
+    #[test]
+    fn global_pool_worker_waits_for_a_dedicated_build_instead_of_duplicating() {
+        use std::time::Duration;
+
+        let memo = Arc::new(PoolSafeMemo::new());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+
+        let warm_memo = Arc::clone(&memo);
+        let warm = thread::spawn(move || {
+            warm_memo.get_or_build_on_dedicated_pool(move || {
+                started_tx.send(()).expect("send start");
+                resume_rx.recv().expect("resume dedicated build");
+                7usize
+            })
+        });
+        started_rx.recv().expect("dedicated build should start");
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("rayon pool");
+        let worker_memo = Arc::clone(&memo);
+        let (worker_tx, worker_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let value = pool.install(|| {
+                worker_memo.get_or_build(
+                    || panic!("a waiting global-pool worker must not build"),
+                    || panic!("a waiting global-pool worker must not build"),
+                )
+            });
+            worker_tx.send(()).expect("send worker completion");
+            value
+        });
+        assert!(
+            worker_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the pool worker returned without waiting for the dedicated build"
+        );
+
+        resume_tx.send(()).expect("resume dedicated build");
+        let warmed = warm.join().expect("warm thread should finish");
+        let waited = worker.join().expect("worker thread should finish");
+        assert!(Arc::ptr_eq(&warmed, &waited));
+        assert_eq!(*waited, 7);
+    }
+
+    /// The workers of the dedicated pool are the build's own parallelism, so
+    /// they keep the duplicate-serial-build rule: re-entering the same memo
+    /// from inside a dedicated build must complete, not deadlock (#549).
+    #[test]
+    fn reentrant_call_from_inside_a_dedicated_build_completes() {
+        use rayon::prelude::*;
+        use std::time::Duration;
+
+        let memo = Arc::new(PoolSafeMemo::new());
+        let (tx, rx) = mpsc::channel();
+
+        let builder_memo = Arc::clone(&memo);
+        let builder = thread::spawn(move || {
+            let inner_memo = Arc::clone(&builder_memo);
+            let value = builder_memo.get_or_build_on_dedicated_pool(move || {
+                (0..64usize)
+                    .into_par_iter()
+                    .map(|_| *inner_memo.get_or_build(|| 7usize, || 7usize))
+                    .sum::<usize>()
+            });
+            tx.send(value).expect("send built value");
+        });
+
+        let value = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("re-entrant dedicated build deadlocked");
+        let stored = memo.get().expect("memo should be populated");
+        assert!(Arc::ptr_eq(&value, &stored));
+        assert!(*stored == 7 || *stored == 448);
+        builder.join().expect("builder should finish");
     }
 
     /// A panicking build must wake waiters and leave the slot empty so a woken

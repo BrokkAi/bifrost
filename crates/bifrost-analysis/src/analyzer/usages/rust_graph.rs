@@ -362,11 +362,11 @@ mod tests {
         );
         assert!(cancellation.is_cancelled());
         assert!(!analyzer.cargo_routes_ready_for_test());
-        assert!(!analyzer.usage_index_ready_for_test());
+        assert!(!analyzer.usage_index_ready());
 
         let candidates = rust_usage_candidate_files(&analyzer, &target, &CancellationToken::new());
         assert!(candidates.contains(&source));
         assert!(analyzer.cargo_routes_ready_for_test());
-        assert!(analyzer.usage_index_ready_for_test());
+        assert!(analyzer.usage_index_ready());
     }
 }

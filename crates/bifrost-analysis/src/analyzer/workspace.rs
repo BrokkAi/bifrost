@@ -480,12 +480,11 @@ impl WorkspaceAnalyzer {
     }
 
     /// Pre-build the lazily constructed Rust usage/re-export index (plus the
-    /// cargo route index it depends on) and the per-file reference contexts.
-    /// These are otherwise charged to whichever request first touches the Rust
-    /// usage graph, which can push a single interactive `scan_usages` call
-    /// past its wall-clock budget on a large workspace (issue #1416). A no-op
-    /// for workspaces without Rust.
-    pub fn warm_rust_usage_analysis(&self) {
+    /// cargo route index it depends on). It is otherwise charged to whichever
+    /// request first touches the Rust usage graph, which can push a single
+    /// interactive call past its wall-clock budget on a large workspace
+    /// (issues #1416, #1757). A no-op for workspaces without Rust.
+    pub fn warm_rust_usage_index(&self) {
         if let Some(rust) =
             crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
         {
@@ -493,8 +492,30 @@ impl WorkspaceAnalyzer {
             // request-scoped memoization; without a scope each lookup re-hydrates
             // (observed ~65s instead of ~3.5s on the Bifrost workspace).
             let _scope = crate::analyzer::AnalyzerQueryScope::new(self.analyzer());
-            rust.warm_usage_analysis();
+            rust.warm_usage_index();
         }
+    }
+
+    /// Pre-build every per-file Rust reference context. A whole-workspace
+    /// fan-out, kept separate from [`Self::warm_rust_usage_index`] so a
+    /// session that does not query the Rust usage graph can leave it out.
+    /// A no-op for workspaces without Rust.
+    pub fn warm_rust_usage_reference_contexts(&self) {
+        if let Some(rust) =
+            crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
+        {
+            let _scope = crate::analyzer::AnalyzerQueryScope::new(self.analyzer());
+            rust.warm_usage_reference_contexts();
+        }
+    }
+
+    /// Whether the Rust usage index is built for this generation. Answers
+    /// without blocking behind an in-flight background build, so a caller that
+    /// must not wait for it can ask this first (#1757). Always true for a
+    /// workspace with no Rust: there is no such index to wait for.
+    pub fn rust_usage_index_ready(&self) -> bool {
+        crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
+            .is_none_or(|rust| rust.usage_index_ready())
     }
 
     /// Select the execution-semantics provider for the requested file without
@@ -703,6 +724,32 @@ mod tests {
         assert!(!multi.query_indexes_warm());
         multi.warm_query_indexes();
         assert!(multi.query_indexes_warm());
+    }
+
+    /// The readiness probe a caller uses to decide whether to wait for the
+    /// background usage-index build (#1757). It must answer `false` before the
+    /// build and `true` after, and it must never be `false` for a workspace
+    /// with no Rust, which has no such index to wait for.
+    #[test]
+    fn rust_usage_index_readiness_reports_false_before_the_warm_and_true_after() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        ProjectFile::new(root.clone(), "src/lib.rs")
+            .write("pub mod worker;\npub fn root() {}\n")
+            .unwrap();
+        ProjectFile::new(root.clone(), "src/worker.rs")
+            .write("use crate::root;\npub fn run() { root(); }\n")
+            .unwrap();
+
+        let rust: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
+        let rust = WorkspaceAnalyzer::build(rust, AnalyzerConfig::default());
+        assert!(!rust.rust_usage_index_ready());
+        rust.warm_rust_usage_index();
+        assert!(rust.rust_usage_index_ready());
+
+        let java: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
+        let java = WorkspaceAnalyzer::build(java, AnalyzerConfig::default());
+        assert!(java.rust_usage_index_ready());
     }
 
     #[test]

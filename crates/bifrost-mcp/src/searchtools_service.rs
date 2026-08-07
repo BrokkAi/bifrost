@@ -835,8 +835,28 @@ pub struct SearchToolsService {
     file_listing: RwLock<Option<Arc<WorkspaceFileListingCache>>>,
     update_strategy: UpdateStrategy,
     semantic_indexing: bool,
+    startup_index_warm: StartupIndexWarm,
     watcher_starter: WatcherStarter,
     diff_snapshot_object_dir: Option<PathBuf>,
+}
+
+/// When a session pays for the expensive per-generation index builds.
+///
+/// The distinction is the process, not the workspace: the same Firefox root
+/// costs minutes and gigabytes to index either way, but only one of these two
+/// kinds of process is still around to spend it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartupIndexWarm {
+    /// A long-lived MCP server, built through the deferred or unbound
+    /// constructors. Start the builds in the background as soon as the
+    /// workspace exists, so the first request that needs one waits for a build
+    /// already in flight instead of running it inside its own budget (#1757).
+    AtStartup,
+    /// A synchronously constructed service: a one-shot `--tool` invocation, an
+    /// embedded host, a test fixture. It can exit seconds later, so it must not
+    /// spend minutes and gigabytes up front on an index it may never query
+    /// (#1758). These sessions keep the lazy build on first need.
+    OnDemand,
 }
 
 struct WorkspaceSession {
@@ -1139,6 +1159,7 @@ impl SearchToolsService {
             workspace,
             UpdateStrategy::Manual,
             false,
+            StartupIndexWarm::OnDemand,
             &watcher_starter,
         )?;
         Ok(Self {
@@ -1156,6 +1177,7 @@ impl SearchToolsService {
             file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::Manual,
             semantic_indexing: false,
+            startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
         })
@@ -1202,6 +1224,7 @@ impl SearchToolsService {
             workspace,
             UpdateStrategy::Manual,
             false,
+            StartupIndexWarm::OnDemand,
             &watcher_starter,
         )?;
         Ok(Self {
@@ -1219,6 +1242,7 @@ impl SearchToolsService {
             file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::Manual,
             semantic_indexing: false,
+            startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
         })
@@ -2079,6 +2103,7 @@ impl SearchToolsService {
             workspace,
             update_strategy,
             semantic_indexing,
+            StartupIndexWarm::OnDemand,
             &watcher_starter,
         )?;
         Ok(Self {
@@ -2096,6 +2121,7 @@ impl SearchToolsService {
             file_listing: RwLock::new(file_listing),
             update_strategy,
             semantic_indexing,
+            startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
         })
@@ -2129,6 +2155,7 @@ impl SearchToolsService {
             workspace,
             update_strategy,
             semantic_indexing,
+            StartupIndexWarm::OnDemand,
             &watcher_starter,
         )?;
         Ok(Self {
@@ -2146,6 +2173,7 @@ impl SearchToolsService {
             file_listing: RwLock::new(file_listing),
             update_strategy,
             semantic_indexing,
+            startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
         })
@@ -2187,6 +2215,7 @@ impl SearchToolsService {
             file_listing: RwLock::new(file_listing),
             update_strategy,
             semantic_indexing,
+            startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
         })
@@ -2251,6 +2280,7 @@ impl SearchToolsService {
             file_listing: RwLock::new(None),
             update_strategy,
             semantic_indexing: semantic_indexing_enabled(),
+            startup_index_warm: StartupIndexWarm::AtStartup,
             watcher_starter: production_watcher_starter(),
             diff_snapshot_object_dir: None,
         }
@@ -2292,6 +2322,7 @@ impl SearchToolsService {
         let build_root = canonical.clone();
         let update_strategy = self.update_strategy;
         let semantic_indexing = self.semantic_indexing;
+        let startup_index_warm = self.startup_index_warm;
         let watcher_starter = Arc::clone(&self.watcher_starter);
         // Created before the deferred build so listing-backed fast paths can
         // fill it while indexing is pending; installed below alongside `root`.
@@ -2312,6 +2343,7 @@ impl SearchToolsService {
                         workspace,
                         update_strategy,
                         semantic_indexing,
+                        startup_index_warm,
                         &watcher_starter,
                     )?;
                     Ok((generation, build_root, session))
@@ -2438,6 +2470,7 @@ impl SearchToolsService {
                         workspace,
                         update_strategy,
                         semantic_indexing,
+                        StartupIndexWarm::AtStartup,
                         &watcher_starter,
                     )?;
                     Ok((1, canonical, session))
@@ -2459,6 +2492,7 @@ impl SearchToolsService {
             file_listing: RwLock::new(file_listing),
             update_strategy,
             semantic_indexing,
+            startup_index_warm: StartupIndexWarm::AtStartup,
             watcher_starter,
             diff_snapshot_object_dir: None,
         })
@@ -2528,6 +2562,7 @@ impl SearchToolsService {
                         workspace,
                         self.update_strategy,
                         self.semantic_indexing,
+                        self.startup_index_warm,
                         &self.watcher_starter,
                     )
                 });
@@ -2782,7 +2817,8 @@ impl SearchToolsService {
         let session = guard.as_mut().ok_or_else(Self::closed_error)?;
 
         if resolved == session.snapshot.analyzer().project().root() {
-            return active_workspace_result(&resolved);
+            let usage_index_ready = session.snapshot.rust_usage_index_ready();
+            return active_workspace_result(&resolved, usage_index_ready);
         }
 
         // Fully assemble the replacement before mutating either active field so
@@ -2806,6 +2842,7 @@ impl SearchToolsService {
             new_workspace,
             self.update_strategy,
             semantic_indexing,
+            self.startup_index_warm,
             &self.watcher_starter,
         )
         .map_err(|err| {
@@ -2821,6 +2858,7 @@ impl SearchToolsService {
         self.advance_workspace_generation();
         let old_session = std::mem::replace(session, new_session);
         session.schedule_index_warm();
+        let usage_index_ready = session.snapshot.rust_usage_index_ready();
         *root = Some(resolved.clone());
         *self
             .file_listing
@@ -2831,7 +2869,10 @@ impl SearchToolsService {
         drop(root);
         old_session.close_semantic();
 
-        active_workspace_result(&resolved)
+        // The replacement session's background index warm has only just
+        // started, so this reports the newly activated workspace's readiness,
+        // not the closed one's.
+        active_workspace_result(&resolved, usage_index_ready)
     }
 
     fn handle_get_active_workspace(
@@ -2844,7 +2885,10 @@ impl SearchToolsService {
             })?;
         let guard = self.read_session()?;
         let session = guard.as_ref().ok_or_else(Self::closed_error)?;
-        active_workspace_result(session.snapshot.analyzer().project().root())
+        active_workspace_result(
+            session.snapshot.analyzer().project().root(),
+            session.snapshot.rust_usage_index_ready(),
+        )
     }
 
     /// Read-first snapshot acquisition: the exclusive session lock is only
@@ -3762,6 +3806,7 @@ fn assemble_session(
     workspace: WorkspaceAnalyzer,
     update_strategy: UpdateStrategy,
     semantic_indexing: bool,
+    startup_index_warm: StartupIndexWarm,
     watcher_starter: &WatcherStarter,
 ) -> Result<WorkspaceSession, String> {
     let document_root = Arc::new(
@@ -3770,17 +3815,30 @@ fn assemble_session(
     );
     let watcher = start_session_watcher(Arc::clone(&project), update_strategy, watcher_starter)?;
     let snapshot = Arc::new(workspace);
-    // Pre-build the lazy Rust usage index off the request path (issue #1416)
-    // unless the caller disables it. Large C++ workspaces can contain a large
-    // vendored Rust tree. Warming every Rust reference context in those trees
-    // competes with ordinary symbol requests and delays their first result.
-    if rust_usage_warming_enabled() {
+    // Start the lazy Rust usage index off the request path at workspace
+    // startup (issues #1416, #1757). A server session that never starts the
+    // build bills its whole-workspace construction to whichever request first
+    // touches the Rust usage graph. The build publishes through a
+    // `PoolSafeMemo`, so a request that arrives mid-build waits for it and a
+    // failed build stays unpublished, resurfacing on the first query that
+    // needs the index.
+    //
+    // The per-file reference contexts are a separate whole-workspace fan-out
+    // that no single request waits on as a unit, and a large C++ workspace can
+    // contain a large vendored Rust tree whose contexts it never queries.
+    // Warming those competes with ordinary symbol requests and delays their
+    // first result, so that half stays opt-out (d8920a38).
+    if startup_index_warm == StartupIndexWarm::AtStartup {
         let snapshot = Arc::clone(&snapshot);
+        let warm_reference_contexts = rust_usage_reference_context_warming_enabled();
         std::thread::Builder::new()
             .name("bifrost-usage-index-warm".to_string())
             .spawn(move || {
                 let _scope = profiling::scope("mcp_cold.query_index_construction.rust_usage");
-                snapshot.warm_rust_usage_analysis();
+                snapshot.warm_rust_usage_index();
+                if warm_reference_contexts {
+                    snapshot.warm_rust_usage_reference_contexts();
+                }
             })
             .map_err(|error| format!("Failed to spawn usage-index warm thread: {error}"))?;
     }
@@ -3798,12 +3856,15 @@ fn assemble_session(
     })
 }
 
-/// Return whether the session should eagerly build the Rust usage graph.
+/// Return whether the session should eagerly build every Rust reference
+/// context at startup.
 ///
 /// The default keeps the interactive behavior for normal sessions. Benchmark
 /// and symbol-only callers can set `BIFROST_WARM_USAGE_ANALYSIS=off` when a
-/// large workspace contains unrelated Rust sources.
-fn rust_usage_warming_enabled() -> bool {
+/// large workspace contains unrelated Rust sources. This never disables the
+/// usage *index* build: leaving that unstarted only moves it into a request
+/// (#1757).
+fn rust_usage_reference_context_warming_enabled() -> bool {
     !matches!(
         std::env::var("BIFROST_WARM_USAGE_ANALYSIS").as_deref(),
         Ok("0") | Ok("off") | Ok("false") | Ok("disabled")
@@ -3857,9 +3918,13 @@ fn resolve_workspace_root(path: &Path) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-fn active_workspace_result(root: &Path) -> Result<ToolOutput, SearchToolsServiceError> {
+fn active_workspace_result(
+    root: &Path,
+    usage_index_ready: bool,
+) -> Result<ToolOutput, SearchToolsServiceError> {
     let structured = serde_json::to_value(ActiveWorkspaceResult {
         workspace_path: root.display().to_string(),
+        usage_index_ready,
     })
     .map_err(|err| {
         SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
@@ -3912,6 +3977,7 @@ mod watcher_startup_tests {
             file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: false,
+            startup_index_warm: StartupIndexWarm::AtStartup,
             watcher_starter: starter,
             diff_snapshot_object_dir: None,
         }
@@ -4503,6 +4569,93 @@ mod watcher_startup_tests {
         }
     }
 
+    /// A long-lived server session starts the Rust usage-index build at
+    /// workspace startup, and `get_active_workspace` answers whether it has
+    /// finished. Every other tool blocks until it has; this is how a caller
+    /// that would rather not wait finds out first (#1757).
+    #[test]
+    fn workspace_startup_starts_the_usage_index_build_and_reports_its_readiness() {
+        let (_temp, root) = workspace("lib.rs", "pub fn root() {}\npub fn run() { root(); }\n");
+        let service = SearchToolsService::new_deferred_manual(root).unwrap();
+        service.ensure_ready().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let reported = service
+                .call_tool_value("get_active_workspace", json!({}))
+                .unwrap();
+            let ready = {
+                let guard = service.session.read().unwrap();
+                guard.as_ref().unwrap().snapshot.rust_usage_index_ready()
+            };
+            // The probe reports the session's own readiness rather than a
+            // constant, in both states.
+            assert_eq!(reported["usage_index_ready"], json!(ready));
+            if ready {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the startup usage-index build never finished"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The other half of the trigger: a synchronously constructed service is a
+    /// one-shot invocation or an embedded host, which can exit seconds later.
+    /// It must not spend the workspace's whole usage-index build up front on an
+    /// index it may never query (#1758), so the build stays lazy.
+    #[test]
+    fn a_one_shot_service_does_not_start_the_usage_index_build_at_startup() {
+        let (_temp, root) = workspace("lib.rs", "pub fn root() {}\npub fn run() { root(); }\n");
+        let service = SearchToolsService::new_manual_without_semantic_index(root).unwrap();
+
+        // Far longer than this two-declaration workspace needs to build the
+        // index, so a started warm would have published by now.
+        std::thread::sleep(Duration::from_millis(200));
+
+        let guard = service.session.read().unwrap();
+        assert!(
+            !guard.as_ref().unwrap().snapshot.rust_usage_index_ready(),
+            "a one-shot service must leave the usage index to the first query that needs it"
+        );
+    }
+
+    /// A tool call that lands while the startup build is still running returns
+    /// the same answer it returns once the index is warm: it waits for the
+    /// background build instead of failing or answering from a partial index.
+    #[test]
+    fn a_request_racing_the_startup_usage_index_build_returns_the_warm_answer() {
+        let (_temp, root) = workspace(
+            "lib.rs",
+            "pub fn root() {}\npub fn run() { root(); }\npub fn spare() {}\n",
+        );
+        let service = SearchToolsService::new_deferred_manual(root).unwrap();
+        service.ensure_ready().unwrap();
+
+        let racing = service
+            .call_tool_value("scan_usages_by_reference", json!({"symbols": ["root"]}))
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !{
+            let guard = service.session.read().unwrap();
+            guard.as_ref().unwrap().snapshot.rust_usage_index_ready()
+        } {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the startup usage-index build never finished"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let warm = service
+            .call_tool_value("scan_usages_by_reference", json!({"symbols": ["root"]}))
+            .unwrap();
+
+        assert_eq!(racing, warm);
+    }
+
     #[test]
     fn deferred_manual_service_does_not_invoke_watcher_starter() {
         let (_temp, root) = workspace("DeferredManual.java", "class DeferredManual {}\n");
@@ -4814,6 +4967,7 @@ public partial class MudDialogContainer
             file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: false,
+            startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter: production_watcher_starter(),
             diff_snapshot_object_dir: None,
         }
@@ -5045,6 +5199,7 @@ mod client_roots_tests {
             file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::Manual,
             semantic_indexing: false,
+            startup_index_warm: StartupIndexWarm::AtStartup,
             watcher_starter: production_watcher_starter(),
             diff_snapshot_object_dir: None,
         }
@@ -5711,6 +5866,7 @@ mod tests {
             file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: true,
+            startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter: production_watcher_starter(),
             diff_snapshot_object_dir: None,
         };

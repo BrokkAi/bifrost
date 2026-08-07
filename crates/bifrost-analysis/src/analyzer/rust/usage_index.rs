@@ -1923,18 +1923,36 @@ impl RustAnalyzer {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn usage_index_ready_for_test(&self) -> bool {
+    /// Whether the usage index has been built for this analyzer generation.
+    /// Never blocks behind an in-flight build, so a caller that does not want
+    /// to wait for the background build can ask this first (#1757).
+    pub(crate) fn usage_index_ready(&self) -> bool {
         self.usage_index.is_ready()
     }
 
-    /// Force the lazy usage index and the per-file reference contexts to exist
-    /// now, so a background warmer can pay their build cost instead of the
-    /// first interactive usage query (which otherwise spends most of a warm
-    /// scan constructing reference contexts one file at a time).
-    pub fn warm_usage_analysis(&self) {
-        let _scope = crate::profiling::scope("RustAnalyzer::warm_usage_analysis");
-        self.usage_index();
+    /// Build the usage index now, from a background warm.
+    ///
+    /// The build runs on the dedicated index-build pool. That is what makes a
+    /// request arriving mid-build *wait* for this build: a request reaches the
+    /// index from inside its own parallel fan-out, and a global-pool worker
+    /// that cannot wait duplicates the whole-workspace build serially inside
+    /// the request instead (985.9 s and 1,049.1 s on Firefox, #1757).
+    pub fn warm_usage_index(&self) {
+        let _scope = crate::profiling::scope("RustAnalyzer::warm_usage_index");
+        self.usage_index
+            .get_or_build_on_dedicated_pool(|| RustUsageIndex::build(self, true));
+    }
+
+    /// Build every per-file reference context now, so an interactive usage
+    /// query does not spend most of a warm scan constructing them one file at
+    /// a time.
+    ///
+    /// Separate from [`Self::warm_usage_index`]: this is a whole-workspace
+    /// fan-out over every Rust file, which a large C++ workspace with a
+    /// vendored Rust tree pays for work it never queries, so sessions can
+    /// leave it out (d8920a38). The index itself always warms.
+    pub fn warm_usage_reference_contexts(&self) {
+        let _scope = crate::profiling::scope("RustAnalyzer::warm_usage_reference_contexts");
         let files: Vec<ProjectFile> = self.get_analyzed_files().into_iter().collect();
         files.par_iter().for_each(|file| {
             self.reference_context_of(file);
@@ -3352,6 +3370,53 @@ mod tests {
 
         assert!(analyzer.usage_index_while(&|| true).is_some());
         assert!(analyzer.usage_index.get().is_some());
+    }
+
+    /// The usage index must be startable on its own. Warming it behind the
+    /// type-hierarchy build is what left it unstarted when the first request
+    /// that needed it arrived on a 401k-file workspace (#1757).
+    #[test]
+    fn warming_the_usage_index_neither_needs_nor_builds_the_hierarchy_index() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/lib.rs")
+            .write("pub mod worker;\npub fn root() {}\n")
+            .expect("write lib.rs");
+        ProjectFile::new(root.clone(), "src/worker.rs")
+            .write("use crate::root;\npub fn run() { root(); }\n")
+            .expect("write worker.rs");
+        let analyzer = analyzer_for(&root);
+        assert!(!analyzer.usage_index_ready());
+
+        analyzer.warm_usage_index();
+
+        assert!(analyzer.usage_index_ready());
+        assert!(analyzer.hierarchy_index.get().is_none());
+    }
+
+    /// The two halves of the old `warm_usage_analysis` are separate so a
+    /// session can skip the whole-workspace reference-context fan-out over a
+    /// vendored Rust tree it never queries (d8920a38) while still starting the
+    /// index build every request blocks on (#1757).
+    #[test]
+    fn warming_the_usage_index_does_not_build_every_reference_context() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let worker = ProjectFile::new(root.clone(), "src/worker.rs");
+        ProjectFile::new(root.clone(), "src/lib.rs")
+            .write("pub mod worker;\npub fn root() {}\n")
+            .expect("write lib.rs");
+        worker
+            .write("use crate::root;\npub fn run() { root(); }\n")
+            .expect("write worker.rs");
+        let analyzer = analyzer_for(&root);
+
+        analyzer.warm_usage_index();
+        assert!(analyzer.usage_index_ready());
+        assert!(analyzer.reference_contexts.get(&worker).is_none());
+
+        analyzer.warm_usage_reference_contexts();
+        assert!(analyzer.reference_contexts.get(&worker).is_some());
     }
 
     fn reexport_chain(

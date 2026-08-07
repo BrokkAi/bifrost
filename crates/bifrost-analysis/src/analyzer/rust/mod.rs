@@ -590,14 +590,21 @@ impl IAnalyzer for RustAnalyzer {
 
     /// The type-hierarchy and usage indexes each take double-digit seconds to
     /// build on large workspaces; every other lazy cache on this analyzer
-    /// fills incrementally at acceptable cost. Warm them sequentially from
-    /// the calling thread rather than under `rayon::join`: each build
+    /// fills incrementally at acceptable cost.
+    ///
+    /// Warm them on two plain threads, not under `rayon::join`: each build
     /// parallelizes internally, and running the accessors on pool workers
     /// would both demote the usage build to its serial pool-safe path and
-    /// block a worker inside the hierarchy `OnceLock` init.
+    /// block a worker inside the hierarchy `OnceLock` init. Warming them one
+    /// after the other is worse still -- on a 401k-file workspace the
+    /// hierarchy build had not returned 16 minutes in, so the usage index had
+    /// not been started when the first request that needed it arrived and the
+    /// request built it itself (#1757).
     fn warm_query_indexes(&self) {
-        self.hierarchy_index();
-        self.usage_index();
+        std::thread::scope(|scope| {
+            scope.spawn(|| self.warm_usage_index());
+            self.hierarchy_index();
+        });
     }
 
     fn query_indexes_warm(&self) -> bool {

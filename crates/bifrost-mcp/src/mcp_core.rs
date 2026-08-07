@@ -389,7 +389,7 @@ pub(crate) fn workspace_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "get_active_workspace",
-            "Return the current active workspace root, including after any prior workspace switch; use this to confirm which repository later tools will inspect.",
+            "Return the current active workspace root, including after any prior workspace switch; use this to confirm which repository later tools will inspect. Also reports usage_index_ready: other tools block until that background index build finishes, so call this first if you would rather do something else than wait.",
             json_schema_object(&[]),
         ),
     ]
