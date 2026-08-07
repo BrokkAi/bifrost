@@ -605,6 +605,11 @@ fn register_scope_binding_shadows(scope: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     if declarator.kind() != "variable_declarator" {
                         continue;
                     }
+                    // CommonJS require bindings resolve through the import
+                    // graph. They must not hide their imported target.
+                    if is_commonjs_require_declarator(declarator, ctx.source) {
+                        continue;
+                    }
                     if let Some(pattern) = declarator.child_by_field_name("name") {
                         register_lexical_pattern_shadows(pattern, ctx);
                     }

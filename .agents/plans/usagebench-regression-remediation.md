@@ -23,6 +23,8 @@ reliable readiness path.
   coverage.
 - [x] (2026-08-07 13:34Z) Run focused Rust tests, formatter, policy checks,
   and the four affected UsageBench cases.
+- [x] (2026-08-07 14:12Z) Repair the related CommonJS LSP click-around
+  regression found by the aarch64 CI job.
 
 ## Surprises & Discoveries
 
@@ -40,6 +42,9 @@ reliable readiness path.
   Evidence: `src/node/wrapper.ts` declares `const onMessage` on line 46 and
   uses it on lines 27 and 55. An owner-range fallback had treated it as the
   outer target declaration.
+- Observation: A CommonJS destructuring binding can be an imported target.
+  Evidence: CI job `92859509677` lost `widget.render()` after it marked the
+  `Widget` binding from `require("./lib")` as a local shadow.
 
 ## Decision Log
 
@@ -75,6 +80,7 @@ Focused validation passed:
 - `cargo test --test suite_usages go_graph_strategy_finds_method_receiver_type_references`
 - `cargo test --test suite_usages js_named_commonjs_function_expression_name_is_not_a_usage_but_recursion_is`
 - `cargo test --test suite_usages ts_promise_callback_binding_does_not_impersonate_outer_function`
+- `cargo test --test suite_mcp_cli lsp_click_around_regression::milestone_8_javascript_commonjs_object_click_around`
 - `cargo test -p brokk-bifrost-mcp cold_workspace_deadline_tests --lib`
 - `cargo test -p brokk-bifrost-mcp explicit_request_budget_wins_over_the_cold_workspace_fallback --lib`
 
