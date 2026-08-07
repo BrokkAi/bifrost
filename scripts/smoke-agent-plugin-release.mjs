@@ -284,10 +284,8 @@ async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env) {
     };
     const rootsRequestPromise = waitForMethod(child, reader, "roots/list");
     writeMessage(child, { jsonrpc: "2.0", method: "notifications/initialized" });
-    // The legacy host requests roots after initialization. RMCP waits until a
-    // tool call needs the workspace, so start that call before awaiting roots.
-    const searchPromise =
-      env.BIFROST_MCP_RMCP === "on" ? roundTrip(child, reader, searchRequest) : null;
+    // RMCP requests roots when a tool call first needs a workspace.
+    const searchPromise = roundTrip(child, reader, searchRequest);
     const rootsRequest = await rootsRequestPromise;
     writeMessage(child, {
       jsonrpc: "2.0",
@@ -296,7 +294,7 @@ async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env) {
         roots: [{ uri: pathToFileURL(workspaceRoot).href, name: "release-smoke-workspace" }],
       },
     });
-    const search = await (searchPromise ?? roundTrip(child, reader, searchRequest));
+    const search = await searchPromise;
     assert.equal(search.result?.isError, false, `MCP roots search_symbols returned an error: ${JSON.stringify(search)}`);
     assertWorkspaceSymbolHit(search, "MCP roots");
     const catalog = await roundTrip(child, reader, {

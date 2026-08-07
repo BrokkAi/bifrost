@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """Replay MCP reproductions and protocol stress scenarios over stdio.
 
-Drives a `bifrost` binary as a real MCP client (roots capability included) on
-either protocol stack, replaying the reproductions from the open latency
-issues (#1423 #1419 #1411 #1430 #1416 #1435 #1398) plus cold-start,
-cancellation, parallel-storm, roots-change, and per-tool coverage scenarios.
-The two stacks disagreeing on the same input is the most useful signal while
-both exist; run both and diff the summaries.
+Drives a `bifrost` binary as a real RMCP client (roots capability included).
+It replays reproductions from the open latency issues (#1423 #1419 #1411
+#1430 #1416 #1435 #1398) plus cold-start, cancellation, parallel-storm,
+roots-change, and per-tool coverage scenarios.
 
 Usage:
   scripts/mcp-replay.py --binary target/release/bifrost --workspace . \
-      [--stack rmcp|legacy] [--scenario NAME ...] [--warm] \
+      [--scenario NAME ...] [--warm] \
       [--budget-secs N] [--no-roots] [--mode 'symbol|extended']
 
 Delete .bifrost/cache/bifrost_cache.v*.db* first for a true-cold run. Set
@@ -33,9 +31,8 @@ import threading
 import time
 
 class McpClient:
-    def __init__(self, binary, workspace, stack, mode, use_roots, extra_env=None):
+    def __init__(self, binary, workspace, mode, use_roots, extra_env=None):
         env = dict(os.environ)
-        env["BIFROST_MCP_RMCP"] = "on" if stack == "rmcp" else "off"
         env["BIFROST_SEMANTIC_INDEX"] = "off"
         if extra_env:
             env.update(extra_env)
@@ -426,7 +423,7 @@ COVERAGE_ARGS = {
     "get_symbol_sources": {"symbols": ["serial_tool_request"]},
     "get_summaries": {"targets": ["crates/bifrost-mcp/src/rmcp_host.rs"]},
     "most_relevant_files": {"seed_file_paths": ["crates/bifrost-mcp/src/rmcp_host.rs"], "limit": 5},
-    "scan_usages_by_location": {"targets": [{"path": "crates/bifrost-mcp/src/mcp_common.rs", "line": 654, "column": 15}]},
+    "scan_usages_by_location": {"targets": [{"path": "crates/bifrost-mcp/src/mcp_common.rs", "line": 137, "column": 15}]},
     "scan_usages_by_reference": {"symbols": ["serial_tool_request"]},
     "get_symbol_locations": {"symbols": ["serial_tool_request"]},
     "get_declarations_by_location": {"references": [{"path": "crates/bifrost-mcp/src/mcp_common.rs", "line": 654}]},
@@ -493,7 +490,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", required=True)
     ap.add_argument("--workspace", required=True)
-    ap.add_argument("--stack", choices=["rmcp", "legacy"], default="rmcp")
     ap.add_argument("--mode", default="symbol|extended")
     ap.add_argument("--no-roots", action="store_true")
     ap.add_argument("--scenario", action="append", default=None)
@@ -506,12 +502,11 @@ def main():
         os.environ["BIFROST_MCP_REQUEST_BUDGET_SECS"] = args.budget_secs
 
     names = args.scenario or list(SCENARIOS)
-    client = McpClient(args.binary, args.workspace, args.stack, args.mode,
-                       use_roots=not args.no_roots)
+    client = McpClient(args.binary, args.workspace, args.mode, use_roots=not args.no_roots)
     try:
         init = client.initialize()
         server = init["result"].get("serverInfo", {})
-        print(f"stack={args.stack} server={server.get('name')} {server.get('version')} roots={not args.no_roots}")
+        print(f"server={server.get('name')} {server.get('version')} roots={not args.no_roots}")
         if args.warm:
             t0 = time.monotonic()
             deadline = t0 + 300
