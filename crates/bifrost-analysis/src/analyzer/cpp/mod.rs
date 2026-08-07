@@ -250,10 +250,10 @@ impl CppAnalyzer {
             .collect()
     }
 
-    pub(crate) fn compile_context_for(&self, file: &ProjectFile) -> Option<&CppCompileContext> {
+    pub(crate) fn compile_contexts_for(&self, file: &ProjectFile) -> &[CppCompileContext] {
         self.compile_contexts
             .get_or_init(|| CppCompileContexts::load(self.inner.project()))
-            .for_file(file)
+            .contexts_for(file)
     }
 
     pub(crate) fn prepared_syntax(
@@ -579,8 +579,8 @@ impl CppSource for CppAnalyzer {
         CppAnalyzer::template_metadata(self, code_unit)
     }
 
-    fn compile_context_for(&self, file: &ProjectFile) -> Option<&CppCompileContext> {
-        CppAnalyzer::compile_context_for(self, file)
+    fn compile_contexts_for(&self, file: &ProjectFile) -> &[CppCompileContext] {
+        CppAnalyzer::compile_contexts_for(self, file)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -902,10 +902,12 @@ impl IAnalyzer for CppAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
-        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(
-            file,
-            brokk_bifrost_cpp::diagnostics::collect_cpp_semantic_diagnostics(self, file, source),
-        )
+        // The collector builds the complete report itself: it is the only
+        // caller that knows whether a compile command was found, whether its
+        // include closure could be reproduced, and which of those failures
+        // leaves a name unjudged rather than absent. The blanket
+        // workspace-local wrapper would report every one of them as clean.
+        brokk_bifrost_cpp::diagnostics::collect_cpp_semantic_diagnostics(self, file, source)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
