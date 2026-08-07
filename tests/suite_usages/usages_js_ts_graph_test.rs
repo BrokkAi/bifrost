@@ -2978,6 +2978,93 @@ fn js_commonjs_exports_named_function_expression_resolves_module_object_usage() 
 }
 
 #[test]
+fn js_named_commonjs_function_expression_name_is_not_a_usage_but_recursion_is() {
+    let source = r#"
+exports.accepts = function accepts(depth) {
+  if (depth > 0) return accepts(depth - 1);
+  return true;
+};
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("request.js", source).build());
+    let target = find_js_target(&analyzer, &project.file("request.js"), |cu| {
+        cu.short_name() == "accepts" && cu.is_function()
+    });
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    assert!(result.all_hits().is_empty(), "external hits: {result:?}");
+    let editor_hits = result.all_hits_including_imports();
+    assert_eq!(1, editor_hits.len(), "editor hits: {editor_hits:?}");
+    let editor_hit = editor_hits
+        .iter()
+        .next()
+        .expect("the recursive call must be an editor hit");
+    assert_eq!(UsageHitKind::SelfReceiver, editor_hit.kind);
+    assert!(
+        editor_hit.snippet.contains("accepts(depth - 1)"),
+        "only the recursive call is an editor hit: {editor_hits:?}"
+    );
+}
+
+#[test]
+fn ts_promise_callback_binding_does_not_impersonate_outer_function() {
+    let source = r#"export function onMessage(depth: number): Promise<number> {
+  return new Promise((resolve) => {
+    const cleanup = () => {
+      proc.off("message", onMessage);
+    };
+    const onMessage = () => {
+      resolve(depth);
+    };
+    proc.on("message", onMessage);
+  });
+}
+
+function use(): Promise<number> { return onMessage(1); }
+"#;
+    let (project, analyzer) = ts_inline_analyzer(|p| p.file("wrapper.ts", source).build());
+    let target = find_ts_target(&analyzer, &project.file("wrapper.ts"), |cu| {
+        cu.short_name() == "onMessage" && cu.is_function()
+    });
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let external_hits = result.all_hits();
+    assert_eq!(1, external_hits.len(), "external hits: {external_hits:?}");
+    let external_lines: BTreeSet<_> = external_hits
+        .iter()
+        .map(|hit| {
+            source[..hit.start_offset]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1
+        })
+        .collect();
+    assert_eq!(
+        BTreeSet::from([13]),
+        external_lines,
+        "only the external call may remain: {external_hits:?}"
+    );
+
+    let editor_hits = result.all_hits_including_imports();
+    assert_eq!(1, editor_hits.len(), "editor hits: {editor_hits:?}");
+    let editor_lines: BTreeSet<_> = editor_hits
+        .iter()
+        .map(|hit| {
+            source[..hit.start_offset]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1
+        })
+        .collect();
+    assert_eq!(
+        BTreeSet::from([13]),
+        editor_lines,
+        "only the external call may remain: {editor_hits:?}"
+    );
+}
+
+#[test]
 fn js_commonjs_module_exports_local_object_resolves_later_member_declaration() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(

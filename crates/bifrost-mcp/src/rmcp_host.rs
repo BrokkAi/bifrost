@@ -1318,6 +1318,16 @@ fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> Erro
     }
 }
 
+/// Apply the bounded cold-start fallback to every analyzer tool except symbol
+/// discovery. `search_symbols` is the first request that agent clients use to
+/// discover a workspace. It waits for the already-running snapshot build
+/// without holding the workspace lock or an analyzer permit. Giving that wait
+/// the fallback deadline makes a cold workspace report a retryable failure
+/// even when the snapshot becomes ready immediately afterwards.
+fn default_cold_workspace_budget_applies(tool_name: &str, cold_workspace: bool) -> bool {
+    cold_workspace && tool_name != "search_symbols"
+}
+
 /// Whether this request's peer negotiated MCP `2026-07-28` or newer.
 ///
 /// Gates every field that revision added. `rmcp` strips `resultType` for a
@@ -1629,7 +1639,10 @@ impl ServerHandler for BifrostMcpHandler {
 
         let accepted_at = Instant::now();
         let cold_workspace = service.workspace_build_pending();
-        let deadline = mcp_request_deadline(accepted_at, cold_workspace);
+        let deadline = mcp_request_deadline(
+            accepted_at,
+            default_cold_workspace_budget_applies(&name, cold_workspace),
+        );
         if !serial {
             let service = Arc::clone(&service);
             let ct = context.ct.clone();
@@ -2003,5 +2016,26 @@ mod named_workspace_tests {
         for invalid in ["", "-repo", "two repos", "repo/path"] {
             assert!(validate_workspace_name(invalid).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod cold_workspace_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn cold_search_symbols_does_not_take_the_default_readiness_deadline() {
+        assert!(!default_cold_workspace_budget_applies(
+            "search_symbols",
+            true
+        ));
+        assert!(default_cold_workspace_budget_applies(
+            "scan_usages_by_location",
+            true
+        ));
+        assert!(!default_cold_workspace_budget_applies(
+            "search_symbols",
+            false
+        ));
     }
 }

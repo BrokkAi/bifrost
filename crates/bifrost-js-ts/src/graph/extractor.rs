@@ -198,6 +198,7 @@ pub fn scan_files_for_seeds(
             receiver_facts,
             lexical_bindings,
             scope_stack: vec![HashMap::default()],
+            lexical_shadow_scopes: Vec::new(),
             binding_engine,
             type_binding_engine: LocalInferenceEngine::new(LocalInferenceConfig::default()),
             hits: &mut local_hits,
@@ -299,6 +300,7 @@ pub struct ScanCtx<'a> {
     receiver_facts: JsTsReceiverFactProvider<'a, 'a>,
     lexical_bindings: Option<JsTsLexicalBindingIndex>,
     scope_stack: Vec<HashMap<String, LocalBinding>>,
+    lexical_shadow_scopes: Vec<HashSet<String>>,
     binding_engine: LocalInferenceEngine<&'static str>,
     type_binding_engine: LocalInferenceEngine<()>,
     pub hits: &'a mut BTreeSet<UsageHit>,
@@ -385,6 +387,9 @@ fn local_property_read_matches(
 
 impl ScanCtx<'_> {
     fn binds_target(&self, ident: &str) -> bool {
+        if self.is_lexically_shadowed(ident) {
+            return false;
+        }
         let local_resolution = self.binding_engine.resolve_symbol(ident);
         if local_resolution.as_precise().is_some_and(|targets| {
             targets.contains(TARGET_BINDING) || targets.contains(TARGET_VALUE_BINDING)
@@ -422,6 +427,9 @@ impl ScanCtx<'_> {
     }
 
     fn binds_target_value(&self, ident: &str) -> bool {
+        if self.is_lexically_shadowed(ident) {
+            return false;
+        }
         self.binding_engine
             .resolve_symbol(ident)
             .as_precise()
@@ -429,6 +437,9 @@ impl ScanCtx<'_> {
     }
 
     fn binds_target_object(&self, ident: &str) -> bool {
+        if self.is_lexically_shadowed(ident) {
+            return false;
+        }
         self.binding_engine
             .resolve_symbol(ident)
             .as_precise()
@@ -436,11 +447,33 @@ impl ScanCtx<'_> {
     }
 
     fn shadows_import_binding(&self, ident: &str) -> bool {
-        self.binding_engine.is_shadowed_in_non_root_scope(ident)
-            && self
-                .edges
-                .iter()
-                .any(|edge| edge.local_name == ident && edge_binds_bare_identifier(edge))
+        self.is_lexically_shadowed(ident)
+            || (self.binding_engine.is_shadowed_in_non_root_scope(ident)
+                && self
+                    .edges
+                    .iter()
+                    .any(|edge| edge.local_name == ident && edge_binds_bare_identifier(edge)))
+    }
+
+    fn enter_lexical_shadow_scope(&mut self) {
+        self.lexical_shadow_scopes.push(HashSet::default());
+    }
+
+    fn exit_lexical_shadow_scope(&mut self) {
+        self.lexical_shadow_scopes.pop();
+    }
+
+    fn declare_lexical_shadow(&mut self, name: String) {
+        if let Some(scope) = self.lexical_shadow_scopes.last_mut() {
+            scope.insert(name);
+        }
+    }
+
+    fn is_lexically_shadowed(&self, name: &str) -> bool {
+        self.lexical_shadow_scopes
+            .iter()
+            .rev()
+            .any(|scope| scope.contains(name))
     }
 }
 
@@ -453,6 +486,12 @@ fn edge_binds_bare_identifier(edge: &ImportEdge) -> bool {
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let kind = node.kind();
+    let introduces_lexical_shadow_scope = matches!(kind, "program" | "statement_block")
+        || (matches!(kind, "function_expression" | "generator_function")
+            && node.child_by_field_name("name").is_some());
+    if introduces_lexical_shadow_scope {
+        ctx.enter_lexical_shadow_scope();
+    }
 
     let introduces_scope = matches!(
         kind,
@@ -461,14 +500,19 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             | "function_expression"
             | "generator_function"
             | "function_declaration"
+            | "generator_function_declaration"
             | "method_definition"
     );
     if introduces_scope {
         ctx.binding_engine.enter_scope();
         ctx.type_binding_engine.enter_scope();
         register_function_parameters(node, ctx);
+        register_named_function_expression_shadow(node, ctx);
         ctx.scope_stack.push(HashMap::default());
         register_scope_parameters(node, ctx);
+    }
+    if kind == "program" || kind == "statement_block" {
+        register_scope_binding_shadows(node, ctx);
     }
     register_lexical_type_shadow(node, ctx);
 
@@ -534,6 +578,146 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         ctx.binding_engine.exit_scope();
         ctx.type_binding_engine.exit_scope();
     }
+    if introduces_lexical_shadow_scope {
+        ctx.exit_lexical_shadow_scope();
+    }
+}
+
+/// Function and lexical declarations bind throughout their containing scope.
+/// Read direct declaration nodes before their scope body, so a same-named local
+/// callback cannot resolve to an outer queried target before its declaration.
+fn register_scope_binding_shadows(scope: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let mut cursor = scope.walk();
+    for child in scope.named_children(&mut cursor) {
+        let declaration = child
+            .child_by_field_name("declaration")
+            .filter(|_| child.kind() == "export_statement")
+            .unwrap_or(child);
+        match declaration.kind() {
+            "function_declaration" | "generator_function_declaration" => {
+                if let Some(name) = declaration.child_by_field_name("name") {
+                    register_unrelated_lexical_target_shadow(name, ctx);
+                }
+            }
+            "lexical_declaration" => {
+                let mut declarations = declaration.walk();
+                for declarator in declaration.named_children(&mut declarations) {
+                    if declarator.kind() != "variable_declarator" {
+                        continue;
+                    }
+                    if let Some(pattern) = declarator.child_by_field_name("name") {
+                        register_lexical_pattern_shadows(pattern, ctx);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A named function expression binds its name only inside its own body. Its
+/// name is still a declaration, not a usage, and an unrelated same-named
+/// expression must shadow an imported or enclosing target binding there.
+fn register_named_function_expression_shadow(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if !matches!(node.kind(), "function_expression" | "generator_function") {
+        return;
+    }
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    let text = slice(name, ctx.source);
+    if text.is_empty() || is_target_declaration_binding(name, text, ctx, true) {
+        return;
+    }
+    ctx.declare_lexical_shadow(text.to_string());
+}
+
+fn register_lexical_pattern_shadows(pattern: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let mut stack = vec![pattern];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" => {
+                register_unrelated_lexical_target_shadow(node, ctx);
+            }
+            "required_parameter" | "optional_parameter" => {
+                if let Some(pattern) = node
+                    .child_by_field_name("pattern")
+                    .or_else(|| node.child_by_field_name("name"))
+                {
+                    stack.push(pattern);
+                }
+            }
+            "assignment_pattern" | "object_assignment_pattern" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    stack.push(left);
+                }
+            }
+            "pair_pattern" => {
+                if let Some(value) = node.child_by_field_name("value") {
+                    stack.push(value);
+                }
+            }
+            _ => {
+                for index in (0..node.named_child_count()).rev() {
+                    if let Some(child) = node.named_child(index) {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn register_unrelated_lexical_target_shadow(name: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let text = slice(name, ctx.source);
+    if text.is_empty() || is_target_lexical_declaration_binding(name, text, ctx) {
+        return;
+    }
+    ctx.declare_lexical_shadow(text.to_string());
+}
+
+fn is_target_lexical_declaration_binding(name: Node<'_>, lhs: &str, ctx: &ScanCtx<'_>) -> bool {
+    if !ctx.target_self_file
+        || (lhs != ctx.target_short && ctx.target_member.is_none_or(|member| lhs != member))
+    {
+        return false;
+    }
+    let Some(declaration) = name.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "function_declaration" | "generator_function_declaration" | "variable_declarator"
+        )
+    }) else {
+        return false;
+    };
+    let matches_target_range = |node: Node<'_>| {
+        ctx.analyzer
+            .ranges(ctx.target)
+            .iter()
+            .any(|range| range.start_byte == node.start_byte() && range.end_byte == node.end_byte())
+    };
+    if matches_target_range(declaration) {
+        return true;
+    }
+    let Some(parent) = declaration.parent() else {
+        return false;
+    };
+    if parent.kind() == "export_statement" {
+        return matches_target_range(parent);
+    }
+    if !matches!(
+        parent.kind(),
+        "lexical_declaration" | "variable_declaration"
+    ) {
+        return false;
+    }
+    if matches_target_range(parent) {
+        return true;
+    }
+    parent
+        .parent()
+        .filter(|grandparent| grandparent.kind() == "export_statement")
+        .is_some_and(matches_target_range)
 }
 
 fn register_lexical_type_shadow(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -995,7 +1179,7 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !binds_target {
         return;
     }
-    if is_declaration_identifier(node) {
+    if is_declaration_identifier(node) || is_named_function_expression_declaration(node) {
         return;
     }
     if is_property_key_in_member(node) {
@@ -1005,6 +1189,15 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     record_hit(node, ctx);
+}
+
+fn is_named_function_expression_declaration(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "function_expression" | "generator_function")
+            && parent
+                .child_by_field_name("name")
+                .is_some_and(|name| name.id() == node.id())
+    })
 }
 
 fn handle_export_specifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

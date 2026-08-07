@@ -17,9 +17,9 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use crate::graph::ast::{
     NON_OWNER_TOKEN, OWNER_TOKEN, SELF_RECEIVER_TOKEN, composite_literal_owner_type_for_key,
     field_owner_token, for_each_var_spec, is_definition_identifier, is_identifier_node,
-    is_method_receiver_parameter, is_method_receiver_type_name, lhs_identifier_slots,
-    parameter_names, receiver_symbol_from_qualifier, rhs_expressions, selector_parts,
-    type_ref_from_node, var_spec_name_slots, var_spec_names,
+    is_method_receiver_parameter, is_method_receiver_type, lhs_identifier_slots, parameter_names,
+    receiver_symbol_from_qualifier, rhs_expressions, selector_parts, type_ref_from_node,
+    var_spec_name_slots, var_spec_names,
 };
 use crate::graph::hits::{record_hit, record_self_receiver_hit, record_unproven_hit};
 use crate::graph::reference::go_is_top_level_decl;
@@ -541,31 +541,16 @@ fn scan_direct_identifier(
     ctx: &mut ScanCtx<'_>,
     locals: &LocalInferenceEngine<String>,
 ) {
-    if ctx.spec.is_member() {
-        return;
-    }
-    // A method receiver names its own type: `func (a AclResourceType) String()`
-    // is a real occurrence of `AclResourceType` that an editor must navigate to
-    // (gopls lists it), so it is recorded rather than swallowed by the
-    // declaration-name guard (#1765). It is also declaration-adjacent noise for
-    // usage counting -- every method of a type would otherwise make the type
-    // look heavily used and defeat dead-code evidence -- so it is classified
-    // `SelfReceiver`, the #1638 trade-off: visible to LspReferences, omitted
-    // from ExternalUsages.
-    let receiver_type = is_method_receiver_type_name(node);
-    if !receiver_type && is_definition_identifier(node, ctx.source) {
+    // A method receiver type is a resolved reference to its named type. The
+    // declaration-side scanner excludes it, but inverse type lookup must keep
+    // the reference. Other definition identifiers remain excluded.
+    if ctx.spec.is_member()
+        || (is_definition_identifier(node, ctx.source) && !is_method_receiver_type(node))
+    {
         return;
     }
     let text = node_text(node, ctx.source);
-    if !ctx.bindings.matches_direct_target(text) {
-        return;
-    }
-    if receiver_type {
-        // A receiver type resolves in package scope: the receiver binding is not
-        // in scope for its own type, even when Go lets the two share a spelling
-        // (`func (Config Config) Reload()`), so the local shadow does not apply.
-        record_self_receiver_hit(node, ctx);
-    } else if !locals.is_shadowed(text) {
+    if ctx.bindings.matches_direct_target(text) && !locals.is_shadowed(text) {
         record_hit(node, ctx);
     }
 }

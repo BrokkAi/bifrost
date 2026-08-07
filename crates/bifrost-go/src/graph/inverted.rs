@@ -25,7 +25,7 @@ use tree_sitter::Node;
 
 use crate::graph::ast::{
     SELF_RECEIVER_TOKEN, for_each_var_spec, is_definition_identifier, is_identifier_node,
-    is_method_receiver_parameter, lhs_identifier_slots, parameter_names,
+    is_method_receiver_parameter, is_method_receiver_type, lhs_identifier_slots, parameter_names,
     receiver_symbol_from_qualifier, rhs_expressions, selector_parts, type_ref_from_node,
     var_spec_names,
 };
@@ -355,7 +355,9 @@ fn scan_selector(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &LocalInference
 }
 
 fn scan_direct(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &LocalInferenceEngine<String>) {
-    if is_definition_identifier(node, ctx.source) {
+    // Keep a method receiver's structured type reference. It names the
+    // receiver type, even though declarations otherwise exclude their names.
+    if is_definition_identifier(node, ctx.source) && !is_method_receiver_type(node) {
         return;
     }
     let text = node_text(node, ctx.source).to_string();
