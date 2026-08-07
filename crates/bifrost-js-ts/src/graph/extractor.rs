@@ -14,7 +14,8 @@ use crate::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, JsTsLexicalBindingScope,
     direct_property_definitions, is_commonjs_require_declarator, is_declaration_identifier,
     is_lexically_nested_type_declaration, is_object_in_member_expression,
-    is_property_key_in_member, nested_type_identifier_parts, slice, static_member_receiver,
+    is_property_key_in_member, nested_type_identifier_parts, pattern_binder_identifiers, slice,
+    static_member_receiver,
 };
 use crate::ts_owners::ts_resolve_type_text_to_property_owners;
 use crate::type_text::ts_type_annotation_text;
@@ -610,15 +611,12 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let Some(value_node) = node.child_by_field_name("value") else {
-        if is_target_declaration_binding(name_node, lhs, ctx, false) {
-            return;
-        }
-        register_pattern_bindings(name_node, ctx);
+        register_declarator_pattern_shadows(name_node, ctx);
         return;
     };
 
     if matches!(name_node.kind(), "object_pattern" | "array_pattern") {
-        register_pattern_bindings(name_node, ctx);
+        register_declarator_pattern_shadows(name_node, ctx);
         if name_node.kind() == "object_pattern"
             && (expression_carries_target_object(value_node, ctx)
                 || expression_resolves_to_target_owner(value_node, ctx))
@@ -880,6 +878,26 @@ fn register_parameter_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Declares one shadow per binder of a `let`/`const`/`var` declarator's
+/// left-hand side, except a binder that is the target's own declaration.
+///
+/// A destructuring declarator binds one ordinary declaration per binder
+/// (`add_destructured_binder_units` indexes each of them), so the binder that
+/// declares the target must not shadow it: shadowing hid every later read of a
+/// module-level `const { cyan } = palette` from the usage scan (#1769). The
+/// plainly named form already returns before `declare_shadow` for the same
+/// reason. Containment in the target's own ranges is the whole test, so a
+/// same-named binder in a nested scope still shadows.
+fn register_declarator_pattern_shadows(name_node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    for binder in pattern_binder_identifiers(name_node) {
+        let name = slice(binder, ctx.source);
+        if name.is_empty() || is_target_declaration_binding(binder, name, ctx, false) {
+            continue;
+        }
+        ctx.binding_engine.declare_shadow(name.to_string());
     }
 }
 

@@ -3488,3 +3488,337 @@ fn jsts_usage_index_invalidates_when_reexport_removed_on_update_javascript() {
         "after removing the re-export and updating, the stale Widget usage must be gone (JS)"
     );
 }
+
+// #1769: a module-level destructuring pattern binds ordinary declarations. Their
+// uses must appear on every surface, exactly as a plain `const name = ...`
+// binding's uses do.
+
+#[test]
+fn ts_module_shorthand_destructured_binding_resolves_same_file_uses() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "colors.ts",
+            "const palette = {\n\
+               cyan: (s: string) => s,\n\
+             };\n\
+             \n\
+             const { cyan } = palette;\n\
+             \n\
+             export function banner(): string {\n\
+               return cyan('hello');\n\
+             }\n\
+             \n\
+             export function footer(): string {\n\
+               return cyan('bye');\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("colors.ts"), |cu| {
+        cu.is_field() && cu.short_name() == "colors.ts.cyan"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([8, 12]),
+        "both reads of the shorthand-destructured module binding must be external usages: {hits:#?}"
+    );
+}
+
+#[test]
+fn ts_module_renamed_destructured_binding_resolves_uses_of_the_local_name() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "colors.ts",
+            "const palette = {\n\
+               cyan: (s: string) => s,\n\
+             };\n\
+             \n\
+             const { cyan: teal } = palette;\n\
+             \n\
+             export function banner(): string {\n\
+               return teal('hello');\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("colors.ts"), |cu| {
+        cu.is_field() && cu.short_name() == "colors.ts.teal"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([8]),
+        "the renamed binder's local name is the declaration name: {hits:#?}"
+    );
+}
+
+#[test]
+fn ts_module_array_destructured_binding_resolves_uses() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "pair.ts",
+            "const items: string[] = ['a', 'b'];\n\
+             \n\
+             const [first, second] = items;\n\
+             \n\
+             export function head(): string {\n\
+               return first;\n\
+             }\n\
+             \n\
+             export function tail(): string {\n\
+               return second;\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("pair.ts"), |cu| {
+        cu.is_field() && cu.short_name() == "pair.ts.first"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([6]),
+        "the array binder's single read must be listed, and `second` must not be: {hits:#?}"
+    );
+}
+
+#[test]
+fn ts_module_destructured_binding_of_imported_object_resolves_uses() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "vendor.ts",
+            "const colors = {\n\
+               cyan: (s: string) => s,\n\
+             };\n\
+             export default colors;\n",
+        )
+        .file(
+            "colors.ts",
+            "import colors from './vendor';\n\
+             \n\
+             const { cyan } = colors;\n\
+             \n\
+             export function banner(): string {\n\
+               return cyan('hello');\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("colors.ts"), |cu| {
+        cu.is_field() && cu.short_name() == "colors.ts.cyan"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([6]),
+        "an imported source object does not change the binder's own declaration: {hits:#?}"
+    );
+}
+
+#[test]
+fn js_module_shorthand_destructured_binding_resolves_uses() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "colors.js",
+            "const palette = {\n\
+               cyan: (s) => s,\n\
+             };\n\
+             \n\
+             const { cyan } = palette;\n\
+             \n\
+             export function banner() {\n\
+               return cyan('hello');\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("colors.js"), |cu| {
+        cu.is_field() && cu.short_name() == "colors.js.cyan"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([8]),
+        "the shared js-ts graph must list the JavaScript binder's read too: {hits:#?}"
+    );
+}
+
+#[test]
+fn ts_plain_module_const_binding_keeps_resolving_uses() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "theme.ts",
+            "const resolvedTheme = 'dark';\n\
+             \n\
+             export function isDark(): boolean {\n\
+               return resolvedTheme === 'dark';\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("theme.ts"), |cu| {
+        cu.is_field() && cu.short_name() == "theme.ts.resolvedTheme"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([4]),
+        "the plain module const control must keep its single read: {hits:#?}"
+    );
+}
+
+#[test]
+fn ts_function_local_destructuring_does_not_match_a_same_named_module_binding() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "colors.ts",
+            "const palette = {\n\
+               cyan: (s: string) => s,\n\
+             };\n\
+             \n\
+             const { cyan } = palette;\n\
+             \n\
+             export function banner(): string {\n\
+               return cyan('hello');\n\
+             }\n\
+             \n\
+             export function shadowed(other: { cyan: (s: string) => string }): string {\n\
+               const { cyan } = other;\n\
+               return cyan('shadow');\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("colors.ts"), |cu| {
+        cu.is_field() && cu.short_name() == "colors.ts.cyan"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([8]),
+        "a function-body destructuring binds a local that shadows the module binding: {hits:#?}"
+    );
+}
+
+#[test]
+fn ts_module_nested_destructured_binding_resolves_uses() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "config.ts",
+            "const config = {\n\
+               theme: { primary: 'blue' },\n\
+             };\n\
+             \n\
+             const {\n\
+               theme: { primary },\n\
+             } = config;\n\
+             \n\
+             export function accent(): string {\n\
+               return primary;\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("config.ts"), |cu| {
+        cu.is_field() && cu.short_name() == "config.ts.primary"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([10]),
+        "a nested pattern binder is a declaration like any other binder: {hits:#?}"
+    );
+}
+
+/// The woodpecker `useTheme` composition shape from #1769: several renamed
+/// binders destructured from a call on an unresolvable external import.
+#[test]
+fn ts_module_renamed_binders_from_unresolved_import_call_resolve_uses() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "useTheme.ts",
+            "import { useColorMode } from '@vueuse/core';\n\
+             \n\
+             const {\n\
+               store: storeTheme,\n\
+               state: resolvedTheme,\n\
+             } = useColorMode({ storageKey: 'theme' });\n\
+             \n\
+             function updateTheme() {\n\
+               if (resolvedTheme.value === 'dark') {\n\
+                 return storeTheme;\n\
+               }\n\
+               return resolvedTheme;\n\
+             }\n\
+             \n\
+             export function useTheme() {\n\
+               return { theme: resolvedTheme, storeTheme, updateTheme };\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("useTheme.ts"), |cu| {
+        cu.is_field() && cu.short_name() == "useTheme.ts.resolvedTheme"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([9, 12, 16]),
+        "every read of the renamed binder must be listed, and storeTheme's must not: {hits:#?}"
+    );
+}
