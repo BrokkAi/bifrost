@@ -16,7 +16,7 @@ After this change: on a two-language test workspace where nearly all volume is i
 - [x] (2026-08-07) Milestone 1: second-chance retry pass in the sequential set-op executor, with two behavior tests in `crates/bifrost-analysis/src/analyzer/structural/search/tests/execution.rs`. Implemented by an Opus subagent; reviewed. Three empirical deviations from this plan's first draft, all recorded in Surprises and the Decision Log: the retry precondition is `starved` (truncated with `execution_budget_exhausted`) plus whole-budget headroom plus a raised *scan* lane, not "any lane strictly larger"; truncated seed-cache entries must be evicted before the retry or it replays the cached frontier verbatim; and a retry that is still truncated with no more rows than the first attempt is discarded. Validation: bifrost-analysis 1683 passed, suite_bench_policy 321, suite_smells 149, suite_issues 335, crate clippy clean.
 - [x] (2026-08-07) Milestone 2: parallel coordinator parity *deferred* - production `Auto` never selects the parallel path (explicitly gated 2-branch experiment, recorded no-crossover A/B in `select_parallel_union`), so the divergence is unreachable in production; the sequential retry semantics should settle before the experiment mirrors them. To be recorded on #1766 at PR time.
 - [x] (2026-08-07) Milestone 3: budget-scaling follow-up filed as #1771; `PolicyBudget::scaled_for_workspace` implemented (Opus subagent, reviewed) with separate 16x hard-cap constants for the three scan lanes (the old constants doubled as builder hard caps and would have rejected scaled values), applied once in the coordinator's shared inner path (`evaluate_prepared_policy_inputs`), which serves both the CLI gate and MCP `run_policy`. On this repository only the fact-node lane rises (2M -> ~6.27M against the measured ~3.6M need). Policy crate 297 passed, suite_bench_policy 321 passed, crate clippy clean.
-- [ ] Milestone 4: gate re-measurement on this repository; record numbers here; comment on #1766 and #1598.
+- [x] (2026-08-07) Milestone 4: gate re-measurement done; numbers in Artifacts and Notes. Conclusiveness acceptance met in full: all 13 runs `complete`, exit reflects findings only. Latency is the honest cost the truncation had been hiding: 43m06s wall for 13 policies now genuinely scanning the whole workspace per policy - material timing evidence for the batch-amortization gap (to be added to #1452). The candidate rule reports 4 findings, triaged in Outcomes (two rule-boundary cases, two justified worklist idioms) - #1598 flip material, not evaluation defects.
 
 ## Surprises & Discoveries
 
@@ -50,7 +50,11 @@ After this change: on a two-language test workspace where nearly all volume is i
 
 ## Outcomes & Retrospective
 
-To be written as milestones complete.
+Both mechanisms landed and the conclusiveness acceptance is met in full: starved sequential set-op branches get one deterministic retry against the true leftovers, the policy gate's scan budgets scale with the workspace it audits, and the release gate on this repository went from six `partial_discovery` runs to all 13 `complete` with exit reflecting findings only. The `--query-file` control shows the retry doing exactly its job: the union's exhaustion frontier moved from the 1/5 share (403k facts) to the full single-branch frontier (2.05M facts) under the unchanged interactive budget.
+
+What the fix un-hid: the 28-second gate of the starved era was fast only because every heavy scan silently truncated. An honest gate is 13 whole-workspace scans and costs 43 minutes, because the batch re-scans the workspace once per policy - cross-policy scan amortization is the next bottleneck (timing evidence added to #1452). And the candidate rule's first complete run surfaced 4 findings whose triage (two justified worklist idioms; two rule-boundary refinements, notably assignment-vs-binding) is the real remaining #1598 flip material.
+
+Lessons: (1) diagnosis before design paid off twice - the issue as filed blamed the parallel coordinator, but production unions are sequential, and the single-branch control probe separated the fairness gap from the budget-size gap before either fix was written; (2) the plan's retry precondition survived contact with reality only in outline - three empirically-forced refinements (starved-only, seed-cache eviction, survivor selection) came from the implementing subagent's test failures, which is the process working; (3) conclusiveness fixes convert hidden incompleteness into visible latency and findings - expect the next blocker to be of the newly visible kind.
 
 ## Context and Orientation
 
@@ -72,7 +76,7 @@ Milestone 2 - parallel parity. Decide: mirror the retry semantics in `execute_pa
 
 Milestone 3 - workspace-scaled policy budgets. First file the follow-up issue (per repository policy) recording the single-branch measurement above, the density estimate, and the proposed scaling; link it here once it exists. Then, in `crates/bifrost-policy/src/budget.rs`, add a constructor that scales the three scan lanes from the workspace's total analyzed source bytes and file count (max of fixed default and density-derived value with ~2x headroom; clamped to the hard caps), with unit tests for the formula, the clamp, and the small-workspace identity (a workspace below the fixed defaults changes nothing). Thread it through the CLI policy runner and MCP `run_policy` where the budget is constructed, summing analyzed-file sizes from the workspace snapshot already in hand.
 
-Milestone 4 - measurement. Rebuild release; re-run the #1766 reproducers: the union selector via `--query-file` (expect: no `execution_budget_exhausted`), and the full pack + candidate rule gate (expect: every run `complete`, exit reflecting findings only). Record numbers here; comment on #1766 and #1598.
+Milestone 4 - measurement. Rebuild release; re-run the #1766 reproducers. Corrected expectation for the `--query-file` reproducer: interactive `query_code` deliberately keeps its fixed budget, so the union selector may still report `execution_budget_exhausted` - the retry's success shows as the exhaustion moving from the 1/5 share (~403k facts) to the full single-branch frontier (~2M facts). The gate, whose budget scales (#1771), is the surface that must conclude: every run `complete`, exit reflecting findings only. Record numbers here; comment on #1766 and #1598.
 
 ## Concrete Steps
 
@@ -102,7 +106,28 @@ Reproducers and baseline numbers (2026-08-07, release, at `387cae65a`):
     rust branch alone, full budget:   execution_budget_exhausted after 675 files / 21.27MB / 2,007,515 facts (repo: 1309 rs files / 37.6MB)
     gate (pack + candidate):          28.4s, exit 2; candidate + 5 naive rules inconclusive [partial_discovery]
 
-Post-change numbers to be recorded by Milestone 4.
+Post-change numbers (2026-08-07, release, at `4e53adb75`):
+
+    union selector via --query-file:  still execution_budget_exhausted (interactive budgets stay
+                                      fixed by design) but at the FULL single-branch frontier:
+                                      2,045,875 facts / 884 files / 22.6MB, vs 403,158 / 174 before.
+                                      The retry lifted the 1/5-share starvation exactly as designed.
+    gate (pack + candidate):          43m06s wall / 2144s user, exit 1 (findings only), all 13 runs
+                                      complete; zero partial_discovery anywhere; 193 suppressions
+                                      applied. Candidate rule complete with 4 findings.
+
+    Candidate finding triage: value_flow/client.rs:187 and get_definition/scala.rs:875 are
+    worklist idioms where per-iteration sort+dedup is semantically load-bearing (suppress-with-
+    reason candidates); reference_candidates.rs:161 sorts immediately before an early return
+    (executes at most once - lexical containment cannot see the return); jvm inverted.rs:4256
+    re-sorts a value REASSIGNED each iteration - the reaching binding is outer but the value is
+    fresh, the assignment-vs-binding boundary. The latter two are rule-refinement material for
+    the #1598 flip (e.g. an additional no-assignment-inside-the-loop predicate).
+
+    Latency: the 28s "fast" gate before these fixes was fast only because every heavy scan
+    truncated at the 1/5 share. 13 policies x a genuine whole-workspace multi-language scan
+    each = 43 minutes; the batch does not share subject scans across policies. That is the
+    next bottleneck (evidence to #1452), and it gates the #1598 flip alongside finding triage.
 
 ## Interfaces and Dependencies
 
