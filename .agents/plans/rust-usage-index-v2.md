@@ -22,8 +22,8 @@ The design transliterates IntelliJ's indexing architecture, verified against `/h
 - [x] (2026-08-07 21:30Z) Milestone 2b: `identities_by_name` is gone from `RustUsageIndex`. The per-file declaration-identity derivation is now one shared function that both the v1 build and the query layer call, and the workspace-wide name bucket is replaced by the store's indexed short-name lookup plus per-candidate verification. `module_importers` and `importer_reverse` did NOT move; the Decision Log records why they cannot until 2c exists.
 - [x] (2026-08-07 23:55Z) Milestone 2c: migrate the cross-file group (`module_files`, `module_aliases`, `physical_owners`, `actual_crate_roots`, export chains) to memoized bounded walks, add the `module_resolution` / `export_chain` / `resolve` caches, and finish the consumer switch so `RustUsageIndex` is unused. Now also carries `module_importers` and `importer_reverse`, whose verification step IS the forward-edge computation 2c introduces. Decomposition and dependency order recorded in the Decision Log.
 - [x] (2026-08-08 02:40Z) Milestone 3: invalidation and readiness. The v1 warm is gone from every path: `warm_usage_index` is deleted, `warm_query_indexes` and the MCP `StartupIndexWarm` thread run the new per-file fact catch-up instead, and `usage_index_ready` reports the catch-up set rather than the unread index. Catch-up policy implemented with the threshold constant (20), inline below it and on the dedicated build pool at or above it. `update` / `update_all` audited: they already rotate every v2 cache correctly, and the pinning test proves it.
-- [ ] Milestone 4: kill-gate benchmark on a large Rust workspace; gates defined below must pass.
-- [ ] Milestone 5: delete v1 (the seventeen-map struct and its warm machinery), close out issues and docs.
+- [ ] Milestone 4: kill-gate benchmark on a large Rust workspace; gates defined below must pass. RUN 1 (2026-08-07): all three gates FAIL for v2, and fail identically for v1. The failure is not attributable to v2 -- `RustAnalyzer::build_cargo_routes` consumes 87-97% of every cell. Numbers and decomposition in Outcomes; the plan stops here pending an owner decision.
+- [ ] Milestone 5: delete v1 (the seventeen-map struct and its warm machinery), close out issues and docs. BLOCKED by the Milestone 4 gate.
 
 ## Surprises & Discoveries
 
@@ -62,6 +62,10 @@ The design transliterates IntelliJ's indexing architecture, verified against `/h
 - Observation (Milestone 3): the v1 probe conflated two questions that v2 has to separate. "Is the index built" answered both "has the background preparation happened" and "would a query wait", because for a build they are the same event. Under v2 there is no build: a freshly opened workspace would wait for nothing, so it is READY, but it has not WARMED. `usage_index_ready` (the tool field) is the wait question; `rust_usage_facts_warm` is the warm question that `query_indexes_warm` and the one-shot-service test need.
 - Observation (Milestone 3, out of scope but load-bearing for Milestone 4): after this milestone the Rust usage path still drops and rebuilds one workspace-sized structure on every file change, and it is not a usage structure. `update` resets `cargo_routes`, and `RustCargoRouteIndex::build_while` hydrates and parses EVERY analyzed Rust file (its own comment says "hydrating and parsing every workspace file dominates this build"). Every usage walk needs it -- `RustUsageWalks::new` cannot start without it -- so Milestone 4's cell (c), a single-file edit followed immediately by a query, measures the Cargo-route rebuild rather than anything this plan changed. The type-hierarchy index (issue #1772) is the same shape. Neither is in this plan's scope; both must be read off the cell (c) number before it is attributed to v2.
   Evidence: `rust/mod.rs` `update` (`cargo_routes: Arc::new(PoolSafeMemo::new())`); `cargo_routes.rs` `build_while` lines 197-218.
+- Observation (Milestone 4): the Milestone 3 prediction about `cargo_routes` was right in kind and wrong in scope. It does not dominate cell (c); it dominates EVERY cell. `RustAnalyzer::build_cargo_routes` costs 34-44 s on the 35k-file rustc tree in each of (a) cold, (a) warm, (b) cold, (b) warm and (c) -- an untouched warm workspace pays it exactly as an edited one does, because `RustCargoRouteIndex` is not persisted and every process rebuilds it. Worse, it is charged INSIDE `searchtools.scan_usages_backend`, which sets the 3 s `SCAN_USAGES_MAX_DURATION` deadline at entry, and `RustUsageWalks::new` cannot return without it. So the deadline is 11-15x expired before any usage question is asked, and every cell of the benchmark returns `status=failure`, `incomplete_reason=time_budget`, `resolved=0`.
+  Evidence: v2i cell (a) warm, `build_cargo_routes` 41.914 s of a 43.456 s scan backend (96%); cell (c) 34.160 s of 35.488 s (96%); `ScanUsagesExecutionContext::with_cancellation_and_max_duration` in `searchtools/scan_usages.rs`.
+- Observation (Milestone 4): the benchmark did not compare v1's index against v2's walks, and the absent spans are how you can tell. `RustUsageIndex::build` never appears in any v1 run, and `RustAnalyzer::rust_fact_catch_up` never appears in any v2 run. Neither implementation's usage layer was reached; both runs measured the same shared Cargo-route rebuild. Any future attempt to attribute a Milestone 4 number to this plan has to check for those two spans first -- their absence means the number says nothing about v1 versus v2.
+- Observation (Milestone 4): the costs sitting behind `cargo_routes` are shared machinery, not v2's, and the naive reading of the evidence gets this backwards. With the budget raised to 120 s, the largest span in all four binaries is `usages::candidate_discovery` (`usages/finder.rs:173`, byte-identical at `b86e575a` and HEAD) at 75-92 s, inside which `project::collect_workspace_files` -- a whole-workspace listing -- runs 64 to 137 times in a single query and `sql_definition_candidates.rows` runs 397k to 662k times. Seeing the repeated listing on v2 first invites blaming repeated `RustUsageWalks` construction, since the Milestone 3 Decision Log notes that the walk constructor lists the workspace for `RustPackageFileIndex`. The v1 runs refute that: v1 has no `RustUsageWalks` and re-lists MORE often (137 versus 64). Peak RSS also tracks how long the scan is allowed to run -- 14 GB at the 3 s default, 26-27 GB at 120 s, on both implementations -- so the gate-3 figure is not a plateau.
 - Observation: only three of the seventeen `RustUsageIndex` products are genuinely cross-file (module-file resolution, alias routes, transitive export chains), and each is a bounded walk from a seed, not a closure. Everything else is a per-file fact or a per-file fact plus a SQL index.
   Evidence: classification table in research report section 7.3.
 
@@ -181,6 +185,13 @@ The design transliterates IntelliJ's indexing architecture, verified against `/h
   Rationale: "the probe reports false while a batch drains" is a two-state assertion, and without a hold the false state is a race against a batch that persists twenty-one small files in milliseconds. A sleep-based test would be flaky in exactly the direction that hides a regression. The persistence path already carries injection hooks of this shape (`should_inject_preparation_failure_for_test`), so this follows an established pattern rather than inventing one.
   Date/Author: 2026-08-08 / Opus (implementation).
 
+- Decision (Milestone 4): the benchmark built four binaries, not two. `RustAnalyzer::build_cargo_routes` had no profiling scope of its own -- the only cargo-route span in the tree is `RustUsageIndex::build::cargo_routes`, which is inside a build v2 never performs -- so cell (c) could not be decomposed at all on v2. Two extra binaries (`v1i`, `v2i`) add exactly one `profiling::scope("RustAnalyzer::build_cargo_routes")` to `build_cargo_routes_while` and change nothing else; the gate verdicts are read off the unmodified v1 and v2 binaries and the instrumented pair supplies the attribution. They were built in throwaway detached worktrees so no source file in the working tree was touched, and the worktrees were removed afterwards.
+  Rationale: a subtracted number that nobody can source to a span is not evidence. The alternative -- reporting cell (c) end to end only -- would have left the plan unable to distinguish "v2 is slow" from "something outside v2 is slow", which is the single question the cell exists to answer.
+  Date/Author: 2026-08-07 / Opus (measurement).
+- Decision (Milestone 4): the cell-(c) figure after subtracting the cargo-routes span (7.70 s, under the 10 s bar) is recorded as a decomposition and NOT as a conditional pass.
+  Rationale: the residual is analyzer construction plus 1.33 s of scan work, and the scan had not resolved the symbol when its deadline fired. A subtraction can show where the time went; it cannot show that the remaining code would have met the bar, because that code did not run. Recording it as "passes once cargo_routes is discounted" would license Milestone 5 on the strength of work that was never measured.
+  Date/Author: 2026-08-07 / Opus (measurement).
+
 ## Outcomes & Retrospective
 
 Milestone 1 (2026-08-07). The store now carries four per-blob Rust fact tables and analysis populates them. Migration `crates/bifrost-core/migrations/cache/0016-rust-usage-facts.sql` follows the existing numbered-migration mechanism exactly: a new `include_str!` constant, an entry appended to `CACHE_MIGRATION_SQL`, `CURRENT_MIGRATION_VERSION` 15 -> 16 (the compile-time assertion ties the two), and a matching `execute_batch` in the `CURRENT_SCHEMA_OBJECTS` test fixture. The store file is therefore now `bifrost_cache.v16.db` and v15 caches are untouched beside it, which is the point of the version-in-the-name scheme.
@@ -232,6 +243,104 @@ The warm is now the same catch-up. `RustAnalyzer::warm_usage_index` is deleted; 
 Four new tests, each demonstrated failing against the state it guards: the single-file edit test above; `a_below_threshold_catch_up_runs_inline_and_never_reports_a_wait`, which deletes a workspace's fact rows and requires the next query to answer anyway with the probe never false (it fails without the walk hook); `an_above_threshold_catch_up_defers_and_reports_false_until_it_drains`, which holds the batch on a barrier so the false state is observed without a timing assumption (it fails if the policy always inlines); and `warming_the_usage_facts_builds_neither_the_hierarchy_nor_the_reference_contexts`, which also asserts the v1 index is never built. Three existing tests changed text: the hierarchy warm test now asserts the catch-up rather than the v1 memo, the workspace probe test asserts the readiness/warmth distinction, and the MCP one-shot-service test asserts warmth rather than readiness, because a v2 session with nothing outstanding is ready before it warms.
 
 What Milestone 4 must account for before it attributes any number to v2: the Rust usage path still drops a workspace-sized structure on every file change, and it is `cargo_routes`, whose build hydrates and parses every analyzed Rust file. Every walk needs it. Cell (c) of the benchmark measures that rebuild, not the fact catch-up. The Surprises entry has the evidence.
+
+Milestone 4, run 1 (2026-08-07). **All three gates fail for v2. All three fail
+for v1 by the same margins. The plan stops; Milestone 5 does not start.** Full
+report, repro commands and limitations: `usage-v2-killgate-v1.md` in the session
+scratchpad; the numbers that decide each gate are reproduced here.
+
+Setup. Two featureless release binaries: v1 = `b86e575a` (the parent of the 2c
+consumer switch `8f0d2a75`, where `binding_seeds` and `importers_of_seeds` still
+read `self.usage_index()`), v2 = HEAD `41b93227`. Both built through
+`scripts/with-isolated-cargo-target.sh` in throwaway detached worktrees, and
+identified by distinguishing strings rather than by trusting the build script
+(v1 carries `RustUsageIndex::build::module_aliases`; v2 carries
+`RustAnalyzer::rust_fact_catch_up` and `usage_walks.rs`). Two further binaries,
+v1i and v2i, add one `profiling::scope("RustAnalyzer::build_cargo_routes")` to
+`build_cargo_routes_while` and nothing else, because no existing span brackets
+the Cargo-route build outside `RustUsageIndex::build` -- which v2 never runs.
+Workspace: the rustc tree `rust--01f6ddf7` (35,370 `.rs` files) copied off the
+read-only corpus to a writable path. One cache per binary, each built from
+scratch by its own binary (~843 MB, ~2 min); both commits are at cache schema
+v16, verified in `cache_db.rs` at both revisions. Host: 120 CPUs, 98 GB, busy
+throughout (1-min loadavg 20-390, recorded per cell), one repetition per cell.
+
+Cells. (a) `compiler/rustc_target/src/spec/mod.rs#SanitizerSet`, 75 mentioning
+files, cross-crate. (b) `main`, selected by the plan's own
+`SELECT identifier, COUNT(*) ... ORDER BY COUNT(*) DESC` over
+`rust_identifier_occurrences` -- the winner at **22,976 blobs** (next: `a`
+15,929, `the` 13,493), anchored to `compiler/rustc/src/main.rs#main` because
+`main` is declared 21,942 times. (c) a trailing comment appended to the file
+that declares the (a) symbol, then the (a) query, restored after (`git diff
+--quiet` clean each time). (d) `/usr/bin/time -v` maximum RSS.
+
+Results, product default configuration, wall seconds / peak RSS GB:
+
+| cell | v1 cold | v1 warm | v2 cold | v2 warm |
+| --- | --- | --- | --- | --- |
+| (a) | 50.97 / 13.85 | 58.51 / 13.84 | 45.36 / 14.23 | **47.97 / 14.22** |
+| (b) | 63.74 / 13.85 | 84.82 / 13.79 | 45.47 / 14.22 | **42.26 / 14.24** |
+| (c) | -- | 43.49 / 13.93 (edited) | -- | **74.91 / 14.33** (edited; v2i, quieter host: 41.86 / 14.34) |
+
+Every single cell, both binaries, returns `status=failure`,
+`incomplete_reason=time_budget`, `resolved=0`, `total_hits=0`. Nothing was
+answered.
+
+Gate verdicts, each with the measurement that decides it. **Gate 1 FAILS** on
+its absolute bar: v2 (a) warm = 47.97 s against 5 s, 9.6x over. Its relative
+half passes (v2 is 0.82x of v1's 58.51 s, inside 2x) but the plan's text is an
+AND, and a query that returns nothing cannot pass on latency. **Gate 1(b)
+FAILS**: v2 (b) warm = 42.26 s against 5 s. **Gate 2 FAILS**: v2 (c) = 74.91 s
+against 10 s (v1: 43.49 s). **Gate 3 FAILS**: v2 peak RSS 14.22-14.33 GB against
+4 GB, 3.6x over, and *worse* than v1's 13.79-13.93 GB rather than the reduction
+this plan predicted.
+
+Cell (c) decomposition, v2i, warm cache, one edited file: wall 41.86 s, of which
+`searchtools.scan_usages_backend` 35.49 s, of which **`RustAnalyzer::build_cargo_routes`
+34.16 s (82% of wall)** and all other scan work **1.33 s**; `WorkspaceAnalyzer::build`
+5.46 s; the edited file's `reconcile_file_states` 1.95 s. Subtracting the
+cargo-routes span leaves 7.70 s, which is under the 10 s bar -- **this is
+recorded as a decomposition, not as a passing verdict.** The residual is
+analyzer construction plus 1.33 s of scan work, and the scan had not resolved
+the symbol when the deadline fired, so nothing inside that 7.70 s demonstrates
+v2 meeting anything.
+
+The finding that governs the whole run: `build_cargo_routes` costs 34-44 s in
+*every* v2 cell -- cold and warm, edited and unedited -- and it is charged
+inside the scan's own 3 s `SCAN_USAGES_MAX_DURATION`. The deadline is 11-15x
+expired before `RustUsageWalks::new` can return. The Milestone 3 Surprises entry
+predicted this for cell (c); it is true of all of them, on an untouched warm
+workspace, so it is not an invalidation problem but the absence of persistence
+for `RustCargoRouteIndex`. Two spans are conspicuously absent and worth
+recording: `RustAnalyzer::rust_fact_catch_up` never fires (every live blob
+already had fact rows, so the Milestone 3 catch-up costs nothing here), and
+`RustUsageIndex::build` never fires on v1 either -- **this benchmark never
+compared the v1 index against the v2 walks at all.**
+
+A supplementary sweep raised the budget to 120 s so the scan could get past
+cargo_routes. All four binaries still returned `resolved=0` / `time_budget`
+after ~127 s of scan, at 25.8-27.3 GB peak RSS (so the 14 GB above is not a
+plateau -- it is how far the process got in the default budget). The largest
+span in all four is `usages::candidate_discovery` (`usages/finder.rs:173`,
+byte-identical in both trees) at 75-92 s, inside which
+`project::collect_workspace_files` -- a whole-workspace listing -- runs 64 to
+137 times in one query and `sql_definition_candidates.rows` runs 397k to 662k
+times. Both patterns are at least as strong in v1 (137 listings, 662k lookups)
+as in v2 (64 listings, 397k lookups), so neither is v2's. An earlier reading in
+that session provisionally attributed the repeated listing to repeated
+`RustUsageWalks` construction; the v1 runs refute it.
+
+What this means for the plan. The kill-gate did its job in the sense that it
+stopped Milestone 5, but it did not answer the question it was designed to ask.
+Two structures outside this plan's scope -- the unpersisted Cargo-route index
+and shared candidate discovery -- consume the entire query budget before any
+per-file-fact composition runs, so the run supports no claim that v2 is faster,
+slower, or equivalent to v1 for usage analysis. Deleting `RustUsageIndex` now
+would remove the only comparison point while that question is still open. Both
+structures are product regressions under CLAUDE.md's five-second rule and want
+the open-issue search before new issues are filed; #1758 names neither. The
+owner's call is whether fixing them becomes a prerequisite of this plan or a
+separate track that Milestone 4 waits on.
 
 ## Context and Orientation
 
@@ -375,6 +484,7 @@ No new crates. At the end: four new store tables as specified in Milestone 1 (fi
 
 ## Revision notes
 
+- 2026-08-07 (Milestone 4 run 1, measurement only): recorded the kill-gate result in Progress and Outcomes & Retrospective, and added three observations to Surprises & Discoveries -- that `build_cargo_routes` is charged inside the scan's own three-second budget and consumes 87-97% of every cell rather than only cell (c), that neither implementation reaches its usage layer at all so the benchmark did not compare them, and that the costs behind cargo_routes belong to shared candidate discovery rather than to v2. Added one decision recording why two extra instrumented binaries were built and why the cell-(c) subtraction is not a passing verdict. No source file changed; the instrumented binaries were built in throwaway detached worktrees, which were removed. Milestone 5 is marked blocked.
 - 2026-08-08 (Milestone 3 implementation): checked off Milestone 3 in Progress. Added six observations to Surprises & Discoveries -- that the staleness bug the milestone was told to look for does not exist and why the pinning test is still worth having, that the real gap is invisibility rather than staleness, the duplicate-blob-key trap for a batch of files, the content-drift rule that forbids persisting a file whose bytes moved on, the readiness/warmth split the v1 probe conflated, and the out-of-scope finding that `cargo_routes` is still dropped and rebuilt on every edit and will dominate Milestone 4's cell (c). Added seven decisions covering the untouched `update` constructors, the choice of hook site, the per-generation full scan and why the narrowed alternative is not correct alone, the `rust_modules` witness rule, the dedicated-pool scheduling, the probe split with the unchanged tool field, and the test barrier. Wrote the Milestone 3 entry in Outcomes & Retrospective. The Milestone 3 section in Plan of Work is left as authored; the two places where the as-built differs from it -- the hook site and the two-predicate probe -- are recorded in the Decision Log rather than by editing the milestone text.
 - 2026-08-07 (Milestone 2c implementation): checked off 2c in Progress. Added five implementation observations to Surprises & Discoveries -- the `definitions(fq_name)` collapse that makes the recorded `inline_by_name` equivalence wrong, the path half of the physical-owner child computation having no index to invert through, the v1 alias fixed point not being the least fixed point of the recursion, the length-one export-chain cycle, and the analyzer growing past the `AnalyzerDelegate` size lint. Added seven decisions covering cache keying, the cache count, keeping v1 compiling, the importer candidate sources and their known gap, the recursion depth of `bindings_at`, leaving the warm wired to the unread index, and the one existing test whose text changed. Wrote the Milestone 2c entry in Outcomes & Retrospective. The `Milestone 2c work breakdown` section is left as authored, because it was the design this implementation followed; the two places where it was wrong are corrected in Surprises rather than by editing the breakdown.
 - 2026-08-07 (Milestone 2c design, same session as 2b): added a `Milestone 2c work breakdown` section above the Plan of Work, recording the dependency-ordered inventory of the fifteen remaining maps and the lazy shape of each. Added three design observations to Surprises & Discoveries: the sequencing constraint that forbids landing 2c in pieces, the finding that module-file resolution needs no new index because `RustPackageFileIndex` and `definitions(fq_name)` already are the two maps it is built from (with the `resolve_module_files` look-alike trap), and the finding that three of the cross-file products are per-file predicates rather than walks. Added the decision that 2c lands atomically, and that a flag selecting eager or lazy resolution was rejected. No code changed for 2c.
