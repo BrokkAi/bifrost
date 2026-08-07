@@ -93,10 +93,13 @@ pub trait CppSource:
     /// The persisted C++ template metadata side table's row for `code_unit`.
     fn template_metadata(&self, code_unit: &CodeUnit) -> Option<CppTemplateMetadata>;
 
-    /// The `compile_commands.json` entry governing `file`, if the workspace has
-    /// a compile database that names it. The only analyzer-resident product
-    /// [`crate::diagnostics`] needs.
-    fn compile_context_for(&self, file: &ProjectFile) -> Option<&CppCompileContext>;
+    /// Every distinct `compile_commands.json` configuration governing `file`,
+    /// empty when the workspace has no compile database entry naming it. The
+    /// only analyzer-resident product [`crate::diagnostics`] needs.
+    ///
+    /// A file the build compiles in several configurations yields several
+    /// contexts, because their include closures can disagree about a name.
+    fn compile_contexts_for(&self, file: &ProjectFile) -> &[CppCompileContext];
 
     /// Count a precise-parent resolution against the analyzer's counter.
     ///

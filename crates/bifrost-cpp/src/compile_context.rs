@@ -25,7 +25,7 @@ pub struct CppCompileContext {
 
 #[derive(Debug, Default)]
 pub struct CppCompileContexts {
-    by_source: HashMap<PathBuf, CppCompileContext>,
+    by_source: HashMap<PathBuf, Vec<CppCompileContext>>,
 }
 
 impl CppCompileContexts {
@@ -38,28 +38,40 @@ impl CppCompileContexts {
             return Self::default();
         };
 
-        let mut by_source = HashMap::default();
-        let mut ambiguous_sources = HashSet::default();
+        let mut by_source: HashMap<PathBuf, Vec<CppCompileContext>> = HashMap::default();
         for entry in entries {
             let Some(source) = entry.source_path(project.root()) else {
                 continue;
             };
-            if !source.starts_with(project.root()) || ambiguous_sources.contains(&source) {
+            if !source.starts_with(project.root()) {
                 continue;
             }
             let Some(context) = entry.compile_context(project.root()) else {
                 continue;
             };
-            if by_source.insert(source.clone(), context).is_some() {
-                by_source.remove(&source);
-                ambiguous_sources.insert(source);
+            // A build that compiles one file in several configurations records
+            // one entry per configuration. Keeping every distinct one lets the
+            // caller decide per name whether the configurations agree; dropping
+            // them would make "compiled two ways" look like "never compiled".
+            // Entries that parse to the same context are one configuration.
+            let candidates = by_source.entry(source).or_default();
+            if !candidates.contains(&context) {
+                candidates.push(context);
             }
         }
         Self { by_source }
     }
 
-    pub fn for_file(&self, file: &ProjectFile) -> Option<&CppCompileContext> {
-        self.by_source.get(&file.abs_path().normalize())
+    /// Every distinct compile configuration the database records for `file`,
+    /// empty when no entry names it.
+    ///
+    /// Exactly one context is an unambiguous selection. More than one means the
+    /// include closures can differ, so a name is absent only where every
+    /// candidate agrees that it is.
+    pub fn contexts_for(&self, file: &ProjectFile) -> &[CppCompileContext] {
+        self.by_source
+            .get(&file.abs_path().normalize())
+            .map_or(&[], Vec::as_slice)
     }
 }
 
@@ -199,11 +211,19 @@ mod tests {
     fn missing_or_malformed_database_has_no_context() {
         let (_temp, project) = project_with_database(None);
         let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
-        assert!(CppCompileContexts::load(&project).for_file(&file).is_none());
+        assert!(
+            CppCompileContexts::load(&project)
+                .contexts_for(&file)
+                .is_empty()
+        );
 
         let (_temp, project) = project_with_database(Some("not json"));
         let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
-        assert!(CppCompileContexts::load(&project).for_file(&file).is_none());
+        assert!(
+            CppCompileContexts::load(&project)
+                .contexts_for(&file)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -213,7 +233,9 @@ mod tests {
         ));
         let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
         let contexts = CppCompileContexts::load(&project);
-        let context = contexts.for_file(&file).expect("matching context");
+        let [context] = contexts.contexts_for(&file) else {
+            panic!("one matching context");
+        };
 
         assert_eq!(
             vec![
@@ -237,7 +259,9 @@ mod tests {
         ));
         let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
         let contexts = CppCompileContexts::load(&project);
-        let context = contexts.for_file(&file).expect("matching context");
+        let [context] = contexts.contexts_for(&file) else {
+            panic!("one matching context");
+        };
 
         assert_eq!(
             vec![project.root_path().join("project include")],
@@ -247,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_or_unmatched_entries_do_not_supply_context() {
+    fn a_file_compiled_in_two_configurations_keeps_both() {
         let (_temp, project) = project_with_database(Some(
             r#"[
                 {"directory":".","file":"src/main.cpp","arguments":["clang++","-c","src/main.cpp"]},
@@ -256,6 +280,42 @@ mod tests {
             ]"#,
         ));
         let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
-        assert!(CppCompileContexts::load(&project).for_file(&file).is_none());
+        let contexts = CppCompileContexts::load(&project);
+        let candidates = contexts.contexts_for(&file);
+
+        // Before #1627 a second entry deleted the first and the file lost its
+        // context entirely, which read downstream as "never compiled".
+        assert_eq!(2, candidates.len());
+        assert!(candidates[0].defined_macros.is_empty());
+        assert!(candidates[1].defined_macros.contains("OTHER"));
+    }
+
+    #[test]
+    fn repeated_identical_entries_are_one_configuration() {
+        let (_temp, project) = project_with_database(Some(
+            r#"[
+                {"directory":".","file":"src/main.cpp","arguments":["clang++","-I","include","-c","src/main.cpp"]},
+                {"directory":".","file":"src/main.cpp","arguments":["clang++","-I","include","-c","src/main.cpp"]}
+            ]"#,
+        ));
+        let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
+        let contexts = CppCompileContexts::load(&project);
+
+        // Two entries that parse to the same flags are not a disagreement, so
+        // the selection stays unambiguous.
+        assert_eq!(1, contexts.contexts_for(&file).len());
+    }
+
+    #[test]
+    fn an_unmatched_file_has_no_context() {
+        let (_temp, project) = project_with_database(Some(
+            r#"[{"directory":".","file":"src/other.cpp","arguments":["clang++","-c","src/other.cpp"]}]"#,
+        ));
+        let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
+        assert!(
+            CppCompileContexts::load(&project)
+                .contexts_for(&file)
+                .is_empty()
+        );
     }
 }
