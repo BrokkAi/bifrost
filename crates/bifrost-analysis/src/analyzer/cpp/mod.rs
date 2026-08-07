@@ -36,10 +36,10 @@ use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::weighted_cache::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    DirectDescendantIndex, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, ImportInfo,
-    Language, PoolSafeMemo, Project, ProjectFile, Range, SignatureMetadata, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
-    TypeHierarchyProvider, resolve_analyzer,
+    CppFieldLinkage, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer,
+    ImportAnalysisProvider, ImportInfo, Language, PoolSafeMemo, Project, ProjectFile, Range,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -54,15 +54,18 @@ use brokk_bifrost_cpp::graph_support::CppSource;
 use brokk_bifrost_cpp::identity::{CppReconciledDefinitionIndex, cpp_reconciled_definitions};
 use brokk_bifrost_cpp::imports::IncludeTargetIndex;
 use brokk_bifrost_cpp::test_detection::detect_cpp_test_assertion_smells;
-use cache::{weight_code_unit_set_by_file, weight_code_unit_vec_by_file, weight_project_file_set};
+use cache::{
+    weight_code_unit_set_by_file, weight_code_unit_vec_by_file, weight_include_reachability,
+    weight_project_file_set,
+};
 use clones::build_clone_candidate_data;
 
 pub(crate) use brokk_bifrost_cpp::declarations::{
     cpp_sentinel_recovered_classes, is_direct_recovered_exported_class_field_declaration, node_text,
 };
 pub(crate) use brokk_bifrost_cpp::identity::{
-    CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole, cpp_callable_unit_role,
-    cpp_indexed_callable_linkage, cpp_is_range_for_binding_name, cpp_occurrence_role_for_range,
+    CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole, cpp_indexed_callable_linkage,
+    cpp_is_range_for_binding_name, cpp_occurrence_role_for_range,
 };
 pub(crate) use identity::{
     cpp_callable_definitions_share_identity_evidence, cpp_header_body_files_are_related,
@@ -75,6 +78,7 @@ pub struct CppAnalyzer {
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     visible_type_units_by_file: Cache<ProjectFile, Arc<Vec<CodeUnit>>>,
+    unconditional_include_reachability: Cache<(ProjectFile, ProjectFile, bool), bool>,
     /// #1134 resolution-time identity-reconciliation overlay. Maps the canonical
     /// `fq_name` a header declaration carries to the provisional out-of-line
     /// member definition `CodeUnit`s whose per-file identity extraction could not
@@ -151,6 +155,10 @@ impl CppAnalyzer {
                 memo_budget / 8,
                 weight_code_unit_vec_by_file,
             ),
+            unconditional_include_reachability: build_weighted_cache(
+                memo_budget / 8,
+                weight_include_reachability,
+            ),
             reconciled_definitions_by_fq: moka::sync::Cache::builder().max_capacity(2048).build(),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
@@ -201,6 +209,10 @@ impl CppAnalyzer {
                 self.memo_budget / 8,
                 weight_code_unit_vec_by_file,
             ),
+            unconditional_include_reachability: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_include_reachability,
+            ),
             reconciled_definitions_by_fq: moka::sync::Cache::builder().max_capacity(2048).build(),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
@@ -230,6 +242,14 @@ impl CppAnalyzer {
 }
 
 impl CppAnalyzer {
+    pub(crate) fn import_statements_from_projection(&self, file: &ProjectFile) -> Vec<String> {
+        self.inner
+            .import_info_of(file)
+            .into_iter()
+            .map(|import| import.raw_snippet)
+            .collect()
+    }
+
     pub(crate) fn compile_context_for(&self, file: &ProjectFile) -> Option<&CppCompileContext> {
         self.compile_contexts
             .get_or_init(|| CppCompileContexts::load(self.inner.project()))
@@ -302,12 +322,30 @@ impl CppAnalyzer {
         self.inner.signature_metadata_limited(code_unit, limit)
     }
 
+    pub(crate) fn signatures_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<String> {
+        self.inner.signatures_limited(code_unit, limit)
+    }
+
     pub(crate) fn ranges_limited(
         &self,
         code_unit: &CodeUnit,
         limit: usize,
     ) -> LimitedQueryRows<Range> {
         self.inner.ranges_limited(code_unit, limit)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_full_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test()
     }
 
     pub fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -329,6 +367,12 @@ impl CppAnalyzer {
     #[doc(hidden)]
     pub fn reset_prepared_syntax_parse_counts_for_test(&self) {
         self.inner.reset_prepared_syntax_parse_counts_for_test();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn unconditional_include_reachability_cache_len_for_test(&self) -> u64 {
+        self.unconditional_include_reachability.run_pending_tasks();
+        self.unconditional_include_reachability.entry_count()
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -485,6 +529,45 @@ impl CppSource for CppAnalyzer {
         CppAnalyzer::prepared_syntax(self, file)
     }
 
+    fn cpp_field_linkage(&self, code_unit: &CodeUnit) -> Option<CppFieldLinkage> {
+        if !code_unit.is_field() {
+            return None;
+        }
+        let metadata = CppAnalyzer::signature_metadata_limited(self, code_unit, 2);
+        metadata
+            .complete
+            .then_some(metadata.rows)
+            .into_iter()
+            .flatten()
+            .find_map(|metadata| metadata.cpp_field_linkage())
+    }
+
+    fn cached_unconditional_include_reachability(
+        &self,
+        first: &ProjectFile,
+        donor_source: &ProjectFile,
+        reference_is_c: bool,
+    ) -> Option<bool> {
+        self.unconditional_include_reachability.get(&(
+            first.clone(),
+            donor_source.clone(),
+            reference_is_c,
+        ))
+    }
+
+    fn cache_unconditional_include_reachability(
+        &self,
+        first: &ProjectFile,
+        donor_source: &ProjectFile,
+        reference_is_c: bool,
+        reaches: bool,
+    ) {
+        self.unconditional_include_reachability.insert(
+            (first.clone(), donor_source.clone(), reference_is_c),
+            reaches,
+        );
+    }
+
     fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         CppAnalyzer::structural_parent_of(self, code_unit)
     }
@@ -520,7 +603,7 @@ impl CppSource for CppAnalyzer {
 /// what that coercion did.
 impl CppWorkspaceSource for CppAnalyzer {
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
+        self.import_statements_from_projection(file)
     }
 
     fn definitions_by_fqn(&self, fqn: &str) -> Vec<&CodeUnit> {
@@ -795,7 +878,7 @@ impl IAnalyzer for CppAnalyzer {
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
+        self.import_statements_from_projection(file)
     }
 
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
@@ -1020,6 +1103,15 @@ impl LanguageSupport for CppSupport {
     ) -> Option<LimitedQueryRows<SignatureMetadata>> {
         resolve_analyzer::<CppAnalyzer>(analyzer)
             .map(|cpp| cpp.signature_metadata_limited(unit, limit))
+    }
+
+    fn signatures_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<String>> {
+        resolve_analyzer::<CppAnalyzer>(analyzer).map(|cpp| cpp.signatures_limited(unit, limit))
     }
 
     fn declaration_ranges_limited(

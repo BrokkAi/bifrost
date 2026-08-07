@@ -5,6 +5,8 @@ use crate::policy::{
     PolicyExecutionStage, PolicyExecutionTermination, PolicyReportDiagnosticCode,
     PolicySuppressionDocumentState,
 };
+#[cfg(test)]
+use crate::searchtools::get_symbol_sources;
 use crate::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectChangeWatcher,
     ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache,
@@ -42,10 +44,11 @@ use crate::{
         classify_test_files, get_declarations_by_location_with_cancellation,
         get_definitions_by_location_with_cancellation, get_definitions_by_reference,
         get_summaries_with_cancellation, get_symbol_ancestors,
-        get_symbol_locations_with_cancellation, get_symbol_sources, get_type_by_location,
-        list_symbols, most_relevant_files_with_cancellation, refresh_result, rename_symbol,
-        scan_usages_by_location_with_cancellation, scan_usages_by_reference_with_cancellation,
-        search_symbols_with_cancellation, symbol_source_candidate_files, usage_graph,
+        get_symbol_locations_with_cancellation, get_symbol_sources_with_source_budget,
+        get_type_by_location, list_symbols, most_relevant_files_with_cancellation, refresh_result,
+        rename_symbol, scan_usages_by_location_with_cancellation,
+        scan_usages_by_reference_with_cancellation, search_symbols_with_cancellation,
+        symbol_source_candidate_files, usage_graph,
     },
     searchtools_render::{RenderOptions, RenderText},
     workspace_document::{WorkspaceDocumentError, WorkspaceRoot, read_workspace_document},
@@ -2924,7 +2927,12 @@ impl SearchToolsService {
                 "get_symbol_sources was cancelled or exceeded its request-wide time budget",
             ));
         }
-        let mut result = get_symbol_sources(initial_snapshot.analyzer(), params.clone());
+        let mut result = get_symbol_sources_with_source_budget(
+            initial_snapshot.analyzer(),
+            params.clone(),
+            GET_SYMBOL_SOURCES_RESPONSE_BUDGET_BYTES,
+        )
+        .map_err(Self::symbol_sources_budget_error)?;
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err(SearchToolsServiceError::internal(
                 "get_symbol_sources was cancelled or exceeded its request-wide time budget",
@@ -2969,7 +2977,12 @@ impl SearchToolsService {
 
             if !Arc::ptr_eq(initial_snapshot.arc(), &final_snapshot) {
                 let final_snapshot = initial_snapshot.scope_snapshot(final_snapshot);
-                result = get_symbol_sources(final_snapshot.analyzer(), params);
+                result = get_symbol_sources_with_source_budget(
+                    final_snapshot.analyzer(),
+                    params,
+                    GET_SYMBOL_SOURCES_RESPONSE_BUDGET_BYTES,
+                )
+                .map_err(Self::symbol_sources_budget_error)?;
                 let output = Self::symbol_sources_output(result, render_options);
                 return final_snapshot.finish("get_symbol_sources", output);
             }
@@ -3000,6 +3013,15 @@ impl SearchToolsService {
             structured,
             rendered_text: Some(rendered_text),
         })
+    }
+
+    fn symbol_sources_budget_error(
+        exceeded: brokk_bifrost_analysis::searchtools::SymbolSourcesBudgetExceeded,
+    ) -> SearchToolsServiceError {
+        SearchToolsServiceError::invalid_params(format!(
+            "get_symbol_sources exceeded the {}-byte response budget while resolving source; re-call with fewer or narrower symbols",
+            exceeded.max_source_bytes()
+        ))
     }
 
     /// Same read-first strategy as `snapshot_for_query`, plus the session's

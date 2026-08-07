@@ -400,6 +400,18 @@ pub enum CallableLinkage {
     Internal,
 }
 
+/// Linkage carried by C++ global-field metadata.
+///
+/// C++ `const` and `constexpr` fields are internal unless an exact peer is
+/// explicitly external. Consumers must inspect those peers before they treat
+/// this variant as internal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CppFieldLinkage {
+    External,
+    Internal,
+    InternalUnlessExternalPeer,
+}
+
 /// Whether one callable declaration proves that runtime dispatch is closed.
 ///
 /// Signature metadata carries this declaration-side fact so bounded query
@@ -452,6 +464,8 @@ pub struct SignatureMetadata {
     field_is_static: bool,
     #[serde(default)]
     field_is_final: bool,
+    #[serde(default)]
+    cpp_field_linkage: Option<CppFieldLinkage>,
     /// Whether this class-like declaration is a Kotlin `companion object`.
     ///
     /// A companion and an ordinary nested `object` are both nested classes, and
@@ -1636,6 +1650,7 @@ impl SignatureMetadata {
             extension_receiver_is_unconstrained_type_parameter: false,
             field_is_static: false,
             field_is_final: false,
+            cpp_field_linkage: None,
             companion_object: false,
         }
     }
@@ -1684,6 +1699,7 @@ impl SignatureMetadata {
             extension_receiver_is_unconstrained_type_parameter: false,
             field_is_static: false,
             field_is_final: false,
+            cpp_field_linkage: None,
             companion_object: false,
         }
     }
@@ -1699,6 +1715,11 @@ impl SignatureMetadata {
     pub fn with_field_modifiers(mut self, is_static: bool, is_final: bool) -> Self {
         self.field_is_static = is_static;
         self.field_is_final = is_final;
+        self
+    }
+
+    pub fn with_cpp_field_linkage(mut self, linkage: CppFieldLinkage) -> Self {
+        self.cpp_field_linkage = Some(linkage);
         self
     }
 
@@ -1801,6 +1822,10 @@ impl SignatureMetadata {
 
     pub fn field_is_final(&self) -> bool {
         self.field_is_final
+    }
+
+    pub const fn cpp_field_linkage(&self) -> Option<CppFieldLinkage> {
+        self.cpp_field_linkage
     }
 
     pub fn return_type_identity(&self) -> Option<&StructuredTypeIdentity> {
