@@ -19,9 +19,15 @@ pub(crate) fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(enclosing) = ctx.code_units.enclosing_code_unit(ctx.file, &range) else {
         return;
     };
-    if enclosing == ctx.spec.target {
+    // A reference whose enclosing declaration is a *callable* target is a
+    // recursive call (#1638): recorded, then classified `SelfReceiver`, so
+    // editor find-references lists it while the external usage surface omits
+    // it. For any other target the site is the declaration itself, not a use
+    // of it, and stays dropped.
+    if enclosing == ctx.spec.target && !ctx.spec.target.is_function() {
         return;
     }
+    let recursive = enclosing == ctx.spec.target;
     ctx.hits.insert(usage_hit(
         ctx.file,
         range.start_line,
@@ -36,6 +42,9 @@ pub(crate) fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             SNIPPET_CONTEXT_LINES,
         ),
     ));
+    if recursive {
+        reclassify_self_receiver_hit_at(ctx.hits, ctx.file, start, end);
+    }
 }
 
 /// Record `node` as a same-owner receiver hit (#1014 facet B): a call whose

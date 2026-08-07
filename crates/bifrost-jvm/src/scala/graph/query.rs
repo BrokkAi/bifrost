@@ -689,17 +689,30 @@ impl ScalaQueryHitSink<'_> {
                 continue;
             }
             let query_target = &self.catalog.targets[target_id];
-            if enclosing == *query_target
+            // A reference inside a *callable* target's own declaration is a
+            // recursive call (#1638). It is recorded as a `SelfReceiver` hit,
+            // which the editor surface lists and the external usage surface
+            // omits, and it stays out of `observed_hits` so the callsite budget
+            // still counts only references from elsewhere. Inside any other
+            // target's own declaration the site is the declaration itself, not
+            // a use of it, and stays dropped.
+            let inside_own_declaration = enclosing == *query_target
                 && self
                     .analyzer
                     .ranges(query_target)
                     .iter()
-                    .any(|range| range.start_byte <= start && end <= range.end_byte)
-            {
+                    .any(|range| range.start_byte <= start && end <= range.end_byte);
+            let recursive = inside_own_declaration && query_target.is_function();
+            if inside_own_declaration && !recursive {
                 continue;
             }
-            if self.hits[target_id].insert(hit.clone()) {
-                self.observed_hits.insert(hit.clone());
+            let target_hit = if recursive {
+                hit.clone().into_self_receiver()
+            } else {
+                hit.clone()
+            };
+            if self.hits[target_id].insert(target_hit.clone()) && !recursive {
+                self.observed_hits.insert(target_hit);
                 if external_usage_hit_count(self.observed_hits) > self.max_usages {
                     self.limit_exceeded = true;
                     break;

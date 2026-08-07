@@ -9,7 +9,9 @@
 
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
-use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_target};
+use crate::analyzer::usages::common::{
+    analyzed_files_for_language, classify_recursive_hits, language_for_target,
+};
 use crate::analyzer::usages::inverted_edges::{
     UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output, parse_and_collect,
 };
@@ -286,11 +288,10 @@ fn resolve_with_graph(
         &target_spec,
         scan_scope.cancellation(),
     );
-    let hits: BTreeSet<_> = scan_result
-        .hits
-        .into_iter()
-        .filter(|hit| &hit.enclosing != target)
-        .collect();
+    // The scan classifies a proven recursive call into a callable target as
+    // `SelfReceiver` (#1638); this pass drops every other
+    // enclosing-equals-target hit, as does the unproven channel below.
+    let hits = classify_recursive_hits(analyzer, scan_result.hits, target);
     let unproven_hits: BTreeSet<_> = scan_result
         .unproven_hits
         .into_iter()

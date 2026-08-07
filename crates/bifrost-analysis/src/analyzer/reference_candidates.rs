@@ -96,10 +96,29 @@ pub fn semantic_token_candidate_ranges(
     .expect("non-cancellable collection cannot be cancelled")
 }
 
+/// The raw tree-sitter identifier census: every identifier-class leaf token plus
+/// the receiver keywords and compound callable names, with NO per-language
+/// reference exclusions. This is the census-seeded FIRD probe frontier
+/// (`--probe-seed census`): it is deliberately ignorant of the analyzer's
+/// declaration index, so it proposes occurrences the index-filtered
+/// [`reference_candidate_ranges`] frontier never surfaces. Comment and string
+/// contents are excluded structurally, because they are not identifier-class
+/// leaf nodes. Declaration and local-binding occurrences are recorded here and
+/// filtered downstream by the engine (they are not usage probes).
+pub fn census_identifier_ranges(
+    root: Node<'_>,
+    language: Language,
+    limit: usize,
+) -> ReferenceCandidateRanges {
+    collect_candidate_ranges(root, language, limit, CandidateFrontier::Census, &|| false)
+        .expect("non-cancellable collection cannot be cancelled")
+}
+
 #[derive(Clone, Copy)]
 enum CandidateFrontier {
     References,
     SemanticTokens,
+    Census,
 }
 
 fn collect_candidate_ranges(
@@ -115,12 +134,22 @@ fn collect_candidate_ranges(
         if is_cancelled() {
             return None;
         }
-        let compound = matches!(frontier, CandidateFrontier::References)
-            && is_compound_reference_candidate(language, node.kind());
+        let compound = matches!(
+            frontier,
+            CandidateFrontier::References | CandidateFrontier::Census
+        ) && is_compound_reference_candidate(language, node.kind());
         let candidate = match frontier {
             CandidateFrontier::References => is_reference_candidate_node(language, node.kind()),
             CandidateFrontier::SemanticTokens => {
                 is_semantic_token_identifier_node(language, node.kind())
+            }
+            // The census is the maximal grammar-only identifier frontier: the
+            // identifier-class leaves the semantic-token frontier keeps, unioned
+            // with the receiver keywords and compound callable names the
+            // reference frontier adds. No index knowledge, no exclusions.
+            CandidateFrontier::Census => {
+                is_semantic_token_identifier_node(language, node.kind())
+                    || is_reference_candidate_node(language, node.kind())
             }
         };
         if candidate
@@ -286,6 +315,52 @@ mod tests {
             panic!("reference candidate budget exceeded for {language:?}");
         };
         ranges.into_iter().map(|range| range.start_byte).collect()
+    }
+
+    fn census_offsets(language: Language, path: &str, source: &str) -> Vec<usize> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, path);
+        let tree = parse_tree_for_language(&file, language, source)
+            .unwrap_or_else(|| panic!("failed to parse {language:?}"));
+        let ReferenceCandidateRanges::Complete(ranges) =
+            census_identifier_ranges(tree.root_node(), language, 1000)
+        else {
+            panic!("census budget exceeded for {language:?}");
+        };
+        ranges.into_iter().map(|range| range.start_byte).collect()
+    }
+
+    #[test]
+    fn census_frontier_is_a_superset_of_the_reference_frontier() {
+        // The census keeps identifier occurrences the index-filtered reference
+        // frontier deliberately drops: the JS export alias and the Go field and
+        // type declaration names. This is the whole point of census seeding -
+        // it proposes sites the analyzer's own frontier never surfaces.
+        let js = "const value = 1; export { value as renamed };\n";
+        let js_census = census_offsets(Language::JavaScript, "index.js", js);
+        let alias_start = js.find("renamed").expect("export alias");
+        assert!(
+            js_census.contains(&alias_start),
+            "census must keep the JS export alias the reference frontier drops: {js_census:?}"
+        );
+
+        let go = "package sample\n\ntype Repository struct {\n    Query Query\n}\n";
+        let go_census = census_offsets(Language::Go, "sample.go", go);
+        let field_decl = go.find("Query Query").expect("field declaration");
+        assert!(
+            go_census.contains(&field_decl),
+            "census must keep the Go field declaration name: {go_census:?}"
+        );
+        // And the census is a strict superset: every reference candidate is a
+        // census candidate.
+        let go_reference = reference_candidate_offsets(Language::Go, "sample.go", go);
+        for offset in go_reference {
+            assert!(
+                go_census.contains(&offset),
+                "census dropped a reference-frontier candidate at {offset}: {go_census:?}"
+            );
+        }
     }
 
     #[test]

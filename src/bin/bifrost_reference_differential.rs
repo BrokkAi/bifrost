@@ -1,6 +1,6 @@
 use brokk_bifrost::reference_differential::{
-    ExactReferenceSite, ReferenceDifferentialConfig, ReferenceDifferentialProgress,
-    ReferenceDifferentialReport, run_reference_differential_with_progress,
+    ExactReferenceSite, ProbeSeed, ReferenceDifferentialConfig, ReferenceDifferentialProgress,
+    ReferenceDifferentialReport, TierSelection, run_reference_differential_with_progress,
 };
 use brokk_bifrost::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
 use git2::{Repository, StatusOptions};
@@ -74,6 +74,8 @@ struct EngineOptions {
     include_tests: bool,
     exact_site: Option<ExactReferenceSite>,
     cache_mode: CacheMode,
+    probe_seed: ProbeSeed,
+    tiers: TierSelection,
 }
 
 impl Default for EngineOptions {
@@ -91,6 +93,8 @@ impl Default for EngineOptions {
             include_tests: false,
             exact_site: None,
             cache_mode: CacheMode::Persisted,
+            probe_seed: ProbeSeed::Index,
+            tiers: TierSelection::default(),
         }
     }
 }
@@ -135,6 +139,8 @@ impl EngineOptions {
             seed: self.seed,
             include_tests: self.include_tests,
             exact_site: self.exact_site.clone(),
+            probe_seed: self.probe_seed,
+            tiers: self.tiers,
         }
     }
 }
@@ -317,6 +323,22 @@ fn parse_engine_option(
                 .map_err(|_| format!("--seed expects a non-negative integer, got `{value}`"))?;
         }
         "--include-tests" => options.include_tests = true,
+        "--probe-seed" => {
+            let value = take_value(args, index, option)?;
+            options.probe_seed = match value.as_str() {
+                "index" => ProbeSeed::Index,
+                "census" => ProbeSeed::Census,
+                other => {
+                    return Err(format!(
+                        "--probe-seed expects `index` or `census`, got `{other}`"
+                    ));
+                }
+            };
+        }
+        "--tiers" => {
+            let value = take_value(args, index, option)?;
+            options.tiers = parse_tiers(&value)?;
+        }
         "--cache-mode" => options.cache_mode = CacheMode::parse(&take_value(args, index, option)?)?,
         "--path" => {
             let value = take_value(args, index, option)?;
@@ -342,6 +364,34 @@ fn parse_engine_option(
         _ => return Ok(false),
     }
     Ok(true)
+}
+
+fn parse_tiers(value: &str) -> Result<TierSelection, String> {
+    let mut selection = TierSelection {
+        tier1: false,
+        tier2: false,
+        tier3: false,
+    };
+    for token in value.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token {
+            "1" => selection.tier1 = true,
+            "2" => selection.tier2 = true,
+            "3" => selection.tier3 = true,
+            other => {
+                return Err(format!(
+                    "--tiers expects a comma-separated subset of 1,2,3, got `{other}`"
+                ));
+            }
+        }
+    }
+    if !(selection.tier1 || selection.tier2 || selection.tier3) {
+        return Err("--tiers must select at least one of 1,2,3".to_string());
+    }
+    Ok(selection)
 }
 
 fn empty_exact_site() -> ExactReferenceSite {
@@ -1240,6 +1290,12 @@ fn print_common_options() {
         "  --max-usages N           Usage hits per inverse query (default: {DEFAULT_MAX_USAGES})"
     );
     println!("  --seed N                 Deterministic sampling seed (default: 0)");
+    println!(
+        "  --probe-seed SEED        index (analyzer frontier, default) or census (raw tree-sitter identifier census)"
+    );
+    println!(
+        "  --tiers LIST             census gap tiers to report as findings, e.g. 1,2,3 (default) or 1"
+    );
     println!("  --include-tests          Include references in test files");
     println!(
         "  --cache-mode MODE        persisted for warm/resumable campaigns (default); ephemeral for one-off smoke runs"

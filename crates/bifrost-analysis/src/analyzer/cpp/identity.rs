@@ -14,7 +14,7 @@
 //! `false`, exactly as the downcast's `else` arm did before.
 
 use super::CppAnalyzer;
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, resolve_analyzer};
+use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile, resolve_analyzer};
 use brokk_bifrost_cpp::identity::cpp_header_body_implementation_file;
 
 pub(crate) fn cpp_header_body_files_are_related(
@@ -28,10 +28,15 @@ pub(crate) fn cpp_header_body_files_are_related(
     let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
         return false;
     };
+    let imports = cpp.import_info_of(implementation);
+    let import_statements: Vec<_> = imports
+        .into_iter()
+        .map(|import| import.raw_snippet)
+        .collect();
     brokk_bifrost_cpp::identity::cpp_header_body_files_are_related(
         left,
         right,
-        &analyzer.import_statements(implementation),
+        &import_statements,
         cpp.include_target_index(),
     )
 }

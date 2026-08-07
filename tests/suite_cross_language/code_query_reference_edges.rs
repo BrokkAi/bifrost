@@ -328,13 +328,13 @@ const JAVA_RECURSION: &str = "package fixture;\n\npublic class Walker {\n    int
 /// the target itself, so the relation must be `self_reference` rather than
 /// collapsed into `same_owner`.
 ///
-/// Only the forward producer states it. The usage index enumerates no site at
-/// all for the recursive call -- on the external-usages surface *and* on the
-/// `lsp-references` surface -- so the second half of this test records that
-/// asymmetry rather than hiding it: the two producers legitimately disagree
-/// here, which is exactly the kind of gap this domain exists to make visible.
+/// Both producers state it (#1638). The usage index enumerates the site on the
+/// complete row set and on the `lsp-references` surface, because a recursive
+/// call is a real occurrence an editor must be able to navigate to; the
+/// `external-usages` surface omits it, because it is not a call from anywhere
+/// else and must not make the declaration look used from outside.
 #[test]
-fn only_the_forward_producer_states_a_recursive_call_and_it_is_a_self_reference() {
+fn both_producers_state_a_recursive_call_and_only_the_external_surface_omits_it() {
     let fixture = Fixture::new(&[("src/Walker.java", JAVA_RECURSION)]);
     let forward = fixture.json(json!({
         "languages": ["java"],
@@ -353,10 +353,10 @@ fn only_the_forward_producer_states_a_recursive_call_and_it_is_a_self_reference(
         "a call inside the target's own body is a self reference: {forward:#}"
     );
 
-    for surface in [
-        json!(null),
-        json!("external_usages"),
-        json!("lsp_references"),
+    for (surface, expected_sites) in [
+        (json!(null), 1),
+        (json!("external_usages"), 0),
+        (json!("lsp_references"), 1),
     ] {
         let mut step = json!({ "op": "edges_of" });
         if !surface.is_null() {
@@ -366,11 +366,18 @@ fn only_the_forward_producer_states_a_recursive_call_and_it_is_a_self_reference(
             "match": { "kind": "callable", "name": "walk" },
             "steps": [{ "op": "enclosing_decl" }, step]
         }));
-        assert!(
-            edge_rows(&inverse).is_empty(),
-            "the usage index enumerates no inverse site for a recursive call \
-             (surface {surface}): {inverse:#}"
+        assert_eq!(
+            edge_rows(&inverse).len(),
+            expected_sites,
+            "inverse sites for the recursive call (surface {surface}): {inverse:#}"
         );
+        for row in edge_rows(&inverse) {
+            assert_eq!(
+                row["owner_relation"],
+                json!("self_reference"),
+                "the inverse row agrees with the forward relation: {inverse:#}"
+            );
+        }
     }
 }
 

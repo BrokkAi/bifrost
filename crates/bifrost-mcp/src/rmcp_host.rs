@@ -349,10 +349,8 @@ enum WorkspaceBindingSource {
 
 /// Per-connection workspace authorization state.
 ///
-/// Unlike the hand-written host this replaces, it carries no protocol
-/// bookkeeping: `rmcp` owns the lifecycle, owns outbound request ids, and
-/// turns `roots/list` into an ordinary awaited call, so there is nothing to
-/// correlate by hand.
+/// RMCP owns the lifecycle, outbound request ids, and `roots/list` calls.
+/// Bifrost therefore keeps only the authorization state.
 struct ConnectionState {
     accepts_client_roots: bool,
     /// What the handshake established, or nothing if it has not happened.
@@ -1741,8 +1739,7 @@ impl ServerHandler for BifrostMcpHandler {
         // The response -- success or execution error -- is ready the moment
         // execute_tool returns; everything after this point is transport. Arm
         // the timing keyed by the wire id so the transport wrapper can emit
-        // `response_queue_wait` and `writer_delivery` when it delivers it,
-        // matching the hand-written host's writer-thread phases (#1491).
+        // `response_queue_wait` and `writer_delivery` when it delivers it.
         self.response_timings
             .arm(context.id.clone(), name, correlation_id);
         Ok(response?.into())
@@ -1813,6 +1810,7 @@ pub fn run_stdio_server_with_build_identity(
     root: Option<PathBuf>,
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
+    diff_snapshot_object_dir: Option<PathBuf>,
     build_identity: &str,
 ) -> Result<(), String> {
     // Explicit roots build in the background. Rootless servers answer
@@ -1822,12 +1820,17 @@ pub fn run_stdio_server_with_build_identity(
 
     let accepts_client_roots = root.is_none();
     let watch_files = file_watching_enabled(std::env::var_os(MCP_FILE_WATCHER_ENV).as_deref())?;
-    let service = Arc::new(match (root, watch_files) {
+    let service = match (root, watch_files) {
         (Some(root), true) => SearchToolsService::new_deferred(root)?,
         (Some(root), false) => SearchToolsService::new_deferred_manual(root)?,
         (None, true) => SearchToolsService::new_unbound(),
         (None, false) => SearchToolsService::new_unbound_manual(),
-    });
+    };
+    let service = match diff_snapshot_object_dir {
+        Some(dir) => service.with_diff_snapshot_object_dir(dir),
+        None => service,
+    };
+    let service = Arc::new(service);
     run_stdio_server_impl(
         service,
         None,

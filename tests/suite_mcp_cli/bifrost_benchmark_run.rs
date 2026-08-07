@@ -199,7 +199,7 @@ fn query_code_empty_fast_response_fails_oracle_and_discards_all_timings() {
 while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"fake-bifrost","version":"0","buildIdentity":"__IDENTITY__"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"fake-bifrost","version":"0"},"_meta":{"io.bifrost/build-identity":"__IDENTITY__"}}}'
       ;;
     *'"method":"tools/call"'*)
       printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"format":"bifrost_code_query_profile/v2","result":{"results":[],"truncated":false},"timings_ns":{"total":1},"work":{"scanned_files":0,"scanned_source_bytes":0,"fact_nodes":0,"pipeline_rows":0,"examined_references":0,"import_files_resolved":0,"import_edges_resolved":0},"cache_layers":[],"access_path":{}}}}'
@@ -357,6 +357,10 @@ definition_queries = [
         .as_array()
         .expect("profile artifact array");
     assert_eq!(artifacts.len(), 2, "report: {report}");
+    let traces = artifacts
+        .iter()
+        .map(|artifact| read_profile_trace(&output_dir, artifact))
+        .collect::<Vec<_>>();
 
     let mut combined_traces = String::new();
     for (index, artifact) in artifacts.iter().enumerate() {
@@ -364,7 +368,7 @@ definition_queries = [
         let components = Path::new(relative).components().collect::<Vec<_>>();
         assert_eq!(components.len(), 3, "run-scoped artifact path: {relative}");
         assert_eq!(components[0].as_os_str(), "profiles");
-        let trace = fs::read_to_string(output_dir.join(relative)).expect("read profile trace");
+        let trace = &traces[index];
         let expected_phase = if index == 0 { "warmup" } else { "measured" };
         assert!(trace.contains("repository=fixture-java"), "trace: {trace}");
         assert!(trace.contains("scenario=get_definition"), "trace: {trace}");
@@ -374,7 +378,7 @@ definition_queries = [
         );
         assert!(trace.contains("iteration=1"), "trace: {trace}");
         assert!(trace.contains("[bifrost-timing]"), "trace: {trace}");
-        combined_traces.push_str(&trace);
+        combined_traces.push_str(trace);
     }
     for expected in [
         "SearchToolsService::snapshot_for_query",
@@ -449,18 +453,10 @@ fn interactive_session_prewarm_keeps_workspace_build_out_of_timed_profile_sample
     );
     drop(session);
 
-    // Two runs, one per side of the #1491 benchmark-validity fix. An ambient
-    // `BIFROST_MCP_RMCP=off` must be stripped by the harness, so the first run
-    // measures the default rmcp stack. Selecting the legacy rollback requires
-    // the explicit benchmark-facing variable. Both runs must satisfy the
-    // transport-phase profile contract.
-    for (run_label, benchmark_env) in [
-        ("ambient-stripped-default-rmcp", ("BIFROST_MCP_RMCP", "off")),
-        (
-            "explicit-legacy-rollback",
-            ("BIFROST_BENCHMARK_MCP_RMCP", "off"),
-        ),
-    ] {
+    // The benchmark always measures RMCP. Its profile must keep the warm and
+    // measured requests separate from workspace initialization.
+    let run_label = "rmcp";
+    {
         let manifest_dir = temp.path().join(format!("manifest-{run_label}"));
         fs::create_dir_all(&manifest_dir).expect("manifest dir");
         let manifest_path = manifest_dir.join("benchmark.toml");
@@ -492,7 +488,6 @@ interactive_queries = [
         )
         .expect("write manifest");
 
-        let (env_name, env_value) = benchmark_env;
         let output = Command::new(env!("CARGO_BIN_EXE_bifrost_benchmark"))
             .arg("run")
             .arg("--manifest")
@@ -502,7 +497,6 @@ interactive_queries = [
                 "BIFROST_BENCHMARK_BIFROST_BIN",
                 env!("CARGO_BIN_EXE_bifrost"),
             )
-            .env(env_name, env_value)
             .output()
             .expect("run profiled interactive benchmark");
 
@@ -544,9 +538,11 @@ interactive_queries = [
             2,
             "prewarm must not create a timing sample: {report}"
         );
-        for (index, artifact) in artifacts.iter().enumerate() {
-            let relative = artifact.as_str().expect("artifact path");
-            let trace = fs::read_to_string(output_dir.join(relative)).expect("read profile trace");
+        let traces = artifacts
+            .iter()
+            .map(|artifact| read_profile_trace(&output_dir, artifact))
+            .collect::<Vec<_>>();
+        for (index, trace) in traces.iter().enumerate() {
             let phase = if index == 0 { "warmup" } else { "measured" };
             assert!(trace.contains(&format!("phase={phase}")), "trace: {trace}");
             assert!(
@@ -1242,6 +1238,11 @@ fn single_json_file(dir: &Path) -> PathBuf {
         .collect::<Vec<_>>();
     assert_eq!(files.len(), 1, "expected one JSON report file in {dir:?}");
     files[0].clone()
+}
+
+fn read_profile_trace(output_dir: &Path, artifact: &Value) -> String {
+    let relative = artifact.as_str().expect("artifact path");
+    fs::read_to_string(output_dir.join(relative)).expect("read profile trace")
 }
 
 fn toml_basic_string(value: &str) -> String {

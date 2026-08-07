@@ -67,9 +67,15 @@ pub fn push_hit_range(
     let Some(enclosing) = analyzer.index.enclosing_code_unit(file, &range) else {
         return;
     };
-    if enclosing == spec.target {
+    // A reference whose enclosing declaration is a *callable* target is a
+    // recursive call (#1638): recorded, then classified `SelfReceiver`, so
+    // editor find-references lists it while the external usage surface omits
+    // it. For any other target the site is the declaration itself, not a use
+    // of it, and stays dropped.
+    if enclosing == spec.target && !spec.target.is_function() {
         return;
     }
+    let recursive = enclosing == spec.target;
     hits.insert(usage_hit(
         file,
         range.start_line,
@@ -78,6 +84,9 @@ pub fn push_hit_range(
         enclosing,
         snippet_around_line(source, line_starts, range.start_line, SNIPPET_CONTEXT_LINES),
     ));
+    if recursive {
+        reclassify_self_receiver_hit_at(hits, file, start, end);
+    }
 }
 
 /// Push a hit for `[start, end)` then reclassify it as a same-owner self/this

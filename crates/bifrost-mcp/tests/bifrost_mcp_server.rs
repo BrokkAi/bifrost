@@ -1,7 +1,6 @@
 mod common;
 
 use brokk_bifrost_analysis::Language;
-use brokk_bifrost_mcp::mcp_common::MCP_RMCP_HOST_ENV;
 use brokk_bifrost_policy::{PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files};
 use common::{FixtureCorpus, InlineTestProject};
 use serde_json::{Value, json};
@@ -1023,15 +1022,6 @@ fn bifrost_mcp_query_code_transports_explain_and_profile_reports() {
 
 #[test]
 fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
-    // Both hosts: the upstream sync that added request correlation ids
-    // landed them on the hand-written host alone. Only a wire assertion
-    // against both hosts would have caught the rmcp omission.
-    for host in McpHost::ALL {
-        bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions_on(host);
-    }
-}
-
-fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions_on(host: McpHost) {
     let initial = InlineTestProject::with_language(Language::Python)
         .file("src/app.py", "def harmless(value):\n    return value\n")
         .file("policies/dynamic-eval.rqlp", MCP_DYNAMIC_EVAL_POLICY)
@@ -1051,7 +1041,7 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions_on(h
     assert_eq!(expected.exit_status(), 1);
     let expected_report = serde_json::to_value(expected.report()).expect("serialize direct report");
 
-    let mut child = spawn_server_on(host, initial.root(), "searchtools");
+    let mut child = spawn_server(initial.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let mut stderr = child.stderr.take().expect("stderr");
@@ -3317,18 +3307,12 @@ fn rootless_mcp_binds_from_codex_sandbox_state_and_revokes_per_call_scope() {
 
 #[test]
 fn rootless_mcp_rejects_first_codex_workspace_activation_outside_sandbox() {
-    for host in McpHost::ALL {
-        rootless_mcp_rejects_first_codex_workspace_activation_outside_sandbox_on(host);
-    }
-}
-
-fn rootless_mcp_rejects_first_codex_workspace_activation_outside_sandbox_on(host: McpHost) {
     let plugin_dir = TempDir::new().expect("plugin dir");
     let workspace = InlineTestProject::new()
         .file("FirstCallWorkspace.java", "class FirstCallWorkspace {}\n")
         .build();
 
-    let mut child = spawn_rootless_server_on(host, plugin_dir.path(), "workspace");
+    let mut child = spawn_rootless_server(plugin_dir.path(), "workspace");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
@@ -3451,12 +3435,6 @@ fn explicit_mcp_root_ignores_codex_sandbox_state() {
 
 #[test]
 fn rootless_mcp_accepts_codex_sandbox_metadata_from_a_compatible_client() {
-    for host in McpHost::ALL {
-        rootless_mcp_accepts_codex_sandbox_metadata_from_a_compatible_client_on(host);
-    }
-}
-
-fn rootless_mcp_accepts_codex_sandbox_metadata_from_a_compatible_client_on(host: McpHost) {
     let plugin_dir = TempDir::new().expect("plugin dir");
     fs::write(
         plugin_dir.path().join("PluginOnly.java"),
@@ -3466,7 +3444,7 @@ fn rootless_mcp_accepts_codex_sandbox_metadata_from_a_compatible_client_on(host:
     let workspace = InlineTestProject::new()
         .file("CompatibleWorkspace.java", "class CompatibleWorkspace {}\n")
         .build();
-    let mut child = spawn_rootless_server_on(host, plugin_dir.path(), "symbol");
+    let mut child = spawn_rootless_server(plugin_dir.path(), "symbol");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
@@ -3603,15 +3581,13 @@ fn call_tool_answering_roots(
 /// *instead of* `initialize`, carrying the negotiation keys in `_meta`, and
 /// rmcp answers it before any session exists. It is not a mid-session call.
 #[test]
-fn default_mcp_host_answers_2026_07_28_discovery_before_any_handshake() {
+fn rmcp_host_answers_2026_07_28_discovery_before_any_handshake() {
     let workspace = InlineTestProject::new()
         .file("DiscoverMe.java", "class DiscoverMe {}\n")
         .build();
-    // The legacy CI lane sets the rollback selector for its parent process.
-    // Remove it from this child because this test proves the process default.
-    let mut command = mcp_server_command(workspace.root(), "searchtools", &[]);
-    command.env_remove(MCP_RMCP_HOST_ENV);
-    let mut child = command.spawn().expect("spawn default-host bifrost");
+    let mut child = mcp_server_command(workspace.root(), "searchtools", &[])
+        .spawn()
+        .expect("spawn RMCP bifrost");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
@@ -3653,7 +3629,7 @@ fn mcp_2026_07_28_clients_get_result_types() {
     let workspace = InlineTestProject::new()
         .file("DiscoverMe.java", "class DiscoverMe {}\n")
         .build();
-    let mut child = spawn_server_on(McpHost::Rmcp, workspace.root(), "searchtools");
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
@@ -3708,7 +3684,7 @@ fn cache_hints_reach_new_clients_and_stay_off_the_legacy_wire() {
         .file("Cacheable.java", "class Cacheable {}\n")
         .build();
 
-    let mut child = spawn_server_on(McpHost::Rmcp, workspace.root(), "searchtools");
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
@@ -3778,7 +3754,7 @@ fn cache_hints_reach_new_clients_and_stay_off_the_legacy_wire() {
 
     // A 2025-11-25 client has no schema for these fields; rmcp strips
     // `resultType` for legacy peers but not the cache hints, so Bifrost has to.
-    let mut child = spawn_server_on(McpHost::Rmcp, workspace.root(), "searchtools");
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
@@ -3816,7 +3792,7 @@ fn legacy_clients_never_see_a_result_type() {
         .build();
     // Pinned: the fallback host has no `resultType` to suppress, so asserting
     // its absence there would pass without testing anything.
-    let mut child = spawn_server_on(McpHost::Rmcp, workspace.root(), "searchtools");
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
@@ -4095,36 +4071,18 @@ fn mcp_server_command(root: &std::path::Path, mode: &str, extra_args: &[&str]) -
 /// Issue #1491: the benchmark's transport-phase profile contract in
 /// `src/benchmark/mcp_iteration.rs` requires all four `mcp_request.*` phases
 /// (`queue_wait`, `execution`, `response_queue_wait`, `writer_delivery`) in
-/// the stderr trace of a profiled session. The hand-written host emits them
-/// from its writer thread; the rmcp host emits the delivery phases from its
-/// transport wrapper. Asserted over the wire on both hosts so a divergence
-/// fails here rather than in a dogfooded benchmark run.
+/// the stderr trace of a profiled RMCP session. The transport wrapper emits
+/// the delivery phases. The wire assertion protects the benchmark contract.
 #[test]
 fn profiled_tool_calls_emit_all_transport_phases() {
-    for host in McpHost::ALL {
-        profiled_tool_calls_emit_all_transport_phases_on(host);
-    }
-}
-
-fn profiled_tool_calls_emit_all_transport_phases_on(host: McpHost) {
     let workspace = InlineTestProject::new()
         .file(
             "Example.java",
             "public class Example { public void execute() {} }\n",
         )
         .build();
-    let mut child = Command::new(mcp_server_binary())
-        .env(MCP_RMCP_HOST_ENV, host.switch())
-        .env("BIFROST_SEMANTIC_INDEX", "off")
+    let mut child = mcp_server_command(workspace.root(), "searchtools", &[])
         .env("BIFROST_TIMING", "1")
-        .arg("--force-semantic-cpu")
-        .arg("--root")
-        .arg(workspace.root())
-        .arg("--mcp")
-        .arg("searchtools")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn profiled bifrost");
     let mut stdin = child.stdin.take().expect("stdin");
@@ -4170,7 +4128,7 @@ fn profiled_tool_calls_emit_all_transport_phases_on(host: McpHost) {
     ] {
         assert!(
             trace.contains(&format!("mcp_request.{phase}[search_symbols]")),
-            "host={host:?} stderr trace omitted transport phase `{phase}`:\n{trace}"
+            "stderr trace omitted transport phase `{phase}`:\n{trace}"
         );
     }
 }
@@ -4205,7 +4163,7 @@ fn light_lookup_overtakes_long_usage_scan() {
         );
     }
     let workspace = project.build();
-    let mut child = spawn_server_on(McpHost::Rmcp, workspace.root(), "searchtools");
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
@@ -4272,61 +4230,8 @@ fn light_lookup_overtakes_long_usage_scan() {
     let _ = child.wait();
 }
 
-/// Which MCP host serves a session.
-///
-/// The rmcp stack is the default. `BIFROST_MCP_RMCP=off` selects the
-/// hand-written rollback stack. Rootless behaviour -- where all client-supplied
-/// workspace authorization lives -- is asserted against both. The rollback
-/// host must stay correct, and testing one host once let a pre-handshake bypass
-/// reach a green suite.
-#[derive(Clone, Copy, Debug)]
-enum McpHost {
-    /// The hand-written rollback stack in `mcp_common.rs`.
-    HandWritten,
-    /// The default `rmcp`-backed host in `rmcp_host.rs`.
-    Rmcp,
-}
-
-impl McpHost {
-    const ALL: [McpHost; 2] = [McpHost::HandWritten, McpHost::Rmcp];
-
-    fn switch(self) -> &'static str {
-        match self {
-            McpHost::HandWritten => "off",
-            McpHost::Rmcp => "on",
-        }
-    }
-}
-
-/// Spawn an explicitly-rooted server on a chosen host.
-///
-/// MCP 2026-07-28 is what the rmcp host adds, so assertions about discovery,
-/// `resultType`, or MRTR have to name it; the hand-written host only speaks
-/// 2025-11-25. Contracts shared by both revisions should use [`spawn_server`]
-/// so they keep covering the default host.
-fn spawn_server_on(host: McpHost, root: &std::path::Path, mode: &str) -> std::process::Child {
+fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Child {
     Command::new(mcp_server_binary())
-        .env(MCP_RMCP_HOST_ENV, host.switch())
-        .env("BIFROST_SEMANTIC_INDEX", "off")
-        .arg("--force-semantic-cpu")
-        .arg("--root")
-        .arg(root)
-        .arg("--mcp")
-        .arg(mode)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn bifrost")
-}
-
-fn spawn_rootless_server_on(
-    host: McpHost,
-    cwd: &std::path::Path,
-    mode: &str,
-) -> std::process::Child {
-    Command::new(mcp_server_binary())
-        .env(MCP_RMCP_HOST_ENV, host.switch())
         .env("BIFROST_SEMANTIC_INDEX", "off")
         .arg("--force-semantic-cpu")
         .arg("--mcp")
@@ -4337,17 +4242,6 @@ fn spawn_rootless_server_on(
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn rootless bifrost")
-}
-
-/// Spawn a rootless server on the rmcp host specifically.
-///
-/// For assertions that only hold on the rmcp host: it refuses any
-/// pre-`initialize` request outright, and it asks a Roots-capable client for
-/// its workspace from the tool call that needs one rather than from a
-/// lifecycle notification. Contracts both hosts must honour should use
-/// [`spawn_rootless_server_on`] with [`McpHost::ALL`] instead.
-fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Child {
-    spawn_rootless_server_on(McpHost::Rmcp, cwd, mode)
 }
 
 fn spawn_server_no_args(cwd: &std::path::Path) -> std::process::Child {

@@ -1,10 +1,104 @@
 use crate::common::{InlineTestProject, call_search_tool_json};
 use brokk_bifrost::reference_differential::{
-    ExactReferenceSite, ReferenceClassification, ReferenceDifferentialConfig,
+    ExactReferenceSite, ProbeSeed, ReferenceClassification, ReferenceDifferentialConfig,
     run_reference_differential,
 };
 use brokk_bifrost::{AnalyzerConfig, Language};
 use serde_json::json;
+
+fn rust_census_differential(
+    files: &[(&str, &str)],
+) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {
+    let mut project = InlineTestProject::with_language(Language::Rust);
+    for (path, source) in files {
+        project = project.file(path, *source);
+    }
+    let project = project.build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    run_reference_differential(
+        workspace.analyzer(),
+        &ReferenceDifferentialConfig {
+            corpus_language: "rust".to_string(),
+            max_files: 20,
+            max_sites: 1_000,
+            max_candidates_per_file: 1_000,
+            max_source_bytes: 100_000,
+            max_targets: 1_000,
+            max_usage_files: 20,
+            max_usages: 1_000,
+            probe_seed: ProbeSeed::Census,
+            ..ReferenceDifferentialConfig::default()
+        },
+    )
+    .expect("run inline Rust census differential")
+}
+
+/// The census seed proposes an identifier occurrence inside a `macro_rules!`
+/// body -- joint-blindness territory the analyzer's index-filtered frontier
+/// never surfaces -- and every census site is tagged `seed == "census"`. This
+/// is the core M1 capability: probe sites the index seed cannot reach.
+#[test]
+fn census_seed_proposes_macro_body_occurrence_the_index_seed_excludes() {
+    let source = "macro_rules! call_it { () => { frobnicate() }; }\nfn frobnicate() {}\nfn run() { call_it!(); }\n";
+    let census = rust_census_differential(&[("src/lib.rs", source)]);
+    assert!(
+        census.sites.iter().all(|site| site.seed == "census"),
+        "every census site must be tagged census: {:#?}",
+        census
+            .sites
+            .iter()
+            .map(|s| (&s.text, &s.seed))
+            .collect::<Vec<_>>()
+    );
+    let macro_body_start = source.find("frobnicate()").expect("macro body call");
+    assert!(
+        census
+            .sites
+            .iter()
+            .any(|site| site.text == "frobnicate" && site.start_byte == macro_body_start),
+        "census must propose the macro-body `frobnicate` occurrence: {:#?}",
+        census
+            .sites
+            .iter()
+            .map(|s| (&s.text, s.start_byte))
+            .collect::<Vec<_>>()
+    );
+    // The census is a superset of the index frontier at the engine level: it
+    // samples at least as many sites because it drops the per-language
+    // reference exclusions the index seed applies.
+    let index = rust_differential(&[("src/lib.rs", source)]);
+    assert!(
+        census.summary.sampled_sites >= index.summary.sampled_sites,
+        "census sampled {} sites, index sampled {}; census must be a superset",
+        census.summary.sampled_sites,
+        index.summary.sampled_sites,
+    );
+    assert!(
+        index.sites.iter().all(|site| site.seed == "index"),
+        "index-seed sites must be tagged index"
+    );
+}
+
+/// A forward-unresolvable census occurrence whose name has no same-file
+/// declaration stays tier 3 (exploration-grade), never a missing finding, so
+/// healthy code does not fabricate gaps.
+#[test]
+fn census_seed_stays_silent_without_a_same_file_declaration() {
+    let source = "macro_rules! call_it { () => { frobnicate() }; }\nfn run() { call_it!(); }\n";
+    let census = rust_census_differential(&[("src/lib.rs", source)]);
+    let false_gap = census.sites.iter().find(|site| {
+        site.text == "frobnicate" && site.classification == ReferenceClassification::Missing
+    });
+    assert!(
+        false_gap.is_none(),
+        "no same-file declaration must mean no census gap finding: {:#?}",
+        census
+            .sites
+            .iter()
+            .map(|s| (&s.text, &s.forward_status, s.tier, s.classification))
+            .collect::<Vec<_>>()
+    );
+}
 
 fn rust_differential(
     files: &[(&str, &str)],

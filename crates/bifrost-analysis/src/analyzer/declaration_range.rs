@@ -266,6 +266,19 @@ fn declaration_name_node_from_fields<'tree>(
 ) -> Option<Node<'tree>> {
     let mut stack = vec![declaration_node];
     while let Some(node) = stack.pop() {
+        // A declarator chain bottoms out at the declared name itself. C/C++
+        // spell `void target(int)` as `function_definition.declarator ->
+        // function_declarator.declarator -> identifier`, with no `name` field
+        // anywhere on the way, so without this the chain runs out and the
+        // caller falls back to a text search across the whole declaration --
+        // which then answers with whatever occurrence of the name the body
+        // happens to contain, such as a recursive call (#1638).
+        if node.named_child_count() == 0
+            && let Some(identifier_node) =
+                matching_identifier_node(node, identifier, content, support)
+        {
+            return Some(identifier_node);
+        }
         for field in ["name", "left", "pattern"] {
             if let Some(binding) = node.child_by_field_name(field)
                 && let Some(identifier_node) =

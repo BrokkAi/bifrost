@@ -5,7 +5,7 @@ mod inverted;
 mod resolver;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
-use crate::analyzer::usages::common::language_for_target;
+use crate::analyzer::usages::common::{classify_recursive_hits, language_for_target};
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, ReferenceGraphResult, UsageHitSurface};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
@@ -173,10 +173,10 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
             )
         };
 
-        let hits: BTreeSet<_> = hits
-            .into_iter()
-            .filter(|hit| &hit.enclosing != target)
-            .collect();
+        // A proven hit inside the target itself is a recursive call (#1638):
+        // kept, classified `SelfReceiver`. The unproven channel still drops
+        // them -- an unproven recursive call is not evidence of anything.
+        let hits = classify_recursive_hits(analyzer, hits, target);
         let unproven_hits: BTreeSet<_> = unproven_hits
             .into_iter()
             .filter(|hit| &hit.enclosing != target)

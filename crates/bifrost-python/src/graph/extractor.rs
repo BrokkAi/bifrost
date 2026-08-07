@@ -843,7 +843,7 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let text = slice(node, ctx.source);
-    if text.is_empty() || is_declaration_identifier(node) {
+    if text.is_empty() || is_declaration_identifier(node) || decorates_the_target(node, ctx) {
         return;
     }
     if let Some(member) = ctx.target_member {
@@ -870,6 +870,33 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     record_hit(node, ctx);
+}
+
+/// Whether `node` sits in a decorator of the very definition the scan is
+/// looking for.
+///
+/// Python evaluates a decorator expression before the decorated name is bound,
+/// so `@foo` above `def foo()` names an *outer* `foo` and never the definition
+/// it decorates. Without this the decorated definition reads as a user of
+/// itself, which the enclosing-equals-target drop used to hide.
+fn decorates_the_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if ctx.file != ctx.target_source {
+        return false;
+    }
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "decorated_definition" && current.kind() == "decorator" {
+            let Some(definition) = parent.child_by_field_name("definition") else {
+                return false;
+            };
+            return ctx.graph.index.ranges(ctx.target).iter().any(|range| {
+                range.start_byte <= definition.start_byte()
+                    && definition.end_byte() <= range.end_byte
+            });
+        }
+        current = parent;
+    }
+    false
 }
 
 fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

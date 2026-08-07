@@ -254,19 +254,11 @@ jobs:
           structural_search_planner:: structural_search_python::
 
   mcp-contract:
-    name: MCP contract (${{ matrix.host }})
+    name: MCP contract
     needs: [ci-impact, quick-policy, lint]
     if: needs.ci-impact.outputs.mcp_contract == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - host: rmcp
-            selector: 'on'
-          - host: legacy rollback
-            selector: 'off'
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -289,8 +281,6 @@ jobs:
           toolchain: 1.96.0
 
       - name: Run MCP contract tests
-        env:
-          BIFROST_MCP_RMCP: ${{ matrix.selector }}
         run: node scripts/ci-timing.mjs --label mcp-contract -- cargo test -p brokk-bifrost-mcp --features nlp
 
   analysis-unit:

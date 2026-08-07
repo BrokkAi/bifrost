@@ -16,7 +16,7 @@ publish = true
 name = "brokk_bifrost_ruby"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.23" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.24" }
 # The one dependency the seam census did not predict. Ruby persists a class or
 # module's superclass and its include/prepend/extend arguments through the
 # analyzer's `supertype_lookup_paths` column as a JSON object per relation

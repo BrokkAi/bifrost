@@ -9,7 +9,7 @@
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
-use crate::analyzer::usages::common::language_for_target;
+use crate::analyzer::usages::common::{classify_recursive_hits, language_for_target};
 use crate::analyzer::usages::inverted_edges::{
     UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output, parse_and_collect,
 };
@@ -217,11 +217,10 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
                 scan_scope.cancellation(),
             )
         });
-        let hits: BTreeSet<UsageHit> = scan_result
-            .hits
-            .into_iter()
-            .filter(|hit| &hit.enclosing != target)
-            .collect();
+        // A proven hit inside the target itself is a recursive call (#1638):
+        // kept, classified `SelfReceiver`. The unproven channel still drops
+        // them -- an unproven recursive call is not evidence of anything.
+        let hits = classify_recursive_hits(analyzer, scan_result.hits, target);
         let unproven_hits: BTreeSet<UsageHit> = scan_result
             .unproven_hits
             .into_iter()

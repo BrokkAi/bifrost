@@ -10,7 +10,7 @@ use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::ruby::parse_ruby_tree;
-use crate::analyzer::usages::common::language_for_target;
+use crate::analyzer::usages::common::{classify_recursive_hits, language_for_target};
 use crate::analyzer::usages::inverted_edges::{
     UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output, parse_and_collect,
 };
@@ -195,10 +195,10 @@ impl RubyQueryResolver<'_> {
             scan.scan(tree.root_node());
         }
 
-        let hits: BTreeSet<_> = hits
-            .into_iter()
-            .filter(|hit| hit.enclosing != spec.target)
-            .collect();
+        // A proven hit inside the target itself is a recursive call (#1638):
+        // kept, classified `SelfReceiver`. The unproven channel still drops
+        // them -- an unproven recursive call is not evidence of anything.
+        let hits = classify_recursive_hits(analyzer, hits, &spec.target);
         let unproven_hits: BTreeSet<_> = unproven_hits
             .into_iter()
             .filter(|hit| hit.enclosing != spec.target)
