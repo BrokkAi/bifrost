@@ -15,8 +15,10 @@ use crate::analyzer::usages::common::{
 use crate::analyzer::usages::inverted_edges::{
     UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output, parse_and_collect,
 };
-use crate::analyzer::usages::model::FuzzyResult;
-use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::model::{FuzzyResult, UsageAnalysisDiagnostic};
+use crate::analyzer::usages::outcome::{
+    CandidateUsageHits, GraphFailureReason, GraphUsageOutcome, union_candidate_usages,
+};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
@@ -29,14 +31,13 @@ pub(in crate::analyzer::usages) use brokk_bifrost_go::graph::reference::{
 use brokk_bifrost_go::graph::resolver::{
     GoEdgeIndex, GoGraphSource, GoProjectGraph, TargetSpec, build_go_edge_index, build_go_graph,
 };
-use std::collections::BTreeSet;
 
 pub(crate) use brokk_bifrost_go::graph::go_implicit_entry_point;
 pub(crate) use brokk_bifrost_go::graph::resolver::{go_simple_type_name, go_type_name_parts};
 
 /// Build every Go `caller -> callee` edge in one pass over the workspace.
 ///
-/// The per-symbol path ([`resolve_with_graph`]) answers "who calls X" by
+/// The per-symbol path ([`scan_candidate_with_graph`]) answers "who calls X" by
 /// scanning every candidate file for X. Building the *whole* graph that way
 /// walks each file once per symbol whose name it contains -- quadratic on real
 /// repos. This inverts it: walk each file's tree once, resolve every reference
@@ -104,6 +105,9 @@ where
     Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
 }
 
+/// The strategy name every Go usage diagnostic reports.
+const GO_STRATEGY: &str = "GoUsageGraphStrategy";
+
 pub(crate) struct GoQueryResolver<'a> {
     go: &'a GoAnalyzer,
 }
@@ -134,28 +138,29 @@ impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        let Some(target) = overloads.first() else {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        };
         let candidate_files = scan_scope.candidate_files();
-        let graph = build_go_graph(
-            go_graph_source(self.go),
-            candidate_files,
-            target.source(),
-            scan_scope.cancellation(),
-        );
-        if scan_scope.is_cancelled() {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        }
-        resolve_with_graph(
-            analyzer,
-            self.go,
-            &graph,
-            overloads,
-            candidate_files,
-            scan_scope,
-            max_usages,
-        )
+        union_candidate_usages(overloads, max_usages, |target| {
+            // The graph is seeded from the candidate's own file, so a target
+            // group holding declarations in different packages (#1779) builds
+            // one graph per candidate.
+            let graph = build_go_graph(
+                go_graph_source(self.go),
+                candidate_files,
+                target.source(),
+                scan_scope.cancellation(),
+            );
+            if scan_scope.is_cancelled() {
+                return Ok(CandidateUsageHits::default());
+            }
+            scan_candidate_with_graph(
+                analyzer,
+                self.go,
+                &graph,
+                target,
+                candidate_files,
+                scan_scope,
+            )
+        })
     }
 }
 
@@ -237,7 +242,7 @@ impl GraphUsageAnalyzer for GoUsageGraphStrategy {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::UnsupportedTargetLanguage("target is not Go"),
-                "GoUsageGraphStrategy",
+                GO_STRATEGY,
             );
         }
 
@@ -247,7 +252,7 @@ impl GraphUsageAnalyzer for GoUsageGraphStrategy {
                 GraphFailureReason::MissingAnalyzerCapability(
                     "analyzer does not expose GoAnalyzer",
                 ),
-                "GoUsageGraphStrategy",
+                GO_STRATEGY,
             );
         };
 
@@ -255,26 +260,21 @@ impl GraphUsageAnalyzer for GoUsageGraphStrategy {
     }
 }
 
-/// Resolve a single symbol's callers against an already-built [`GoProjectGraph`].
-/// Shared by the per-query path (`scan_usages`) and the shared-graph bulk path
-/// (`usage_graph`); only the graph's construction differs between them.
-fn resolve_with_graph(
+/// Resolve one candidate declaration's callers against an already-built
+/// [`GoProjectGraph`]. `Err` is this candidate declining; the query's answer
+/// unions every candidate that did resolve (see [`union_candidate_usages`]).
+fn scan_candidate_with_graph(
     analyzer: &dyn IAnalyzer,
     go: &GoAnalyzer,
     graph: &GoProjectGraph,
-    overloads: &[CodeUnit],
+    target: &CodeUnit,
     candidate_files: &HashSet<ProjectFile>,
     scan_scope: &UsageScanScope<'_>,
-    max_usages: usize,
-) -> GraphUsageOutcome {
-    let target = &overloads[0];
+) -> Result<CandidateUsageHits, UsageAnalysisDiagnostic> {
     let target_spec = TargetSpec::new(go_graph_source(go), graph, target);
     if !target_spec.has_scan_seed() {
-        return GraphUsageOutcome::fallback_safe(
-            target.fq_name(),
-            GraphFailureReason::NoGraphSeed("no graph seed resolved"),
-            "GoUsageGraphStrategy",
-        );
+        return Err(GraphFailureReason::NoGraphSeed("no graph seed resolved")
+            .diagnostic(target.fq_name(), GO_STRATEGY));
     }
 
     let mut scan_files = graph.scan_files(candidate_files, target, &target_spec);
@@ -291,28 +291,14 @@ fn resolve_with_graph(
     // The scan classifies a proven recursive call into a callable target as
     // `SelfReceiver` (#1638); this pass drops every other
     // enclosing-equals-target hit, as does the unproven channel below.
-    let hits = classify_recursive_hits(analyzer, scan_result.hits, target);
-    let unproven_hits: BTreeSet<_> = scan_result
-        .unproven_hits
-        .into_iter()
-        .filter(|hit| &hit.enclosing != target)
-        .collect();
-
-    let external_callsites = crate::analyzer::usages::common::external_usage_hit_count(&hits);
-    if external_callsites > max_usages {
-        return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-            short_name: target.short_name().to_string(),
-            total_callsites: external_callsites,
-            limit: max_usages,
-            sample_hits: hits,
-        });
-    }
-
-    GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
-        target.clone(),
-        hits,
-        unproven_hits,
-    ))
+    Ok(CandidateUsageHits {
+        hits: classify_recursive_hits(analyzer, scan_result.hits, target),
+        unproven_hits: scan_result
+            .unproven_hits
+            .into_iter()
+            .filter(|hit| &hit.enclosing != target)
+            .collect(),
+    })
 }
 
 impl UsageAnalyzer for GoUsageGraphStrategy {

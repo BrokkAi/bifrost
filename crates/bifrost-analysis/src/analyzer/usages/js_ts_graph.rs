@@ -39,7 +39,9 @@ use crate::analyzer::usages::inverted_edges::{
     parse_and_collect,
 };
 use crate::analyzer::usages::model::FuzzyResult;
-use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::outcome::{
+    CandidateUsageHits, GraphFailureReason, GraphUsageOutcome, union_candidate_usages,
+};
 use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use crate::analyzer::usages::traits::{
     GraphUsageAnalyzer, UsageAnalyzer, UsageQueryResolver, UsageScanScope,
@@ -51,7 +53,7 @@ use crate::analyzer::{
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use brokk_bifrost_js_ts::graph::resolver::{combine_jsts_usage_indices, target_language};
-use brokk_bifrost_js_ts::graph::{JsTsHosts, inverted};
+use brokk_bifrost_js_ts::graph::{JsTsHosts, inverted, scan_js_ts_target_usages};
 use brokk_bifrost_js_ts::parse::{js_ts_tree_sitter_language_for_file, tree_sitter_language_for};
 use brokk_bifrost_js_ts::providers::JsTsSource;
 use std::collections::BTreeMap;
@@ -59,6 +61,9 @@ use std::sync::Arc;
 
 /// The two dialects, in the order every whole-workspace pass walks them.
 const JS_TS_LANGUAGES: [Language; 2] = [Language::TypeScript, Language::JavaScript];
+
+/// The strategy name every JS/TS usage diagnostic reports.
+const JS_TS_STRATEGY: &str = "JsTsExportUsageGraphStrategy";
 
 /// Resolve both dialects' analyzers once for a whole-workspace pass.
 ///
@@ -145,42 +150,50 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        let Some(target) = overloads.first() else {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        };
-        let language = target_language(target);
-        if language == Language::None {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetLanguage("target is not JS/TS"),
-                "JsTsExportUsageGraphStrategy",
-            );
-        }
-
         let cancellation = scan_scope.cancellation();
-        let index = resolve_js_ts_source(analyzer, language)
-            .and_then(|host| host.usage_index(cancellation).map(|index| (host, index)));
-        let Some((host, index)) = index else {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+        // One host and resolution index per dialect, resolved the first time a
+        // candidate needs it: a target group can hold a TypeScript and a
+        // JavaScript declaration of the same name, and each is scanned against
+        // its own dialect's index. The index itself is analyzer-cached, so the
+        // repeat lookups a multi-candidate group makes are map hits.
+        let mut hosts: Vec<(Language, &dyn JsTsSource, Arc<JsTsUsageIndex>)> = Vec::new();
+        union_candidate_usages(overloads, max_usages, |target| {
+            let language = target_language(target);
+            if language == Language::None {
+                return Err(
+                    GraphFailureReason::UnsupportedTargetLanguage("target is not JS/TS")
+                        .diagnostic(target.fq_name(), JS_TS_STRATEGY),
+                );
             }
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::MissingAnalyzerCapability(
-                    "analyzer does not expose a JS/TS analyzer",
-                ),
-                "JsTsExportUsageGraphStrategy",
-            );
-        };
-        brokk_bifrost_js_ts::graph::find_js_ts_usages(
-            host,
-            analyzer,
-            index.as_ref(),
-            target,
-            scan_scope,
-            language,
-            max_usages,
-        )
+            if !hosts.iter().any(|(dialect, _, _)| *dialect == language) {
+                let resolved = resolve_js_ts_source(analyzer, language)
+                    .and_then(|host| host.usage_index(cancellation).map(|index| (host, index)));
+                let Some((host, index)) = resolved else {
+                    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                        // The scan stopped mid-flight; the group keeps whatever
+                        // the candidates scanned before the token tripped.
+                        return Ok(CandidateUsageHits::default());
+                    }
+                    return Err(GraphFailureReason::MissingAnalyzerCapability(
+                        "analyzer does not expose a JS/TS analyzer",
+                    )
+                    .diagnostic(target.fq_name(), JS_TS_STRATEGY));
+                };
+                hosts.push((language, host, index));
+            }
+            let (_, host, index) = hosts
+                .iter()
+                .find(|(dialect, _, _)| *dialect == language)
+                .expect("host for this dialect was just resolved");
+            Ok(scan_js_ts_target_usages(
+                *host,
+                analyzer,
+                index.as_ref(),
+                target,
+                scan_scope,
+                language,
+            ))
+        })
     }
 }
 
@@ -436,7 +449,7 @@ impl GraphUsageAnalyzer for JsTsExportUsageGraphStrategy {
                 GraphFailureReason::MissingAnalyzerCapability(
                     "analyzer does not expose a JS/TS analyzer",
                 ),
-                "JsTsExportUsageGraphStrategy",
+                JS_TS_STRATEGY,
             );
         };
         resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
