@@ -1128,6 +1128,17 @@ pub enum DispatchBoundaryKind {
 }
 
 impl DispatchBoundaryKind {
+    /// The stable public spelling of this boundary kind.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::External(_) => "external",
+            Self::Unmaterialized(_) => "unmaterialized",
+            Self::Deferred { .. } => "deferred",
+            Self::Unresolved => "unresolved",
+            Self::Truncated => "truncated",
+        }
+    }
+
     /// Exact structured target retained for a non-materialized dispatch arm.
     /// Unresolved and truncated residual arms do not name one target.
     pub fn target_locator(&self) -> Option<&SemanticLocator> {

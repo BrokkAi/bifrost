@@ -100,10 +100,15 @@ pub enum DetailedCodeQueryDomain {
     CallArgument,
     ReceiverEvidence,
     MemberSelection,
+    DispatchOutcome,
+    DispatchTarget,
+    MemberFamily,
+    MemberFamilyEdge,
     Occurrence,
     LexicalScope,
     Binding,
     ResolutionCandidate,
+    CandidateHop,
     GenerationSite,
     Export,
     DeclarationState,
@@ -134,10 +139,15 @@ pub const ALL_DETAILED_CODE_QUERY_DOMAINS: &[DetailedCodeQueryDomain] = &[
     DetailedCodeQueryDomain::CallArgument,
     DetailedCodeQueryDomain::ReceiverEvidence,
     DetailedCodeQueryDomain::MemberSelection,
+    DetailedCodeQueryDomain::DispatchOutcome,
+    DetailedCodeQueryDomain::DispatchTarget,
+    DetailedCodeQueryDomain::MemberFamily,
+    DetailedCodeQueryDomain::MemberFamilyEdge,
     DetailedCodeQueryDomain::Occurrence,
     DetailedCodeQueryDomain::LexicalScope,
     DetailedCodeQueryDomain::Binding,
     DetailedCodeQueryDomain::ResolutionCandidate,
+    DetailedCodeQueryDomain::CandidateHop,
     DetailedCodeQueryDomain::GenerationSite,
     DetailedCodeQueryDomain::Export,
     DetailedCodeQueryDomain::DeclarationState,
@@ -276,10 +286,15 @@ impl DetailedCodeQueryDomain {
             QueryValueKind::CallArgument => Self::CallArgument,
             QueryValueKind::ReceiverEvidence => Self::ReceiverEvidence,
             QueryValueKind::MemberSelection => Self::MemberSelection,
+            QueryValueKind::DispatchOutcome => Self::DispatchOutcome,
+            QueryValueKind::DispatchTarget => Self::DispatchTarget,
+            QueryValueKind::MemberFamily => Self::MemberFamily,
+            QueryValueKind::MemberFamilyEdge => Self::MemberFamilyEdge,
             QueryValueKind::Occurrence => Self::Occurrence,
             QueryValueKind::LexicalScope => Self::LexicalScope,
             QueryValueKind::Binding => Self::Binding,
             QueryValueKind::ResolutionCandidate => Self::ResolutionCandidate,
+            QueryValueKind::CandidateHop => Self::CandidateHop,
             QueryValueKind::GenerationSite => Self::GenerationSite,
             QueryValueKind::Export => Self::Export,
             QueryValueKind::DeclarationState => Self::DeclarationState,
@@ -313,10 +328,15 @@ impl DetailedCodeQueryDomain {
             Self::CallArgument => "call_argument",
             Self::ReceiverEvidence => "receiver_evidence",
             Self::MemberSelection => "member_selection",
+            Self::DispatchOutcome => "dispatch_outcome",
+            Self::DispatchTarget => "dispatch_target",
+            Self::MemberFamily => "member_family",
+            Self::MemberFamilyEdge => "member_family_edge",
             Self::Occurrence => "occurrence",
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
             Self::ResolutionCandidate => "resolution_candidate",
+            Self::CandidateHop => "candidate_hop",
             Self::GenerationSite => "generation_site",
             Self::Export => "export",
             Self::DeclarationState => "declaration_state",
@@ -446,6 +466,60 @@ impl DetailedCodeQueryDomain {
                 CodeQueryRowField::required("proof", Scalar::ConstrainedEnum),
                 CodeQueryRowField::required("completeness", Scalar::ConstrainedEnum),
             ],
+            Self::DispatchOutcome => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("site_id", Scalar::StableId),
+                CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
+                CodeQueryRowField::required("outcome", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("call_site_count", Scalar::Integer),
+                CodeQueryRowField::required("target_count", Scalar::Integer),
+                CodeQueryRowField::required("targets_truncated", Scalar::Boolean),
+                CodeQueryRowField::optional("semantic_unsupported", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("exceeded_limit", Scalar::ConstrainedEnum),
+            ],
+            Self::DispatchTarget => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("site_id", Scalar::StableId),
+                CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
+                CodeQueryRowField::required("ordinal", Scalar::Integer),
+                CodeQueryRowField::required("target_id", Scalar::StableId),
+                CodeQueryRowField::optional("target_declaration_id", Scalar::DeclarationIdentity),
+                CodeQueryRowField::required("proof", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("completeness", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("dispatch", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("boundary_kind", Scalar::ConstrainedEnum),
+            ],
+            Self::MemberFamily => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("member_id", Scalar::StableId),
+                CodeQueryRowField::required("outcome", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("reason", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("capability", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("family_id", Scalar::StableId),
+                CodeQueryRowField::required("overrides_count", Scalar::Integer),
+                CodeQueryRowField::required("implements_count", Scalar::Integer),
+                CodeQueryRowField::required("overridden_by_count", Scalar::Integer),
+                CodeQueryRowField::required("implemented_by_count", Scalar::Integer),
+                CodeQueryRowField::required("edge_count", Scalar::Integer),
+                CodeQueryRowField::required("root_count", Scalar::Integer),
+                CodeQueryRowField::optional("member_declaration_id", Scalar::DeclarationIdentity),
+            ],
+            Self::MemberFamilyEdge => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("member_id", Scalar::StableId),
+                CodeQueryRowField::required("ordinal", Scalar::Integer),
+                CodeQueryRowField::required("target_id", Scalar::StableId),
+                CodeQueryRowField::required("relation", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("family_id", Scalar::StableId),
+                CodeQueryRowField::required("hierarchy_depth", Scalar::Integer),
+                CodeQueryRowField::required("proof", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("completeness", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("target_declaration_id", Scalar::DeclarationIdentity),
+            ],
             Self::CallShape => code_query_row_fields![
                 CodeQueryRowField::required("id", Scalar::StableId),
                 CodeQueryRowField::required("site_id", Scalar::StableId),
@@ -522,6 +596,19 @@ impl DetailedCodeQueryDomain {
                 CodeQueryRowField::required("candidate_kind", Scalar::ConstrainedEnum),
                 CodeQueryRowField::optional("candidate_id", Scalar::DeclarationIdentity),
                 CodeQueryRowField::optional("canonical_member_id", Scalar::StableId),
+                CodeQueryRowField::optional("owner_id", Scalar::DeclarationIdentity),
+                CodeQueryRowField::optional("hierarchy_depth", Scalar::Integer),
+                CodeQueryRowField::optional("dispatch_tier", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("applicability", Scalar::ConstrainedEnum),
+            ],
+            Self::CandidateHop => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("candidate_id", Scalar::StableId),
+                CodeQueryRowField::required("ast_id", Scalar::StableId),
+                CodeQueryRowField::required("hop", Scalar::Integer),
+                CodeQueryRowField::required("relation", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("from_id", Scalar::DeclarationIdentity),
+                CodeQueryRowField::optional("to_id", Scalar::DeclarationIdentity),
             ],
             Self::GenerationSite => code_query_row_fields![
                 CodeQueryRowField::required("id", Scalar::StableId),
@@ -612,6 +699,10 @@ impl CodeQueryResultValue {
             Self::ReceiverAnalysis { value } => Some(value.range),
             Self::ReceiverOutcome { value } => Some(value.range),
             Self::MemberSelection { value } => Some(value.range),
+            Self::DispatchOutcome { value } => Some(value.range),
+            Self::DispatchTarget { .. } => None,
+            Self::MemberFamily { value } => Some(value.range),
+            Self::MemberFamilyEdge { value } => Some(value.range),
             Self::CallShape { value } => Some(value.range),
             Self::CallArgumentGroup { value } => Some(value.range),
             Self::CallArgument { value } => Some(value.range),
@@ -619,6 +710,7 @@ impl CodeQueryResultValue {
             Self::LexicalScope { value } => Some(value.range),
             Self::Binding { value } => Some(value.range),
             Self::ResolutionCandidate { value } => Some(value.range),
+            Self::CandidateHop { value } => Some(value.range),
             Self::GenerationSite { value } => Some(value.range),
             Self::Export { value } => Some(value.range),
             Self::DeclarationState { value } => value.range,
@@ -651,10 +743,15 @@ impl CodeQueryResultValue {
             Self::CallArgumentGroup { .. } => DetailedCodeQueryDomain::CallArgumentGroup,
             Self::CallArgument { .. } => DetailedCodeQueryDomain::CallArgument,
             Self::MemberSelection { .. } => DetailedCodeQueryDomain::MemberSelection,
+            Self::DispatchOutcome { .. } => DetailedCodeQueryDomain::DispatchOutcome,
+            Self::DispatchTarget { .. } => DetailedCodeQueryDomain::DispatchTarget,
+            Self::MemberFamily { .. } => DetailedCodeQueryDomain::MemberFamily,
+            Self::MemberFamilyEdge { .. } => DetailedCodeQueryDomain::MemberFamilyEdge,
             Self::Occurrence { .. } => DetailedCodeQueryDomain::Occurrence,
             Self::LexicalScope { .. } => DetailedCodeQueryDomain::LexicalScope,
             Self::Binding { .. } => DetailedCodeQueryDomain::Binding,
             Self::ResolutionCandidate { .. } => DetailedCodeQueryDomain::ResolutionCandidate,
+            Self::CandidateHop { .. } => DetailedCodeQueryDomain::CandidateHop,
             Self::GenerationSite { .. } => DetailedCodeQueryDomain::GenerationSite,
             Self::Export { .. } => DetailedCodeQueryDomain::Export,
             Self::DeclarationState { .. } => DetailedCodeQueryDomain::DeclarationState,
@@ -947,6 +1044,146 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::CallArgument { value }, "spread") => {
             Some(Scalar::Boolean(value.spread))
         }
+        (CodeQueryResultValue::DispatchOutcome { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "site_ast_id") => {
+            value.site_ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "outcome") => {
+            Some(Scalar::ConstrainedEnum(value.outcome))
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "call_site_count") => {
+            Some(Scalar::Integer(value.call_site_count as u64))
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "target_count") => {
+            Some(Scalar::Integer(value.target_count as u64))
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "targets_truncated") => {
+            Some(Scalar::Boolean(value.targets_truncated))
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "semantic_unsupported") => {
+            value.semantic_unsupported.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::DispatchOutcome { value }, "exceeded_limit") => {
+            value.exceeded_limit.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::DispatchTarget { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "site_ast_id") => {
+            value.site_ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "ordinal") => {
+            Some(Scalar::Integer(value.ordinal as u64))
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "target_id") => {
+            Some(Scalar::StableId(&value.target_id))
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "target_declaration_id") => value
+            .target_declaration
+            .as_ref()
+            .and_then(|declaration| declaration.id.as_deref())
+            .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::DispatchTarget { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "dispatch") => {
+            Some(Scalar::ConstrainedEnum(value.dispatch))
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "boundary_kind") => {
+            value.boundary_kind.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::MemberFamily { value }, "member_id") => {
+            Some(Scalar::StableId(&value.member_id))
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "outcome") => {
+            Some(Scalar::ConstrainedEnum(value.outcome))
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "reason") => {
+            value.reason.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "capability") => {
+            Some(Scalar::ConstrainedEnum(value.capability))
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "family_id") => {
+            value.family_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "overrides_count") => {
+            Some(Scalar::Integer(value.overrides_count as u64))
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "implements_count") => {
+            Some(Scalar::Integer(value.implements_count as u64))
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "overridden_by_count") => {
+            Some(Scalar::Integer(value.overridden_by_count as u64))
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "implemented_by_count") => {
+            Some(Scalar::Integer(value.implemented_by_count as u64))
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "edge_count") => {
+            Some(Scalar::Integer(value.edge_count as u64))
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "root_count") => {
+            Some(Scalar::Integer(value.root_count as u64))
+        }
+        (CodeQueryResultValue::MemberFamily { value }, "member_declaration_id") => value
+            .member
+            .as_ref()
+            .and_then(|declaration| declaration.id.as_deref())
+            .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::MemberFamilyEdge { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::MemberFamilyEdge { value }, "member_id") => {
+            Some(Scalar::StableId(&value.member_id))
+        }
+        (CodeQueryResultValue::MemberFamilyEdge { value }, "ordinal") => {
+            Some(Scalar::Integer(value.ordinal as u64))
+        }
+        (CodeQueryResultValue::MemberFamilyEdge { value }, "target_id") => {
+            Some(Scalar::StableId(&value.target_id))
+        }
+        (CodeQueryResultValue::MemberFamilyEdge { value }, "relation") => {
+            Some(Scalar::ConstrainedEnum(value.relation))
+        }
+        (CodeQueryResultValue::MemberFamilyEdge { value }, "family_id") => {
+            value.family_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::MemberFamilyEdge { value }, "hierarchy_depth") => {
+            Some(Scalar::Integer(value.hierarchy_depth as u64))
+        }
+        (CodeQueryResultValue::MemberFamilyEdge { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::MemberFamilyEdge { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
+        }
+        (CodeQueryResultValue::MemberFamilyEdge { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::MemberFamilyEdge { value }, "target_declaration_id") => value
+            .target
+            .as_ref()
+            .and_then(|declaration| declaration.id.as_deref())
+            .map(Scalar::DeclarationIdentity),
         (CodeQueryResultValue::ReceiverEvidence { value }, "id") => {
             Some(Scalar::StableId(&value.id))
         }
@@ -1124,6 +1361,43 @@ fn project_code_query_row_field<'a>(
                 _ => None,
             }
         }
+        (CodeQueryResultValue::ResolutionCandidate { value }, "owner_id") => value
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.id.as_deref())
+            .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::ResolutionCandidate { value }, "hierarchy_depth") => value
+            .hierarchy_depth
+            .map(|depth| Scalar::Integer(depth as u64)),
+        (CodeQueryResultValue::ResolutionCandidate { value }, "dispatch_tier") => {
+            value.dispatch_tier.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::ResolutionCandidate { value }, "applicability") => {
+            value.applicability.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CandidateHop { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::CandidateHop { value }, "candidate_id") => {
+            Some(Scalar::StableId(&value.candidate_id))
+        }
+        (CodeQueryResultValue::CandidateHop { value }, "ast_id") => {
+            Some(Scalar::StableId(&value.ast_id))
+        }
+        (CodeQueryResultValue::CandidateHop { value }, "hop") => {
+            Some(Scalar::Integer(value.hop as u64))
+        }
+        (CodeQueryResultValue::CandidateHop { value }, "relation") => {
+            Some(Scalar::ConstrainedEnum(value.relation))
+        }
+        (CodeQueryResultValue::CandidateHop { value }, "from_id") => value
+            .from
+            .as_ref()
+            .and_then(|unit| unit.id.as_deref())
+            .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::CandidateHop { value }, "to_id") => value
+            .to
+            .as_ref()
+            .and_then(|unit| unit.id.as_deref())
+            .map(Scalar::DeclarationIdentity),
         (CodeQueryResultValue::GenerationSite { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::GenerationSite { value }, "ast_id") => {
             value.ast_id.as_deref().map(Scalar::StableId)
@@ -1318,6 +1592,24 @@ pub enum DetailedCodeQueryKey {
         id: String,
         site_id: String,
     },
+    DispatchOutcome {
+        id: String,
+        site_id: String,
+    },
+    DispatchTarget {
+        id: String,
+        site_id: String,
+        ordinal: usize,
+    },
+    MemberFamily {
+        id: String,
+        member_id: String,
+    },
+    MemberFamilyEdge {
+        id: String,
+        member_id: String,
+        ordinal: usize,
+    },
     CallShape {
         id: String,
         site_id: String,
@@ -1353,6 +1645,11 @@ pub enum DetailedCodeQueryKey {
         id: String,
         ast_id: String,
         ordinal: usize,
+    },
+    CandidateHop {
+        id: String,
+        candidate_id: String,
+        hop: usize,
     },
     GenerationSite {
         id: String,
@@ -1479,6 +1776,22 @@ impl DetailedCodeQueryResult {
                             DetailedCodeQueryKey::ReceiverEvidence { .. }
                         )
                         | (
+                            DetailedCodeQueryDomain::DispatchOutcome,
+                            DetailedCodeQueryKey::DispatchOutcome { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::DispatchTarget,
+                            DetailedCodeQueryKey::DispatchTarget { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::MemberFamily,
+                            DetailedCodeQueryKey::MemberFamily { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::MemberFamilyEdge,
+                            DetailedCodeQueryKey::MemberFamilyEdge { .. }
+                        )
+                        | (
                             DetailedCodeQueryDomain::CallShape,
                             DetailedCodeQueryKey::CallShape { .. }
                         )
@@ -1509,6 +1822,10 @@ impl DetailedCodeQueryResult {
                         | (
                             DetailedCodeQueryDomain::ResolutionCandidate,
                             DetailedCodeQueryKey::ResolutionCandidate { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::CandidateHop,
+                            DetailedCodeQueryKey::CandidateHop { .. }
                         )
                         | (
                             DetailedCodeQueryDomain::GenerationSite,
@@ -1657,6 +1974,10 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::ReceiverAnalysis { .. }
         | CodeQueryResultValue::ReceiverOutcome { .. }
         | CodeQueryResultValue::ReceiverEvidence { .. }
+        | CodeQueryResultValue::DispatchOutcome { .. }
+        | CodeQueryResultValue::DispatchTarget { .. }
+        | CodeQueryResultValue::MemberFamily { .. }
+        | CodeQueryResultValue::MemberFamilyEdge { .. }
         | CodeQueryResultValue::CallShape { .. }
         | CodeQueryResultValue::CallArgumentGroup { .. }
         | CodeQueryResultValue::CallArgument { .. }
@@ -1665,6 +1986,7 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::LexicalScope { .. }
         | CodeQueryResultValue::Binding { .. }
         | CodeQueryResultValue::ResolutionCandidate { .. }
+        | CodeQueryResultValue::CandidateHop { .. }
         | CodeQueryResultValue::GenerationSite { .. }
         | CodeQueryResultValue::Export { .. }
         | CodeQueryResultValue::DeclarationState { .. }
@@ -1715,6 +2037,10 @@ fn assert_detailed_terminal_identities(
                 | DetailedCodeQueryDomain::ReceiverAnalysis
                 | DetailedCodeQueryDomain::ReceiverOutcome
                 | DetailedCodeQueryDomain::ReceiverEvidence
+                | DetailedCodeQueryDomain::DispatchOutcome
+                | DetailedCodeQueryDomain::DispatchTarget
+                | DetailedCodeQueryDomain::MemberFamily
+                | DetailedCodeQueryDomain::MemberFamilyEdge
                 | DetailedCodeQueryDomain::CallShape
                 | DetailedCodeQueryDomain::CallArgumentGroup
                 | DetailedCodeQueryDomain::CallArgument
@@ -1727,6 +2053,7 @@ fn assert_detailed_terminal_identities(
                 | DetailedCodeQueryDomain::LexicalScope
                 | DetailedCodeQueryDomain::Binding
                 | DetailedCodeQueryDomain::ResolutionCandidate
+                | DetailedCodeQueryDomain::CandidateHop
                 // The three materialization domains are identified by their
                 // own content-scoped digests too (#1476).
                 | DetailedCodeQueryDomain::GenerationSite
@@ -1772,6 +2099,10 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::ReceiverAnalysis { .. }
         | DetailedCodeQueryKey::ReceiverOutcome { .. }
         | DetailedCodeQueryKey::ReceiverEvidence { .. }
+        | DetailedCodeQueryKey::DispatchOutcome { .. }
+        | DetailedCodeQueryKey::DispatchTarget { .. }
+        | DetailedCodeQueryKey::MemberFamily { .. }
+        | DetailedCodeQueryKey::MemberFamilyEdge { .. }
         | DetailedCodeQueryKey::CallShape { .. }
         | DetailedCodeQueryKey::CallArgumentGroup { .. }
         | DetailedCodeQueryKey::CallArgument { .. }
@@ -1780,6 +2111,7 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::LexicalScope { .. }
         | DetailedCodeQueryKey::Binding { .. }
         | DetailedCodeQueryKey::ResolutionCandidate { .. }
+        | DetailedCodeQueryKey::CandidateHop { .. }
         | DetailedCodeQueryKey::GenerationSite { .. }
         | DetailedCodeQueryKey::Export { .. }
         | DetailedCodeQueryKey::DeclarationState { .. }

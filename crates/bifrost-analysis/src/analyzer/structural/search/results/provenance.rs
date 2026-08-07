@@ -152,6 +152,38 @@ pub enum CodeQueryResultRef {
         range: CodeQueryRange,
         evidence_kind: &'static str,
     },
+    DispatchOutcome {
+        id: String,
+        site_id: String,
+        path: String,
+        range: CodeQueryRange,
+        outcome: &'static str,
+        coverage: &'static str,
+    },
+    DispatchTarget {
+        id: String,
+        site_id: String,
+        path: String,
+        range: CodeQueryRange,
+        ordinal: usize,
+        dispatch: &'static str,
+    },
+    MemberFamily {
+        id: String,
+        member_id: String,
+        path: String,
+        range: CodeQueryRange,
+        outcome: &'static str,
+        coverage: &'static str,
+    },
+    MemberFamilyEdge {
+        id: String,
+        member_id: String,
+        path: String,
+        range: CodeQueryRange,
+        ordinal: usize,
+        relation: &'static str,
+    },
     CallShape {
         id: String,
         site_id: String,
@@ -216,6 +248,14 @@ pub enum CodeQueryResultRef {
         #[serde(skip_serializing_if = "Option::is_none")]
         tier: Option<&'static str>,
         outcome: &'static str,
+    },
+    CandidateHop {
+        id: String,
+        candidate_id: String,
+        path: String,
+        range: CodeQueryRange,
+        hop: usize,
+        relation: &'static str,
     },
     ReferenceEdge {
         id: String,

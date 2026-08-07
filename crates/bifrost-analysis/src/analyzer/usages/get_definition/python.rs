@@ -156,6 +156,13 @@ pub(crate) fn resolve_python_bounded(
                             ),
                         )
                     } else {
+                        // Found by asking the index for `<receiver fq>.<member>`,
+                        // so the receiver is the owner and the walk took no
+                        // hierarchy hop (#1477). This seam has no ancestor walk
+                        // at all, so an inherited member never reaches it.
+                        let mut attribution = PythonMemberAttribution::default();
+                        attribution.record_direct(&receiver, &candidates);
+                        attribution.stage();
                         candidates_outcome(candidates)
                     }
                 }
@@ -2000,11 +2007,26 @@ fn python_member_outcome(
         units
     };
     let mut candidates = member_candidates(&receiver_type.fq_name());
+    // The member attribution this seam can name: every candidate was found by
+    // asking the index for `<owner fq>.<member>`, so the owner is exactly the
+    // type the lookup asked about, and the hop distance is that type's distance
+    // from the receiver. Built only while a trace records (#1477).
+    let mut attribution = PythonMemberAttribution::default();
+    attribution.record_direct(&receiver_type, &candidates);
     if candidates.is_empty()
         && let Some(provider) = analyzer.type_hierarchy_provider()
     {
+        // The routes are the walk `get_ancestors` performs, retaining the hop
+        // distance and the first-discovery parent it discards.
+        let routes = if trace::recording() {
+            PythonAncestorRoutes::build(provider, &receiver_type)
+        } else {
+            PythonAncestorRoutes::default()
+        };
         for ancestor in provider.get_ancestors(&receiver_type) {
-            candidates.extend(member_candidates(&ancestor.fq_name()));
+            let found = member_candidates(&ancestor.fq_name());
+            attribution.record_inherited(&receiver_type, &ancestor, &found, &routes);
+            candidates.extend(found);
         }
         sort_units(&mut candidates);
         candidates.dedup();
@@ -2021,7 +2043,197 @@ fn python_member_outcome(
         };
         no_definition("no_indexed_definition", message)
     } else {
+        attribution.stage();
         candidates_outcome(candidates)
+    }
+}
+
+/// How many ancestor types the recording-only route walk may visit. Mirrors the
+/// bound the Java member-family walk applies to the same kind of closure: a
+/// diamond or a deep framework hierarchy stays bounded, and a hierarchy that
+/// exceeds the bound loses attribution rather than gaining a wrong one.
+const MAX_ANCESTOR_FRONTIER: usize = 512;
+
+/// The hop distance and first-discovery parent of every ancestor the Python
+/// member walk can reach (#1477).
+///
+/// `TypeHierarchyProvider::get_ancestors` flattens its breadth-first walk to a
+/// list, discarding both facts. This repeats that walk over the same
+/// direct-ancestor edges, in the same order and with the same
+/// fully-qualified-name deduplication, and retains them. It decides nothing:
+/// the production loop still consumes `get_ancestors` unchanged.
+///
+/// The walk is bounded by [`MAX_ANCESTOR_FRONTIER`]. Truncation removes
+/// attribution, never distorts it: breadth-first order fixes every depth at
+/// the level it was recorded, so an ancestor the bound cut off simply has no
+/// depth and [`PythonAncestorRoutes::route`] returns `None` for it, leaving
+/// that candidate unattributed.
+#[derive(Default)]
+struct PythonAncestorRoutes {
+    /// First-discovery parent of each ancestor the walk expanded.
+    parents: HashMap<CodeUnit, CodeUnit>,
+    /// Breadth-first hop distance from the receiver.
+    depths: HashMap<CodeUnit, usize>,
+}
+
+impl PythonAncestorRoutes {
+    fn build(provider: &dyn crate::analyzer::TypeHierarchyProvider, receiver: &CodeUnit) -> Self {
+        let mut routes = Self::default();
+        let mut seen: HashSet<String> = HashSet::default();
+        seen.insert(receiver.fq_name());
+        let mut level = provider.get_direct_ancestors(receiver);
+        for ancestor in &level {
+            routes
+                .parents
+                .entry(ancestor.clone())
+                .or_insert_with(|| receiver.clone());
+        }
+        let mut depth = 0usize;
+        let mut visited = 0usize;
+        'walk: while !level.is_empty() {
+            depth += 1;
+            let mut next_level = Vec::new();
+            for ancestor in level {
+                if !seen.insert(ancestor.fq_name()) {
+                    continue;
+                }
+                visited += 1;
+                if visited > MAX_ANCESTOR_FRONTIER {
+                    // Stop before recording anything about this ancestor. Every
+                    // depth already recorded is the breadth-first minimum and
+                    // stays correct; the rest of the closure is simply absent,
+                    // so its candidates stay unattributed.
+                    break 'walk;
+                }
+                routes.depths.insert(ancestor.clone(), depth);
+                let expanded = provider.get_direct_ancestors(&ancestor);
+                for next in &expanded {
+                    routes
+                        .parents
+                        .entry(next.clone())
+                        .or_insert_with(|| ancestor.clone());
+                }
+                next_level.extend(expanded);
+            }
+            level = next_level;
+        }
+        routes
+    }
+
+    /// The exact route from `receiver` to `owner`, as first-discovery hops.
+    /// Every Python direct-ancestor edge is a base-class edge, so each hop is
+    /// [`HierarchyRelation::Extends`]. Returns `None` when the walk never
+    /// reached `owner`, which leaves the candidate unattributed rather than
+    /// attributed to a route this seam cannot name.
+    fn route(
+        &self,
+        receiver: &CodeUnit,
+        owner: &CodeUnit,
+    ) -> Option<(usize, Vec<trace::HierarchyHopRecord>)> {
+        use crate::analyzer::structural::HierarchyRelation;
+
+        let depth = *self.depths.get(owner)?;
+        let mut chain = vec![owner.clone()];
+        while chain.last() != Some(receiver) {
+            let parent = self
+                .parents
+                .get(chain.last().expect("chain is never empty"))?;
+            chain.push(parent.clone());
+        }
+        chain.reverse();
+        debug_assert_eq!(
+            chain.len(),
+            depth + 1,
+            "the first-discovery chain must be exactly the walk's hop distance"
+        );
+        let route = chain
+            .windows(2)
+            .enumerate()
+            .map(|(hop, pair)| trace::HierarchyHopRecord {
+                hop,
+                from: pair[0].clone(),
+                to: pair[1].clone(),
+                relation: HierarchyRelation::Extends,
+            })
+            .collect();
+        Some((depth, route))
+    }
+}
+
+/// The member attribution the Python member seams accumulate before they hand
+/// their candidates to the shared outcome constructor (#1477).
+///
+/// Applicability stays `Unknown`: these seams select by owner and name and
+/// never inspect the call shape, so claiming anything else would be inventing
+/// a check the resolver did not perform.
+#[derive(Default)]
+struct PythonMemberAttribution {
+    by_fq_name: Vec<(String, trace::MemberEnrichment)>,
+}
+
+impl PythonMemberAttribution {
+    /// Candidates found on the receiver's own type: depth zero, no route.
+    fn record_direct(&mut self, receiver: &CodeUnit, found: &[CodeUnit]) {
+        use crate::analyzer::structural::MemberDispatchTier;
+        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
+        if !trace::recording() {
+            return;
+        }
+        for candidate in found {
+            self.by_fq_name.push((
+                candidate.fq_name(),
+                trace::MemberEnrichment {
+                    owner: receiver.clone(),
+                    hierarchy_depth: 0,
+                    dispatch_tier: MemberDispatchTier::InherentOrDirect,
+                    applicability: ApplicabilityVerdict::Unknown,
+                    route: Vec::new(),
+                },
+            ));
+        }
+    }
+
+    /// Candidates found on an ancestor of the receiver. A candidate whose owner
+    /// the route walk cannot place stays unattributed.
+    fn record_inherited(
+        &mut self,
+        receiver: &CodeUnit,
+        owner: &CodeUnit,
+        found: &[CodeUnit],
+        routes: &PythonAncestorRoutes,
+    ) {
+        use crate::analyzer::structural::MemberDispatchTier;
+        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
+        if !trace::recording() || found.is_empty() {
+            return;
+        }
+        let Some((depth, route)) = routes.route(receiver, owner) else {
+            return;
+        };
+        for candidate in found {
+            self.by_fq_name.push((
+                candidate.fq_name(),
+                trace::MemberEnrichment {
+                    owner: owner.clone(),
+                    hierarchy_depth: depth,
+                    dispatch_tier: MemberDispatchTier::InheritedOrPromoted,
+                    applicability: ApplicabilityVerdict::Unknown,
+                    route: route.clone(),
+                },
+            ));
+        }
+    }
+
+    /// Stage the attribution for the outcome constructor the caller is about to
+    /// reach. Staging nothing leaves the rows unattributed, which is what an
+    /// unrecorded trace and an unplaceable owner must both look like.
+    fn stage(self) {
+        if self.by_fq_name.is_empty() {
+            return;
+        }
+        trace::stage_member_context(self.by_fq_name);
     }
 }
 

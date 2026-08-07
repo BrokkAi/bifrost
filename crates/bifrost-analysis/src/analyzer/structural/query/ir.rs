@@ -67,10 +67,15 @@ pub enum QueryValueKind {
     CallArgumentGroup,
     CallArgument,
     MemberSelection,
+    DispatchOutcome,
+    DispatchTarget,
+    MemberFamily,
+    MemberFamilyEdge,
     Occurrence,
     LexicalScope,
     Binding,
     ResolutionCandidate,
+    CandidateHop,
     ReferenceEdge,
     QualifiedPath,
     PathSegment,
@@ -103,10 +108,15 @@ impl QueryValueKind {
             Self::CallArgumentGroup => "call_argument_group",
             Self::CallArgument => "call_argument",
             Self::MemberSelection => "member_selection",
+            Self::DispatchOutcome => "dispatch_outcome",
+            Self::DispatchTarget => "dispatch_target",
+            Self::MemberFamily => "member_family",
+            Self::MemberFamilyEdge => "member_family_edge",
             Self::Occurrence => "occurrence",
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
             Self::ResolutionCandidate => "resolution_candidate",
+            Self::CandidateHop => "candidate_hop",
             Self::ReferenceEdge => "reference_edge",
             Self::QualifiedPath => "qualified_path",
             Self::PathSegment => "path_segment",
@@ -268,6 +278,10 @@ pub enum QueryStep {
     CallArgumentGroups,
     CallArguments,
     MemberSelection,
+    DispatchOutcome,
+    DispatchTargets,
+    MemberFamily,
+    FamilyEdges,
     OccurrencesOf(OccurrenceFilter),
     OccurrencesIn(OccurrenceFilter),
     OccurrenceTarget,
@@ -277,6 +291,7 @@ pub enum QueryStep {
     ReachingBinding(ReachingBindingOptions),
     BindingOccurrence,
     CandidatesOf(CandidateFilter),
+    CandidateHierarchy,
     CandidateTarget,
     EdgesOf(EdgeFilter),
     EdgesFrom(EdgeFilter),
@@ -750,6 +765,10 @@ impl QueryStep {
             Self::CallArgumentGroups => QueryStepOp::CallArgumentGroups,
             Self::CallArguments => QueryStepOp::CallArguments,
             Self::MemberSelection => QueryStepOp::MemberSelection,
+            Self::DispatchOutcome => QueryStepOp::DispatchOutcome,
+            Self::DispatchTargets => QueryStepOp::DispatchTargets,
+            Self::MemberFamily => QueryStepOp::MemberFamily,
+            Self::FamilyEdges => QueryStepOp::FamilyEdges,
             Self::OccurrencesOf(_) => QueryStepOp::OccurrencesOf,
             Self::OccurrencesIn(_) => QueryStepOp::OccurrencesIn,
             Self::OccurrenceTarget => QueryStepOp::OccurrenceTarget,
@@ -759,6 +778,7 @@ impl QueryStep {
             Self::ReachingBinding(_) => QueryStepOp::ReachingBinding,
             Self::BindingOccurrence => QueryStepOp::BindingOccurrence,
             Self::CandidatesOf(_) => QueryStepOp::CandidatesOf,
+            Self::CandidateHierarchy => QueryStepOp::CandidateHierarchy,
             Self::Generates => QueryStepOp::Generates,
             Self::GeneratedBy => QueryStepOp::GeneratedBy,
             Self::DeclarationStateOf(_) => QueryStepOp::DeclarationStateOf,
@@ -819,6 +839,10 @@ impl QueryStep {
             QueryStepOp::CallArgumentGroups => Some(Self::CallArgumentGroups),
             QueryStepOp::CallArguments => Some(Self::CallArguments),
             QueryStepOp::MemberSelection => Some(Self::MemberSelection),
+            QueryStepOp::DispatchOutcome => Some(Self::DispatchOutcome),
+            QueryStepOp::DispatchTargets => Some(Self::DispatchTargets),
+            QueryStepOp::MemberFamily => Some(Self::MemberFamily),
+            QueryStepOp::FamilyEdges => Some(Self::FamilyEdges),
             QueryStepOp::OccurrencesOf => Some(Self::OccurrencesOf(OccurrenceFilter::default())),
             QueryStepOp::OccurrencesIn => Some(Self::OccurrencesIn(OccurrenceFilter::default())),
             QueryStepOp::OccurrenceTarget => Some(Self::OccurrenceTarget),
@@ -830,6 +854,7 @@ impl QueryStep {
             }
             QueryStepOp::BindingOccurrence => Some(Self::BindingOccurrence),
             QueryStepOp::CandidatesOf => Some(Self::CandidatesOf(CandidateFilter::default())),
+            QueryStepOp::CandidateHierarchy => Some(Self::CandidateHierarchy),
             QueryStepOp::CandidateTarget => Some(Self::CandidateTarget),
             QueryStepOp::EdgesOf => Some(Self::EdgesOf(EdgeFilter::default())),
             QueryStepOp::EdgesFrom => Some(Self::EdgesFrom(EdgeFilter::default())),
@@ -894,6 +919,10 @@ impl QueryStep {
                 | QueryValueKind::CallArgumentGroup
                 | QueryValueKind::CallArgument
                 | QueryValueKind::MemberSelection
+                | QueryValueKind::DispatchOutcome
+                | QueryValueKind::DispatchTarget
+                | QueryValueKind::MemberFamily
+                | QueryValueKind::MemberFamilyEdge
                 | QueryValueKind::Occurrence
                 | QueryValueKind::LexicalScope
                 | QueryValueKind::Binding
@@ -962,6 +991,24 @@ impl QueryStep {
             (Self::MemberSelection, QueryValueKind::Occurrence) => {
                 Some(QueryValueKind::MemberSelection)
             }
+            (
+                Self::DispatchOutcome,
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::CallSite
+                | QueryValueKind::ReferenceSite
+                | QueryValueKind::Occurrence,
+            ) => Some(QueryValueKind::DispatchOutcome),
+            (
+                Self::DispatchTargets,
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::CallSite
+                | QueryValueKind::ReferenceSite
+                | QueryValueKind::Occurrence,
+            ) => Some(QueryValueKind::DispatchTarget),
+            (Self::MemberFamily, QueryValueKind::Declaration) => Some(QueryValueKind::MemberFamily),
+            (Self::FamilyEdges, QueryValueKind::Declaration) => {
+                Some(QueryValueKind::MemberFamilyEdge)
+            }
             (Self::OccurrencesOf(_), QueryValueKind::Declaration) => {
                 Some(QueryValueKind::Occurrence)
             }
@@ -988,6 +1035,9 @@ impl QueryStep {
             (Self::BindingOccurrence, QueryValueKind::Binding) => Some(QueryValueKind::Occurrence),
             (Self::CandidatesOf(_), QueryValueKind::Occurrence) => {
                 Some(QueryValueKind::ResolutionCandidate)
+            }
+            (Self::CandidateHierarchy, QueryValueKind::Occurrence) => {
+                Some(QueryValueKind::CandidateHop)
             }
             (Self::SegmentsOf(_), QueryValueKind::QualifiedPath) => {
                 Some(QueryValueKind::PathSegment)
@@ -1085,6 +1135,10 @@ pub(super) fn validate_query_steps(
             QueryStep::CallArgumentGroups => "call_shape",
             QueryStep::CallArguments => "call_argument_group",
             QueryStep::MemberSelection => "occurrence",
+            QueryStep::DispatchOutcome | QueryStep::DispatchTargets => {
+                "structural_match, call_site, reference_site, or occurrence"
+            }
+            QueryStep::MemberFamily | QueryStep::FamilyEdges => "declaration",
             QueryStep::OccurrencesOf(_) => "declaration",
             QueryStep::OccurrencesIn(_) => "structural_match or file",
             QueryStep::OccurrenceTarget => "occurrence",
@@ -1094,6 +1148,7 @@ pub(super) fn validate_query_steps(
             QueryStep::ReachingBinding(_) => "occurrence",
             QueryStep::BindingOccurrence => "binding",
             QueryStep::CandidatesOf(_) => "occurrence",
+            QueryStep::CandidateHierarchy => "occurrence",
             QueryStep::CandidateTarget => "resolution_candidate",
             QueryStep::EdgesOf(_) => "declaration",
             QueryStep::EdgesFrom(_) => "occurrence",

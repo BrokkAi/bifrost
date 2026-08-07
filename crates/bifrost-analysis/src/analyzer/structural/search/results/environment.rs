@@ -210,6 +210,62 @@ pub struct CodeQueryResolutionCandidate {
     /// string. `None` for candidates without a workspace declaration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical_member_id: Option<String>,
+    /// The exact hierarchy type the resolver found this member candidate on
+    /// (#1477). Absent when the recording seam is not a member lookup; absence
+    /// is unattributed, never "the receiver's own type".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<CodeQueryDeclaration>,
+    /// Hierarchy hops between the receiver's declared owner and `owner`. Zero
+    /// is a direct member; absent is unattributed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hierarchy_depth: Option<usize>,
+    /// The language-neutral dispatch bucket the find belongs to (#1477).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_tier: Option<&'static str>,
+    /// Whether the candidate accepts the call shape as far as the member seam
+    /// checked. `unknown` means no shape was checked, never "applicable".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applicability: Option<&'static str>,
+}
+
+/// One exact hierarchy hop on one member candidate's route (#1477).
+///
+/// One row is one edge the production resolver's own member walk took, so a
+/// candidate found at depth `n` contributes exactly `n` rows, numbered `0`
+/// through `n - 1`, contiguous, starting at the receiver's declared owner and
+/// terminating at the candidate's owner. A depth-zero (direct) candidate
+/// contributes no row, and a candidate the resolver recorded without member
+/// attribution contributes none either. Zero rows is therefore never a claim
+/// that no hierarchy was walked; the mandatory per-occurrence outcome is the
+/// `member_selection` summary's job, not this domain's.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryCandidateHop {
+    pub id: String,
+    /// The exact `id` of the `resolution_candidate` row this hop belongs to.
+    /// Both ids are derived by the same function, so string equality is the
+    /// join between the two domains.
+    pub candidate_id: String,
+    /// The AST identity of the *reference* occurrence the owning candidate was
+    /// considered for, which is what a capture over that token joins on.
+    pub ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    /// The reference occurrence's source range: a hop explains part of the
+    /// resolution of that position.
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    /// Zero-based position of this hop on its candidate's route.
+    pub hop: usize,
+    /// The kind of hierarchy edge, as the provider that recorded it stated it.
+    pub relation: &'static str,
+    /// The type the hop left. `None` when the workspace can no longer locate
+    /// the recorded unit, which is a stated rendering gap, not an absent hop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<CodeQueryDeclaration>,
+    /// The type the hop reached, under the same rule as `from`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<CodeQueryDeclaration>,
 }
 
 /// One canonical reference edge (#1479).

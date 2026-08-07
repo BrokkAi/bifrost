@@ -301,6 +301,62 @@ pub(super) fn candidate_expansions(
         .collect()
 }
 
+/// The exact hierarchy hops each traced member candidate of one reference
+/// occurrence was found through.
+///
+/// One row is one edge the resolver's own member walk took, so a candidate
+/// found at depth `n` contributes exactly `n` contiguous rows. A depth-zero
+/// candidate contributes none by construction, and a candidate the resolver
+/// recorded without member attribution contributes none because nothing about
+/// its route is known. Neither absence is a claim, and neither is converted
+/// into one here: the mandatory per-occurrence outcome row is
+/// `member_selection`'s, not this step's.
+pub(super) fn candidate_hierarchy_expansions(
+    analyzer: &dyn IAnalyzer,
+    environment_cache: &mut EnvironmentTraversalCache,
+    row: &OccurrenceRow,
+    cancellation: Option<&CancellationToken>,
+    row_exhausted: &mut bool,
+) -> Vec<PipelineExpansion> {
+    let Some(traced) = environment_cache.traced_occurrences_for(analyzer, &row.file, cancellation)
+    else {
+        *row_exhausted = true;
+        return Vec::new();
+    };
+    let Some(traced_row) = traced
+        .rows
+        .iter()
+        .find(|other| other.node == row.node && other.role == row.role)
+    else {
+        return Vec::new();
+    };
+    let Some(trace) = &traced_row.candidates else {
+        return Vec::new();
+    };
+    let occurrence = Arc::new(traced_row.clone());
+    trace
+        .candidates
+        .iter()
+        .enumerate()
+        .flat_map(|(ordinal, candidate)| {
+            candidate
+                .member
+                .as_deref()
+                .map(|member| member.route.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .map(move |hop| (ordinal, hop))
+        })
+        .map(|(ordinal, hop)| {
+            pipeline_expansion(PipelineValue::CandidateHop(Box::new(CandidateHopValue {
+                occurrence: Arc::clone(&occurrence),
+                ordinal,
+                hop: Arc::new(hop.clone()),
+            })))
+        })
+        .collect()
+}
+
 /// The mandatory member-selection summary for one occurrence.
 ///
 /// Exactly one row is always produced for the row the traced file can

@@ -17,7 +17,7 @@ use brokk_bifrost::policy::{
     PolicyRegistry, PolicyRegistryLimits, PolicyRun, PolicyRunCompletion, PolicySourceIdentity,
     TaintCatalogRegistry,
 };
-use brokk_bifrost::{IAnalyzer, Language, TypescriptAnalyzer};
+use brokk_bifrost::{IAnalyzer, JavaAnalyzer, Language, TypescriptAnalyzer};
 
 /// `render` is declared once and never read.
 const CORRECT_SOURCE: &str = "export function render(): number {\n  return 1;\n}\n";
@@ -87,11 +87,70 @@ fn evaluate(source: &str, analyzer: &dyn IAnalyzer, budget: &mut PolicyBudget) -
         .expect("relational assertion evaluation")
 }
 
+/// Evaluate against a full workspace snapshot, which the semantic row
+/// families (the #1477 M4 dispatch expansions) require.
+fn evaluate_with_workspace(
+    source: &str,
+    workspace: &brokk_bifrost::analyzer::WorkspaceAnalyzer,
+    budget: &mut PolicyBudget,
+) -> PolicyRun {
+    let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+        CatalogRegistryLimits::default(),
+    ));
+    let mut registry =
+        PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
+    registry
+        .register_policy_bytes(
+            PolicySourceIdentity::new("test:relational"),
+            source.as_bytes(),
+        )
+        .expect("valid relational assertion policy");
+    let policy = registry.policies().next().expect("one policy");
+    DefaultPolicyEvaluator::new()
+        .evaluate(
+            policy,
+            &PolicyEvaluationContext {
+                analyzer: workspace.analyzer(),
+                workspace: Some(workspace),
+                cancellation: None,
+                cvss_overlays: &[],
+                organizational_risk: &[],
+            },
+            budget,
+        )
+        .expect("relational assertion evaluation")
+}
+
+/// A Java workspace snapshot for the semantic row families.
+fn java_workspace(
+    source: &str,
+) -> (
+    crate::common::BuiltInlineTestProject,
+    brokk_bifrost::analyzer::WorkspaceAnalyzer,
+) {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("App.java", source)
+        .build();
+    let workspace = brokk_bifrost::analyzer::WorkspaceAnalyzer::build(
+        project.project_dyn(),
+        brokk_bifrost::AnalyzerConfig::default(),
+    );
+    (project, workspace)
+}
+
 fn typescript(source: &str) -> (crate::common::BuiltInlineTestProject, TypescriptAnalyzer) {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file("widget.ts", source)
         .build();
     let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    (project, analyzer)
+}
+
+fn java(source: &str) -> (crate::common::BuiltInlineTestProject, JavaAnalyzer) {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("App.java", source)
+        .build();
+    let analyzer = JavaAnalyzer::from_project(project.project().clone());
     (project, analyzer)
 }
 
@@ -266,6 +325,55 @@ fn member_selection_invariant_is_unreliable_on_a_truncated_binding() {
     assert!(run.findings().is_empty());
 }
 
+/// The #1477 hierarchy-route invariant: every traced member candidate's route
+/// is exactly as long as the hierarchy distance the resolver walked. The plan
+/// binds sites, expands them into hop rows through the production trace, and
+/// asserts the per-candidate hop count. This is also the executable proof that
+/// `candidate-hierarchy` is a usable relational expansion.
+const TWO_HOP_ROUTE: &str = r#"(policy
+  :id "test.relational.candidate-route-length"
+  :name "The inherited member is reached in exactly two hops"
+  :message "the resolver's hierarchy route must be exactly two hops long"
+  :severity error
+  :analysis (analysis
+    :type assertion
+    (bind :name site :query (rql (occurrences :role [member_position])))
+    (bind :name hop :from site :step candidate-hierarchy)
+    (join :left site :right hop :on ((ast_id ast_id)))
+    (group :name by-candidate :by (hop.candidate_id)
+      (aggregate :name hops :op count))
+    (assert :group by-candidate :value hops :cardinality (exactly 2))))"#;
+
+/// Clean: the candidate is found two supertypes up, so its route has exactly
+/// two hop rows.
+#[test]
+fn candidate_hierarchy_expansion_is_clean_on_the_two_hop_route() {
+    let (_project, analyzer) = java(
+        "class Root { void run() {} }\nclass Base extends Root { }\nclass Service extends Base { }\nclass Caller {\n    void call(Service service) { service.run(); }\n}\n",
+    );
+    let run = evaluate(TWO_HOP_ROUTE, &analyzer, &mut PolicyBudget::default());
+    assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+    assert!(run.findings().is_empty(), "{:?}", run.findings());
+}
+
+/// Finding: a direct member is reached in zero hops, so the only group that
+/// exists is the one-hop route of the *other* site, and the zero-hop candidate
+/// contributes no group at all. A one-hop fixture therefore violates.
+#[test]
+fn candidate_hierarchy_expansion_reports_a_route_of_the_wrong_length() {
+    let (_project, analyzer) = java(
+        "class Root { void run() {} }\nclass Service extends Root { }\nclass Caller {\n    void call(Service service) { service.run(); }\n}\n",
+    );
+    let run = evaluate(TWO_HOP_ROUTE, &analyzer, &mut PolicyBudget::default());
+    assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+    assert_eq!(run.findings().len(), 1, "{:?}", run.findings());
+    let PolicyFindingEvidence::Assertion { evidence } = run.findings()[0].evidence() else {
+        panic!("relational assertion policies produce assertion evidence");
+    };
+    assert_eq!(evidence.expectation(), "(exactly 2)");
+    assert_eq!(evidence.actual_count(), 1);
+}
+
 /// A truncated binding row set is never a verdict: the relational plan reports
 /// the run inconclusive instead of concluding over a proper subset.
 #[test]
@@ -292,5 +400,69 @@ fn a_truncated_relational_binding_is_inconclusive() {
     assert!(
         run.findings().is_empty(),
         "an incomplete row set never yields a verdict"
+    );
+}
+
+/// The #1477 M4 open-world honesty rule as an executable policy: every call
+/// site must dispatch to exactly one proven target. A closed monomorphic call
+/// satisfies it; an open interface receiver must not, because its arms stay
+/// `may_dispatch` inside a non-exhaustive set. This is also the executable
+/// proof that `dispatch-outcome` and `dispatch-targets` are usable relational
+/// expansions.
+const EXACTLY_ONE_PROVEN_DISPATCH: &str = r#"(policy
+  :id "test.relational.proven-dispatch"
+  :name "Every call has exactly one proven dispatch target"
+  :message "a call site must dispatch to exactly one proven target"
+  :severity error
+  :analysis (analysis
+    :type assertion
+    (bind :name site :query (rql (occurrences :role [member_position])))
+    (bind :name outcome :from site :step dispatch-outcome)
+    (bind :name target :from site :step dispatch-targets)
+    (join :left site :right outcome :on ((ast_id site_ast_id)))
+    (join :left site :right target :on ((ast_id site_ast_id)))
+    (group :name by-site :by (outcome.site_id)
+      (aggregate :name proven :op count
+                 :where ((target.dispatch eq proven_dispatch))))
+    (assert :group by-site :value proven :cardinality (exactly 1))))"#;
+
+/// Clean: a closed monomorphic call has one proven target in an exhaustive
+/// set, so the exact-set assertion holds.
+#[test]
+fn dispatch_expansions_are_clean_on_a_closed_monomorphic_call() {
+    let (_project, workspace) = java_workspace(
+        "public class App {\n  static int helper() { return 1; }\n  static int caller() { return helper(); }\n}\n",
+    );
+    let run = evaluate_with_workspace(
+        EXACTLY_ONE_PROVEN_DISPATCH,
+        &workspace,
+        &mut PolicyBudget::default(),
+    );
+    assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+    assert!(run.findings().is_empty(), "{:?}", run.findings());
+}
+
+/// Open-world dispatch never satisfies an exact-set assertion. The interface
+/// receiver's arm stays `may_dispatch`, so the proven count is zero and the
+/// site is reported instead of passing.
+#[test]
+fn open_world_dispatch_never_satisfies_the_exact_set_assertion() {
+    let (_project, workspace) = java_workspace(
+        "interface Shape { int area(); }\nclass Square implements Shape { public int area() { return 1; } }\nclass Circle implements Shape { public int area() { return 2; } }\npublic class App {\n  static int caller(Shape shape) { return shape.area(); }\n}\n",
+    );
+    let run = evaluate_with_workspace(
+        EXACTLY_ONE_PROVEN_DISPATCH,
+        &workspace,
+        &mut PolicyBudget::default(),
+    );
+    assert_eq!(run.findings().len(), 1, "{:?}", run.findings());
+    let PolicyFindingEvidence::Assertion { evidence } = run.findings()[0].evidence() else {
+        panic!("relational assertion policies produce assertion evidence");
+    };
+    assert_eq!(evidence.expectation(), "(exactly 1)");
+    assert_eq!(
+        evidence.actual_count(),
+        0,
+        "an open arm must never be counted as a proven dispatch"
     );
 }

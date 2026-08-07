@@ -386,6 +386,7 @@ macro_rules! query_step_ops {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuerySemanticFacet {
     Procedures,
+    Dispatch,
     ProgramPoints,
     ControlEdges,
     Typestate,
@@ -406,7 +407,7 @@ query_step_ops! {
     ValueFlow { label: "value_flow", signature: "procedure -> flow_endpoint", description: "Run one registered diagnostic-neutral value-flow plan for the exact procedure root.", semantic: [Procedures, ValueFlow] }
     Taint { label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint] }
     Witness { label: "witness", signature: "typestate_finding|flow_endpoint -> typestate_witness|flow_witness", description: "Project bounded retained evidence from each typestate finding or reached flow endpoint without rerunning analysis." }
-    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis|call_shape|call_argument_group|call_argument -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, or receiver analyses to their workspace files." }
+    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis|call_shape|call_argument_group|call_argument|dispatch_outcome|dispatch_target|member_family|member_family_edge -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, receiver analyses, dispatch rows, or method-family rows to their workspace files." }
     ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
     Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
@@ -430,6 +431,10 @@ query_step_ops! {
     CallArgumentGroups { label: "call_argument_groups", signature: "call_shape -> call_argument_group", description: "Project the ordered argument-list group rows of each call shape." }
     CallArguments { label: "call_arguments", signature: "call_argument_group -> call_argument", description: "Project the ordered argument rows of each argument-list group." }
     MemberSelection { label: "member_selection", signature: "occurrence -> member_selection", description: "Project the mandatory member-selection summary row for each reference occurrence, from the production resolver's own candidate trace." }
+    DispatchOutcome { label: "dispatch_outcome", signature: "structural_match|call_site|reference_site|occurrence -> dispatch_outcome", description: "Project the mandatory bounded-dispatch outcome row for each input site: the semantic outcome, the candidate coverage, and the retained target count. Exactly one row per input site, so an unknown, unsupported, over-budget, or cancelled dispatch is stated rather than silently empty.", semantic: [Procedures, Dispatch] }
+    DispatchTargets { label: "dispatch_targets", signature: "structural_match|call_site|reference_site|occurrence -> dispatch_target", description: "Project zero or more bounded dispatch target rows for each input site, one per retained dispatch candidate plus one per boundary arm that names a target. Each row keeps the oracle's own proof, completeness, and candidate coverage, so a proven target in an exhaustive set stays distinguishable from an open may-dispatch arm.", semantic: [Procedures, Dispatch] }
+    MemberFamily { label: "member_family", signature: "declaration -> member_family", description: "Project the mandatory canonical method-family outcome row for each member declaration: the family id when the analyzer proves the family, the typed reason when it cannot, the per-relation edge counts, and the coverage. Exactly one row per input declaration, so an unsupported language or an unprovable overload identity is stated rather than silently empty." }
+    FamilyEdges { label: "family_edges", signature: "declaration -> member_family_edge", description: "Project the typed method-family edges of each member declaration: the forward overrides/implements edges the analyzer proves, plus the bounded inversion of those same edges as overridden_by/implemented_by. Emitted only from a proven family, so an unproven or unsupported member yields no edge row and its outcome row says why." }
     OccurrencesOf { label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it." }
     OccurrencesIn { label: "occurrences_in", signature: "structural_match|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or file." }
     OccurrenceTarget { label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences." }
@@ -439,6 +444,7 @@ query_step_ops! {
     ReachingBinding { label: "reaching_binding", signature: "occurrence -> binding", description: "Return the binding of the occurrence's name that is in effect at its exact position." }
     BindingOccurrence { label: "binding_occurrence", signature: "binding -> occurrence", description: "Return the binder-class occurrence row of each binding's declaring token." }
     CandidatesOf { label: "candidates_of", signature: "occurrence -> resolution_candidate", description: "Return the candidates the resolver considered for each reference-class occurrence, with tier, outcome, and boundary." }
+    CandidateHierarchy { label: "candidate_hierarchy", signature: "occurrence -> candidate_hop", description: "Return the exact hierarchy hops each traced member candidate of a reference occurrence was found through. A depth-zero candidate contributes no hop, and a candidate the resolver recorded without member attribution contributes none either -- absence here is unattributed, never a claim that no hierarchy was walked; the mandatory outcome story is member_selection's." }
     CandidateTarget { label: "candidate_target", signature: "resolution_candidate -> declaration", description: "Project the workspace declarations of unit-backed resolution candidates." }
     EdgesOf { label: "edges_of", signature: "declaration -> reference_edge", description: "Return the canonical inverse reference edges of each declaration: every usage site the usage index enumerates, with kind, proof, usage kind, and owner relation." }
     EdgesFrom { label: "edges_from", signature: "occurrence -> reference_edge", description: "Return the canonical forward reference edges of each occurrence: the resolver's own resolved targets for that exact token, with kind, proof, usage kind, and owner relation." }
@@ -594,6 +600,10 @@ macro_rules! rql_forms {
                     | Self::CallArgumentGroups
                     | Self::CallArguments
                     | Self::MemberSelection
+                    | Self::DispatchOutcome
+                    | Self::DispatchTargets
+                    | Self::MemberFamily
+                    | Self::FamilyEdges
                     | Self::Occurrences
                     | Self::OccurrencesOf
                     | Self::OccurrencesIn
@@ -609,6 +619,7 @@ macro_rules! rql_forms {
                     | Self::ReachingBinding
                     | Self::BindingOccurrence
                     | Self::CandidatesOf
+                    | Self::CandidateHierarchy
                     | Self::GenerationSites
                     | Self::Exports
                     | Self::Generates
@@ -1006,6 +1017,38 @@ rql_forms! {
         description: (QueryStepOp::MemberSelection),
         step: MemberSelection,
     }
+    DispatchOutcome {
+        labels: ["dispatch-outcome", "dispatch_outcome"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(dispatch-outcome query)",
+        description: (QueryStepOp::DispatchOutcome),
+        step: DispatchOutcome,
+    }
+    DispatchTargets {
+        labels: ["dispatch-targets", "dispatch_targets"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(dispatch-targets query)",
+        description: (QueryStepOp::DispatchTargets),
+        step: DispatchTargets,
+    }
+    MemberFamily {
+        labels: ["member-family", "member_family"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(member-family query)",
+        description: (QueryStepOp::MemberFamily),
+        step: MemberFamily,
+    }
+    FamilyEdges {
+        labels: ["family-edges", "family_edges"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(family-edges query)",
+        description: (QueryStepOp::FamilyEdges),
+        step: FamilyEdges,
+    }
     Occurrences {
         labels: ["occurrences", "occurrence"],
         class: Wrapper,
@@ -1121,6 +1164,14 @@ rql_forms! {
         signature: "(candidates-of [:tier ...] [:outcome ...] [:boundary ...] query)",
         description: (QueryStepOp::CandidatesOf),
         step: CandidatesOf,
+    }
+    CandidateHierarchy {
+        labels: ["candidate-hierarchy", "candidate_hierarchy"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(candidate-hierarchy query)",
+        description: (QueryStepOp::CandidateHierarchy),
+        step: CandidateHierarchy,
     }
     CandidateTarget {
         labels: ["candidate-target", "candidate_target"],

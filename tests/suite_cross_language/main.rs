@@ -13,12 +13,17 @@ pub mod value_flow_conformance;
 #[path = "../common/value_flow_scenarios.rs"]
 pub mod value_flow_scenarios;
 
+mod code_query_candidate_hierarchy;
 mod code_query_cpp_receiver;
+mod code_query_dispatch_rows;
 mod code_query_docs;
 mod code_query_edge_conformance;
 mod code_query_lexical_environment;
 mod code_query_materialization;
 mod code_query_member_dispatch;
+mod code_query_member_dispatch_rust;
+mod code_query_member_dispatch_ts_python;
+mod code_query_member_family;
 mod code_query_occurrences;
 mod code_query_pipelines;
 mod code_query_public_api;

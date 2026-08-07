@@ -734,6 +734,11 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         RqlForm::ReceiverOutcome
         | RqlForm::ReceiverEvidence
         | RqlForm::MemberSelection
+        | RqlForm::CandidateHierarchy
+        | RqlForm::DispatchOutcome
+        | RqlForm::DispatchTargets
+        | RqlForm::MemberFamily
+        | RqlForm::FamilyEdges
         | RqlForm::CallShape
         | RqlForm::CallArgumentGroups
         | RqlForm::CallArguments => {
@@ -746,6 +751,11 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 RqlForm::CallArgumentGroups => "call_argument_groups",
                 RqlForm::CallArguments => "call_arguments",
                 RqlForm::MemberSelection => "member_selection",
+                RqlForm::CandidateHierarchy => "candidate_hierarchy",
+                RqlForm::DispatchOutcome => "dispatch_outcome",
+                RqlForm::DispatchTargets => "dispatch_targets",
+                RqlForm::MemberFamily => "member_family",
+                RqlForm::FamilyEdges => "family_edges",
                 _ => unreachable!("receiver row wrapper filtered above"),
             };
             query
@@ -1515,6 +1525,11 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::ReachingBinding
         | RqlForm::BindingOccurrence
         | RqlForm::CandidatesOf
+        | RqlForm::CandidateHierarchy
+        | RqlForm::DispatchOutcome
+        | RqlForm::DispatchTargets
+        | RqlForm::MemberFamily
+        | RqlForm::FamilyEdges
         | RqlForm::CandidateTarget
         | RqlForm::GenerationSites
         | RqlForm::Exports

@@ -85,6 +85,147 @@ labelled_enum! {
         WrongDeclarationSpace => "wrong_declaration_space",
         AmbiguousPeer => "ambiguous_peer",
         BoundaryBlocked => "boundary_blocked",
+        HiddenByCloserMember => "hidden_by_closer_member",
+        CallableApplicabilityDeferred => "callable_applicability_deferred",
+    }
+}
+
+labelled_enum! {
+    /// The language-neutral ordering bucket a member candidate was found in
+    /// (#1477). Each language adapter maps its own precedence rules into these
+    /// buckets; the bucket never replaces the language's real precedence, it
+    /// only makes buckets comparable across languages in one policy.
+    ///
+    /// Declaration order is precedence order, strongest first, and `Ord` is
+    /// derived from it, exactly as for [`PrecedenceTier`].
+    MemberDispatchTier, ALL_MEMBER_DISPATCH_TIERS {
+        InherentOrDirect => "inherent_or_direct",
+        InheritedOrPromoted => "inherited_or_promoted",
+        TraitOrInterface => "trait_or_interface",
+        Extension => "extension",
+        StaticOrCompanion => "static_or_companion",
+        DynamicOrOpen => "dynamic_or_open",
+    }
+}
+
+labelled_enum! {
+    /// The kind of one exact hierarchy edge on one candidate's route (#1477).
+    ///
+    /// `Supertype` is the undifferentiated edge: the hierarchy provider that
+    /// recorded it does not distinguish extension from implementation, and the
+    /// row must not claim a distinction the provider never made.
+    HierarchyRelation, ALL_HIERARCHY_RELATIONS {
+        Extends => "extends",
+        Implements => "implements",
+        Supertype => "supertype",
+        Embedded => "embedded",
+        TraitImpl => "trait_impl",
+    }
+}
+
+labelled_enum! {
+    /// One typed edge of a canonical method family (#1477 M4).
+    ///
+    /// `Overrides` and `Implements` are the only edges an analyzer proves
+    /// directly: a member redefines a superclass member, or supplies the body
+    /// for an interface member. `OverriddenBy` and `ImplementedBy` are their
+    /// inverses and are only ever derived by bounded inversion over indexed
+    /// forward edges -- never resolved on their own -- so the two directions
+    /// cannot disagree.
+    MethodFamilyRelation, ALL_METHOD_FAMILY_RELATIONS {
+        Overrides => "overrides",
+        Implements => "implements",
+        OverriddenBy => "overridden_by",
+        ImplementedBy => "implemented_by",
+    }
+}
+
+impl MethodFamilyRelation {
+    /// Whether this relation is one an analyzer proves directly from the
+    /// member's own declaration and its owner's hierarchy.
+    pub const fn is_forward(self) -> bool {
+        matches!(self, Self::Overrides | Self::Implements)
+    }
+
+    /// The relation that names the same edge from the other end.
+    pub const fn inverse(self) -> Self {
+        match self {
+            Self::Overrides => Self::OverriddenBy,
+            Self::Implements => Self::ImplementedBy,
+            Self::OverriddenBy => Self::Overrides,
+            Self::ImplementedBy => Self::Implements,
+        }
+    }
+}
+
+labelled_enum! {
+    /// The per-member result of asking for a method family (#1477 M4).
+    ///
+    /// `Proven` and `NoFamily` are both complete answers: the first means the
+    /// analyzer enumerated the member's family roots, the second means the
+    /// member is structurally outside any family (a constructor, a static
+    /// method, a private method, or a declaration that is not a method at
+    /// all). `Incomplete` and `Unsupported` are the honest failures, and
+    /// neither ever carries a family id.
+    MemberFamilyOutcome, ALL_MEMBER_FAMILY_OUTCOMES {
+        Proven => "proven",
+        NoFamily => "no_family",
+        Incomplete => "incomplete",
+        Unsupported => "unsupported",
+    }
+}
+
+labelled_enum! {
+    /// Why a method-family answer is not `proven` (#1477 M4).
+    ///
+    /// The first group are proven exclusions that accompany `no_family`: the
+    /// language itself says the member participates in no override family, so
+    /// zero edges is the complete answer. The second group accompanies
+    /// `incomplete` or `unsupported`: the analyzer looked for a fact and did
+    /// not find it. No variant is ever reported beside an edge row -- a
+    /// not-proven family emits no edges rather than a guessed one.
+    MemberFamilyReason, ALL_MEMBER_FAMILY_REASONS {
+        NotAMethod => "not_a_method",
+        ConstructorExcluded => "constructor_excluded",
+        StaticMemberExcluded => "static_member_excluded",
+        PrivateMemberExcluded => "private_member_excluded",
+        UnsupportedLanguage => "unsupported_language",
+        OwnerUnknown => "owner_unknown",
+        ModifiersUnrecorded => "modifiers_unrecorded",
+        OwnerKindUnrecorded => "owner_kind_unrecorded",
+        OverloadIdentityUnproven => "overload_identity_unproven",
+        HierarchyTruncated => "hierarchy_truncated",
+        FamilyRootNotCanonical => "family_root_not_canonical",
+    }
+}
+
+impl MemberFamilyReason {
+    /// Whether this reason states a proven exclusion rather than missing
+    /// evidence. A proven exclusion is a complete answer with zero edges; the
+    /// rest are honest failures.
+    pub const fn is_proven_exclusion(self) -> bool {
+        matches!(
+            self,
+            Self::NotAMethod
+                | Self::ConstructorExcluded
+                | Self::StaticMemberExcluded
+                | Self::PrivateMemberExcluded
+        )
+    }
+}
+
+labelled_enum! {
+    /// How strong an analyzer's member-identity evidence is when it matches a
+    /// member against an ancestor's members (#1477 M4).
+    ///
+    /// This is a measured property of a language adapter, not an aspiration.
+    /// `Unsupported` is the default for every language that states nothing,
+    /// which is what keeps the family rollout per-language honest.
+    MemberFamilyCapability, ALL_MEMBER_FAMILY_CAPABILITIES {
+        Unsupported => "unsupported",
+        NameAndArity => "name_and_arity",
+        ParameterTypeSpellings => "parameter_type_spellings",
+        ErasedParameterTypes => "erased_parameter_types",
     }
 }
 
@@ -383,12 +524,39 @@ mod tests {
         check!(ALL_BINDING_KINDS, BindingKind);
         check!(ALL_PRECEDENCE_TIERS, PrecedenceTier);
         check!(ALL_REJECTION_REASONS, RejectionReason);
+        check!(ALL_MEMBER_DISPATCH_TIERS, MemberDispatchTier);
+        check!(ALL_HIERARCHY_RELATIONS, HierarchyRelation);
         check!(ALL_BOUNDARY_STATUSES, BoundaryStatus);
         check!(ALL_DECLARED_VISIBILITIES, DeclaredVisibility);
         check!(ALL_ENVIRONMENT_AXES, EnvironmentAxis);
+        check!(ALL_METHOD_FAMILY_RELATIONS, MethodFamilyRelation);
+        check!(ALL_MEMBER_FAMILY_OUTCOMES, MemberFamilyOutcome);
+        check!(ALL_MEMBER_FAMILY_REASONS, MemberFamilyReason);
+        check!(ALL_MEMBER_FAMILY_CAPABILITIES, MemberFamilyCapability);
 
         assert!(PrecedenceTier::from_label("not_a_tier").is_none());
         assert!(EnvironmentAxis::from_label("not_an_axis").is_none());
+    }
+
+    /// A family edge names the same pair from either end, so inversion must be
+    /// an involution over forward and inverse relations alike.
+    #[test]
+    fn family_relations_invert_as_an_involution() {
+        for &relation in ALL_METHOD_FAMILY_RELATIONS {
+            assert_eq!(relation.inverse().inverse(), relation);
+            assert_ne!(relation.inverse(), relation);
+            assert_eq!(relation.is_forward(), !relation.inverse().is_forward());
+        }
+        assert!(MethodFamilyRelation::Overrides.is_forward());
+        assert!(MethodFamilyRelation::Implements.is_forward());
+        assert_eq!(
+            MethodFamilyRelation::Overrides.inverse(),
+            MethodFamilyRelation::OverriddenBy
+        );
+        assert_eq!(
+            MethodFamilyRelation::Implements.inverse(),
+            MethodFamilyRelation::ImplementedBy
+        );
     }
 
     /// Precedence is a comparison, not a table: the derived `Ord` must follow
@@ -406,6 +574,16 @@ mod tests {
         assert_eq!(
             ALL_PRECEDENCE_TIERS.last(),
             Some(&PrecedenceTier::NameOnlyFallback)
+        );
+
+        let mut dispatch = ALL_MEMBER_DISPATCH_TIERS.to_vec();
+        dispatch.sort();
+        assert_eq!(dispatch, ALL_MEMBER_DISPATCH_TIERS);
+        assert!(MemberDispatchTier::InherentOrDirect < MemberDispatchTier::InheritedOrPromoted);
+        assert!(MemberDispatchTier::Extension < MemberDispatchTier::StaticOrCompanion);
+        assert_eq!(
+            ALL_MEMBER_DISPATCH_TIERS.last(),
+            Some(&MemberDispatchTier::DynamicOrOpen)
         );
     }
 

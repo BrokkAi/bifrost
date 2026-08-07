@@ -2,6 +2,7 @@ use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segm
 use brokk_bifrost_core::analyzer::model::{CallableArity, SignatureMetadata};
 use brokk_bifrost_core::analyzer::model::{DeclarationInfo, DeclarationKind};
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
@@ -282,7 +283,19 @@ pub fn visit_class_like(
             Some(top_level.clone()),
         );
         parsed.set_raw_supertypes(code_unit.clone(), raw_supertypes);
-        parsed.add_signature(code_unit.clone(), signature);
+        // The declaration node's own kind is what separates an interface from a
+        // class; recording it here is what lets a family edge state `implements`
+        // rather than `overrides` without re-reading the owner's source. A Java
+        // annotation type is an interface -- `@interface Marker` declares
+        // `interface Marker extends java.lang.annotation.Annotation` -- so a
+        // class that names one in its `implements` clause implements it.
+        parsed.add_signature_with_metadata(
+            code_unit.clone(),
+            SignatureMetadata::new(signature, Vec::new()).with_class_like_interface(matches!(
+                node.kind(),
+                "interface_declaration" | "annotation_type_declaration"
+            )),
+        );
 
         if node.kind() == "record_declaration" {
             visit_record_components(
@@ -404,6 +417,7 @@ fn visit_callable(
         Some(parent.clone()),
         Some(top_level.clone()),
     );
+    let modifiers = java_callable_modifiers(node);
     parsed.add_signature_with_metadata(
         code_unit.clone(),
         SignatureMetadata::with_parameter_labels(callable_sig, parameter_labels)
@@ -411,6 +425,16 @@ fn visit_callable(
                 node.child_by_field_name("parameters")
                     .map(callable_arity_for_parameters)
                     .unwrap_or_else(|| CallableArity::exact(0)),
+            )
+            .with_callable_modifiers(
+                modifiers.is_static,
+                node.kind() == "constructor_declaration",
+                modifiers.visibility,
+            )
+            .with_callable_parameter_types(
+                node.child_by_field_name("parameters")
+                    .map(|parameters| canonical_parameter_type_texts(parameters, source))
+                    .unwrap_or_default(),
             ),
     );
 
@@ -479,7 +503,9 @@ fn visit_compact_constructor(
             callable_sig,
             parameter_labels(parameters, source),
         )
-        .with_callable_arity(callable_arity_for_parameters(parameters)),
+        .with_callable_arity(callable_arity_for_parameters(parameters))
+        .with_callable_modifiers(false, true, java_callable_modifiers(node).visibility)
+        .with_callable_parameter_types(canonical_parameter_type_texts(parameters, source)),
     );
 
     if let Some(body) = node.child_by_field_name("body") {
@@ -1032,6 +1058,20 @@ fn callable_signature(node: Node<'_>, source: &str) -> String {
 }
 
 fn canonical_parameters_signature(parameters: Node<'_>, source: &str) -> String {
+    format!(
+        "({})",
+        canonical_parameter_type_texts(parameters, source).join(", ")
+    )
+}
+
+/// The declared type of each parameter, in order, read from the parameter's own
+/// `type` node (plus its array dimensions or varargs marker).
+///
+/// This is the strongest per-parameter fact the Java declaration walk holds: a
+/// source spelling, not a resolved or erased type. It is recorded so that
+/// consumers can discriminate overloads structurally instead of splitting a
+/// rendered signature string.
+fn canonical_parameter_type_texts(parameters: Node<'_>, source: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut cursor = parameters.walk();
     for child in parameters.named_children(&mut cursor) {
@@ -1070,7 +1110,43 @@ fn canonical_parameters_signature(parameters: Node<'_>, source: &str) -> String 
         }
     }
 
-    format!("({})", parts.join(", "))
+    parts
+}
+
+/// The modifier facts a Java callable declares, read from its `modifiers`
+/// node rather than from its rendered header text.
+struct JavaCallableModifiers {
+    is_static: bool,
+    visibility: DeclaredVisibility,
+}
+
+fn java_callable_modifiers(node: Node<'_>) -> JavaCallableModifiers {
+    // Java's default when no access modifier is written is package-private.
+    // Interface members are implicitly public, but that is an inheritance rule
+    // the consumer applies from the owner's kind; the declaration itself still
+    // states nothing here, and inventing `Public` would be a claim the source
+    // never made.
+    let mut modifiers = JavaCallableModifiers {
+        is_static: false,
+        visibility: DeclaredVisibility::PackagePrivate,
+    };
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "modifiers" {
+            continue;
+        }
+        let mut inner = child.walk();
+        for modifier in child.children(&mut inner) {
+            match modifier.kind() {
+                "static" => modifiers.is_static = true,
+                "public" => modifiers.visibility = DeclaredVisibility::Public,
+                "protected" => modifiers.visibility = DeclaredVisibility::Protected,
+                "private" => modifiers.visibility = DeclaredVisibility::Private,
+                _ => {}
+            }
+        }
+    }
+    modifiers
 }
 
 fn parameter_labels(parameters: Node<'_>, source: &str) -> Vec<String> {
