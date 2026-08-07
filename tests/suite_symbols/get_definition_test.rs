@@ -15958,8 +15958,14 @@ public class RegExpInspectionConfigurationCellRenderer extends ColoredListCellRe
     );
 }
 
+/// The parameterless `repaint()` cannot bind the five-parameter local override,
+/// and `ExternalBaseList` is outside the indexed workspace, so the accepting
+/// declaration is on the far side of that boundary. The case pinned
+/// `no_definition` until #1755 taught the arity refusal to say which of the two
+/// it is; the load-bearing half -- never binding the wrong-arity override -- is
+/// unchanged.
 #[test]
-fn java_unqualified_inherited_method_call_with_only_external_base_match_returns_no_definition() {
+fn java_unqualified_inherited_method_call_with_only_external_base_match_reports_the_boundary() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
             "pkg/JBList.java",
@@ -15991,7 +15997,12 @@ public class JBList extends ExternalBaseList {
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
+        "the five-parameter override must never be bound: {value}"
+    );
 }
 
 #[test]
@@ -32482,5 +32493,278 @@ fn rust_focus_never_resolves_bindings_to_unrelated_members_issue_644() {
     assert!(
         defs.iter().any(|name| name == "Node"),
         "issue #644: `Self` must resolve to the enclosing type Node, got {defs:?} ({value})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1754: JLS 6.4.2 obscuring / 6.5.2 ambiguous names on the forward
+// occurrence surface. A simple name in an expression context denotes the
+// variable whenever one is in scope; the same-named type wins only in a type
+// context.
+// ---------------------------------------------------------------------------
+
+const JAVA_OBSCURING_WIDGET: &str = r#"package fixture;
+
+public class Widget {
+    public static String type(Class<?> c) {
+        return c.getName();
+    }
+}
+"#;
+
+const JAVA_OBSCURING_FACTORY: &str = r#"package fixture;
+
+public class Factory {
+    static final String Widget = fixture.Widget.type(Widget.class);
+
+    String describe() {
+        return "L" + Widget + ";";
+    }
+}
+"#;
+
+fn java_obscuring_project() -> crate::common::BuiltInlineTestProject {
+    InlineTestProject::with_language(Language::Java)
+        .file("src/main/java/fixture/Widget.java", JAVA_OBSCURING_WIDGET)
+        .file("src/main/java/fixture/Factory.java", JAVA_OBSCURING_FACTORY)
+        .build()
+}
+
+#[test]
+fn java_value_position_bare_name_resolves_the_obscuring_field_not_the_type() {
+    let project = java_obscuring_project();
+    let concatenation = JAVA_OBSCURING_FACTORY
+        .find("+ Widget +")
+        .expect("string concatenation operand")
+        + "+ ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "src/main/java/fixture/Factory.java",
+            JAVA_OBSCURING_FACTORY,
+            concatenation,
+        ),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "fixture.Factory.Widget",
+        "the concatenation operand reads the field, not the same-named class: {value}"
+    );
+}
+
+#[test]
+fn java_class_literal_keeps_naming_the_type_an_enclosing_field_obscures() {
+    let project = java_obscuring_project();
+    let literal = JAVA_OBSCURING_FACTORY
+        .find("Widget.class")
+        .expect("class literal");
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "src/main/java/fixture/Factory.java",
+            JAVA_OBSCURING_FACTORY,
+            literal,
+        ),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "fixture.Widget",
+        "`X.class` qualifies a type, so obscuring does not apply: {value}"
+    );
+}
+
+#[test]
+fn java_type_positions_keep_naming_the_type_an_enclosing_field_obscures() {
+    let source = r#"package fixture;
+
+import java.util.List;
+
+public class Holder extends Widget {
+    static final String Widget = "obscured";
+
+    List<Widget> items;
+
+    Widget make(Widget seed) {
+        Object cast = (Widget) seed;
+        return new Widget();
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/main/java/fixture/Widget.java", JAVA_OBSCURING_WIDGET)
+        .file("src/main/java/fixture/Holder.java", source)
+        .build();
+    for (label, needle) in [
+        ("superclass", "extends Widget"),
+        ("generic argument", "List<Widget>"),
+        ("declared return type", "Widget make("),
+        ("parameter type", "Widget seed"),
+        ("cast", "(Widget) seed"),
+        ("object creation", "new Widget()"),
+    ] {
+        let at = source.find(needle).expect("type position")
+            + needle.find("Widget").expect("type name in needle");
+        let value = lookup(
+            project.root(),
+            &location_reference("src/main/java/fixture/Holder.java", source, at),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{label}: {value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "fixture.Widget",
+            "{label} is a type context, so the same-named field does not obscure it: {value}"
+        );
+    }
+}
+
+#[test]
+fn java_annotation_name_keeps_naming_the_type_an_enclosing_field_obscures() {
+    let marker = "package fixture;\n\npublic @interface Marker {\n}\n";
+    let source = r#"package fixture;
+
+public class Annotated {
+    static final String Marker = "obscured";
+
+    @Marker
+    void run() {
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/main/java/fixture/Marker.java", marker)
+        .file("src/main/java/fixture/Annotated.java", source)
+        .build();
+    let at = source.find("@Marker").expect("annotation") + "@".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/main/java/fixture/Annotated.java", source, at),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "fixture.Marker",
+        "an annotation name is a type context: {value}"
+    );
+}
+
+#[test]
+fn java_enum_constant_obscures_a_same_package_class_of_that_name() {
+    let placeholder = "package fixture;\n\npublic class UnknownRecordPlaceholder {\n}\n";
+    let source = r#"package fixture;
+
+public enum RecordTypes {
+    UnknownRecordPlaceholder;
+
+    static RecordTypes forTypeID(RecordTypes rt) {
+        return (rt != null) ? rt : UnknownRecordPlaceholder;
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/main/java/fixture/UnknownRecordPlaceholder.java",
+            placeholder,
+        )
+        .file("src/main/java/fixture/RecordTypes.java", source)
+        .build();
+    let at = source
+        .rfind("UnknownRecordPlaceholder")
+        .expect("conditional operand");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/main/java/fixture/RecordTypes.java", source, at),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "fixture.RecordTypes.UnknownRecordPlaceholder",
+        "the enum constant obscures the same-package class: {value}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1755: a forward occurrence must not bind a call to an overload whose
+// arity cannot accept the argument list.
+// ---------------------------------------------------------------------------
+
+const JAVA_ARITY_APP: &str = r#"package fixture;
+
+import external.framework.Application;
+
+public class App extends Application {
+    @Override
+    public void run(int count, String phase) {
+    }
+
+    public static void main(String[] args) {
+        new App().run(args);
+    }
+}
+"#;
+
+#[test]
+fn java_call_behind_an_unindexed_superclass_does_not_bind_a_wrong_arity_overload() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/main/java/fixture/App.java", JAVA_ARITY_APP)
+        .build();
+    let at = JAVA_ARITY_APP.find("run(args)").expect("one-argument call");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/main/java/fixture/App.java", JAVA_ARITY_APP, at),
+    );
+    let result = &value["results"][0];
+    assert_eq!(
+        result["status"], "unresolvable_import_boundary",
+        "the only indexed `run` takes two parameters and the superclass is external: {value}"
+    );
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
+        "a wrong-arity overload must never be bound: {value}"
+    );
+}
+
+#[test]
+fn java_call_resolves_the_accepting_overload_on_an_indexed_superclass() {
+    let base = r#"package fixture;
+
+public abstract class Base {
+    public final void run(String[] args) {
+    }
+
+    public abstract void run(int count, String phase);
+}
+"#;
+    let app = r#"package fixture;
+
+public class App extends Base {
+    @Override
+    public void run(int count, String phase) {
+    }
+
+    public static void main(String[] args) {
+        new App().run(args);
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/main/java/fixture/Base.java", base)
+        .file("src/main/java/fixture/App.java", app)
+        .build();
+    let at = app.find("run(args)").expect("one-argument call");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/main/java/fixture/App.java", app, at),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "fixture.Base.run",
+        "the one-argument call binds the inherited `run(String[])`: {value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["signature"], "(String[])",
+        "{value}"
     );
 }

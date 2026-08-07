@@ -866,13 +866,6 @@ pub(crate) struct PreparedQueryCode {
     typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
 }
 
-impl PreparedQueryCode {
-    #[cfg(test)]
-    pub(crate) const fn workspace_generation(&self) -> u64 {
-        self.workspace_generation
-    }
-}
-
 pub(crate) struct PreparedRunPolicy {
     snapshot: WorkspaceQueryScope,
     root: PathBuf,
@@ -880,20 +873,11 @@ pub(crate) struct PreparedRunPolicy {
     options: PolicyEvaluationOptions,
     selection_elapsed: Duration,
     snapshot_elapsed: Duration,
-    #[cfg(test)]
-    workspace_generation: u64,
 }
 
 pub(crate) enum RunPolicyPreparation {
     Ready(PreparedRunPolicy),
     Deadline(RunPolicyToolResult),
-}
-
-impl PreparedRunPolicy {
-    #[cfg(test)]
-    pub(crate) const fn workspace_generation(&self) -> u64 {
-        self.workspace_generation
-    }
 }
 
 impl WorkspaceQueryScope {
@@ -3557,8 +3541,6 @@ impl SearchToolsService {
                 options,
                 selection_elapsed,
                 snapshot_elapsed: snapshot_started.elapsed(),
-                #[cfg(test)]
-                workspace_generation,
             }));
         }
     }
