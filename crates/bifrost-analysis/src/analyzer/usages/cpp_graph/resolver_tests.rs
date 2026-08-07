@@ -454,6 +454,7 @@ ABSL_NAMESPACE_END
                     && unit.source() == &definition
             })
             .expect("definition global field");
+        analyzer.reset_full_hydration_count_for_test();
         let (internal, inspected_peers) =
             with_cpp_global_field_linkage_peer_inspection_counter_for_test(|| {
                 cpp_global_field_has_internal_linkage(
@@ -469,6 +470,11 @@ ABSL_NAMESPACE_END
         assert_eq!(
             inspected_peers, 1,
             "exact-fqn peer lookup should inspect only the matching extern peer, not unrelated globals from the rest of the workspace"
+        );
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            0,
+            "persisted field linkage must avoid preparing source syntax during global-field resolution"
         );
     }
 
@@ -669,7 +675,7 @@ ABSL_NAMESPACE_END
     }
 
     #[test]
-    fn visible_identifier_index_reuses_internal_linkage_classification_across_roots() {
+    fn visible_identifier_index_skips_linkage_for_reachable_field_sources() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let left = ProjectFile::new(root.clone(), "left.cpp");
@@ -702,8 +708,8 @@ ABSL_NAMESPACE_END
             });
 
         assert_eq!(
-            classification_count, 2,
-            "one batch should classify each repeated global field once even when several roots share it"
+            classification_count, 0,
+            "a field from a reachable source does not need linkage classification"
         );
         // issue_1184 exercises the authoritative internal-linkage/root-isolation behavior.
         // This fixture only guards that sharing the cache across roots preserves the buckets.
@@ -1555,6 +1561,98 @@ ABSL_NAMESPACE_END
             visibility.include_activation_build_count_for_test(),
             0,
             "zero-donor targets must not inspect the include graph"
+        );
+    }
+
+    #[test]
+    fn unconditional_include_reachability_is_reused_across_visibility_indexes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let bridge = ProjectFile::new(root.clone(), "bridge.h");
+        let donor = ProjectFile::new(root.clone(), "donor.h");
+        consumer
+            .write("#include \"bridge.h\"\nint consume() { return target(); }\n")
+            .expect("write consumer");
+        bridge
+            .write("#include \"donor.h\"\n")
+            .expect("write bridge");
+        donor.write("int target();\n").expect("write donor");
+
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let roots = HashSet::from_iter([consumer.clone()]);
+        let first =
+            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
+        let prepared = analyzer
+            .prepared_syntax(&consumer)
+            .expect("prepared consumer");
+        assert!(
+            first
+                .include_activation_for_source(&analyzer, &consumer, prepared.as_ref(), &donor)
+                .is_some(),
+            "the direct include must reach the donor through the bridge"
+        );
+
+        let second =
+            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
+        assert!(
+            second
+                .include_activation_for_source(&analyzer, &consumer, prepared.as_ref(), &donor)
+                .is_some(),
+            "the shared analyzer cache must preserve the include activation"
+        );
+        assert_eq!(
+            analyzer.unconditional_include_reachability_cache_len_for_test(),
+            1,
+            "separate visibility indexes must reuse one reachability result"
+        );
+    }
+
+    #[test]
+    fn unconditional_include_reachability_keeps_c_and_cpp_contexts_separate() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let c_consumer = ProjectFile::new(root.clone(), "consumer.c");
+        let cpp_consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let bridge = ProjectFile::new(root.clone(), "bridge.h");
+        let donor = ProjectFile::new(root.clone(), "donor.h");
+        c_consumer
+            .write("#include \"bridge.h\"\nint consume_c() { return 0; }\n")
+            .expect("write C consumer");
+        cpp_consumer
+            .write("#include \"bridge.h\"\nint consume_cpp() { return target(); }\n")
+            .expect("write C++ consumer");
+        bridge
+            .write("#ifdef __cplusplus\n#include \"donor.h\"\n#endif\n")
+            .expect("write bridge");
+        donor.write("int target();\n").expect("write donor");
+
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        for (consumer, reaches) in [(c_consumer, false), (cpp_consumer, true)] {
+            let roots = HashSet::from_iter([consumer.clone()]);
+            let visibility =
+                VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
+            let prepared = analyzer
+                .prepared_syntax(&consumer)
+                .expect("prepared consumer");
+            assert_eq!(
+                visibility
+                    .include_activation_for_source(&analyzer, &consumer, prepared.as_ref(), &donor)
+                    .is_some(),
+                reaches,
+                "the include closure must respect the reference language"
+            );
+        }
+        assert_eq!(
+            analyzer.unconditional_include_reachability_cache_len_for_test(),
+            2,
+            "the cache must not reuse a C result for a C++ reference"
         );
     }
 

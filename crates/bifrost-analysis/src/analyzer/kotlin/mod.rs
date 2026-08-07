@@ -272,6 +272,14 @@ impl KotlinAnalyzer {
         self.inner.signature_metadata_limited(code_unit, limit)
     }
 
+    pub(crate) fn signatures_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<String> {
+        self.inner.signatures_limited(code_unit, limit)
+    }
+
     pub(crate) fn ranges_limited(
         &self,
         code_unit: &CodeUnit,
@@ -770,6 +778,16 @@ impl LanguageSupport for KotlinSupport {
     ) -> Option<LimitedQueryRows<SignatureMetadata>> {
         resolve_analyzer::<KotlinAnalyzer>(analyzer)
             .map(|kotlin| kotlin.signature_metadata_limited(unit, limit))
+    }
+
+    fn signatures_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<String>> {
+        resolve_analyzer::<KotlinAnalyzer>(analyzer)
+            .map(|kotlin| kotlin.signatures_limited(unit, limit))
     }
 
     fn declaration_ranges_limited(

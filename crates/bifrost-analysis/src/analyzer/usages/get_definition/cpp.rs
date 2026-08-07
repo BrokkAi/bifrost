@@ -7012,9 +7012,10 @@ fn cpp_alias_target_texts<'a>(
 ) -> impl Iterator<Item = String> + 'a {
     let mut signatures: Vec<String> = unit.signature().map(str::to_string).into_iter().collect();
     signatures.extend(analyzer.signatures(unit));
-    signatures.extend(analyzer.get_source(unit, false));
+    let source = std::iter::once_with(move || analyzer.get_source(unit, false)).flatten();
     signatures
         .into_iter()
+        .chain(source)
         .filter_map(|signature| cpp_alias_target_text(&signature))
 }
 

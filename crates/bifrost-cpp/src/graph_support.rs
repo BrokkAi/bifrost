@@ -28,7 +28,7 @@ use crate::compile_context::CppCompileContext;
 use crate::graph::CppWorkspaceSource;
 use crate::imports::IncludeTargetIndex;
 use brokk_bifrost_core::analyzer::capabilities::{TypeAliasProvider, TypeHierarchyProvider};
-use brokk_bifrost_core::analyzer::model::CppTemplateMetadata;
+use brokk_bifrost_core::analyzer::model::{CppFieldLinkage, CppTemplateMetadata};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
 use std::sync::Arc;
@@ -60,6 +60,31 @@ pub trait CppSource:
     /// across a scan (#1175), so an implementor must forward to the same
     /// analyzer the query is running against.
     fn prepared_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>>;
+
+    /// The persisted linkage fact for one C++ field, when the parser recorded
+    /// it. A missing fact requires the resolver's syntax fallback.
+    fn cpp_field_linkage(&self, code_unit: &CodeUnit) -> Option<CppFieldLinkage>;
+
+    /// The cached result of a preprocessor-visible include-reachability walk.
+    ///
+    /// The reference language affects only `__cplusplus` guards. Callers pass
+    /// that fact as a Boolean so cache keys do not retain the full reference
+    /// path.
+    fn cached_unconditional_include_reachability(
+        &self,
+        first: &ProjectFile,
+        donor_source: &ProjectFile,
+        reference_is_c: bool,
+    ) -> Option<bool>;
+
+    /// Store a completed preprocessor-visible include-reachability walk.
+    fn cache_unconditional_include_reachability(
+        &self,
+        first: &ProjectFile,
+        donor_source: &ProjectFile,
+        reference_is_c: bool,
+        reaches: bool,
+    );
 
     /// The declaration's syntactic owner, which unlike
     /// [`CodeUnitIndex::parent_of`] never falls back to a definition-row lookup.

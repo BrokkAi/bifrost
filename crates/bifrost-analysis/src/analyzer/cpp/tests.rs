@@ -44,6 +44,41 @@ template <typename T> class envelope {
     assert!(analyzer.template_metadata(nested).is_none());
 }
 
+#[test]
+fn cpp_import_lines_use_persisted_projection() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical temp dir");
+    let files: Vec<_> = (0..129)
+        .map(|index| {
+            let file = ProjectFile::new(root.clone(), format!("unit{index}.hpp"));
+            file.write("#include \"shared.hpp\"\nstruct Value {};\n")
+                .expect("write header");
+            file
+        })
+        .collect();
+    ProjectFile::new(root.clone(), "shared.hpp")
+        .write("struct Shared {};\n")
+        .expect("write shared header");
+    let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+
+    analyzer.reset_full_hydration_count_for_test();
+    for file in &files {
+        assert_eq!(
+            IAnalyzer::import_statements(&analyzer, file),
+            vec!["#include \"shared.hpp\""],
+        );
+        assert_eq!(
+            CppWorkspaceSource::import_statements(&analyzer, file),
+            vec!["#include \"shared.hpp\""],
+        );
+    }
+    assert_eq!(
+        analyzer.full_hydration_count_for_test(),
+        0,
+        "persisted C++ import rows must not hydrate FileState values"
+    );
+}
+
 #[cfg(test)]
 mod cache_tests {
     use super::*;
