@@ -5501,6 +5501,142 @@ public sealed class BinaryAmbiguous {
     }
 }
 
+/// #1798: the inverse recognized method-group *values* only in a whitelist of
+/// parent contexts that omitted `==`/`!=` comparisons and both arms of a
+/// ternary, so those sites produced no evidence at all while the forward
+/// resolver reported them. The controls (assignment, argument, switch arm,
+/// `+`, `??`, `base.Hook`) were already consistent and must stay that way.
+#[test]
+fn usage_finder_csharp_finds_comparison_and_ternary_method_groups() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "Demo/Hooks.cs",
+        r#"
+namespace Demo;
+
+public class Base {
+    public virtual void Hook(int data) { }
+    public virtual void Other(int data) { }
+}
+
+public sealed class Derived : Base {
+    private bool Ready(int data) => data > 0;
+
+    public void Register(System.Action<int> handler) { }
+
+    public void Run(bool flag) {
+        if (Hook != base.Hook) { }
+        if (Hook == base.Hook) { }
+        System.Action<int> assigned = Hook;
+        Register(Hook);
+        System.Action<int> ternary = flag ? Hook : Other;
+        System.Action<int> switched = flag switch { true => Hook, false => Other };
+        System.Action<int> added = Hook + Other;
+        System.Action<int> coalesced = Hook ?? Other;
+        System.Action<int> gated = Ready ? Hook : Other;
+    }
+}
+"#,
+    )]);
+
+    let consumer = project.file("Demo/Hooks.cs");
+    let source = consumer.read_to_string().expect("method-group source");
+    // (line, occurrence of `Hook` on that line) for every site that must be reported.
+    let expected = [
+        ("        if (Hook != base.Hook) { }", 0),
+        ("        if (Hook != base.Hook) { }", 1),
+        ("        if (Hook == base.Hook) { }", 0),
+        ("        if (Hook == base.Hook) { }", 1),
+        ("        System.Action<int> assigned = Hook;", 0),
+        ("        Register(Hook);", 0),
+        (
+            "        System.Action<int> ternary = flag ? Hook : Other;",
+            0,
+        ),
+        (
+            "        System.Action<int> switched = flag switch { true => Hook, false => Other };",
+            0,
+        ),
+        ("        System.Action<int> added = Hook + Other;", 0),
+        ("        System.Action<int> coalesced = Hook ?? Other;", 0),
+        (
+            "        System.Action<int> gated = Ready ? Hook : Other;",
+            0,
+        ),
+    ]
+    .into_iter()
+    .map(|(line, occurrence)| {
+        let start = source.find(line).unwrap_or_else(|| panic!("line {line}"));
+        start
+            + line
+                .match_indices("Hook")
+                .nth(occurrence)
+                .unwrap_or_else(|| panic!("occurrence {occurrence} of Hook in {line}"))
+                .0
+    })
+    .collect::<Vec<_>>();
+
+    let hook = member_function_with_arity(&analyzer, "Demo.Base", "Hook", 1);
+    let graph = graph_hits(&analyzer, &hook);
+    for start in &expected {
+        assert!(
+            graph
+                .iter()
+                .any(|hit| hit.start_offset <= *start && *start + "Hook".len() <= hit.end_offset),
+            "missing inverted method-group hit at {start}: {graph:#?}"
+        );
+    }
+    assert_eq!(
+        expected.len(),
+        graph.len(),
+        "the method-group value contexts must be reported exactly once each: {graph:#?}"
+    );
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let routed = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&hook),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("method-group query should resolve");
+    assert_eq!(
+        expected.len(),
+        routed.len(),
+        "targeted extraction must match the inverted method-group hits: {routed:#?}"
+    );
+
+    // Near miss: the ternary *condition* is not a delegate value position, so a
+    // bare identifier there must not become a method-group reference.
+    let ready = member_function_with_arity(&analyzer, "Demo.Derived", "Ready", 1);
+    let result = graph_result(&analyzer, &ready);
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } => {
+            assert!(
+                hits_by_overload
+                    .get(&ready)
+                    .is_none_or(|hits| hits.is_empty()),
+                "a ternary condition must not be a method-group value: {hits_by_overload:#?}"
+            );
+            assert_eq!(
+                None,
+                unproven_total_by_overload.get(&ready),
+                "a ternary condition must not produce unproven method-group evidence"
+            );
+        }
+        other => panic!("expected a resolved ternary-condition result, got {other:#?}"),
+    }
+}
+
 #[test]
 fn usage_finder_csharp_finds_unique_private_method_group_argument() {
     let (project, analyzer) = csharp_analyzer_with_files(&[(

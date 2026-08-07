@@ -753,6 +753,13 @@ fn containing_method_group_value_context(node: Node<'_>) -> bool {
                 return parent.child_by_field_name("value") == Some(current);
             }
             "binary_expression" => return is_delegate_binary_operand(current, parent),
+            // Both ternary arms are delegate value positions (#1798). The
+            // condition is not: an identifier there is a boolean expression,
+            // never a method group.
+            "conditional_expression" => {
+                return parent.child_by_field_name("consequence") == Some(current)
+                    || parent.child_by_field_name("alternative") == Some(current);
+            }
             _ => {}
         }
         if transparent_expression_parent(current, parent) {
@@ -778,11 +785,14 @@ fn transparent_expression_parent(current: Node<'_>, parent: Node<'_>) -> bool {
                 .is_some_and(|operator| operator.kind() == "!"))
 }
 
+/// `+ - ??` combine delegates and `== !=` compare them, as in the common
+/// `if (Hook != base.Hook)` guard (#1798). Every one of those operands reads
+/// the method group as a value.
 fn is_delegate_binary_operand(current: Node<'_>, parent: Node<'_>) -> bool {
     parent.kind() == "binary_expression"
         && parent
             .child_by_field_name("operator")
-            .is_some_and(|operator| matches!(operator.kind(), "+" | "-" | "??"))
+            .is_some_and(|operator| matches!(operator.kind(), "+" | "-" | "??" | "==" | "!="))
         && (parent.child_by_field_name("left") == Some(current)
             || parent.child_by_field_name("right") == Some(current))
 }
