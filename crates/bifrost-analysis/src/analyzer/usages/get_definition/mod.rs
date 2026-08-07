@@ -53,7 +53,7 @@ use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, Receive
 pub(crate) use crate::analyzer::usages::reference_site::byte_offset_for_character_column;
 pub(crate) use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site_with_line_starts,
-    smallest_named_node_covering,
+    simple_reference_name, smallest_named_node_covering,
 };
 use brokk_bifrost_js_ts::syntax::JsTsImportBinder;
 // The Ruby definition route is parked on `ResolutionSession`'s siblings while
@@ -1166,10 +1166,11 @@ fn resolve_one<'a>(
             }
         }
     };
-    let site = if matches!(language, Language::JavaScript | Language::TypeScript) {
-        js_ts::jsts_site_for_focus(site)
-    } else {
-        site
+    let site = match tree.as_ref() {
+        Some(tree) if matches!(language, Language::JavaScript | Language::TypeScript) => {
+            js_ts::jsts_site_for_focus(site, tree.root_node(), &source, language)
+        }
+        _ => site,
     };
 
     let site = if language == Language::Ruby {

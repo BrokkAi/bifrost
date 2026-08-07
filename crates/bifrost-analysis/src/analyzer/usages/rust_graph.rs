@@ -7,8 +7,10 @@ use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::{classify_recursive_hits, language_for_target};
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
-use crate::analyzer::usages::model::{FuzzyResult, ReferenceGraphResult, UsageHitSurface};
-use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::model::{FuzzyResult, ReferenceGraphResult};
+use crate::analyzer::usages::outcome::{
+    CandidateUsageHits, GraphFailureReason, GraphUsageOutcome, union_candidate_usages,
+};
 use crate::analyzer::usages::rust_graph::extractor::{
     effective_scan_files, scan_files_for_member_target, scan_files_for_target,
 };
@@ -85,6 +87,9 @@ pub(crate) fn rust_usage_candidate_files(
     usage_candidate_files_while(rust, &roots, &|| !cancellation.is_cancelled()).unwrap_or_default()
 }
 
+/// The strategy name every Rust usage diagnostic reports.
+const RUST_STRATEGY: &str = "RustExportUsageGraphStrategy";
+
 pub(crate) struct RustQueryResolver<'a> {
     rust: &'a RustAnalyzer,
 }
@@ -103,103 +108,84 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        let Some(target) = overloads.first() else {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        };
         let rust = self.rust;
-        let canonical_target = canonical_usage_target(rust, target);
-        let target = &canonical_target;
+        // Canonicalize first, then scan each distinct candidate: forward
+        // resolution can hand the query several declarations of one path (#1779),
+        // and two of them can canonicalize onto the same declaration.
+        let mut candidates: Vec<CodeUnit> = Vec::with_capacity(overloads.len());
+        for overload in overloads {
+            let canonical = canonical_usage_target(rust, overload);
+            if !candidates.contains(&canonical) {
+                candidates.push(canonical);
+            }
+        }
 
-        let (hits, unproven_hits) = if is_member_target(rust, target) {
-            let seed_result = infer_graph_seeds(rust, target);
-            if seed_result.roots.is_empty() {
-                return GraphUsageOutcome::fallback_safe(
-                    target.fq_name(),
-                    GraphFailureReason::NoGraphSeed("no graph seed resolved"),
-                    "RustExportUsageGraphStrategy",
-                );
-            }
-            let seeds = usage_binding_seeds(rust, &seed_result.roots);
-            let graph_visible = is_graph_visible_member_target(rust, target);
-            let private_authoritative_scope = scan_scope.is_authoritative();
-            if seed_result.kind == RustGraphSeedKind::Export
-                && !graph_visible
-                && !private_authoritative_scope
-            {
-                return GraphUsageOutcome::Resolved(FuzzyResult::success(
-                    target.clone(),
-                    BTreeSet::new(),
-                ));
-            }
-            let mut scan_files = effective_scan_files(rust, scan_scope, target, &seeds);
-            if seed_result.kind == RustGraphSeedKind::LocalDeclaration {
-                scan_files.extend(local_impl_target_importer_files(rust, target));
-            }
-            let scan_target = trait_member_for_impl_member(rust, target);
-            let scan_target = scan_target.as_ref().unwrap_or(target);
-            let result = scan_files_for_member_target(
-                analyzer,
-                rust,
-                scan_files,
-                scan_target,
-                target,
-                scan_scope.cancellation(),
-            );
-            (result.hits, result.unproven_hits)
-        } else {
-            let seed_result = infer_graph_seeds(rust, target);
-            if seed_result.roots.is_empty() {
-                return GraphUsageOutcome::fallback_safe(
-                    target.fq_name(),
-                    GraphFailureReason::NoGraphSeed("no graph seed resolved"),
-                    "RustExportUsageGraphStrategy",
-                );
-            }
-            let seeds = usage_binding_seeds(rust, &seed_result.roots);
-            let mut scan_files = effective_scan_files(rust, scan_scope, target, &seeds);
-            if seed_result.kind == RustGraphSeedKind::LocalDeclaration {
-                scan_files.extend(local_impl_target_importer_files(rust, target));
-            }
-            (
-                scan_files_for_target(
+        union_candidate_usages(&candidates, max_usages, |target| {
+            let (hits, unproven_hits) = if is_member_target(rust, target) {
+                let seed_result = infer_graph_seeds(rust, target);
+                if seed_result.roots.is_empty() {
+                    return Err(GraphFailureReason::NoGraphSeed("no graph seed resolved")
+                        .diagnostic(target.fq_name(), RUST_STRATEGY));
+                }
+                let seeds = usage_binding_seeds(rust, &seed_result.roots);
+                let graph_visible = is_graph_visible_member_target(rust, target);
+                let private_authoritative_scope = scan_scope.is_authoritative();
+                if seed_result.kind == RustGraphSeedKind::Export
+                    && !graph_visible
+                    && !private_authoritative_scope
+                {
+                    return Ok(CandidateUsageHits::default());
+                }
+                let mut scan_files = effective_scan_files(rust, scan_scope, target, &seeds);
+                if seed_result.kind == RustGraphSeedKind::LocalDeclaration {
+                    scan_files.extend(local_impl_target_importer_files(rust, target));
+                }
+                let scan_target = trait_member_for_impl_member(rust, target);
+                let scan_target = scan_target.as_ref().unwrap_or(target);
+                let result = scan_files_for_member_target(
                     analyzer,
                     rust,
                     scan_files,
+                    scan_target,
                     target,
-                    Some(&seeds),
                     scan_scope.cancellation(),
-                ),
-                BTreeSet::new(),
-            )
-        };
+                );
+                (result.hits, result.unproven_hits)
+            } else {
+                let seed_result = infer_graph_seeds(rust, target);
+                if seed_result.roots.is_empty() {
+                    return Err(GraphFailureReason::NoGraphSeed("no graph seed resolved")
+                        .diagnostic(target.fq_name(), RUST_STRATEGY));
+                }
+                let seeds = usage_binding_seeds(rust, &seed_result.roots);
+                let mut scan_files = effective_scan_files(rust, scan_scope, target, &seeds);
+                if seed_result.kind == RustGraphSeedKind::LocalDeclaration {
+                    scan_files.extend(local_impl_target_importer_files(rust, target));
+                }
+                (
+                    scan_files_for_target(
+                        analyzer,
+                        rust,
+                        scan_files,
+                        target,
+                        Some(&seeds),
+                        scan_scope.cancellation(),
+                    ),
+                    BTreeSet::new(),
+                )
+            };
 
-        // A proven hit inside the target itself is a recursive call (#1638):
-        // kept, classified `SelfReceiver`. The unproven channel still drops
-        // them -- an unproven recursive call is not evidence of anything.
-        let hits = classify_recursive_hits(analyzer, hits, target);
-        let unproven_hits: BTreeSet<_> = unproven_hits
-            .into_iter()
-            .filter(|hit| &hit.enclosing != target)
-            .collect();
-
-        let external_hit_count = hits
-            .iter()
-            .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
-            .count();
-        if external_hit_count > max_usages {
-            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-                short_name: target.short_name().to_string(),
-                total_callsites: external_hit_count,
-                limit: max_usages,
-                sample_hits: hits,
-            });
-        }
-
-        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
-            target.clone(),
-            hits,
-            unproven_hits,
-        ))
+            // A proven hit inside the target itself is a recursive call (#1638):
+            // kept, classified `SelfReceiver`. The unproven channel still drops
+            // them -- an unproven recursive call is not evidence of anything.
+            Ok(CandidateUsageHits {
+                hits: classify_recursive_hits(analyzer, hits, target),
+                unproven_hits: unproven_hits
+                    .into_iter()
+                    .filter(|hit| &hit.enclosing != target)
+                    .collect(),
+            })
+        })
     }
 }
 
@@ -302,7 +288,7 @@ impl GraphUsageAnalyzer for RustExportUsageGraphStrategy {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::UnsupportedTargetLanguage("target is not Rust"),
-                "RustExportUsageGraphStrategy",
+                RUST_STRATEGY,
             );
         }
 
@@ -312,7 +298,7 @@ impl GraphUsageAnalyzer for RustExportUsageGraphStrategy {
                 GraphFailureReason::MissingAnalyzerCapability(
                     "analyzer does not expose RustAnalyzer",
                 ),
-                "RustExportUsageGraphStrategy",
+                RUST_STRATEGY,
             );
         };
 

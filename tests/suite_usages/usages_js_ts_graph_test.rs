@@ -4307,3 +4307,264 @@ export function nearMiss() {
         "`imported.key` is a different property from `host.viaAssignment.key`: {hits:#?}"
     );
 }
+
+const MULTI_COPY_BUNDLE_SOURCE: &str = r#"(function (global, factory) {
+  typeof exports === 'object' ? factory(exports) : factory((global.bootstrap = {}));
+})(this, function (exports) {
+  var NAME = 'alert';
+  var $ = { fn: {} };
+
+  var Alert = function () {
+    function Alert(element) {
+      this._element = element;
+    }
+
+    return Alert;
+  }();
+
+  Alert._jQueryInterface = function _jQueryInterface(config) {
+    return config;
+  };
+
+  $.fn[NAME] = Alert._jQueryInterface;
+
+  exports.Alert = Alert;
+});
+"#;
+
+const MULTI_COPY_SRC_SOURCE: &str = r#"const NAME = 'alert';
+const $ = { fn: {} };
+
+class Alert {
+  static _jQueryInterface(config) {
+    return config;
+  }
+}
+
+$.fn[NAME] = Alert._jQueryInterface;
+
+export default Alert;
+"#;
+
+/// A reported site: the workspace-relative file it sits in, and its line.
+type HitSite = (String, usize);
+type HitSites = BTreeSet<HitSite>;
+
+/// The `(file, line)` of every proven and every unproven site a usage query
+/// reports, so a multi-candidate answer can be compared site for site.
+fn multi_copy_sites(
+    analyzer: &JavascriptAnalyzer,
+    overloads: &[CodeUnit],
+    candidates: &brokk_bifrost::hash::HashSet<ProjectFile>,
+) -> (HitSites, HitSites) {
+    let result =
+        JsTsExportUsageGraphStrategy::new().find_usages(analyzer, overloads, candidates, 1000);
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            ..
+        } => (
+            candidate_hit_sites(hits_by_overload.into_values().flatten()),
+            candidate_hit_sites(unproven_by_overload.into_values().flatten()),
+        ),
+        other => panic!("expected Success, got {other:#?}"),
+    }
+}
+
+fn candidate_hit_sites(
+    hits: impl IntoIterator<Item = brokk_bifrost::usages::UsageHit>,
+) -> HitSites {
+    hits.into_iter()
+        .map(|hit| {
+            (
+                hit.file.rel_path().to_string_lossy().replace('\\', "/"),
+                hit.line,
+            )
+        })
+        .collect()
+}
+
+fn multi_copy_project() -> (crate::common::BuiltInlineTestProject, JavascriptAnalyzer) {
+    js_inline_analyzer(|p| {
+        p.file("dist/bundle.js", MULTI_COPY_BUNDLE_SOURCE)
+            .file("src/alert.js", MULTI_COPY_SRC_SOURCE)
+            .build()
+    })
+}
+
+fn multi_copy_targets(
+    analyzer: &JavascriptAnalyzer,
+    project: &crate::common::BuiltInlineTestProject,
+) -> (CodeUnit, CodeUnit) {
+    let units: Vec<_> = analyzer.all_declarations().collect();
+    let dist = project.file("dist/bundle.js");
+    let src = project.file("src/alert.js");
+    let dist_target = definition_in(units.iter(), |cu| {
+        cu.source() == &dist && cu.short_name() == "Alert._jQueryInterface"
+    });
+    let src_target = definition_in(units.iter(), |cu| {
+        cu.source() == &src && cu.short_name() == "Alert._jQueryInterface"
+    });
+    (dist_target, src_target)
+}
+
+/// #1779: a vendored bundle and the source it was built from both declare
+/// `Alert._jQueryInterface`, so forward resolution answers with a two-candidate
+/// group. The bundle copy proves only its own read and knows nothing of the
+/// source file, so a strategy that scans just the first candidate loses the
+/// source read entirely -- and which copy sorts first decides that.
+#[test]
+fn js_multi_copy_target_group_unions_every_candidate_scan() {
+    let (project, analyzer) = multi_copy_project();
+    let (dist_target, src_target) = multi_copy_targets(&analyzer, &project);
+    let candidates: brokk_bifrost::hash::HashSet<ProjectFile> =
+        analyzer.get_analyzed_files().into_iter().collect();
+
+    let (bundle_read, source_read, bundle_assignment) = multi_copy_site_lines();
+
+    let (proven, unproven) = multi_copy_sites(
+        &analyzer,
+        &[dist_target.clone(), src_target.clone()],
+        &candidates,
+    );
+    assert_eq!(
+        proven,
+        BTreeSet::from([bundle_read.clone(), source_read.clone()]),
+        "the group's proven sites must include the source copy's read, not only the bundle's"
+    );
+    assert_eq!(
+        unproven,
+        BTreeSet::from([bundle_assignment.clone()]),
+        "the bundle read is proven for the bundle candidate, so the source candidate's \
+         unproven reading of the same site must not be reported a second time"
+    );
+
+    // Perturbation control: the answer must not depend on which copy sorts
+    // first. Renaming the bundle directory was what flipped this site from
+    // missing to reported before the union.
+    let source_first = multi_copy_sites(&analyzer, &[src_target, dist_target], &candidates);
+    assert_eq!(
+        source_first,
+        (proven, unproven),
+        "candidate order must not change the reported sites"
+    );
+}
+
+/// Control: a single-candidate query is unchanged by the union. Each copy still
+/// proves only what it can see and reports the other copy's sites as unproven.
+#[test]
+fn js_single_copy_target_keeps_its_own_proven_and_unproven_split() {
+    let (project, analyzer) = multi_copy_project();
+    let (dist_target, src_target) = multi_copy_targets(&analyzer, &project);
+    let candidates: brokk_bifrost::hash::HashSet<ProjectFile> =
+        analyzer.get_analyzed_files().into_iter().collect();
+
+    let (bundle_read, source_read, bundle_assignment) = multi_copy_site_lines();
+
+    assert_eq!(
+        multi_copy_sites(&analyzer, &[dist_target], &candidates),
+        (BTreeSet::from([bundle_read.clone()]), BTreeSet::new()),
+        "the bundle candidate alone still proves only its own read"
+    );
+    assert_eq!(
+        multi_copy_sites(&analyzer, &[src_target], &candidates),
+        (
+            BTreeSet::from([source_read]),
+            BTreeSet::from([bundle_assignment, bundle_read])
+        ),
+        "the source candidate alone still reports the bundle sites as unproven"
+    );
+}
+
+/// The bundle's read, the source copy's read, and the bundle's own
+/// assignment-minted declaration, as `(file, line)` sites.
+fn multi_copy_site_lines() -> (HitSite, HitSite, HitSite) {
+    (
+        (
+            "dist/bundle.js".to_string(),
+            line_number_of(MULTI_COPY_BUNDLE_SOURCE, "  $.fn[NAME] = Alert."),
+        ),
+        (
+            "src/alert.js".to_string(),
+            line_number_of(MULTI_COPY_SRC_SOURCE, "$.fn[NAME] = Alert."),
+        ),
+        (
+            "dist/bundle.js".to_string(),
+            line_number_of(
+                MULTI_COPY_BUNDLE_SOURCE,
+                "  Alert._jQueryInterface = function",
+            ),
+        ),
+    )
+}
+// --- issue #1792: optional-chain reads of a local property ---
+//
+// `?.` is an `optional_chain` child that sits between a member expression's
+// `object` and `property` fields, so every receiver-chain walk that reads those
+// fields already steps over it. These two tests pin that down: the inverse
+// matcher reports an optional-chain read of the same field its plain spelling
+// reports, in every operator position, and still rejects a different chain.
+// The reported witness of #1792 was a forward defect instead -- a caret on a
+// chain segment after a `?.` named the whole chain -- and is pinned by
+// `tests/suite_symbols/optional_chain_reference_site.rs`.
+
+#[test]
+fn js_optional_chain_reads_of_a_declarator_minted_property_are_usages() {
+    let source = r#"function shapes(host) {
+  host.chain = { key: 1 };
+  const plain = host.chain.key;
+  const optionalRoot = host?.chain.key;
+  const optionalMember = host.chain?.key;
+  const optionalBoth = host?.chain?.key;
+  const nearMiss = host?.other.key;
+  return [plain, optionalRoot, optionalMember, optionalBoth, nearMiss];
+}
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("shapes.js", source).build());
+    let file = project.file("shapes.js");
+    let target = find_js_definition(&analyzer, &file, "host.chain.key", |cu| cu.is_field());
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+
+    assert_eq!(
+        reference_lines(&hits),
+        BTreeSet::from([
+            line_number_of(source, "const plain ="),
+            line_number_of(source, "const optionalRoot ="),
+            line_number_of(source, "const optionalMember ="),
+            line_number_of(source, "const optionalBoth ="),
+        ]),
+        "every optional spelling of `host.chain.key` reads it, and `host?.other.key` does not: {hits:#?}"
+    );
+}
+
+#[test]
+fn js_optional_chain_reads_of_a_member_assignment_minted_property_are_usages() {
+    let source = r#"function shapes(row, data) {
+  row.dataset.raw = JSON.stringify(data);
+  const plain = row.dataset.raw;
+  const optionalRoot = row?.dataset.raw;
+  const optionalMember = row.dataset?.raw;
+  const optionalBoth = row?.dataset?.raw;
+  const nearMiss = row?.other.raw;
+  return [plain, optionalRoot, optionalMember, optionalBoth, nearMiss];
+}
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("dataset.js", source).build());
+    let file = project.file("dataset.js");
+    let target = find_js_definition(&analyzer, &file, "row.dataset.raw", |cu| cu.is_field());
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+
+    assert_eq!(
+        reference_lines(&hits),
+        BTreeSet::from([
+            line_number_of(source, "const plain ="),
+            line_number_of(source, "const optionalRoot ="),
+            line_number_of(source, "const optionalMember ="),
+            line_number_of(source, "const optionalBoth ="),
+        ]),
+        "every optional spelling of `row.dataset.raw` reads it, and `row?.other.raw` does not: {hits:#?}"
+    );
+}

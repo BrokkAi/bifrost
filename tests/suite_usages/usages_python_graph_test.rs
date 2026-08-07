@@ -6,7 +6,7 @@ use brokk_bifrost::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, PythonAnalyzer,
 };
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn definition(analyzer: &PythonAnalyzer, fq_name: &str) -> CodeUnit {
     analyzer
@@ -3918,5 +3918,102 @@ fn function_scoped_import_is_not_a_reexport() {
         hits.iter()
             .all(|hit| hit.file != project.file("src/ws/server.py")),
         "a function-local import does not re-export the name: {hits:#?}"
+    );
+}
+
+/// The `(file, line)` of every external usage a Python query reports.
+fn python_usage_sites(
+    analyzer: &PythonAnalyzer,
+    overloads: &[CodeUnit],
+) -> BTreeSet<(String, usize)> {
+    let query = UsageFinder::new().query(analyzer, overloads, 1000, 1000);
+    assert!(query.graph_failure.is_none(), "query: {:?}", query.result);
+    query
+        .result
+        .all_hits()
+        .into_iter()
+        .map(|hit| {
+            (
+                hit.file.rel_path().to_string_lossy().replace('\\', "/"),
+                hit.line,
+            )
+        })
+        .collect()
+}
+
+/// #1791 (following #1779): two vendored copies of one package -- `first/pkg`
+/// and `second/pkg`, each its own package root because only `pkg` carries an
+/// `__init__.py` -- give every item in them the module-qualified name
+/// `pkg.service.Service.run`, so forward resolution answers one query with both
+/// declarations.
+///
+/// Python keys import resolution on that module name rather than on the
+/// declaring file, so whichever copy wins the definition lookup proves both
+/// consumers' calls and its sibling proves nothing at all. Scanning only
+/// `overloads.first()` therefore let candidate order decide the whole answer:
+/// with the losing copy first the query reported no usages.
+#[test]
+fn python_duplicate_package_target_group_unions_every_candidate_scan() {
+    let service = "class Service:\n    def run(self):\n        pass\n";
+    let consumer = "from pkg.service import Service\n\n\ndef go(s: Service):\n    s.run()\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("first/pkg/__init__.py", "")
+        .file("first/pkg/service.py", service)
+        .file("first/pkg/consumer.py", consumer)
+        .file("second/pkg/__init__.py", "")
+        .file("second/pkg/service.py", service)
+        .file("second/pkg/consumer.py", consumer)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+
+    let mut definitions = analyzer.get_definitions("pkg.service.Service.run");
+    definitions.sort_by_key(|unit| unit.source().rel_path().to_path_buf());
+    assert_eq!(
+        definitions
+            .iter()
+            .map(|unit| unit
+                .source()
+                .rel_path()
+                .to_string_lossy()
+                .replace('\\', "/"))
+            .collect::<Vec<_>>(),
+        vec![
+            "first/pkg/service.py".to_string(),
+            "second/pkg/service.py".to_string()
+        ],
+        "both copies must resolve as candidates of one target group"
+    );
+
+    let both = BTreeSet::from([
+        ("first/pkg/consumer.py".to_string(), 5),
+        ("second/pkg/consumer.py".to_string(), 5),
+    ]);
+
+    assert_eq!(
+        python_usage_sites(&analyzer, &definitions),
+        both,
+        "the group's usages must include both copies' call sites"
+    );
+    let reversed: Vec<CodeUnit> = definitions.iter().rev().cloned().collect();
+    assert_eq!(
+        python_usage_sites(&analyzer, &reversed),
+        both,
+        "candidate order must not change the reported sites"
+    );
+
+    // Controls: exactly one copy wins the `pkg.service` lookup, so exactly one
+    // single-candidate query answers with anything. That asymmetry is what made
+    // the pre-fix truncation lose every site whenever the losing copy sorted
+    // first, and it is why the union must run every candidate's scan.
+    let first_only = python_usage_sites(&analyzer, &definitions[..1]);
+    let second_only = python_usage_sites(&analyzer, &definitions[1..]);
+    assert!(
+        first_only.is_empty() != second_only.is_empty(),
+        "one copy must win the module-name lookup outright: {first_only:?} / {second_only:?}"
+    );
+    assert_eq!(
+        &first_only | &second_only,
+        both,
+        "between them the candidates must account for both call sites"
     );
 }

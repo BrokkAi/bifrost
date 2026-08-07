@@ -1657,36 +1657,89 @@ fn jsts_unbound_assigned_property_shape<'a>(
     found.then_some((object_name, property_name))
 }
 
-pub(super) fn jsts_site_for_focus(mut site: ResolvedReferenceSite) -> ResolvedReferenceSite {
-    if let Some(reference) = jsts_reference_prefix_for_focus(&site) {
-        site.range.end_byte = site.range.start_byte + reference.len();
+/// Narrows a dotted site to the chain the caret actually names: a caret on a
+/// segment other than the last one names the chain that ends at that segment
+/// (`row.dataset` in `row.dataset.raw`), not the whole chain.
+///
+/// The site text is canonical, so it drops the `?` of an optional chain (#1781)
+/// and is one byte shorter than its source span per operator. The focused
+/// segment therefore comes from the access nodes rather than from offsets into
+/// the text: byte arithmetic matched no segment at all once an operator
+/// preceded the caret, kept the whole chain, and resolved a caret on `dataset`
+/// in `row?.dataset.raw` to the `raw` field (#1792).
+pub(super) fn jsts_site_for_focus(
+    mut site: ResolvedReferenceSite,
+    root: Node<'_>,
+    source: &str,
+    language: Language,
+) -> ResolvedReferenceSite {
+    if let Some((reference, end_byte)) = jsts_focused_chain_prefix(&site, root, source, language) {
+        site.range.end_byte = end_byte;
         site.text = reference;
     }
     site
 }
 
-fn jsts_reference_prefix_for_focus(site: &ResolvedReferenceSite) -> Option<String> {
+fn jsts_focused_chain_prefix(
+    site: &ResolvedReferenceSite,
+    root: Node<'_>,
+    source: &str,
+    language: Language,
+) -> Option<(String, usize)> {
     if !site.text.contains('.') {
         return None;
     }
-    let relative_start = site.focus_start_byte.checked_sub(site.range.start_byte)?;
-    let relative_end = site.focus_end_byte.checked_sub(site.range.start_byte)?;
-    if relative_start >= relative_end || relative_end > site.text.len() {
+    let focused = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    let access = focused.parent()?;
+    let (receiver, member) = jsts_dotted_access_parts(access)?;
+    // The caret names the access that ends at its own segment: the access
+    // itself when the caret is on the member, the bare root when it is on the
+    // receiver of the innermost access.
+    let prefix = if member.id() == focused.id() {
+        access
+    } else if receiver.id() == focused.id() {
+        focused
+    } else {
+        return None;
+    };
+    if prefix.end_byte() >= site.range.end_byte {
         return None;
     }
+    Some((
+        jsts_dotted_chain_text(prefix, source, language)?,
+        prefix.end_byte(),
+    ))
+}
 
-    let mut segment_start = 0;
-    for segment in site.text.split('.') {
-        let segment_end = segment_start + segment.len();
-        if relative_start >= segment_start && relative_end <= segment_end {
-            if segment_end == site.text.len() {
-                return None;
-            }
-            return Some(site.text[..segment_end].to_string());
-        }
-        segment_start = segment_end + 1;
+/// The receiver and member of one dotted JS/TS access. `?.` is an
+/// `optional_chain` child sitting between the two fields, so reading the fields
+/// steps over it.
+fn jsts_dotted_access_parts<'tree>(node: Node<'tree>) -> Option<(Node<'tree>, Node<'tree>)> {
+    match node.kind() {
+        "member_expression" => Some((
+            node.child_by_field_name("object")?,
+            node.child_by_field_name("property")?,
+        )),
+        "nested_type_identifier" => Some((
+            node.child_by_field_name("module")?,
+            node.child_by_field_name("name")?,
+        )),
+        _ => None,
     }
-    None
+}
+
+/// The canonical dotted text of `node`, rebuilt from its segment names so that
+/// no `?` reaches a caller that splits the text on `.`.
+fn jsts_dotted_chain_text(node: Node<'_>, source: &str, language: Language) -> Option<String> {
+    let mut names = Vec::new();
+    let mut current = node;
+    while let Some((receiver, member)) = jsts_dotted_access_parts(current) {
+        names.push(simple_reference_name(member, source, language)?);
+        current = receiver;
+    }
+    names.push(simple_reference_name(current, source, language)?);
+    names.reverse();
+    Some(names.join("."))
 }
 
 /// Resolve `new Foo().member` by typing the receiver as the constructed class.

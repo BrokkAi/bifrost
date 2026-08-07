@@ -24,10 +24,8 @@ use crate::providers::JsTsSource;
 use crate::syntax::{direct_property_definitions, slice};
 use crate::tsconfig::AliasResolver;
 use brokk_bifrost_core::analyzer::usages::common::classify_recursive_hit;
-use brokk_bifrost_core::analyzer::usages::model::{
-    ExportEntry, FuzzyResult, UsageHit, UsageHitSurface, UsageProof,
-};
-use brokk_bifrost_core::analyzer::usages::outcome::GraphUsageOutcome;
+use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, UsageHit, UsageProof};
+use brokk_bifrost_core::analyzer::usages::outcome::CandidateUsageHits;
 use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
@@ -72,23 +70,23 @@ impl<'a> JsTsHosts<'a> {
     }
 }
 
-/// Resolve every usage of `target` through the export/import graph.
+/// Resolve every usage of one candidate declaration through the export/import
+/// graph.
 ///
 /// The body of the `UsageQueryResolver` impl in `brokk-bifrost-analysis`, which
-/// keeps the SPI block, the downcast that produces `host`, and the
-/// missing-analyzer and cancellation outcomes. `analyzer` is the dispatching
-/// analyzer -- in a mixed workspace a `MultiAnalyzer` -- and `host` is the JS/TS
-/// analyzer for `language`.
-#[allow(clippy::too_many_arguments)]
-pub fn find_js_ts_usages(
+/// keeps the SPI block, the downcast that produces `host`, the missing-analyzer
+/// and cancellation outcomes, and the union over the query's whole candidate
+/// group (#1779). `analyzer` is the dispatching analyzer -- in a mixed
+/// workspace a `MultiAnalyzer` -- and `host` is the JS/TS analyzer for
+/// `language`.
+pub fn scan_js_ts_target_usages(
     host: &dyn JsTsSource,
     analyzer: &dyn CodeUnitIndex,
     index: &JsTsUsageIndex,
     target: &CodeUnit,
     scan_scope: &UsageScanScope<'_>,
     language: Language,
-    max_usages: usize,
-) -> GraphUsageOutcome {
+) -> CandidateUsageHits {
     let target_seed = target_seed_identifier(analyzer, target);
     let owner_seed_allowed = is_static_member(target)
         || !target.short_name().contains('.')
@@ -165,24 +163,10 @@ pub fn find_js_ts_usages(
         })
         .partition(|hit| hit.proof == UsageProof::Proven);
 
-    let external_hit_count = hits
-        .iter()
-        .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
-        .count();
-    if external_hit_count > max_usages {
-        return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-            short_name: target.short_name().to_string(),
-            total_callsites: external_hit_count,
-            limit: max_usages,
-            sample_hits: hits,
-        });
-    }
-
-    GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
-        target.clone(),
+    CandidateUsageHits {
         hits,
         unproven_hits,
-    ))
+    }
 }
 
 fn target_seed_identifier(analyzer: &dyn CodeUnitIndex, target: &CodeUnit) -> String {
