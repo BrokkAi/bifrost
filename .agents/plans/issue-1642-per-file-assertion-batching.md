@@ -17,8 +17,8 @@ Observable outcome: a two-file test project where one file fits a deliberately t
 - [x] (2026-08-07) Studied `evaluate_assertion_policy`, the query builders, `PolicyRunCompletion`, `PolicyRun::try_new`, the eager-index execution helper, and the prototype suite harness.
 - [x] (2026-08-07) Authored this plan.
 - [x] (2026-08-07) Milestone 1: restructured `evaluate_assertion_policy` into a per-file loop with per-file completion accounting; added the missing non-empty-path assert to `assertion_generation_query`. `cargo test -p brokk-bifrost-policy` (294 tests) and the 22-test `policy_loop_invariant` suite pass unchanged.
-- [ ] Milestone 2: behavior tests in `tests/suite_bench_policy/policy_assertion_per_file_completion.rs` (new suite member).
-- [ ] Milestone 3: existing-suite validation (bifrost-policy crate tests, `suite_bench_policy`, `suite_cross_language`) and fmt/clippy.
+- [x] (2026-08-07) Milestone 2: four behavior tests in `tests/suite_bench_policy/policy_assertion_per_file_completion.rs` (degradation, multi-file Complete, per-file capability gap, vacuous empty), registered in `main.rs` and the harness manifest. Written by an Opus subagent, reviewed and tightened (helper renamed to say what it asserts; the widened-rule `replace` now asserts it actually changed the fixture text).
+- [x] (2026-08-07) Milestone 3: full `suite_bench_policy` (321 passed), `cargo test -p brokk-bifrost-policy` (294 passed), fmt, and featureless `cargo clippy --workspace --all-targets -- -D warnings` clean. All-features clippy runs before push.
 - [ ] Milestone 4: workspace-scale measurement on this repository (release build), recorded here; decides whether latency needs follow-up work beyond conclusiveness.
 
 ## Surprises & Discoveries
@@ -29,6 +29,10 @@ Observable outcome: a two-file test project where one file fits a deliberately t
   Evidence: `crates/bifrost-analysis/src/analyzer/structural/search/mod.rs:2100` and the `environment_cache` parameter threading in `search/pipeline.rs`.
 - Observation: `PolicyRun::try_new` permits findings alongside a non-reliable completion (the `Failed` path already attaches findings), so "findings from concluded files + `Inconclusive` verdict" needs no new run type.
   Evidence: `crates/bifrost-policy/src/finding.rs:2416` validation; `failed_policy_run_with_reason` in `evaluator.rs`.
+- Observation (Milestone 2): the planned degradation fixture (many small sort-in-loop subjects in the big file) cannot exhaust a per-file budget before the run-level subject query does - the subject query spans both files and uses the same `max_pipeline_rows`, so there was no budget window at all. The working fixture keeps the big file at *one* subject and makes it expensive in scopes instead (80 filler functions of nested blocks): the family that then exhausts first is the per-file lexical scope seed ("lexical environment seed reached its N-row cap"), with a wide calibration window (degradation holds from 40 to ~400 rows; everything Complete by 600; the test pins 200).
+  Evidence: calibration record in `tests/suite_bench_policy/policy_assertion_per_file_completion.rs`.
+- Observation (Milestone 2): widening the rule's receiver for the capability-gap test uses a bare `(capture "target")` pattern - `(expression ...)` is not a normalized RQL kind and fails to load. The bare capture matches both an identifier receiver (file A keeps its finding) and an array-literal receiver, which carries no receiver-position occurrence and so produces exactly the per-file `CapabilityIncomplete`.
+  Evidence: `per_file_capability_gaps_do_not_block_other_files` in the new suite.
 
 ## Decision Log
 

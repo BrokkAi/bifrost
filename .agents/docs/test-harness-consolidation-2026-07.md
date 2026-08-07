@@ -115,7 +115,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `typescript_analyzer_update_test`
 - `typescript_import_test`
 
-### `suite_bench_policy` (27 modules)
+### `suite_bench_policy` (28 modules)
 
 - `benchmark_compare`
 - `benchmark_manifest`
@@ -128,6 +128,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `no_stringly_name_parsing`
 - `policy_assertion_conformance`
 - `policy_assertion_evaluation`
+- `policy_assertion_per_file_completion`
 - `policy_docs`
 - `policy_loading`
 - `policy_loading_workspace`
