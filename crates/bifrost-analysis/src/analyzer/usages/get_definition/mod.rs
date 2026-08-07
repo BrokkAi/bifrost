@@ -1142,6 +1142,11 @@ fn resolve_one<'a>(
         }
     };
 
+    let tree = {
+        let _scope = profiling::scope("get_definition::parse_tree");
+        context.tree(&request.file, language, &source)
+    };
+
     let site = {
         let _scope = profiling::scope("get_definition::reference_site");
         let line_starts = context.line_starts(&request.file, &source);
@@ -1149,6 +1154,7 @@ fn resolve_one<'a>(
             &request.as_source_location(),
             &source,
             &line_starts,
+            tree.as_ref().map(Tree::root_node),
         ) {
             Ok(site) => site,
             Err(message) => {
@@ -1166,10 +1172,6 @@ fn resolve_one<'a>(
         site
     };
 
-    let tree = {
-        let _scope = profiling::scope("get_definition::parse_tree");
-        context.tree(&request.file, language, &source)
-    };
     let site = if language == Language::Ruby {
         tree.as_ref()
             .map(|tree| ruby::ruby_site_for_focus(site.clone(), tree, &source))
