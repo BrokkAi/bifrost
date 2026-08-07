@@ -9,6 +9,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod cpp_member_dispatch_trace;
 mod csharp_bounded_receiver_hardening;
 mod go_rust_bounded_receiver_acceptance;
 mod issue_1416_scan_name_gate;
