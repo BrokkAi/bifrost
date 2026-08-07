@@ -999,20 +999,16 @@ fn import_bindings_from_imports(
         if packages.is_empty() {
             // No workspace package answers this path. The local name it binds
             // comes from the alias, then from the package clause an exact API
-            // pack records, then from the import path's own last segment --
-            // the same precedence `get_definition` applies, read from the
-            // parser's structured segments rather than by splitting the path.
+            // pack records, then from the binding name the Go import parser
+            // already derived. That is exactly the precedence `get_definition`
+            // applies in `go_import_paths`, so a diagnostic and a definition
+            // cannot disagree about which package a qualifier names.
             match alias {
                 Some(".") => bindings.dot_external.push(path),
                 _ => {
                     let local = match alias {
                         Some(explicit) => Some(default_go_import_local_name(explicit)),
-                        None => declared_package_name(&path).or_else(|| {
-                            import
-                                .path
-                                .as_ref()
-                                .and_then(|structured| structured.segments.last().cloned())
-                        }),
+                        None => declared_package_name(&path).or_else(|| import.identifier.clone()),
                     };
                     if let Some(local) = local.filter(|local| !local.is_empty() && local != "_") {
                         bindings.external.entry(local).or_default().push(path);

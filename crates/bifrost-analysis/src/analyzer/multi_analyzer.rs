@@ -1123,6 +1123,16 @@ impl IAnalyzer for MultiAnalyzer {
                 self, file, source,
             );
         }
+        // Go classifies references that leave the workspace against the
+        // activated exact API packs (#1623), and the semantic-model overlay
+        // and the retained Go module graph belong to the dispatching analyzer,
+        // not to the delegate. Passing `self` is what lets a Go file's import
+        // of an indexed module resolve instead of reporting nothing known.
+        if language_for_file(file) == Language::Go && self.delegates.contains_key(&Language::Go) {
+            return crate::analyzer::go::diagnostics::collect_go_semantic_diagnostics(
+                self, file, source,
+            );
+        }
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().semantic_diagnostics(file, source))
             .unwrap_or_default()
