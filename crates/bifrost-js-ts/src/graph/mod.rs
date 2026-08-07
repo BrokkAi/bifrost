@@ -23,6 +23,7 @@ use crate::parse::js_ts_tree_sitter_language_for_file;
 use crate::providers::JsTsSource;
 use crate::syntax::{direct_property_definitions, slice};
 use crate::tsconfig::AliasResolver;
+use brokk_bifrost_core::analyzer::usages::common::classify_recursive_hit;
 use brokk_bifrost_core::analyzer::usages::model::{
     ExportEntry, FuzzyResult, UsageHit, UsageHitSurface, UsageProof,
 };
@@ -152,9 +153,16 @@ pub fn find_js_ts_usages(
             scan_scope.cancellation(),
         )
     };
+    // A proven hit inside the target itself is a recursive call (#1638): kept,
+    // classified `SelfReceiver`, so editor find-references lists it while the
+    // external usage surface omits it. An unproven one is still dropped -- an
+    // unproven recursive call is not evidence of anything.
     let (hits, unproven_hits): (BTreeSet<UsageHit>, BTreeSet<UsageHit>) = scan_hits
         .into_iter()
-        .filter(|hit| &hit.enclosing != target)
+        .filter_map(|hit| match hit.proof {
+            UsageProof::Proven => classify_recursive_hit(hit, target),
+            UsageProof::Unproven => (&hit.enclosing != target).then_some(hit),
+        })
         .partition(|hit| hit.proof == UsageProof::Proven);
 
     let external_hit_count = hits

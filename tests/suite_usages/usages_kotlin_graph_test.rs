@@ -979,6 +979,51 @@ open class Greeter {
 }
 
 #[test]
+fn kotlin_recursive_call_is_editor_visible_but_not_an_external_usage() {
+    // A call whose enclosing declaration *is* the target is a recursive call
+    // (#1638). The forward resolver states that edge, so the inverse listing
+    // must state it too: editor find-references lists the site as a same-owner
+    // self receiver hit, and the external usage surface omits it, so `countdown`
+    // does not look used from outside on the strength of calling itself.
+    let (_project, analyzer) = kotlin_workspace(&[(
+        "src/lib/Counter.kt",
+        "package lib
+
+class Counter {
+
+    fun countdown(n: Int) {
+
+        if (n > 0) countdown(n - 1)
+    }
+
+    fun start() {
+
+        countdown(3)
+    }
+}
+",
+    )]);
+
+    let target = definition(&analyzer, "lib.Counter.countdown");
+    let result = usages(&analyzer, &target);
+    assert!(
+        external_hits(&result).is_empty(),
+        "neither the recursive call nor the sibling call is external, got {:#?}",
+        external_hits(&result)
+    );
+    let editor = hits(&result);
+    assert_eq!(2, editor.len(), "{editor:#?}");
+    assert_hit_line(&editor, 7);
+    assert_hit_line(&editor, 12);
+    assert!(
+        editor
+            .iter()
+            .all(|hit| hit.kind == UsageHitKind::SelfReceiver),
+        "both sites are same-owner hits, got {editor:#?}"
+    );
+}
+
+#[test]
 fn kotlin_call_through_another_variable_of_the_owner_type_stays_external() {
     // The other half of the same-owner rule: same *type* is not same *owner*.
     // A call through a different object is a real external usage even from

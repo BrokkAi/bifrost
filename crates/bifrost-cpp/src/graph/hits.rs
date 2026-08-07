@@ -108,15 +108,34 @@ fn push_hit_with_options(
         return;
     }
     let start = node.start_byte();
-    if (!allow_inside_target_declaration && is_inside_target_declaration(node, ctx))
-        || is_member_field_own_declarator(node, ctx)
-    {
+    if is_member_field_own_declarator(node, ctx) {
         return;
     }
+    let inside_target_declaration =
+        !allow_inside_target_declaration && is_inside_target_declaration(node, ctx);
     let line_idx = find_line_index_for_offset(ctx.line_starts, start);
     let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
         return;
     };
+    // A reference whose enclosing declaration is the target itself is a
+    // recursive call (#1638). When the target is declared and defined in one
+    // place the site sits inside the target's own declaration range, which is
+    // why it has to be decided before that range is consulted. The declared
+    // name itself is excluded structurally, through the declarator chain, so
+    // the declaration does not become a usage of itself. `SelfReceiver` gives
+    // the same contract as [`push_recursive_reference_hit`]: editor-visible,
+    // absent from the external usage surface.
+    if matches!(kind, UsageHitKind::Reference | UsageHitKind::SelfReceiver)
+        && ctx.spec.target.is_function()
+        && enclosing == ctx.spec.target
+        && !is_target_declaration_name(node, ctx)
+    {
+        insert_hit(node, ctx, enclosing, line_idx, UsageHitKind::SelfReceiver);
+        return;
+    }
+    if inside_target_declaration {
+        return;
+    }
     if ctx.target_group.contains(&enclosing) {
         return;
     }
@@ -193,6 +212,32 @@ pub fn enclosing_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> EnclosingContext 
         .borrow_mut()
         .insert(key, context.clone());
     context
+}
+
+/// Returns whether `node` is the target declaration's own declared name.
+///
+/// The declarator chain of a C++ declaration bottoms out at the declared name
+/// (`function_definition.declarator -> function_declarator.declarator ->
+/// identifier`), while parameters, default arguments, and the body hang off
+/// sibling fields. Containment in that terminal therefore covers a qualified
+/// out-of-line name (`void Foo::target()`) without also covering a call written
+/// in a default argument.
+fn is_target_declaration_name(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if ctx.target_declaration_ranges.iter().any(|range| {
+            candidate.start_byte() == range.start_byte && candidate.end_byte() == range.end_byte
+        }) {
+            let mut declarator = candidate;
+            while let Some(inner) = declarator.child_by_field_name("declarator") {
+                declarator = inner;
+            }
+            return node.start_byte() >= declarator.start_byte()
+                && node.end_byte() <= declarator.end_byte();
+        }
+        current = candidate.parent();
+    }
+    false
 }
 
 fn is_inside_target_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {

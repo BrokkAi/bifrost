@@ -2,15 +2,15 @@
 //!
 //! `assert-edge-parity` states that the two production analyses answering
 //! "what does this token reference" and "who references this declaration"
-//! agree field for field, within one workspace generation. The load-bearing
-//! test is `a_recursive_call_is_a_one_sided_edge_the_parity_assert_reports`:
-//! the forward producer states the recursive edge and the inverse listing
-//! omits the site entirely, on every surface -- precisely the one-sided-edge
-//! shape the mined regressions (02abec289, 7cac14b63) fixed by hand, present
-//! in the engine today and reported as a finding that names the edge. The
-//! sibling-call pair then shows the surface comparison working in both
-//! directions: the complete row sets agree, and narrowing to the
-//! external-usage surface exposes the self-receiver classification gap.
+//! agree field for field, within one workspace generation. Two tests carry
+//! the contract. `a_recursive_call_is_parity_clean_on_the_complete_row_set`
+//! pins the recursion shape that used to be one-sided: since #1638 the
+//! inverse listing enumerates the recursive site, so the complete row sets
+//! agree -- and `the_external_surface_exposes_the_recursive_self_receiver_gap`
+//! shows the surface comparison still reporting the site as one-sided when
+//! the comparison is narrowed to the external-usage surface, which omits a
+//! `self_receiver` row by design. The sibling-call pair shows the same
+//! surface comparison on a call from another declaration in the same class.
 //!
 //! Every test asserts the run's completion before reading its findings: the
 //! soundness rule returns zero findings whenever an input is incomplete, so a
@@ -34,9 +34,10 @@ const JAVA_REGISTRY: &str =
     "package fixture;\n\npublic class Registry {\n    public void register() {\n    }\n}\n";
 const JAVA_STARTUP: &str = "package fixture;\n\npublic class Startup {\n    void boot(Registry registry) {\n        registry.register();\n    }\n}\n";
 
-/// A recursive call: the forward producer states an ordinary reference edge,
-/// while the inverse listing omits the site entirely -- a genuine one-sided
-/// edge in the current engine, on every surface.
+/// A recursive call: the forward producer states an ordinary reference edge
+/// and, since #1638, the inverse listing states the same site as a
+/// `self_receiver` row -- so the complete row sets agree and only the
+/// external-usage surface is one-sided.
 const JAVA_RECURSIVE: &str = "package fixture;\n\npublic class Countdown {\n    void tick(int remaining) {\n        if (remaining > 0) {\n            tick(remaining - 1);\n        }\n    }\n}\n";
 
 /// A sibling call through the implicit receiver: both producers state the
@@ -152,17 +153,45 @@ fn parity_is_clean_on_a_plain_proven_cross_file_call() {
     );
 }
 
-/// The one-sided edge: the forward producer states the recursive call and the
-/// inverse listing omits the site entirely. The finding names the unmatched
-/// edge and both provenance chains.
+/// The recursive call, compared on the complete row set: both producers now
+/// state the site, so there is nothing one-sided left to report (#1638).
 #[test]
-fn a_recursive_call_is_a_one_sided_edge_the_parity_assert_reports() {
+fn a_recursive_call_is_parity_clean_on_the_complete_row_set() {
     let (_project, analyzer) = java_recursive();
     let run = evaluate(
         &policy(
             "test.edge.parity.recursive",
             RECURSIVE_TOKEN_SUBJECT,
             r#"(assert-edge-parity :id parity :at "site" :role member_position)"#,
+        ),
+        &analyzer,
+    );
+    assert_eq!(
+        run.completion(),
+        &PolicyRunCompletion::Complete,
+        "{:?}",
+        run.diagnostics()
+    );
+    assert!(
+        run.findings().is_empty(),
+        "the inverse listing states the recursive site: {:?}",
+        run.findings()
+    );
+}
+
+/// The same recursive call compared on the external-usage surface alone is
+/// one-sided, because the inverse row is classified `self_receiver` and that
+/// surface omits it by design while the forward producer's row stays. The
+/// finding names the unmatched edge.
+#[test]
+fn the_external_surface_exposes_the_recursive_self_receiver_gap() {
+    let (_project, analyzer) = java_recursive();
+    let run = evaluate(
+        &policy(
+            "test.edge.parity.recursive.external",
+            RECURSIVE_TOKEN_SUBJECT,
+            r#"(assert-edge-parity :id parity :at "site" :role member_position
+                          :surface external-usages)"#,
         ),
         &analyzer,
     );

@@ -59,6 +59,27 @@ pub fn reclassify_self_receiver_hit_at(
     reclassify_hit_at(hits, file, start, end, UsageHit::into_self_receiver);
 }
 
+/// Decide what a proven hit whose enclosing declaration *is* the target means
+/// (#1638). `None` drops the hit.
+///
+/// For a callable target the site is a recursive call. The forward occurrence
+/// resolver states that edge and calls it a `self_reference`, so the inverse
+/// listing must state it too, and `SelfReceiver` says both halves of the truth:
+/// editor find-references lists the site, and the external usage surface omits
+/// it, so dead-code evidence and the callsite budget still count only calls
+/// from elsewhere.
+///
+/// For any other target -- a class, a field, a module -- "enclosing is the
+/// target" is not recursion. It is the declaration's own name, or something
+/// written inside the declaration that names it, and neither is a use of it, so
+/// it stays dropped as before.
+pub fn classify_recursive_hit(hit: UsageHit, target: &CodeUnit) -> Option<UsageHit> {
+    if hit.enclosing != *target {
+        return Some(hit);
+    }
+    target.is_function().then(|| hit.into_self_receiver())
+}
+
 fn reclassify_hit_at(
     hits: &mut BTreeSet<UsageHit>,
     file: &ProjectFile,

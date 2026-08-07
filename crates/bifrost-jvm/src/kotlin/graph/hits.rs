@@ -42,20 +42,29 @@ pub fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
         return;
     };
-    // A reference inside the target's own body is not a usage of it. Types are
-    // exempt: a class naming itself (a factory returning its own type, a
-    // self-referential parameter) is a real reference.
-    if enclosing == ctx.spec.target && !ctx.spec.target.is_class() {
+    // A reference inside a *callable* target's own body is a recursive call
+    // (#1638): recorded, then classified `SelfReceiver`, so editor
+    // find-references lists it while the external usage surface omits it.
+    // Types are exempt: a class naming itself (a factory returning its own
+    // type, a self-referential parameter) is an ordinary reference. Every
+    // other enclosing-equals-target reference stays dropped.
+    if enclosing == ctx.spec.target && !ctx.spec.target.is_function() && !ctx.spec.target.is_class()
+    {
         return;
     }
+    let recursive = enclosing == ctx.spec.target && ctx.spec.target.is_function();
+    let end = node.end_byte();
     ctx.hits.insert(usage_hit(
         ctx.file,
         line_idx,
         start,
-        node.end_byte(),
+        end,
         enclosing,
         snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
     ));
+    if recursive {
+        reclassify_self_receiver_hit_at(ctx.hits, ctx.file, start, end);
+    }
     refresh_usage_limit(ctx);
 }
 
