@@ -107,7 +107,126 @@ fn widget_pack(completeness: &str) -> CompiledSemanticModelPack {
     .unwrap_or_else(|diagnostics| panic!("fixture pack must compile: {diagnostics:#?}"))
 }
 
-fn activation_request() -> SemanticModelActivationRequest {
+/// A pack for a crate whose `Serialize` is declared at `widget::internal` and
+/// re-exported from the crate root with `pub use`.
+///
+/// `followed` is the whole point of the fixture. A rustdoc producer that walks
+/// the `pub use` chain publishes the *re-exported* spelling `widget.Serialize`
+/// alongside the declaration, and records a complete surface. One that cannot
+/// walk it publishes only `widget.internal.Serialize` and records itself
+/// partial -- which is what stops the ladder proving `widget::Serialize`
+/// absent when it plainly is not.
+fn reexport_pack(followed: bool) -> CompiledSemanticModelPack {
+    let type_fact = |id: &str, name: &str, kind: &str| {
+        json!({
+            "id": id,
+            "name": name,
+            "type_kind": kind,
+            "visibility": "public",
+            "aliases": json!([]),
+            "locator": locator(name)
+        })
+    };
+    let mut types = vec![
+        type_fact("type.reexport.root", PACKAGE, "module"),
+        type_fact("type.reexport.internal", "widget.internal", "module"),
+        type_fact(
+            "type.reexport.declared",
+            "widget.internal.Serialize",
+            "struct",
+        ),
+    ];
+    if followed {
+        types.push(type_fact(
+            "type.reexport.surfaced",
+            "widget.Serialize",
+            "struct",
+        ));
+    }
+    let value = json!({
+        "schema_version": 1,
+        "pack_id": "fixture.rust.reexport",
+        "version": "1.0.0",
+        "producer": { "name": "rust-fixture", "version": "1.0.0" },
+        "language": "rust",
+        "ecosystem": "cargo",
+        "compatibility": { "bifrost": "*", "toolchains": [] },
+        "provenance": { "source": "fixture" },
+        "license": "NOASSERTION",
+        "completeness": if followed { "complete" } else { "partial" },
+        "safety": { "generated_code_only": false, "review_required": false },
+        "shards": [{
+            "id": "declarations.rust.external",
+            "activation": [{ "package": { "name": PACKAGE } }],
+            "payload": {
+                "kind": "declaration_facts",
+                "types": types,
+                "members": [],
+                "relations": []
+            }
+        }]
+    });
+    compile_source(
+        SourceFormat::Json,
+        &serde_json::to_vec(&value).unwrap(),
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("fixture pack must compile: {diagnostics:#?}"))
+}
+
+/// A complete `widget` pack whose shard activates only for `pack_target`.
+fn target_pinned_pack(pack_target: &str) -> CompiledSemanticModelPack {
+    let type_fact = |id: &str, name: &str, kind: &str| {
+        json!({
+            "id": id,
+            "name": name,
+            "type_kind": kind,
+            "visibility": "public",
+            "aliases": json!([]),
+            "locator": locator(name)
+        })
+    };
+    let value = json!({
+        "schema_version": 1,
+        "pack_id": "fixture.rust.target",
+        "version": "1.0.0",
+        "producer": { "name": "rust-fixture", "version": "1.0.0" },
+        "language": "rust",
+        "ecosystem": "cargo",
+        "compatibility": { "bifrost": "*", "toolchains": [] },
+        "provenance": { "source": "fixture" },
+        "license": "NOASSERTION",
+        "completeness": "complete",
+        "safety": { "generated_code_only": false, "review_required": false },
+        "shards": [{
+            "id": "declarations.rust.external",
+            "activation": [{
+                "package": { "name": PACKAGE },
+                "targets": [pack_target]
+            }],
+            "payload": {
+                "kind": "declaration_facts",
+                "types": [
+                    type_fact("type.target.root", PACKAGE, "module"),
+                    type_fact("type.target.widget", "widget.Widget", "struct"),
+                ],
+                "members": [],
+                "relations": []
+            }
+        }]
+    });
+    compile_source(
+        SourceFormat::Json,
+        &serde_json::to_vec(&value).unwrap(),
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("fixture pack must compile: {diagnostics:#?}"))
+}
+
+fn activation_request_for(
+    pack_id: &str,
+    evidence_target: Option<&str>,
+) -> SemanticModelActivationRequest {
     SemanticModelActivationRequest {
         bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
         evidence: vec![SemanticModelActivationEvidence {
@@ -119,7 +238,7 @@ fn activation_request() -> SemanticModelActivationRequest {
             }),
             module: None,
             toolchain: None,
-            target: None,
+            target: evidence_target.map(str::to_owned),
             configuration: None,
             artifact_sha256: None,
         }],
@@ -127,7 +246,7 @@ fn activation_request() -> SemanticModelActivationRequest {
             scope: SemanticModelControlScope::Workspace,
             action: SemanticModelControlAction::Enable,
             selector: SemanticModelPackSelector {
-                pack_id: "fixture.rust.widget".to_owned(),
+                pack_id: pack_id.to_owned(),
                 version: None,
                 manifest_digest: None,
             },
@@ -167,6 +286,22 @@ fn activate(
     pack: &CompiledSemanticModelPack,
     discovery: Option<DependencyDiscoveryEvidence>,
 ) {
+    activate_pack(analyzer, pack, "fixture.rust.widget", discovery, None);
+    assert!(analyzer.analyzer().semantic_model_overlay().is_some());
+}
+
+/// Register `pack` as a session pack and activate it under `pack_id`.
+///
+/// Unlike [`activate`] this asserts nothing about the resulting overlay,
+/// because one caller deliberately activates a pack whose shard cannot match
+/// the workspace evidence.
+fn activate_pack(
+    analyzer: &WorkspaceAnalyzer,
+    pack: &CompiledSemanticModelPack,
+    pack_id: &str,
+    discovery: Option<DependencyDiscoveryEvidence>,
+    evidence_target: Option<&str>,
+) {
     let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
     catalog
         .register_session_pack(
@@ -182,13 +317,12 @@ fn activate(
         analyzer.analyzer(),
         &catalog,
         None,
-        &activation_request(),
+        &activation_request_for(pack_id, evidence_target),
         published.as_ref().map(|published| published.as_slice()),
         &CancellationToken::default(),
     ) else {
         panic!("Rust fixture pack must activate");
     };
-    assert!(analyzer.analyzer().semantic_model_overlay().is_some());
 }
 
 struct RustFixture {
@@ -553,6 +687,208 @@ fn an_associated_item_miss_is_incomplete_while_a_module_item_miss_is_proof() {
             .all(|diagnostic| !diagnostic.message.contains("not_an_inherent_item")),
         "{:#?}",
         report.diagnostics()
+    );
+}
+
+/// A `pub use` chain the producer followed: the re-exported spelling is
+/// published, so the source path into it resolves at the external boundary.
+#[test]
+fn a_followed_reexport_resolves_at_the_external_boundary() {
+    let fixture = RustFixture::new(&[(
+        "src/lib.rs",
+        "pub fn consume() {\n    widget::Serialize;\n}\n",
+    )]);
+    activate_pack(
+        &fixture.analyzer,
+        &reexport_pack(true),
+        "fixture.rust.reexport",
+        None,
+        None,
+    );
+
+    let report = fixture.report("src/lib.rs");
+    assert!(
+        report.diagnostics().is_empty(),
+        "a followed re-export must resolve: {:#?}",
+        report.diagnostics()
+    );
+    assert!(
+        resolved_at(&report, BoundaryStatus::ExternalIndexed),
+        "{:#?}",
+        report.outcomes()
+    );
+}
+
+/// A `pub use` chain the producer could not follow. The re-exported spelling is
+/// missing from the pack even though the crate really exports it, so proving it
+/// absent would be a false accusation. The producer records the surface partial
+/// for exactly this reason, and the ladder answers Incomplete.
+///
+/// The declaration the chain points at is still published, which is what
+/// distinguishes "the pack could not follow the re-export" from "the pack knows
+/// nothing about this crate".
+#[test]
+fn an_unfollowed_reexport_suppresses_instead_of_proving_absence() {
+    let fixture = RustFixture::new(&[(
+        "src/lib.rs",
+        "pub fn consume() {\n    widget::Serialize;\n    widget::internal::Serialize;\n}\n",
+    )]);
+    activate_pack(
+        &fixture.analyzer,
+        &reexport_pack(false),
+        "fixture.rust.reexport",
+        None,
+        None,
+    );
+
+    let report = fixture.report("src/lib.rs");
+    assert!(
+        report.diagnostics().is_empty(),
+        "an unfollowed re-export must not be accused: {:#?}",
+        report.diagnostics()
+    );
+    assert!(
+        resolved_at(&report, BoundaryStatus::ExternalIndexed),
+        "the declaration the chain points at must still resolve: {:#?}",
+        report.outcomes()
+    );
+    assert!(
+        incomplete_reasons(&report).iter().any(|reason| matches!(
+            reason,
+            SemanticDiagnosticIncompleteReason::UnsupportedSemantics { detail }
+                if detail.contains("partial")
+        )),
+        "{:#?}",
+        report.outcomes()
+    );
+}
+
+/// A pack produced for a different target cannot prove absence, because the
+/// activation runtime never publishes it: its shard pins a target the workspace
+/// evidence does not name, so the crate reads as unindexed rather than as a
+/// complete surface with a missing item.
+#[test]
+fn a_pack_for_another_target_cannot_prove_absence() {
+    let fixture = RustFixture::new(&[(
+        "src/lib.rs",
+        "pub fn consume() {\n    widget::Missing;\n}\n",
+    )]);
+    activate_pack(
+        &fixture.analyzer,
+        &target_pinned_pack("aarch64-apple-darwin"),
+        "fixture.rust.target",
+        None,
+        Some("x86_64-unknown-linux-gnu"),
+    );
+
+    let report = fixture.report("src/lib.rs");
+    assert!(
+        report.diagnostics().is_empty(),
+        "a pack for another target must not accuse: {:#?}",
+        report.diagnostics()
+    );
+    assert!(
+        missing_dependency_boundaries(&report).contains(&BoundaryStatus::ExternalUnknown),
+        "{:#?}",
+        report.outcomes()
+    );
+}
+
+/// The other direction of the same rule: when the pack's target is the one the
+/// workspace resolves, the shard activates and the complete surface proves the
+/// missing item. Without this the test above would pass for the wrong reason.
+#[test]
+fn a_pack_for_the_workspace_target_proves_absence() {
+    let fixture = RustFixture::new(&[(
+        "src/lib.rs",
+        "pub fn consume() {\n    widget::Missing;\n}\n",
+    )]);
+    activate_pack(
+        &fixture.analyzer,
+        &target_pinned_pack("x86_64-unknown-linux-gnu"),
+        "fixture.rust.target",
+        None,
+        Some("x86_64-unknown-linux-gnu"),
+    );
+
+    let report = fixture.report("src/lib.rs");
+    assert!(
+        report.outcomes().iter().any(|outcome| matches!(
+            outcome,
+            SemanticDiagnosticOutcome::Absent(proof)
+                if proof.boundary == BoundaryStatus::ExternalIndexed
+        )),
+        "a matching-target pack must still prove absence: {:#?}",
+        report.outcomes()
+    );
+}
+
+/// The rename end to end, both halves.
+///
+/// A Cargo `package = "..."` rename reaches the overlay as an *alias* added
+/// beside the crate's own name (`add_cargo_dependency_aliases`), so the renamed
+/// spelling resolves and a name absent under it is still proved absent against
+/// the same complete surface. The alias is additive, so the crate's original
+/// spelling keeps resolving too.
+///
+/// That second fact is a deliberate record of current behaviour, not an
+/// endorsement. Under a rename, `widget::Widget` is not a path Cargo accepts,
+/// and rustc would reject it; the ladder resolves it because the pack still
+/// publishes the crate's own name, which the pack needs for its own internal
+/// type references. The consequence is a missed error, never a false one, so
+/// it errs in the safe direction -- but it is a gap, and this test will fail
+/// the moment anyone makes the aliasing replace rather than add, which is the
+/// point of pinning it.
+#[test]
+fn a_cargo_rename_resolves_the_renamed_spelling_and_still_answers_the_original() {
+    let fixture = RustFixture::with_pack(
+        &[(
+            "src/lib.rs",
+            "pub fn consume() {\n    renamed_widget::Widget;\n    renamed_widget::Missing;\n}\n",
+        )],
+        "complete",
+    );
+
+    let report = fixture.report("src/lib.rs");
+    assert!(
+        resolved_at(&report, BoundaryStatus::ExternalIndexed),
+        "the renamed spelling must resolve: {:#?}",
+        report.outcomes()
+    );
+    assert!(
+        report.outcomes().iter().any(|outcome| matches!(
+            outcome,
+            SemanticDiagnosticOutcome::Absent(proof)
+                if proof.boundary == BoundaryStatus::ExternalIndexed
+        )),
+        "a miss under the renamed spelling is proved against the same surface: {:#?}",
+        report.outcomes()
+    );
+    assert!(
+        report
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("Missing")),
+        "{:#?}",
+        report.diagnostics()
+    );
+
+    // The crate's own spelling still answers, because the rename is published
+    // as an added alias rather than a replacement.
+    let original = RustFixture::with_pack(
+        &[("src/lib.rs", "pub fn consume() {\n    widget::Widget;\n}\n")],
+        "complete",
+    );
+    let original_report = original.report("src/lib.rs");
+    assert!(
+        original_report.diagnostics().is_empty(),
+        "the original spelling resolves today: {:#?}",
+        original_report.diagnostics()
+    );
+    assert!(
+        resolved_at(&original_report, BoundaryStatus::ExternalIndexed),
+        "{:#?}",
+        original_report.outcomes()
     );
 }
 
