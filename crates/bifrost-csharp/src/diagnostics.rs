@@ -188,6 +188,7 @@ pub fn collect_csharp_semantic_diagnostics(
         usings: file_using_namespaces(csharp, file),
         scope_is_visible: true,
         type_parameters: Vec::new(),
+        partial_declarations: HashSet::default(),
         report,
         diagnostic_count: 0,
     };
@@ -195,6 +196,7 @@ pub fn collect_csharp_semantic_diagnostics(
     // namespaces a file opens are all visible decides whether an unqualified
     // reference that misses everywhere was checked against a complete surface.
     collector.check_using_directives(&tree);
+    collector.collect_partial_declarations(&tree);
     collector.scan_tree(tree.root_node());
     collector.report
 }
@@ -225,6 +227,9 @@ struct CSharpDiagnosticCollector<'a> {
     /// Generic parameter names in scope, innermost frame last. A reference to
     /// one names no declaration and is not a lookup.
     type_parameters: Vec<HashSet<String>>,
+    /// Short names this file declares `partial`, whose member surface a
+    /// generated half may extend.
+    partial_declarations: HashSet<String>,
     report: SemanticDiagnosticReport,
     diagnostic_count: usize,
 }
@@ -371,6 +376,43 @@ impl CSharpDiagnosticCollector<'_> {
             BoundaryStatus::WorkspaceLocal
         } else {
             BoundaryStatus::ExternalIndexed
+        }
+    }
+
+    // -- partial declarations -----------------------------------------------
+
+    /// The short names of types this file declares `partial`.
+    ///
+    /// A `partial` type may be completed by a half this workspace never sees --
+    /// a source generator writes into the build's intermediate output, which is
+    /// not analyzed. Its own declarations are therefore only part of its member
+    /// surface, so a member miss against one proves nothing.
+    ///
+    /// The scan is of this file only, because it is the tree the request
+    /// already holds. A `partial` half declared in *another* file is not
+    /// detected, which leaves a known gap; the multi-file case that gap covers
+    /// is the benign one, since every part the workspace holds contributes its
+    /// members to the owner's fq-name lookup already.
+    fn collect_partial_declarations(&mut self, tree: &Tree) {
+        let mut cursor = tree.root_node().walk();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if matches!(
+                node.kind(),
+                "class_declaration"
+                    | "struct_declaration"
+                    | "record_declaration"
+                    | "record_struct_declaration"
+                    | "interface_declaration"
+            ) && declares_partial(node, self.source)
+                && let Some(name) = node.child_by_field_name("name")
+            {
+                self.partial_declarations
+                    .insert(node_text(name, self.source).trim().to_string());
+            }
+            for child in node.named_children(&mut cursor) {
+                stack.push(child);
+            }
         }
     }
 
@@ -747,6 +789,19 @@ impl CSharpDiagnosticCollector<'_> {
         member: &str,
         boundary: BoundaryStatus,
     ) {
+        if self.owner_may_be_generated(owner_fqn) {
+            self.report.push_incomplete(
+                Some(range),
+                vec![
+                    SemanticDiagnosticIncompleteReason::UnsupportedGeneratedSurface {
+                        detail: format!(
+                            "`{owner_fqn}` is declared partial, so a generated half may declare `{member}`"
+                        ),
+                    },
+                ],
+            );
+            return;
+        }
         if self.extension_method_could_apply(member) {
             self.report.push_incomplete(
                 Some(range),
@@ -768,6 +823,17 @@ impl CSharpDiagnosticCollector<'_> {
             CSHARP_UNRECOGNIZED_MEMBER,
             format!("unrecognized member `{member}` on `{owner_fqn}`"),
         );
+    }
+
+    /// Whether the owner is a `partial` type this file declares, so a half the
+    /// workspace never sees may declare the member.
+    ///
+    /// Matched on the short name: a file that declares `partial class Widget`
+    /// and reads a member off some other namespace's `Widget` suppresses one
+    /// claim it could have made, which is the safe direction to be wrong in.
+    fn owner_may_be_generated(&self, owner_fqn: &str) -> bool {
+        let short_name = owner_fqn.rsplit('.').next().unwrap_or(owner_fqn);
+        self.partial_declarations.contains(short_name)
     }
 
     /// Whether a static method named `member` is visible from this file, which
@@ -1016,6 +1082,14 @@ fn file_root(node: Node<'_>) -> Node<'_> {
         current = parent;
     }
     current
+}
+
+/// Whether a type declaration carries the `partial` modifier.
+fn declares_partial(node: Node<'_>, source: &str) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == "modifier")
+        .any(|child| node_text(child, source).trim() == "partial")
 }
 
 fn is_csharp_dynamic(declared: &str) -> bool {
