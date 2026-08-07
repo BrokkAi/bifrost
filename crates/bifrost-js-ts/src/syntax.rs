@@ -366,18 +366,23 @@ fn direct_object_pair_receiver<'tree>(
         return None;
     }
     let object = pair.parent().filter(|parent| parent.kind() == "object")?;
-    let declarator = object
-        .parent()
-        .filter(|parent| parent.kind() == "variable_declarator")?;
-    if declarator
-        .child_by_field_name("value")
-        .is_none_or(|value| value.id() != object.id())
-    {
-        return None;
-    }
-    let receiver = declarator.child_by_field_name("name")?;
-    let receiver = static_member_receiver(receiver, source)?;
-    receiver.members.is_empty().then_some((receiver, property))
+    let bound = object.parent()?;
+    // The literal is the whole value of a binding, so its keys are properties of
+    // whatever that binding names: `const x = { key: ... }` mints `x.key`, and
+    // `x.y = { key: ... }` mints `x.y.key`. A chained receiver is kept whole --
+    // the read side compares receiver member chains element-wise.
+    let receiver = match bound.kind() {
+        "variable_declarator" => bound
+            .child_by_field_name("value")
+            .filter(|value| value.id() == object.id())
+            .and_then(|_| bound.child_by_field_name("name")),
+        "assignment_expression" => bound
+            .child_by_field_name("right")
+            .filter(|right| right.id() == object.id())
+            .and_then(|_| bound.child_by_field_name("left")),
+        _ => None,
+    }?;
+    static_member_receiver(receiver, source).map(|receiver| (receiver, property))
 }
 
 pub fn static_member_receiver<'tree>(

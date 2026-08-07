@@ -228,6 +228,13 @@ fn exported_local_property_binding(
         &target_member,
     )
     .into_iter()
+    // Only a bare receiver may seed importers. The importer-side match treats the
+    // imported binding as the direct owner of the property
+    // (`expression_carries_target_object` in `extractor`), so a chained receiver
+    // such as `host.viaAssignment = { key: 1 }` would report `imported.key` --
+    // a property that does not exist -- while still missing the real
+    // `imported.viaAssignment.key` read. #1780 fixed the same-file inverse for
+    // those chains; carrying them across files needs a chain-aware importer match.
     .find_map(|definition| {
         definition
             .receiver
