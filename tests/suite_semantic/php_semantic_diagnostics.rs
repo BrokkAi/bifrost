@@ -182,12 +182,25 @@ class Service {
 }
 
 #[test]
-fn a_malformed_file_reports_nothing_and_stays_complete() {
-    // Parse diagnostics own a broken file. The semantic pass must not claim the
-    // file is incomplete, because it deliberately did not look.
+fn a_malformed_file_reports_no_errors_and_a_typed_incomplete() {
+    // Parse diagnostics own a broken file. The semantic pass emits no errors
+    // about it, and records that the file could not be judged so an empty
+    // result is not mistaken for clean.
     let report =
         report("<?php\nnamespace App;\nclass Broken { public function run(: void { X; }\n");
 
     assert!(report.diagnostics().is_empty());
-    assert!(report.outcomes().is_empty(), "{:#?}", report.outcomes());
+    assert!(
+        matches!(
+            report.outcomes(),
+            [SemanticDiagnosticOutcome::Incomplete { range: None, reasons }]
+                if matches!(
+                    reasons.as_slice(),
+                    [SemanticDiagnosticIncompleteReason::UnsupportedSemantics { detail }]
+                        if detail.contains("parse errors")
+                )
+        ),
+        "{:#?}",
+        report.outcomes()
+    );
 }

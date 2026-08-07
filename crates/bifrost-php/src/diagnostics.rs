@@ -102,7 +102,14 @@ pub fn collect_php_semantic_diagnostics(
     collect_parse_errors(tree.root_node(), &mut parse_errors);
     if !parse_errors.is_empty() {
         // A malformed file belongs to the parse-diagnostic path. The semantic
-        // pass reports nothing about it, and says nothing incomplete either.
+        // report records that this file could not be judged, so an empty
+        // result is not mistaken for clean.
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "PHP source has parse errors".to_string(),
+            }],
+        );
         return report;
     }
 

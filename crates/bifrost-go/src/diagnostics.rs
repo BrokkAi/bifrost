@@ -93,8 +93,15 @@ pub fn collect_go_semantic_diagnostics(
     collect_parse_errors(tree.root_node(), &mut parse_errors);
     if !parse_errors.is_empty() {
         // A malformed file is a parse problem, reported through the LSP parse
-        // path. Its name lookups are meaningless, so this request checked
-        // nothing and claims nothing.
+        // path. Its name lookups are meaningless, so the semantic report
+        // records that this file could not be judged, and an empty result is
+        // not mistaken for clean.
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "Go source has parse errors".to_string(),
+            }],
+        );
         return report;
     }
 
