@@ -24,6 +24,8 @@ Scope is the MCP `symbols` toolset and the associated Rust and Python APIs; LSP 
 - [ ] M2: `--probe-seed` pluggability in `collect_sampled_sites`, forward adjudication of census sites tagged `seed: census`, tier-2/3 classification, ledger/shrink/single-line rerun.
 - [ ] M3: inverse-precision check (name-literal), sharded corpus runner (`--shard K/N`), per-language ranking; two-language corpus pass.
 - [ ] Campaign: per-language depth-first passes over top-20 repos; file/fix/close/merge; per-language summary. Rediscovery audit against #1526/#1527/#1528/#1537/#1377 (#1376 already fixed and closed).
+  - [x] (2026-08-07) RUST run complete (20/20 repos, `--tiers 1`, clone HEADs, `/mnt/optane/tmp/bifrost-fird/rust-census-54eee258.jsonl`). 471 actionable = 293 forward-adjudicated misses + 178 tier-1 gaps. Signal/noise: ~183 are prelude/std noise (`Err` 116, `Ok` 48, `drop` 19) - forward can't resolve external std, or mis-resolves `Err` to a same-named local enum (nom). Many remaining forward-adjudicated misses are forward mis-resolutions to a *module* target (e.g. `field::ValueSet` -> `tracing.field` module), which the runbook says is not a legitimate inverse miss. Clearest genuine finding: tracing-subscriber `Filter` trait-reference inverse miss (6 witnesses, forward-correct, complete-but-absent). It does not minimize (plain trait-bound/cross-module/simple-cfg cases are all Consistent), so it was FILED + ESCALATED to Dave as #1749 (cfg-gated-trait-in-multi-crate-workspace interaction, same area as #1377).
+  - [ ] RUST remaining: triage the non-noise tail (coreutils `Type::method`/`Type::CONST` associated-member misses; `State`/`Self::Error` associated-type refs) for any minimizable, generalizable, fixable bug; else conclude rust's directly-fixable yield is low and summarize.
 
 ## Surprises & Discoveries
 
@@ -43,6 +45,15 @@ Scope is the MCP `symbols` toolset and the associated Rust and Python APIs; LSP 
   Date/Author: 2026-08-07, Claude (Opus) with Jonathan.
 - Decision: Implement the census walk as a new `CandidateFrontier::Census` variant of the existing iterative `collect_candidate_ranges` rather than a separate module.
   Rationale: The traversal, limit handling, and cancellation are already correct and stack-safe; census differs only in the leaf predicate (identifier-class, comment/string excluded) and the absence of per-language reference exclusions. Reuse avoids a parallel divergent walker. (Revisit if scope-path/role recording makes the shared function unwieldy.)
+  Date/Author: 2026-08-07, Claude (Opus).
+- Decision: M2's ledger/shrink/rerun is realized as a post-processing triage script (`/mnt/optane/tmp/bifrost-fird/triage.py`) over the report JSONL rather than embedded in the engine; M3's `--shard` is realized as subagent-level parallelism (independent per-repo/per-language runs) rather than an in-process shard flag.
+  Rationale: The report JSONL already carries every evidence field the ledger needs (seed, tier, forward_status, targets, inverse_hit, source_evidence, repo_head), and this campaign is agent-adjudicated (not the autonomous run-until-dry loop the in-engine ledger/shrink was designed for). Subagent parallelism (user-authorized) covers corpus throughput without an in-process sharder. Keeps engine risk low and gets to real findings faster. The census FINDING capability (forward adjudication + tier grading) is fully in the engine.
+  Date/Author: 2026-08-07, Claude (Opus).
+- Decision: Campaign runs use `--tiers 1` (actionable = forward-adjudicated misses + tier-1 gaps) at first, widening only if the high-precision set dries up.
+  Rationale: A 60-file tokio smoke run already produced ~160 tier-3 rows; tier-3 is exploration-grade and would swamp hand-adjudication at full budget. Forward-adjudicated misses are reported regardless of `--tiers`, so `--tiers 1` keeps the actionable set high-precision.
+  Date/Author: 2026-08-07, Claude (Opus).
+- Decision: Campaign runs analyze each clone at its current clean HEAD (recorded as `repo_head`) rather than force-checking-out corpus pins.
+  Rationale: `run-corpus` reads and records the clone HEAD; all sampled clones are clean. A bug reproduced at a clean checkout is a valid finding, and the recorded head makes it reproducible. Force-checkout of 220 clones is out of scope for finding+fixing analyzer bugs.
   Date/Author: 2026-08-07, Claude (Opus).
 
 ## Outcomes & Retrospective
