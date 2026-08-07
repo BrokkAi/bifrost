@@ -484,6 +484,58 @@ func Run() {
     );
 }
 
+/// The census differential found Go receiver type mentions forward-resolving to
+/// the type while the inverse listing omitted them entirely (#1765: 2462 of 2485
+/// forward-adjudicated misses on the Go top-20 corpus). They are now inverse-
+/// visible as `SelfReceiver`, so the site classifies `editor_only`, while an
+/// ordinary type reference stays `consistent`.
+#[test]
+fn go_method_receiver_type_is_an_editor_only_reference_site() {
+    let source = r#"package main
+
+type ResourceType int
+
+func (r ResourceType) String() string {
+    return "resource"
+}
+
+func Describe(value ResourceType) string {
+    return value.String()
+}
+"#;
+    let report = go_differential(&[("go.mod", "module example.com/app\n"), ("main.go", source)]);
+    let receiver_type = source.find("r ResourceType").expect("receiver type") + "r ".len();
+    let parameter_type =
+        source.find("value ResourceType").expect("parameter type") + "value ".len();
+
+    let receiver_site = report
+        .sites
+        .iter()
+        .find(|site| site.start_byte == receiver_type)
+        .expect("the receiver type remains a sampled reference site");
+    assert_eq!(
+        receiver_site.forward_status, "resolved",
+        "{receiver_site:#?}"
+    );
+    assert_eq!(
+        receiver_site.classification,
+        ReferenceClassification::EditorOnly,
+        "the receiver type mention is editor-visible but not an external usage: {receiver_site:#?}"
+    );
+
+    let parameter_site = report
+        .sites
+        .iter()
+        .find(|site| site.start_byte == parameter_type)
+        .expect("the parameter type remains a sampled reference site");
+    assert_eq!(
+        parameter_site.classification,
+        ReferenceClassification::Consistent,
+        "{parameter_site:#?}"
+    );
+    assert_eq!(report.summary.classifications.missing, 0, "{report:#?}");
+}
+
 #[test]
 fn rust_nested_cargo_private_import_round_trips_to_its_physical_crate() {
     let consumer = r#"use crate::fs::asyncify;

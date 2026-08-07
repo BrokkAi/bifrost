@@ -47,12 +47,13 @@ pub(crate) fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-/// Record `node` as a same-owner receiver hit (#1014 facet B): a call whose
-/// receiver is the enclosing method's own receiver variable (Go's analog of
-/// `self`/`this`). Excluded from the external usage surface, counted as a
-/// same-owner site. Records the ordinary hit, then reclassifies it — the shared
-/// scan consumer, so the record ceremony (span, enclosing, self-definition
-/// guard) lives in exactly one place.
+/// Record `node` as a same-owner receiver hit: a call whose receiver is the
+/// enclosing method's own receiver variable (Go's analog of `self`/`this`,
+/// #1014 facet B), or the receiver's type name in a method header (#1765).
+/// Excluded from the external usage surface, counted as a same-owner site.
+/// Records the ordinary hit, then reclassifies it — the shared scan consumer,
+/// so the record ceremony (span, enclosing, self-definition guard) lives in
+/// exactly one place.
 pub(crate) fn record_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     record_hit(node, ctx);
     reclassify_self_receiver_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());

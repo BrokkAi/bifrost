@@ -266,6 +266,43 @@ pub fn is_method_receiver_type(node: Node<'_>) -> bool {
     }
     false
 }
+
+/// Whether `node` is the type name a method receiver attaches the method to --
+/// `Stack` in `func (s *Stack[T]) Push()`.
+///
+/// This is narrower than [`is_method_receiver_type`], which is true of every
+/// identifier anywhere inside the receiver's type. The pointer wrapper carries
+/// no name, and the type arguments in receiver position are the receiver's own
+/// type-parameter *bindings* (`T` declares a parameter here; it does not
+/// reference a type called `T`), so only the base name is a mention of a
+/// declared type.
+pub fn is_method_receiver_type_name(node: Node<'_>) -> bool {
+    if node.kind() != "type_identifier" {
+        return false;
+    }
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if current.kind() == "parameter_declaration" {
+            return is_method_receiver_parameter(current)
+                && receiver_type_name(current).is_some_and(|name| same_node(name, node));
+        }
+        ancestor = current.parent();
+    }
+    false
+}
+
+/// Peel the receiver's declared type down to the `type_identifier` it names.
+fn receiver_type_name(receiver_parameter: Node<'_>) -> Option<Node<'_>> {
+    let mut node = receiver_parameter.child_by_field_name("type")?;
+    loop {
+        match node.kind() {
+            "type_identifier" => return Some(node),
+            "pointer_type" => node = first_named_child(node)?,
+            "generic_type" => node = node.child_by_field_name("type")?,
+            _ => return None,
+        }
+    }
+}
 /// Return the structured owner type for a keyed composite-literal element.
 ///
 /// An elided value such as `[1]Owner{{Field: value}}` has no type node at the

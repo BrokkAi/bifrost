@@ -820,6 +820,67 @@ class Foo {
     );
 }
 
+/// Renaming a Go type must rewrite its method receivers too, or the workspace
+/// stops compiling. The receiver mentions reach rename through the same
+/// `SelfReceiver` classification that keeps them off the external usage surface
+/// (#1765).
+#[test]
+fn rename_symbol_includes_go_receiver_type_mentions() {
+    let source = r#"package app
+
+type ResourceType int
+
+func (r ResourceType) String() string {
+    return "resource"
+}
+
+func (r *ResourceType) Reset() {
+    *r = 0
+}
+
+func Describe(value ResourceType) string {
+    return value.String()
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("resource.go", source)
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+    let args = serde_json::json!({
+        "path": "resource.go",
+        "line": 3,
+        "column": 6,
+        "new_name": "ResourceKind"
+    });
+
+    let payload = service
+        .call_tool_json("rename_symbol", &args.to_string())
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!("ok", value["status"], "payload: {value}");
+    let edits = value["edits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "resource.go")
+        .and_then(|file| file["edits"].as_array())
+        .expect("resource.go edits");
+    let renamed_lines: BTreeSet<u64> = edits
+        .iter()
+        .filter(|edit| edit["old_text"] == "ResourceType" && edit["new_text"] == "ResourceKind")
+        .filter_map(|edit| edit["start_line"].as_u64())
+        .collect();
+
+    assert_eq!(
+        BTreeSet::from([3, 5, 9, 13]),
+        renamed_lines,
+        "rename must rewrite the declaration, both method receivers and the parameter type: {value}"
+    );
+}
+
 #[test]
 fn get_file_contents_reads_workspace_git_history() {
     let temp = TempDir::new().unwrap();
