@@ -42,7 +42,7 @@ pub fn seeds_for_target(
                     // identity so inverse queries can seed it.
                     Some(local_name.as_deref().unwrap_or("default"))
                 }
-                ExportEntry::ReexportedNamed { .. } => None,
+                ExportEntry::ReexportedNamed { .. } | ExportEntry::ReexportedModule { .. } => None,
             };
             if let Some(local_name) = local
                 && export_local_matches_target(

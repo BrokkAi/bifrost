@@ -713,7 +713,7 @@ fn canonical_export_keys_inner(
                 }
                 return BTreeSet::new();
             }
-            ExportEntry::ReexportedNamed { .. } => {}
+            ExportEntry::ReexportedNamed { .. } | ExportEntry::ReexportedModule { .. } => {}
         }
     }
 

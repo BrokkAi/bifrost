@@ -3703,3 +3703,220 @@ fn plain_string_identifier_text_is_not_a_usage() {
 
     assert!(hits.is_empty(), "plain string text is not code: {hits:#?}");
 }
+
+// Issue #1763: a module-qualified annotation whose target is owned by a module
+// (a type alias, TypeVar, NewType value, or a function) is a usage. Only the
+// class-owned shapes used to survive the annotation path.
+#[test]
+fn module_qualified_annotation_resolves_module_field_target() {
+    let source = "import op_tree\n\n\ndef g() -> op_tree.OP_TREE:\n    return 1\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("op_tree.py", "OP_TREE = int\n")
+        .file("user.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "op_tree.OP_TREE",
+        "user.py",
+        source,
+        &[("OP_TREE", 0)],
+    );
+}
+
+#[test]
+fn module_qualified_subscripted_annotation_resolves_module_field_target() {
+    let source =
+        "import op_tree\n\n\ndef g(items: list[op_tree.OP_TREE]) -> None:\n    return None\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("op_tree.py", "OP_TREE = int\n")
+        .file("user.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "op_tree.OP_TREE",
+        "user.py",
+        source,
+        &[("OP_TREE", 0)],
+    );
+}
+
+#[test]
+fn module_qualified_annotation_resolves_module_function_target() {
+    let source = "import service\nfrom typing import Annotated\n\n\ndef g() -> Annotated[int, service.merge]:\n    return 1\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "def merge(left, right):\n    return left\n")
+        .file("user.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "service.merge",
+        "user.py",
+        source,
+        &[("merge", 0)],
+    );
+}
+
+#[test]
+fn module_qualified_value_reference_resolves_module_field_target() {
+    // Control: the value position always worked and must keep working.
+    let source = "import op_tree\n\nvalue = op_tree.OP_TREE\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("op_tree.py", "OP_TREE = int\n")
+        .file("user.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "op_tree.OP_TREE",
+        "user.py",
+        source,
+        &[("OP_TREE", 0)],
+    );
+}
+
+#[test]
+fn bare_name_annotation_resolves_module_field_target() {
+    // Control: the from-import spelling of the same reference was consistent.
+    let source = "from op_tree import OP_TREE\n\n\ndef g() -> OP_TREE:\n    return 1\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("op_tree.py", "OP_TREE = int\n")
+        .file("user.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "op_tree.OP_TREE",
+        "user.py",
+        source,
+        &[("OP_TREE", 1)],
+    );
+}
+
+#[test]
+fn module_qualified_annotation_resolves_class_target() {
+    // Control: a class target through the same syntax was consistent.
+    let source =
+        "import service\n\n\ndef g(value: service.Thing) -> service.Thing:\n    return value\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "class Thing:\n    pass\n")
+        .file("user.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "service.Thing",
+        "user.py",
+        source,
+        &[("Thing", 0), ("Thing", 1)],
+    );
+}
+
+#[test]
+fn module_qualified_annotation_resolves_class_owned_field_target() {
+    // Issue #1763 also lifted this shape: a class-owned alias reached through a
+    // namespace import used to produce no proven hit at all.
+    let source = "import service\n\n\ndef g() -> service.Holder.Alias:\n    return 1\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "class Holder:\n    Alias = int\n")
+        .file("user.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "service.Holder.Alias",
+        "user.py",
+        source,
+        &[("Alias", 0)],
+    );
+}
+
+// Issue #1764: re-exports nested in a block are exports too. The AST collector
+// the export index falls back to when an import name collides with a top-level
+// declaration used to look at depth-1 children only.
+const PYTHON_NESTED_REEXPORT_CONSUMER: &str =
+    "from .compatibility import timeout\n\n\ndef go():\n    with timeout(5):\n        pass\n";
+
+fn python_nested_reexport_project(compatibility: &str) -> BuiltInlineTestProject {
+    InlineTestProject::with_language(Language::Python)
+        .file("src/ws/__init__.py", "")
+        .file(
+            "src/ws/async_timeout.py",
+            "def timeout(delay):\n    return delay\n",
+        )
+        .file("src/ws/compatibility.py", compatibility)
+        .file("src/ws/server.py", PYTHON_NESTED_REEXPORT_CONSUMER)
+        .build()
+}
+
+#[test]
+fn block_nested_reexport_shadowing_a_declaration_reaches_consumers() {
+    let project = python_nested_reexport_project(
+        "zzz = 1\nif True:\n    from asyncio import zzz\n    from .async_timeout import timeout\n",
+    );
+
+    assert_python_usage_hits(
+        &project,
+        "ws.async_timeout.timeout",
+        "src/ws/server.py",
+        PYTHON_NESTED_REEXPORT_CONSUMER,
+        &[("timeout", 1)],
+    );
+}
+
+#[test]
+fn flat_reexport_shadowing_a_declaration_reaches_consumers() {
+    // Control: the same collision without nesting was always consistent.
+    let project = python_nested_reexport_project(
+        "zzz = 1\nfrom asyncio import zzz\nfrom .async_timeout import timeout\n",
+    );
+
+    assert_python_usage_hits(
+        &project,
+        "ws.async_timeout.timeout",
+        "src/ws/server.py",
+        PYTHON_NESTED_REEXPORT_CONSUMER,
+        &[("timeout", 1)],
+    );
+}
+
+#[test]
+fn block_nested_reexport_without_a_collision_reaches_consumers() {
+    // Control: with no shadowed name the export index reads the import records,
+    // which always saw nested imports.
+    let project =
+        python_nested_reexport_project("if True:\n    from .async_timeout import timeout\n");
+
+    assert_python_usage_hits(
+        &project,
+        "ws.async_timeout.timeout",
+        "src/ws/server.py",
+        PYTHON_NESTED_REEXPORT_CONSUMER,
+        &[("timeout", 1)],
+    );
+}
+
+#[test]
+fn function_scoped_import_is_not_a_reexport() {
+    // Near miss for the block-nested walk: a function body is a scope, so the
+    // import it runs binds a local, not an export of the module.
+    let project = python_nested_reexport_project(
+        "zzz = 1\nif True:\n    from asyncio import zzz\n\n\ndef load():\n    from .async_timeout import timeout\n\n    return timeout\n",
+    );
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "ws.async_timeout.timeout");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should succeed for the function-scoped import");
+
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != project.file("src/ws/server.py")),
+        "a function-local import does not re-export the name: {hits:#?}"
+    );
+}

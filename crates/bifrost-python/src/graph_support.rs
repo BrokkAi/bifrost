@@ -273,13 +273,23 @@ fn collect_reexport_events(
     events: &mut Vec<(usize, String, ExportEntry)>,
     index: &mut ExportIndex,
 ) {
-    let mut cursor = root.walk();
-    for node in root.named_children(&mut cursor) {
-        if node.kind() != "import_from_statement" {
-            continue;
-        }
-        for info in python_import_infos_from_node(node, source) {
-            record_single_reexport_event(python, file, &info, events, index);
+    // Module scope is not depth one. A `from ... import` inside an if/else,
+    // try/except, with or match block still binds a module-level name, so it
+    // re-exports like any other (issue #1764). Only a function or class body
+    // opens a scope whose bindings are not module exports.
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            match child.kind() {
+                "import_from_statement" => {
+                    for info in python_import_infos_from_node(child, source) {
+                        record_single_reexport_event(python, file, &info, events, index);
+                    }
+                }
+                "function_definition" | "class_definition" => {}
+                _ => stack.push(child),
+            }
         }
     }
 }
@@ -333,14 +343,18 @@ fn record_single_reexport_event(
         return;
     }
     let exported_name = alias.unwrap_or(name.clone());
-    let imported_name = format!("{resolved_module}.{name}");
-    if resolve_module_code_unit(python, &imported_name).is_some() {
+    // `from P import S` binds the submodule `P.S` itself when that module
+    // exists, exactly as the import binder reads it below. Recording it as
+    // "the name S inside module P.S" would follow the subpackage's own
+    // exports, which silently mis-resolves whenever the subpackage re-exports
+    // a member named after itself (issue #1762).
+    let module_candidate = format!("{resolved_module}.{name}");
+    if resolve_module_code_unit(python, &module_candidate).is_some() {
         events.push((
             start_byte,
             exported_name,
-            ExportEntry::ReexportedNamed {
-                module_specifier: imported_name,
-                imported_name: name,
+            ExportEntry::ReexportedModule {
+                module_specifier: module_candidate,
             },
         ));
         return;

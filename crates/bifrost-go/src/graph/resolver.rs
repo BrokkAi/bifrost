@@ -173,7 +173,7 @@ fn build_reexport_edges(
                             .push((file.clone(), exported_name.clone()));
                     }
                 }
-                ExportEntry::Default { .. } => {}
+                ExportEntry::Default { .. } | ExportEntry::ReexportedModule { .. } => {}
                 ExportEntry::ReexportedNamed {
                     module_specifier,
                     imported_name,

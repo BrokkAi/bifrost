@@ -291,10 +291,10 @@ fn resolve_annotation_attribute_types(
     node: Node<'_>,
 ) -> Vec<CodeUnit> {
     // Preserve the established namespace-import path (`module.Type`) while
-    // adding owner-qualified nested classes (`Outer.Inner`). The constructor
-    // resolver already understands module/re-export bindings; it simply cannot
-    // interpret a class as the namespace for another class.
-    let mut candidates = resolve_constructor_types(graph, python, file, source, node);
+    // adding owner-qualified nested classes (`Outer.Inner`). The namespace walk
+    // already understands module/re-export bindings; it simply cannot interpret
+    // a class as the namespace for another class.
+    let mut candidates = namespace_qualified_declarations(graph, python, file, source, node);
     let Some((root, attributes)) = annotation_attribute_chain(node) else {
         return candidates;
     };
@@ -480,14 +480,14 @@ pub fn resolve_constructor_types(
     source: &str,
     function: Node<'_>,
 ) -> Vec<CodeUnit> {
-    let binder = python.import_binder_of(file);
-    let fqn = match function.kind() {
+    let candidates = match function.kind() {
         "identifier" => {
             let local = node_text(function, source);
             if local.is_empty() {
                 return Vec::new();
             }
-            match binder.bindings.get(local) {
+            let binder = python.import_binder_of(file);
+            let fqn = match binder.bindings.get(local) {
                 Some(binding) if binding.kind == ImportKind::Named => binding
                     .imported_name
                     .as_ref()
@@ -498,22 +498,45 @@ pub fn resolve_constructor_types(
                     .into_iter()
                     .find(|unit| unit.is_class() && unit.identifier() == local)
                     .map(|unit| unit.fq_name()),
-            }
+            };
+            let Some(fqn) = fqn else {
+                return Vec::new();
+            };
+            resolve_fqn_candidates(python, &fqn, |name| graph.index.definitions(name).collect())
         }
-        "attribute" => namespace_constructor_fqn(&binder, source, function),
-        _ => None,
+        "attribute" => namespace_qualified_declarations(graph, python, file, source, function),
+        _ => Vec::new(),
     };
-    let Some(fqn) = fqn else {
-        return Vec::new();
-    };
-    let mut classes: Vec<CodeUnit> =
-        resolve_fqn_candidates(python, &fqn, |name| graph.index.definitions(name).collect())
-            .into_iter()
-            .filter(CodeUnit::is_class)
-            .collect();
+    // A call callee names something constructible; an annotation does not, so
+    // the kind filter belongs here rather than in the shared namespace walk.
+    let mut classes: Vec<CodeUnit> = candidates.into_iter().filter(CodeUnit::is_class).collect();
     classes.sort();
     classes.dedup();
     classes
+}
+
+/// The declarations a namespace-qualified attribute path names (`module.Name`,
+/// `pkg.module.Name`), walked structurally through the import binder.
+///
+/// No kind filter: a Python annotation legitimately names a module-level type
+/// alias, `TypeAlias`, `NewType` or `TypeVar` value, all of which the analyzer
+/// models as fields (issue #1763).
+fn namespace_qualified_declarations(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Vec<CodeUnit> {
+    let binder = python.import_binder_of(file);
+    let Some(fqn) = namespace_constructor_fqn(&binder, source, node) else {
+        return Vec::new();
+    };
+    let mut candidates =
+        resolve_fqn_candidates(python, &fqn, |name| graph.index.definitions(name).collect());
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 fn namespace_constructor_fqn(

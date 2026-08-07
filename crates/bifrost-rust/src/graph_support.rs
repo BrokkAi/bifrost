@@ -1007,7 +1007,8 @@ fn forward_exported_targets_from_files_with_progress(
             }) => {
                 targets.insert((file.clone(), local_name.clone()));
             }
-            Some(ExportEntry::Default { local_name: None }) => {}
+            Some(ExportEntry::Default { local_name: None })
+            | Some(ExportEntry::ReexportedModule { .. }) => {}
             None if reached_through_reexport => {
                 for unit in rust.declarations(&file) {
                     reference_context_checkpoint(progress)?;

@@ -1861,7 +1861,7 @@ impl RustUsageIndex {
                                 .map(|file| Work::Visit(file, imported_name.clone())),
                         );
                     }
-                    ExportEntry::Default { .. } => {}
+                    ExportEntry::Default { .. } | ExportEntry::ReexportedModule { .. } => {}
                 }
             }
         }

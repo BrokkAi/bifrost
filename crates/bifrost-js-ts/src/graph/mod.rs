@@ -250,7 +250,8 @@ fn exported_local_property_binding(
             } if local_name == &receiver_root => Some(exported_name.clone()),
             ExportEntry::Local { .. }
             | ExportEntry::Default { .. }
-            | ExportEntry::ReexportedNamed { .. } => None,
+            | ExportEntry::ReexportedNamed { .. }
+            | ExportEntry::ReexportedModule { .. } => None,
         })
         .collect::<BTreeSet<_>>();
     (!exported_names.is_empty()).then_some(ExportedLocalPropertyBinding {

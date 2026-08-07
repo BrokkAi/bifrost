@@ -210,7 +210,9 @@ impl PythonUsageIndex {
                                 .push((file.clone(), exported_name.clone()));
                         }
                     }
-                    ExportEntry::Default { .. } => {}
+                    // A re-exported module is a terminal binding: it carries
+                    // no member name, so it opens no name-to-name edge.
+                    ExportEntry::Default { .. } | ExportEntry::ReexportedModule { .. } => {}
                     ExportEntry::ReexportedNamed {
                         module_specifier,
                         imported_name,
@@ -260,7 +262,9 @@ impl PythonUsageIndex {
                 let local = match entry {
                     ExportEntry::Local { local_name } => Some(local_name.as_str()),
                     ExportEntry::Default { local_name } => local_name.as_deref(),
-                    ExportEntry::ReexportedNamed { .. } => None,
+                    ExportEntry::ReexportedNamed { .. } | ExportEntry::ReexportedModule { .. } => {
+                        None
+                    }
                 };
                 if let Some(local_name) = local
                     && local_name == target_short

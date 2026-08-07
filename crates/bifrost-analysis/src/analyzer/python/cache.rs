@@ -39,6 +39,7 @@ pub(super) fn weight_export_index(_key: &ProjectFile, value: &Arc<ExportIndex>) 
                         module_specifier,
                         imported_name,
                     } => module_specifier.len() + imported_name.len(),
+                    ExportEntry::ReexportedModule { module_specifier } => module_specifier.len(),
                     ExportEntry::Default { local_name } => {
                         local_name.as_deref().map_or(0, str::len)
                     }

@@ -511,6 +511,11 @@ pub enum ExportEntry {
         module_specifier: String,
         imported_name: String,
     },
+    /// Exported name *is* another module, not a name looked up inside one.
+    /// Python's `from pkg import sub` binds the submodule `pkg.sub` whenever
+    /// that module exists; resolving it must stop at the module rather than
+    /// re-enter `pkg.sub` looking for a member called `sub`.
+    ReexportedModule { module_specifier: String },
     /// Default export. `local_name` is `None` when the default export is anonymous.
     Default { local_name: Option<String> },
 }

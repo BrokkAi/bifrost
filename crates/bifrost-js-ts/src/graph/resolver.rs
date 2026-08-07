@@ -184,7 +184,7 @@ impl JsTsUsageIndex {
                             local_name.clone().unwrap_or_else(|| "default".to_string()),
                         ));
                     }
-                    ExportEntry::ReexportedNamed { .. } => {}
+                    ExportEntry::ReexportedNamed { .. } | ExportEntry::ReexportedModule { .. } => {}
                 }
                 continue;
             }
@@ -244,7 +244,9 @@ impl JsTsUsageIndex {
                     // objects whose edge shape intentionally differs. Without a
                     // recorded direct named re-export, they are not evidence of
                     // an external boundary.
-                    ExportEntry::Local { .. } | ExportEntry::Default { .. } => {}
+                    ExportEntry::Local { .. }
+                    | ExportEntry::Default { .. }
+                    | ExportEntry::ReexportedModule { .. } => {}
                 }
                 continue;
             }
@@ -486,7 +488,7 @@ fn build_reexport_edges(
                         }
                     }
                 }
-                ExportEntry::Default { .. } => {}
+                ExportEntry::Default { .. } | ExportEntry::ReexportedModule { .. } => {}
                 ExportEntry::ReexportedNamed {
                     module_specifier,
                     imported_name,

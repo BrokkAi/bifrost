@@ -736,7 +736,10 @@ fn handle_annotation_reference_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) 
         record_hit(site, ctx);
     }
 
-    if ctx.target_member.is_some() && node.kind() == "attribute" && candidates.is_empty() {
+    // An attribute annotation the resolver could not turn into a candidate is
+    // not consumed here: the namespace-attribute path still has to see it, and
+    // so do the node's children. `inverted.rs` always fell through this way.
+    if node.kind() == "attribute" && candidates.is_empty() {
         return false;
     }
 

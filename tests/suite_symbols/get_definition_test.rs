@@ -32882,3 +32882,156 @@ public class App extends Base {
         "{value}"
     );
 }
+
+// Issue #1762: `from P import S` where `P.S` is a submodule binds the module,
+// even when `P.S` re-exports a member whose name equals the submodule's.
+const PYTHON_SUBMODULE_SELF_NAMED_MEMBER_USER: &str =
+    "from pkg import backend\n\n\ndef f(dtype):\n    return backend.standardize_dtype(dtype)\n";
+
+fn python_submodule_self_named_member_project() -> crate::common::BuiltInlineTestProject {
+    InlineTestProject::with_language(Language::Python)
+        .file("pkg/__init__.py", "from pkg import backend\n")
+        .file(
+            "pkg/backend/__init__.py",
+            "from pkg.backend.config import backend\n\n\ndef standardize_dtype(dtype):\n    return dtype\n",
+        )
+        .file("pkg/backend/config.py", "def backend():\n    return \"tf\"\n")
+        .file("user.py", PYTHON_SUBMODULE_SELF_NAMED_MEMBER_USER)
+        .build()
+}
+
+#[test]
+fn python_from_import_of_submodule_resolves_head_to_the_module() {
+    let project = python_submodule_self_named_member_project();
+    let source = PYTHON_SUBMODULE_SELF_NAMED_MEMBER_USER;
+    let at = source
+        .find("backend.standardize_dtype")
+        .expect("attribute head");
+    let value = lookup(project.root(), &location_reference("user.py", source, at));
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "pkg.backend",
+        "the head names the submodule, not its same-named re-export: {value}"
+    );
+}
+
+#[test]
+fn python_from_import_of_submodule_resolves_member_through_the_module() {
+    let project = python_submodule_self_named_member_project();
+    let source = PYTHON_SUBMODULE_SELF_NAMED_MEMBER_USER;
+    let at = source
+        .find("standardize_dtype(dtype)")
+        .expect("member site");
+    let value = lookup(project.root(), &location_reference("user.py", source, at));
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "pkg.backend.standardize_dtype",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_plain_import_of_submodule_resolves_head_to_the_module() {
+    // Perturbation p8: the same package shape read through `import pkg.backend`
+    // was always correct and must stay correct.
+    let source =
+        "import pkg.backend\n\n\ndef f(dtype):\n    return pkg.backend.standardize_dtype(dtype)\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/__init__.py", "from pkg import backend\n")
+        .file(
+            "pkg/backend/__init__.py",
+            "from pkg.backend.config import backend\n\n\ndef standardize_dtype(dtype):\n    return dtype\n",
+        )
+        .file("pkg/backend/config.py", "def backend():\n    return \"tf\"\n")
+        .file("pkg/user.py", source)
+        .build();
+    let at = source
+        .find("pkg.backend.standardize_dtype")
+        .expect("qualified call");
+    let value = lookup(
+        project.root(),
+        &location_reference("pkg/user.py", source, at),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "pkg", "{value}");
+}
+
+#[test]
+fn python_submodule_declaring_its_own_name_still_resolves_to_the_module() {
+    // Perturbation p11: the subpackage declares `backend` itself instead of
+    // re-exporting it. `from pkg import backend` still binds the submodule -
+    // the declaration is `pkg.backend.backend`, a different name - so the head
+    // is the module. Before issue #1762 this reported an ambiguity between the
+    // module and that declaration.
+    let source = PYTHON_SUBMODULE_SELF_NAMED_MEMBER_USER;
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/__init__.py", "from pkg import backend\n")
+        .file(
+            "pkg/backend/__init__.py",
+            "def backend():\n    return \"tf\"\n\n\ndef standardize_dtype(dtype):\n    return dtype\n",
+        )
+        .file("user.py", source)
+        .build();
+    let at = source
+        .find("backend.standardize_dtype")
+        .expect("attribute head");
+    let value = lookup(project.root(), &location_reference("user.py", source, at));
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "pkg.backend", "{value}");
+}
+
+// Issue #1764, secondary observation: `compute_export_index_of` backs forward
+// export resolution and always used the AST re-export collector, so a
+// block-nested re-export was dropped for every file, not only colliding ones.
+const PYTHON_NESTED_REEXPORT_CONSUMER: &str =
+    "from .compatibility import timeout\n\n\ndef go():\n    with timeout(5):\n        pass\n";
+
+fn python_nested_reexport_definition(compatibility: &str) -> serde_json::Value {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("src/ws/__init__.py", "")
+        .file(
+            "src/ws/async_timeout.py",
+            "def timeout(delay):\n    return delay\n",
+        )
+        .file("src/ws/compatibility.py", compatibility)
+        .file("src/ws/server.py", PYTHON_NESTED_REEXPORT_CONSUMER)
+        .build();
+    let at = PYTHON_NESTED_REEXPORT_CONSUMER
+        .find("timeout(5)")
+        .expect("call site");
+    lookup(
+        project.root(),
+        &location_reference("src/ws/server.py", PYTHON_NESTED_REEXPORT_CONSUMER, at),
+    )
+}
+
+#[test]
+fn python_flat_reexport_after_a_declaration_resolves_to_the_later_binding() {
+    // Control: the same shadowing without nesting was always read in order.
+    let value = python_nested_reexport_definition(
+        "def timeout(delay):\n    return delay\n\n\nfrom .async_timeout import timeout\n",
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ws.async_timeout.timeout",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_block_nested_reexport_after_a_declaration_resolves_to_the_later_binding() {
+    let value = python_nested_reexport_definition(
+        "def timeout(delay):\n    return delay\n\n\nif True:\n    from .async_timeout import timeout\n",
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ws.async_timeout.timeout",
+        "{value}"
+    );
+}

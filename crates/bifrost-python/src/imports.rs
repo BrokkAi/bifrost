@@ -604,6 +604,11 @@ fn resolve_exported_name(
                         queue.push_back((target_file, imported_name.clone()));
                     }
                 }
+                ExportEntry::ReexportedModule { module_specifier } => {
+                    // Terminal: the export *is* the module, so the walk stops
+                    // here instead of looking the name up inside it.
+                    results.extend(resolve_module_code_unit(python, module_specifier));
+                }
                 ExportEntry::Default { local_name } => {
                     if let Some(local_name) = local_name {
                         results.extend(local_export_declarations(python, &file, local_name));
