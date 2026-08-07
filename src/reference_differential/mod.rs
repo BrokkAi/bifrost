@@ -1392,7 +1392,14 @@ fn classify_census_gaps(
     use std::collections::BTreeMap;
     let mut by_path: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (index, record) in records.iter().enumerate() {
-        if record.forward_status != "resolved" {
+        // An import boundary is an adjudicated forward answer - the name
+        // resolves to a dependency outside the indexed workspace - not joint
+        // blindness. Grading it as a gap buried real findings under hundreds
+        // of external-package uses whose require/import binder doubles as the
+        // "same-file declaration" (IBM CRAIG's lazy-z destructured requires).
+        if record.forward_status != "resolved"
+            && record.forward_status != "unresolvable_import_boundary"
+        {
             by_path.entry(record.path.clone()).or_default().push(index);
         }
     }
