@@ -427,20 +427,7 @@ impl DependencyDiscoveryEvidence {
     /// dotted module names discovery itself recorded, so segment-prefix
     /// containment is their defined structure, not a re-parse of source text.
     pub fn declares_module_path(&self, path: &str) -> bool {
-        if path.is_empty() {
-            return false;
-        }
-        if self.declared_modules.contains(path) {
-            return true;
-        }
-        let mut prefix = path;
-        while let Some((head, _)) = prefix.rsplit_once('.') {
-            if self.declared_modules.contains(head) {
-                return true;
-            }
-            prefix = head;
-        }
-        false
+        self.declares_path_below(path, '.')
     }
 
     /// Whether the build declares the Go module that `import_path` routes
@@ -455,14 +442,42 @@ impl DependencyDiscoveryEvidence {
     /// the module paths discovery itself recorded, so segment-prefix
     /// containment is their defined structure, not a re-parse of source text.
     pub fn declares_go_import_path(&self, import_path: &str) -> bool {
-        if import_path.is_empty() {
+        self.declares_path_below(import_path, '/')
+    }
+
+    /// Whether the build declares the gem that a Ruby `require` argument loads:
+    /// an exact declared gem name, or one reached by walking the load path back
+    /// toward its root (`widget/core` is declared when the `widget` gem is).
+    ///
+    /// Ruby discovery records one identity per locked gem, which is the bare
+    /// gem name (`crates/bifrost-analysis/src/analyzer/ruby/dependency_discovery.rs`
+    /// puts `RubyGemApiArtifact::name` in the package coordinate and leaves the
+    /// module coordinate empty). A require argument is the slash-separated load
+    /// path a gem publishes, so this shares Go's walk rather than the dotted
+    /// one: `widget/core` splits on `.` into itself and would match nothing.
+    ///
+    /// A Ruby *constant* path is not a load path and must not be asked here.
+    /// `Widget::Config` is `::`-separated and its head, `Widget`, is a constant
+    /// name that only an inflection rule relates to the gem name `widget`.
+    /// Bifrost does not guess inflections, so a constant is classified against
+    /// the activated overlay instead (see `ruby::constant_identity`).
+    pub fn declares_ruby_require_path(&self, require_path: &str) -> bool {
+        self.declares_path_below(require_path, '/')
+    }
+
+    /// The shared containment walk behind the three `declares_*` accessors: an
+    /// exact declared identity, or one reached by removing trailing
+    /// `separator`-delimited segments. Segment removal rather than
+    /// `str::starts_with` is what keeps `requestsfoo` from matching `requests`.
+    fn declares_path_below(&self, path: &str, separator: char) -> bool {
+        if path.is_empty() {
             return false;
         }
-        if self.declared_modules.contains(import_path) {
+        if self.declared_modules.contains(path) {
             return true;
         }
-        let mut prefix = import_path;
-        while let Some((head, _)) = prefix.rsplit_once('/') {
+        let mut prefix = path;
+        while let Some((head, _)) = prefix.rsplit_once(separator) {
             if self.declared_modules.contains(head) {
                 return true;
             }

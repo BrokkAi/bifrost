@@ -1167,6 +1167,18 @@ impl IAnalyzer for MultiAnalyzer {
                 self, file, source,
             );
         }
+        // Ruby classifies a constant that leaves the visible require closure
+        // against the activated exact gem API packs (#1624), and both the
+        // semantic-model overlay and the retained Gemfile.lock discovery
+        // evidence belong to the dispatching analyzer, not to the delegate.
+        // Passing `self` is what lets a gem's indexed constant resolve instead
+        // of reporting an unknown boundary.
+        if language_for_file(file) == Language::Ruby && self.delegates.contains_key(&Language::Ruby)
+        {
+            return crate::analyzer::ruby::diagnostics::collect_ruby_semantic_diagnostics(
+                self, file, source,
+            );
+        }
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().semantic_diagnostics(file, source))
             .unwrap_or_default()
