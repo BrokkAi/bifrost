@@ -11,11 +11,12 @@ use crate::common::InlineTestProject;
 use brokk_bifrost::analyzer::DependencyPackEcosystem;
 use brokk_bifrost::analyzer::semantic_model::{
     CatalogCoordinate, CatalogOptions, CompiledSemanticModelPack, CompilerOptions,
+    DependencyDiscoveryEvidence, DependencyDiscoveryOutcome, ResolvedDependency,
     SemanticModelActivationControl, SemanticModelActivationEvidence,
     SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
     SemanticModelPackSelector, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
     SemanticPackCatalog, SessionPackSource, SessionPackSourceKind, SourceFormat,
-    acquire_active_semantic_models, compile_source,
+    acquire_active_semantic_models_with_evidence, compile_source,
 };
 use brokk_bifrost::{AnalyzerConfig, CancellationToken, Language, WorkspaceAnalyzer};
 use brokk_bifrost_analysis::analyzer::structural::BoundaryStatus;
@@ -82,6 +83,14 @@ fn dep_pack(completeness: &str) -> CompiledSemanticModelPack {
                         &format!("{VIEWS}.{MODULE_SCOPE}"),
                         json!([]),
                     ),
+                    // A standard-library package: its import path is one
+                    // segment, with no module prefix to strip.
+                    module_type("type.strconv.module", "strconv", json!(["strconv"])),
+                    module_type(
+                        "type.strconv.scope",
+                        &format!("strconv.{MODULE_SCOPE}"),
+                        json!([]),
+                    ),
                     json!({
                         "id": "type.api.client",
                         "name": format!("{API}.Client"),
@@ -119,6 +128,15 @@ fn dep_pack(completeness: &str) -> CompiledSemanticModelPack {
                         "visibility": "public",
                         "signature": { "parameters": [] },
                         "locator": locator(&format!("{VIEWS}.Render"))
+                    }),
+                    json!({
+                        "id": "member.strconv.itoa",
+                        "owner": "type.strconv.scope",
+                        "name": "Itoa",
+                        "member_kind": "function",
+                        "visibility": "public",
+                        "signature": { "parameters": [] },
+                        "locator": locator("strconv.Itoa")
                     }),
                     json!({
                         "id": "member.api.base.promoted",
@@ -172,9 +190,39 @@ fn activation_request() -> SemanticModelActivationRequest {
     }
 }
 
+/// Retained evidence that the build declares `module` and nothing indexed it.
+/// This is the residue a discovery run leaves behind; constructing it directly
+/// keeps the test offline.
+fn declared_module_evidence(module: &str) -> DependencyDiscoveryEvidence {
+    DependencyDiscoveryEvidence::from_outcome(&DependencyDiscoveryOutcome::complete(vec![
+        ResolvedDependency {
+            id: format!("go:module:{module}"),
+            evidence: SemanticModelActivationEvidence {
+                language: "go".to_owned(),
+                ecosystem: "go-module".to_owned(),
+                package: None,
+                module: Some(CatalogCoordinate {
+                    name: module.to_owned(),
+                    version: None,
+                }),
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            },
+            provenance: Vec::new(),
+            artifacts: Vec::new(),
+        },
+    ]))
+}
+
 /// Activate `pack` against `analyzer`. The catalog is ephemeral and the pack is
 /// a session pack, so nothing is installed and nothing is downloaded.
-fn activate(analyzer: &WorkspaceAnalyzer, pack: &CompiledSemanticModelPack) {
+fn activate(
+    analyzer: &WorkspaceAnalyzer,
+    pack: &CompiledSemanticModelPack,
+    discovery: Option<DependencyDiscoveryEvidence>,
+) {
     let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
     catalog
         .register_session_pack(
@@ -185,11 +233,13 @@ fn activate(analyzer: &WorkspaceAnalyzer, pack: &CompiledSemanticModelPack) {
             },
         )
         .unwrap();
-    let SemanticModelRuntimeOutcome::Ready { .. } = acquire_active_semantic_models(
+    let published = discovery.map(|evidence| [(Box::from([Language::Go]), evidence)]);
+    let SemanticModelRuntimeOutcome::Ready { .. } = acquire_active_semantic_models_with_evidence(
         analyzer.analyzer(),
         &catalog,
         None,
         &activation_request(),
+        published.as_ref().map(|published| published.as_slice()),
         &CancellationToken::default(),
     ) else {
         panic!("Go fixture pack must activate");
@@ -215,7 +265,17 @@ impl GoFixture {
 
     fn with_pack(files: &[(&str, &str)], completeness: &str) -> Self {
         let fixture = Self::new(files);
-        activate(&fixture.analyzer, &dep_pack(completeness));
+        activate(&fixture.analyzer, &dep_pack(completeness), None);
+        fixture
+    }
+
+    fn with_pack_and_declared_module(files: &[(&str, &str)], module: &str) -> Self {
+        let fixture = Self::new(files);
+        activate(
+            &fixture.analyzer,
+            &dep_pack("complete"),
+            Some(declared_module_evidence(module)),
+        );
         fixture
     }
 
@@ -335,6 +395,66 @@ fn indexed_module_export_never_errors() {
     );
     assert!(
         resolved_at(&report, BoundaryStatus::ExternalIndexed),
+        "{:#?}",
+        report.outcomes()
+    );
+}
+
+#[test]
+fn an_indexed_standard_library_export_never_errors() {
+    let fixture = GoFixture::with_pack(
+        &[
+            go_mod(),
+            (
+                "main.go",
+                "package main\n\nimport \"strconv\"\n\nfunc Run() {\n\tstrconv.Itoa(1)\n\tstrconv.Missing()\n}\n",
+            ),
+        ],
+        "complete",
+    );
+
+    let report = fixture.report("main.go");
+    // A standard-library import path has one segment and no module prefix.
+    assert!(resolved_at(&report, BoundaryStatus::ExternalIndexed));
+    assert!(
+        absent_member(&report, "strconv", "Missing"),
+        "{:#?}",
+        report.outcomes()
+    );
+    let diagnostics = report.diagnostics();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(diagnostics[0].message.contains("Missing"));
+}
+
+#[test]
+fn a_declared_but_unindexed_module_suppresses_the_claim_with_its_boundary() {
+    let fixture = GoFixture::with_pack_and_declared_module(
+        &[
+            go_mod(),
+            (
+                "main.go",
+                "package main\n\nimport \"example.com/other/pkg\"\n\nfunc Run() {\n\tpkg.Anything()\n}\n",
+            ),
+        ],
+        "example.com/other",
+    );
+
+    let report = fixture.report("main.go");
+    // The module graph declares `example.com/other` and no pack published the
+    // package below it. Go import paths are slash-separated, so reaching the
+    // declared module from `example.com/other/pkg` walks segments, not dots.
+    assert!(
+        report.diagnostics().is_empty(),
+        "{:#?}",
+        report.diagnostics()
+    );
+    assert!(
+        incomplete_reasons(&report).iter().any(|reason| matches!(
+            reason,
+            SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                boundary: BoundaryStatus::ExternalDeclaredUnindexed
+            }
+        )),
         "{:#?}",
         report.outcomes()
     );
