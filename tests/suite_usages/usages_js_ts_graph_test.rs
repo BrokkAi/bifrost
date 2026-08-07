@@ -652,6 +652,43 @@ function readBeforeFunctionBinding() {
     }
 }
 
+/// #1778: `window.X = ...` declares browser global `X`, so a bare `X` is a read
+/// of that field in every position -- including the object slot of a member
+/// expression, which the identifier visitor suppresses to avoid double-counting.
+#[test]
+fn js_window_global_property_counts_bare_read_in_receiver_position() {
+    let source = r#"window.zqxfoo = 1;
+function readReceiver() { return zqxfoo.bar; }
+function readValue() { return helper(zqxfoo); }
+function callIt() { return zqxfoo(); }
+function readQualified() { return window.zqxfoo; }
+function shadowedReceiver() { const zqxfoo = { bar: 2 }; return zqxfoo.bar; }
+function otherReceiver() { return holder.zqxfoo.bar; }
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("globals.js", source).build());
+    let file = project.file("globals.js");
+    let target = find_js_target(&analyzer, &file, |unit| {
+        unit.is_field() && unit.fq_name() == "window.zqxfoo"
+    });
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+    let ranges: BTreeSet<_> = hits
+        .iter()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+
+    assert_eq!(
+        BTreeSet::from([
+            identifier_occurrence_range(source, "zqxfoo", 1),
+            identifier_occurrence_range(source, "zqxfoo", 2),
+            identifier_occurrence_range(source, "zqxfoo", 3),
+            identifier_occurrence_range(source, "zqxfoo", 4),
+        ]),
+        ranges,
+        "the receiver, value, callee and qualified reads are the browser global; the local shadow and the unrelated receiver's property are not: {hits:#?}"
+    );
+}
+
 #[test]
 fn authoritative_js_usage_counts_assignment_pattern_default_rhs() {
     let source = r#"const UNKNOWN = 0;

@@ -387,6 +387,15 @@ fn local_property_read_matches(
 }
 
 impl ScanCtx<'_> {
+    /// Whether `name` has a lexical binding covering `byte` in this file. A
+    /// bound name is the file's own, which disproves every global-identity
+    /// read of the same spelling.
+    fn lexically_bound_at(&self, name: &str, byte: usize) -> bool {
+        self.lexical_bindings
+            .as_ref()
+            .is_some_and(|bindings| bindings.is_bound_at(name, byte))
+    }
+
     fn binds_target(&self, ident: &str) -> bool {
         if self.is_lexically_shadowed(ident) {
             return false;
@@ -1233,12 +1242,7 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if text.is_empty() {
         return;
     }
-    if ctx.browser_global_object.is_some()
-        && ctx
-            .lexical_bindings
-            .as_ref()
-            .is_some_and(|bindings| bindings.is_bound_at(text, node.start_byte()))
-    {
+    if ctx.browser_global_object.is_some() && ctx.lexically_bound_at(text, node.start_byte()) {
         return;
     }
     let binds_target = if node.kind() == "type_identifier" {
@@ -1405,13 +1409,23 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         && property_text == target_member
     {
         if simple_identifier_text(object, ctx.source) == Some(global_object)
-            && !ctx
-                .lexical_bindings
-                .as_ref()
-                .is_some_and(|bindings| bindings.is_bound_at(global_object, object.start_byte()))
+            && !ctx.lexically_bound_at(global_object, object.start_byte())
         {
             record_hit(property, ctx);
         }
+        return;
+    }
+
+    // `window.X = ...` declares browser global `X`, so a bare `X` reads the
+    // target in the object slot too (`location.hash`). `handle_identifier_candidate`
+    // admits the same read but suppresses member-expression objects to avoid
+    // double-counting member targets, so record it here (#1778).
+    if ctx.browser_global_object.is_some()
+        && simple_identifier_text(object, ctx.source).is_some()
+        && ctx.binds_target(object_text)
+        && !ctx.lexically_bound_at(object_text, object.start_byte())
+    {
+        record_hit(object, ctx);
         return;
     }
 
