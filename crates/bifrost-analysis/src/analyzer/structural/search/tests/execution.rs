@@ -1343,3 +1343,184 @@ fn skipped_set_profile_forwards_cancellation_safe_partial_cardinality() {
     }));
     assert_eq!(detailed.result.completion(), CodeQueryCompletion::Cancelled);
 }
+
+/// Two-language workspace whose volume is concentrated in the first-listed
+/// union branch: the Rust files hold nearly all of the facts, the single
+/// Python file almost none.
+fn skewed_two_language_workspace(root: &std::path::Path) {
+    for file in 0..8 {
+        let mut source = String::new();
+        for function in 0..12 {
+            source.push_str(&format!(
+                "pub fn rust_{file}_{function}(left: usize, right: usize) -> usize {{\n    let total = left.saturating_add(right);\n    total.saturating_mul({function} + 1)\n}}\n"
+            ));
+        }
+        ProjectFile::new(root.to_path_buf(), PathBuf::from(format!("rust_{file}.rs")))
+            .write(&source)
+            .expect("write Rust source");
+    }
+    ProjectFile::new(root.to_path_buf(), PathBuf::from("tiny.py"))
+        .write("def python_only():\n    return 1\n")
+        .expect("write Python source");
+}
+
+fn two_language_analyzer(root: &std::path::Path) -> MultiAnalyzer {
+    MultiAnalyzer::new(BTreeMap::from([
+        (
+            Language::Rust,
+            AnalyzerDelegate::Rust(RustAnalyzer::from_project(TestProject::new(
+                root.to_path_buf(),
+                Language::Rust,
+            ))),
+        ),
+        (
+            Language::Python,
+            AnalyzerDelegate::Python(PythonAnalyzer::from_project(TestProject::new(
+                root.to_path_buf(),
+                Language::Python,
+            ))),
+        ),
+    ]))
+}
+
+fn functions_in(language: &str) -> serde_json::Value {
+    json!({ "languages": [language], "match": { "kind": "function" } })
+}
+
+/// Result identity without provenance: a branch's rows carry the union branch
+/// index, which a single-branch query has no reason to report.
+fn result_identities(result: &CodeQueryResult) -> Vec<serde_json::Value> {
+    let mut values = result
+        .results
+        .iter()
+        .map(|item| {
+            let mut value = serde_json::to_value(item).expect("result item serializes");
+            value
+                .as_object_mut()
+                .expect("result item is an object")
+                .remove("provenance");
+            value
+        })
+        .collect::<Vec<_>>();
+    values.sort_by_key(ToString::to_string);
+    values
+}
+
+/// Scan access keeps the metered lanes proportional to the workspace; the
+/// posting index an earlier query may build would charge candidates only and
+/// make these budgets non-binding.
+fn scan_only_run(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+) -> DetailedCodeQueryResult {
+    execute_code_query_with_access_mode(
+        analyzer,
+        query,
+        limits,
+        StructuralAccessMode::ScanOnly,
+        false,
+    )
+    .expect("scan access is always available")
+}
+
+#[test]
+fn sequential_union_retries_a_starved_first_branch() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    skewed_two_language_workspace(&root);
+    let analyzer = two_language_analyzer(&root);
+
+    // Calibrate: the union's total fact budget is exactly what the two
+    // branches cost on their own, so only the fair split can truncate.
+    let mut branch_facts = Vec::new();
+    let mut branch_identities = Vec::new();
+    for language in ["rust", "python"] {
+        let query = CodeQuery::from_json(&json!({
+            "languages": [language],
+            "match": { "kind": "function" },
+            "limit": 1000
+        }))
+        .expect("branch query");
+        let run = scan_only_run(&analyzer, &query, CodeQueryExecutionLimits::default());
+        assert!(!run.result.truncated, "{:?}", run.result.diagnostics);
+        branch_facts.push(usize::try_from(run.work.fact_nodes).expect("facts fit usize"));
+        branch_identities.push(result_identities(&run.result));
+    }
+    let total_facts = branch_facts[0].saturating_add(branch_facts[1]);
+    assert!(
+        branch_facts[0] > total_facts.div_ceil(2),
+        "the first branch must not fit inside its half share: {branch_facts:?}"
+    );
+
+    let union = CodeQuery::from_json(&json!({
+        "union": [functions_in("rust"), functions_in("python")],
+        "limit": 1000
+    }))
+    .expect("union query");
+    let limits = CodeQueryExecutionLimits {
+        max_fact_nodes: total_facts,
+        ..CodeQueryExecutionLimits::default()
+    };
+
+    let detailed = scan_only_run(&analyzer, &union, limits);
+
+    assert!(
+        !detailed.result.truncated,
+        "{:?}",
+        detailed.result.diagnostics
+    );
+    assert!(
+        !detailed.result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+        }),
+        "{:?}",
+        detailed.result.diagnostics
+    );
+    let mut expected = branch_identities.concat();
+    expected.sort_by_key(ToString::to_string);
+    assert_eq!(result_identities(&detailed.result), expected);
+}
+
+#[test]
+fn sequential_union_retry_keeps_reporting_genuine_exhaustion() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    skewed_two_language_workspace(&root);
+    let analyzer = two_language_analyzer(&root);
+    let probe = CodeQuery::from_json(&json!({
+        "languages": ["rust"],
+        "match": { "kind": "function" },
+        "limit": 1000
+    }))
+    .expect("probe query");
+    let probe_run = scan_only_run(&analyzer, &probe, CodeQueryExecutionLimits::default());
+    assert!(!probe_run.result.truncated);
+    let rust_facts = usize::try_from(probe_run.work.fact_nodes).expect("facts fit usize");
+
+    let union = CodeQuery::from_json(&json!({
+        "union": [functions_in("rust"), functions_in("python")],
+        "limit": 1000
+    }))
+    .expect("union query");
+    // Half of the first branch's own scan: no redistribution completes it.
+    let limits = CodeQueryExecutionLimits {
+        max_fact_nodes: rust_facts / 2,
+        ..CodeQueryExecutionLimits::default()
+    };
+
+    let detailed = scan_only_run(&analyzer, &union, limits);
+
+    assert!(detailed.result.truncated);
+    assert!(
+        detailed.result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+        }),
+        "{:?}",
+        detailed.result.diagnostics
+    );
+    assert!(
+        usize::try_from(detailed.work.fact_nodes).expect("facts fit usize") <= rust_facts,
+        "a retry must not spend more than the branch's own uncapped scan"
+    );
+}
