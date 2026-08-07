@@ -49,14 +49,41 @@ All in `/mnt/containers/code_isnt_memory/codescale-grep-hard-cleanup-20260805/`:
 `symbols-r11-stall-diagnosis-v1.md`, `symbols-r12-final/`, `symbols-r11-orphan-salvage-v1/`,
 `build-paired14-report-v1.py`.
 
+## Latency root cause and fixes (added 2026-08-07, after the paired report)
+
+The isolation ladder exonerated the box: 1/4/10-way scaling is flat, storage is not saturated,
+and 10-way is often faster than isolated because concurrent readers share index pages. The
+dominant cost was a single-request defect: `suffix_resolution.pattern_stage` ran one full
+declaration-table walk per workspace language (substring/regex over millions of rows), 186 s of
+a 194 s isolated Kubernetes call, more than 600 s on 11-language Firefox. The #1688 gate never
+fired because it was miss-only and because `PhpAnalyzer` did not advertise index completeness,
+which disabled the gate on any workspace containing one PHP file.
+
+Fixes landed on `bifrost-nlp-ft` (not in runtime-r25; a future campaign measures them):
+
+- `2ba5dda4` seeks the identifier index in the suffix pattern stage. Measured on the prototype:
+  Kubernetes 194.3 s to 12.9 s cold, 81.9 s to 3.6 s warm; Firefox pattern stage above 600 s to
+  0.55 s for all 11 languages. The reviewed version also fixed a prototype regression with
+  Scala `$` sigil spellings.
+- `c1b08f54` lets `PhpAnalyzer` advertise its complete symbol lookup index, which revives the
+  conclusive-miss gate on mixed workspaces.
+- anvil `dd25f3d` (anvil repository, master) demultiplexes stdio MCP responses; client-side
+  head-of-line blocking was 48 percent of observed campaign latency.
+
+Known residuals, recorded: the ambiguity-reporting path after a multi-match still uses a broad
+scan (unmeasured, behind the now-cheap stage); C# arity spellings (`Name`+backtick+digit) are
+not seekable and were already broken on baseline; issues #1756 (cancellation does not reach
+SQL), #1757 (lazy RustUsageIndex build inside requests), #1758 (Firefox exact stage 227 s and
+25.5 GB RSS against 8 GiB task containers) track the remaining measured defects.
+
 ## Next actions
 
 1. Decide on arm 03 (symbols plus NLP): same manifest and runtime-r25, NLP enabled. It needs a
-   GPU assignment for the embedding sidecar.
-2. Run isolated warm reruns of the worst get_symbol_sources and scan_usages_by_reference calls
-   to split contention from single-request cost (#1688, #1748).
-3. Decide whether the two Firefox timeout tasks get a rerun after latency fixes, or stand as
-   recorded. Under the never-mix-runtimes rule, a rerun with a fixed Bifrost would be a new
-   campaign, not a patch to this arm.
-4. The too-broad scope guards landed on bifrost-nlp-ft after runtime-r25 was built. They are
-   not in this campaign and must not enter it mid-arm. A future campaign can measure them.
+   GPU assignment for the embedding sidecar. Alternatively, fold arm 03 into a new campaign on
+   a fixed runtime.
+2. Decide whether the two Firefox timeout tasks get a rerun after latency fixes, or stand as
+   recorded. Under the never-mix-runtimes rule, a rerun with a fixed Bifrost is a new campaign,
+   not a patch to this arm. #1758 says Firefox likely also needs bigger task containers.
+3. A future campaign runtime picks up the suffix-lookup fix, the Php gate fix, the too-broad
+   scope guards, and anvil's demultiplexed client, plus per-repository caches per the eval
+   plan's Decision Log.
