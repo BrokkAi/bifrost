@@ -1124,8 +1124,7 @@ fn go_model_package_selector_outcome(
         // member that a diagnostic then calls absent.
         candidates.extend(
             crate::analyzer::go::package_identity::GoOverlayPackages::member_candidates(
-                package,
-                &members[0],
+                package, members[0],
             ),
         );
     }
