@@ -26,6 +26,7 @@ pub mod adapter;
 pub mod clones;
 pub mod dead_code;
 pub mod declarations;
+pub mod diagnostics;
 pub mod graph;
 pub mod graph_support;
 pub mod hierarchy;
