@@ -3,10 +3,11 @@ use std::path::PathBuf;
 use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProductionRequest, AuthoredPayload,
-    AuthoredSemanticModelPack, CatalogCoordinate, Compatibility, DependencyArtifactRole,
-    DependencyPackAdapter, DependencyPackProduction, ExactDependencyArtifact, ExternalArtifactKind,
-    NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
-    ResolvedDependency, Safety, VersionConstraint, normalize_artifact_locator_paths,
+    AuthoredSemanticModelPack, CatalogCoordinate, Compatibility, Completeness,
+    DependencyArtifactRole, DependencyPackAdapter, DependencyPackProduction,
+    ExactDependencyArtifact, ExternalArtifactKind, NameSelector, Producer, ProducerDiagnostic,
+    ProducerDiagnosticSeverity, Provenance, ResolvedDependency, Safety, VersionConstraint,
+    normalize_artifact_locator_paths,
 };
 
 use super::RustdocJsonPackProducer;
@@ -68,19 +69,67 @@ impl DependencyPackAdapter for RustDependencyPackAdapter {
             production.artifact_sha256.as_deref(),
             Some(artifact.sha256())
         );
+        let mut diagnostics = production.diagnostics;
         if let Some(pack) = production.pack.as_mut() {
             normalize_artifact_locator_paths(
                 pack,
                 &format!("sha256-{}.rustdoc.json", artifact.sha256()),
             );
             add_cargo_dependency_aliases(pack, dependency);
+            if let Some(missing) = features_the_pack_never_saw(dependency) {
+                diagnostics.push(ProducerDiagnostic {
+                    code: "rust.rustdoc.feature_set_narrower_than_resolved".to_owned(),
+                    severity: ProducerDiagnosticSeverity::Warning,
+                    location: None,
+                    message: format!(
+                        "rustdoc ran without the Cargo-resolved features {missing:?}, so items they gate are absent from this surface"
+                    ),
+                });
+                pack.completeness = Completeness::Partial;
+            }
         }
         DependencyPackProduction {
             pack: production.pack,
-            diagnostics: production.diagnostics,
+            diagnostics,
             suppressed_diagnostics: production.suppressed_diagnostics,
         }
     }
+}
+
+/// The Cargo-resolved features this pack was *not* produced with, if any.
+///
+/// Discovery records both axes on the dependency: `cargo.feature` is what the
+/// host says it passed to rustdoc, and `cargo.metadata_feature` is the set
+/// Cargo's own resolve reports for the package. Nothing else compares them and
+/// neither reaches the pack, so the comparison has to happen here, while both
+/// are still in hand and while the answer can still change the pack's recorded
+/// completeness.
+///
+/// The test is containment, not equality, because the two directions are not
+/// symmetric. A pack built with *more* features than the build enables still
+/// documents everything the build can see, so an item missing from it is
+/// genuinely missing: extra features only add items. A pack built with *fewer*
+/// features is missing whatever those features gate, so a miss against it
+/// proves nothing about the crate as this workspace compiles it. Only the
+/// second case may block an absence claim, and it does so by recording the
+/// pack partial -- which is exactly the signal `rust/crate_identity.rs` already
+/// reads to refuse a proof (#1625).
+fn features_the_pack_never_saw(dependency: &ResolvedDependency) -> Option<Vec<String>> {
+    let produced: std::collections::BTreeSet<&str> = dependency
+        .provenance
+        .iter()
+        .filter(|entry| entry.key == "cargo.feature")
+        .map(|entry| entry.value.as_str())
+        .collect();
+    let missing: Vec<String> = dependency
+        .provenance
+        .iter()
+        .filter(|entry| entry.key == "cargo.metadata_feature")
+        .map(|entry| entry.value.as_str())
+        .filter(|feature| !produced.contains(feature))
+        .map(str::to_owned)
+        .collect();
+    (!missing.is_empty()).then_some(missing)
 }
 
 fn add_cargo_dependency_aliases(

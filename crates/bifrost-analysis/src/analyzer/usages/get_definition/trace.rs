@@ -717,6 +717,29 @@ pub(in crate::analyzer::usages) fn boundary_evidence(
                 (BoundaryStatus::ExternalUnknown, None)
             }
         }
+        Language::Rust => {
+            // Rust reads the same pair, resolved through the shared crate
+            // identity so a trace, a definition, and a diagnostic classify one
+            // crate path identically. A path is spelled with `::` and a pack
+            // records it dotted, and a Cargo rename is published as an alias,
+            // so the written spelling is the lookup key either way.
+            let overlay = analyzer.semantic_model_overlay();
+            let crates =
+                crate::analyzer::rust::crate_identity::RustOverlayCrates::new(overlay.as_deref());
+            if let Some(symbol) = crates.unique_symbol(name) {
+                return (BoundaryStatus::ExternalIndexed, Some(symbol.id.clone()));
+            }
+            let declared = analyzer
+                .dependency_discovery_evidence(Language::Rust)
+                .is_some_and(|evidence| {
+                    evidence.truncated() || evidence.declares_module_path(name)
+                });
+            if declared {
+                (BoundaryStatus::ExternalDeclaredUnindexed, None)
+            } else {
+                (BoundaryStatus::ExternalUnknown, None)
+            }
+        }
         _ => (BoundaryStatus::ExternalUnknown, None),
     }
 }
