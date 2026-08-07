@@ -445,6 +445,17 @@ impl CodeQueryResult {
                             "  boundary {}, trace {}\n",
                             value.boundary, value.trace_completeness
                         ));
+                        if let (Some(owner), Some(depth), Some(tier), Some(applicability)) = (
+                            value.owner.as_ref(),
+                            value.hierarchy_depth,
+                            value.dispatch_tier,
+                            value.applicability,
+                        ) {
+                            out.push_str(&format!(
+                                "  owner {} at depth {depth}, tier {tier}, {applicability}\n",
+                                owner.fq_name,
+                            ));
+                        }
                     }
                     CodeQueryResultValue::ReferenceEdge { value } => {
                         out.push_str(&format!(

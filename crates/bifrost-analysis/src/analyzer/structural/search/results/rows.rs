@@ -522,6 +522,10 @@ impl DetailedCodeQueryDomain {
                 CodeQueryRowField::required("candidate_kind", Scalar::ConstrainedEnum),
                 CodeQueryRowField::optional("candidate_id", Scalar::DeclarationIdentity),
                 CodeQueryRowField::optional("canonical_member_id", Scalar::StableId),
+                CodeQueryRowField::optional("owner_id", Scalar::DeclarationIdentity),
+                CodeQueryRowField::optional("hierarchy_depth", Scalar::Integer),
+                CodeQueryRowField::optional("dispatch_tier", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("applicability", Scalar::ConstrainedEnum),
             ],
             Self::GenerationSite => code_query_row_fields![
                 CodeQueryRowField::required("id", Scalar::StableId),
@@ -1123,6 +1127,20 @@ fn project_code_query_row_field<'a>(
                 }
                 _ => None,
             }
+        }
+        (CodeQueryResultValue::ResolutionCandidate { value }, "owner_id") => value
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.id.as_deref())
+            .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::ResolutionCandidate { value }, "hierarchy_depth") => value
+            .hierarchy_depth
+            .map(|depth| Scalar::Integer(depth as u64)),
+        (CodeQueryResultValue::ResolutionCandidate { value }, "dispatch_tier") => {
+            value.dispatch_tier.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::ResolutionCandidate { value }, "applicability") => {
+            value.applicability.map(Scalar::ConstrainedEnum)
         }
         (CodeQueryResultValue::GenerationSite { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::GenerationSite { value }, "ast_id") => {

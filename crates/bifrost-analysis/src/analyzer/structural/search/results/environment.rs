@@ -210,6 +210,22 @@ pub struct CodeQueryResolutionCandidate {
     /// string. `None` for candidates without a workspace declaration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical_member_id: Option<String>,
+    /// The exact hierarchy type the resolver found this member candidate on
+    /// (#1477). Absent when the recording seam is not a member lookup; absence
+    /// is unattributed, never "the receiver's own type".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<CodeQueryDeclaration>,
+    /// Hierarchy hops between the receiver's declared owner and `owner`. Zero
+    /// is a direct member; absent is unattributed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hierarchy_depth: Option<usize>,
+    /// The language-neutral dispatch bucket the find belongs to (#1477).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_tier: Option<&'static str>,
+    /// Whether the candidate accepts the call shape as far as the member seam
+    /// checked. `unknown` means no shape was checked, never "applicable".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applicability: Option<&'static str>,
 }
 
 /// One canonical reference edge (#1479).

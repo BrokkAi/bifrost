@@ -85,6 +85,41 @@ labelled_enum! {
         WrongDeclarationSpace => "wrong_declaration_space",
         AmbiguousPeer => "ambiguous_peer",
         BoundaryBlocked => "boundary_blocked",
+        HiddenByCloserMember => "hidden_by_closer_member",
+        CallableApplicabilityDeferred => "callable_applicability_deferred",
+    }
+}
+
+labelled_enum! {
+    /// The language-neutral ordering bucket a member candidate was found in
+    /// (#1477). Each language adapter maps its own precedence rules into these
+    /// buckets; the bucket never replaces the language's real precedence, it
+    /// only makes buckets comparable across languages in one policy.
+    ///
+    /// Declaration order is precedence order, strongest first, and `Ord` is
+    /// derived from it, exactly as for [`PrecedenceTier`].
+    MemberDispatchTier, ALL_MEMBER_DISPATCH_TIERS {
+        InherentOrDirect => "inherent_or_direct",
+        InheritedOrPromoted => "inherited_or_promoted",
+        TraitOrInterface => "trait_or_interface",
+        Extension => "extension",
+        StaticOrCompanion => "static_or_companion",
+        DynamicOrOpen => "dynamic_or_open",
+    }
+}
+
+labelled_enum! {
+    /// The kind of one exact hierarchy edge on one candidate's route (#1477).
+    ///
+    /// `Supertype` is the undifferentiated edge: the hierarchy provider that
+    /// recorded it does not distinguish extension from implementation, and the
+    /// row must not claim a distinction the provider never made.
+    HierarchyRelation, ALL_HIERARCHY_RELATIONS {
+        Extends => "extends",
+        Implements => "implements",
+        Supertype => "supertype",
+        Embedded => "embedded",
+        TraitImpl => "trait_impl",
     }
 }
 
@@ -383,6 +418,8 @@ mod tests {
         check!(ALL_BINDING_KINDS, BindingKind);
         check!(ALL_PRECEDENCE_TIERS, PrecedenceTier);
         check!(ALL_REJECTION_REASONS, RejectionReason);
+        check!(ALL_MEMBER_DISPATCH_TIERS, MemberDispatchTier);
+        check!(ALL_HIERARCHY_RELATIONS, HierarchyRelation);
         check!(ALL_BOUNDARY_STATUSES, BoundaryStatus);
         check!(ALL_DECLARED_VISIBILITIES, DeclaredVisibility);
         check!(ALL_ENVIRONMENT_AXES, EnvironmentAxis);
@@ -406,6 +443,16 @@ mod tests {
         assert_eq!(
             ALL_PRECEDENCE_TIERS.last(),
             Some(&PrecedenceTier::NameOnlyFallback)
+        );
+
+        let mut dispatch = ALL_MEMBER_DISPATCH_TIERS.to_vec();
+        dispatch.sort();
+        assert_eq!(dispatch, ALL_MEMBER_DISPATCH_TIERS);
+        assert!(MemberDispatchTier::InherentOrDirect < MemberDispatchTier::InheritedOrPromoted);
+        assert!(MemberDispatchTier::Extension < MemberDispatchTier::StaticOrCompanion);
+        assert_eq!(
+            ALL_MEMBER_DISPATCH_TIERS.last(),
+            Some(&MemberDispatchTier::DynamicOrOpen)
         );
     }
 

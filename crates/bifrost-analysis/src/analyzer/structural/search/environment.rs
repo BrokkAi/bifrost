@@ -25,9 +25,9 @@ use super::super::occurrences::OccurrenceRole;
 use super::super::query::{BindingFilter, CandidateFilter, ScopeFilter};
 use super::super::resolution::EnvironmentAxis;
 use super::results::{
-    CodeQueryBinding, CodeQueryCandidateRef, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
-    CodeQueryDiagnosticImpact, CodeQueryImportBinder, CodeQueryLexicalScope, CodeQueryRange,
-    CodeQueryResolutionCandidate,
+    CodeQueryBinding, CodeQueryCandidateRef, CodeQueryDeclaration, CodeQueryDiagnostic,
+    CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryImportBinder,
+    CodeQueryLexicalScope, CodeQueryRange, CodeQueryResolutionCandidate,
 };
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::usages::get_definition::{
@@ -448,9 +448,11 @@ pub(super) fn public_candidate(
     range: CodeQueryRange,
     candidate: CodeQueryCandidateRef,
     canonical_member_id: Option<String>,
+    owner: Option<CodeQueryDeclaration>,
 ) -> CodeQueryResolutionCandidate {
     let row = &value.occurrence;
     let trace = &value.candidate;
+    let member = trace.member.as_deref();
     CodeQueryResolutionCandidate {
         id: value.id(),
         ast_id: row.ast_id(),
@@ -469,6 +471,10 @@ pub(super) fn public_candidate(
         candidate,
         external_target: trace.external_target.clone(),
         canonical_member_id,
+        owner,
+        hierarchy_depth: member.map(|member| member.hierarchy_depth),
+        dispatch_tier: member.map(|member| member.dispatch_tier.label()),
+        applicability: member.map(|member| member.applicability.label()),
     }
 }
 

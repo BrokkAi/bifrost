@@ -2460,6 +2460,151 @@ fn java_terminal_segment(path: &str) -> Option<String> {
         .filter(|segment| !segment.is_empty())
 }
 
+/// The per-candidate attribution the Java member walk records while it runs,
+/// built only when a trace is being recorded (#1477). The walk itself decides
+/// nothing from it; it is an emission of facts the walk already holds: which
+/// hierarchy type each candidate was found on, at which BFS depth, and through
+/// which first-discovery parent chain.
+#[derive(Default)]
+struct JavaMemberTrace {
+    /// First-discovery parent of each ancestor the walk expanded, which makes
+    /// the route reconstruction a bounded walk back to the receiver's owner.
+    parents: HashMap<CodeUnit, CodeUnit>,
+    /// Candidate declaration -> (hierarchy type it was found on, BFS depth).
+    found: HashMap<CodeUnit, (CodeUnit, usize)>,
+}
+
+impl JavaMemberTrace {
+    fn record_found(&mut self, candidates: &[CodeUnit], found_on: &CodeUnit, depth: usize) {
+        for candidate in candidates {
+            self.found
+                .entry(candidate.clone())
+                .or_insert_with(|| (found_on.clone(), depth));
+        }
+    }
+
+    /// The exact hierarchy route from `base` to the type `candidate` was found
+    /// on, as first-discovery hops. The provider reports undifferentiated
+    /// ancestors, so every hop is [`HierarchyRelation::Supertype`].
+    fn route(&self, base: &CodeUnit, candidate: &CodeUnit) -> Vec<trace::HierarchyHopRecord> {
+        use crate::analyzer::structural::HierarchyRelation;
+
+        let Some((found_on, depth)) = self.found.get(candidate) else {
+            return Vec::new();
+        };
+        let mut chain = vec![found_on.clone()];
+        while chain.last() != Some(base) {
+            let Some(parent) = self
+                .parents
+                .get(chain.last().expect("chain is never empty"))
+            else {
+                break;
+            };
+            chain.push(parent.clone());
+        }
+        chain.reverse();
+        debug_assert_eq!(
+            chain.len(),
+            depth + 1,
+            "the first-discovery chain must be exactly the BFS depth"
+        );
+        chain
+            .windows(2)
+            .enumerate()
+            .map(|(hop, pair)| trace::HierarchyHopRecord {
+                hop,
+                from: pair[0].clone(),
+                to: pair[1].clone(),
+                relation: HierarchyRelation::Supertype,
+            })
+            .collect()
+    }
+
+    fn enrichment(
+        &self,
+        base: &CodeUnit,
+        candidate: &CodeUnit,
+        applicability: brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict,
+    ) -> Option<trace::MemberEnrichment> {
+        use crate::analyzer::structural::MemberDispatchTier;
+
+        let (found_on, depth) = self.found.get(candidate)?;
+        let dispatch_tier = if *depth == 0 {
+            MemberDispatchTier::InherentOrDirect
+        } else {
+            MemberDispatchTier::InheritedOrPromoted
+        };
+        Some(trace::MemberEnrichment {
+            owner: found_on.clone(),
+            hierarchy_depth: *depth,
+            dispatch_tier,
+            applicability,
+            route: self.route(base, candidate),
+        })
+    }
+
+    /// Stage attribution for `winners` on the outcome the caller is about to
+    /// construct, and record every member of `considered` that is not a winner
+    /// as a rejected row. Java's losers here always lost the arity check, whose
+    /// structured story belongs to the callable axis (#1478), so the rejection
+    /// reason defers to it.
+    fn stage_selection(
+        &self,
+        base: &CodeUnit,
+        winners: &[CodeUnit],
+        considered: &[CodeUnit],
+        winner_applicability: brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict,
+    ) {
+        use crate::analyzer::structural::{PrecedenceTier, RejectionReason};
+        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
+        for loser in considered.iter().filter(|unit| !winners.contains(unit)) {
+            let tier = self.found.get(loser).map(|(_, depth)| {
+                if *depth == 0 {
+                    PrecedenceTier::OwnMember
+                } else {
+                    PrecedenceTier::InheritedMember
+                }
+            });
+            let mut row = trace::TraceCandidate::rejected(
+                trace::TraceCandidateRef::Unit(loser.clone()),
+                tier,
+                RejectionReason::CallableApplicabilityDeferred,
+            );
+            if let Some(enrichment) =
+                self.enrichment(base, loser, ApplicabilityVerdict::Inapplicable)
+            {
+                row = row.with_member(enrichment);
+            }
+            trace::record(row);
+        }
+        let winner_tier = winners
+            .iter()
+            .filter_map(|unit| self.found.get(unit))
+            .map(|(_, depth)| *depth)
+            .min()
+            .map(|depth| {
+                if depth == 0 {
+                    PrecedenceTier::OwnMember
+                } else {
+                    PrecedenceTier::InheritedMember
+                }
+            });
+        if let Some(tier) = winner_tier {
+            trace::stage_tier(tier, winners.iter().map(|unit| unit.fq_name()).collect());
+        }
+        trace::stage_member_context(
+            winners
+                .iter()
+                .filter_map(|unit| {
+                    self.enrichment(base, unit, winner_applicability)
+                        .map(|enrichment| (unit.fq_name(), enrichment))
+                })
+                .collect(),
+        );
+    }
+}
+
 fn java_member_candidates(
     analyzer: &dyn IAnalyzer,
     session: &JavaResolutionSession<'_>,
@@ -2468,17 +2613,39 @@ fn java_member_candidates(
     kind: JavaMemberLookupKind,
     arity: Option<usize>,
 ) -> DefinitionLookupOutcome {
+    use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
     let support: &dyn BoundedDefinitionLookup = session;
     let owner_fqn = owner.fq_name();
+    let mut member_trace = trace::recording().then(JavaMemberTrace::default);
     let mut candidates =
         java_filter_member_candidates(support.fqn(&format!("{owner_fqn}.{member}")), kind);
     sort_units(&mut candidates);
     candidates.dedup();
+    if let Some(state) = member_trace.as_mut() {
+        state.record_found(&candidates, owner, 0);
+    }
     if let Some(filtered_candidates) = java_arity_candidates(analyzer, session, &candidates, arity)
     {
+        if let Some(state) = member_trace.as_ref() {
+            state.stage_selection(
+                owner,
+                &filtered_candidates,
+                &candidates,
+                ApplicabilityVerdict::Applicable,
+            );
+        }
         return candidates_outcome(filtered_candidates);
     }
     if !candidates.is_empty() && arity.is_none() {
+        if let Some(state) = member_trace.as_ref() {
+            state.stage_selection(
+                owner,
+                &candidates,
+                &candidates,
+                ApplicabilityVerdict::Unknown,
+            );
+        }
         return candidates_outcome(candidates);
     }
     let mut fallback_candidates = (!candidates.is_empty()).then_some(candidates);
@@ -2486,8 +2653,18 @@ fn java_member_candidates(
     if let Some(provider) = analyzer.type_hierarchy_provider() {
         let mut seen = HashSet::default();
         let mut level = session.direct_ancestors(provider, owner);
+        if let Some(state) = member_trace.as_mut() {
+            for ancestor in &level {
+                state
+                    .parents
+                    .entry(ancestor.clone())
+                    .or_insert_with(|| owner.clone());
+            }
+        }
         seen.insert(owner.clone());
+        let mut depth = 0usize;
         while !level.is_empty() {
+            depth += 1;
             let mut level_candidates = Vec::new();
             let mut next_level = Vec::new();
             for ancestor in level {
@@ -2500,29 +2677,88 @@ fn java_member_candidates(
                 if !seen.insert(ancestor.clone()) {
                     continue;
                 }
-                level_candidates.extend(java_filter_member_candidates(
+                let found = java_filter_member_candidates(
                     support.fqn(&format!("{}.{}", ancestor.fq_name(), member)),
                     kind,
-                ));
-                next_level.extend(session.direct_ancestors(provider, &ancestor));
+                );
+                if let Some(state) = member_trace.as_mut() {
+                    state.record_found(&found, &ancestor, depth);
+                }
+                level_candidates.extend(found);
+                let expanded = session.direct_ancestors(provider, &ancestor);
+                if let Some(state) = member_trace.as_mut() {
+                    for next in &expanded {
+                        state
+                            .parents
+                            .entry(next.clone())
+                            .or_insert_with(|| ancestor.clone());
+                    }
+                }
+                next_level.extend(expanded);
             }
             sort_units(&mut level_candidates);
             level_candidates.dedup();
             if let Some(filtered_level_candidates) =
                 java_arity_candidates(analyzer, session, &level_candidates, arity)
             {
+                if let Some(state) = member_trace.as_ref() {
+                    // A shallower fallback set that a deeper arity match
+                    // displaces lost the same arity check it failed earlier.
+                    let mut considered = level_candidates.clone();
+                    considered.extend(fallback_candidates.iter().flatten().cloned());
+                    state.stage_selection(
+                        owner,
+                        &filtered_level_candidates,
+                        &considered,
+                        ApplicabilityVerdict::Applicable,
+                    );
+                }
                 return candidates_outcome(filtered_level_candidates);
             }
             if !level_candidates.is_empty() {
                 if arity.is_none() {
+                    if let Some(state) = member_trace.as_ref() {
+                        state.stage_selection(
+                            owner,
+                            &level_candidates,
+                            &level_candidates,
+                            ApplicabilityVerdict::Unknown,
+                        );
+                    }
                     return candidates_outcome(level_candidates);
                 }
-                fallback_candidates.get_or_insert(level_candidates);
+                match &fallback_candidates {
+                    None => fallback_candidates = Some(level_candidates),
+                    Some(_) => {
+                        // Discarded outright: a shallower arity-failing set is
+                        // already retained, so these deeper rows can never be
+                        // returned. Record them as rejected while the walk
+                        // still knows them.
+                        if let Some(state) = member_trace.as_ref() {
+                            state.stage_selection(
+                                owner,
+                                &[],
+                                &level_candidates,
+                                ApplicabilityVerdict::Inapplicable,
+                            );
+                        }
+                    }
+                }
             }
             level = next_level;
         }
     }
     if let Some(candidates) = fallback_candidates {
+        if let Some(state) = member_trace.as_ref() {
+            // The best-effort answer: returned despite failing the arity
+            // check, so the verdict stays inapplicable on the selected rows.
+            state.stage_selection(
+                owner,
+                &candidates,
+                &candidates,
+                ApplicabilityVerdict::Inapplicable,
+            );
+        }
         return candidates_outcome(candidates);
     }
     no_definition(

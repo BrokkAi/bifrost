@@ -583,17 +583,9 @@ pub(super) fn render_resolution_candidate(
     let range = render_source_range(analyzer, &occurrence.file, &occurrence.range, cache);
     let candidate = match &value.candidate.candidate {
         TraceCandidateRef::Unit(unit) => {
-            let declaration = analyzer
-                .ranges_of(unit)
-                .into_iter()
-                .min_by_key(primary_range_key)
-                .map(|range| DeclarationValue {
-                    unit: unit.clone(),
-                    range,
-                });
-            match declaration {
+            match render_unit_declaration(analyzer, unit, detail, cache) {
                 Some(declaration) => CodeQueryCandidateRef::Unit {
-                    unit: Box::new(render_declaration(analyzer, &declaration, detail, cache)),
+                    unit: Box::new(declaration),
                 },
                 // A candidate whose unit the workspace can no longer locate is
                 // reported as an external route rather than dropped: the
@@ -635,7 +627,31 @@ pub(super) fn render_resolution_candidate(
     };
     let canonical_member_id = environment::candidate_unit(&value.candidate.candidate)
         .map(|unit| canonical_member_digest(analyzer, unit));
-    environment::public_candidate(value, range, candidate, canonical_member_id)
+    let owner = value
+        .candidate
+        .member
+        .as_ref()
+        .and_then(|member| render_unit_declaration(analyzer, &member.owner, detail, cache));
+    environment::public_candidate(value, range, candidate, canonical_member_id, owner)
+}
+
+/// Render one workspace declaration for a row field, or `None` when the
+/// workspace can no longer locate the unit.
+fn render_unit_declaration(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> Option<CodeQueryDeclaration> {
+    analyzer
+        .ranges_of(unit)
+        .into_iter()
+        .min_by_key(primary_range_key)
+        .map(|range| DeclarationValue {
+            unit: unit.clone(),
+            range,
+        })
+        .map(|declaration| render_declaration(analyzer, &declaration, detail, cache))
 }
 
 /// A stable, domain-separated digest of one declaration's #1475 canonical

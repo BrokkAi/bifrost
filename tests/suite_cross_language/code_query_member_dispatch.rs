@@ -296,6 +296,105 @@ fn every_language_family_emits_an_honest_mandatory_selection_summary() {
     }
 }
 
+/// Java member candidates carry their #1477 attribution: the exact hierarchy
+/// owner the resolver found the member on, the BFS depth of that owner, and
+/// the language-neutral dispatch tier. A member inherited through two hops
+/// reports the root owner at depth 2; a decoy owner outside the hierarchy is
+/// never attributed.
+#[test]
+fn java_candidate_rows_attribute_owner_depth_and_tier() {
+    let files = [(
+        "App.java",
+        r#"class Root { void run() {} }
+class Base extends Root { }
+class Service extends Base { }
+class Decoy { void run() {} }
+class Caller {
+    void call(Service service) { service.run(); }
+}
+"#,
+    )];
+    let candidates = serialized(&run(
+        &files,
+        json!({
+            "where": ["App.java"],
+            "occurrences": { "role": ["member_position"] },
+            "steps": [{"op": "candidates_of"}],
+            "result_detail": "full"
+        }),
+    ));
+    let selected = rows(&candidates)
+        .iter()
+        .filter(|row| row["outcome"] == "selected")
+        .collect::<Vec<_>>();
+    assert!(!selected.is_empty(), "{candidates}");
+    for row in &selected {
+        assert_eq!(
+            row["candidate"]["unit"]["fq_name"], "Root.run",
+            "{candidates}"
+        );
+        assert_eq!(row["owner"]["fq_name"], "Root", "{candidates}");
+        assert_eq!(row["hierarchy_depth"], 2, "{candidates}");
+        assert_eq!(
+            row["dispatch_tier"], "inherited_or_promoted",
+            "{candidates}"
+        );
+        assert_eq!(row["tier"], "inherited_member", "{candidates}");
+        assert!(
+            row["owner_id"].is_null() || row["owner"]["id"] == row["owner_id"],
+            "{candidates}"
+        );
+    }
+}
+
+/// A direct member outranks the same-name inherited member, and the candidate
+/// row states the direct find: owner is the receiver's own type, depth zero,
+/// tier `inherent_or_direct`. The deeper inherited declaration is never
+/// reached by the production walk, so no row claims it was considered.
+#[test]
+fn java_direct_member_precedence_is_attributed_at_depth_zero() {
+    let files = [(
+        "App.java",
+        r#"class Base { void run() {} }
+class Service extends Base { void run() {} }
+class Caller {
+    void call(Service service) { service.run(); }
+}
+"#,
+    )];
+    let candidates = serialized(&run(
+        &files,
+        json!({
+            "where": ["App.java"],
+            "occurrences": { "role": ["member_position"] },
+            "steps": [{"op": "candidates_of"}],
+            "result_detail": "full"
+        }),
+    ));
+    let selected = rows(&candidates)
+        .iter()
+        .filter(|row| row["outcome"] == "selected")
+        .collect::<Vec<_>>();
+    assert!(!selected.is_empty(), "{candidates}");
+    for row in &selected {
+        assert_eq!(
+            row["candidate"]["unit"]["fq_name"], "Service.run",
+            "{candidates}"
+        );
+        assert_eq!(row["owner"]["fq_name"], "Service", "{candidates}");
+        assert_eq!(row["hierarchy_depth"], 0, "{candidates}");
+        assert_eq!(row["dispatch_tier"], "inherent_or_direct", "{candidates}");
+        assert_eq!(row["tier"], "own_member", "{candidates}");
+    }
+    assert!(
+        rows(&candidates)
+            .iter()
+            .all(|row| row["candidate"]["unit"]["fq_name"] != "Base.run"),
+        "the hidden deeper member is never computed by the production walk, \
+         so no row may claim it was considered: {candidates}"
+    );
+}
+
 /// Java: the summary row is mandatory and joins its candidates by AST
 /// identity, with an inherited-member fixture and a same-name decoy.
 #[test]
