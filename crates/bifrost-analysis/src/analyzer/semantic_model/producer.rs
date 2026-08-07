@@ -22,6 +22,10 @@ pub enum ExternalArtifactKind {
     PythonStub,
     PythonSource,
     RubyGemArchive,
+    /// One Composer-installed package tree. Composer installs sources rather
+    /// than a compiled artifact, so the ecosystem names the input instead of
+    /// the language, exactly as `NpmPackageManifest` does.
+    ComposerPackageSourceSet,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

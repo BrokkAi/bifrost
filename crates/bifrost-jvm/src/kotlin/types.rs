@@ -31,10 +31,14 @@
 //! without three copies of the precedence rules.
 
 use brokk_bifrost_core::analyzer::model::ImportInfo;
+use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile};
 
 use crate::kotlin::graph_support::KotlinSource;
 use crate::kotlin::imports::{KOTLIN_DEFAULT_IMPORT_PACKAGES, kotlin_import_path};
+use crate::proof::{
+    JvmActiveSemanticModel, JvmModelDisposition, JvmNameProof, prove_against_active_model,
+};
 use crate::realm::JvmSourceRealm;
 
 /// How many levels of inherited scope a nested-type lookup will walk.
@@ -261,42 +265,82 @@ pub fn resolve_kotlin_type_name_with_external_in_realm(
     resolve_kotlin_type_name_in_scope(source, raw_name, &scope, realm)
 }
 
-/// Whether `raw_name`, looked up against a caller-supplied `scope`, is
-/// unambiguously unknown to every tier of Kotlin's resolution ladder: the
-/// scope's imports, the file's own package, star imports, default imports, the
-/// wider JVM source realm (when `realm` is supplied), and the external
-/// dependency index.
+/// What every retained surface proves about `raw_name` looked up against a
+/// caller-supplied `scope`: the scope's imports, the file's own package, star
+/// imports, default imports, the wider JVM source realm (when `realm` is
+/// supplied), the retained external dependency index, and the active dependency
+/// model.
 ///
-/// Returns `false` for anything the ladder resolves *or* for a genuinely
-/// ambiguous star-import collision — [`KotlinTypeName::Ambiguous`] is a real
-/// answer (Kotlin itself rejects the reference), not evidence that a
-/// declaration is missing, so it must never be reported as unrecognized. This
-/// is the tri-state-preserving sibling of [`resolve_kotlin_type_name_in_scope`]:
-/// that function folds `Ambiguous` into `None` because a caller just wants
-/// "the" resolved unit, but a diagnostic collector must not conflate the two.
-pub fn kotlin_type_name_definitely_unresolved_in_realm(
+/// This is the tri-state-preserving sibling of
+/// [`resolve_kotlin_type_name_in_scope`]: that function folds `Ambiguous` into
+/// `None` because a caller just wants "the" resolved unit, but a diagnostic
+/// collector must not conflate the two. [`KotlinTypeName::Ambiguous`] is a real
+/// answer -- Kotlin itself rejects the reference -- not evidence that a
+/// declaration is missing, so it becomes [`JvmNameProof::Ambiguous`] and never
+/// an error.
+///
+/// Every tier here reads retained state. In particular the external tier peeks:
+/// see [`crate::proof`] on why a diagnostic may not build the jar index.
+pub fn kotlin_type_name_proof(
     source: &dyn KotlinSource,
     scope: &KotlinNameScope<'_>,
     raw_name: &str,
     realm: Option<&JvmSourceRealm<'_>>,
-) -> bool {
-    let source_first = resolve_kotlin_type_name(raw_name, scope, |candidate| {
+    model: &dyn JvmActiveSemanticModel,
+) -> JvmNameProof {
+    match resolve_kotlin_type_name(raw_name, scope, |candidate| {
         kotlin_realm_type_exists(source, candidate, realm)
-    });
-    if !matches!(source_first, KotlinTypeName::Unresolved) {
-        return false;
+    }) {
+        KotlinTypeName::Resolved(_) => return JvmNameProof::Workspace,
+        // The head-segment walk stops at the second competing star import, so
+        // two is what it observed, not a count of every route that could
+        // compete. Both routes it saw were workspace declarations.
+        KotlinTypeName::Ambiguous => {
+            return JvmNameProof::Ambiguous {
+                boundaries: vec![BoundaryStatus::WorkspaceLocal; 2],
+            };
+        }
+        KotlinTypeName::Unresolved => {}
     }
 
-    if source.external_index_is_empty() {
-        return true;
-    }
     let access_package = scope.package_name;
-    matches!(
-        resolve_kotlin_type_name(raw_name, scope, |candidate| {
-            source.external_qualified_name_exists(candidate, access_package)
-        }),
-        KotlinTypeName::Unresolved
-    )
+    let retained = source.retained_external_index();
+    if retained.is_readable() {
+        match resolve_kotlin_type_name(raw_name, scope, |candidate| {
+            source.retained_external_qualified_name_exists(candidate, access_package)
+        }) {
+            KotlinTypeName::Resolved(_) => return JvmNameProof::ExternalIndexed,
+            KotlinTypeName::Ambiguous => {
+                return JvmNameProof::Ambiguous {
+                    boundaries: vec![BoundaryStatus::ExternalIndexed; 2],
+                };
+            }
+            KotlinTypeName::Unresolved => {}
+        }
+    }
+
+    prove_against_active_model(retained, model, || {
+        // Kotlin's own tiers decide which spelling the model is asked about, so
+        // an unrelated dependency type that merely shares the simple name
+        // cannot silence a real error.
+        let mut matched = JvmModelDisposition::Absent;
+        let decided = resolve_kotlin_type_name(raw_name, scope, |candidate| {
+            match model.qualified_name_disposition(candidate) {
+                JvmModelDisposition::Absent => false,
+                found => {
+                    matched = found;
+                    true
+                }
+            }
+        });
+        match decided {
+            KotlinTypeName::Resolved(_) => matched,
+            // Two star imports both name a modelled type: the spelling exists
+            // and denotes neither one in particular.
+            KotlinTypeName::Ambiguous => JvmModelDisposition::Conflicting { declarations: 2 },
+            KotlinTypeName::Unresolved => JvmModelDisposition::Absent,
+        }
+    })
 }
 
 fn resolve_kotlin_type_name_in_scope(

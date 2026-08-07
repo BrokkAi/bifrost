@@ -19,8 +19,9 @@ A user can verify this behavior with focused semantic and LSP tests. Missing loc
 - [x] (2026-08-05 16:14Z) Milestone 1, issue #1616: added the shared semantic diagnostic proof report, migrated all implementations, tested it, and completed the post-milestone review. The checkpoint commit follows this plan update.
 - [x] (2026-08-05 16:45Z) Milestone 2, issue #1617: added the host-owned seven-ecosystem activation and evidence lifecycle, tested it, reviewed it, and landed commit `739708573`.
 - [x] (2026-08-05 16:45Z) Milestone 3, issue #1618: added the shared proof conformance harness and pinned offline Scala witnesses, tested it, reviewed it, and landed commit `be3c3d66a`.
-- [ ] Milestone 4, issue #1619: add the JVM pilot, exact positive and near-miss tests, review it, and commit it.
+- [x] (2026-08-07) Milestone 4, issue #1619: all three JVM languages answer one proof ladder, diagnostics are read-only, and the cross-language matrix is executable.
 - [x] (2026-08-05 17:10Z) Started #1619: added proof-gated Java collection, merged-realm workspace lookup, and three focused tests.
+- [x] (2026-08-07) Finished #1619: added `brokk-bifrost-jvm/src/proof.rs`, migrated Kotlin and Scala off `from_workspace_absences`, made every external read peek-only, moved jar building to `warm_query_indexes`, and added Java's active-overlay import tiers.
 - [ ] Run the final Bifrost policy gate and appropriate CI-equivalent checks.
 
 ## Surprises & Discoveries
@@ -41,6 +42,14 @@ A user can verify this behavior with focused semantic and LSP tests. Missing loc
   Evidence: Issue #1668 records the exact request, revision, RMCP state, and result.
 - Observation: Existing Kotlin and Scala collectors still construct complete workspace absences after resolver calls that can initialize JVM external indexes.
   Evidence: Their implementations use `from_workspace_absences`; Kotlin type checks call `external_declaration_index()`.
+- Observation: The concern above was worse than recorded. Every JVM external read went through `OnceLock::get_or_init`, and no `.get()` peek existed anywhere. `JvmExternalDeclarationIndex::build_for_project` reads up to 128 artifacts and 512 MiB of jars, and under `JvmDependencyDiscoveryMode::OfflineBuildTools` spawns `mvn -o` or `gradle --offline` with a 30-second timeout each.
+  Evidence: Survey of `analyzer/jvm/external.rs:968-1017` and `dependency_discovery.rs:88-226`. No pre-warm caller existed: `warm_query_indexes` was overridden only by `RustAnalyzer`, so the background `IndexWarmer` never touched the JVM index and every build was demand-driven from a request.
+- Observation: `JvmExternalType` carries no member information at all.
+  Evidence: `analyzer/jvm/external.rs:59-67` holds `fqn`, `package_name`, `short_name`, `kind`, `visibility`, `source`. `class_type` parses a whole `.class` file through `jclassfile` and discards the method and field tables; `apply_java_type_fact` merges only `kind` and `visibility`.
+- Observation: The active overlay indexes each symbol under its simple name as well as its qualified name and aliases, so a naive `symbols_named` lookup silently accepted a simple-name match.
+  Evidence: `semantic_model/overlay.rs:616-619` posts all three. A Kotlin file spelling a bare `Widget` with no import matched the modelled `com.acme.Widget` until `JvmOverlayModel` was narrowed to qualified spellings.
+- Observation: `MultiAnalyzer` routed Kotlin diagnostics to the Kotlin *delegate* and only when `kotlin_realm()` found Java or Scala peers, so a Kotlin-only workspace read an empty overlay. Scala had no arm at all.
+  Evidence: `acquire_active_semantic_models` publishes onto the analyzer the host holds; delegates keep their own `snapshot_caches`. Both defects would have made the proof gate permanently inert for those languages.
 
 ## Decision Log
 
@@ -65,6 +74,21 @@ A user can verify this behavior with focused semantic and LSP tests. Missing loc
 - Decision: Keep the shared #1618 matrix report-level and add language execution as each ecosystem integration lands.
   Rationale: The shared proof contract exists now. Only the JVM pilot is in this lane. Other language collectors belong to #1620 through #1627.
   Date/Author: 2026-08-05 / Codex
+- Decision: A diagnostic peeks at the retained external index and never builds it; `IAnalyzer::warm_query_indexes` builds it instead.
+  Rationale: #1615 forbids package I/O inside a request, and building that index reads jars and can spawn build tools. `warm_query_indexes` is the documented off-request, background-safe, idempotent hook, and `IndexWarmer` already drives it. The resolver keeps its eager path, so the diagnostic path's evidence is a strict subset of the resolver's; with less evidence a lookup can only fall toward `Incomplete`, never toward `Absent`, so a diagnostic can never contradict a `get_definition` that resolved the same reference.
+  Date/Author: 2026-08-07 / Claude
+- Decision: Only a published dependency model makes an external miss provable. A complete jar index answers `ExternalUnknown` on a miss.
+  Rationale: This follows the Java pilot rather than widening it. A jar index is complete for the artifacts that happened to resolve on disk, which is not a claim about the classpath the build would use; if JDK discovery had not run, trusting it would report `String` as absent. A published model set is an activated, curated API surface, so missing it is evidence. The visible consequence is recorded under Outcomes.
+  Date/Author: 2026-08-07 / Claude
+- Decision: Map Scala's former `Uncertain` to `UnsupportedSemantics{detail}`, not to a dependency-state reason.
+  Rationale: `Uncertain` meant an import the resolver cannot follow -- a wildcard whose members it does not enumerate, or a target no retained surface holds. Nothing is missing from the dependency surface; the gap is in this resolver. `MissingDependencyDiscovery` would send a reader to configure a classpath that is not the problem. The detail quotes the exact import.
+  Date/Author: 2026-08-07 / Claude
+- Decision: JVM member-surface absence is not implemented, and is documented as vacuous rather than faked.
+  Rationale: `JvmExternalType` carries no member information, so no JVM surface can prove a member absent from a complete owner. `SemanticDiagnosticDomain::MemberSurface` therefore has no JVM producer, and all three collectors diagnose written type and term names only. The shared conformance harness still covers the domain at report level from #1618.
+  Date/Author: 2026-08-07 / Claude
+- Decision: A conflicted model match is `Ambiguous`, not a miss.
+  Rationale: Two dependency models binding one fully-qualified name means the name exists and denotes neither in particular. Treating that as absence would manufacture an error out of an excess of evidence.
+  Date/Author: 2026-08-07 / Claude
 
 ## Outcomes & Retrospective
 
@@ -77,6 +101,14 @@ Milestone 2 is complete. `DependencyPackEcosystem` selects JVM, .NET, npm, Pytho
 Milestone 3 is complete for the shared proof layer. The matrix contains all 11 required scenario classes, all five checked domains, exact multi-reason suppression, member-surface completeness, and the LSP diagnostic projection. Ten non-absence cases emit zero errors. One complete workspace absence emits one error. Two offline Scala witnesses are content-pinned. No checked-in pinned Java or Kotlin real-project corpus exists yet; milestone 4 must add JVM-specific executable cases. Other ecosystem real-project rows remain gated by their integration issues #1620 through #1627.
 
 Milestone 4 has started but is not complete. Java now has a structured collector. It uses the merged JVM workspace definition index in `MultiAnalyzer`, keeps multiple workspace candidates ambiguous, and does not create external `CodeUnit` values. Without retained dependency proof, a missing Java type produces `MissingDependencyDiscovery` and no error. Three Java tests cover workspace resolution, an unproved missing type, and a same-name value near miss. Active overlay lookup must next use Java import tiers. Kotlin and Scala must then stop eager external-index initialization during diagnostics.
+
+Milestone 4 is now complete. `brokk-bifrost-jvm/src/proof.rs` holds the vocabulary all three languages answer: `JvmNameProof`, `JvmProofGap`, `JvmRetainedExternalIndex`, `JvmModelDisposition` and `JvmActiveSemanticModel`. `record_jvm_name_proof` is the only path from a proof to a report entry, so exactly one code path can emit an error and only `JvmNameProof::Absent` reaches it. Kotlin's `kotlin_type_name_proof` replaces a boolean that had collapsed three facts into one bit, and Scala's `simple_type_proof` and `simple_term_proof` replace `ScalaTypeKnownness`, whose `Uncertain` arm had collapsed two more.
+
+Every external read is now a peek. Java, Kotlin and Scala expose `retained_*` members that read the `OnceLock` without initializing it, and all three analyzers implement `warm_query_indexes` so the jar reads happen on the host's background hook instead. Java consults the active model through `java_type_name_candidate_fqns`, which walks the explicit-import, wildcard-import, same-package, default-package and `java.lang` tiers and yields spellings rather than `CodeUnit`s, because an external declaration has none and must never be given a fabricated one.
+
+Validation: 694 semantic-suite tests, 1686 analysis unit tests, 33 JVM crate tests and 198 LSP server tests pass, with featureless workspace clippy clean. `tests/suite_semantic/jvm_diagnostic_proof.rs` runs ten cross-language assertions covering all six acceptance criteria; the per-language files now assert outcomes instead of `Debug` substrings.
+
+Two consequences are deliberate and visible. First, JVM unrecognized-symbol diagnostics no longer fire without an activated dependency model, so a plain LSP session publishes none: the LSP host does not call `activate_dependency_packs`, while the MCP service does activate through `acquire_active_semantic_models`. Wiring LSP activation is host work outside this lane and is what turns positive JVM diagnostics back on. The two LSP opt-in tests were rewritten to pin the new contract -- an enabled pass still publishes nothing it cannot prove -- and they name where the positive case is pinned instead. Second, `SemanticDiagnosticDomain::MemberSurface` has no JVM producer, because `JvmExternalType` carries no member information; this is documented in `proof.rs` and in the Decision Log rather than simulated.
 
 ## Context and Orientation
 
@@ -170,3 +202,5 @@ Revision note, 2026-08-05 16:14Z: Completed issue #1616. Added exact API, test, 
 Revision note, 2026-08-05 16:45Z: Landed #1617 and #1618 together after their parallel detached-worktree reviews. Recorded atomic lifecycle behavior, conformance results, pinned-corpus limits, and dogfood latency issue #1668.
 
 Revision note, 2026-08-05 17:10Z: Started #1619 with Java proof-gated collection and focused near-miss tests. Recorded remaining overlay-precedence and read-only migration work.
+
+Revision note, 2026-08-07: Completed #1619. Added the shared JVM proof ladder, migrated Kotlin and Scala onto it, made every external read peek-only and moved jar building to `warm_query_indexes`. Recorded the two routing defects that would have left the gate inert, the simple-name overlay match that would have suppressed real errors, the vacuous member-surface result, and the LSP activation gap that keeps positive JVM diagnostics off until a host activates packs.

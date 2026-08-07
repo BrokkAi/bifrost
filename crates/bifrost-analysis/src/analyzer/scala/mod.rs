@@ -1,5 +1,6 @@
 mod adapter;
 mod clones;
+pub(crate) mod diagnostics;
 mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
@@ -21,6 +22,7 @@ use crate::analyzer::clone_detection::{
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
+use crate::analyzer::jvm::retained_external_index_state;
 use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
@@ -56,6 +58,7 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
+use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -64,9 +67,13 @@ use std::sync::{Arc, OnceLock};
 pub(crate) use crate::analyzer::usages::scala_graph::ScalaProjectTypes;
 pub(crate) use crate::analyzer::{ScalaExportInfo, ScalaExportSelector};
 pub(crate) use adapter::ScalaAdapter;
+pub(crate) use brokk_bifrost_jvm::proof::{
+    JvmActiveSemanticModel, JvmModelDisposition, JvmProofGap, model_disposition_over_tiers,
+    prove_against_active_model,
+};
 pub(crate) use brokk_bifrost_jvm::scala::graph_support::{
     ScalaCallableFactsIndex, ScalaDefinitionIndex, ScalaFileFacts, ScalaForwardOwnerFacts,
-    ScalaSource, ScalaTypeKnownness,
+    ScalaNameProof, ScalaSource,
 };
 pub(crate) use brokk_bifrost_jvm::scala::imports::{
     scala_enclosing_template_owner_fq_names, scala_lexical_scope_path_at,
@@ -461,8 +468,8 @@ impl ScalaAnalyzer {
 
     /// Whether a bare Scala type name is declared in `file` itself or anywhere
     /// in `package_name`. The source-declaration half of both
-    /// [`ScalaSource::simple_type_knownness`] and
-    /// [`ScalaSource::is_known_simple_term`], which decide whether
+    /// [`ScalaSource::simple_type_proof`] and
+    /// [`ScalaSource::simple_term_proof`], which decide whether
     /// `SCALA_UNRECOGNIZED_SYMBOL` fires for a name.
     ///
     /// Two indexed lookups, one per disjunct, in place of one
@@ -637,67 +644,176 @@ fn weight_scala_usage_edges(
     (key_bytes + edge_bytes + summary_bytes).clamp(1, u32::MAX as usize) as u32
 }
 
+/// A tier that stopped Scala's ladder because an import could bind the name and
+/// this analyzer cannot follow it to a declaration set.
+///
+/// `UnsupportedSemantics`, not a dependency-state reason: nothing is missing
+/// from the dependency surface, and pointing at the classpath would send a
+/// reader to fix the wrong thing. The gap is in this resolver -- it does not
+/// enumerate a wildcard import's members, and it cannot follow an import target
+/// that no retained surface holds -- so the reason names that.
+fn unfollowable_scala_import(spelling: &str) -> ScalaNameProof {
+    ScalaNameProof::Incomplete(JvmProofGap::Unsupported {
+        detail: format!("Scala {spelling} cannot be followed to a declaration set"),
+    })
+}
+
+/// What a published dependency model proves about one fully-qualified Scala
+/// spelling, or `None` when it does not hold that spelling at all.
+fn model_proof(model: &dyn JvmActiveSemanticModel, fqn: &str) -> Option<ScalaNameProof> {
+    match model.qualified_name_disposition(fqn) {
+        JvmModelDisposition::Absent => None,
+        JvmModelDisposition::Unique => Some(ScalaNameProof::ExternalIndexed),
+        JvmModelDisposition::Conflicting { declarations } => Some(ScalaNameProof::Ambiguous {
+            boundaries: vec![BoundaryStatus::ExternalIndexed; declarations],
+        }),
+    }
+}
+
+fn qualify_scala_name(package_name: &str, name: &str) -> String {
+    if package_name.is_empty() {
+        name.to_string()
+    } else {
+        format!("{package_name}.{name}")
+    }
+}
+
 impl ScalaSource for ScalaAnalyzer {
-    fn simple_type_knownness(&self, file: &ProjectFile, name: &str) -> ScalaTypeKnownness {
+    /// Scala's type-name ladder, read-only (#1619).
+    ///
+    /// Every tier peeks: `self.external_index.get()` rather than
+    /// `external_declaration_index()`, because building that index reads jars
+    /// and a diagnostic request may not. An unbuilt index simply cannot answer,
+    /// which is `Incomplete`, never `Absent`.
+    ///
+    /// The tiers are, in order: `scala_default_type_name`, this file's and this
+    /// package's declarations, `java.lang`, the file's imports, and finally the
+    /// package projection of the external surfaces. An import that cannot be
+    /// followed to a declaration set stops the ladder with the exact import
+    /// spelling, because that import may be what binds the name.
+    fn simple_type_proof(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        model: &dyn JvmActiveSemanticModel,
+    ) -> ScalaNameProof {
         if name.is_empty() || scala_default_type_name(name) {
-            return ScalaTypeKnownness::Known;
+            // A name on Scala's built-in list is known by construction. It
+            // denotes a stdlib declaration, so the boundary is external.
+            return ScalaNameProof::ExternalIndexed;
         }
 
         let package_name = self.inner.package_name_of(file).unwrap_or_default();
         if self.declares_simple_type(file, &package_name, name) {
-            return ScalaTypeKnownness::Known;
+            return ScalaNameProof::Workspace;
         }
 
         let imports = self.inner.import_info_of(file);
         let imported = self.imported_code_units_of(file);
-        let external = self.external_declaration_index();
-        if external.resolve_java_lang(name).is_some() {
-            return ScalaTypeKnownness::Known;
+        let retained = self.external_index.get();
+        let declares_name = |declaration: &CodeUnit| {
+            declaration.is_class() && declaration.short_name().trim_end_matches('$') == name
+        };
+        if retained.is_some_and(|external| external.resolve_java_lang(name).is_some()) {
+            return ScalaNameProof::ExternalIndexed;
         }
         for import in &imports {
             let Some(path) = scala_import_path(import) else {
-                return ScalaTypeKnownness::Uncertain;
+                return unfollowable_scala_import("an import with no structured path");
             };
             if import.is_wildcard {
-                if imported.iter().any(|declaration| {
-                    declaration.is_class() && declaration.short_name().trim_end_matches('$') == name
-                }) || external
-                    .resolve_wildcard_import(&path, name, &package_name)
-                    .is_some()
-                {
-                    return ScalaTypeKnownness::Known;
+                if imported.iter().any(declares_name) {
+                    return ScalaNameProof::Workspace;
                 }
-                return ScalaTypeKnownness::Uncertain;
+                if retained.is_some_and(|external| {
+                    external
+                        .resolve_wildcard_import(&path, name, &package_name)
+                        .is_some()
+                }) {
+                    return ScalaNameProof::ExternalIndexed;
+                }
+                if let Some(proof) = model_proof(model, &format!("{path}.{name}")) {
+                    return proof;
+                }
+                // The members of a wildcard import this analyzer cannot
+                // enumerate are exactly the names it cannot rule out.
+                return unfollowable_scala_import(&format!("wildcard import `{path}`"));
             }
 
             if import.local_name() != Some(name) {
                 continue;
             }
-            if imported.iter().any(|declaration| {
-                declaration.is_class() && declaration.short_name().trim_end_matches('$') == name
-            }) || external
-                .resolve_explicit_import(&path, &package_name)
-                .is_some()
-            {
-                return ScalaTypeKnownness::Known;
+            if imported.iter().any(declares_name) {
+                return ScalaNameProof::Workspace;
             }
-            return ScalaTypeKnownness::Uncertain;
+            if retained.is_some_and(|external| {
+                external
+                    .resolve_explicit_import(&path, &package_name)
+                    .is_some()
+            }) {
+                return ScalaNameProof::ExternalIndexed;
+            }
+            if let Some(proof) = model_proof(model, &path) {
+                return proof;
+            }
+            // An explicit import binds this spelling to something no retained
+            // surface holds. The import is the answer; it just cannot be
+            // followed, so the name must not be called absent.
+            return unfollowable_scala_import(&format!("import `{path}`"));
         }
 
-        if external.resolve_same_package(&package_name, name).is_some() {
-            ScalaTypeKnownness::Known
-        } else {
-            ScalaTypeKnownness::Absent
+        if retained
+            .is_some_and(|external| external.resolve_same_package(&package_name, name).is_some())
+        {
+            return ScalaNameProof::ExternalIndexed;
         }
+        let spellings = [
+            qualify_scala_name(&package_name, name),
+            format!("java.lang.{name}"),
+        ];
+        prove_against_active_model(retained_external_index_state(retained), model, || {
+            model_disposition_over_tiers(model, spellings.iter().map(String::as_str))
+        })
     }
 
-    fn is_known_simple_term(&self, file: &ProjectFile, name: &str) -> bool {
+    /// Scala's term ladder, read-only. See [`Self::simple_type_proof`].
+    ///
+    /// A term is looked for among this file's and this package's declarations
+    /// only. Any import that could bind the spelling stops the ladder: Scala
+    /// imports terms as readily as types, and this analyzer does not follow an
+    /// import to its term members.
+    fn simple_term_proof(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        model: &dyn JvmActiveSemanticModel,
+    ) -> ScalaNameProof {
         let package_name = self.inner.package_name_of(file).unwrap_or_default();
-        self.declares_simple_type(file, &package_name, name)
-            || self
-                .external_declaration_index()
-                .resolve_same_package(&package_name, name)
-                .is_some()
+        if self.declares_simple_type(file, &package_name, name) {
+            return ScalaNameProof::Workspace;
+        }
+        let retained = self.external_index.get();
+        if retained
+            .is_some_and(|external| external.resolve_same_package(&package_name, name).is_some())
+        {
+            return ScalaNameProof::ExternalIndexed;
+        }
+        let imports = self.inner.import_info_of(file);
+        if let Some(import) = imports
+            .iter()
+            .find(|import| import.is_wildcard || import.local_name() == Some(name))
+        {
+            let spelling = scala_import_path(import).unwrap_or_else(|| name.to_string());
+            return unfollowable_scala_import(&if import.is_wildcard {
+                format!("wildcard import `{spelling}`")
+            } else {
+                format!("import `{spelling}`")
+            });
+        }
+        let spelling = qualify_scala_name(&package_name, name);
+        prove_against_active_model(retained_external_index_state(retained), model, || {
+            model_disposition_over_tiers(model, std::iter::once(spelling.as_str()))
+        })
     }
 
     fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -1052,14 +1168,19 @@ impl IAnalyzer for ScalaAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
-        let diagnostics =
-            brokk_bifrost_jvm::scala::diagnostics::collect_scala_semantic_diagnostics(
-                self, file, source,
-            )
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(file, diagnostics)
+        diagnostics::collect_scala_semantic_diagnostics(self, file, source)
+    }
+
+    /// Build the jar-backed external declaration index off the request path.
+    /// See `JavaAnalyzer::warm_query_indexes`; the three JVM analyzers share
+    /// one dependency universe and one reason not to build it under a
+    /// diagnostic.
+    fn warm_query_indexes(&self) {
+        self.external_declaration_index();
+    }
+
+    fn query_indexes_warm(&self) -> bool {
+        self.external_index.get().is_some()
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
@@ -1514,19 +1635,69 @@ class Use(api: Api) { def call(): Int = api.choose(1)("overlay") }
     }
 }
 
-/// The answers [`ScalaSource::simple_type_knownness`] and
-/// [`ScalaSource::is_known_simple_term`] give for a bare name, pinned on a
+/// The answers [`ScalaSource::simple_type_proof`] and
+/// [`ScalaSource::simple_term_proof`] give for a bare name, pinned on a
 /// fixture that separates every disjunct of the declaration test.
 ///
-/// These predicates decide whether `SCALA_UNRECOGNIZED_SYMBOL` fires, so a
-/// changed answer is a changed diagnostic and nothing else reports it. The
-/// cases below existed before the indexed lookups replaced the whole-workspace
+/// These two decide whether `SCALA_UNRECOGNIZED_SYMBOL` fires, so a changed
+/// answer is a changed diagnostic and nothing else reports it. The cases below
+/// existed before the indexed lookups replaced the whole-workspace
 /// `all_declarations()` scan and read identically after, which is the whole
 /// point of writing them as one table.
+///
+/// Since #1619 the table records *proofs* rather than a `Known`/`Absent`
+/// boolean. A name the workspace does not declare is no longer absent by
+/// default: with no retained jar index and no published dependency model,
+/// nothing past the workspace has been read, so the honest answer is
+/// `Incomplete`. Only the published-model case below can reach `Absent`.
 #[cfg(test)]
 mod knownness_tests {
     use super::*;
     use crate::analyzer::TestProject;
+
+    /// A dependency model holding exactly the fully-qualified names it is given.
+    struct FakeActiveModel {
+        published: bool,
+        names: Vec<&'static str>,
+    }
+
+    impl FakeActiveModel {
+        fn unpublished() -> Self {
+            Self {
+                published: false,
+                names: Vec::new(),
+            }
+        }
+
+        fn publishing(names: &[&'static str]) -> Self {
+            Self {
+                published: true,
+                names: names.to_vec(),
+            }
+        }
+    }
+
+    impl JvmActiveSemanticModel for FakeActiveModel {
+        fn is_published(&self) -> bool {
+            self.published
+        }
+
+        fn qualified_name_disposition(&self, fqn: &str) -> JvmModelDisposition {
+            match self.names.iter().filter(|name| **name == fqn).count() {
+                0 => JvmModelDisposition::Absent,
+                1 => JvmModelDisposition::Unique,
+                declarations => JvmModelDisposition::Conflicting { declarations },
+            }
+        }
+    }
+
+    /// What every name below answers when nothing past the workspace is
+    /// readable: the jar index was never built and no model is published.
+    fn unreadable_beyond_workspace() -> ScalaNameProof {
+        ScalaNameProof::Incomplete(JvmProofGap::ExternalBoundary {
+            boundary: BoundaryStatus::ExternalUnknown,
+        })
+    }
 
     /// `app/Consumer.scala` declares `nested.FileLocal` in a second package
     /// clause, so that unit is same-file but *not* same-package: it isolates
@@ -1565,70 +1736,134 @@ mod knownness_tests {
     }
 
     #[test]
-    fn simple_type_knownness_answers_each_declaration_shape() {
+    fn simple_type_proof_answers_each_declaration_shape() {
         let (_temp, analyzer, consumer) = fixture();
+        let model = FakeActiveModel::unpublished();
         for (name, expected) in [
             // Same package, another file: the plain class.
-            ("Sibling", ScalaTypeKnownness::Known),
+            ("Sibling", ScalaNameProof::Workspace),
             // Same package, class and companion object under one name.
-            ("Paired", ScalaTypeKnownness::Known),
+            ("Paired", ScalaNameProof::Workspace),
             // Same package, companion object with no class: the only unit is
             // `app.Lonely$`, matched with its trailing `$` trimmed.
-            ("Lonely", ScalaTypeKnownness::Known),
-            ("Outer", ScalaTypeKnownness::Known),
+            ("Lonely", ScalaNameProof::Workspace),
+            ("Outer", ScalaNameProof::Workspace),
             // The `$`-carrying spelling is not a Scala type name, and trimming
             // the declaration's `$` must not make it one.
-            ("Lonely$", ScalaTypeKnownness::Absent),
+            ("Lonely$", unreadable_beyond_workspace()),
             // Nested object: short name `Outer$.Inner$`, so a bare `Inner` has
             // never matched it even though the type exists in the package.
-            ("Inner", ScalaTypeKnownness::Absent),
+            ("Inner", unreadable_beyond_workspace()),
             // Same file, different package.
-            ("FileLocal", ScalaTypeKnownness::Known),
+            ("FileLocal", ScalaNameProof::Workspace),
             // Another package entirely, and no import to reach it.
-            ("Far", ScalaTypeKnownness::Absent),
-            ("Missing", ScalaTypeKnownness::Absent),
+            ("Far", unreadable_beyond_workspace()),
+            ("Missing", unreadable_beyond_workspace()),
         ] {
             assert_eq!(
                 expected,
-                ScalaSource::simple_type_knownness(&analyzer, &consumer, name),
-                "knownness of `{name}`"
+                ScalaSource::simple_type_proof(&analyzer, &consumer, name, &model),
+                "type proof of `{name}`"
             );
         }
     }
 
     #[test]
-    fn is_known_simple_term_answers_each_declaration_shape() {
+    fn simple_term_proof_answers_each_declaration_shape() {
         let (_temp, analyzer, consumer) = fixture();
+        let model = FakeActiveModel::unpublished();
         for (name, expected) in [
-            ("Sibling", true),
-            ("Paired", true),
-            ("Lonely", true),
-            ("Outer", true),
-            ("Lonely$", false),
-            ("Inner", false),
-            ("FileLocal", true),
-            ("Far", false),
-            ("Missing", false),
+            ("Sibling", ScalaNameProof::Workspace),
+            ("Paired", ScalaNameProof::Workspace),
+            ("Lonely", ScalaNameProof::Workspace),
+            ("Outer", ScalaNameProof::Workspace),
+            ("Lonely$", unreadable_beyond_workspace()),
+            ("Inner", unreadable_beyond_workspace()),
+            ("FileLocal", ScalaNameProof::Workspace),
+            ("Far", unreadable_beyond_workspace()),
+            ("Missing", unreadable_beyond_workspace()),
         ] {
             assert_eq!(
                 expected,
-                ScalaSource::is_known_simple_term(&analyzer, &consumer, name),
-                "term knownness of `{name}`"
+                ScalaSource::simple_term_proof(&analyzer, &consumer, name, &model),
+                "term proof of `{name}`"
             );
         }
     }
 
-    /// The reason the two predicates above stopped calling `all_declarations()`.
+    /// The one state in which a bare Scala name is provably absent: a published
+    /// dependency model that does not hold it. Everything else in this module
+    /// stops at `Incomplete`, and this is what separates the two.
+    #[test]
+    fn a_published_model_decides_between_absent_and_externally_indexed() {
+        let (_temp, analyzer, consumer) = fixture();
+
+        let empty = FakeActiveModel::publishing(&[]);
+        assert_eq!(
+            ScalaNameProof::Absent {
+                boundary: BoundaryStatus::ExternalIndexed,
+            },
+            ScalaSource::simple_type_proof(&analyzer, &consumer, "Missing", &empty),
+            "a published model that misses the name proves it absent"
+        );
+
+        // The model is consulted at the spelling Scala's own package tier
+        // produces, so the same simple name under another package must not
+        // silence the error.
+        let elsewhere = FakeActiveModel::publishing(&["other.Missing"]);
+        assert_eq!(
+            ScalaNameProof::Absent {
+                boundary: BoundaryStatus::ExternalIndexed,
+            },
+            ScalaSource::simple_type_proof(&analyzer, &consumer, "Missing", &elsewhere),
+            "a same-named type in an unrelated package is not this reference"
+        );
+
+        let holding = FakeActiveModel::publishing(&["app.Missing"]);
+        assert_eq!(
+            ScalaNameProof::ExternalIndexed,
+            ScalaSource::simple_type_proof(&analyzer, &consumer, "Missing", &holding),
+            "the model holds the name at the file's own package"
+        );
+
+        let conflicted = FakeActiveModel::publishing(&["app.Missing", "app.Missing"]);
+        assert_eq!(
+            ScalaNameProof::Ambiguous {
+                boundaries: vec![BoundaryStatus::ExternalIndexed; 2],
+            },
+            ScalaSource::simple_type_proof(&analyzer, &consumer, "Missing", &conflicted),
+            "two published declarations of one name is ambiguity, not absence"
+        );
+    }
+
+    /// A diagnostic must never build the jar-backed external index: reading
+    /// jars is package I/O, which #1615 forbids inside a request.
+    #[test]
+    fn a_name_proof_never_builds_the_external_declaration_index() {
+        let (_temp, analyzer, consumer) = fixture();
+        let model = FakeActiveModel::unpublished();
+        for name in ["Sibling", "Missing", "Far", "Inner"] {
+            ScalaSource::simple_type_proof(&analyzer, &consumer, name, &model);
+            ScalaSource::simple_term_proof(&analyzer, &consumer, name, &model);
+        }
+        assert!(
+            analyzer.external_index.get().is_none(),
+            "answering a bare Scala name must not build the classpath index"
+        );
+    }
+
+    /// The reason the two proofs above stopped calling `all_declarations()`.
     ///
     /// Without this the swap to indexed lookups is unobservable: every
     /// assertion in this module passes just as well against a whole-workspace
     /// scan, which is exactly what made the scan survive this long.
     #[test]
-    fn knownness_never_scans_every_workspace_declaration() {
+    fn a_name_proof_never_scans_every_workspace_declaration() {
         let (_temp, analyzer, consumer) = fixture();
+        let model = FakeActiveModel::unpublished();
         // Warm the indexes first: building one is allowed to scan, answering a
         // name is not.
-        let _ = ScalaSource::simple_type_knownness(&analyzer, &consumer, "Sibling");
+        ScalaSource::simple_type_proof(&analyzer, &consumer, "Sibling", &model);
         analyzer.inner.reset_full_declaration_scan_count_for_test();
         for name in [
             "Sibling",
@@ -1638,8 +1873,8 @@ mod knownness_tests {
             "FileLocal",
             "Missing",
         ] {
-            let _ = ScalaSource::simple_type_knownness(&analyzer, &consumer, name);
-            let _ = ScalaSource::is_known_simple_term(&analyzer, &consumer, name);
+            ScalaSource::simple_type_proof(&analyzer, &consumer, name, &model);
+            ScalaSource::simple_term_proof(&analyzer, &consumer, name, &model);
         }
         assert_eq!(
             0,

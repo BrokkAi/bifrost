@@ -1,18 +1,28 @@
-//! Scala's semantic diagnostics: conservative unrecognized-symbol reporting.
+//! Scala's semantic diagnostics: proof-gated unrecognized-symbol reporting
+//! (#1619).
 //!
-//! The pass only reports a name when the workspace can prove it is absent. A
-//! wildcard or aliased import that this analyzer cannot follow answers
-//! [`ScalaTypeKnownness::Uncertain`], and an uncertain name is never reported.
+//! The pass reports a name only when every retained surface was able to miss
+//! it. What used to be silence is now a typed outcome: a wildcard or aliased
+//! import this analyzer cannot follow records `UnsupportedSemantics` naming the
+//! import, and an unreadable or unbuilt classpath records
+//! `MissingDependencyDiscovery` naming the boundary. Both still suppress the
+//! error; neither is silent about why.
 //!
-//! `analyzer/scala/diagnostics.rs` keeps nothing: the
-//! `SemanticDiagnosticReport` wrapper `IAnalyzer::semantic_diagnostics`
-//! returns stays on the analyzer, which calls this directly.
+//! There is no `analyzer/scala/diagnostics.rs`: the analyzer calls this
+//! directly and returns the report unchanged.
+//!
+//! Only type and term *names* are diagnosed. See [`crate::proof`] on why no JVM
+//! language can claim a `MemberSurface` domain today.
 
-use crate::scala::graph_support::{ScalaSource, ScalaTypeKnownness};
-use brokk_bifrost_core::analyzer::model::SemanticDiagnostic;
+use crate::proof::{JvmActiveSemanticModel, JvmNameProof, record_jvm_name_proof};
+use crate::scala::graph_support::ScalaSource;
+use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::model::{
+    SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
+    SemanticDiagnosticReport,
+};
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{node_range, node_text};
 use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
-use brokk_bifrost_core::analyzer::{ProjectFile, Range};
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use tree_sitter::{Node, Parser, Tree};
@@ -22,39 +32,39 @@ pub const SCALA_SEMANTIC_DIAGNOSTIC_SOURCE: &str = "bifrost-scala";
 const MAX_SCALA_SEMANTIC_DIAGNOSTIC_BYTES: usize = 512 * 1024;
 const MAX_SCALA_SEMANTIC_DIAGNOSTICS: usize = 200;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScalaSemanticDiagnostic {
-    pub range: Range,
-    pub kind: &'static str,
-    pub message: String,
-}
-
-impl From<ScalaSemanticDiagnostic> for SemanticDiagnostic {
-    fn from(diagnostic: ScalaSemanticDiagnostic) -> Self {
-        Self {
-            range: diagnostic.range,
-            source: SCALA_SEMANTIC_DIAGNOSTIC_SOURCE,
-            kind: diagnostic.kind,
-            message: diagnostic.message,
-        }
-    }
-}
-
 pub fn collect_scala_semantic_diagnostics(
     scala: &dyn ScalaSource,
     file: &ProjectFile,
     source: &str,
-) -> Vec<ScalaSemanticDiagnostic> {
+    model: &dyn JvmActiveSemanticModel,
+) -> SemanticDiagnosticReport {
+    let mut report = SemanticDiagnosticReport::new();
     if source.len() > MAX_SCALA_SEMANTIC_DIAGNOSTIC_BYTES {
-        return Vec::new();
+        report.push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
+        return report;
     }
     let Some(tree) = parse_scala_tree(source) else {
-        return Vec::new();
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "Scala source did not parse".to_string(),
+            }],
+        );
+        return report;
     };
     let mut parse_errors = Vec::new();
     collect_parse_errors(tree.root_node(), &mut parse_errors);
     if !parse_errors.is_empty() {
-        return Vec::new();
+        // A file the parser could not read has no reliable reference sites, so
+        // no name in it can be proved absent. The LSP still publishes the parse
+        // errors themselves through its own path.
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: format!("Scala source has {} parse errors", parse_errors.len()),
+            }],
+        );
+        return report;
     }
 
     let line_starts = compute_line_starts(source);
@@ -62,15 +72,17 @@ pub fn collect_scala_semantic_diagnostics(
     let declared_value_names = collect_declared_value_names(tree.root_node(), source);
     let mut collector = ScalaDiagnosticCollector {
         scala,
+        model,
         file,
         source,
         line_starts: &line_starts,
         declared_type_names,
         declared_value_names,
-        diagnostics: Vec::new(),
+        report,
+        errors: 0,
     };
     collector.scan_tree(tree.root_node());
-    collector.diagnostics
+    collector.report
 }
 
 fn parse_scala_tree(source: &str) -> Option<Tree> {
@@ -83,19 +95,23 @@ fn parse_scala_tree(source: &str) -> Option<Tree> {
 
 struct ScalaDiagnosticCollector<'a> {
     scala: &'a dyn ScalaSource,
+    model: &'a dyn JvmActiveSemanticModel,
     file: &'a ProjectFile,
     source: &'a str,
     line_starts: &'a [usize],
     declared_type_names: HashSet<String>,
     declared_value_names: HashSet<String>,
-    diagnostics: Vec<ScalaSemanticDiagnostic>,
+    report: SemanticDiagnosticReport,
+    errors: usize,
 }
 
 impl ScalaDiagnosticCollector<'_> {
     fn scan_tree(&mut self, root: Node<'_>) {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            if self.diagnostics.len() >= MAX_SCALA_SEMANTIC_DIAGNOSTICS {
+            if self.errors >= MAX_SCALA_SEMANTIC_DIAGNOSTICS {
+                self.report
+                    .push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
                 break;
             }
             if node.kind() == "type_identifier" && is_bare_type_reference(node) {
@@ -112,41 +128,65 @@ impl ScalaDiagnosticCollector<'_> {
 
     fn check_type_identifier(&mut self, node: Node<'_>) {
         let name = node_text(node, self.source).trim();
-        if name.is_empty() || self.declared_type_names.contains(name) {
+        if name.is_empty() {
             return;
         }
-        if self.scala.simple_type_knownness(self.file, name) != ScalaTypeKnownness::Absent {
-            return;
+        // A type parameter or a `type` member written in this very file binds
+        // the spelling lexically, and no wider surface can overturn that.
+        let proof = if self.declared_type_names.contains(name) {
+            JvmNameProof::Workspace
+        } else {
+            self.scala.simple_type_proof(self.file, name, self.model)
+        };
+        let range = node_range(node, self.line_starts);
+        if record_jvm_name_proof(&mut self.report, range, proof, || {
+            (
+                SemanticDiagnosticDomain::Type {
+                    name: name.to_string(),
+                },
+                SemanticDiagnostic {
+                    range,
+                    source: SCALA_SEMANTIC_DIAGNOSTIC_SOURCE,
+                    kind: SCALA_UNRECOGNIZED_SYMBOL,
+                    message: format!("Unrecognized Scala type `{name}`"),
+                },
+            )
+        }) {
+            self.errors += 1;
         }
-        self.diagnostics.push(ScalaSemanticDiagnostic {
-            range: node_range(node, self.line_starts),
-            kind: SCALA_UNRECOGNIZED_SYMBOL,
-            message: format!("Unrecognized Scala type `{name}`"),
-        });
     }
 
     fn check_value_identifier(&mut self, node: Node<'_>) {
         let name = node_text(node, self.source).trim();
-        if name.is_empty()
-            || self.declared_value_names.contains(name)
-            || scala_default_term_name(name)
-            || self.scala.is_known_simple_term(self.file, name)
-        {
+        if name.is_empty() {
             return;
         }
-        let imports = self.scala.import_info_of(self.file);
-        if imports.iter().any(|import| import.is_wildcard)
-            || imports
-                .iter()
-                .any(|import| import.local_name() == Some(name))
-        {
-            return;
+        let proof = if self.declared_value_names.contains(name) || scala_default_term_name(name) {
+            JvmNameProof::Workspace
+        } else {
+            self.scala.simple_term_proof(self.file, name, self.model)
+        };
+        let range = node_range(node, self.line_starts);
+        if record_jvm_name_proof(&mut self.report, range, proof, || {
+            (
+                // A bare term is looked for from the position it is written at:
+                // this file's declarations, then what its package and imports
+                // make visible there. That is the lexical scope, not a named
+                // type or member surface.
+                SemanticDiagnosticDomain::LexicalScope {
+                    file: self.file.rel_path().to_path_buf(),
+                    range,
+                },
+                SemanticDiagnostic {
+                    range,
+                    source: SCALA_SEMANTIC_DIAGNOSTIC_SOURCE,
+                    kind: SCALA_UNRECOGNIZED_SYMBOL,
+                    message: format!("Unrecognized Scala symbol `{name}`"),
+                },
+            )
+        }) {
+            self.errors += 1;
         }
-        self.diagnostics.push(ScalaSemanticDiagnostic {
-            range: node_range(node, self.line_starts),
-            kind: SCALA_UNRECOGNIZED_SYMBOL,
-            message: format!("Unrecognized Scala symbol `{name}`"),
-        });
     }
 }
 

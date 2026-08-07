@@ -12,6 +12,46 @@ pub struct AnalyzerConfig {
     pub go: GoAnalyzerConfig,
     pub python: PythonAnalyzerConfig,
     pub ruby: RubyAnalyzerConfig,
+    pub php: PhpAnalyzerConfig,
+}
+
+/// Explicit, passive evidence for Composer dependency API-pack ingestion.
+///
+/// Bifrost reads the named metadata files and the installed package trees below
+/// the approved vendor roots. It never runs Composer, a Composer script, a
+/// Composer plugin, or any dependency code, and it never opens a network
+/// connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PhpAnalyzerConfig {
+    pub dependency_api_evidence: Vec<PhpDependencyApiEvidence>,
+}
+
+/// One exact Composer install whose API surface a host approves for indexing.
+///
+/// Unlike Ruby, the host does not repeat the package list: `composer.lock` is
+/// itself the exact package inventory, and `lockfile_sha256` pins the revision
+/// this evidence describes. What the host must still state explicitly is where
+/// installed package trees may be read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhpDependencyApiEvidence {
+    /// `composer.lock`. Relative paths resolve against the project root.
+    pub lockfile_path: PathBuf,
+    /// Lowercase SHA-256 of the exact lockfile this evidence describes.
+    pub lockfile_sha256: String,
+    /// `vendor/composer/installed.json`, which records the install path and the
+    /// autoload rules Composer actually wrote. Absent evidence falls back to
+    /// the autoload block in `composer.lock` and the conventional
+    /// `<vendor root>/<package name>` install path.
+    pub installed_json_path: Option<PathBuf>,
+    /// Lowercase SHA-256 of `installed_json_path` when that path is present.
+    pub installed_json_sha256: Option<String>,
+    /// The PHP runtime whose platform requirements the lock was solved for.
+    pub php_version: String,
+    /// Roots that contain the installed package trees. A package whose install
+    /// directory escapes every approved root is not read.
+    pub approved_vendor_roots: Vec<PathBuf>,
+    /// Index `packages-dev` in addition to `packages`.
+    pub include_dev_packages: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -320,6 +360,7 @@ impl Default for AnalyzerConfig {
             go: GoAnalyzerConfig::default(),
             python: PythonAnalyzerConfig::default(),
             ruby: RubyAnalyzerConfig::default(),
+            php: PhpAnalyzerConfig::default(),
         }
     }
 }

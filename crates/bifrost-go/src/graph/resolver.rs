@@ -923,6 +923,25 @@ fn namespace_packages_from(
     )
 }
 
+/// Every name a Go file's import block binds, split by whether a workspace
+/// package answers the import path.
+///
+/// Semantic diagnostics need both halves: the workspace half decides whether a
+/// package member is indexed here, and the external half is the only way to
+/// name the package identity an exact API pack publishes. Resolving them in
+/// one pass keeps a path from appearing in both halves.
+#[derive(Debug, Default)]
+pub struct GoImportBindings {
+    /// Local name -> canonical, module-qualified workspace package prefixes.
+    pub workspace: HashMap<String, Vec<String>>,
+    /// Dot-imported canonical workspace package prefixes.
+    pub dot_workspace: Vec<String>,
+    /// Local name -> import paths that no workspace package answers.
+    pub external: HashMap<String, Vec<String>>,
+    /// Dot-imported import paths that no workspace package answers.
+    pub dot_external: Vec<String>,
+}
+
 fn namespace_packages_from_imports(
     file: &ProjectFile,
     imports: &[ImportInfo],
@@ -930,8 +949,30 @@ fn namespace_packages_from_imports(
     workspace_paths: &GoWorkspacePathIndex,
     target_package_name: impl Fn(&ProjectFile) -> Option<String>,
 ) -> NamespacePackages {
-    let mut by_alias: HashMap<String, Vec<String>> = HashMap::default();
-    let mut dot_imports: Vec<String> = Vec::new();
+    let bindings = import_bindings_from_imports(
+        file,
+        imports,
+        dir_index,
+        workspace_paths,
+        target_package_name,
+        |_| None,
+    );
+    (bindings.workspace, bindings.dot_workspace)
+}
+
+/// `declared_package_name` answers "what `package` clause does an activated
+/// exact API pack record for this import path", which is how an unaliased
+/// `import "example.com/m/postgres"` of `package pg` binds `pg`. It reads
+/// retained overlay state only; it must never start dependency discovery.
+fn import_bindings_from_imports(
+    file: &ProjectFile,
+    imports: &[ImportInfo],
+    dir_index: &ParentDirIndex,
+    workspace_paths: &GoWorkspacePathIndex,
+    target_package_name: impl Fn(&ProjectFile) -> Option<String>,
+    declared_package_name: impl Fn(&str) -> Option<String>,
+) -> GoImportBindings {
+    let mut bindings = GoImportBindings::default();
     for import in imports {
         let alias = import.alias.as_deref();
         if alias == Some("_") {
@@ -956,12 +997,31 @@ fn namespace_packages_from_imports(
         packages.sort();
         packages.dedup();
         if packages.is_empty() {
+            // No workspace package answers this path. The local name it binds
+            // comes from the alias, then from the package clause an exact API
+            // pack records, then from the binding name the Go import parser
+            // already derived. That is exactly the precedence `get_definition`
+            // applies in `go_import_paths`, so a diagnostic and a definition
+            // cannot disagree about which package a qualifier names.
+            match alias {
+                Some(".") => bindings.dot_external.push(path),
+                _ => {
+                    let local = match alias {
+                        Some(explicit) => Some(default_go_import_local_name(explicit)),
+                        None => declared_package_name(&path).or_else(|| import.identifier.clone()),
+                    };
+                    if let Some(local) = local.filter(|local| !local.is_empty() && local != "_") {
+                        bindings.external.entry(local).or_default().push(path);
+                    }
+                }
+            }
             continue;
         }
         let canonicals = || packages.iter().map(|(_, canonical)| canonical.clone());
         match alias {
-            Some(".") => dot_imports.extend(canonicals()),
-            Some(explicit) => by_alias
+            Some(".") => bindings.dot_workspace.extend(canonicals()),
+            Some(explicit) => bindings
+                .workspace
                 .entry(default_go_import_local_name(explicit))
                 .or_default()
                 .extend(canonicals()),
@@ -969,18 +1029,28 @@ fn namespace_packages_from_imports(
                 // A plain import is referred to by its package-clause name;
                 // map that local name to the canonical node fqn prefix.
                 for (clause, canonical) in packages {
-                    by_alias.entry(clause).or_default().push(canonical);
+                    bindings
+                        .workspace
+                        .entry(clause)
+                        .or_default()
+                        .push(canonical);
                 }
             }
         }
     }
-    for names in by_alias.values_mut() {
+    for names in bindings
+        .workspace
+        .values_mut()
+        .chain(bindings.external.values_mut())
+    {
         names.sort();
         names.dedup();
     }
-    dot_imports.sort();
-    dot_imports.dedup();
-    (by_alias, dot_imports)
+    bindings.dot_workspace.sort();
+    bindings.dot_workspace.dedup();
+    bindings.dot_external.sort();
+    bindings.dot_external.dedup();
+    bindings
 }
 
 pub fn resolve_go_import_namespaces(
@@ -992,6 +1062,29 @@ pub fn resolve_go_import_namespaces(
     namespace_packages_from(source, file, &dir_index, source.workspace_paths, |target| {
         package_names.get(target).cloned()
     })
+}
+
+/// Resolve every name `file`'s import block binds, workspace and external.
+///
+/// `declared_package_name` reads the activated semantic-model overlay from the
+/// analysis side; passing it here keeps diagnostics and `get_definition` on
+/// one package identity instead of two that agree by accident.
+pub fn resolve_go_import_bindings(
+    source: GoGraphSource<'_>,
+    file: &ProjectFile,
+    package_names: &HashMap<ProjectFile, String>,
+    declared_package_name: impl Fn(&str) -> Option<String>,
+) -> GoImportBindings {
+    let dir_index = build_parent_dir_index(package_names.keys());
+    let imports = source.imports.import_info_of(file);
+    import_bindings_from_imports(
+        file,
+        &imports,
+        &dir_index,
+        source.workspace_paths,
+        |target| package_names.get(target).cloned(),
+        declared_package_name,
+    )
 }
 
 fn parse_go_file(file: &ProjectFile) -> Option<ParsedFile> {

@@ -407,6 +407,43 @@ pub fn resolve_js_ts_module_specifier(
     candidates
 }
 
+/// The npm package a bare module specifier addresses, and the subpath below it.
+///
+/// `left-pad` -> (`left-pad`, none); `left-pad/dist/index` -> (`left-pad`,
+/// `dist/index`); `@scope/pkg/deep` -> (`@scope/pkg`, `deep`). A relative or
+/// absolute specifier addresses a workspace file rather than a package and
+/// yields `None`.
+///
+/// The specifier is the whole structure here: npm has no AST above it, and the
+/// scope/name/subpath split is the specifier grammar npm itself defines, not a
+/// re-parse of source text. Discovery records exactly these package and module
+/// identities (see `js_ts::external::declaration_entries`), so callers that
+/// match retained evidence must split the same way.
+pub fn npm_package_of_module_specifier(specifier: &str) -> Option<(&str, Option<&str>)> {
+    if specifier.is_empty() || specifier.starts_with('.') || specifier.starts_with('/') {
+        return None;
+    }
+    let boundary = if specifier.starts_with('@') {
+        // A scoped package is `@scope/name`: the package ends at the second slash.
+        let scope_end = specifier.find('/')?;
+        specifier[scope_end + 1..]
+            .find('/')
+            .map(|offset| scope_end + 1 + offset)
+    } else {
+        specifier.find('/')
+    };
+    match boundary {
+        Some(offset) => {
+            let subpath = specifier[offset + 1..].trim_start_matches('/');
+            Some((
+                &specifier[..offset],
+                (!subpath.is_empty()).then_some(subpath),
+            ))
+        }
+        None => Some((specifier, None)),
+    }
+}
+
 fn extract_import_module_path(raw_import: &str) -> Option<String> {
     let trimmed = raw_import.trim().trim_end_matches(';').trim();
     if trimmed.starts_with("import ") {
@@ -654,5 +691,37 @@ mod tests {
             .map(|import| import.identifier.unwrap_or_default())
             .collect::<Vec<_>>();
         assert_eq!(vec!["BubbleState", "SummaryState"], identifiers);
+    }
+
+    #[test]
+    fn splits_bare_specifiers_into_their_npm_package_and_subpath() {
+        use super::npm_package_of_module_specifier as split;
+
+        assert_eq!(Some(("left-pad", None)), split("left-pad"));
+        assert_eq!(Some(("left-pad", Some("dist"))), split("left-pad/dist"));
+        assert_eq!(
+            Some(("left-pad", Some("dist/index"))),
+            split("left-pad/dist/index")
+        );
+        assert_eq!(Some(("@scope/pkg", None)), split("@scope/pkg"));
+        assert_eq!(Some(("@scope/pkg", Some("deep"))), split("@scope/pkg/deep"));
+        assert_eq!(
+            Some(("@scope/pkg", Some("deep/deeper"))),
+            split("@scope/pkg/deep/deeper")
+        );
+        // A trailing slash names the package itself, not an empty subpath.
+        assert_eq!(Some(("left-pad", None)), split("left-pad/"));
+    }
+
+    #[test]
+    fn refuses_specifiers_that_do_not_address_a_package() {
+        use super::npm_package_of_module_specifier as split;
+
+        assert_eq!(None, split(""));
+        assert_eq!(None, split("./local"));
+        assert_eq!(None, split("../sibling"));
+        assert_eq!(None, split("/absolute"));
+        // A scope with no package name is not an npm coordinate.
+        assert_eq!(None, split("@scope"));
     }
 }

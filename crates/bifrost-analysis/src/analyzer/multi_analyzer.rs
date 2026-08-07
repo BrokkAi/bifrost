@@ -8,9 +8,9 @@ use crate::analyzer::{
     ImportAnalysisProvider, ImportInfo, ImportReachability, JavaAnalyzer, JavascriptAnalyzer,
     KotlinAnalyzer, Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range,
     RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch,
-    SemanticDiagnostic, SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
-    TypeHierarchyProvider, TypescriptAnalyzer,
+    SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
+    TypescriptAnalyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
@@ -1100,26 +1100,98 @@ impl IAnalyzer for MultiAnalyzer {
         // that realm view (see `kotlin_realm`), so this is the one place the
         // widening happens rather than inside `KotlinAnalyzer` itself.
         if language_for_file(file) == Language::Kotlin
-            && let Some((kotlin, realm)) = self.kotlin_realm()
+            && self.delegates.contains_key(&Language::Kotlin)
         {
-            let diagnostics =
-                crate::analyzer::kotlin::diagnostics::collect_kotlin_semantic_diagnostics(
-                    kotlin,
-                    file,
-                    source,
-                    Some(&realm),
-                )
-                .into_iter()
-                .map(SemanticDiagnostic::from)
-                .collect();
-            return crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(
+            // Every Kotlin file routes here, not only one with Java or Scala
+            // peers: the realm widens *resolution*, but the active dependency
+            // model that decides whether a miss is provable is published on the
+            // dispatcher either way. Falling through to the delegate for a
+            // Kotlin-only workspace would read its empty overlay and suppress
+            // every unknown name.
+            //
+            // `self`, not the Kotlin delegate, for the same reason -- plus the
+            // enclosing-declaration lookup, which crosses languages. The shim
+            // downcasts to the Kotlin analyzer itself.
+            let realm = self.kotlin_realm().map(|(_, realm)| realm);
+            return crate::analyzer::kotlin::diagnostics::collect_kotlin_semantic_diagnostics(
+                self,
                 file,
-                diagnostics,
+                source,
+                realm.as_ref(),
             );
         }
         if language_for_file(file) == Language::Java && self.delegates.contains_key(&Language::Java)
         {
             return crate::analyzer::java::diagnostics::collect_java_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        // Scala's own ladder is delegate-resident, but the active dependency
+        // model it must not claim absence past is published on the dispatcher.
+        if language_for_file(file) == Language::Scala
+            && self.delegates.contains_key(&Language::Scala)
+        {
+            return crate::analyzer::scala::diagnostics::collect_scala_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        // Go classifies references that leave the workspace against the
+        // activated exact API packs (#1623), and the semantic-model overlay
+        // and the retained Go module graph belong to the dispatching analyzer,
+        // not to the delegate. Passing `self` is what lets a Go file's import
+        // of an indexed module resolve instead of reporting nothing known.
+        if language_for_file(file) == Language::Go && self.delegates.contains_key(&Language::Go) {
+            return crate::analyzer::go::diagnostics::collect_go_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        // Python's environment proof lives on the analyzer a host activated
+        // packs against, which is this composite one and not the delegate. A
+        // request routed straight to the delegate would see no overlay and no
+        // discovery evidence, and would report every external import as an
+        // unknown boundary.
+        if language_for_file(file) == Language::Python
+            && self.delegates.contains_key(&Language::Python)
+        {
+            return crate::analyzer::python::diagnostics::collect_python_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        // PHP's proof ladder reads the semantic-model overlay and the retained
+        // Composer discovery evidence, and only the dispatching analyzer holds
+        // them. Delegating to the `PhpAnalyzer` would hand the collector a view
+        // with no indexed dependencies, so every vendor symbol would look
+        // unknown even with an active pack.
+        if language_for_file(file) == Language::Php && self.delegates.contains_key(&Language::Php) {
+            return crate::analyzer::php::diagnostics::collect_php_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        // JS/TS diagnostics judge external imports against the activated npm
+        // declaration surface and the retained npm discovery evidence (#1620).
+        // Both hang off the analyzer that owns the workspace snapshot, which is
+        // this one: a delegate passed on its own carries no snapshot caches and
+        // would report every npm import as an unknown boundary.
+        let language = language_for_file(file);
+        if language == Language::JavaScript && self.delegates.contains_key(&Language::JavaScript) {
+            return crate::analyzer::js_ts::diagnostics::collect_javascript_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        if language == Language::TypeScript && self.delegates.contains_key(&Language::TypeScript) {
+            return crate::analyzer::js_ts::diagnostics::collect_typescript_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        // Rust classifies paths that leave the workspace against the activated
+        // exact Cargo API packs (#1625), and the semantic-model overlay and the
+        // retained Cargo dependency evidence belong to the dispatching
+        // analyzer, not to the delegate. Passing `self` is what lets a path
+        // into an indexed dependency resolve instead of reporting nothing
+        // known.
+        if language_for_file(file) == Language::Rust && self.delegates.contains_key(&Language::Rust)
+        {
+            return crate::analyzer::rust::diagnostics::collect_rust_semantic_diagnostics(
                 self, file, source,
             );
         }

@@ -7,9 +7,10 @@
 //! how a free function reaches back for a memoized product without naming the
 //! analyzer type -- the same idiom `RubySource` and `CppSource` landed.
 //!
-//! [`ScalaSource::simple_type_knownness`] and [`ScalaSource::is_known_simple_term`]
-//! are load-bearing beyond their signature. Both answer "does the workspace know
-//! this bare Scala name", and both consult `JvmExternalDeclarationIndex` -- the
+//! [`ScalaSource::simple_type_proof`] and [`ScalaSource::simple_term_proof`]
+//! are load-bearing beyond their signature. Both answer "what does every
+//! retained surface prove about this bare Scala name", and both consult
+//! `JvmExternalDeclarationIndex` -- the
 //! classpath-artifact index built out of `analyzer/jvm/`, which is parked in
 //! `brokk-bifrost-analysis` with the rest of the `semantic_model` band. That
 //! index is why they are trait members rather than moved bodies: the decision
@@ -38,21 +39,20 @@ use brokk_bifrost_core::analyzer::model::{
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile, Range};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
+use crate::proof::JvmActiveSemanticModel;
+
 use crate::scala::graph::inverted::ProjectTypes;
 use crate::scala::supertypes::ScalaSupertypeLookupPath;
 
-/// What the workspace can prove about a bare Scala type name at a site.
+/// Every surface a Scala name lookup consults, and what each proved.
 ///
-/// `Uncertain` is the answer that keeps the semantic-diagnostic pass honest: an
-/// unresolved wildcard or aliased import means the name *may* be declared
-/// somewhere this analyzer does not index, so reporting it would be a false
-/// positive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScalaTypeKnownness {
-    Known,
-    Absent,
-    Uncertain,
-}
+/// This is [`crate::proof::JvmNameProof`], the vocabulary Java and Kotlin
+/// answer in too. It replaces an earlier `Known | Absent | Uncertain`
+/// tri-state: `Uncertain` collapsed two different facts -- "an import points
+/// somewhere I cannot follow" and "nothing past the workspace is readable" --
+/// into one silent suppression, and #1619 requires each to carry its own
+/// reason.
+pub use crate::proof::JvmNameProof as ScalaNameProof;
 
 /// The supertype, signature and trait facts a Scala owner's own file state
 /// carries, decoded once by the analyzer that holds the state.
@@ -66,13 +66,30 @@ pub struct ScalaForwardOwnerFacts {
 pub trait ScalaSource:
     CodeUnitIndex + ImportAnalysisProvider + TypeAliasProvider + TypeHierarchyProvider
 {
-    /// What the workspace can prove about the bare type name `name` as written
-    /// in `file`. See this module's note on why this is not a moved body.
-    fn simple_type_knownness(&self, file: &ProjectFile, name: &str) -> ScalaTypeKnownness;
+    /// What every retained surface proves about the bare type name `name` as
+    /// written in `file`. See this module's note on why this is not a moved
+    /// body: Scala's ladder needs the jar index, the resolved-import set and
+    /// the package projection, all of which are analyzer-resident.
+    ///
+    /// `model` is the dispatching analyzer's active dependency model, passed in
+    /// because a language analyzer only knows its own generation. Every tier
+    /// reads retained state; see [`crate::proof`] on why a diagnostic may not
+    /// build the jar index.
+    fn simple_type_proof(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        model: &dyn JvmActiveSemanticModel,
+    ) -> ScalaNameProof;
 
-    /// Whether `name` names a value the workspace declares in `file`'s own
-    /// package, source-side or on the classpath.
-    fn is_known_simple_term(&self, file: &ProjectFile, name: &str) -> bool;
+    /// [`Self::simple_type_proof`] for a bare term: a value or `object` name
+    /// rather than a type name.
+    fn simple_term_proof(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        model: &dyn JvmActiveSemanticModel,
+    ) -> ScalaNameProof;
 
     /// The owner the parser recorded for `code_unit`, without the fq-name
     /// segment-pop fallback [`CodeUnitIndex::parent_of`] layers on top.

@@ -70,6 +70,7 @@ use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
+use crate::analyzer::jvm::retained_external_index_state;
 use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
     LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
@@ -94,12 +95,13 @@ use crate::analyzer::weighted_cache::{
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, JvmAnalyzerConfig, Language, Project,
-    ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
     UsageFactsIndex, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_jvm::kotlin::test_detection::detect_kotlin_test_assertion_smells;
+use brokk_bifrost_jvm::proof::JvmRetainedExternalIndex;
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
@@ -333,6 +335,18 @@ impl KotlinSource for KotlinAnalyzer {
             .resolve_qualified_name(fqn, access_package)
             .is_some()
     }
+
+    fn retained_external_index(&self) -> JvmRetainedExternalIndex {
+        retained_external_index_state(self.external_index.get())
+    }
+
+    fn retained_external_qualified_name_exists(&self, fqn: &str, access_package: &str) -> bool {
+        self.external_index.get().is_some_and(|external| {
+            external
+                .resolve_qualified_name(fqn, access_package)
+                .is_some()
+        })
+    }
 }
 
 use crate::analyzer::CodeUnitIndex;
@@ -563,12 +577,19 @@ impl IAnalyzer for KotlinAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
-        let diagnostics =
-            diagnostics::collect_kotlin_semantic_diagnostics(self, file, source, None)
-                .into_iter()
-                .map(SemanticDiagnostic::from)
-                .collect();
-        crate::analyzer::SemanticDiagnosticReport::from_workspace_absences(file, diagnostics)
+        diagnostics::collect_kotlin_semantic_diagnostics(self, file, source, None)
+    }
+
+    /// Build the jar-backed external declaration index off the request path.
+    /// See `JavaAnalyzer::warm_query_indexes`; the three JVM analyzers share
+    /// one dependency universe and one reason not to build it under a
+    /// diagnostic.
+    fn warm_query_indexes(&self) {
+        self.external_declaration_index();
+    }
+
+    fn query_indexes_warm(&self) -> bool {
+        self.external_index.get().is_some()
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {

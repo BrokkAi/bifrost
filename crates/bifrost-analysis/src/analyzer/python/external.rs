@@ -471,7 +471,21 @@ struct PythonApiCollector<'a, 'd> {
     diagnostics: &'d mut BoundedProducerDiagnostics,
     types: Vec<TypeFact>,
     members: Vec<MemberFact>,
+    /// `owner.name` for every binding an import already contributed, so a
+    /// conditional import cannot mint one member identity twice.
+    imported_names: std::collections::HashSet<String>,
 }
+
+/// The member name a Python surface carries when it binds names this producer
+/// cannot enumerate, e.g. `from ._impl import *` in a package's `__init__`.
+///
+/// `*` is not a Python identifier, so this member can never collide with a
+/// real name. Its presence is the module-level fact that the listed members
+/// are not the whole surface. A wildcard is a property of the surface, not a
+/// fault in producing the pack, so it is recorded rather than reported as a
+/// producer diagnostic: a diagnostic would make the production partial and
+/// stop the whole environment from activating.
+pub(crate) const PYTHON_UNENUMERATED_BINDING: &str = "*";
 
 impl<'a, 'd> PythonApiCollector<'a, 'd> {
     fn new(
@@ -495,6 +509,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             diagnostics,
             types: Vec::new(),
             members: Vec::new(),
+            imported_names: std::collections::HashSet::new(),
         };
         collector.push_type(module.to_owned(), TypeKind::Module, Vec::new(), Vec::new());
         collector
@@ -523,6 +538,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                     self.visit_definition(&mut stack, node, None, owner, class_scope);
                 }
                 "expression_statement" => self.visit_assignment(node, &owner, class_scope),
+                "import_statement" | "import_from_statement" => self.visit_import(node, &owner),
                 "type_alias_statement" => self.visit_type_alias(node, &owner),
                 // Module control blocks do not make declarations dynamic by
                 // themselves. The emitted pack remains a static surface and
@@ -657,6 +673,47 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             false,
             None,
         );
+    }
+
+    /// An import inside a module or class body binds a name on that surface:
+    /// `from .sessions import Session` in `requests/__init__.pyi` is how
+    /// `requests.Session` exists at all. One artifact is produced without a
+    /// view of the modules it imports, so the binding is recorded by name
+    /// alone. That is what an absence proof needs -- "does this surface bind
+    /// that name" -- and recording it is what makes a surface marked complete
+    /// actually complete.
+    ///
+    /// A wildcard binds a set this producer cannot enumerate, and so does a
+    /// form that spells no single bound name. Either one is recorded as the
+    /// [`PYTHON_UNENUMERATED_BINDING`] member, which is not a Python
+    /// identifier and so can never be confused with a real name. A consumer
+    /// that finds it knows this surface binds more than it lists, and that a
+    /// name missing from it is therefore not proof of absence.
+    fn visit_import(&mut self, node: Node<'_>, owner: &str) {
+        for import in
+            brokk_bifrost_python::imports::python_import_infos_from_node(node, self.source)
+        {
+            let name = match import.local_name().filter(|_| !import.is_wildcard) {
+                Some(name) => name,
+                None => PYTHON_UNENUMERATED_BINDING,
+            };
+            // Two branches of a `try`/`except ImportError` pair bind the same
+            // name; recording it twice would mint one identity twice and mark
+            // the surface ambiguous.
+            if !self
+                .imported_names
+                .insert(format!("{owner}.{name}", name = name))
+            {
+                continue;
+            }
+            self.push_member(
+                owner.to_owned(),
+                name.to_owned(),
+                MemberKind::Constant,
+                false,
+                None,
+            );
+        }
     }
 
     fn visit_type_alias(&mut self, node: Node<'_>, owner: &str) {

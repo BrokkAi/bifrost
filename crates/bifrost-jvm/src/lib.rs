@@ -44,6 +44,7 @@
 
 pub mod java;
 pub mod kotlin;
+pub mod proof;
 pub mod queries;
 pub mod realm;
 pub mod scala;

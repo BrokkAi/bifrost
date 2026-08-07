@@ -241,6 +241,31 @@ fn produce_go_facts<'a>(
     let entries = entries.into_iter().collect::<HashMap<_, _>>();
     let mut parsed_sources = Vec::new();
     for package in packages {
+        // A package whose surface the toolchain reported but this producer
+        // does not model keeps the pack explicitly partial. Both conditions
+        // hide exported declarations: cgo files declare Go surface this
+        // producer cannot parse, and a build constraint excluded the ignored
+        // files from this target's build. Absence proofs read the resulting
+        // completeness, so a member miss against such a package is suppressed
+        // rather than reported (#1623). Test files never contribute exported
+        // API, so an excluded `_test.go` does not reduce the surface.
+        let constrained = package
+            .ignored_go_files
+            .iter()
+            .filter(|path| !path.ends_with("_test.go"))
+            .chain(package.cgo_files.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !constrained.is_empty() {
+            diagnostics.warning(
+                "go.constrained_surface",
+                Some(package.import_path.clone()),
+                format!(
+                    "Go package {} has sources this producer does not model, so its exported surface is explicitly partial: {constrained:?}",
+                    package.import_path
+                ),
+            );
+        }
         for path in &package.files {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 diagnostics.error(
@@ -2578,6 +2603,48 @@ var privateValue int
                 .any(|diagnostic| diagnostic.code == "go.generated_surface"),
             "{diagnostics:#?}"
         );
+    }
+
+    #[test]
+    fn producer_marks_cgo_and_build_constrained_sources_as_partial_coverage() {
+        let constrained = |ignored: &[&str], cgo: &[&str]| {
+            let mut package = package(&["api.go"]);
+            package.ignored_go_files = ignored.iter().map(|file| file.to_string()).collect();
+            package.cgo_files = cgo.iter().map(|file| file.to_string()).collect();
+            let limits = ArtifactProducerLimits::default();
+            let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+            produce_go_facts(
+                &[package],
+                &HashMap::default(),
+                [(
+                    "api/api.go",
+                    b"package api\ntype Exported struct{}\n".as_slice(),
+                )],
+                &limits,
+                None,
+                &mut diagnostics,
+            )
+            .unwrap();
+            diagnostics.finish().0
+        };
+        // Both conditions hide exported declarations from the produced pack,
+        // so its completeness must stay partial and a member miss against it
+        // must be suppressed rather than reported (#1623).
+        for (ignored, cgo) in [
+            (&["api/linux.go"][..], &[][..]),
+            (&[][..], &["api/bridge.go"][..]),
+        ] {
+            let diagnostics = constrained(ignored, cgo);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "go.constrained_surface"),
+                "{diagnostics:#?}"
+            );
+        }
+        // An excluded test file never contributed exported API, so it does not
+        // reduce the surface and must leave the pack complete.
+        assert!(constrained(&["api/api_test.go"], &[]).is_empty());
     }
 
     #[test]
