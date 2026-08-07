@@ -1,7 +1,8 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::declaration_range::DeclarationNameRangeContext;
 use crate::analyzer::reference_candidates::{
-    ReferenceCandidateRanges, reference_candidate_ranges, reference_candidate_requires_point_lookup,
+    ReferenceCandidateRanges, census_identifier_ranges, reference_candidate_ranges,
+    reference_candidate_requires_point_lookup,
 };
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::cpp_graph::CppAuthoritativeUsageBatch;
@@ -44,6 +45,67 @@ pub struct ReferenceDifferentialConfig {
     pub seed: u64,
     pub include_tests: bool,
     pub exact_site: Option<ExactReferenceSite>,
+    /// Which probe frontier proposes reference sites. `Index` (default) is the
+    /// analyzer's filtered candidate frontier; `Census` is the raw tree-sitter
+    /// identifier census that also reaches sites the index never proposes.
+    #[serde(default)]
+    pub probe_seed: ProbeSeed,
+    /// Which deterministic evidence tiers a forward-unresolvable census site may
+    /// be reported under. Only consulted for `probe_seed == Census`.
+    #[serde(default)]
+    pub tiers: TierSelection,
+}
+
+/// The probe frontier that proposes reference sites to the differential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeSeed {
+    /// The analyzer's index-filtered candidate frontier (`reference_candidate_ranges`).
+    #[default]
+    Index,
+    /// The raw tree-sitter identifier census (`census_identifier_ranges`).
+    Census,
+}
+
+impl ProbeSeed {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProbeSeed::Index => "index",
+            ProbeSeed::Census => "census",
+        }
+    }
+}
+
+/// Which census gap tiers to report. A census site that forward-resolves is
+/// always reported (it is a forward-adjudicated finding, tier-independent);
+/// this selection only gates forward-*unresolvable* census sites, whose only
+/// evidence is the deterministic tier grade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TierSelection {
+    pub tier1: bool,
+    pub tier2: bool,
+    pub tier3: bool,
+}
+
+impl Default for TierSelection {
+    fn default() -> Self {
+        Self {
+            tier1: true,
+            tier2: true,
+            tier3: true,
+        }
+    }
+}
+
+impl TierSelection {
+    pub fn includes(self, tier: u8) -> bool {
+        match tier {
+            1 => self.tier1,
+            2 => self.tier2,
+            3 => self.tier3,
+            _ => false,
+        }
+    }
 }
 
 impl Default for ReferenceDifferentialConfig {
@@ -61,6 +123,8 @@ impl Default for ReferenceDifferentialConfig {
             seed: 0,
             include_tests: true,
             exact_site: None,
+            probe_seed: ProbeSeed::Index,
+            tiers: TierSelection::default(),
         }
     }
 }
@@ -153,6 +217,17 @@ pub struct ReferenceDifferentialSite {
     pub note: Option<String>,
     pub inverse_hit: Option<InverseHitEvidence>,
     pub diagnostics: Vec<ReferenceDiagnostic>,
+    /// The probe frontier that proposed this site: `"index"` or `"census"`.
+    #[serde(default = "default_seed_tag")]
+    pub seed: String,
+    /// The census gap tier (1, 2, or 3) for a forward-unresolvable census site;
+    /// `None` for forward-resolved sites and for the index seed.
+    #[serde(default)]
+    pub tier: Option<u8>,
+}
+
+fn default_seed_tag() -> String {
+    "index".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -354,6 +429,12 @@ pub fn run_reference_differential_with_progress(
         progress,
         &worker_pool,
     )?;
+    if config.probe_seed == ProbeSeed::Census {
+        for record in &mut records {
+            record.seed = ProbeSeed::Census.as_str().to_string();
+        }
+        classify_census_gaps(analyzer, config, &mut records);
+    }
     recompute_classifications(&records, &mut summary.classifications);
 
     Ok(ReferenceDifferentialReport {
@@ -552,8 +633,16 @@ fn collect_sampled_sites(
             ));
             continue;
         };
+        let candidate_ranges = match config.probe_seed {
+            ProbeSeed::Index => {
+                reference_candidate_ranges(root, language, config.max_candidates_per_file)
+            }
+            ProbeSeed::Census => {
+                census_identifier_ranges(root, language, config.max_candidates_per_file)
+            }
+        };
         let ranges =
-            match reference_candidate_ranges(root, language, config.max_candidates_per_file) {
+            match candidate_ranges {
                 ReferenceCandidateRanges::Complete(ranges) => ranges,
                 ReferenceCandidateRanges::LimitExceeded { limit, .. } => {
                     summary.candidate_limit_exceeded_files += 1;
@@ -779,6 +868,8 @@ fn forward_resolve_file(
             },
             inverse_hit: None,
             diagnostics,
+            seed: default_seed_tag(),
+            tier: None,
         });
         if outcome.status == DefinitionLookupStatus::Resolved {
             let mut targets = outcome.definitions;
@@ -1215,6 +1306,143 @@ fn set_group_inconclusive(
     for index in indexes {
         records[*index].classification = ReferenceClassification::Inconclusive;
         records[*index].note = Some(note.to_string());
+    }
+}
+
+/// The tree-sitter role of a census occurrence, used to grade census gaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CensusSiteRole {
+    /// `self.N(...)` / `this.N(...)`: a same-owner receiver member call.
+    SelfMemberCall,
+    /// `N(...)`: a bare (unqualified) call.
+    BareCall,
+    /// `recv.N` / `recv.N(...)` on some other receiver, or `N` in a value/type
+    /// position: a weaker reference role.
+    Other,
+}
+
+/// Classify a census occurrence's syntactic role from its tree-sitter context.
+/// Language-agnostic: it keys on node-kind substrings shared across the corpus
+/// grammars (`call`/`invocation` for calls; `field`/`member`/`selector`/
+/// `attribute` for member access; `self`/`this` receiver text for same-owner).
+fn census_site_role(
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    start: usize,
+    end: usize,
+) -> CensusSiteRole {
+    let Some(node) = root.named_descendant_for_byte_range(start, end) else {
+        return CensusSiteRole::Other;
+    };
+    let Some(parent) = node.parent() else {
+        return CensusSiteRole::Other;
+    };
+    let parent_kind = parent.kind();
+    let is_member = parent_kind.contains("field")
+        || parent_kind.contains("member")
+        || parent_kind.contains("selector")
+        || parent_kind.contains("attribute");
+    if is_member {
+        // The receiver is the member access's first named child that is not the
+        // property name itself.
+        let receiver_is_self = (0..parent.named_child_count())
+            .filter_map(|index| parent.named_child(index))
+            .find(|child| child.start_byte() != start || child.end_byte() != end)
+            .map(|receiver| &source[receiver.start_byte()..receiver.end_byte()])
+            .is_some_and(|text| text == "self" || text == "this");
+        let member_call = parent
+            .parent()
+            .is_some_and(|grandparent| grandparent.kind().contains("call") || grandparent.kind().contains("invocation"));
+        if receiver_is_self && member_call {
+            return CensusSiteRole::SelfMemberCall;
+        }
+        return CensusSiteRole::Other;
+    }
+    let bare_call = (parent_kind.contains("call") || parent_kind.contains("invocation"))
+        && parent
+            .child_by_field_name("function")
+            .or_else(|| parent.child_by_field_name("callee"))
+            .is_some_and(|callee| callee.start_byte() == start && callee.end_byte() == end);
+    if bare_call {
+        return CensusSiteRole::BareCall;
+    }
+    CensusSiteRole::Other
+}
+
+/// Grade forward-unresolvable census sites into deterministic evidence tiers.
+///
+/// A census site that forward RESOLVES already flowed through the inverse
+/// comparison (a forward-adjudicated finding or consistent), so it keeps
+/// `tier == None`. This pass grades only the sites forward could not resolve --
+/// the joint-blindness residue:
+///
+/// - tier 1: a `self`/`this`-receiver member call or a bare call of name N,
+///   whose declaration exists in the same file. Forward found nothing yet the
+///   declaration is indexed in the same file -- a high-precision forward gap.
+/// - tier 2: some same-file declaration of N exists, but the occurrence is a
+///   weaker reference role (member access on another receiver, value/type use).
+/// - tier 3: no same-file declaration of N; exploration-grade.
+///
+/// A selected tier-1/2 site becomes `Missing` (actionable). Tier 3 (and any
+/// unselected tier) stays `Inconclusive`. The site's `tier` is always recorded.
+fn classify_census_gaps(
+    analyzer: &dyn IAnalyzer,
+    config: &ReferenceDifferentialConfig,
+    records: &mut [ReferenceDifferentialSite],
+) {
+    use std::collections::BTreeMap;
+    let mut by_path: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, record) in records.iter().enumerate() {
+        if record.forward_status != "resolved" {
+            by_path.entry(record.path.clone()).or_default().push(index);
+        }
+    }
+    for (path, indexes) in by_path {
+        let Some(file) = analyzer
+            .analyzed_files()
+            .into_iter()
+            .find(|file| rel_path_string(file) == path)
+        else {
+            continue;
+        };
+        let Some(source) = analyzer.indexed_source(&file) else {
+            continue;
+        };
+        let same_file_names: HashSet<String> = analyzer
+            .declarations(&file)
+            .into_iter()
+            .map(|unit| unit.identifier().to_string())
+            .collect();
+        let context = DeclarationNameRangeContext::new(&file, source);
+        let root = context.root_node();
+        let content = context.content();
+        for index in indexes {
+            let record = &mut records[index];
+            let name = record.text.clone();
+            let has_same_file_decl = same_file_names.contains(&name);
+            let role = root
+                .map(|root| census_site_role(root, content, record.start_byte, record.end_byte))
+                .unwrap_or(CensusSiteRole::Other);
+            let tier = if has_same_file_decl
+                && matches!(
+                    role,
+                    CensusSiteRole::SelfMemberCall | CensusSiteRole::BareCall
+                ) {
+                1
+            } else if has_same_file_decl {
+                2
+            } else {
+                3
+            };
+            record.tier = Some(tier);
+            if config.tiers.includes(tier) && matches!(tier, 1 | 2) {
+                record.classification = ReferenceClassification::Missing;
+                record.note = Some(format!(
+                    "census tier-{tier} gap: same-file declaration `{name}` exists but forward lookup returned {}",
+                    record.forward_status
+                ));
+            }
+        }
     }
 }
 
