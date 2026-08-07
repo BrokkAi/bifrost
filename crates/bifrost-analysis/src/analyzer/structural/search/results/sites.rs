@@ -311,8 +311,13 @@ pub struct CodeQueryMemberFamily {
     /// `exhaustive` or `open`.
     pub coverage: &'static str,
     /// The canonical family id: a domain-separated digest over the
-    /// deterministically ordered exact family roots plus language identity.
-    /// Absent whenever the family is not proven.
+    /// deterministically ordered exact family roots *of this member* plus
+    /// language identity. Two members carry the same id exactly when their
+    /// proven root closures coincide, so a member that redeclares several roots
+    /// (a class implementing two interfaces that each declare the member) has a
+    /// different id from any one of those roots. Read it as "answers to the
+    /// same contracts", not as a connected-component id. Absent whenever the
+    /// family is not proven.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub family_id: Option<String>,
     pub overrides_count: usize,
@@ -328,9 +333,15 @@ pub struct CodeQueryMemberFamily {
 ///
 /// Forward rows (`overrides`, `implements`) are the analyzer's direct proof.
 /// Inverse rows (`overridden_by`, `implemented_by`) are the bounded inversion
-/// of those same forward edges, never an independent resolution, so a pair
-/// round-trips: the same two declarations and the same `family_id` appear from
-/// either end.
+/// of those same forward edges, never an independent resolution, so the *edge*
+/// round-trips: the same two declarations appear from either end, with the
+/// relation reversed.
+///
+/// `family_id` is the id of the row's own member, not of the edge. It matches
+/// from both ends whenever both members prove the same root closure -- an
+/// override chain, for example. It differs when they do not, as when the
+/// overriding member also implements a second interface that declares the same
+/// contract.
 #[derive(Debug, Clone, Serialize)]
 pub struct CodeQueryMemberFamilyEdge {
     pub id: String,

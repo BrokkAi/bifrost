@@ -246,16 +246,13 @@ fn python_own_member_precedence_is_attributed_at_depth_zero() {
 /// reads the annotation's `union_type` node, so a two-arm receiver resolves
 /// ambiguously to both classes instead of reporting the first arm as one
 /// precise answer (#1477).
-#[test]
-fn typescript_union_annotation_resolves_every_arm() {
-    let source = r#"class ServiceA { run() {} }
-class ServiceB { run() {} }
-export function caller(service: ServiceA | ServiceB) { service.run(); }
-"#;
+/// The declared type of the `service.run()` receiver on the third line of a
+/// one-file TypeScript fixture, through the public type lookup.
+fn receiver_type_lookup(source: &str) -> brokk_bifrost::searchtools::TypeLookupResult {
     let project = InlineTestProject::new().file("app.ts", source).build();
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
     let line = source.lines().nth(2).expect("caller line");
-    let result = brokk_bifrost::searchtools::get_type_by_location(
+    let mut result = brokk_bifrost::searchtools::get_type_by_location(
         workspace.analyzer(),
         brokk_bifrost::searchtools::GetTypeParams {
             references: vec![brokk_bifrost::searchtools::TypeReferenceQuery {
@@ -265,7 +262,17 @@ export function caller(service: ServiceA | ServiceB) { service.run(); }
             }],
         },
     );
-    let lookup = &result.results[0];
+    result.results.remove(0)
+}
+
+#[test]
+fn typescript_union_annotation_resolves_every_arm() {
+    let lookup = receiver_type_lookup(
+        r#"class ServiceA { run() {} }
+class ServiceB { run() {} }
+export function caller(service: ServiceA | ServiceB) { service.run(); }
+"#,
+    );
     let names = lookup
         .types
         .iter()
@@ -280,6 +287,88 @@ export function caller(service: ServiceA | ServiceB) { service.run(); }
         lookup.status, "ambiguous",
         "a two-arm union is never one precise answer: {names:?}"
     );
+}
+
+/// A union with one indexed arm and one arm no definition backs is still not a
+/// precise single type. Reporting `ServiceA` alone would erase the open arm --
+/// the exact misrepresentation this work removes -- so the lookup stays
+/// `ambiguous` and names the arm it could not resolve (#1477).
+#[test]
+fn typescript_partly_resolved_union_stays_open_about_the_unindexed_arm() {
+    let lookup = receiver_type_lookup(
+        r#"class ServiceA { run() {} }
+class Unrelated { run() {} }
+export function caller(service: ServiceA | ExternalLibService) { service.run(); }
+"#,
+    );
+    let names = lookup
+        .types
+        .iter()
+        .map(|item| item.fqn.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec!["ServiceA"],
+        "only the indexed arm has definitions to report: {names:?}"
+    );
+    assert_eq!(
+        lookup.status, "ambiguous",
+        "one resolved arm out of two is not a precise answer: {names:?}"
+    );
+    assert!(
+        lookup
+            .diagnostics
+            .iter()
+            .any(|item| item.kind == "unresolved_type_arm"
+                && item.message.contains("ExternalLibService")),
+        "the open arm is named rather than dropped: {:?}",
+        lookup.diagnostics
+    );
+}
+
+/// A union whose arms are all unindexed reports no type at all, and says which
+/// arms it could not resolve. It never falls back to the leading-identifier
+/// text scan, which would report the first arm as one precise type (#1477).
+#[test]
+fn typescript_union_of_unindexed_arms_reports_no_type_not_the_first_arm() {
+    let lookup = receiver_type_lookup(
+        r#"class Unrelated { run() {} }
+class AlsoUnrelated { run() {} }
+export function caller(service: ExternalA | ExternalB) { service.run(); }
+"#,
+    );
+    assert!(lookup.types.is_empty(), "{:?}", lookup.types);
+    assert_eq!(lookup.status, "no_type", "{:?}", lookup.diagnostics);
+    assert!(
+        lookup
+            .diagnostics
+            .iter()
+            .any(|item| item.kind == "unresolved_type_arm"
+                && item.message.contains("ExternalA")
+                && item.message.contains("ExternalB")),
+        "both open arms are named: {:?}",
+        lookup.diagnostics
+    );
+}
+
+/// `ServiceA | null` is not open: the grammar fixes what `null` denotes, so no
+/// class hides behind it and the resolved arm really is the complete answer.
+/// The nullable annotation therefore keeps the precise result it always had.
+#[test]
+fn typescript_nullable_union_stays_precise() {
+    let lookup = receiver_type_lookup(
+        r#"class ServiceA { run() {} }
+class Unrelated { run() {} }
+export function caller(service: ServiceA | null) { service.run(); }
+"#,
+    );
+    let names = lookup
+        .types
+        .iter()
+        .map(|item| item.fqn.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["ServiceA"], "{names:?}");
+    assert_eq!(lookup.status, "resolved", "{:?}", lookup.diagnostics);
 }
 
 /// EXPECTED GAP (#1477): the receiver-analysis path does not consume the fix

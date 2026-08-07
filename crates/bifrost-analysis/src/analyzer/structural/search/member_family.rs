@@ -27,7 +27,8 @@ const MEMBER_FAMILY_ROW_ID_DOMAIN: &[u8] = b"bifrost.code_query.member_family.v1
 const MEMBER_FAMILY_EDGE_ID_DOMAIN: &[u8] = b"bifrost.code_query.member_family_edge.v1";
 
 /// One member's whole family answer, shared by its outcome row and each of its
-/// edge rows so both directions of an edge carry one family id.
+/// edge rows so every row of one member states one family id -- the digest of
+/// that member's own proven root closure.
 #[derive(Debug, Clone)]
 pub(super) struct MemberFamilyValue {
     pub(super) member: DeclarationValue,
@@ -97,14 +98,16 @@ impl MemberFamilyEdgeValue {
 /// Derive the family answer for one member declaration and project the
 /// requested rows.
 ///
-/// The provider is asked for the forward relation and for its bounded
-/// inversion. The inversion is not an independent resolution: it reads the
-/// forward edges of the members below this one and turns them around, so the
-/// two directions of one edge cannot disagree, and both carry the family id
-/// computed from the same roots.
+/// The provider answers both directions from one walk. The inversion is not an
+/// independent resolution: it reads the forward edges of the members below this
+/// one and turns them around, so the two directions of one edge cannot
+/// disagree. Asking once is also what caps the work: the forward relation is
+/// resolved a single time, and the ancestor walk, the root closure, and the
+/// inversion share one visit budget and the request's cancellation token.
 pub(super) fn member_family_expansions_for_declaration(
     analyzer: &dyn IAnalyzer,
     declaration: &DeclarationValue,
+    cancellation: Option<&CancellationToken>,
     edges: bool,
 ) -> Vec<PipelineExpansion> {
     let member_id = render::canonical_member_digest(analyzer, &declaration.unit);
@@ -118,22 +121,13 @@ pub(super) fn member_family_expansions_for_declaration(
             edges,
         );
     };
-    let forward = provider.forward_member_family(&declaration.unit);
-    if !forward.is_proven() {
-        return finish(analyzer, declaration, member_id, forward, Vec::new(), edges);
+    let answer = provider.member_family(&declaration.unit, cancellation);
+    if !answer.is_proven() {
+        return finish(analyzer, declaration, member_id, answer, Vec::new(), edges);
     }
-    // The inversion reads the forward edges of the members below this one and
-    // turns them around. It can only fail where the forward relation itself
-    // could not be enumerated, and when it does the whole answer becomes that
-    // failure rather than a half-populated edge set.
-    let inverse = provider.inverse_member_family(&declaration.unit);
-    if !inverse.is_proven() {
-        return finish(analyzer, declaration, member_id, inverse, Vec::new(), edges);
-    }
-    let row_edges = forward
+    let row_edges = answer
         .edges
         .iter()
-        .chain(inverse.edges.iter())
         .map(|edge| MemberFamilyRowEdge {
             target_id: render::canonical_member_digest(analyzer, &edge.target),
             target: edge.target.clone(),
@@ -146,7 +140,7 @@ pub(super) fn member_family_expansions_for_declaration(
             },
         })
         .collect();
-    finish(analyzer, declaration, member_id, forward, row_edges, edges)
+    finish(analyzer, declaration, member_id, answer, row_edges, edges)
 }
 
 fn finish(

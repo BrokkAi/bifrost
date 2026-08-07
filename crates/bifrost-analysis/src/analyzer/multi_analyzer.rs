@@ -608,18 +608,12 @@ impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
         crate::analyzer::usages::java_member_family_capability(self, member)
     }
 
-    fn forward_member_family(
+    fn member_family(
         &self,
         member: &CodeUnit,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> crate::analyzer::usages::MemberFamilyAnswer {
-        crate::analyzer::usages::java_forward_member_family(self, self, member)
-    }
-
-    fn inverse_member_family(
-        &self,
-        member: &CodeUnit,
-    ) -> crate::analyzer::usages::MemberFamilyAnswer {
-        crate::analyzer::usages::java_inverse_member_family(self, self, member)
+        crate::analyzer::usages::java_member_family(self, self, member, cancellation)
     }
 }
 

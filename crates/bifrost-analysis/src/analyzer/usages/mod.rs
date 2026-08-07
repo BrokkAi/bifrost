@@ -76,8 +76,8 @@ pub use local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
 pub use member_family::{
-    MemberFamilyAnswer, MemberFamilyEdge, MemberFamilyProvider, java_forward_member_family,
-    java_inverse_member_family, java_member_family_capability, member_family_id,
+    MemberFamilyAnswer, MemberFamilyEdge, MemberFamilyProvider, java_member_family,
+    java_member_family_capability, member_family_id,
 };
 pub use model::{
     CONFIDENCE_THRESHOLD, ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding,

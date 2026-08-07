@@ -2048,6 +2048,12 @@ fn python_member_outcome(
     }
 }
 
+/// How many ancestor types the recording-only route walk may visit. Mirrors the
+/// bound the Java member-family walk applies to the same kind of closure: a
+/// diamond or a deep framework hierarchy stays bounded, and a hierarchy that
+/// exceeds the bound loses attribution rather than gaining a wrong one.
+const MAX_ANCESTOR_FRONTIER: usize = 512;
+
 /// The hop distance and first-discovery parent of every ancestor the Python
 /// member walk can reach (#1477).
 ///
@@ -2056,6 +2062,12 @@ fn python_member_outcome(
 /// direct-ancestor edges, in the same order and with the same
 /// fully-qualified-name deduplication, and retains them. It decides nothing:
 /// the production loop still consumes `get_ancestors` unchanged.
+///
+/// The walk is bounded by [`MAX_ANCESTOR_FRONTIER`]. Truncation removes
+/// attribution, never distorts it: breadth-first order fixes every depth at
+/// the level it was recorded, so an ancestor the bound cut off simply has no
+/// depth and [`PythonAncestorRoutes::route`] returns `None` for it, leaving
+/// that candidate unattributed.
 #[derive(Default)]
 struct PythonAncestorRoutes {
     /// First-discovery parent of each ancestor the walk expanded.
@@ -2077,12 +2089,21 @@ impl PythonAncestorRoutes {
                 .or_insert_with(|| receiver.clone());
         }
         let mut depth = 0usize;
-        while !level.is_empty() {
+        let mut visited = 0usize;
+        'walk: while !level.is_empty() {
             depth += 1;
             let mut next_level = Vec::new();
             for ancestor in level {
                 if !seen.insert(ancestor.fq_name()) {
                     continue;
+                }
+                visited += 1;
+                if visited > MAX_ANCESTOR_FRONTIER {
+                    // Stop before recording anything about this ancestor. Every
+                    // depth already recorded is the breadth-first minimum and
+                    // stays correct; the rest of the closure is simply absent,
+                    // so its candidates stay unattributed.
+                    break 'walk;
                 }
                 routes.depths.insert(ancestor.clone(), depth);
                 let expanded = provider.get_direct_ancestors(&ancestor);

@@ -4,9 +4,17 @@
 //! `member_family` outcome row is mandatory per member declaration, so an
 //! unsupported language, an excluded member, or an unprovable overload
 //! identity states a typed reason instead of vanishing. Edge rows are emitted
-//! only from a proven family, the inverse direction is the bounded inversion of
-//! the forward edges rather than an independent resolution, and both ends of
-//! one edge carry the same `family_id`.
+//! only from a proven family, and the inverse direction is the bounded
+//! inversion of the forward edges rather than an independent resolution, so an
+//! edge round-trips by declaration identity from either end.
+//!
+//! `family_id` is the id of the row's *own* member: a digest of that member's
+//! proven root closure. Two members share an id exactly when their root
+//! closures coincide, which is why an override chain round-trips through one id
+//! (`java_superclass_override_round_trips_through_one_family`) while a member
+//! with two roots carries an id of its own
+//! (`a_multi_root_member_and_its_single_root_ancestor_carry_different_family_ids`).
+//! It is not a connected-component id, and no test may assert that it is.
 //!
 //! Measured Java capability, pinned by
 //! `overload_identity_uses_parameter_type_spellings`: the Java declaration walk
@@ -106,6 +114,20 @@ class Service extends Base { void run(int x) {} }
 const DECOY_JAVA: &str = r#"class Base { void run() {} }
 class Other { void run() {} }
 class Service extends Base { void run() {} }
+"#;
+
+/// Two independent interfaces declaring one contract, and a class that
+/// satisfies both. `C.run` has two exact roots; each interface member has one.
+const TWO_INTERFACE_JAVA: &str = r#"interface I1 { void run(); }
+interface I2 { void run(); }
+class C implements I1, I2 { public void run() {} }
+"#;
+
+/// A parse-level inheritance cycle. javac rejects it, but Bifrost parses a file
+/// in exactly this state while it is being edited, so the family walk must
+/// answer instead of recursing.
+const CYCLE_JAVA: &str = r#"class A extends B { void run() {} }
+class B extends A { void run() {} }
 "#;
 
 /// A static same-name pair and the constructors beside them.
@@ -239,6 +261,126 @@ fn java_interface_implementation_states_implements_in_both_directions() {
     let family = family_of(&summary, "Service.run");
     assert_eq!(family["implements_count"], 1, "{summary}");
     assert_eq!(family["overrides_count"], 0, "{summary}");
+}
+
+/// What `family_id` actually guarantees: it digests the *queried member's* own
+/// proven root closure, so two members share an id exactly when their root
+/// closures coincide. A member with two roots therefore carries a different id
+/// from either single-root root, even though one edge joins them. The
+/// single-root round trip is pinned by
+/// `java_superclass_override_round_trips_through_one_family`; this test pins the
+/// multi-root case so the published claim cannot drift back to "both ends of one
+/// edge share an id".
+#[test]
+fn a_multi_root_member_and_its_single_root_ancestor_carry_different_family_ids() {
+    let files = [("App.java", TWO_INTERFACE_JAVA)];
+
+    let summary = serialized(&run(&files, family_query("App.java", "C", "member_family")));
+    let family = family_of(&summary, "C.run");
+    assert_eq!(family["outcome"], "proven", "{summary}");
+    assert_eq!(family["implements_count"], 2, "{summary}");
+    assert_eq!(
+        family["root_count"], 2,
+        "both interface declarations are exact roots: {summary}"
+    );
+    let subclass_id = family["family_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("proven family carries an id: {summary}"))
+        .to_string();
+
+    for owner in ["I1", "I2"] {
+        let interface = serialized(&run(
+            &files,
+            family_query("App.java", owner, "member_family"),
+        ));
+        let root_family = family_of(&interface, &format!("{owner}.run"));
+        assert_eq!(root_family["outcome"], "proven", "{interface}");
+        assert_eq!(root_family["root_count"], 1, "{interface}");
+        assert_eq!(root_family["implemented_by_count"], 1, "{interface}");
+        assert_ne!(
+            root_family["family_id"],
+            subclass_id.as_str(),
+            "{owner}: a one-root ancestor and a two-root implementor are different root closures: {interface}"
+        );
+    }
+
+    // The same holds on the edge rows, in both directions of one edge: each row
+    // states the id of its own member, and the edge itself still round-trips by
+    // declaration identity.
+    let forward = serialized(&run(&files, family_query("App.java", "C", "family_edges")));
+    let out = edges_of(&forward, "C.run");
+    assert_eq!(out.len(), 2, "{forward}");
+    for edge in &out {
+        assert_eq!(edge["relation"], "implements", "{forward}");
+        assert_eq!(edge["family_id"], subclass_id.as_str(), "{forward}");
+    }
+
+    let inverse = serialized(&run(&files, family_query("App.java", "I1", "family_edges")));
+    let back = edges_of(&inverse, "I1.run");
+    assert_eq!(back.len(), 1, "{inverse}");
+    assert_eq!(back[0]["relation"], "implemented_by", "{inverse}");
+    assert_eq!(back[0]["target"]["fq_name"], "C.run", "{inverse}");
+    assert_ne!(
+        back[0]["family_id"],
+        subclass_id.as_str(),
+        "the two ends of one edge state their own ids, not a shared one: {inverse}"
+    );
+    let forward_to_i1 = out
+        .iter()
+        .find(|edge| edge["target"]["fq_name"] == "I1.run")
+        .unwrap_or_else(|| panic!("C.run implements I1.run: {forward}"));
+    assert_eq!(
+        back[0]["target_id"], forward_to_i1["member_id"],
+        "the edge still round-trips by declaration identity: {inverse}"
+    );
+    assert_eq!(
+        back[0]["member_id"], forward_to_i1["target_id"],
+        "and in the other direction too: {inverse}"
+    );
+}
+
+/// A parse-level inheritance cycle answers, bounded, instead of recursing until
+/// the stack overflows.
+///
+/// Root discovery is one iterative closure with one shared seen set, so each
+/// member of the cycle is expanded once. Nothing in the cycle overrides
+/// nothing, so the family has no exact root, and the answer says that with
+/// `family_root_not_canonical` rather than publishing a proven family with an
+/// empty root set or an id digested from no root.
+#[test]
+fn parse_level_inheritance_cycle_is_bounded_and_incomplete() {
+    let files = [("App.java", CYCLE_JAVA)];
+
+    for (owner, member) in [("A", "A.run"), ("B", "B.run")] {
+        let summary = serialized(&run(
+            &files,
+            family_query("App.java", owner, "member_family"),
+        ));
+        let family = family_of(&summary, member);
+        assert_eq!(family["outcome"], "incomplete", "{member}: {summary}");
+        assert_eq!(
+            family["reason"], "family_root_not_canonical",
+            "{member}: a cycle has no member that overrides nothing: {summary}"
+        );
+        assert_eq!(
+            family["coverage"], "open",
+            "{member}: an incomplete family is never exhaustive: {summary}"
+        );
+        assert!(
+            family["family_id"].is_null(),
+            "{member}: no exact root means no exact id: {summary}"
+        );
+        assert_eq!(family["edge_count"], 0, "{member}: {summary}");
+
+        let edges = serialized(&run(
+            &files,
+            family_query("App.java", owner, "family_edges"),
+        ));
+        assert!(
+            edges_of(&edges, member).is_empty(),
+            "{member}: an unproven family emits no edge row: {edges}"
+        );
+    }
 }
 
 /// The measured Java capability level, pinned. See the module comment.

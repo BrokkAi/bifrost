@@ -713,6 +713,186 @@ export interface RqlMemberSelectionResult extends RqlQueryResultBase {
   coverage: string;
 }
 
+/**
+ * One exact hierarchy hop on one member candidate's route.
+ *
+ * A candidate found at depth `n` contributes exactly `n` rows, numbered `0`
+ * through `n - 1`. A direct (depth-zero) candidate contributes none, and so
+ * does a candidate the resolver recorded without member attribution. Zero hop
+ * rows is therefore never a claim that no hierarchy was walked; the mandatory
+ * per-occurrence summary is the `member_selection` row's job.
+ */
+export interface RqlCandidateHopResult extends RqlQueryResultBase {
+  result_type: "candidate_hop";
+  id: string;
+  /** The `resolution_candidate` row this hop belongs to; string equality joins them. */
+  candidate_id: string;
+  /** The AST identity of the *reference* occurrence the candidate was considered for. */
+  ast_id: string;
+  language: string;
+  /** The reference occurrence's range: a hop explains part of that position's resolution. */
+  range: RqlResultRange;
+  start_byte: number;
+  end_byte: number;
+  /** Zero-based position of this hop on its candidate's route. */
+  hop: number;
+  relation: string;
+  /**
+   * The type the hop left. Absent when the workspace can no longer locate the
+   * recorded unit, which is a stated rendering gap, not an absent hop.
+   */
+  from?: RqlDeclarationValue;
+  /** The type the hop reached, under the same rule as `from`. */
+  to?: RqlDeclarationValue;
+}
+
+/**
+ * The mandatory terminal row for one bounded-dispatch site.
+ *
+ * Target rows can be empty. This row always states the semantic outcome that
+ * produced that emptiness and whether the retained target set is exhaustive.
+ * `coverage` is `exhaustive` only when the oracle itself reported exhaustive
+ * coverage; an unknown, unsupported, over-budget, or cancelled dispatch never
+ * is, so do not read an empty target relation as "no targets".
+ */
+export interface RqlDispatchOutcomeResult extends RqlQueryResultBase {
+  result_type: "dispatch_outcome";
+  id: string;
+  /** Joins the outcome row to its target rows and to the dispatch site. */
+  site_id: string;
+  /** Absent when the producer cannot address the site as a facts-arena node. */
+  site_ast_id?: string;
+  language: string;
+  range: RqlResultRange;
+  /**
+   * `resolved`, `ambiguous`, `unproven`, `unknown`, `unsupported`,
+   * `exceeded_budget`, or `cancelled`.
+   */
+  outcome: string;
+  /** The oracle's own candidate coverage: `exhaustive`, `open`, or `truncated`. */
+  coverage: string;
+  /**
+   * Exact semantic call sites located inside the input range. Zero means the
+   * position holds no call the semantic artifact retained, which is why the
+   * outcome is `unknown` rather than a proven-empty target set.
+   */
+  call_site_count: number;
+  target_count: number;
+  targets_truncated: boolean;
+  /** Present when the outcome is `unsupported`. */
+  semantic_unsupported?: string;
+  /** Present when the outcome is `exceeded_budget`. */
+  exceeded_limit?: string;
+}
+
+/**
+ * One bounded dispatch arm of one call site.
+ *
+ * A row is either a materialized candidate (`boundary_kind` absent) or a
+ * boundary arm the oracle named a target for. `dispatch` is the honest
+ * conjunction of `proof`, `completeness`, and the site's `coverage`, and it
+ * never upgrades: `proven_dispatch` only for a proven, complete arm inside an
+ * exhaustive set, and `may_dispatch` otherwise. The row carries no range: it is
+ * an arm of a site, not a second location.
+ */
+export interface RqlDispatchTargetResult extends RqlQueryResultBase {
+  result_type: "dispatch_target";
+  id: string;
+  site_id: string;
+  site_ast_id?: string;
+  /** Zero-based position of this arm among the site's retained arms. */
+  ordinal: number;
+  /** The arm's semantic identity digest. Never an arena id. */
+  target_id: string;
+  target_path: string;
+  /**
+   * The target rendered as a workspace declaration. Absent for an external or
+   * unmaterialized arm, and for a procedure the workspace no longer indexes.
+   */
+  target_declaration?: RqlDeclarationValue;
+  proof: string;
+  completeness: string;
+  /** The owning site's candidate coverage, repeated so an arm alone can reject an exact-set claim. */
+  coverage: string;
+  /** `proven_dispatch` or `may_dispatch`. */
+  dispatch: string;
+  /** Present when this arm is a boundary rather than a materialized candidate. */
+  boundary_kind?: string;
+}
+
+/**
+ * The mandatory terminal row for one member's canonical method family.
+ *
+ * Edge rows can be empty, and this row is what says why: a `proven` family with
+ * no edge overrides and implements nothing, a `no_family` member is one the
+ * language excludes outright, while `incomplete` and `unsupported` are honest
+ * failures that carry no `family_id`. `coverage` is `exhaustive` only for the
+ * two complete answers.
+ */
+export interface RqlMemberFamilyResult extends RqlQueryResultBase {
+  result_type: "member_family";
+  id: string;
+  /** The member's structured canonical identity digest, never a rendered FQN. */
+  member_id: string;
+  language: string;
+  range: RqlResultRange;
+  member?: RqlDeclarationValue;
+  /** `proven`, `no_family`, `incomplete`, or `unsupported`. */
+  outcome: string;
+  /** Why the outcome is not `proven`. A proven family states none. */
+  reason?: string;
+  /** The measured strength of the analyzer's member-identity evidence for the language. */
+  capability: string;
+  /** `exhaustive` or `open`. */
+  coverage: string;
+  /** The canonical family id. Absent whenever the family is not proven. */
+  family_id?: string;
+  overrides_count: number;
+  implements_count: number;
+  overridden_by_count: number;
+  implemented_by_count: number;
+  edge_count: number;
+  /** How many exact roots the family id digested. */
+  root_count: number;
+}
+
+/**
+ * One typed edge of one member's method family.
+ *
+ * Forward rows (`overrides`, `implements`) are the analyzer's direct proof.
+ * Inverse rows (`overridden_by`, `implemented_by`) are the bounded inversion of
+ * those same forward edges, never an independent resolution, so a pair
+ * round-trips with the same declarations and the same `family_id`.
+ */
+export interface RqlMemberFamilyEdgeResult extends RqlQueryResultBase {
+  result_type: "member_family_edge";
+  id: string;
+  /** The source member's canonical identity digest. */
+  member_id: string;
+  range: RqlResultRange;
+  /** Zero-based position among the member's retained edges: forward first, then inverse. */
+  ordinal: number;
+  source?: RqlDeclarationValue;
+  /** The target member's canonical identity digest. */
+  target_id: string;
+  target?: RqlDeclarationValue;
+  /** `overrides`, `implements`, `overridden_by`, or `implemented_by`. */
+  relation: string;
+  family_id?: string;
+  /** Hierarchy hops between the two owners on the route that found the edge. */
+  hierarchy_depth: number;
+  /**
+   * `proven` when structure alone singled the target out. `unproven` when only
+   * recorded parameter-type spellings separated an overload set: a spelling is
+   * not a resolved or erased type.
+   */
+  proof: string;
+  /** Always `complete`; a truncated walk reports `incomplete` and emits no edges. */
+  completeness: string;
+  /** The owning member's family coverage, repeated on the edge. */
+  coverage: string;
+}
+
 export type RqlQueryResultItem =
   | RqlStructuralMatchResult
   | RqlDeclarationResult
@@ -736,7 +916,12 @@ export type RqlQueryResultItem =
   | RqlReferenceEdgeResult
   | RqlReceiverOutcomeResult
   | RqlReceiverEvidenceResult
-  | RqlMemberSelectionResult;
+  | RqlMemberSelectionResult
+  | RqlCandidateHopResult
+  | RqlDispatchOutcomeResult
+  | RqlDispatchTargetResult
+  | RqlMemberFamilyResult
+  | RqlMemberFamilyEdgeResult;
 
 export interface RqlQueryResponse {
   text: string;
@@ -869,6 +1054,16 @@ export function queryResultLabel(result: RqlQueryResultItem): string {
       return result.declaration_fq_name ?? result.evidence_kind;
     case "member_selection":
       return result.member;
+    case "candidate_hop":
+      return `${result.relation}: ${result.from?.fq_name ?? "unknown"} → ${result.to?.fq_name ?? "unknown"}`;
+    case "dispatch_outcome":
+      return `dispatch: ${result.outcome}`;
+    case "dispatch_target":
+      return result.target_declaration?.fq_name ?? result.target_path;
+    case "member_family":
+      return result.member?.fq_name ?? result.member_id;
+    case "member_family_edge":
+      return `${result.relation}: ${result.target?.fq_name ?? result.target_id}`;
   }
 }
 
@@ -925,6 +1120,20 @@ export function queryResultDescription(result: RqlQueryResultItem): string {
       return `${result.evidence_kind} · hop ${result.chain_hop} · ${result.proof}/${result.completeness}`;
     case "member_selection":
       return `${result.outcome} · ${result.selected_count}/${result.candidate_count} · ${result.coverage}`;
+    case "candidate_hop":
+      return `hop ${result.hop} · ${result.relation} · ${result.range.start_line}:${result.range.start_column}`;
+    case "dispatch_outcome":
+      return (
+        `${result.coverage} · ${result.target_count} target${result.target_count === 1 ? "" : "s"}` +
+        (result.targets_truncated ? " (truncated)" : "") +
+        ` · ${result.call_site_count} call site${result.call_site_count === 1 ? "" : "s"}`
+      );
+    case "dispatch_target":
+      return `${result.dispatch} · ${result.proof}/${result.completeness} · ${result.coverage}${result.boundary_kind ? ` · ${result.boundary_kind}` : ""}`;
+    case "member_family":
+      return `${result.outcome} · ${result.coverage} · ${result.edge_count} edge${result.edge_count === 1 ? "" : "s"}`;
+    case "member_family_edge":
+      return `${result.relation} · depth ${result.hierarchy_depth} · ${result.proof}/${result.completeness}`;
     case "structural_match":
     case "declaration":
       return `${result.kind} · ${result.start_line}-${result.end_line}`;
@@ -1133,6 +1342,83 @@ export function queryResultTooltip(result: RqlQueryResultItem): string {
           ? "\n\nThis language records no candidate trace, so an absent rejection row says nothing."
           : "")
       );
+    case "candidate_hop":
+      return (
+        `**${result.relation} hop ${result.hop}** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\n\`${result.from?.fq_name ?? "unrenderable"}\` → \`${result.to?.fq_name ?? "unrenderable"}\`` +
+        (result.from === undefined || result.to === undefined
+          ? "\n\nThe workspace can no longer locate one recorded unit, which is a rendering gap, not an absent hop."
+          : "") +
+        `\n\nCandidate \`${result.candidate_id}\`` +
+        "\n\nHop rows explain a route; the mandatory per-occurrence answer is the member_selection row."
+      );
+    case "dispatch_outcome":
+      return (
+        `**dispatch outcome** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\n${result.outcome} · coverage ${result.coverage}` +
+        `\n\nCall sites: ${result.call_site_count} · targets: ${result.target_count}` +
+        (result.targets_truncated ? " (truncated)" : "") +
+        (result.semantic_unsupported
+          ? `\n\nSemantic support absent: ${result.semantic_unsupported}`
+          : "") +
+        (result.exceeded_limit ? `\n\nExceeded budget: ${result.exceeded_limit}` : "") +
+        (result.call_site_count === 0
+          ? "\n\nNo semantic call site was located here, so an empty target set is unknown, not proven-empty."
+          : "") +
+        (result.coverage === "exhaustive"
+          ? ""
+          : "\n\nCoverage is not exhaustive, so an absent target says nothing.")
+      );
+    case "dispatch_target":
+      return (
+        `**${result.dispatch}** to \`${result.target_declaration?.fq_name ?? result.target_path}\`` +
+        ` for site \`${result.site_id}\` in ${result.path}` +
+        `\n\nArm ${result.ordinal} · ${result.proof}/${result.completeness} · coverage ${result.coverage}` +
+        (result.boundary_kind
+          ? `\n\nBoundary arm (${result.boundary_kind}): the workspace holds no body to render.`
+          : "") +
+        (result.target_declaration
+          ? ""
+          : "\n\nThe workspace located no declaration for this target.") +
+        (result.dispatch === "proven_dispatch"
+          ? ""
+          : "\n\nThis arm may dispatch; it is not proven. A dispatch is proven only for a proven, complete arm inside an exhaustive set.")
+      );
+    case "member_family":
+      return (
+        `**member family (${result.outcome})** for \`${result.member?.fq_name ?? result.member_id}\`` +
+        ` at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\nCoverage ${result.coverage} · capability ${result.capability}` +
+        `\n\nOverrides ${result.overrides_count} · implements ${result.implements_count}` +
+        ` · overridden by ${result.overridden_by_count} · implemented by ${result.implemented_by_count}` +
+        `\n\nEdges: ${result.edge_count}` +
+        (result.reason ? `\n\n${result.reason}` : "") +
+        (result.family_id
+          ? `\n\nFamily: \`${result.family_id}\` over ${result.root_count} root${result.root_count === 1 ? "" : "s"}` +
+            (result.outcome === "proven"
+              ? ""
+              : "\n\nA family id is only meaningful for a proven family.")
+          : "\n\nNo family id: this outcome does not prove a family.") +
+        (result.coverage === "exhaustive"
+          ? ""
+          : "\n\nCoverage is not exhaustive, so an absent edge says nothing.")
+      );
+    case "member_family_edge":
+      return (
+        `**${result.relation}** \`${result.source?.fq_name ?? result.member_id}\` → ` +
+        `\`${result.target?.fq_name ?? result.target_id}\` at ${result.path}:${result.range.start_line}` +
+        `\n\nEdge ${result.ordinal} · hierarchy depth ${result.hierarchy_depth}` +
+        `\n\n${result.proof}/${result.completeness} · coverage ${result.coverage}` +
+        (result.family_id
+          ? `\n\nFamily: \`${result.family_id}\``
+          : "\n\nNo family id on this edge.") +
+        (result.proof === "proven"
+          ? ""
+          : "\n\nUnproven: only recorded parameter-type spellings separated an overload set, and a spelling is not a resolved type.") +
+        (result.relation === "overridden_by" || result.relation === "implemented_by"
+          ? "\n\nAn inverse row is the bounded inversion of a forward edge, never an independent resolution."
+          : "")
+      );
   }
 }
 
@@ -1184,15 +1470,31 @@ export function queryResultIcon(result: RqlQueryResultItem): string {
       return "symbol-field";
     case "member_selection":
       return "checklist";
+    case "candidate_hop":
+      return "arrow-up";
+    case "dispatch_outcome":
+      return "git-merge";
+    case "dispatch_target":
+      return "call-incoming";
+    case "member_family":
+      return "type-hierarchy-sub";
+    case "member_family_edge":
+      return "git-compare";
   }
 }
 
 export function queryResultRange(result: RqlQueryResultItem): RqlResultRange | undefined {
   switch (result.result_type) {
-    // A receiver-evidence row is evidence about a site, not a second location.
+    // A receiver-evidence row is evidence about a site, and a dispatch-target
+    // row is one arm of a site: neither is a second location.
     case "file":
     case "receiver_evidence":
+    case "dispatch_target":
       return undefined;
+    case "candidate_hop":
+    case "dispatch_outcome":
+    case "member_family":
+    case "member_family_edge":
     case "receiver_outcome":
     case "member_selection":
     case "reference_site":

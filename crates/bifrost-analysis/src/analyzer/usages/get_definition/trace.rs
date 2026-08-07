@@ -404,7 +404,7 @@ pub(crate) fn deep_scope_is(name: &str) -> bool {
 pub(super) struct TraceSession;
 
 impl TraceSession {
-    fn install() -> Self {
+    pub(super) fn install() -> Self {
         RECORDER.with(|recorder| *recorder.borrow_mut() = Some(Recorder::default()));
         Self
     }

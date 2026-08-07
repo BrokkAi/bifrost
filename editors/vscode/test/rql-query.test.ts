@@ -14,10 +14,15 @@ import {
   queryResultTooltip,
   runRqlQuery,
   typestateWitnessStepTargets,
+  type RqlCandidateHopResult,
   type RqlControlEdgeResult,
+  type RqlDispatchOutcomeResult,
+  type RqlDispatchTargetResult,
   type RqlFlowEndpointResult,
   type RqlFlowWitnessResult,
   type RqlProcedureResult,
+  type RqlMemberFamilyEdgeResult,
+  type RqlMemberFamilyResult,
   type RqlMemberSelectionResult,
   type RqlProgramPointResult,
   type RqlQueryRunner,
@@ -522,6 +527,288 @@ void test("renders a member-selection result and states an absent trace", () => 
     queryResultTooltip(traced),
     /This resolver reports only its selections, so an absent rejection row says nothing\./
   );
+});
+
+void test("renders a candidate-hop result and states a rendering gap", () => {
+  const hop: RqlCandidateHopResult = {
+    uri: "file:///workspace/src/app.ts",
+    path: "src/app.ts",
+    result_type: "candidate_hop",
+    id: "hop-a",
+    candidate_id: "candidate-a",
+    ast_id: "ast-a",
+    language: "typescript",
+    range: {
+      start_line: 12,
+      start_column: 7,
+      end_line: 12,
+      end_column: 14
+    },
+    start_byte: 120,
+    end_byte: 127,
+    hop: 1,
+    relation: "extends",
+    from: {
+      path: "src/app.ts",
+      language: "typescript",
+      kind: "class",
+      fq_name: "Derived",
+      start_line: 1,
+      end_line: 3
+    },
+    to: {
+      path: "src/app.ts",
+      language: "typescript",
+      kind: "class",
+      fq_name: "Base",
+      start_line: 5,
+      end_line: 8
+    }
+  };
+
+  assert.equal(queryResultLabel(hop), "extends: Derived → Base");
+  assert.equal(queryResultDescription(hop), "hop 1 · extends · 12:7");
+  assert.equal(queryResultIcon(hop), "arrow-up");
+  const tooltip = queryResultTooltip(hop);
+  assert.match(tooltip, /\*\*extends hop 1\*\*/);
+  assert.match(tooltip, /`Derived` → `Base`/);
+  assert.match(tooltip, /Candidate `candidate-a`/);
+  assert.doesNotMatch(tooltip, /rendering gap/);
+  assert.deepEqual(queryResultRange(hop), hop.range);
+
+  const unrenderable: RqlCandidateHopResult = { ...hop, to: undefined };
+  assert.equal(queryResultLabel(unrenderable), "extends: Derived → unknown");
+  assert.match(queryResultTooltip(unrenderable), /rendering gap, not an absent hop/);
+});
+
+void test("renders a dispatch-outcome result and refuses to prove an empty target set", () => {
+  const outcome: RqlDispatchOutcomeResult = {
+    uri: "file:///workspace/src/app.ts",
+    path: "src/app.ts",
+    result_type: "dispatch_outcome",
+    id: "dispatch-a",
+    site_id: "site-a",
+    site_ast_id: "ast-a",
+    language: "typescript",
+    range: {
+      start_line: 14,
+      start_column: 3,
+      end_line: 14,
+      end_column: 19
+    },
+    outcome: "unknown",
+    coverage: "open",
+    call_site_count: 0,
+    target_count: 0,
+    targets_truncated: false
+  };
+
+  assert.equal(queryResultLabel(outcome), "dispatch: unknown");
+  assert.equal(queryResultDescription(outcome), "open · 0 targets · 0 call sites");
+  assert.equal(queryResultIcon(outcome), "git-merge");
+  const tooltip = queryResultTooltip(outcome);
+  assert.match(tooltip, /unknown · coverage open/);
+  assert.match(tooltip, /unknown, not proven-empty/);
+  assert.match(tooltip, /Coverage is not exhaustive, so an absent target says nothing\./);
+  assert.deepEqual(queryResultRange(outcome), outcome.range);
+
+  const unsupported: RqlDispatchOutcomeResult = {
+    ...outcome,
+    outcome: "unsupported",
+    call_site_count: 2,
+    target_count: 3,
+    targets_truncated: true,
+    semantic_unsupported: "typescript records no dispatch oracle",
+    exceeded_limit: "call_depth"
+  };
+  assert.equal(queryResultDescription(unsupported), "open · 3 targets (truncated) · 2 call sites");
+  const unsupportedTooltip = queryResultTooltip(unsupported);
+  assert.match(
+    unsupportedTooltip,
+    /Semantic support absent: typescript records no dispatch oracle/
+  );
+  assert.match(unsupportedTooltip, /Exceeded budget: call_depth/);
+  assert.doesNotMatch(unsupportedTooltip, /not proven-empty/);
+});
+
+void test("renders a may-dispatch target without claiming it is proven", () => {
+  const target: RqlDispatchTargetResult = {
+    uri: "file:///workspace/src/app.ts",
+    path: "src/app.ts",
+    result_type: "dispatch_target",
+    id: "target-a",
+    site_id: "site-a",
+    site_ast_id: "ast-a",
+    ordinal: 0,
+    target_id: "digest-a",
+    target_path: "src/service.ts",
+    target_declaration: {
+      path: "src/service.ts",
+      language: "typescript",
+      kind: "method",
+      fq_name: "Service.connect",
+      start_line: 4,
+      end_line: 6
+    },
+    proof: "unproven",
+    completeness: "partial",
+    coverage: "open",
+    dispatch: "may_dispatch"
+  };
+
+  assert.equal(queryResultLabel(target), "Service.connect");
+  assert.equal(queryResultDescription(target), "may_dispatch · unproven/partial · open");
+  assert.equal(queryResultIcon(target), "call-incoming");
+  const tooltip = queryResultTooltip(target);
+  assert.match(tooltip, /\*\*may_dispatch\*\* to `Service\.connect`/);
+  assert.match(tooltip, /This arm may dispatch; it is not proven\./);
+  assert.doesNotMatch(tooltip, /proven_dispatch/);
+  // The arm is one arm of a site, not a second location.
+  assert.equal(queryResultRange(target), undefined);
+
+  const boundary: RqlDispatchTargetResult = {
+    ...target,
+    target_declaration: undefined,
+    boundary_kind: "external_call"
+  };
+  assert.equal(queryResultLabel(boundary), "src/service.ts");
+  assert.equal(
+    queryResultDescription(boundary),
+    "may_dispatch · unproven/partial · open · external_call"
+  );
+  const boundaryTooltip = queryResultTooltip(boundary);
+  assert.match(boundaryTooltip, /Boundary arm \(external_call\)/);
+  assert.match(boundaryTooltip, /The workspace located no declaration for this target\./);
+
+  const proven: RqlDispatchTargetResult = {
+    ...target,
+    proof: "proven",
+    completeness: "complete",
+    coverage: "exhaustive",
+    dispatch: "proven_dispatch"
+  };
+  assert.doesNotMatch(queryResultTooltip(proven), /may dispatch; it is not proven/);
+});
+
+void test("renders an incomplete member family without showing a family id", () => {
+  const family: RqlMemberFamilyResult = {
+    uri: "file:///workspace/src/app.ts",
+    path: "src/app.ts",
+    result_type: "member_family",
+    id: "family-a",
+    member_id: "member-digest-a",
+    language: "typescript",
+    range: {
+      start_line: 20,
+      start_column: 3,
+      end_line: 22,
+      end_column: 4
+    },
+    member: {
+      path: "src/app.ts",
+      language: "typescript",
+      kind: "method",
+      fq_name: "Service.connect",
+      start_line: 20,
+      end_line: 22
+    },
+    outcome: "incomplete",
+    reason: "hierarchy walk hit its bound",
+    capability: "partial",
+    coverage: "open",
+    overrides_count: 0,
+    implements_count: 0,
+    overridden_by_count: 0,
+    implemented_by_count: 0,
+    edge_count: 0,
+    root_count: 0
+  };
+
+  assert.equal(queryResultLabel(family), "Service.connect");
+  assert.equal(queryResultDescription(family), "incomplete · open · 0 edges");
+  assert.equal(queryResultIcon(family), "type-hierarchy-sub");
+  const tooltip = queryResultTooltip(family);
+  assert.match(tooltip, /\*\*member family \(incomplete\)\*\*/);
+  assert.match(tooltip, /hierarchy walk hit its bound/);
+  // An incomplete outcome proves no family, so no family id may be shown.
+  assert.doesNotMatch(tooltip, /Family: `/);
+  assert.match(tooltip, /No family id: this outcome does not prove a family\./);
+  assert.match(tooltip, /Coverage is not exhaustive, so an absent edge says nothing\./);
+  assert.deepEqual(queryResultRange(family), family.range);
+
+  const proven: RqlMemberFamilyResult = {
+    ...family,
+    outcome: "proven",
+    reason: undefined,
+    coverage: "exhaustive",
+    family_id: "family-digest-a",
+    overrides_count: 1,
+    edge_count: 1,
+    root_count: 2
+  };
+  const provenTooltip = queryResultTooltip(proven);
+  assert.match(provenTooltip, /Family: `family-digest-a` over 2 roots/);
+  assert.doesNotMatch(provenTooltip, /No family id/);
+  assert.doesNotMatch(provenTooltip, /Coverage is not exhaustive/);
+});
+
+void test("renders a member-family edge and names an inverse row as an inversion", () => {
+  const edge: RqlMemberFamilyEdgeResult = {
+    uri: "file:///workspace/src/app.ts",
+    path: "src/app.ts",
+    result_type: "member_family_edge",
+    id: "edge-a",
+    member_id: "member-digest-a",
+    range: {
+      start_line: 20,
+      start_column: 3,
+      end_line: 22,
+      end_column: 4
+    },
+    ordinal: 0,
+    source: {
+      path: "src/app.ts",
+      language: "typescript",
+      kind: "method",
+      fq_name: "Derived.connect",
+      start_line: 20,
+      end_line: 22
+    },
+    target_id: "member-digest-b",
+    target: {
+      path: "src/base.ts",
+      language: "typescript",
+      kind: "method",
+      fq_name: "Base.connect",
+      start_line: 4,
+      end_line: 6
+    },
+    relation: "overrides",
+    family_id: "family-digest-a",
+    hierarchy_depth: 1,
+    proof: "proven",
+    completeness: "complete",
+    coverage: "exhaustive"
+  };
+
+  assert.equal(queryResultLabel(edge), "overrides: Base.connect");
+  assert.equal(queryResultDescription(edge), "overrides · depth 1 · proven/complete");
+  assert.equal(queryResultIcon(edge), "git-compare");
+  const tooltip = queryResultTooltip(edge);
+  assert.match(tooltip, /\*\*overrides\*\* `Derived\.connect` → `Base\.connect`/);
+  assert.match(tooltip, /Family: `family-digest-a`/);
+  assert.doesNotMatch(tooltip, /Unproven/);
+  assert.doesNotMatch(tooltip, /bounded inversion/);
+  assert.deepEqual(queryResultRange(edge), edge.range);
+
+  const inverse: RqlMemberFamilyEdgeResult = {
+    ...edge,
+    relation: "overridden_by",
+    proof: "unproven"
+  };
+  const inverseTooltip = queryResultTooltip(inverse);
+  assert.match(inverseTooltip, /a spelling is not a resolved type/);
+  assert.match(inverseTooltip, /never an independent resolution/);
 });
 
 void test("renders typestate findings and exposes navigable witness steps", () => {

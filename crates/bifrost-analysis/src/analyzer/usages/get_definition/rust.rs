@@ -4124,7 +4124,7 @@ fn resolve_rust_field(
             ));
         };
         let member_kind = rust_field_expression_member_kind(support, field_expression)?;
-        let member_trace = RustMemberTrace::begin(analyzer, support, &owner);
+        let member_trace = RustMemberTrace::begin(analyzer, &owner);
         let considered = support.members_for_owner_name(&owner, member);
         let candidates = match member_trace.as_ref() {
             // Same filter, kept as a partition so the namespace losers the
@@ -4308,7 +4308,7 @@ fn rust_token_tree_dotted_member_outcome(
     } else {
         RustMemberKind::Field
     };
-    let member_trace = RustMemberTrace::begin(analyzer, support, &owner);
+    let member_trace = RustMemberTrace::begin(analyzer, &owner);
     let considered = support.fqn(&format!("{owner}.{member}"));
     let mut candidates = match member_trace.as_ref() {
         Some(state) => {
@@ -4567,17 +4567,30 @@ struct RustMemberTrace<'a> {
 impl<'a> RustMemberTrace<'a> {
     /// `None` when nothing is recording, or when the analyzer is not the Rust
     /// analyzer whose hierarchy the attribution reads.
-    fn begin(
-        analyzer: &'a dyn IAnalyzer,
-        support: &dyn RustDefinitionProvider,
-        owner_fqn: &str,
-    ) -> Option<Self> {
+    ///
+    /// The owner lookup deliberately goes to the analyzer's store rather than
+    /// through `RustDefinitionProvider`. A provider lookup is charged against
+    /// the resolution session's scope budget, so a recording run would spend
+    /// budget the untraced run does not spend, and a request near its
+    /// scope-node limit would exhaust the budget inside the real member lookup
+    /// and answer differently while recording. The trace must explain the
+    /// decision the product made, never change it, so every read this type
+    /// performs -- this one, `get_direct_ancestors`, `structural_parent_of`,
+    /// `parent_of` -- is a session-free store read. `definitions` is an exact
+    /// indexed FQN lookup, so leaving it uncharged does not hide unbounded
+    /// work either.
+    fn begin(analyzer: &'a dyn IAnalyzer, owner_fqn: &str) -> Option<Self> {
         if !trace::recording() {
             return None;
         }
         let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
-        let mut owners = support
-            .fqn(owner_fqn)
+        // Deduplicated exactly as the provider deduplicates its own store
+        // results, so "names exactly one owner" means the same thing here as it
+        // did when this lookup went through the provider.
+        let mut declarations: Vec<CodeUnit> = rust.definitions(owner_fqn).collect();
+        sort_units(&mut declarations);
+        declarations.dedup();
+        let mut owners = declarations
             .into_iter()
             .filter(|unit| rust.supports_type_hierarchy(unit))
             .filter(|unit| !is_rust_trait_declaration(rust, unit));
@@ -6881,6 +6894,91 @@ fn use_service(service: Service) {
                 [definition] if definition.fq_name() == "Service.run"
             ),
             "{value:#?}"
+        );
+    }
+
+    /// The #1477 member trace is emission-only: recording explains the decision
+    /// the resolver made and must never change it. Under a bounded session the
+    /// only way it could is by spending scope budget, because a request that
+    /// runs out of budget answers `Exceeded` with no definitions. So the pin is
+    /// exact: at *every* scope-node budget from one up to the amount the
+    /// unrecorded lookup spends, the recorded run must charge the same work and
+    /// reach the same answer. A budget-charging owner lookup in the trace fails
+    /// this at the budgets near the top of the range, where the extra charge is
+    /// what exhausts the budget inside the real member lookup.
+    #[test]
+    fn recording_a_member_lookup_charges_the_same_bounded_budget() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum Answer {
+            Complete(DefinitionLookupStatus, Vec<String>),
+            Exceeded(ReceiverBudgetLimit),
+            Cancelled,
+        }
+
+        let (fixture, file, source, tree, site) = member_fixture();
+        let resolve = |max_scope_nodes: usize| {
+            let outcome = resolve_rust_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                &source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget {
+                    max_scope_nodes,
+                    ..ReceiverAnalysisBudget::default()
+                },
+                None,
+            );
+            let work = outcome.work();
+            let answer = match outcome {
+                BoundedResolution::Complete { value, .. } => Answer::Complete(
+                    value.status,
+                    value
+                        .definitions
+                        .iter()
+                        .map(|definition| definition.fq_name())
+                        .collect(),
+                ),
+                BoundedResolution::Exceeded { limit, .. } => Answer::Exceeded(limit),
+                BoundedResolution::Cancelled { .. } => Answer::Cancelled,
+            };
+            (answer, work)
+        };
+
+        let spent = {
+            let (answer, work) = resolve(ReceiverAnalysisBudget::default().max_scope_nodes);
+            assert_eq!(
+                answer,
+                Answer::Complete(
+                    DefinitionLookupStatus::Resolved,
+                    vec!["Service.run".to_string()]
+                )
+            );
+            assert!(work.scope_nodes > 0);
+            work.scope_nodes
+        };
+
+        for max_scope_nodes in 1..=spent {
+            let untraced = resolve(max_scope_nodes);
+            let traced = {
+                let _recorder = trace::TraceSession::install();
+                assert!(trace::recording());
+                resolve(max_scope_nodes)
+            };
+            assert_eq!(
+                traced, untraced,
+                "recording changed the answer or the charged work at a scope budget of {max_scope_nodes}"
+            );
+        }
+
+        // The range is only a real test if its top end actually resolves the
+        // member, which is what makes the budgets just below it the tight ones.
+        assert_eq!(
+            resolve(spent).0,
+            Answer::Complete(
+                DefinitionLookupStatus::Resolved,
+                vec!["Service.run".to_string()]
+            )
         );
     }
 

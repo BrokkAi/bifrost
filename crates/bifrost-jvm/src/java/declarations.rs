@@ -285,11 +285,16 @@ pub fn visit_class_like(
         parsed.set_raw_supertypes(code_unit.clone(), raw_supertypes);
         // The declaration node's own kind is what separates an interface from a
         // class; recording it here is what lets a family edge state `implements`
-        // rather than `overrides` without re-reading the owner's source.
+        // rather than `overrides` without re-reading the owner's source. A Java
+        // annotation type is an interface -- `@interface Marker` declares
+        // `interface Marker extends java.lang.annotation.Annotation` -- so a
+        // class that names one in its `implements` clause implements it.
         parsed.add_signature_with_metadata(
             code_unit.clone(),
-            SignatureMetadata::new(signature, Vec::new())
-                .with_class_like_interface(node.kind() == "interface_declaration"),
+            SignatureMetadata::new(signature, Vec::new()).with_class_like_interface(matches!(
+                node.kind(),
+                "interface_declaration" | "annotation_type_declaration"
+            )),
         );
 
         if node.kind() == "record_declaration" {

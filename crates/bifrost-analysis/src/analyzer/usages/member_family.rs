@@ -10,10 +10,12 @@
 //! Three rules make the contract honest, and they are the reason this is a
 //! capability rather than a shared algorithm:
 //!
-//! 1. **Only forward edges are resolved.** [`MemberFamilyProvider`] returns the
-//!    members a member overrides or implements. `overridden_by` and
-//!    `implemented_by` are derived by bounded inversion over indexed forward
-//!    edges ([`inverse_member_family`]), so the two directions cannot disagree.
+//! 1. **Only forward edges are resolved.** The walk resolves the members a
+//!    member overrides or implements. `overridden_by` and `implemented_by` are
+//!    derived by bounded inversion over those same forward edges, so the two
+//!    directions cannot disagree. [`MemberFamilyProvider::member_family`]
+//!    answers both directions from one walk, which is what lets both share one
+//!    visit budget and one cancellation token.
 //! 2. **The owner relationship comes from the real hierarchy walk.** Ancestors
 //!    are the analyzer's own `get_direct_ancestors` edges, walked iteratively
 //!    with a seen set and a metered frontier. Nothing is matched by
@@ -38,18 +40,24 @@ use brokk_bifrost_core::analyzer::structural::resolution::{
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::{CapabilityProvider, CodeUnit, IAnalyzer, Language, TypeHierarchyProvider};
+use crate::cancellation::CancellationToken;
 
 /// Domain separator for a canonical method-family id.
 const MEMBER_FAMILY_ID_DOMAIN: &[u8] = b"bifrost.member_family.v1";
 
-/// How many ancestor types one forward walk may visit before the answer
-/// becomes [`MemberFamilyReason::HierarchyTruncated`]. A diamond or a deep
-/// framework hierarchy stays bounded; an honest truncation is reported rather
-/// than an under-counted family.
-const MAX_ANCESTOR_FRONTIER: usize = 512;
-
-/// How many descendant types one bounded inversion may visit.
-const MAX_DESCENDANT_FRONTIER: usize = 512;
+/// How many type and member visits one member's whole family answer may spend.
+///
+/// The budget is shared by every walk the answer performs -- the ancestor walk
+/// of the queried member, the ancestor walk of each member the root closure
+/// reaches, and the descendant walk of the bounded inversion together with the
+/// ancestor walk it runs per candidate below. Sharing it is what caps the
+/// *product* of the walks rather than each factor: an inversion over 512
+/// descendants can no longer spend 512 ancestor visits apiece.
+///
+/// Exhausting the budget, like cancelling the request, is reported as
+/// [`MemberFamilyReason::HierarchyTruncated`]: the walk stopped before it saw
+/// the whole hierarchy, so the answer is `incomplete` and carries no edge.
+const MAX_FAMILY_VISITS: usize = 4_096;
 
 /// One proven family edge from a member to a member it overrides or
 /// implements, or -- after inversion -- from a member to a member that
@@ -81,6 +89,9 @@ pub struct MemberFamilyAnswer {
     pub capability: MemberFamilyCapability,
     pub outcome: MemberFamilyOutcome,
     pub reason: Option<MemberFamilyReason>,
+    /// The forward edges first, each ordered by target identity, then the
+    /// bounded inversion of the same relation, likewise ordered. One vector
+    /// because one walk produced both under one budget.
     pub edges: Vec<MemberFamilyEdge>,
     /// The deterministically ordered exact roots of this member's family: the
     /// members reachable by following forward edges that themselves override
@@ -149,46 +160,125 @@ pub trait MemberFamilyProvider: CapabilityProvider + Send + Sync {
     /// [`MemberFamilyCapability::Unsupported`].
     fn member_family_capability(&self, member: &CodeUnit) -> MemberFamilyCapability;
 
-    /// The exact forward edges of one member: the members it overrides or
-    /// implements.
-    fn forward_member_family(&self, member: &CodeUnit) -> MemberFamilyAnswer;
-
-    /// The bounded inversion of the forward relation: the members that
-    /// override or implement this one.
-    fn inverse_member_family(&self, member: &CodeUnit) -> MemberFamilyAnswer;
+    /// One member's whole family: the forward edges (the members it overrides
+    /// or implements) followed by the bounded inversion of the same relation
+    /// (the members that override or implement it).
+    ///
+    /// Both directions come from one walk so that they share one visit budget
+    /// and one cancellation token; a caller that asked for them separately
+    /// would pay for the forward relation twice and could cap neither.
+    /// `cancellation` is checked at every visit, and a cancelled or exhausted
+    /// walk answers `incomplete` with
+    /// [`MemberFamilyReason::HierarchyTruncated`] rather than a partial edge
+    /// set.
+    fn member_family(
+        &self,
+        member: &CodeUnit,
+        cancellation: Option<&CancellationToken>,
+    ) -> MemberFamilyAnswer;
 }
 
-/// The Java forward relation, parameterized over the analyzer that holds
-/// members and metadata and over the hierarchy provider that holds ancestor
-/// edges.
-///
-/// The two are separate parameters because the multi-analyzer must supply its
-/// own realm-aware hierarchy: a Kotlin class can extend a Java class, and only
-/// the multi-analyzer resolves that edge. Passing the multi-analyzer as both
-/// arguments is what makes the delegation correct rather than merely present.
-pub fn java_forward_member_family(
-    analyzer: &dyn IAnalyzer,
-    hierarchy: &dyn TypeHierarchyProvider,
-    member: &CodeUnit,
-) -> MemberFamilyAnswer {
-    if language_for_file(member.source()) != Language::Java {
-        return MemberFamilyAnswer::unsupported();
+/// The shared state of one member's family answer: the two sources the walk
+/// reads, the request's cancellation token, and the one visit budget every
+/// walk of that answer draws from.
+struct FamilyWalk<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    hierarchy: &'a dyn TypeHierarchyProvider,
+    cancellation: Option<&'a CancellationToken>,
+    remaining: usize,
+}
+
+impl<'a> FamilyWalk<'a> {
+    fn new(
+        analyzer: &'a dyn IAnalyzer,
+        hierarchy: &'a dyn TypeHierarchyProvider,
+        cancellation: Option<&'a CancellationToken>,
+    ) -> Self {
+        Self {
+            analyzer,
+            hierarchy,
+            cancellation,
+            remaining: MAX_FAMILY_VISITS,
+        }
     }
-    let Some(facts) = MemberFacts::read(analyzer, member) else {
-        return MemberFamilyAnswer::incomplete(
+
+    /// Charge one type or member visit against the shared budget, and check
+    /// the request's cancellation token while doing it.
+    ///
+    /// Every loop of every walk calls this exactly once per visit it is about
+    /// to make, so no loop in this module can run past the budget or past a
+    /// cancelled request.
+    fn spend(&mut self) -> Result<(), MemberFamilyReason> {
+        if self
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+            || self.remaining == 0
+        {
+            return Err(MemberFamilyReason::HierarchyTruncated);
+        }
+        self.remaining -= 1;
+        Ok(())
+    }
+}
+
+/// What one member's ancestor walk found.
+///
+/// `Edges` is the only outcome the closure and the inversion continue from.
+/// `Answer` is a complete statement about that member on its own -- an
+/// exclusion, an unsupported language, or a fact the analyzer never recorded --
+/// and it is returned to the caller unchanged when the member is the queried
+/// one, or treated as "no forward edges to follow" when it is not.
+enum ForwardStep {
+    Edges {
+        owner: CodeUnit,
+        edges: Vec<MemberFamilyEdge>,
+    },
+    Answer(MemberFamilyAnswer),
+}
+
+/// The forward edges of exactly one member, and nothing else.
+///
+/// This function is the *only* place an ancestor hierarchy is walked, and it
+/// never calls itself, [`family_roots`], or [`inverse_edges`]. Root discovery
+/// and inversion are separate iterative closures that call it. That layering is
+/// what makes an inheritance cycle safe: before this split, root discovery
+/// re-entered the forward walk, each frame started a fresh seen set, and
+/// `class A extends B` with `class B extends A` -- which javac rejects but
+/// Bifrost parses while the file is being edited -- alternated frames until the
+/// stack overflowed.
+///
+/// `Err` is a walk-level failure that ends the whole answer: the shared budget
+/// ran out, or the request was cancelled.
+fn forward_edges(
+    walk: &mut FamilyWalk<'_>,
+    member: &CodeUnit,
+) -> Result<ForwardStep, MemberFamilyReason> {
+    if language_for_file(member.source()) != Language::Java {
+        return Ok(ForwardStep::Answer(MemberFamilyAnswer::unsupported()));
+    }
+    let Some(facts) = MemberFacts::read(walk.analyzer, member) else {
+        return Ok(ForwardStep::Answer(MemberFamilyAnswer::incomplete(
             MemberFamilyCapability::Unsupported,
             MemberFamilyReason::ModifiersUnrecorded,
-        );
+        )));
     };
     let capability = facts.capability;
     if !member.is_function() {
-        return MemberFamilyAnswer::no_family(capability, MemberFamilyReason::NotAMethod);
+        return Ok(ForwardStep::Answer(MemberFamilyAnswer::no_family(
+            capability,
+            MemberFamilyReason::NotAMethod,
+        )));
     }
     if let Some(reason) = facts.exclusion() {
-        return MemberFamilyAnswer::no_family(capability, reason);
+        return Ok(ForwardStep::Answer(MemberFamilyAnswer::no_family(
+            capability, reason,
+        )));
     }
-    let Some(owner) = analyzer.parent_of(member).filter(CodeUnit::is_class) else {
-        return MemberFamilyAnswer::incomplete(capability, MemberFamilyReason::OwnerUnknown);
+    let Some(owner) = walk.analyzer.parent_of(member).filter(CodeUnit::is_class) else {
+        return Ok(ForwardStep::Answer(MemberFamilyAnswer::incomplete(
+            capability,
+            MemberFamilyReason::OwnerUnknown,
+        )));
     };
 
     // Breadth-first over the analyzer's own ancestor edges. A branch stops at
@@ -197,25 +287,20 @@ pub fn java_forward_member_family(
     // the same chain are reached transitively through that one's own edges.
     let mut edges: Vec<MemberFamilyEdge> = Vec::new();
     let mut seen = vec![owner.clone()];
-    let mut frontier = VecDeque::from([(owner, 0_usize)]);
-    let mut visited = 0_usize;
+    let mut frontier = VecDeque::from([(owner.clone(), 0_usize)]);
     while let Some((type_unit, depth)) = frontier.pop_front() {
-        for ancestor in hierarchy.get_direct_ancestors(&type_unit) {
+        for ancestor in walk.hierarchy.get_direct_ancestors(&type_unit) {
             if seen.contains(&ancestor) {
                 continue;
             }
-            visited += 1;
-            if visited > MAX_ANCESTOR_FRONTIER {
-                return MemberFamilyAnswer::incomplete(
-                    capability,
-                    MemberFamilyReason::HierarchyTruncated,
-                );
-            }
+            walk.spend()?;
             seen.push(ancestor.clone());
-            match java_matching_member(analyzer, &ancestor, &facts) {
+            match java_matching_member(walk.analyzer, &ancestor, &facts) {
                 AncestorMatch::None => frontier.push_back((ancestor, depth + 1)),
                 AncestorMatch::Unproven(reason) => {
-                    return MemberFamilyAnswer::incomplete(capability, reason);
+                    return Ok(ForwardStep::Answer(MemberFamilyAnswer::incomplete(
+                        capability, reason,
+                    )));
                 }
                 AncestorMatch::One {
                     target,
@@ -232,11 +317,43 @@ pub fn java_forward_member_family(
         }
     }
     edges.sort_by(|left, right| left.target.cmp(&right.target));
+    Ok(ForwardStep::Edges { owner, edges })
+}
 
-    let roots = match family_roots(analyzer, hierarchy, member, &edges) {
+/// The Java member family in both directions, parameterized over the analyzer
+/// that holds members and metadata and over the hierarchy provider that holds
+/// ancestor and descendant edges.
+///
+/// The two are separate parameters because the multi-analyzer must supply its
+/// own realm-aware hierarchy: a Kotlin class can extend a Java class, and only
+/// the multi-analyzer resolves that edge. Passing the multi-analyzer as both
+/// arguments is what makes the delegation correct rather than merely present.
+///
+/// One call performs three bounded closures under one budget: the queried
+/// member's ancestor walk, the root closure over the forward edges that walk
+/// found, and the bounded inversion below the member's owner. The forward
+/// answer is computed once and reused by the other two.
+pub fn java_member_family(
+    analyzer: &dyn IAnalyzer,
+    hierarchy: &dyn TypeHierarchyProvider,
+    member: &CodeUnit,
+    cancellation: Option<&CancellationToken>,
+) -> MemberFamilyAnswer {
+    let capability = java_member_family_capability(analyzer, member);
+    let mut walk = FamilyWalk::new(analyzer, hierarchy, cancellation);
+    let (owner, mut edges) = match forward_edges(&mut walk, member) {
+        Err(reason) => return MemberFamilyAnswer::incomplete(capability, reason),
+        Ok(ForwardStep::Answer(answer)) => return answer,
+        Ok(ForwardStep::Edges { owner, edges }) => (owner, edges),
+    };
+    let roots = match family_roots(&mut walk, member, &edges) {
         Ok(roots) => roots,
         Err(reason) => return MemberFamilyAnswer::incomplete(capability, reason),
     };
+    match inverse_edges(&mut walk, member, owner) {
+        Ok(inverse) => edges.extend(inverse),
+        Err(reason) => return MemberFamilyAnswer::incomplete(capability, reason),
+    }
     MemberFamilyAnswer {
         capability,
         outcome: MemberFamilyOutcome::Proven,
@@ -246,7 +363,7 @@ pub fn java_forward_member_family(
     }
 }
 
-/// The bounded inversion of [`java_forward_member_family`].
+/// The bounded inversion of the forward relation.
 ///
 /// The frontier is the direct-descendant index the hierarchy capability
 /// already builds (`get_direct_descendants`, backed by
@@ -255,51 +372,40 @@ pub fn java_forward_member_family(
 /// its *forward* edges, and retains the ones that name this member. Every
 /// inverse edge is therefore a forward edge read backwards, which is what makes
 /// the two directions round trip by construction.
-pub fn java_inverse_member_family(
-    analyzer: &dyn IAnalyzer,
-    hierarchy: &dyn TypeHierarchyProvider,
+///
+/// Both the descendant frontier and each candidate's own ancestor walk draw on
+/// the caller's shared budget, so the cost of the inversion is the sum of its
+/// visits rather than the product of two independent bounds.
+fn inverse_edges(
+    walk: &mut FamilyWalk<'_>,
     member: &CodeUnit,
-) -> MemberFamilyAnswer {
-    let forward = java_forward_member_family(analyzer, hierarchy, member);
-    if !forward.is_proven() {
-        return forward;
-    }
-    let capability = forward.capability;
-    let Some(owner) = analyzer.parent_of(member).filter(CodeUnit::is_class) else {
-        return MemberFamilyAnswer::incomplete(capability, MemberFamilyReason::OwnerUnknown);
-    };
-
+    owner: CodeUnit,
+) -> Result<Vec<MemberFamilyEdge>, MemberFamilyReason> {
     let mut edges = Vec::new();
     let mut seen = vec![owner.clone()];
     let mut frontier = VecDeque::from([owner]);
-    let mut visited = 0_usize;
     while let Some(type_unit) = frontier.pop_front() {
-        for descendant in hierarchy.get_direct_descendants(&type_unit) {
+        for descendant in walk.hierarchy.get_direct_descendants(&type_unit) {
             if seen.contains(&descendant) {
                 continue;
             }
-            visited += 1;
-            if visited > MAX_DESCENDANT_FRONTIER {
-                return MemberFamilyAnswer::incomplete(
-                    capability,
-                    MemberFamilyReason::HierarchyTruncated,
-                );
-            }
+            walk.spend()?;
             seen.push(descendant.clone());
             frontier.push_back(descendant.clone());
-            for candidate in analyzer.direct_children(&descendant) {
+            let candidates = walk.analyzer.direct_children(&descendant);
+            for candidate in candidates {
                 if !candidate.is_function() {
                     continue;
                 }
-                let below = java_forward_member_family(analyzer, hierarchy, &candidate);
-                if !below.is_proven() {
+                walk.spend()?;
+                // A candidate the analyzer cannot state a family for simply
+                // holds no forward edge to invert; that is its own row's
+                // problem, not this member's.
+                let ForwardStep::Edges { edges: below, .. } = forward_edges(walk, &candidate)?
+                else {
                     continue;
-                }
-                for edge in below
-                    .edges
-                    .into_iter()
-                    .filter(|edge| &edge.target == member)
-                {
+                };
+                for edge in below.into_iter().filter(|edge| &edge.target == member) {
                     edges.push(MemberFamilyEdge {
                         target: candidate.clone(),
                         owner: descendant.clone(),
@@ -312,23 +418,27 @@ pub fn java_inverse_member_family(
         }
     }
     edges.sort_by(|left, right| left.target.cmp(&right.target));
-    MemberFamilyAnswer {
-        capability,
-        outcome: MemberFamilyOutcome::Proven,
-        reason: None,
-        edges,
-        roots: forward.roots,
-    }
+    Ok(edges)
 }
 
 /// The family id: a domain-separated digest over the deterministically ordered
-/// exact family roots plus the language and realm the roots live in.
+/// exact family roots of *the queried member* plus the language the roots live
+/// in.
 ///
 /// The digest input is each root's structured canonical identity -- the same
 /// recipe `canonical_member_id` uses on candidate rows -- never a rendered FQN
-/// or signature string. Two members of one family produce the same id because
-/// they produce the same root set, which is what makes the forward and inverse
-/// rows of one edge carry one id.
+/// or signature string.
+///
+/// The guarantee is exactly this: two members carry the same id when their
+/// proven root closures coincide, and different ids when they do not. It is
+/// therefore an id of a root set, not of a connected component. A member that
+/// redeclares one root shares that root's id, which is what makes an override
+/// chain round trip. A member that redeclares *several* roots -- `class C
+/// implements I1, I2` where both interfaces declare `run()` -- has the root set
+/// `{I1.run, I2.run}`, while `I1.run` has `{I1.run}`, so `C.run` and `I1.run`
+/// carry different ids even though one edge joins them. Read the id as "these
+/// members answer to the same contracts", never as "these members are joined by
+/// edges".
 ///
 /// `None` when the answer is not proven or holds no root: an unproven family
 /// never gets an id that would read as exact.
@@ -350,22 +460,33 @@ pub fn member_family_id(analyzer: &dyn IAnalyzer, answer: &MemberFamilyAnswer) -
 }
 
 /// The exact roots of one member's family: follow forward edges until a member
-/// overrides and implements nothing, iteratively and with a seen set.
+/// overrides and implements nothing.
+///
+/// One iterative closure with one explicit work stack, one seen set over the
+/// *members* it has already expanded, and the caller's shared budget. It calls
+/// [`forward_edges`] -- which walks a hierarchy and returns -- and never the
+/// whole-family entry point, so no frame of this closure can start a second
+/// closure with a fresh seen set.
 ///
 /// A member with no forward edges is its own root, so `Base.run` and
 /// `Service.run` agree on the root set and therefore on the family id.
+///
+/// A parse-level inheritance cycle (`class A extends B` beside `class B extends
+/// A`, which javac rejects but Bifrost parses while a file is being edited)
+/// reaches every member of the cycle once and then finds nothing left to
+/// expand, leaving no member that overrides nothing. There is no root, so there
+/// is no exact id, and the family says so with
+/// [`MemberFamilyReason::FamilyRootNotCanonical`] instead of publishing a
+/// proven family with an empty root set.
 fn family_roots(
-    analyzer: &dyn IAnalyzer,
-    hierarchy: &dyn TypeHierarchyProvider,
+    walk: &mut FamilyWalk<'_>,
     member: &CodeUnit,
     edges: &[MemberFamilyEdge],
 ) -> Result<Vec<CodeUnit>, MemberFamilyReason> {
     let mut roots = Vec::new();
     let mut seen = vec![member.clone()];
-    let mut frontier: VecDeque<(CodeUnit, Vec<MemberFamilyEdge>)> =
-        VecDeque::from([(member.clone(), edges.to_vec())]);
-    let mut visited = 0_usize;
-    while let Some((current, current_edges)) = frontier.pop_front() {
+    let mut stack: Vec<(CodeUnit, Vec<MemberFamilyEdge>)> = vec![(member.clone(), edges.to_vec())];
+    while let Some((current, current_edges)) = stack.pop() {
         if current_edges.is_empty() {
             if !roots.contains(&current) {
                 roots.push(current);
@@ -376,19 +497,18 @@ fn family_roots(
             if seen.contains(&edge.target) {
                 continue;
             }
-            visited += 1;
-            if visited > MAX_ANCESTOR_FRONTIER {
-                return Err(MemberFamilyReason::HierarchyTruncated);
-            }
+            walk.spend()?;
             seen.push(edge.target.clone());
-            let above = java_forward_member_family(analyzer, hierarchy, &edge.target);
-            if !above.is_proven() {
+            let ForwardStep::Edges { edges: above, .. } = forward_edges(walk, &edge.target)? else {
                 // A root the analyzer cannot canonicalize makes the whole id
                 // inexact, so the family reports incomplete instead.
                 return Err(MemberFamilyReason::FamilyRootNotCanonical);
-            }
-            frontier.push_back((edge.target, above.edges));
+            };
+            stack.push((edge.target, above));
         }
+    }
+    if roots.is_empty() {
+        return Err(MemberFamilyReason::FamilyRootNotCanonical);
     }
     roots.sort();
     Ok(roots)
@@ -540,11 +660,24 @@ pub fn java_member_family_capability(
 }
 
 /// Whether the owner is an interface, from the kind the declaration walk
-/// recorded. `None` when nothing recorded it, which makes the edge's relation
-/// unstatable rather than guessed.
+/// recorded. `None` when nothing recorded anything about the owner, which makes
+/// the edge's relation unstatable rather than guessed.
+///
+/// A `CodeUnit` can carry more than one metadata entry, and an entry that no
+/// producer qualified spells the flag `false` because `false` is its default.
+/// Reading only the first entry therefore let an unqualified entry outvote a
+/// producer that positively recorded `interface_declaration`. The same `find`
+/// discipline [`MemberFacts::read`] uses applies here: the positive record is
+/// the one that answers, and `false` is the answer only when no entry claims
+/// the owner is an interface.
 fn owner_is_interface(analyzer: &dyn IAnalyzer, owner: &CodeUnit) -> Option<bool> {
-    analyzer
-        .signature_metadata(owner)
-        .first()
-        .map(|metadata| metadata.class_like_is_interface())
+    let metadata = analyzer.signature_metadata(owner);
+    if metadata.is_empty() {
+        return None;
+    }
+    Some(
+        metadata
+            .iter()
+            .any(brokk_bifrost_core::analyzer::model::SignatureMetadata::class_like_is_interface),
+    )
 }

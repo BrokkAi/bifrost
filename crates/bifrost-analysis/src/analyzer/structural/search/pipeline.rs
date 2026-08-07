@@ -1976,6 +1976,7 @@ pub(super) fn apply_pipeline_step(
             ) => member_family::member_family_expansions_for_declaration(
                 analyzer,
                 declaration,
+                cancellation,
                 matches!(step, QueryStep::FamilyEdges),
             ),
             (PipelineValue::Occurrence(value), QueryStep::MemberSelection) => {
