@@ -22,6 +22,7 @@ mod dataflow_fixtures;
 mod memory_benchmark;
 
 mod cpp_semantic_diagnostics;
+mod csharp_semantic_diagnostics;
 mod dataflow_clients;
 mod dataflow_ide;
 mod dataflow_summaries;

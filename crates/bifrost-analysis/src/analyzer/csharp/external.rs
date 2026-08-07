@@ -15,7 +15,7 @@ use crate::analyzer::semantic_model::{
     type_declaration_id,
 };
 use crate::analyzer::{CSharpAnalyzerConfig, Project};
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 use goblin::pe::PE;
 use semver::Version;
 use serde_json::Value;
@@ -280,6 +280,32 @@ impl CSharpExternalType {
     pub fn interfaces(&self) -> &[String] {
         &self.interfaces
     }
+    /// The metadata names of this type's immediate supertypes: its base type
+    /// and each interface it declares.
+    ///
+    /// A member-absence claim walks this to the root of the chain, because the
+    /// owner's own [`Self::members`] is only part of its surface and an
+    /// ancestor the index cannot resolve leaves the rest of that surface
+    /// unknown.
+    ///
+    /// These are the raw decoded identities, which key [`Self::fqn`] and so
+    /// key [`CSharpExternalDeclarationIndex::types_named`]. That is what makes
+    /// them usable for a chain walk, and what separates them from
+    /// [`Self::interfaces`], whose display spelling aliases `System.Int32` to
+    /// `int` and writes generics out in source form. Only a
+    /// [`DecodedType::Named`] supertype names a type; arrays, pointers and
+    /// generic parameters cannot appear in a supertype position, so they
+    /// contribute nothing rather than a synthesized string.
+    pub fn supertype_names(&self) -> Vec<&str> {
+        self.base
+            .iter()
+            .chain(self.interface_refs.iter())
+            .filter_map(|decoded| match decoded {
+                DecodedType::Named { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
     pub fn source(&self) -> &CSharpExternalDeclarationSource {
         &self.source
     }
@@ -288,11 +314,53 @@ impl CSharpExternalType {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CSharpExternalDeclarationIndex {
     types: HashMap<String, Vec<CSharpExternalType>>,
+    /// Every namespace the indexed assemblies declare an externally visible
+    /// type in. A `using` directive naming a namespace absent from here
+    /// reached nothing this index reads.
+    namespaces: HashSet<String>,
+    /// Externally visible static method names, keyed by the namespace of the
+    /// type declaring them.
+    ///
+    /// An extension method is a static method, and the metadata this index
+    /// decodes carries no `[Extension]` attribute, so the two are not
+    /// distinguishable here. A proof-gated instance-member lookup reads this
+    /// to find out whether a namespace the file has in scope could supply an
+    /// extension method of that name, which makes the miss unprovable.
+    static_methods_by_namespace: HashMap<String, HashSet<String>>,
+    /// Whether every dependency input this index was built from was both
+    /// discovered and decoded whole.
+    complete: bool,
+    /// Whether the project declared any dependency input at all: a configured
+    /// assembly path, or a `project.assets.json` under the project root.
+    ///
+    /// Zero inputs is not proof that the compilation references nothing. It is
+    /// the absence of evidence, which is why it is kept apart from
+    /// [`Self::complete`]: discovery over an empty input set completes
+    /// vacuously, and reading that as "the external surface is empty" would
+    /// turn every `using System;` in a loose `.cs` file into an error.
+    has_dependency_inputs: bool,
     production_diagnostics: Vec<ProducerDiagnostic>,
 }
+
+impl Default for CSharpExternalDeclarationIndex {
+    fn default() -> Self {
+        Self {
+            types: HashMap::default(),
+            namespaces: HashSet::default(),
+            static_methods_by_namespace: HashMap::default(),
+            // An index that was handed no inputs read all of them. What stops
+            // an empty index proving anything external is
+            // `has_dependency_inputs`, not this.
+            complete: true,
+            has_dependency_inputs: false,
+            production_diagnostics: Vec::new(),
+        }
+    }
+}
+
 impl CSharpExternalDeclarationIndex {
     pub fn build_for_project(config: &CSharpAnalyzerConfig, project: &dyn Project) -> Self {
         let discovery = resolve_csharp_semantic_pack_dependencies(
@@ -310,6 +378,8 @@ impl CSharpExternalDeclarationIndex {
         paths.sort();
         paths.dedup();
         let mut index = Self::default();
+        index.complete &= discovery.complete;
+        index.has_dependency_inputs = discovery.profile.metadata_inputs_considered > 0;
         for path in paths {
             index.index_assembly(&path);
         }
@@ -389,6 +459,45 @@ impl CSharpExternalDeclarationIndex {
     pub fn is_empty(&self) -> bool {
         self.types.is_empty()
     }
+    /// Types recorded under the exact metadata identity `fqn`.
+    ///
+    /// [`Self::resolve_in_file`] answers a *reference as a file spells it*;
+    /// this answers an identity the index itself produced, which is what
+    /// walking a base-type chain needs.
+    pub fn types_named(&self, fqn: &str) -> &[CSharpExternalType] {
+        self.types.get(fqn).map_or(&[], Vec::as_slice)
+    }
+    /// Whether any indexed assembly declares an externally visible type in
+    /// `namespace`.
+    pub fn declares_namespace(&self, namespace: &str) -> bool {
+        self.namespaces.contains(namespace)
+    }
+    /// Whether an indexed static method named `name` sits in any of
+    /// `namespaces`.
+    ///
+    /// The caller passes the namespaces a file has in scope. A hit means an
+    /// instance-member miss could be an extension method, so it is not proof
+    /// of absence.
+    pub fn declares_static_method_in(&self, namespaces: &[String], name: &str) -> bool {
+        namespaces.iter().any(|namespace| {
+            self.static_methods_by_namespace
+                .get(namespace)
+                .is_some_and(|names| names.contains(name))
+        })
+    }
+    /// Whether every dependency input was discovered and decoded whole.
+    ///
+    /// A partial index holds an unknown remainder, so a miss against it is
+    /// never proof of absence.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+    /// Whether the project declared any dependency input for this index to
+    /// read. A miss against an index built from no inputs proves nothing about
+    /// the compilation's external surface.
+    pub fn has_dependency_inputs(&self) -> bool {
+        self.has_dependency_inputs
+    }
     pub fn production_diagnostics(&self) -> &[ProducerDiagnostic] {
         &self.production_diagnostics
     }
@@ -429,10 +538,25 @@ impl CSharpExternalDeclarationIndex {
         );
         self.production_diagnostics
             .extend(production.diagnostics.iter().cloned());
+        self.complete &= production.completeness == Completeness::Complete;
         let Some(pack) = production.pack.as_ref() else {
             return;
         };
         for ty in project_pack_types(path, pack) {
+            if ty.externally_visible() {
+                self.namespaces.insert(ty.namespace.clone());
+                let static_methods = ty
+                    .members
+                    .iter()
+                    .filter(|member| member.is_static)
+                    .filter(|member| member.kind == CSharpExternalMemberKind::Method)
+                    .filter(|member| member.externally_visible())
+                    .map(|member| member.name.clone());
+                self.static_methods_by_namespace
+                    .entry(ty.namespace.clone())
+                    .or_default()
+                    .extend(static_methods);
+            }
             self.types.entry(ty.fqn.clone()).or_default().push(ty);
         }
     }
@@ -2637,6 +2761,16 @@ fn resolve_typedef_or_ref_type_at_depth(
     }
     let tag = value & 3;
     let index = (value >> 2) as usize;
+    // ECMA-335 II.24.2.6: every TypeDefOrRef row index is 1-based, so index 0
+    // is the nil token and means "no type here". An interface's `Extends` and
+    // `System.Object`'s own are both nil. Without this guard `saturating_sub`
+    // folds the nil token onto row 1, which is the `<Module>` pseudo-type that
+    // holds an assembly's global functions -- so every interface appeared to
+    // extend `<Module>`, and a supertype walk chased a link that does not
+    // exist.
+    if index == 0 {
+        return None;
+    }
     match tag {
         0 => types
             .get(index.saturating_sub(1))
