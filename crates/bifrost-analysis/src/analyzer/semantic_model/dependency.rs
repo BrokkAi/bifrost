@@ -120,6 +120,28 @@ impl ResolvedDependencyArtifact {
         }
     }
 
+    /// A source set whose ecosystem import identity is known. Composer uses this
+    /// for a PSR-4 namespace prefix, so one package's separately mapped prefixes
+    /// stay distinguishable after the files are collected.
+    pub fn module_source_set(
+        role: DependencyArtifactRole,
+        kind: ExternalArtifactKind,
+        module: String,
+        root: PathBuf,
+        relative_paths: Vec<PathBuf>,
+    ) -> Self {
+        Self {
+            role,
+            kind,
+            module: Some(module),
+            input: ResolvedDependencyArtifactInput::SourceSet {
+                root,
+                relative_paths,
+            },
+            expected_sha256: None,
+        }
+    }
+
     pub fn path(&self) -> &Path {
         match &self.input {
             ResolvedDependencyArtifactInput::File(path) => path,
@@ -1066,6 +1088,7 @@ fn artifact_kind_name(kind: ExternalArtifactKind) -> &'static str {
         ExternalArtifactKind::PythonStub => "python_stub",
         ExternalArtifactKind::PythonSource => "python_source",
         ExternalArtifactKind::RubyGemArchive => "ruby_gem_archive",
+        ExternalArtifactKind::ComposerPackageSourceSet => "composer_package_source_set",
     }
 }
 

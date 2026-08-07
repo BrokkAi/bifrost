@@ -11,9 +11,17 @@
 
 mod adapter;
 mod clones;
+pub mod dependency_discovery;
 mod diagnostics;
+mod external;
 mod semantic;
+mod source_artifact;
 mod structural;
+
+pub use dependency_discovery::{
+    PHP_MAX_AUTOLOAD_RULES_PER_PACKAGE, resolve_php_semantic_pack_dependencies,
+};
+pub use external::PhpDependencyPackAdapter;
 
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,

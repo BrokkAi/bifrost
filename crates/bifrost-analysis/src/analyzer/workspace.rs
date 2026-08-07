@@ -205,6 +205,7 @@ pub enum DependencyPackEcosystem {
     Go,
     Cargo,
     Ruby,
+    Composer,
 }
 
 impl DependencyPackEcosystem {
@@ -217,6 +218,7 @@ impl DependencyPackEcosystem {
             Self::Go => &[Language::Go],
             Self::Cargo => &[Language::Rust],
             Self::Ruby => &[Language::Ruby],
+            Self::Composer => &[Language::Php],
         }
     }
 }
@@ -286,6 +288,14 @@ impl WorkspaceAnalyzer {
                     .max_artifacts_per_dependency
                     .max(environment.limits.max_files_per_distribution);
             }
+            // Composer emits one artifact per autoload rule so a PSR-4 prefix
+            // stays bound to the files it admits. Discovery caps the rule count
+            // itself, so the artifact budget only has to admit that cap.
+            if ecosystem == DependencyPackEcosystem::Composer {
+                limits.max_artifacts_per_dependency = limits
+                    .max_artifacts_per_dependency
+                    .max(crate::analyzer::php::PHP_MAX_AUTOLOAD_RULES_PER_PACKAGE);
+            }
             let (discovery, adapter): (DependencyDiscoveryOutcome, &dyn DependencyPackAdapter) =
                 match ecosystem {
                     DependencyPackEcosystem::Jvm => (
@@ -350,6 +360,15 @@ impl WorkspaceAnalyzer {
                             Some(context.cancellation),
                         ),
                         &RubyDependencyPackAdapter,
+                    ),
+                    DependencyPackEcosystem::Composer => (
+                        crate::analyzer::php::resolve_php_semantic_pack_dependencies(
+                            &config.php,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &crate::analyzer::php::PhpDependencyPackAdapter,
                     ),
                 };
             if discovery.cancelled || !discovery.complete {
