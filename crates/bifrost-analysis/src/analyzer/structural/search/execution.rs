@@ -401,15 +401,21 @@ pub(super) fn execute_plan(
                 );
                 let dependencies = physical_node.dependencies();
                 let mut branch_rows = Vec::with_capacity(dependencies.len());
+                // Each branch's diagnostics stay in their own vector until the
+                // retry pass below decides which attempt survives; they are
+                // appended in branch order afterwards.
+                let mut branch_diagnostics: Vec<Vec<CodeQueryDiagnostic>> =
+                    Vec::with_capacity(dependencies.len());
+                let mut branch_attempts: Vec<BranchAttempt> =
+                    Vec::with_capacity(dependencies.len());
                 let mut cancelled_child = None;
-                let mut truncated = false;
                 for (index, dependency) in dependencies.iter().copied().enumerate() {
                     let branch_limits = fair_branch_limits(
                         &state.budget,
                         limits,
                         dependencies.len().saturating_sub(index),
                     );
-                    let diagnostic_start = diagnostics.len();
+                    let mut child_diagnostics = Vec::new();
                     if let Some(branch) = profile_branch.as_mut() {
                         branch.push(index);
                     }
@@ -420,7 +426,7 @@ pub(super) fn execute_plan(
                         state,
                         branch_limits,
                         None,
-                        diagnostics,
+                        &mut child_diagnostics,
                         profile_branch,
                     );
                     if let Some(started) = dependency_started {
@@ -432,16 +438,23 @@ pub(super) fn execute_plan(
                         debug_assert_eq!(popped, Some(index));
                     }
                     input_rows = input_rows.saturating_add(child.rows.len());
+                    rows_visited = rows_visited.saturating_add(child.rows.len());
                     let prefix_started = profiling.then(Instant::now);
                     prefix_branch_rows(&mut child.rows, index);
-                    prefix_branch_diagnostics(&mut diagnostics[diagnostic_start..], index);
+                    prefix_branch_diagnostics(&mut child_diagnostics, index);
                     if let Some(started) = prefix_started {
                         merge_ns = merge_ns.saturating_add(elapsed_ns(started));
                     }
-                    work_started = profiling.then(|| state_execution_work_snapshot(state));
-                    cache_started = state.cache_profile;
-                    own_diagnostic_start = diagnostics.len();
-                    truncated |= child.truncated;
+                    // Only a branch that exhausted its share of the metered
+                    // scan budget can gain from a larger share. A branch that
+                    // stopped on a row cap, a relation limit, or missing
+                    // analysis reports that instead, and re-running it would
+                    // repeat the same work for the same result.
+                    let starved = child.truncated
+                        && child_diagnostics.iter().any(|diagnostic| {
+                            diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+                        });
+                    branch_diagnostics.push(child_diagnostics);
                     if child.cancelled {
                         push_operator_termination(
                             &mut terminations,
@@ -450,9 +463,114 @@ pub(super) fn execute_plan(
                         cancelled_child = Some(child);
                         break;
                     }
+                    branch_attempts.push(BranchAttempt {
+                        limits: branch_limits,
+                        truncated: child.truncated,
+                        starved,
+                    });
                     branch_rows.push(child.rows);
                 }
-                rows_visited = input_rows;
+                if cancelled_child.is_none() {
+                    // Branch 0 ran under a share of the leftovers computed
+                    // before any branch had run, so a dominant first branch
+                    // starves against branches that then leave their share
+                    // unused. Offer every truncated branch one more attempt
+                    // against the leftovers the whole first pass revealed.
+                    // One pass suffices: after it each retried branch has seen
+                    // the true leftovers, and a branch is retried at most once,
+                    // so the pass terminates.
+                    let mut retry_remaining = branch_attempts
+                        .iter()
+                        .filter(|attempt| attempt.starved)
+                        .count();
+                    if retry_remaining > 0 {
+                        // A truncated seed result is cached and replayed
+                        // verbatim, so a retry would re-observe the first
+                        // attempt's frontier. Dropping the truncated entries
+                        // makes the retry rescan; the seed scan ledger keeps
+                        // the files the first attempt already charged free, so
+                        // the rescan resumes at the frontier instead of paying
+                        // for the whole branch again.
+                        state.seed_cache.retain(|_, cached| !cached.truncated);
+                    }
+                    for index in 0..branch_attempts.len() {
+                        if !branch_attempts[index].starved {
+                            continue;
+                        }
+                        let retry_limits =
+                            fair_branch_limits(&state.budget, limits, retry_remaining);
+                        retry_remaining = retry_remaining.saturating_sub(1);
+                        if !retry_can_progress(
+                            &state.budget,
+                            limits,
+                            retry_limits,
+                            branch_attempts[index].limits,
+                        ) {
+                            continue;
+                        }
+                        let mut retry_diagnostics = Vec::new();
+                        if let Some(branch) = profile_branch.as_mut() {
+                            branch.push(index);
+                        }
+                        let dependency_started = profiling.then(Instant::now);
+                        let mut child = execute_plan(
+                            plan,
+                            dependencies[index],
+                            state,
+                            retry_limits,
+                            None,
+                            &mut retry_diagnostics,
+                            profile_branch,
+                        );
+                        if let Some(started) = dependency_started {
+                            dependency_execution_ns =
+                                dependency_execution_ns.saturating_add(elapsed_ns(started));
+                        }
+                        if let Some(branch) = profile_branch.as_mut() {
+                            let popped = branch.pop();
+                            debug_assert_eq!(popped, Some(index));
+                        }
+                        rows_visited = rows_visited.saturating_add(child.rows.len());
+                        let prefix_started = profiling.then(Instant::now);
+                        prefix_branch_rows(&mut child.rows, index);
+                        prefix_branch_diagnostics(&mut retry_diagnostics, index);
+                        if let Some(started) = prefix_started {
+                            merge_ns = merge_ns.saturating_add(elapsed_ns(started));
+                        }
+                        if child.cancelled {
+                            push_operator_termination(
+                                &mut terminations,
+                                QueryOperatorTermination::DependencyCancelled,
+                            );
+                            branch_diagnostics[index] = retry_diagnostics;
+                            cancelled_child = Some(child);
+                            break;
+                        }
+                        // The seed scan ledger admits each file's scan charges
+                        // once per execution, so a retry resumes at the
+                        // truncation frontier; the row lanes are not deduped,
+                        // so a retry against an already-spent row budget can
+                        // return less than the first attempt did. Keep the
+                        // attempt that saw more of the branch.
+                        if child.truncated && child.rows.len() <= branch_rows[index].len() {
+                            continue;
+                        }
+                        input_rows = input_rows
+                            .saturating_sub(branch_rows[index].len())
+                            .saturating_add(child.rows.len());
+                        branch_rows[index] = child.rows;
+                        branch_diagnostics[index] = retry_diagnostics;
+                        branch_attempts[index].truncated = child.truncated;
+                        branch_attempts[index].starved = false;
+                    }
+                }
+                let truncated = branch_attempts.iter().any(|attempt| attempt.truncated);
+                for mut branch in branch_diagnostics {
+                    diagnostics.append(&mut branch);
+                }
+                work_started = profiling.then(|| state_execution_work_snapshot(state));
+                cache_started = state.cache_profile;
+                own_diagnostic_start = diagnostics.len();
                 if let Some(child) = cancelled_child {
                     disposition = QueryOperatorDisposition::Skipped;
                     child
@@ -610,6 +728,44 @@ pub(super) fn execute_plan(
         });
     }
     execution
+}
+
+/// One sequential set-operation branch's first-pass outcome, kept so the retry
+/// pass can compare the leftovers against the limits the branch actually ran
+/// under. `fair_branch_limits` derives its caps from the budget's usage at
+/// call time, so they cannot be recomputed after the fact.
+struct BranchAttempt {
+    limits: CodeQueryExecutionLimits,
+    truncated: bool,
+    /// The branch truncated against its share of the metered scan budget,
+    /// which is the only truncation a larger share can lift.
+    starved: bool,
+}
+
+/// Whether re-running a truncated branch under `retry` can see more of it than
+/// its first attempt under `first` did.
+///
+/// Two conditions. Every lane of the whole query's `parent` budget must still
+/// have room, because a rescan walks the branch from its first file again and
+/// stops at the first exhausted lane. And a *scan* lane must be raised: the
+/// seed scan ledger admits each file's scan charges once per execution, so a
+/// rescan reaches the truncation frontier for free and can spend the raised
+/// cap on new files, while the row lanes are charged on every visit and a
+/// rescan only re-spends what the first attempt already spent.
+fn retry_can_progress(
+    budget: &CodeQueryExecutionBudget,
+    parent: CodeQueryExecutionLimits,
+    retry: CodeQueryExecutionLimits,
+    first: CodeQueryExecutionLimits,
+) -> bool {
+    let has_headroom = budget.scanned_files < parent.max_scanned_files
+        && budget.scanned_source_bytes < parent.max_scanned_source_bytes
+        && budget.fact_nodes.saturating_add(budget.examined_references) < parent.max_fact_nodes
+        && budget.pipeline_rows.max(budget.provenance_steps) < parent.max_pipeline_rows;
+    let raises_a_scan_lane = retry.max_scanned_files > first.max_scanned_files
+        || retry.max_scanned_source_bytes > first.max_scanned_source_bytes
+        || retry.max_fact_nodes > first.max_fact_nodes;
+    has_headroom && raises_a_scan_lane
 }
 
 #[allow(clippy::too_many_arguments)]

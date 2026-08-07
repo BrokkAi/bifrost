@@ -14,6 +14,20 @@ const MAX_SCANNED_FILES: usize = 20_000;
 const MAX_SCANNED_SOURCE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_FACT_NODES: usize = 2_000_000;
 const MAX_PIPELINE_ROWS: usize = 50_000;
+
+// The three scan lanes are the only lanes whose default is a floor rather than
+// a cap.  A whole-workspace policy subject scan costs Theta(workspace facts),
+// so `PolicyBudget::scaled_for_workspace` raises them with the audited
+// workspace's measured volume (#1771).  These hard caps, 16x the defaults,
+// bound the raised values and remain the builder's rejection threshold.
+const MAX_SCANNED_FILES_HARD_CAP: usize = 16 * MAX_SCANNED_FILES;
+const MAX_SCANNED_SOURCE_BYTES_HARD_CAP: usize = 16 * MAX_SCANNED_SOURCE_BYTES;
+const MAX_FACT_NODES_HARD_CAP: usize = 16 * MAX_FACT_NODES;
+
+/// Measured density on a large Rust workspace is ~1 fact node per 10.6 source
+/// bytes; 1 per 6 gives ~1.8x headroom for denser languages (#1771).
+const SOURCE_BYTES_PER_SCALED_FACT_NODE: u64 = 6;
+const SCALED_SCAN_HEADROOM: u64 = 2;
 const MAX_SEMANTIC_MATERIALIZED_FILES: usize = 256;
 const MAX_SEMANTIC_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SEMANTIC_ROWS_PER_DIMENSION: usize = 1_000_000;
@@ -41,6 +55,10 @@ const MAX_POLICIES_PER_BATCH: usize = 256;
 const MAX_TOTAL_FINDINGS_PER_BATCH: usize = 10_000;
 const MAX_RETAINED_REPORT_BYTES_PER_BATCH: usize = 64 * 1024 * 1024;
 const MAX_SERIALIZED_REPORT_BYTES_PER_BATCH: usize = 64 * 1024 * 1024;
+
+fn saturating_usize(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
 
 /// Immutable limits for one policy evaluation and its retained report data.
 #[derive(Debug, Clone, Copy)]
@@ -106,6 +124,37 @@ impl PolicyBudget {
 
     pub const fn query_limits(&self) -> CodeQueryExecutionLimits {
         self.query
+    }
+
+    /// Raise the three scan lanes to fit one whole-workspace subject scan.
+    ///
+    /// The fixed defaults act as floors and the hard caps as ceilings, so a
+    /// workspace smaller than the defaults is returned unchanged and an
+    /// explicitly widened budget is never narrowed.  `max_pipeline_rows` bounds
+    /// per-query memory rather than workspace volume and stays fixed.
+    pub fn scaled_for_workspace(mut self, total_source_bytes: u64, total_files: usize) -> Self {
+        let scaled_fact_nodes =
+            saturating_usize(total_source_bytes / SOURCE_BYTES_PER_SCALED_FACT_NODE);
+        let scaled_source_bytes =
+            saturating_usize(total_source_bytes.saturating_mul(SCALED_SCAN_HEADROOM));
+        let scaled_files = total_files.saturating_mul(SCALED_SCAN_HEADROOM as usize);
+
+        self.query.max_fact_nodes = self
+            .query
+            .max_fact_nodes
+            .max(scaled_fact_nodes)
+            .min(MAX_FACT_NODES_HARD_CAP);
+        self.query.max_scanned_source_bytes = self
+            .query
+            .max_scanned_source_bytes
+            .max(scaled_source_bytes)
+            .min(MAX_SCANNED_SOURCE_BYTES_HARD_CAP);
+        self.query.max_scanned_files = self
+            .query
+            .max_scanned_files
+            .max(scaled_files)
+            .min(MAX_SCANNED_FILES_HARD_CAP);
+        self
     }
 
     pub const fn max_findings(&self) -> usize {
@@ -379,17 +428,17 @@ impl PolicyBudgetBuilder {
         ensure_at_most(
             PolicyBudgetField::ScannedFiles,
             limits.max_scanned_files,
-            MAX_SCANNED_FILES,
+            MAX_SCANNED_FILES_HARD_CAP,
         )?;
         ensure_at_most(
             PolicyBudgetField::ScannedSourceBytes,
             limits.max_scanned_source_bytes,
-            MAX_SCANNED_SOURCE_BYTES,
+            MAX_SCANNED_SOURCE_BYTES_HARD_CAP,
         )?;
         ensure_at_most(
             PolicyBudgetField::FactNodes,
             limits.max_fact_nodes,
-            MAX_FACT_NODES,
+            MAX_FACT_NODES_HARD_CAP,
         )?;
         ensure_at_most(
             PolicyBudgetField::PipelineRows,
@@ -717,9 +766,11 @@ mod tests {
 
     #[test]
     fn builders_reject_values_above_their_hard_caps() {
+        // The scan lanes' hard cap is the workspace-scaling ceiling, not the
+        // fixed default floor (#1771).
         let query_error = PolicyBudget::builder()
             .with_query_limits(CodeQueryExecutionLimits {
-                max_scanned_files: MAX_SCANNED_FILES + 1,
+                max_scanned_files: MAX_SCANNED_FILES_HARD_CAP + 1,
                 ..CodeQueryExecutionLimits::default()
             })
             .unwrap_err();
@@ -727,9 +778,19 @@ mod tests {
             query_error,
             PolicyBudgetError::ExceedsHardCap {
                 field: PolicyBudgetField::ScannedFiles,
-                value: MAX_SCANNED_FILES + 1,
-                hard_cap: MAX_SCANNED_FILES,
+                value: MAX_SCANNED_FILES_HARD_CAP + 1,
+                hard_cap: MAX_SCANNED_FILES_HARD_CAP,
             }
+        );
+        assert!(
+            PolicyBudget::builder()
+                .with_query_limits(CodeQueryExecutionLimits {
+                    max_scanned_files: MAX_SCANNED_FILES_HARD_CAP,
+                    max_scanned_source_bytes: MAX_SCANNED_SOURCE_BYTES_HARD_CAP,
+                    max_fact_nodes: MAX_FACT_NODES_HARD_CAP,
+                    ..CodeQueryExecutionLimits::default()
+                })
+                .is_ok()
         );
 
         for (limits, field, value, hard_cap) in [
@@ -909,6 +970,55 @@ mod tests {
                 .with_max_serialized_report_bytes(MAX_SERIALIZED_REPORT_BYTES_PER_BATCH + 1)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn scan_lanes_scale_with_the_audited_workspace_volume() {
+        // This repository at the time of #1771: 1309 Rust files, 37.6MB.
+        let scaled = PolicyBudget::default().scaled_for_workspace(37_600_000, 1_309);
+        let query = scaled.query_limits();
+        assert!(
+            query.max_fact_nodes >= 6_200_000,
+            "fact nodes did not scale: {}",
+            query.max_fact_nodes
+        );
+        assert_eq!(query.max_fact_nodes, 37_600_000 / 6);
+        // Both lanes stay at their default floors: 2x37.6MB and 2x1309 are
+        // below the fixed defaults.
+        assert_eq!(query.max_scanned_source_bytes, MAX_SCANNED_SOURCE_BYTES);
+        assert_eq!(query.max_scanned_files, MAX_SCANNED_FILES);
+        assert_eq!(query.max_pipeline_rows, MAX_PIPELINE_ROWS);
+
+        let wide = PolicyBudget::default().scaled_for_workspace(1_024 * 1024 * 1024, 100_000);
+        let wide_query = wide.query_limits();
+        assert_eq!(wide_query.max_scanned_source_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(wide_query.max_scanned_files, 200_000);
+    }
+
+    #[test]
+    fn scaled_scan_lanes_clamp_to_their_hard_caps() {
+        let scaled = PolicyBudget::default().scaled_for_workspace(u64::MAX, usize::MAX);
+        let query = scaled.query_limits();
+        assert_eq!(query.max_fact_nodes, MAX_FACT_NODES_HARD_CAP);
+        assert_eq!(
+            query.max_scanned_source_bytes,
+            MAX_SCANNED_SOURCE_BYTES_HARD_CAP
+        );
+        assert_eq!(query.max_scanned_files, MAX_SCANNED_FILES_HARD_CAP);
+        assert_eq!(query.max_pipeline_rows, MAX_PIPELINE_ROWS);
+        PolicyBudget::builder()
+            .with_query_limits(query)
+            .expect("clamped scan lanes stay within the builder hard caps");
+    }
+
+    #[test]
+    fn a_small_workspace_leaves_every_lane_at_its_default() {
+        let scaled = PolicyBudget::default().scaled_for_workspace(1024 * 1024, 50);
+        let query = scaled.query_limits();
+        assert_eq!(query.max_fact_nodes, MAX_FACT_NODES);
+        assert_eq!(query.max_scanned_source_bytes, MAX_SCANNED_SOURCE_BYTES);
+        assert_eq!(query.max_scanned_files, MAX_SCANNED_FILES);
+        assert_eq!(query.max_pipeline_rows, MAX_PIPELINE_ROWS);
     }
 
     #[test]
