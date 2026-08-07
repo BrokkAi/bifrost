@@ -441,7 +441,12 @@ impl ScanCtx<'_> {
     }
 
     fn shadows_import_binding(&self, ident: &str) -> bool {
-        self.is_lexically_shadowed(ident)
+        (self.is_lexically_shadowed(ident)
+            && (self.target_self_file && ident == self.target_short
+                || self
+                    .edges
+                    .iter()
+                    .any(|edge| edge.local_name == ident && edge_binds_bare_identifier(edge))))
             || (self.binding_engine.is_shadowed_in_non_root_scope(ident)
                 && self
                     .edges
