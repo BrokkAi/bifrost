@@ -1570,3 +1570,341 @@ fn path_parent_candidates(file: &ProjectFile) -> Vec<ProjectFile> {
     }
     candidates
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{Language, TestProject};
+    use std::collections::BTreeSet;
+
+    fn project(files: &[(&str, &str)]) -> (tempfile::TempDir, RustAnalyzer) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        for (rel, body) in files {
+            ProjectFile::new(root.clone(), rel)
+                .write(body)
+                .expect("write fixture file");
+        }
+        let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+        // Force the analysis pass that persists the per-file fact rows.
+        let _ = analyzer.get_analyzed_files();
+        (temp, analyzer)
+    }
+
+    fn file(analyzer: &RustAnalyzer, suffix: &str) -> ProjectFile {
+        analyzer
+            .get_analyzed_files()
+            .into_iter()
+            .find(|file| file.rel_path().ends_with(suffix))
+            .unwrap_or_else(|| panic!("{suffix} is analyzed"))
+    }
+
+    fn identity_named(
+        walks: &RustUsageWalks<'_>,
+        file: &ProjectFile,
+        name: &str,
+    ) -> RustSymbolIdentity {
+        walks
+            .queries()
+            .identities_in_file_named(file, name)
+            .into_iter()
+            .map(|(identity, _)| identity)
+            .find(|identity| identity.namespace == RustSymbolNamespace::Type)
+            .unwrap_or_else(|| panic!("{name} is declared in {file:?}"))
+    }
+
+    /// An inverted hit is a candidate, never an answer, and for an import edge
+    /// the thing that decides is module resolution: two files import a `Widget`
+    /// and a third only mentions the name, but exactly one of those imports
+    /// resolves to the module that declares the target.
+    ///
+    /// Returning the candidate set unverified passes the first assertion and
+    /// fails the second, which is what makes this a regression guard rather
+    /// than a restatement of the implementation.
+    #[test]
+    fn a_candidate_importer_whose_import_resolves_elsewhere_is_rejected() {
+        let (_temp, analyzer) = project(&[
+            (
+                "src/lib.rs",
+                "pub mod service;\npub mod decoy;\npub mod consumer;\npub mod bystander;\npub mod impostor;\n",
+            ),
+            ("src/service.rs", "pub struct Widget;\n"),
+            ("src/decoy.rs", "pub struct Widget;\n"),
+            (
+                "src/consumer.rs",
+                "use crate::service::Widget;\npub fn take(_: Widget) {}\n",
+            ),
+            (
+                "src/impostor.rs",
+                "use crate::decoy::Widget;\npub fn take(_: Widget) {}\n",
+            ),
+            (
+                "src/bystander.rs",
+                "pub fn describe() -> &'static str { \"Widget\" }\npub struct Widget;\n",
+            ),
+        ]);
+        let walks = RustUsageWalks::new(&analyzer);
+        let service = file(&analyzer, "service.rs");
+        let consumer = file(&analyzer, "consumer.rs");
+        let target = identity_named(&walks, &service, "Widget");
+
+        let candidates = walks.importer_candidates_for(&target);
+        assert!(
+            candidates.contains(&file(&analyzer, "impostor.rs"))
+                && candidates.contains(&file(&analyzer, "bystander.rs")),
+            "the offered candidates must include the files this test rejects: {candidates:?}"
+        );
+
+        let importers: BTreeSet<ProjectFile> = walks
+            .edges_binding_identity(&target)
+            .into_iter()
+            .map(|edge| edge.importer)
+            .collect();
+        assert_eq!(
+            importers,
+            BTreeSet::from([consumer]),
+            "only the import that resolves to the declaring module binds the target"
+        );
+    }
+
+    /// A walk result is memoized for the analyzer that produced it and for no
+    /// longer. The analyzer instance is the generation: `update_all` builds a
+    /// fresh one with fresh caches, which is the invalidation these
+    /// analyzer-derived values actually have.
+    #[test]
+    fn walk_results_are_memoized_per_generation_and_retire_with_the_analyzer() {
+        let (_temp, analyzer) = project(&[
+            ("src/lib.rs", "pub mod service;\n"),
+            ("src/service.rs", "pub struct Widget;\n"),
+        ]);
+        let walks = RustUsageWalks::new(&analyzer);
+        let first = walks.files_in_module_package("service");
+        let second = RustUsageWalks::new(&analyzer).files_in_module_package("service");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a second walker in the same generation must hit the cache"
+        );
+        // Both the file whose package IS the module and the file that
+        // declares `mod service;` back it, which is what `RustModuleFiles`
+        // held in its two maps.
+        assert_eq!(
+            *first,
+            vec![file(&analyzer, "lib.rs"), file(&analyzer, "service.rs")],
+            "files were {first:?}"
+        );
+
+        let updated = analyzer.update_all();
+        let after = RustUsageWalks::new(&updated).files_in_module_package("service");
+        assert!(
+            !Arc::ptr_eq(&first, &after),
+            "a generation bump must not serve the previous generation's entry"
+        );
+        assert_eq!(*after, *first, "the answer itself is unchanged");
+    }
+
+    /// The export-chain walk replaced a global worklist with recursion, so it
+    /// owns the termination the worklist's `visited` set used to provide. Two
+    /// modules that publish each other's name are a cycle; the walk must still
+    /// return the declaration each name really reaches.
+    #[test]
+    fn an_export_chain_cycle_terminates_and_keeps_the_declared_origin() {
+        let (_temp, analyzer) = project(&[
+            ("src/lib.rs", "pub mod alpha;\npub mod beta;\n"),
+            (
+                "src/alpha.rs",
+                "pub struct Value;\npub use crate::beta::Echo;\n",
+            ),
+            (
+                "src/beta.rs",
+                "pub struct Echo;\npub use crate::alpha::Value;\n",
+            ),
+        ]);
+        let walks = RustUsageWalks::new(&analyzer);
+        let alpha = file(&analyzer, "alpha.rs");
+        let beta = file(&analyzer, "beta.rs");
+        let alpha_module = walks.physical_root_of(&alpha).expect("alpha is analyzed");
+
+        let bindings = walks.bindings_at(&alpha, &alpha_module);
+        let echo = bindings
+            .iter()
+            .find(|binding| {
+                binding.name == "Echo" && binding.namespace == RustSymbolNamespace::Type
+            })
+            .expect("alpha republishes Echo");
+        assert_eq!(
+            echo.origin.file, beta,
+            "the re-exported name keeps beta's declaration as its origin: {bindings:?}"
+        );
+    }
+
+    /// A module that republishes a name declared beside it -- `pub(crate) use`
+    /// next to the `macro_rules!` it renames -- reaches itself through its own
+    /// import edge, which is a cycle of length one. The visibility upgrade the
+    /// republication exists to give must survive that.
+    ///
+    /// This pins the answer, not the mechanism: the guard that fails when the
+    /// cycle handling is removed is
+    /// `usages_rust_graph_test::rust_graph_tracks_bare_macro_invocations_through_structured_visibility`,
+    /// demonstrated failing before the fixed-point iteration landed.
+    #[test]
+    fn a_module_republishing_a_name_declared_beside_it_keeps_the_import_domain() {
+        let (_temp, analyzer) = project(&[
+            ("src/lib.rs", "#[macro_use]\npub mod defs;\npub mod user;\n"),
+            (
+                "src/defs.rs",
+                "macro_rules! target { () => {}; }\npub(crate) use target;\n",
+            ),
+            ("src/user.rs", "use crate::defs::target;\n"),
+        ]);
+        let walks = RustUsageWalks::new(&analyzer);
+        let defs = file(&analyzer, "defs.rs");
+        let defs_module = walks.physical_root_of(&defs).expect("defs is analyzed");
+
+        let bindings = walks.bindings_at(&defs, &defs_module);
+        let republished: Vec<_> = bindings
+            .iter()
+            .filter(|binding| {
+                binding.name == "target" && binding.namespace == RustSymbolNamespace::Macro
+            })
+            .collect();
+        assert!(
+            republished
+                .iter()
+                .any(|binding| matches!(binding.domain, Domain::Crate(_))),
+            "`pub(crate) use` must widen the macro past its own module: {bindings:?}"
+        );
+    }
+
+    /// A deep re-export chain must not exhaust the stack. The walk recurses
+    /// once per link, so this pins the depth the implementation is known to
+    /// survive rather than asserting an unbounded guarantee.
+    #[test]
+    fn an_export_chain_survives_a_deep_re_export_ladder() {
+        const LINKS: usize = 250;
+        let mut files: Vec<(String, String)> = Vec::new();
+        let mut lib = String::new();
+        for index in 0..LINKS {
+            lib.push_str(&format!("pub mod link{index};\n"));
+        }
+        files.push(("src/lib.rs".to_string(), lib));
+        for index in 0..LINKS {
+            let body = if index + 1 == LINKS {
+                "pub struct Value;\n".to_string()
+            } else {
+                format!("pub use crate::link{}::Value;\n", index + 1)
+            };
+            files.push((format!("src/link{index}.rs"), body));
+        }
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(rel, body)| (rel.as_str(), body.as_str()))
+            .collect();
+        let (_temp, analyzer) = project(&borrowed);
+        let walks = RustUsageWalks::new(&analyzer);
+        let head = file(&analyzer, "link0.rs");
+        let tail = file(&analyzer, &format!("link{}.rs", LINKS - 1));
+        let head_module = walks.physical_root_of(&head).expect("link0 is analyzed");
+
+        let bindings = walks.bindings_at(&head, &head_module);
+        let value = bindings
+            .iter()
+            .find(|binding| binding.name == "Value")
+            .expect("the head of the ladder publishes Value");
+        assert_eq!(
+            value.origin.file, tail,
+            "the whole ladder resolves to the one real declaration"
+        );
+    }
+
+    /// The alias search stops at the longest prefix that has any route and does
+    /// not fall back to a shorter alias, matching what the v1 fixed point did.
+    /// Choosing the prefix before filtering by domain is what keeps a private
+    /// alias from shadowing the public one the source means.
+    #[test]
+    fn the_longest_alias_prefix_wins_and_the_search_stops_there() {
+        let (_temp, analyzer) = project(&[
+            (
+                "src/lib.rs",
+                "pub mod outer;\npub mod real;\npub mod other;\n",
+            ),
+            ("src/real.rs", "pub mod inner;\n"),
+            ("src/real/inner.rs", "pub struct Deep;\n"),
+            ("src/other.rs", "pub struct Shallow;\n"),
+            (
+                "src/outer.rs",
+                "pub use crate::real as routed;\npub use crate::real::inner as routed_inner;\n",
+            ),
+        ]);
+        let walks = RustUsageWalks::new(&analyzer);
+        let outer = file(&analyzer, "outer.rs");
+        let outer_module = walks.physical_root_of(&outer).expect("outer is analyzed");
+
+        let one = walks.alias_routes_at(&outer_module.with_suffix(&["routed".to_string()]));
+        let two = walks.alias_routes_at(&outer_module.with_suffix(&["routed_inner".to_string()]));
+        assert!(!one.is_empty() && !two.is_empty(), "{one:?} {two:?}");
+
+        // `routed_inner` is a one-component alias, so the longest prefix of
+        // `routed_inner` is itself and the route lands on `real::inner`, never
+        // on the shorter `routed` alias.
+        let resolved = walks.resolve_segments(
+            &outer,
+            &outer_module.package(),
+            &["routed_inner".to_string()],
+        );
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|route| route.target_file.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([file(&analyzer, "real.rs"), file(&analyzer, "real/inner.rs"),]),
+            "the alias routes to `real::inner`, backed by the file whose \
+             package it is and by the file that declares it: {resolved:?}"
+        );
+        assert!(
+            !resolved
+                .iter()
+                .any(|route| route.target_module.components == ["real"]),
+            "the shorter `routed` alias must not answer: {resolved:?}"
+        );
+    }
+
+    /// The point of the redesign: a usage question is indexed lookups plus
+    /// bounded walks, never a pass over every declaration in the workspace.
+    /// The counter is the `2ba5dda4` structural-pin idiom.
+    #[test]
+    fn a_usage_query_performs_no_whole_workspace_declaration_scan() {
+        let (_temp, analyzer) = project(&[
+            (
+                "src/lib.rs",
+                "pub mod service;\npub mod consumer;\npub mod unrelated;\n",
+            ),
+            ("src/service.rs", "pub struct Widget;\n"),
+            (
+                "src/consumer.rs",
+                "use crate::service::Widget;\npub fn take(_: Widget) {}\n",
+            ),
+            ("src/unrelated.rs", "pub struct Gadget;\n"),
+        ]);
+        let service = file(&analyzer, "service.rs");
+        let target = analyzer
+            .declarations(&service)
+            .into_iter()
+            .find(|declaration| declaration.identifier() == "Widget")
+            .expect("Widget declaration");
+        let roots = BTreeSet::from([target]);
+        analyzer.reset_full_declaration_scan_count_for_test();
+
+        let seeds = analyzer.usage_binding_seeds(&roots);
+        let importers = analyzer.usage_importers(&seeds);
+
+        assert!(
+            importers.contains(&file(&analyzer, "consumer.rs")),
+            "the query still answers: {importers:?}"
+        );
+        assert_eq!(
+            analyzer.full_declaration_scan_count_for_test(),
+            0,
+            "a usage query must not scan every declaration in the workspace"
+        );
+    }
+}
