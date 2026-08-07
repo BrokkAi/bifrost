@@ -161,3 +161,112 @@ impl RubyGemSurface for RetainedRubyGems {
         RubyGemBoundary::Indexed
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::RetainedRubyGems;
+    use crate::analyzer::SemanticDiagnosticIncompleteReason;
+    use crate::analyzer::semantic_model::{
+        CatalogCoordinate, DependencyDiscoveryEvidence, DependencyDiscoveryOutcome,
+        ResolvedDependency, SemanticModelActivationEvidence,
+    };
+    use crate::analyzer::structural::BoundaryStatus;
+    use brokk_bifrost_ruby::diagnostics::{RubyGemBoundary, RubyGemSurface};
+    use std::sync::Arc;
+
+    fn evidence(gems: &[&str], complete: bool) -> DependencyDiscoveryEvidence {
+        let dependencies = gems
+            .iter()
+            .map(|gem| ResolvedDependency {
+                id: format!("rubygems:{gem}"),
+                evidence: SemanticModelActivationEvidence {
+                    language: "ruby".to_owned(),
+                    ecosystem: "rubygems".to_owned(),
+                    package: Some(CatalogCoordinate {
+                        name: (*gem).to_owned(),
+                        version: None,
+                    }),
+                    module: None,
+                    toolchain: None,
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: None,
+                },
+                provenance: Vec::new(),
+                artifacts: Vec::new(),
+            })
+            .collect();
+        let mut outcome = DependencyDiscoveryOutcome::complete(dependencies);
+        outcome.complete = complete;
+        DependencyDiscoveryEvidence::from_outcome(&outcome)
+    }
+
+    fn gems(evidence: Option<DependencyDiscoveryEvidence>) -> RetainedRubyGems {
+        RetainedRubyGems {
+            overlay: None,
+            evidence: evidence.map(Arc::new),
+        }
+    }
+
+    #[test]
+    fn ruby_require_boundary_reports_a_declared_gem_nothing_indexed() {
+        // Discovery reached the lockfile and named the gem; no activation
+        // published an overlay. That is exactly `ExternalDeclaredUnindexed`,
+        // and it is the one state the workspace activation path can leave
+        // behind, because evidence is retained only after preparation succeeds.
+        assert_eq!(
+            RubyGemBoundary::Incomplete(
+                SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                    boundary: BoundaryStatus::ExternalDeclaredUnindexed
+                }
+            ),
+            gems(Some(evidence(&["widget"], true))).require_boundary("widget")
+        );
+    }
+
+    #[test]
+    fn ruby_require_boundary_walks_a_gem_load_path_by_segment() {
+        let surface = gems(Some(evidence(&["widget"], true)));
+        // `widget/core` is published by the `widget` gem.
+        assert!(matches!(
+            surface.require_boundary("widget/core"),
+            RubyGemBoundary::Incomplete(_)
+        ));
+        // Segment removal, not string prefixing: `widgetfork` is not `widget`.
+        assert!(matches!(
+            surface.require_boundary("widgetfork"),
+            RubyGemBoundary::Unpublished(_)
+        ));
+    }
+
+    #[test]
+    fn ruby_require_boundary_separates_no_discovery_from_truncated() {
+        assert_eq!(
+            RubyGemBoundary::Unpublished(
+                SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                    boundary: BoundaryStatus::ExternalUnknown
+                }
+            ),
+            gems(None).require_boundary("widget")
+        );
+        assert_eq!(
+            RubyGemBoundary::Incomplete(SemanticDiagnosticIncompleteReason::Truncated),
+            gems(Some(evidence(&["widget"], false))).require_boundary("widget")
+        );
+    }
+
+    #[test]
+    fn ruby_constant_boundary_without_an_overlay_publishes_nothing() {
+        // No pack owns the namespace, so the packs say nothing either way and
+        // the caller's own workspace surface stays free to prove absence.
+        assert_eq!(
+            RubyGemBoundary::Unpublished(
+                SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                    boundary: BoundaryStatus::ExternalUnknown
+                }
+            ),
+            gems(Some(evidence(&["widget"], true)))
+                .constant_boundary(&["Widget".to_owned()], "Config")
+        );
+    }
+}
