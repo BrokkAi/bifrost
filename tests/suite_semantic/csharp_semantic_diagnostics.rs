@@ -499,6 +499,24 @@ fn a_local_shadowing_a_type_name_is_read_as_the_value_it_binds() {
 }
 
 #[test]
+fn this_names_the_enclosing_type_as_the_member_owner() {
+    let fixture = CSharpFixture::warmed(&[(
+        APP,
+        "namespace App {\n  public class Widget { public int Size; int Read() { return this.Size; } int Bad() { return this.Missing; } }\n}\n",
+    )]);
+    let report = fixture.report(APP);
+    assert!(
+        absent_member(&report, "App.Widget", "Missing"),
+        "`this` needs no inference to name its own type: {report:#?}"
+    );
+    assert_eq!(
+        report.diagnostics().len(),
+        1,
+        "`this.Size` is declared, so only `this.Missing` may error: {report:#?}"
+    );
+}
+
+#[test]
 fn a_partial_owner_cannot_prove_a_member_absent() {
     // A source generator writes its half into the build's intermediate output,
     // which is not analyzed, so a `partial` type's declared members are only

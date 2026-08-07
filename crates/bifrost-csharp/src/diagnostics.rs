@@ -621,6 +621,21 @@ impl CSharpDiagnosticCollector<'_> {
         receiver: Node<'_>,
         receiver_identity: &str,
     ) -> Result<MemberOwner, SemanticDiagnosticIncompleteReason> {
+        // `this` names the enclosing type, which is the one receiver whose type
+        // needs no inference at all. The grammar spells it as the bare keyword
+        // token inside a member access, and as `this_expression` elsewhere.
+        if matches!(receiver.kind(), "this" | "this_expression") {
+            let Some(enclosing) = enclosing_type_name(receiver, self.source) else {
+                return Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                    detail: "`this` appears outside a type declaration".to_string(),
+                });
+            };
+            return self.type_owner(&enclosing).ok_or_else(|| {
+                SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                    detail: format!("enclosing type `{enclosing}` does not resolve uniquely"),
+                }
+            });
+        }
         // A plain identifier is looked up as a value before it is looked up as
         // a type. That is C#'s own order for `E.I` -- the "Color Color" rule --
         // and getting it backwards would read `widget.Missing` against the type
@@ -1073,6 +1088,27 @@ fn is_type_reference_position(node: Node<'_>) -> bool {
                 .is_some_and(|typed| same_node(typed, node))
         }),
     }
+}
+
+/// The name of the type declaration `node` sits in.
+fn enclosing_type_name(node: Node<'_>, source: &str) -> Option<String> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if matches!(
+            parent.kind(),
+            "class_declaration"
+                | "struct_declaration"
+                | "record_declaration"
+                | "record_struct_declaration"
+                | "interface_declaration"
+        ) && let Some(name) = parent.child_by_field_name("name")
+        {
+            let name = node_text(name, source).trim();
+            return (!name.is_empty()).then(|| name.to_string());
+        }
+        current = parent;
+    }
+    None
 }
 
 /// The file's root node, which bounds the local-binding seeding.
