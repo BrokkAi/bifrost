@@ -10,8 +10,12 @@ use crate::analyzer::scala::{
     scala_package_prefixes_at, scala_package_prefixes_at_checked, scala_simple_type_name,
     scala_type_lookup_segments,
 };
+use crate::analyzer::structural::{
+    HierarchyRelation, MemberDispatchTier, PrecedenceTier, RejectionReason,
+};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{ImportInfo, SignatureMetadata, StructuredImportPath, StructuredImportScope};
+use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_jvm::scala::graph::local::{
     ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
     seed_scala_binding_with_receiver_declaration,
@@ -41,6 +45,10 @@ use std::collections::{HashMap, VecDeque};
 struct ForwardScalaExtensionMethod {
     fqn: String,
     receiver_type: Option<String>,
+    /// The declaration whose signature stated `receiver_type`. A Scala
+    /// extension fq name can name several overloads with different declared
+    /// receivers, so the exact declaration is what attribution needs (#1477).
+    declaration: CodeUnit,
 }
 
 #[derive(Clone)]
@@ -1102,6 +1110,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
                         receiver_type: resolved_extension_receiver_type(
                             self.scala, &unit, &signature,
                         ),
+                        declaration: unit,
                     })
             })
             .collect()
@@ -7512,7 +7521,11 @@ fn scala_stable_term_member_candidate_units(
         .into_iter()
         .filter(|unit| unit.is_class() && unit.fq_name() == owner_fqn)
     {
-        for (ancestor, depth) in scala_ancestor_owners(ctx.scala, ctx.support, owner) {
+        // Expected gap (#1477 rule 2): the stable-term ladder answers with
+        // singleton terminals reached through the same ancestor walk, but it
+        // returns them without the owner it read them from, so nothing here
+        // holds an owner to attribute. Its candidates stay unattributed.
+        for (ancestor, depth) in scala_ancestor_owners(ctx.scala, ctx.support, owner, None) {
             if matching_depth.is_some_and(|found| depth > found) {
                 break;
             }
@@ -7615,18 +7628,47 @@ fn scala_member_candidate_units(
     member: &str,
     include_companion: bool,
 ) -> Vec<CodeUnit> {
+    // A logical owner is a name, so the walk's routes can only start where that
+    // name resolves to exactly one declaration. Where it does not, the walk
+    // still answers and the candidates stay unattributed.
+    let mut member_trace = trace::recording()
+        .then(|| scala_owner_declaration(ctx, owner_fqn))
+        .flatten()
+        .map(ScalaMemberTrace::rooted_at);
+
     let candidates = scala_direct_member_candidate_units(ctx.support, owner_fqn, member);
     if !candidates.is_empty() {
+        if let Some(state) = member_trace.as_mut() {
+            let base = state.base.clone();
+            state.record_found(ctx.scala, &candidates, &base, 0);
+            state.stage_selection(&candidates);
+        }
         return candidates;
     }
 
-    let inherited = scala_ancestor_member_candidate_units(ctx, owner_fqn, member);
+    let inherited =
+        scala_ancestor_member_candidate_units(ctx, owner_fqn, member, member_trace.as_mut());
     if !inherited.is_empty() {
+        if let Some(state) = member_trace.as_ref() {
+            state.stage_selection(&inherited);
+        }
         return inherited;
     }
 
     if include_companion && !owner_fqn.ends_with('$') {
-        return scala_direct_member_candidate_units(ctx.support, &format!("{owner_fqn}$"), member);
+        let companion_fqn = format!("{owner_fqn}$");
+        let companion_members =
+            scala_direct_member_candidate_units(ctx.support, &companion_fqn, member);
+        if let Some(state) = member_trace.as_mut()
+            && !companion_members.is_empty()
+            && let Some(companion) = scala_owner_declaration(ctx, &companion_fqn)
+        {
+            let base = state.base.clone();
+            state.record_companion(&base, &companion);
+            state.record_found(ctx.scala, &companion_members, &companion, 0);
+            state.stage_selection(&companion_members);
+        }
+        return companion_members;
     }
 
     Vec::new()
@@ -8013,14 +8055,305 @@ fn scala_exact_subtype_relation(
     ScalaTypedCandidateMatch::Mismatch
 }
 
+/// Where one Scala member walk found one candidate.
+///
+/// `level` is the breadth-first hierarchy level of the declaration the walk was
+/// inspecting, which is what Scala's own precedence ladder orders by; `depth`
+/// is the length of the route back to the receiver's declared owner. The two
+/// differ only for a companion, which is reached by one promotion edge out of
+/// the class that declares it rather than by inheritance.
+struct ScalaMemberFind {
+    owner: CodeUnit,
+    depth: usize,
+    level: usize,
+    dispatch_tier: MemberDispatchTier,
+}
+
+/// The per-candidate attribution a Scala member walk records while it runs
+/// (#1477), built only when a trace is being recorded.
+///
+/// The walk decides nothing from it. Every entry is a fact the walk already
+/// held: which declaration each candidate was read out of, at which
+/// breadth-first level, and through which first-discovery edges that
+/// declaration was reached.
+///
+/// Two Scala-specific facts make this richer than the Java shape it follows.
+/// The analyzer indexes trait-ness per declaration
+/// (`ScalaAnalyzer::is_scala_trait_declaration`), so a member found on a trait
+/// ancestor is the `trait_or_interface` bucket and the hop that reached it is
+/// `trait_impl` -- applying the same rule Scala's own hierarchy layer applies,
+/// which calls a supertype edge a trait implementation only when the subtype is
+/// not itself a trait. And a companion is reached by promotion out of the class
+/// that declares it, which is the edge [`HierarchyRelation::Embedded`] names.
+struct ScalaMemberTrace {
+    /// The receiver's declared owner: every route starts here.
+    base: CodeUnit,
+    /// First-discovery supertype parent of each ancestor the walk expanded,
+    /// with the edge the walk crossed to reach it.
+    parents: HashMap<CodeUnit, (CodeUnit, HierarchyRelation)>,
+    /// Companion object -> the class whose companion the walk expanded.
+    companion_of: HashMap<CodeUnit, CodeUnit>,
+    found: HashMap<CodeUnit, ScalaMemberFind>,
+}
+
+impl ScalaMemberTrace {
+    fn rooted_at(base: CodeUnit) -> Self {
+        Self {
+            base,
+            parents: HashMap::default(),
+            companion_of: HashMap::default(),
+            found: HashMap::default(),
+        }
+    }
+
+    /// Whether this walk's routes start at `owner`. A seam that iterates more
+    /// than one physical declaration for one logical owner name records only
+    /// the one its routes can terminate at.
+    fn is_rooted_at(&self, owner: &CodeUnit) -> bool {
+        self.base == *owner
+    }
+
+    fn record_supertypes(
+        &mut self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        ancestors: &[CodeUnit],
+    ) {
+        for ancestor in ancestors {
+            let relation = scala_hierarchy_relation(scala, owner, ancestor);
+            self.parents
+                .entry(ancestor.clone())
+                .or_insert_with(|| (owner.clone(), relation));
+        }
+    }
+
+    fn record_companion(&mut self, owner: &CodeUnit, companion: &CodeUnit) {
+        self.companion_of
+            .entry(companion.clone())
+            .or_insert_with(|| owner.clone());
+    }
+
+    /// Attribute every candidate the walk just read out of `scope`, which sits
+    /// at breadth-first hierarchy `level`.
+    fn record_found(
+        &mut self,
+        scala: &ScalaAnalyzer,
+        candidates: &[CodeUnit],
+        scope: &CodeUnit,
+        level: usize,
+    ) {
+        if candidates.is_empty() {
+            return;
+        }
+        let companion = self.companion_of.contains_key(scope);
+        // A Scala singleton object is the language's static side, whether the
+        // walk reached it as the receiver's own declared owner (`Service.create`
+        // names the object) or by promotion out of the class it accompanies.
+        // The bucket says so; the depth stays whatever the walk measured.
+        let dispatch_tier =
+            if scala_unit_matches_owner_kind(scala, scope, ScalaOwnerKind::SingletonObject) {
+                MemberDispatchTier::StaticOrCompanion
+            } else if level == 0 {
+                MemberDispatchTier::InherentOrDirect
+            } else if scala.is_scala_trait_declaration(scope) {
+                MemberDispatchTier::TraitOrInterface
+            } else {
+                MemberDispatchTier::InheritedOrPromoted
+            };
+        let depth = level + usize::from(companion);
+        for candidate in candidates {
+            self.found
+                .entry(candidate.clone())
+                .or_insert_with(|| ScalaMemberFind {
+                    owner: scope.clone(),
+                    depth,
+                    level,
+                    dispatch_tier,
+                });
+        }
+    }
+
+    /// The exact route from the receiver's declared owner to the declaration
+    /// `candidate` was found on, as the first-discovery edges the walk took.
+    fn route(&self, candidate: &CodeUnit) -> Vec<trace::HierarchyHopRecord> {
+        let Some(find) = self.found.get(candidate) else {
+            return Vec::new();
+        };
+        let mut reversed = Vec::new();
+        let mut current = find.owner.clone();
+        while current != self.base {
+            let step = if let Some(class) = self.companion_of.get(&current) {
+                (class.clone(), HierarchyRelation::Embedded)
+            } else if let Some((parent, relation)) = self.parents.get(&current) {
+                (parent.clone(), *relation)
+            } else {
+                break;
+            };
+            reversed.push((step.0.clone(), current, step.1));
+            current = step.0;
+        }
+        debug_assert_eq!(
+            reversed.len(),
+            find.depth,
+            "the first-discovery route must be exactly the recorded depth"
+        );
+        reversed.reverse();
+        reversed
+            .into_iter()
+            .enumerate()
+            .map(|(hop, (from, to, relation))| trace::HierarchyHopRecord {
+                hop,
+                from,
+                to,
+                relation,
+            })
+            .collect()
+    }
+
+    /// The attribution for `candidate`, with the applicability the seam that
+    /// asks has checked. The walk itself checks no call shape, so it stages
+    /// `Unknown` and the applicability filter upgrades what it admits.
+    fn enrichment(
+        &self,
+        candidate: &CodeUnit,
+        applicability: ApplicabilityVerdict,
+    ) -> Option<trace::MemberEnrichment> {
+        let find = self.found.get(candidate)?;
+        Some(trace::MemberEnrichment {
+            owner: find.owner.clone(),
+            hierarchy_depth: find.depth,
+            dispatch_tier: find.dispatch_tier,
+            applicability,
+            route: self.route(candidate),
+        })
+    }
+
+    /// Scala's precedence ladder for a member find, which follows the hierarchy
+    /// level: a companion of the receiver's own type is that type's own member,
+    /// not an inherited one.
+    fn precedence_tier(&self, candidate: &CodeUnit) -> Option<PrecedenceTier> {
+        self.found.get(candidate).map(|find| {
+            if find.level == 0 {
+                PrecedenceTier::OwnMember
+            } else {
+                PrecedenceTier::InheritedMember
+            }
+        })
+    }
+
+    /// Stage attribution for the candidates the walk is about to return, for
+    /// the outcome constructor the caller reaches next. Every returned
+    /// candidate is staged, not only the ones that survive the caller's
+    /// applicability filter: the filter reports its own losers from this same
+    /// record (see [`scala_filter_callable_units`]).
+    fn stage_selection(&self, candidates: &[CodeUnit]) {
+        if let Some(tier) = candidates
+            .iter()
+            .filter_map(|unit| self.precedence_tier(unit))
+            .min()
+        {
+            trace::stage_tier(tier, candidates.iter().map(|unit| unit.fq_name()).collect());
+        }
+        scala_stage_member_context(
+            candidates,
+            candidates
+                .iter()
+                .filter_map(|unit| {
+                    self.enrichment(unit, ApplicabilityVerdict::Unknown)
+                        .map(|enrichment| (unit.fq_name(), enrichment))
+                })
+                .collect(),
+        );
+    }
+}
+
+/// Stage member attribution for `candidates`, dropping any fq name this channel
+/// cannot address unambiguously.
+///
+/// Scala indexes one declaration per overload (see
+/// `.agents/plans/scala-per-overload-code-units-1327.md`) and overloads share a
+/// fq name, while the staging channel is keyed by fq name. A name is therefore
+/// staged only when every candidate carrying it was attributed identically.
+/// Where one overload was attributed and a same-named one was not -- an
+/// extension fq name that also names an overload declared on another receiver,
+/// for instance -- the name is dropped rather than letting one overload's facts
+/// speak for the other's.
+fn scala_stage_member_context(
+    candidates: &[CodeUnit],
+    entries: Vec<(String, trace::MemberEnrichment)>,
+) {
+    let staged = entries
+        .iter()
+        .filter(|(name, enrichment)| {
+            let carriers = candidates
+                .iter()
+                .filter(|unit| unit.fq_name() == *name)
+                .count();
+            let attributed = entries
+                .iter()
+                .filter(|(other, other_enrichment)| other == name && other_enrichment == enrichment)
+                .count();
+            carriers == attributed
+        })
+        .cloned()
+        .collect();
+    trace::stage_member_context(staged);
+}
+
+/// The edge a Scala supertype declaration states, as far as the analyzer's own
+/// indexed facts distinguish it.
+///
+/// This applies the rule Scala's hierarchy layer already applies
+/// (`ScalaAnalyzer::relation_kind`): a supertype is a trait implementation when
+/// the trait is mixed into something that is not itself a trait; a trait
+/// extending a trait, or a class extending a class, is ordinary inheritance.
+fn scala_hierarchy_relation(
+    scala: &ScalaAnalyzer,
+    owner: &CodeUnit,
+    ancestor: &CodeUnit,
+) -> HierarchyRelation {
+    if !scala.is_scala_trait_declaration(owner) && scala.is_scala_trait_declaration(ancestor) {
+        HierarchyRelation::TraitImpl
+    } else {
+        HierarchyRelation::Extends
+    }
+}
+
+/// The single class declaration `owner_fqn` names, or `None` when it does not
+/// name exactly one.
+///
+/// A logical receiver owner is only a name, and attribution needs the
+/// declaration. This read runs only while a trace is being recorded, and a name
+/// that does not name exactly one declaration leaves the candidates
+/// unattributed rather than attributed to a guess.
+fn scala_owner_declaration(ctx: ScalaLookupCtx<'_>, owner_fqn: &str) -> Option<CodeUnit> {
+    let mut owners = ctx
+        .support
+        .fqn(owner_fqn)
+        .into_iter()
+        .filter(|unit| unit.is_class() && unit.fq_name() == owner_fqn)
+        .collect::<Vec<_>>();
+    sort_units(&mut owners);
+    owners.dedup();
+    let [owner] = owners.as_slice() else {
+        return None;
+    };
+    Some(owner.clone())
+}
+
 fn scala_exact_owner_member_candidate_units(
     ctx: ScalaLookupCtx<'_>,
     owner: &CodeUnit,
     member: &str,
     include_companion: bool,
 ) -> ScalaExactMemberResolution {
+    let mut member_trace = trace::recording().then(|| ScalaMemberTrace::rooted_at(owner.clone()));
     let direct = scala_direct_member_candidate_units_for_owner(ctx, owner, member);
     if !direct.is_empty() {
+        if let Some(state) = member_trace.as_mut() {
+            state.record_found(ctx.scala, &direct, owner, 0);
+            state.stage_selection(&direct);
+        }
         return ScalaExactMemberResolution::Found(direct);
     }
 
@@ -8030,8 +8363,13 @@ fn scala_exact_owner_member_candidate_units(
             return ScalaExactMemberResolution::Ambiguous;
         }
     };
+    if let Some(state) = member_trace.as_mut() {
+        state.record_supertypes(ctx.scala, owner, &level);
+    }
     let mut seen = HashSet::from_iter([owner.clone()]);
+    let mut depth = 0_usize;
     while !level.is_empty() {
+        depth += 1;
         let mut matches = Vec::new();
         let mut next = Vec::new();
         let mut next_is_ambiguous = false;
@@ -8039,17 +8377,27 @@ fn scala_exact_owner_member_candidate_units(
             if !seen.insert(ancestor.clone()) {
                 continue;
             }
-            matches.extend(scala_direct_member_candidate_units_for_owner(
-                ctx, &ancestor, member,
-            ));
+            let found = scala_direct_member_candidate_units_for_owner(ctx, &ancestor, member);
+            if let Some(state) = member_trace.as_mut() {
+                state.record_found(ctx.scala, &found, &ancestor, depth);
+            }
+            matches.extend(found);
             match ctx.direct_ancestors_for_owner(&ancestor) {
-                ScalaDirectAncestorResolution::Resolved(ancestors) => next.extend(ancestors),
+                ScalaDirectAncestorResolution::Resolved(ancestors) => {
+                    if let Some(state) = member_trace.as_mut() {
+                        state.record_supertypes(ctx.scala, &ancestor, &ancestors);
+                    }
+                    next.extend(ancestors);
+                }
                 ScalaDirectAncestorResolution::Ambiguous => next_is_ambiguous = true,
             }
         }
         sort_units(&mut matches);
         matches.dedup();
         if !matches.is_empty() {
+            if let Some(state) = member_trace.as_ref() {
+                state.stage_selection(&matches);
+            }
             // Each ancestor path was already resolved to one exact physical
             // declaration. Distinct resolved traits at the same inheritance
             // depth are a legitimate Scala conflict, so definition lookup
@@ -8081,6 +8429,11 @@ fn scala_exact_owner_member_candidate_units(
                 let candidates =
                     scala_direct_member_candidate_units_for_owner(ctx, companion, member);
                 if !candidates.is_empty() {
+                    if let Some(state) = member_trace.as_mut() {
+                        state.record_companion(owner, companion);
+                        state.record_found(ctx.scala, &candidates, companion, 0);
+                        state.stage_selection(&candidates);
+                    }
                     return ScalaExactMemberResolution::Found(candidates);
                 }
             }
@@ -8283,12 +8636,94 @@ fn scala_filter_callable_units(
         })
         .sum::<usize>();
     let unique_callable = callable_count == 1;
-    candidates
+    let considered = trace::recording().then(|| candidates.clone());
+    let admitted = candidates
         .into_iter()
         .filter(|unit| {
             scala_member_unit_applies(scala, unit, call_shape, site_role, unique_callable)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if let Some(considered) = considered {
+        scala_record_applicability(&considered, &admitted, call_shape);
+    }
+    admitted
+}
+
+fn scala_member_precedence_tier(enrichment: &trace::MemberEnrichment) -> PrecedenceTier {
+    // A companion is one promotion hop away from the receiver's own type and is
+    // still that type's own member, which is why the tier follows the dispatch
+    // bucket here rather than the hop count.
+    if enrichment.hierarchy_depth == 0
+        || enrichment.dispatch_tier == MemberDispatchTier::StaticOrCompanion
+    {
+        PrecedenceTier::OwnMember
+    } else {
+        PrecedenceTier::InheritedMember
+    }
+}
+
+/// Report what the call-shape filter just decided about candidates a member
+/// walk staged (#1477 rule 5).
+///
+/// A candidate the walk computed and this filter discarded is a row, not a
+/// silence, and it carries the owner, depth and route the walk recorded for it.
+/// The winners' staged attribution is restaged with the applicability this
+/// filter established, which the walk itself could not state: the walk checks
+/// no call shape.
+///
+/// Nothing is claimed for a candidate the staged map does not name: this filter
+/// also runs over candidate sets that no member walk produced (a bare callable,
+/// an imported member), and those have no owner to attribute.
+fn scala_record_applicability(
+    considered: &[CodeUnit],
+    admitted: &[CodeUnit],
+    call_shape: Option<&ScalaCallSiteShape>,
+) {
+    let staged = trace::staged_member_context();
+    let enrichment_of = |unit: &CodeUnit| {
+        let fq_name = unit.fq_name();
+        staged
+            .iter()
+            .find(|(name, _)| *name == fq_name)
+            .map(|(_, enrichment)| enrichment.clone())
+    };
+    for loser in considered.iter().filter(|unit| !admitted.contains(unit)) {
+        let enrichment = enrichment_of(loser);
+        // Where the call's argument list is known, the filter measured the
+        // candidate against it, whose structured story belongs to the callable
+        // axis (#1478). Where it is not, the filter measured the declaration
+        // space alone: a constructor is not an ordinary call target.
+        let reason = if call_shape.is_some() {
+            RejectionReason::CallableApplicabilityDeferred
+        } else {
+            RejectionReason::WrongDeclarationSpace
+        };
+        let mut row = trace::TraceCandidate::rejected(
+            trace::TraceCandidateRef::Unit(loser.clone()),
+            enrichment.as_ref().map(scala_member_precedence_tier),
+            reason,
+        );
+        if let Some(mut enrichment) = enrichment {
+            enrichment.applicability = ApplicabilityVerdict::Inapplicable;
+            row = row.with_member(enrichment);
+        }
+        trace::record(row);
+    }
+    if call_shape.is_none() {
+        return;
+    }
+    let upgraded = admitted
+        .iter()
+        .filter_map(|unit| {
+            enrichment_of(unit).map(|mut enrichment| {
+                enrichment.applicability = ApplicabilityVerdict::Applicable;
+                (unit.fq_name(), enrichment)
+            })
+        })
+        .collect::<Vec<_>>();
+    if !upgraded.is_empty() {
+        scala_stage_member_context(admitted, upgraded);
+    }
 }
 
 fn scala_member_candidate_applies(
@@ -8449,6 +8884,7 @@ fn scala_extension_candidate_units(
     call_shape: Option<&ScalaCallSiteShape>,
 ) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
+    let mut admitted = Vec::new();
     for method in resolver.visible_extension_methods(member) {
         if !scala_extension_receiver_matches(
             resolver,
@@ -8458,6 +8894,42 @@ fn scala_extension_candidate_units(
             continue;
         }
         candidates.extend(ctx.support.fqn(&method.fqn));
+        if trace::recording() {
+            admitted.push(method.declaration);
+        }
+    }
+    // An extension is admitted only when its declared receiver type resolves to
+    // the receiver's own owner (`scala_extension_receiver_matches_resolved` is
+    // an identity check, not a conformance walk), so every admitted extension
+    // sits at depth zero on that owner and its empty route is exact. Staged
+    // before the call-shape filter so the filter can report its own losers.
+    //
+    // Only the declarations the receiver check itself admitted are attributed:
+    // an extension fq name can name several overloads with different declared
+    // receivers, and expanding the name brings in the ones this check never
+    // looked at, which stay unattributed.
+    if !admitted.is_empty()
+        && let Some(owner) = receiver_owner.and_then(|owner| scala_owner_declaration(ctx, owner))
+    {
+        scala_stage_member_context(
+            &candidates,
+            candidates
+                .iter()
+                .filter(|unit| admitted.contains(unit))
+                .map(|unit| {
+                    (
+                        unit.fq_name(),
+                        trace::MemberEnrichment {
+                            owner: owner.clone(),
+                            hierarchy_depth: 0,
+                            dispatch_tier: MemberDispatchTier::Extension,
+                            applicability: ApplicabilityVerdict::Unknown,
+                            route: Vec::new(),
+                        },
+                    )
+                })
+                .collect(),
+        );
     }
     candidates = scala_filter_callable_units(
         ctx.scala,
@@ -8607,6 +9079,7 @@ fn scala_ancestor_member_candidate_units(
     ctx: ScalaLookupCtx<'_>,
     owner_fqn: &str,
     member: &str,
+    mut member_trace: Option<&mut ScalaMemberTrace>,
 ) -> Vec<CodeUnit> {
     let owners = ctx
         .support
@@ -8616,13 +9089,23 @@ fn scala_ancestor_member_candidate_units(
     let mut matching_depth = None;
     let mut matches = Vec::new();
     for owner in owners {
-        for (ancestor, depth) in scala_ancestor_owners(ctx.scala, ctx.support, owner) {
+        // Routes start at one declaration. A second physical declaration of the
+        // same logical name still answers, unattributed.
+        let mut owner_trace = member_trace
+            .as_deref_mut()
+            .filter(|state| state.is_rooted_at(&owner));
+        for (ancestor, depth) in
+            scala_ancestor_owners(ctx.scala, ctx.support, owner, owner_trace.as_deref_mut())
+        {
             if matching_depth.is_some_and(|found| depth > found) {
                 break;
             }
             let direct =
                 scala_direct_member_candidate_units(ctx.support, &ancestor.fq_name(), member);
             if !direct.is_empty() {
+                if let Some(state) = owner_trace.as_deref_mut() {
+                    state.record_found(ctx.scala, &direct, &ancestor, depth);
+                }
                 matching_depth = Some(depth);
                 matches.extend(direct);
             }
@@ -8637,6 +9120,7 @@ fn scala_ancestor_owners(
     scala: &ScalaAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     owner: CodeUnit,
+    mut member_trace: Option<&mut ScalaMemberTrace>,
 ) -> Vec<(CodeUnit, usize)> {
     let mut queue = VecDeque::from([(owner.clone(), 0_usize)]);
     let mut discovered = HashSet::from_iter([owner.fq_name()]);
@@ -8649,6 +9133,11 @@ fn scala_ancestor_owners(
         };
         for ancestor in direct {
             if discovered.insert(ancestor.fq_name()) {
+                if let Some(state) = member_trace.as_deref_mut() {
+                    // The first-discovery edge this walk took, retained while
+                    // the walk still holds both ends of it.
+                    state.record_supertypes(scala, &current, std::slice::from_ref(&ancestor));
+                }
                 let ancestor_depth = depth + 1;
                 ancestors.push((ancestor.clone(), ancestor_depth));
                 queue.push_back((ancestor, ancestor_depth));
