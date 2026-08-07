@@ -257,12 +257,19 @@ pub(super) fn collapse_context_outcomes(
     let Some(first) = outcomes.first() else {
         return invalid_context_lookup(query, "target_not_found", "no target candidates found");
     };
-    let first_key = semantic_outcome_key(analyzer, first);
+    let mut render_cache = DefinitionCandidateRenderCache::default();
+    let first_key = semantic_outcome_key(analyzer, first, &mut render_cache);
     if outcomes
         .iter()
-        .all(|outcome| semantic_outcome_key(analyzer, outcome) == first_key)
+        .skip(1)
+        .all(|outcome| semantic_outcome_key(analyzer, outcome, &mut render_cache) == first_key)
     {
-        return render_definition_reference_lookup(analyzer, query, first.clone());
+        return render_definition_reference_lookup(
+            analyzer,
+            query,
+            first.clone(),
+            &mut render_cache,
+        );
     }
 
     DefinitionByReferenceLookupResult {
@@ -281,6 +288,7 @@ pub(super) fn render_definition_reference_lookup(
     analyzer: &dyn IAnalyzer,
     query: DefinitionContextReferenceQuery,
     outcome: crate::analyzer::usages::get_definition::DefinitionLookupOutcome,
+    render_cache: &mut DefinitionCandidateRenderCache,
 ) -> DefinitionByReferenceLookupResult {
     if outcome.lexical_definition.is_some() {
         return DefinitionByReferenceLookupResult {
@@ -302,7 +310,7 @@ pub(super) fn render_definition_reference_lookup(
     DefinitionByReferenceLookupResult {
         query,
         status: outcome.status.as_str().to_string(),
-        definitions: definition_candidates(analyzer, &outcome.definitions),
+        definitions: definition_candidates_with_cache(analyzer, &outcome.definitions, render_cache),
         diagnostics,
     }
 }
@@ -346,11 +354,12 @@ pub(super) fn definition_by_reference_diagnostic(
 pub(super) fn semantic_outcome_key(
     analyzer: &dyn IAnalyzer,
     outcome: &crate::analyzer::usages::get_definition::DefinitionLookupOutcome,
+    render_cache: &mut DefinitionCandidateRenderCache,
 ) -> DefinitionOutcomeKey {
     let definition = outcome
         .definitions
         .iter()
-        .filter_map(|unit| definition_candidate(analyzer, unit))
+        .filter_map(|unit| definition_candidate_with_cache(analyzer, unit, render_cache))
         .map(|candidate| definition_candidate_key(&candidate))
         .collect();
     (outcome.status.as_str().to_string(), definition)

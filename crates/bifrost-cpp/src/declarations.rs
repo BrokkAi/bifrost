@@ -7,7 +7,7 @@
 use brokk_bifrost_core::analyzer::common::{node_source_text, parse_source_region};
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{
-    CallableArity, CallableLinkage, CodeUnitType, CppTemplateAliasTargetMetadata,
+    CallableArity, CallableLinkage, CodeUnitType, CppFieldLinkage, CppTemplateAliasTargetMetadata,
     CppTemplateExpression, CppTemplateMetadata, CppTemplateParameterKind,
     CppTemplateParameterMetadata, CppTemplateTerm, DispatchExtensibility, ImportInfo,
     ParameterMetadata, Range, SignatureMetadata, StructuredTypeIdentity,
@@ -3250,9 +3250,13 @@ impl<'a> CppVisitor<'a> {
         }
         self.parsed
             .add_code_unit(code_unit.clone(), declaration_node, self.source, None, None);
-        self.parsed.add_signature(
+        self.parsed.add_signature_with_metadata(
             code_unit.clone(),
-            render_cpp_field_signature(declaration_node, declarator, self.source),
+            SignatureMetadata::new(
+                render_cpp_field_signature(declaration_node, declarator, self.source),
+                Vec::new(),
+            )
+            .with_cpp_field_linkage(cpp_field_declaration_linkage(declaration_node, self.source)),
         );
         if let Some(parent) = &scope.class_unit {
             self.parsed.add_child(parent.clone(), code_unit);
@@ -3450,6 +3454,73 @@ impl<'a> CppVisitor<'a> {
                 unit: code_unit.clone(),
             });
         self.parsed.add_signature(code_unit, signature);
+    }
+}
+
+/// Classify a C++ field while its declaration syntax is already available.
+///
+/// The persisted result lets later visibility queries avoid reparsing the
+/// complete source file only to recover linkage.
+pub fn cpp_field_declaration_linkage(declaration: Node<'_>, source: &str) -> CppFieldLinkage {
+    let mut current = declaration.parent();
+    let mut enclosed_by_class = false;
+    while let Some(node) = current {
+        if node.kind() == "namespace_definition"
+            && node
+                .child_by_field_name("name")
+                .is_none_or(|name| normalize_cpp_whitespace(node_text(name, source)).is_empty())
+        {
+            return CppFieldLinkage::Internal;
+        }
+        if matches!(
+            node.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) && node
+            .child_by_field_name("name")
+            .is_none_or(|name| normalize_cpp_whitespace(node_text(name, source)).is_empty())
+        {
+            return CppFieldLinkage::Internal;
+        }
+        if matches!(
+            node.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) {
+            enclosed_by_class = true;
+        }
+        if matches!(node.kind(), "function_definition" | "lambda_expression") {
+            return CppFieldLinkage::Internal;
+        }
+        current = node.parent();
+    }
+    if enclosed_by_class {
+        return CppFieldLinkage::External;
+    }
+    let mut cursor = declaration.walk();
+    let mut has_static = false;
+    let mut has_extern = false;
+    let mut has_inline = false;
+    let mut has_const = false;
+    let mut has_constexpr = false;
+    for child in declaration.named_children(&mut cursor) {
+        let text = normalize_cpp_whitespace(node_text(child, source));
+        match (child.kind(), text.as_str()) {
+            ("storage_class_specifier", "static") => has_static = true,
+            ("storage_class_specifier", "extern") => has_extern = true,
+            ("storage_class_specifier", "inline") => has_inline = true,
+            ("storage_class_specifier", "constexpr") => has_constexpr = true,
+            ("type_qualifier", "const") => has_const = true,
+            ("type_qualifier", "constexpr") => has_constexpr = true,
+            _ => {}
+        }
+    }
+    if has_static {
+        CppFieldLinkage::Internal
+    } else if has_extern || has_inline {
+        CppFieldLinkage::External
+    } else if has_const || has_constexpr {
+        CppFieldLinkage::InternalUnlessExternalPeer
+    } else {
+        CppFieldLinkage::External
     }
 }
 

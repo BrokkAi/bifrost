@@ -2038,6 +2038,45 @@ impl AnalyzerStore {
         Ok(result)
     }
 
+    /// Read only the type-alias units for one persisted file. This avoids
+    /// hydrating its source and unrelated analyzer facts for an alias check.
+    pub(crate) fn type_aliases_for_file<A: LanguageAdapter>(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        adapter: &A,
+        file: &ProjectFile,
+    ) -> Result<Option<Vec<CodeUnit>>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result = type_aliases_for_file_conn(&tx, oid, lang, adapter, file)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Read persisted declarations whose ranges enclose `range` in one file.
+    /// This is sufficient for owner lookup and avoids hydrating the file's
+    /// source and unrelated analyzer facts.
+    pub(crate) fn enclosing_declarations_for_range<A: LanguageAdapter>(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        adapter: &A,
+        file: &ProjectFile,
+        range: &Range,
+    ) -> Result<Option<Vec<(CodeUnit, Range)>>> {
+        let _scope = crate::profiling::scope("AnalyzerStore::enclosing_declarations_for_range");
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result = enclosing_declarations_for_range_conn(&tx, oid, lang, adapter, file, range)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// Read at most `limit` signature-metadata rows for one persisted code
     /// unit without hydrating the owning file state.
     ///
@@ -2057,6 +2096,24 @@ impl AnalyzerStore {
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
         let result = signature_metadata_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Read at most `limit` signature labels for one persisted code unit
+    /// without hydrating the owning file state.
+    pub(crate) fn signatures_for_unit_limited(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Result<LimitedQueryRows<String>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result = signatures_for_unit_limited_conn(&tx, oid, lang, unit, limit)?;
         tx.commit()?;
         Ok(result)
     }
@@ -5210,6 +5267,120 @@ fn summary_file_projection_conn<A: LanguageAdapter>(
     }))
 }
 
+fn type_aliases_for_file_conn<A: LanguageAdapter>(
+    conn: &Connection,
+    oid: Oid,
+    lang: &str,
+    adapter: &A,
+    file: &ProjectFile,
+) -> Result<Option<Vec<CodeUnit>>> {
+    if read_summary_projection_meta(conn, &oid.to_string(), lang)?.is_none() {
+        return Ok(None);
+    }
+    let sql = format!(
+        "SELECT units.kind, units.content_qualifier, units.signature, units.synthetic,
+                units.fq_segments
+         FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+         WHERE units.blob_oid = ?1 AND units.lang = ?2 AND units.is_type_alias = 1
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+         ORDER BY units.unit_key"
+    );
+    let oid = oid.to_string();
+    let mut statement = conn.prepare_cached(&sql)?;
+    let mut rows = statement.query(params![oid, lang])?;
+    let mut aliases = Vec::new();
+    while let Some(row) = rows.next()? {
+        let kind = code_unit_kind_from_i64(row.get(0)?)?;
+        let content_qualifier = row.get::<_, String>(1)?;
+        let signature = row.get::<_, Option<String>>(2)?;
+        let synthetic = row.get::<_, i64>(3)? != 0;
+        let fq_segments = row.get::<_, Option<Vec<u8>>>(4)?;
+        let (fq_name, package_segment_count) =
+            hydrate_unit_fq(adapter, fq_segments.as_deref(), &content_qualifier, file)?;
+        aliases.push(CodeUnit::from_fq(
+            file.clone(),
+            kind,
+            fq_name,
+            package_segment_count,
+            signature,
+            synthetic,
+        ));
+    }
+    Ok(Some(aliases))
+}
+
+fn enclosing_declarations_for_range_conn<A: LanguageAdapter>(
+    conn: &Connection,
+    oid: Oid,
+    lang: &str,
+    adapter: &A,
+    file: &ProjectFile,
+    range: &Range,
+) -> Result<Option<Vec<(CodeUnit, Range)>>> {
+    if read_summary_projection_meta(conn, &oid.to_string(), lang)?.is_none() {
+        return Ok(None);
+    }
+    let sql = format!(
+        "SELECT units.unit_key, units.kind, units.content_qualifier, units.signature, units.synthetic,
+                units.fq_segments,
+                ranges.start_byte, ranges.end_byte, ranges.start_line, ranges.end_line
+         FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+         JOIN unit_ranges AS ranges
+           ON ranges.blob_oid = units.blob_oid
+          AND ranges.lang = units.lang
+          AND ranges.unit_key = units.unit_key
+         WHERE units.blob_oid = ?1 AND units.lang = ?2 AND units.in_declarations = 1
+           AND ranges.start_byte <= ?3 AND ranges.end_byte >= ?4
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+         ORDER BY units.unit_key, ranges.ordinal"
+    );
+    let oid = oid.to_string();
+    let start_byte = i64::try_from(range.start_byte)
+        .map_err(|_| StoreError::new("range start byte exceeds SQLite integer range"))?;
+    let end_byte = i64::try_from(range.end_byte)
+        .map_err(|_| StoreError::new("range end byte exceeds SQLite integer range"))?;
+    let mut statement = conn.prepare_cached(&sql)?;
+    let mut rows = statement.query(params![oid, lang, start_byte, end_byte])?;
+    let mut declarations = Vec::new();
+    let mut previous_unit_key = None;
+    while let Some(row) = rows.next()? {
+        let unit_key = row.get::<_, i64>(0)?;
+        if previous_unit_key == Some(unit_key) {
+            continue;
+        }
+        previous_unit_key = Some(unit_key);
+        let kind = code_unit_kind_from_i64(row.get(1)?)?;
+        let content_qualifier = row.get::<_, String>(2)?;
+        let signature = row.get::<_, Option<String>>(3)?;
+        let synthetic = row.get::<_, i64>(4)? != 0;
+        let fq_segments = row.get::<_, Option<Vec<u8>>>(5)?;
+        let range = Range {
+            start_byte: i64_to_usize(row.get(6)?)?,
+            end_byte: i64_to_usize(row.get(7)?)?,
+            start_line: i64_to_usize(row.get(8)?)?,
+            end_line: i64_to_usize(row.get(9)?)?,
+        };
+        let (fq_name, package_segment_count) =
+            hydrate_unit_fq(adapter, fq_segments.as_deref(), &content_qualifier, file)?;
+        declarations.push((
+            CodeUnit::from_fq(
+                file.clone(),
+                kind,
+                fq_name,
+                package_segment_count,
+                signature,
+                synthetic,
+            ),
+            range,
+        ));
+    }
+    Ok(Some(declarations))
+}
+
 fn hydrate_file_states_conn<A: LanguageAdapter>(
     conn: &Connection,
     entries: &[(ProjectFile, Oid)],
@@ -7172,6 +7343,59 @@ fn signature_metadata_for_unit_limited_conn(
     } else {
         Ok(LimitedQueryRows::complete(rows, inspected))
     }
+}
+
+fn signatures_for_unit_limited_conn(
+    conn: &Connection,
+    oid: Oid,
+    lang: &str,
+    unit: &CodeUnit,
+    limit: usize,
+) -> Result<LimitedQueryRows<String>> {
+    if limit == 0 {
+        return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+    }
+    let sql = format!(
+        "SELECT length(CAST(signatures.text AS BLOB)),
+                CASE
+                    WHEN length(CAST(signatures.text AS BLOB)) <= ?9 THEN signatures.text
+                    ELSE NULL
+                END
+         FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+         JOIN unit_signatures AS signatures
+           ON signatures.blob_oid = units.blob_oid
+          AND signatures.lang = units.lang
+          AND signatures.unit_key = units.unit_key
+         WHERE units.blob_oid = ?1
+           AND units.lang = ?2
+           AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
+           AND units.kind = ?4
+           AND units.short_name = ?5
+           AND units.signature IS ?6
+           AND units.synthetic = ?7
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+         ORDER BY signatures.ordinal
+         LIMIT ?8"
+    );
+    let oid = oid.to_string();
+    let kind = code_unit_kind_to_i64(unit.kind());
+    let synthetic = bool_to_i64(unit.is_synthetic());
+    let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = conn.prepare_cached(&sql)?;
+    let mut query = statement.query(params![
+        oid,
+        lang,
+        unit.fq_name(),
+        kind,
+        unit.short_name(),
+        unit.signature(),
+        synthetic,
+        sql_limit,
+        usize_to_i64(MAX_LIMITED_QUERY_ROW_BYTES)?,
+    ])?;
+    collect_limited_text_rows(&mut query, limit)
 }
 
 fn ruby_method_dispatch_modes_for_unit_limited_conn(

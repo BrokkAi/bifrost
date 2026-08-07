@@ -19,7 +19,7 @@ pub mod syntax;
 
 use crate::graph_support::CppSource;
 use brokk_bifrost_core::analyzer::capabilities::{TypeAliasProvider, TypeHierarchyProvider};
-use brokk_bifrost_core::analyzer::model::SignatureMetadata;
+use brokk_bifrost_core::analyzer::model::{CppFieldLinkage, SignatureMetadata};
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile, Range};
 use std::collections::BTreeSet;
 
@@ -129,6 +129,10 @@ impl<'a> CppGraphSource<'a> {
 
     pub fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
         self.index.signature_metadata(code_unit)
+    }
+
+    pub fn cpp_field_linkage(&self, code_unit: &CodeUnit) -> Option<CppFieldLinkage> {
+        self.cpp?.cpp_field_linkage(code_unit)
     }
 
     pub fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {

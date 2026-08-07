@@ -20,4 +20,5 @@ mod searchtools_definition_selectors;
 mod searchtools_fuzzy_symbol_lookup;
 mod searchtools_list_symbols;
 mod searchtools_service;
+mod searchtools_source_budget;
 mod searchtools_summary_ranges;
