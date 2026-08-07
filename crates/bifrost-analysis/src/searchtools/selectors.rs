@@ -531,7 +531,7 @@ fn definition_candidate_from_range_base(
         signature: unit
             .signature()
             .map(str::to_string)
-            .or_else(|| analyzer.signatures(unit).first().cloned()),
+            .or_else(|| selector_signatures(analyzer, unit).into_iter().next()),
         language: language_name(language),
         canonical_selector: None,
         occurrence_role: None,
@@ -999,6 +999,16 @@ pub(super) fn file_anchored_definition_selector(unit: &CodeUnit) -> String {
     format!("{}#{}", rel_path_string(unit.source()), unit.fq_name())
 }
 
+/// Rendered signatures for selector keying: the language's complete bounded
+/// persisted projection when it provides one, otherwise the analyzer's full
+/// read (which may hydrate the owning `FileState`).
+pub(super) fn selector_signatures(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<String> {
+    language_support(language_for_target(unit))
+        .and_then(|support| support.signatures_limited(analyzer, unit, usize::MAX))
+        .filter(|signatures| signatures.complete)
+        .map_or_else(|| analyzer.signatures(unit), |signatures| signatures.rows)
+}
+
 #[derive(Default)]
 struct CppSelectorFacts {
     signatures: HashMap<CodeUnit, Vec<String>>,
@@ -1016,13 +1026,9 @@ impl CppSelectorFacts {
             .iter()
             .filter(|unit| language_for_target(unit) == Language::Cpp && unit.is_callable())
         {
-            facts.signatures.insert(
-                unit.clone(),
-                support
-                    .signatures_limited(analyzer, unit, usize::MAX)
-                    .filter(|signatures| signatures.complete)
-                    .map_or_else(|| analyzer.signatures(unit), |signatures| signatures.rows),
-            );
+            facts
+                .signatures
+                .insert(unit.clone(), selector_signatures(analyzer, unit));
 
             let metadata = support
                 .signature_metadata_limited(analyzer, unit, usize::MAX)
@@ -1349,7 +1355,7 @@ pub(super) fn distinct_definitions(
         let signature = if language == Language::Cpp && unit.is_callable() {
             cpp_facts.signature_key(unit)
         } else {
-            analyzer.signatures(unit)
+            selector_signatures(analyzer, unit)
         };
         files_by_fqn_signature
             .entry((unit.fq_name(), signature))

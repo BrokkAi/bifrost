@@ -267,6 +267,14 @@ impl JavascriptAnalyzer {
         self.inner.ranges_limited(code_unit, limit)
     }
 
+    pub(crate) fn signatures_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<String> {
+        self.inner.signatures_limited(code_unit, limit)
+    }
+
     pub fn extract_type_identifiers(&self, source: &str) -> BTreeSet<String> {
         extract_js_type_identifiers(source)
     }

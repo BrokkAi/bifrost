@@ -204,6 +204,24 @@ impl PythonAnalyzer {
         self.inner.signature_metadata_limited(code_unit, limit)
     }
 
+    pub(crate) fn signatures_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<String> {
+        self.inner.signatures_limited(code_unit, limit)
+    }
+
+    #[doc(hidden)]
+    pub fn reset_full_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn full_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test()
+    }
+
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
@@ -891,6 +909,16 @@ impl LanguageSupport for PythonSupport {
     ) -> Option<LimitedQueryRows<SignatureMetadata>> {
         resolve_analyzer::<PythonAnalyzer>(analyzer)
             .map(|python| python.signature_metadata_limited(unit, limit))
+    }
+
+    fn signatures_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<String>> {
+        resolve_analyzer::<PythonAnalyzer>(analyzer)
+            .map(|python| python.signatures_limited(unit, limit))
     }
 
     fn declaration_ranges_limited(

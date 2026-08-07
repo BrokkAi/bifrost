@@ -134,6 +134,16 @@ impl LanguageSupport for JavascriptSupport {
             .map(|javascript| javascript.ranges_limited(unit, limit))
     }
 
+    fn signatures_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<String>> {
+        resolve_analyzer::<JavascriptAnalyzer>(analyzer)
+            .map(|javascript| javascript.signatures_limited(unit, limit))
+    }
+
     fn forward_query_provider<'a>(
         &self,
         analyzer: &'a dyn IAnalyzer,
@@ -206,6 +216,16 @@ impl LanguageSupport for TypescriptSupport {
     ) -> Option<LimitedQueryRows<Range>> {
         resolve_analyzer::<TypescriptAnalyzer>(analyzer)
             .map(|typescript| typescript.ranges_limited(unit, limit))
+    }
+
+    fn signatures_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<String>> {
+        resolve_analyzer::<TypescriptAnalyzer>(analyzer)
+            .map(|typescript| typescript.signatures_limited(unit, limit))
     }
 
     fn forward_query_provider<'a>(
