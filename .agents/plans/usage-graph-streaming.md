@@ -66,7 +66,9 @@ measurement is a separate task run after review; it is not part of this plan's a
       wall-clock deadline artifact, not a per-site resolver difference.** Report:
       `hit-delta-triage-v1.md` (session scratchpad). Under non-truncated (narrowed-`paths`)
       sweeps, HEAD `38800fe5` and the run-3 comparator `5c33701b` return the identical 11-hit set,
-      twice each; under matched full-scope conditions both truncate to the identical 4-hit set.
+      twice each. Across three matched full-scope pairs the answers are nested prefixes of that
+      same 11 -- 4/4, 10/8 and 8/8 -- so the count tracks work done, not lineage, and in the one
+      pair that separates them it is HEAD that finds *more*.
       See `Outcomes & Retrospective` for the evidence and for the 300 s budget ceiling it exposed.
 
 ## Surprises & Discoveries
@@ -291,15 +293,17 @@ Two further results worth carrying:
   set**, including all three sites run 4 "lost" (`rustc_codegen_llvm/src/abi.rs:99:49`,
   `codegen_fn_attrs.rs:249:19`, `:255:26`). Narrowing to just those two files returns all three on
   both binaries, twice. **(2) Under matched full-scope conditions the sets are nested prefixes of
-  that same 11, and the sign of the original delta reverses.** Two pairs, each with both binaries
-  started at the same instant: pair 1 (loadavg 85) returned the *identical* 4 hits on both, at
-  7,850 CPU-seconds (HEAD side) against 10,734 (comparator); pair 2 (loadavg 14) returned **10 on
-  HEAD and 8 on the comparator**, at 7,287 against 8,751 CPU-seconds, with exact containment
-  `v3(8) < v6(10) < complete(11)`. **The comparator reproduced run 4's "regressed" 8 exactly,
-  while HEAD returned 10.** Every answer this campaign has recorded is a prefix of one
-  deterministic sweep -- 4 <= 8 <= 10 <= 11 -- so the answer size is a property of how much work
-  fitted inside the wall-clock deadline, not of the lineage. Run 4's "reproducible 8" was three
-  runs sharing one load regime (loadavg 84-486); run 3's 11 was one run at loadavg 3.8-4.7.
+  that same 11, and the sign of the original delta reverses.** Three pairs, each with both
+  binaries started at the same instant: pair 1 (loadavg 85) returned the *identical* 4 hits on
+  both, at 7,850 CPU-seconds (HEAD side) against 10,734 (comparator); pair 2 (loadavg 14)
+  returned **10 on HEAD and 8 on the comparator**, at 7,287 against 8,751 CPU-seconds, with exact
+  containment `v3(8) < v6(10) < complete(11)`; pair 3 (loadavg 12) returned the *identical* 8 on
+  both, at 6,326 against 8,796 CPU-seconds. **The comparator reproduced run 4's "regressed" 8 in
+  two pairs, and in the one pair that separates the lineages it is HEAD that finds more.** Every
+  answer this campaign has recorded is a prefix of one deterministic sweep -- 4 <= 8 <= 10 <= 11
+  -- so the answer size is a property of how much work fitted inside the wall-clock deadline, not
+  of the lineage. Run 4's "reproducible 8" was three runs sharing one load regime (loadavg
+  84-486); run 3's 11 was one run at loadavg 3.8-4.7.
 
   Three things this leaves behind for the record. **`max_duration_secs` is clamped to 300 s**
   (`SCAN_USAGES_MAX_DURATION_CEILING`, `scan_usages.rs:772`), so every "600 s budget" cell in runs
