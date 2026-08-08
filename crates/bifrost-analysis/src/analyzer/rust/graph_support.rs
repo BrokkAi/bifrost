@@ -1851,12 +1851,548 @@ fn trait_reference_matches(
         })
 }
 
+/// The closure-enumerating reference-context algorithm as it stood before the
+/// per-site rewrite (`.agents/plans/usage-graph-streaming.md`), kept alive for
+/// tests only so the rewrite can be pinned answer-for-answer against it.
+///
+/// This is the house idiom from #1793/#1817 in `cargo_routes.rs`: freeze the
+/// algorithm being replaced, then assert the replacement agrees with it over a
+/// fixture, rather than asserting a handful of hand-picked answers.
+///
+/// It deliberately calls the same leaf helpers the live path uses
+/// (`canonical_export_fqn_from_files`, `collect_export_names_from_files`,
+/// `forward_exported_targets_from_files_with_progress`). What is frozen is the
+/// *composition*: enumerate every export name of every namespace- and
+/// glob-imported module up front, versus resolve the one name a site wrote.
+/// That composition is exactly what the rewrite changes and what design risk 2
+/// names as the thing to prove equal.
+#[cfg(test)]
+pub(super) mod frozen {
+    use super::*;
+
+    #[derive(Debug, Default)]
+    pub(super) struct FrozenReferenceContext {
+        package: String,
+        crate_package: String,
+        named: HashMap<String, String>,
+        namespace: HashMap<String, String>,
+        scoped: HashMap<String, String>,
+        glob: HashMap<String, String>,
+        same_file: HashMap<String, String>,
+    }
+
+    impl FrozenReferenceContext {
+        pub(super) fn resolve_bare(&self, name: &str) -> Option<&str> {
+            self.named
+                .get(name)
+                .or_else(|| self.namespace.get(name))
+                .or_else(|| self.same_file.get(name))
+                .or_else(|| self.glob.get(name))
+                .map(String::as_str)
+        }
+
+        pub(super) fn bare_names_resolving_to(&self, target_fqn: &str) -> HashSet<String> {
+            self.named
+                .iter()
+                .chain(self.namespace.iter())
+                .chain(self.same_file.iter())
+                .chain(self.glob.iter())
+                .filter(|&(_, fqn)| fqn == target_fqn)
+                .map(|(name, _)| name.clone())
+                .collect()
+        }
+
+        pub(super) fn resolve_scoped(&self, path: &str, name: &str) -> Option<String> {
+            self.resolve_scoped_owner(path)
+                .map(|owner| join_rust_fqn(&owner, name))
+        }
+
+        pub(super) fn resolve_scoped_owner(&self, path: &str) -> Option<String> {
+            if let Some(canonical) = self.scoped.get(path) {
+                return Some(canonical.clone());
+            }
+            if let Some((module_path, item_name)) = path.rsplit_once("::")
+                && let Some(package) = self.resolve_scoped_owner(module_path)
+            {
+                return Some(join_rust_fqn(&package, item_name));
+            }
+            if let Some(package) = self.namespace.get(path) {
+                return Some(package.clone());
+            }
+            if is_rooted_rust_module_path(path)
+                && let Some(package) =
+                    resolve_rust_module_path_with_crate(&self.package, &self.crate_package, path)
+            {
+                return Some(package);
+            }
+            self.named
+                .get(path)
+                .or_else(|| self.same_file.get(path))
+                .or_else(|| self.glob.get(path))
+                .cloned()
+        }
+    }
+
+    pub(super) fn build_frozen_reference_context(
+        analyzer: &RustAnalyzer,
+        file: &ProjectFile,
+        forward: bool,
+    ) -> FrozenReferenceContext {
+        let go = &|| true;
+        let binder = analyzer.import_binder_of(file);
+        let mut same_file = HashMap::default();
+        for unit in analyzer.declarations(file) {
+            same_file.insert(unit.identifier().to_string(), unit.fq_name());
+        }
+        let mut named: HashMap<String, String> = HashMap::default();
+        let mut namespace: HashMap<String, String> = HashMap::default();
+        let mut scoped: HashMap<String, String> = HashMap::default();
+        let mut glob_candidates: HashMap<String, HashSet<String>> = HashMap::default();
+        for (local, binding) in &binder.bindings {
+            match binding.kind {
+                ImportKind::Named => {
+                    if let Some(imported) = &binding.imported_name {
+                        let module_files =
+                            analyzer.resolve_module_files(file, &binding.module_specifier);
+                        let resolved = analyzer
+                            .canonical_export_fqn_from_files(&module_files, imported, forward, go)
+                            .expect("uninterrupted frozen export traversal")
+                            .or_else(|| {
+                                analyzer
+                                    .resolve_module_package(file, &binding.module_specifier)
+                                    .map(|package| join_rust_fqn(&package, imported))
+                            });
+                        if let Some(resolved) = resolved {
+                            named.insert(local.clone(), resolved);
+                        }
+                    }
+                }
+                ImportKind::Namespace => {
+                    if let Some(package) =
+                        analyzer.resolve_module_package(file, &binding.module_specifier)
+                    {
+                        namespace.insert(local.clone(), package);
+                    }
+                    insert_namespace_export_bindings(
+                        analyzer,
+                        file,
+                        local,
+                        &binding.module_specifier,
+                        forward,
+                        &mut scoped,
+                    );
+                }
+                ImportKind::Glob => collect_glob_reference_bindings(
+                    analyzer,
+                    file,
+                    &binding.module_specifier,
+                    forward,
+                    &mut glob_candidates,
+                ),
+                ImportKind::Default | ImportKind::CommonJsRequire => {}
+            }
+        }
+        insert_reexport_reference_bindings(analyzer, file, &mut named, forward);
+        let glob = glob_candidates
+            .into_iter()
+            .filter_map(|(name, mut candidates)| {
+                (candidates.len() == 1)
+                    .then(|| (name, candidates.drain().next().expect("one glob candidate")))
+            })
+            .collect();
+        FrozenReferenceContext {
+            package: rust_package_name(file),
+            crate_package: rust_crate_root_package(file),
+            named,
+            namespace,
+            scoped,
+            glob,
+            same_file,
+        }
+    }
+
+    fn insert_namespace_export_bindings(
+        analyzer: &RustAnalyzer,
+        file: &ProjectFile,
+        local: &str,
+        module_specifier: &str,
+        forward: bool,
+        scoped: &mut HashMap<String, String>,
+    ) {
+        let go = &|| true;
+        let module_files = analyzer.resolve_module_files(file, module_specifier);
+        let mut names = HashSet::default();
+        analyzer
+            .collect_export_names_from_files(&module_files, &mut HashSet::default(), &mut names, go)
+            .expect("uninterrupted frozen export-name traversal");
+        for name in names {
+            if let Some(fqn) = analyzer
+                .canonical_export_fqn_from_files(&module_files, &name, forward, go)
+                .expect("uninterrupted frozen export traversal")
+            {
+                scoped.insert(format!("{local}::{name}"), fqn);
+            }
+        }
+    }
+
+    fn collect_glob_reference_bindings(
+        analyzer: &RustAnalyzer,
+        file: &ProjectFile,
+        module_specifier: &str,
+        forward: bool,
+        candidates: &mut HashMap<String, HashSet<String>>,
+    ) {
+        let go = &|| true;
+        let module_files = analyzer.resolve_module_files(file, module_specifier);
+        let mut names = HashSet::default();
+        analyzer
+            .collect_export_names_from_files(&module_files, &mut HashSet::default(), &mut names, go)
+            .expect("uninterrupted frozen export-name traversal");
+        for name in names {
+            if let Some(fqn) = analyzer
+                .canonical_export_fqn_from_files(&module_files, &name, forward, go)
+                .expect("uninterrupted frozen export traversal")
+            {
+                candidates.entry(name).or_default().insert(fqn);
+            }
+        }
+    }
+
+    fn insert_reexport_reference_bindings(
+        analyzer: &RustAnalyzer,
+        file: &ProjectFile,
+        named: &mut HashMap<String, String>,
+        forward: bool,
+    ) {
+        let go = &|| true;
+        let export_index = analyzer.export_index_of(file);
+        for (exported_name, entry) in &export_index.exports_by_name {
+            if let ExportEntry::ReexportedNamed {
+                module_specifier,
+                imported_name,
+            } = entry
+            {
+                let module_files = analyzer.resolve_module_files(file, module_specifier);
+                let mut targets = if forward {
+                    analyzer
+                        .forward_exported_targets_from_files_with_progress(
+                            &module_files,
+                            imported_name,
+                            go,
+                        )
+                        .expect("uninterrupted frozen export traversal")
+                } else {
+                    analyzer.exported_targets_from_files(&module_files, imported_name)
+                };
+                if targets.is_empty() {
+                    targets.extend(analyzer.rust_member_reexport_targets(
+                        file,
+                        module_specifier,
+                        imported_name,
+                    ));
+                }
+                if targets.is_empty() {
+                    targets.extend(
+                        rust_declaration_targets_in_files_with_progress(
+                            analyzer,
+                            &module_files,
+                            imported_name,
+                            go,
+                        )
+                        .expect("uninterrupted frozen declaration traversal"),
+                    );
+                }
+                insert_single_reexport_target(named, exported_name.clone(), targets);
+            }
+        }
+
+        for star in &export_index.reexport_stars {
+            let module_files = analyzer.resolve_module_files(file, &star.module_specifier);
+            let mut export_names = HashSet::default();
+            analyzer
+                .collect_export_names_from_files(
+                    &module_files,
+                    &mut HashSet::default(),
+                    &mut export_names,
+                    go,
+                )
+                .expect("uninterrupted frozen export-name traversal");
+            for export_name in export_names {
+                let mut targets = if forward {
+                    analyzer
+                        .forward_exported_targets_from_files_with_progress(
+                            &module_files,
+                            &export_name,
+                            go,
+                        )
+                        .expect("uninterrupted frozen export traversal")
+                } else {
+                    analyzer.exported_targets_from_files(&module_files, &export_name)
+                };
+                if targets.is_empty() {
+                    targets.extend(
+                        rust_declaration_targets_in_files_with_progress(
+                            analyzer,
+                            &module_files,
+                            &export_name,
+                            go,
+                        )
+                        .expect("uninterrupted frozen declaration traversal"),
+                    );
+                }
+                insert_single_reexport_target(named, export_name, targets);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzer::Language;
     use crate::test_support::AnalyzerFixture;
     use std::cell::Cell;
+
+    /// One crate exercising every reference form the per-site rewrite has to
+    /// answer: named, aliased, namespace and glob imports; a re-export chain
+    /// with a `pub use *` cycle (`cyclic_a` and `cyclic_b` star-import each
+    /// other); a renaming re-export imported by its new name; macro-visibility
+    /// gating; and a same-file declaration shadowing a glob-imported name.
+    pub(super) const EQUIVALENCE_FIXTURE: &[(&str, &str)] = &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub mod wide;\n\
+             pub mod barrel;\n\
+             pub mod consumer;\n\
+             pub mod cyclic_a;\n\
+             pub mod cyclic_b;\n\
+             pub mod macros;\n\
+             pub struct RootType;\n",
+        ),
+        (
+            "src/wide.rs",
+            "pub struct Widget;\n\
+             pub struct Gadget;\n\
+             pub fn make_widget() -> Widget { Widget }\n\
+             pub const LIMIT: usize = 3;\n\
+             pub enum Mode { On, Off }\n\
+             fn private_helper() {}\n",
+        ),
+        (
+            "src/barrel.rs",
+            "pub use crate::wide::Widget;\n\
+             pub use crate::wide::Gadget as Renamed;\n\
+             pub use crate::cyclic_a::*;\n",
+        ),
+        (
+            "src/cyclic_a.rs",
+            "pub use crate::cyclic_b::*;\n\
+             pub struct AlphaItem;\n",
+        ),
+        (
+            "src/cyclic_b.rs",
+            "pub use crate::cyclic_a::*;\n\
+             pub struct BetaItem;\n",
+        ),
+        (
+            "src/macros.rs",
+            "#[macro_export]\n\
+             macro_rules! shout { () => {} }\n\
+             pub fn use_macro() { crate::shout!(); }\n",
+        ),
+        (
+            "src/consumer.rs",
+            "use crate::wide;\n\
+             use crate::barrel;\n\
+             use crate::wide::Widget;\n\
+             use crate::wide::Gadget as Alias;\n\
+             use crate::barrel::Renamed;\n\
+             use crate::barrel::*;\n\
+             pub struct AlphaItem;\n\
+             pub fn consume() {\n\
+             \x20   let _a = Widget;\n\
+             \x20   let _b = wide::make_widget();\n\
+             \x20   let _c = Alias;\n\
+             \x20   let _d = Renamed;\n\
+             \x20   let _e = wide::LIMIT;\n\
+             \x20   let _h = barrel::Widget;\n\
+             \x20   let _i = barrel::Renamed;\n\
+             \x20   let _f = AlphaItem;\n\
+             \x20   let _g = BetaItem;\n\
+             }\n",
+        ),
+    ];
+
+    pub(super) const EQUIVALENCE_FILES: &[&str] = &[
+        "src/lib.rs",
+        "src/wide.rs",
+        "src/barrel.rs",
+        "src/cyclic_a.rs",
+        "src/cyclic_b.rs",
+        "src/macros.rs",
+        "src/consumer.rs",
+    ];
+
+    /// Every name the fixture spells, plus names it does not, so a miss is
+    /// pinned as firmly as a hit.
+    pub(super) const EQUIVALENCE_NAMES: &[&str] = &[
+        "Widget",
+        "Gadget",
+        "Renamed",
+        "Alias",
+        "AlphaItem",
+        "BetaItem",
+        "RootType",
+        "Mode",
+        "LIMIT",
+        "wide",
+        "barrel",
+        "consumer",
+        "cyclic_a",
+        "cyclic_b",
+        "macros",
+        "make_widget",
+        "private_helper",
+        "use_macro",
+        "consume",
+        "shout",
+        "crate",
+        "self",
+        "super",
+        "absent_name",
+    ];
+
+    /// Prefixes probed as whole written paths. The two-segment entries are the
+    /// point of the list: `barrel::Widget` is the case the eager `scoped` map
+    /// exists for, because `barrel` re-exports `Widget` from `wide`, so path
+    /// arithmetic alone would answer `barrel.Widget` where the canonical
+    /// declaration is `wide.Widget`.
+    pub(super) const EQUIVALENCE_PREFIXES: &[&str] = &[
+        "wide",
+        "barrel",
+        "cyclic_a",
+        "cyclic_b",
+        "macros",
+        "crate",
+        "crate::wide",
+        "crate::barrel",
+        "self",
+        "super",
+        "Widget",
+        "Alias",
+        "absent_prefix",
+        "wide::Widget",
+        "wide::make_widget",
+        "wide::absent_name",
+        "barrel::Widget",
+        "barrel::Renamed",
+        "barrel::AlphaItem",
+        "barrel::BetaItem",
+        "barrel::absent_name",
+        "cyclic_a::BetaItem",
+        "crate::wide::Widget",
+        "self::AlphaItem",
+    ];
+
+    pub(super) const EQUIVALENCE_TARGET_FQNS: &[&str] = &[
+        "wide.Widget",
+        "wide.Gadget",
+        "wide.make_widget",
+        "wide.LIMIT",
+        "cyclic_a.AlphaItem",
+        "cyclic_b.BetaItem",
+        "consumer.AlphaItem",
+        "wide",
+        "barrel",
+        "absent.Fqn",
+    ];
+
+    #[test]
+    fn reference_resolution_matches_the_frozen_closure_algorithm() {
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, EQUIVALENCE_FIXTURE);
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let root = fixture.project_root();
+
+        // An equivalence pin over answers that are all `None` proves nothing.
+        // These five are the interesting shapes, and each one is an answer that
+        // path arithmetic alone would get wrong: a name re-exported by the
+        // namespace-imported module, a renaming re-export, a glob name reached
+        // through a `pub use *` cycle, an aliased named import, and a same-file
+        // declaration shadowing a glob-imported name.
+        let consumer = ProjectFile::new(root.clone(), "src/consumer.rs");
+        let anchors = analyzer.reference_context_of(&consumer);
+        assert_eq!(
+            anchors.resolve_scoped_owner("barrel::Widget").as_deref(),
+            Some("wide.Widget")
+        );
+        assert_eq!(
+            anchors.resolve_scoped_owner("barrel::Renamed").as_deref(),
+            Some("wide.Gadget")
+        );
+        assert_eq!(anchors.resolve_bare("BetaItem"), Some("cyclic_b.BetaItem"));
+        assert_eq!(anchors.resolve_bare("Alias"), Some("wide.Gadget"));
+        assert_eq!(
+            anchors.resolve_bare("AlphaItem"),
+            Some("consumer.AlphaItem")
+        );
+
+        for relative in EQUIVALENCE_FILES {
+            let file = ProjectFile::new(root.clone(), relative);
+            for forward in [false, true] {
+                let frozen = frozen::build_frozen_reference_context(&analyzer, &file, forward);
+                let live = if forward {
+                    analyzer.forward_reference_context_of(&file)
+                } else {
+                    analyzer.reference_context_of(&file)
+                };
+
+                for name in EQUIVALENCE_NAMES {
+                    assert_eq!(
+                        live.resolve_bare(name).map(str::to_string),
+                        frozen.resolve_bare(name).map(str::to_string),
+                        "resolve_bare disagreed: file={relative} forward={forward} name={name}"
+                    );
+                }
+                for prefix in EQUIVALENCE_PREFIXES {
+                    assert_eq!(
+                        live.resolve_scoped_owner(prefix),
+                        frozen.resolve_scoped_owner(prefix),
+                        "resolve_scoped_owner disagreed: \
+                         file={relative} forward={forward} prefix={prefix}"
+                    );
+                    for name in EQUIVALENCE_NAMES {
+                        assert_eq!(
+                            live.resolve_scoped(prefix, name),
+                            frozen.resolve_scoped(prefix, name),
+                            "resolve_scoped disagreed: \
+                             file={relative} forward={forward} prefix={prefix} name={name}"
+                        );
+                    }
+                }
+                for target_fqn in EQUIVALENCE_TARGET_FQNS {
+                    let mut live_names: Vec<_> = live
+                        .bare_names_resolving_to(target_fqn)
+                        .into_iter()
+                        .collect();
+                    let mut frozen_names: Vec<_> = frozen
+                        .bare_names_resolving_to(target_fqn)
+                        .into_iter()
+                        .collect();
+                    live_names.sort();
+                    frozen_names.sort();
+                    assert_eq!(
+                        live_names, frozen_names,
+                        "bare_names_resolving_to disagreed: \
+                         file={relative} forward={forward} target={target_fqn}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn forward_reference_context_is_reused_within_analyzer_generation() {
