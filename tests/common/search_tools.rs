@@ -59,6 +59,47 @@ pub fn definition_reference_status(
         .to_string()
 }
 
+/// The `get_definitions_by_location` result for the first byte of `needle` in
+/// `source`, which the caller must have written to `path`.
+pub fn definition_at(
+    project: &BuiltInlineTestProject,
+    path: &str,
+    source: &str,
+    needle: &str,
+) -> Value {
+    let start = source
+        .find(needle)
+        .unwrap_or_else(|| panic!("`{needle}` is not present in {path}"));
+    let prefix = &source[..start];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, current_line)| current_line)
+        .chars()
+        .count()
+        + 1;
+    let args = serde_json::json!({"references": [{"path": path, "line": line, "column": column}]})
+        .to_string();
+    call_tool(project, "get_definitions_by_location", &args)["results"][0].clone()
+}
+
+/// Every `file`/`path` reported in a `get_definitions_by_location` result's
+/// `definitions` list.
+pub fn definition_paths(result: &Value) -> Vec<String> {
+    result["definitions"]
+        .as_array()
+        .map(|definitions| {
+            definitions
+                .iter()
+                .filter_map(|definition| {
+                    definition["file"].as_str().or(definition["path"].as_str())
+                })
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The sorted `path`s of every `get_symbol_sources` `sources` entry in `result`.
 pub fn sorted_source_paths(result: &Value) -> Vec<String> {
     let mut paths: Vec<String> = result["sources"]

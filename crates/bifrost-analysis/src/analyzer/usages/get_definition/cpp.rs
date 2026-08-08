@@ -4410,8 +4410,20 @@ fn resolve_cpp_field(
         field,
         receiver,
     );
+    // Two unrelated failures used to share one message. Claiming the receiver
+    // is unresolved when it typed perfectly well sent the whole class-template
+    // inherited-lookup family's triage at receiver analysis instead of at the
+    // base walk that actually came up empty (#1833). The bounded provider
+    // already draws this line; use its vocabulary.
+    let receiver_resolved = !owners.is_empty();
     let candidates = cpp_member_candidates(ctx, owners, member, arity, arg_types);
     if candidates.is_empty() {
+        if receiver_resolved {
+            return no_definition(
+                "no_indexed_definition",
+                format!("C++ member `{member}` is not indexed for the resolved receiver"),
+            );
+        }
         no_definition(
             "unsupported_cpp_receiver",
             format!("receiver for C++ member `{member}` is not resolved"),
@@ -5325,7 +5337,7 @@ fn cpp_inherited_member_candidates(
     loop {
         let mut bases = Vec::new();
         for owner in &level {
-            for base in cpp_direct_base_types(ctx.analyzer, ctx.visibility, ctx.file, owner) {
+            for base in cpp_direct_base_types(ctx.analyzer, owner) {
                 if seen.insert(base.fq_name()) {
                     if let Some(state) = member_trace.as_deref_mut() {
                         state
@@ -5424,16 +5436,7 @@ fn cpp_filter_candidates_by_call_arg_types(
         candidates,
         &shared_arg_types,
         &|name| cpp_resolve_type_unit(analyzer, visibility, file, name),
-        &|arg_type, param_type| {
-            cpp_type_assignable_to(
-                analyzer,
-                visibility,
-                file,
-                arg_type,
-                param_type,
-                &mut HashSet::default(),
-            )
-        },
+        &|arg_type, param_type| cpp_type_assignable_to(analyzer, arg_type, param_type),
     )
 }
 
@@ -5519,73 +5522,47 @@ fn cpp_known_callable_arity(
     )))
 }
 
+/// Whether `arg_type` is `param_type` or derives from it.
+///
+/// The derivation walk is an explicit worklist rather than a recursion: a
+/// chain can be long, and a recovered translation unit can describe a cyclic
+/// derivation. `visited` closes the cycle and bounds the walk.
 fn cpp_type_assignable_to(
     analyzer: &dyn IAnalyzer,
-    visibility: &CppVisibilityIndex,
-    file: &ProjectFile,
     arg_type: &CodeUnit,
     param_type: &CodeUnit,
-    seen: &mut HashSet<String>,
 ) -> bool {
-    if arg_type.fq_name() == param_type.fq_name() {
-        return true;
+    let mut visited = HashSet::default();
+    let mut pending = vec![arg_type.clone()];
+    while let Some(current) = pending.pop() {
+        if current.fq_name() == param_type.fq_name() {
+            return true;
+        }
+        if !visited.insert(current.fq_name()) {
+            continue;
+        }
+        pending.extend(cpp_direct_base_types(analyzer, &current));
     }
-    if !seen.insert(arg_type.fq_name()) {
-        return false;
-    }
-    cpp_direct_base_types(analyzer, visibility, file, arg_type)
-        .into_iter()
-        .any(|base| {
-            base.fq_name() == param_type.fq_name()
-                || cpp_type_assignable_to(analyzer, visibility, file, &base, param_type, seen)
-        })
+    false
 }
 
-fn cpp_direct_base_types(
-    analyzer: &dyn IAnalyzer,
-    visibility: &CppVisibilityIndex,
-    file: &ProjectFile,
-    unit: &CodeUnit,
-) -> Vec<CodeUnit> {
-    let signature = unit
-        .signature()
-        .map(str::to_string)
-        .or_else(|| analyzer.get_source(unit, false));
-    let Some(signature) = signature else {
-        return Vec::new();
-    };
-    let Some((_, bases)) = signature.split_once(':') else {
-        return Vec::new();
-    };
-    let bases = bases.split('{').next().unwrap_or(bases);
-    // Base-class specifiers are frequently written relative to the enclosing namespace
-    // (`struct Derived : PCM::Base` inside `namespace Outer`, meaning `Outer::PCM::Base`).
-    // Resolve them the same namespace-relative way `cpp_resolve_type_unit_in_namespace`
-    // already resolves other qualified type references in this file (issue #939) --
-    // without this, a relatively-qualified base silently fails to resolve and every
-    // inherited-member lookup through it (bare calls here, and overload-assignability
-    // checks in `cpp_type_assignable_to`) fails forward.
-    let lexical_namespace = (!unit.package_name().is_empty()).then(|| unit.package_name());
-    cpp_split_top_level_commas(bases)
-        .filter_map(|base| {
-            cpp_resolve_type_unit_in_namespace(
-                analyzer,
-                visibility,
-                file,
-                &cpp_base_type_text(base),
-                lexical_namespace,
-            )
-        })
-        .collect()
-}
-
-fn cpp_base_type_text(base: &str) -> String {
-    let filtered = base
-        .split_whitespace()
-        .filter(|token| !matches!(*token, "public" | "private" | "protected" | "virtual"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    normalize_cpp_type_text(&filtered)
+/// The direct base classes of `unit`, read from the analyzer's supertype edges.
+///
+/// Those edges are built from the `base_class_clause` the C++ declaration walk
+/// took off the AST, so they are correct for every class head shape, and they
+/// already resolve a base spelled relative to an enclosing namespace by
+/// searching the same namespace chain (issue #939).
+///
+/// The previous implementation recovered the base list by splitting the class's
+/// *rendered signature* at its first `:`. A class template renders with a
+/// `template <...>` prefix, so that colon belongs to the template head and the
+/// base list came back empty: every inherited member of every class template
+/// was unreachable, while the identical non-template class resolved (#1833).
+fn cpp_direct_base_types(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<CodeUnit> {
+    analyzer
+        .type_hierarchy_provider()
+        .map(|hierarchy| hierarchy.get_direct_ancestors(unit))
+        .unwrap_or_default()
 }
 
 /// A C++ value type paired with its pointer indirection depth: 0 for a value or
