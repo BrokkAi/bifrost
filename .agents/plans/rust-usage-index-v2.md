@@ -22,7 +22,7 @@ The design transliterates IntelliJ's indexing architecture, verified against `/h
 - [x] (2026-08-07 21:30Z) Milestone 2b: `identities_by_name` is gone from `RustUsageIndex`. The per-file declaration-identity derivation is now one shared function that both the v1 build and the query layer call, and the workspace-wide name bucket is replaced by the store's indexed short-name lookup plus per-candidate verification. `module_importers` and `importer_reverse` did NOT move; the Decision Log records why they cannot until 2c exists.
 - [x] (2026-08-07 23:55Z) Milestone 2c: migrate the cross-file group (`module_files`, `module_aliases`, `physical_owners`, `actual_crate_roots`, export chains) to memoized bounded walks, add the `module_resolution` / `export_chain` / `resolve` caches, and finish the consumer switch so `RustUsageIndex` is unused. Now also carries `module_importers` and `importer_reverse`, whose verification step IS the forward-edge computation 2c introduces. Decomposition and dependency order recorded in the Decision Log.
 - [x] (2026-08-08 02:40Z) Milestone 3: invalidation and readiness. The v1 warm is gone from every path: `warm_usage_index` is deleted, `warm_query_indexes` and the MCP `StartupIndexWarm` thread run the new per-file fact catch-up instead, and `usage_index_ready` reports the catch-up set rather than the unread index. Catch-up policy implemented with the threshold constant (20), inline below it and on the dedicated build pool at or above it. `update` / `update_all` audited: they already rotate every v2 cache correctly, and the pinning test proves it.
-- [ ] Milestone 4: kill-gate benchmark on a large Rust workspace; gates defined below must pass. RUN 1 (2026-08-07): all three gates FAIL for v2, and fail identically for v1. The failure is not attributable to v2 -- `RustAnalyzer::build_cargo_routes` consumes 87-97% of every cell. Numbers and decomposition in Outcomes; the plan stops here pending an owner decision.
+- [ ] Milestone 4: kill-gate benchmark on a large Rust workspace; gates defined below must pass. RUN 1 (2026-08-07): all three gates FAIL for v2, and fail identically for v1. The failure is not attributable to v2 -- `RustAnalyzer::build_cargo_routes` consumes 87-97% of every cell. RUN 2 (2026-08-08, after both prerequisites landed): gates 1 and 2 still FAIL; gate 3 passes as measured but the measurement is not load-bearing. The gate cells still do not reach either usage layer, because `build_cargo_routes` is still 87-91% of the scan -- now 9-19 s of Cargo-topology orchestration rather than 34-44 s of parsing. Supplementary runs at a raised budget DID reach both layers and produced the first direct comparison: `RustUsageIndex::build` 83.68 s against `rust_fact_catch_up` 0.20 s. They also found a new v2-specific defect: at a 60 s or 120 s budget the v2 scan does not terminate where v1 does. Numbers and decomposition in Outcomes; the plan stops here.
   - [x] (2026-08-08) Milestone 4 prerequisite, issue #1793: `RustCargoRouteIndex` no longer hydrates and parses every analyzed Rust file. The three things the build read out of each file's tree are per-blob rows written at analysis time (migration `0017-rust-module-routes.sql`, cache schema 16 -> 17, four tables, extraction in `parse_rust_file`), and the build is one batched read of them plus the Cargo manifests, which measurement showed are cheap. Cargo manifests stay on disk. The rerun of the gate itself is a separate task.
   - [x] (2026-08-08) Milestone 4 prerequisite, issues #1748 and #1774: the `sql_definition_candidates` half of the shared candidate-discovery storm is gone, and the #1774 live-path scan is memoized per request. Three changes, all in shared code and all language neutral: `definitions(fq_name)` is memoized for the life of an `AnalyzerQueryScope`; the whole-workspace live-path walk that every non-persisted declaration scan re-took is materialized at most once per request, with the narrowing `keep` predicate deliberately left outside the memo; and `ImportAnalysisProvider` gained a `prefetch_import_targets` hook so the workspace-wide importer walk resolves every import target it will ask about in one chunked `IN` seek instead of one point lookup per `use` statement. On the counter-pinned fixture a warm Rust usage query charges 1 batched read and 1 point lookup where 32 import statements previously charged one each. The other measured multiplicity, `project::collect_workspace_files` running 64-137 times, is NOT fixed here and is not attributed; see Surprises. The gate rerun remains a separate task.
 - [ ] Milestone 5: delete v1 (the seventeen-map struct and its warm machinery), close out issues and docs. BLOCKED by the Milestone 4 gate.
@@ -75,6 +75,14 @@ The design transliterates IntelliJ's indexing architecture, verified against `/h
 - Observation (#1793): the manifest half of the build is measured cheap, so it stays on disk. The rustc tree has 347 `Cargo.toml` files totalling 207 KB, which read and TOML-parse in 4.9 ms warm (89 ms on a cold page cache), against 35,370 `.rs` files whose hydration and parsing cost 34-44 s. The build parses the manifest set about three times (`discover_cargo_manifest_directories` plus two `build_from_module_children_while` passes), so the whole manifest cost is on the order of 15 ms. Persisting manifests would have added a table keyed by a hash of a file that is not an analyzed blob, for no measurable gain.
   Evidence: measured with the workspace's own `toml` crate over `/mnt/T9/repo-clones/.codescale-sources/rust--01f6ddf7`, read-only, three repetitions.
 - Observation (#1793): byte-identical files share one blob, and that shows up immediately in the new read. The structural-pin fixture has sixteen files but only three distinct blobs, because most of its module files have identical bodies. The batched read is therefore keyed by oid and fanned back out to files by the live snapshot, and "no rows for this blob" is the only missing-data case there is.
+- Observation (Milestone 4, run 2): #1793 did exactly what it claimed and the wall moved rather than fell. Sub-span instrumentation inside `RustAnalyzer::build_cargo_routes` (13.23 s total on the rustc tree) splits it as `cargo_routes.facts_read` **0.18 s**, `manifests` 0.30 s, `physical_routes` 4.15 s, `macro_visibility` 3.79 s, `passthrough_fixpoint` 0.18 s, `final_routes` 4.59 s. The per-blob row read that replaced hydrating and parsing every file is 1.4% of the build; the other 12.5 s is `RustCargoRouteIndex::build_while`'s Cargo-topology orchestration -- two whole-workspace `build_from_module_children_while` passes plus a per-Cargo-target sweep that iterates every file again -- which #1793 did not touch and which the 34-44 s of parsing used to hide. It is still charged inside the scan's own 3 s budget, so the gate cells still never reach a usage layer.
+  Evidence: binary v2s (HEAD plus six `profiling::scope` calls in `build_cargo_routes` and nothing else), cell (a) warm; `cargo_routes.rs:194` `build_while`, the per-target loop at `cargo_routes.rs:242-278`.
+- Observation (Milestone 4, run 2): the two prerequisites, not v2, are what moved every number the first run reported. V1P -- `b86e575a` with `d4a82ef4` and `366cb82e` cherry-picked, so the v1 usage implementation with the v2 prerequisites -- measures 0.45-0.56 GB peak RSS and 16-24 s per cell, against unmodified v1's 14.22-14.35 GB and 31-80 s. So the 14 GB run 1 charged to the gate was never `RustUsageIndex`; it was the Cargo-route build parsing every file plus the candidate-discovery storm. In the gate configuration v2 and V1P are indistinguishable ((a) warm 12.82 s vs 16.52 s, (c) 24.05 s vs 24.23 s, RSS equal to two decimals), which is expected because neither usage layer runs there.
+- Observation (Milestone 4, run 2): with the budget raised until the layers actually run, the plan's central claim is measured and it holds. `RustUsageIndex::build` fires once on the v1 lineage at **83.68 s**, charging `RustAnalyzer::export_index_of_declarations` 35,357 times -- once per workspace file -- and driving a 30.57 GB peak. Its v2 replacement `RustAnalyzer::rust_fact_catch_up` fires once at **0.20 s** (85 ms in a second run), with a 16.37 GB peak. That is the first direct measurement of the structure this plan removes, across both runs of the gate.
+- Observation (Milestone 4, run 2): the counter-finding is that v2 does not honour a longer deadline. Paired at every budget on the same workspace and cell: at 30 s, v1p terminates at 33.89 s and v2i at 34.90 s; at 60 s, v1p terminates at 72.15 s and v2i is still running when killed at 540 s; at 120 s, v1p terminates at 126.96 s and v2i is still running when killed at 1800 s. `usages::candidate_discovery` never emits an END on v2 while its inner spans keep firing, so the process is working rather than deadlocked. Two candidate causes, neither proven: a walk region in `usage_walks.rs` that does not poll cancellation, and issue #1809's superlinear blowup on cyclic module graphs reached on the real rustc graph rather than on the inline fixture. This is the first evidence in either run that points at v2's own code, and it has to be diagnosed before the gate is run a third time.
+- Observation (Milestone 4, run 2): the run-1 open attribution for `project::collect_workspace_files` is settled, and the answer is that it is time-proportional and shared. The probe binary reports `Project::workspace_file_listing_count` = **11** with **1** actual walk in every gate cell, and **55** requests against **45** walks at a 30 s budget -- on the analyzer snapshot's own `Project`, so the walks are that instance's cache misses and not some other object's. The rate is about two walks per second of scan wall time at every budget (45 in ~20 s, 1044 in 540 s, 3464 in 1800 s) and it is the same on the v1 lineage (v1p: 41 at a 30 s budget, 203 in 127 s). Run 1's 64-137 figure came from its 120 s runs; the rate matches and only the run lengths differ. Nothing here amplifies per candidate.
+- Observation (Milestone 4, run 2): `d4a82ef4`'s macro token-tree expansion has no measurable cost at scale, which the plan flagged as unmeasured. Full analyzer build over 35,370 files, run back to back with the page cache pre-warmed: v1 (schema 16) 116.6 s, v1p (schema 17, same extraction as HEAD) 128.7 s, v2 (schema 17) 104.6 s, all at 1.34-1.35 GB peak. V1P is 10% slower than v1 and v2 is 10% faster, with host load varying 20x across the three, so the difference is inside this host's noise. The persisted cost is real and small: the store grew 842.5 MB to 847.2 MB, +0.55%, for four new tables.
+- Observation (Milestone 4, run 2): the cache-schema question run 1 did not have has no teeth. `CURRENT_MIGRATION_VERSION` is 16 at `b86e575a` and 17 at `d4a82ef4` and HEAD, and the store file carries the version in its name, so a v16 binary writes `bifrost_cache.v16.db` beside a v17 binary's `bifrost_cache.v17.db` and the two never meet. No compatibility failure is reachable; each lineage was still given its own cache built by its own binary.
 - Observation: only three of the seventeen `RustUsageIndex` products are genuinely cross-file (module-file resolution, alias routes, transitive export chains), and each is a bounded walk from a seed, not a closure. Everything else is a per-file fact or a per-file fact plus a SQL index.
   Evidence: classification table in research report section 7.3.
 - Observation (#1748): the 397k-662k `sql_definition_candidates.rows` figure is exactly "one store round trip per `use` statement in the workspace", and the arithmetic says so before any profile does. 397,000 / 35,370 files = 11.2 and 662,000 / 35,370 = 18.7, which are import counts per file, not candidate counts. The mechanism is `find_direct_importers_with_cancellation` (`usages/candidates.rs`), which visits EVERY analyzed workspace file and asks `import_provider.could_import_file(candidate, imports, target)`; `RustAnalyzer::could_import_file` answers by resolving each `use` path to an fq name and calling `self.inner.definitions(&fq_name)`, and each of those opens its own pooled reader, transaction and generation check. It is charged twice per file in practice, because when the answer is `false` -- which it is for nearly every file -- the caller immediately resolves the same imports again through `imported_code_units_of`.
@@ -203,6 +211,15 @@ The design transliterates IntelliJ's indexing architecture, verified against `/h
 - Decision (Milestone 4): the benchmark built four binaries, not two. `RustAnalyzer::build_cargo_routes` had no profiling scope of its own -- the only cargo-route span in the tree is `RustUsageIndex::build::cargo_routes`, which is inside a build v2 never performs -- so cell (c) could not be decomposed at all on v2. Two extra binaries (`v1i`, `v2i`) add exactly one `profiling::scope("RustAnalyzer::build_cargo_routes")` to `build_cargo_routes_while` and change nothing else; the gate verdicts are read off the unmodified v1 and v2 binaries and the instrumented pair supplies the attribution. They were built in throwaway detached worktrees so no source file in the working tree was touched, and the worktrees were removed afterwards.
   Rationale: a subtracted number that nobody can source to a span is not evidence. The alternative -- reporting cell (c) end to end only -- would have left the plan unable to distinguish "v2 is slow" from "something outside v2 is slow", which is the single question the cell exists to answer.
   Date/Author: 2026-08-07 / Opus (measurement).
+- Decision (Milestone 4, run 2): the gate verdicts are read against **V1P** -- `b86e575a` with `d4a82ef4` and `366cb82e` cherry-picked -- rather than against unmodified `b86e575a`, and both are reported.
+  Rationale: the gate compares v1-as-it-was against v2-as-delivered, but run 1 proved v1-as-it-was cannot start on this workspace, so its numbers bound nothing. V1P is the v1 usage implementation carrying exactly the two prerequisites v2 also carries, which is the only comparator that isolates the usage layer. It is honest about its provenance: `d4a82ef4` conflicted in two files, the plan file (documentation, incoming side taken) and `store/mod.rs`, where the HEAD side of the single hunk was EMPTY because the base lacks the Milestone 3 helpers the patch's context carried -- so the resolution was to drop three marker lines and keep the incoming block verbatim, with no line of the patch rewritten. Neither file version contains a literal `=======` line the marker strip could have eaten (verified). `366cb82e` applied clean. V1P compiled without error. A hand-port was not attempted and would have been refused.
+  Date/Author: 2026-08-08 / Opus (measurement).
+- Decision (Milestone 4, run 2): gate 3 is recorded as PASS-as-measured with the caveat attached, not as a clean pass.
+  Rationale: v2's peak RSS across (a)-(c) is 0.45-0.56 GB against a 4 GB bar, which is what the plan asked for. But the figure is where the process got before the 3 s deadline stopped it, not a plateau -- the same binary at a 30 s budget peaks at 16.02 GB -- and V1P measures the same 0.45-0.56 GB, so the reduction is the prerequisites' and not v2's. Recording it as a clean pass would credit v2 with a number it did not produce and would hide that the query performed no usage work. Gates 1 and 2 fail regardless, so nothing turns on the distinction except honesty.
+  Date/Author: 2026-08-08 / Opus (measurement).
+- Decision (Milestone 4, run 2): each cell was run twice in the same cache state, once with `BIFROST_TIMING` unset and once with it set, and the two are never mixed.
+  Rationale: run 1's limitation 4 recorded that timing is not free on v2. Splitting the run gives an unperturbed wall clock and RSS for the verdict and a span decomposition for the attribution, at the cost of doubling the cell count. The alternative -- one timed run per cell -- would have put span I/O inside every gate number.
+  Date/Author: 2026-08-08 / Opus (measurement).
 - Decision (Milestone 4): the cell-(c) figure after subtracting the cargo-routes span (7.70 s, under the 10 s bar) is recorded as a decomposition and NOT as a conditional pass.
   Rationale: the residual is analyzer construction plus 1.33 s of scan work, and the scan had not resolved the symbol when its deadline fired. A subtraction can show where the time went; it cannot show that the remaining code would have met the bar, because that code did not run. Recording it as "passes once cargo_routes is discounted" would license Milestone 5 on the strength of work that was never measured.
   Date/Author: 2026-08-07 / Opus (measurement).
@@ -524,6 +541,95 @@ was removed on the way past: `present_reference_only_sibling_extensions_by_langu
 deep-cloned the project's entire file listing to read extensions off it, and now
 reads the shared `Arc`.
 
+Milestone 4, run 2 (2026-08-08, after both prerequisites). **Gates 1 and 2 still
+FAIL. Gate 3 passes as measured, and that pass is not load-bearing. Milestone 5
+stays blocked.** Full report, repro commands and limitations:
+`usage-v2-killgate-v2.md` in the session scratchpad; the deciding numbers are
+reproduced here.
+
+Setup. Same rustc tree as run 1 (`rust--01f6ddf7` @ `525258043d7f9dcc`, 35,370
+`.rs` files), same cells, same cell-(b) selection -- the plan's own
+`ORDER BY COUNT(*) DESC` re-run on the run-2 cache returns `main` at 22,976 blobs
+again, identical to run 1. Three gate binaries instead of two: **v1** =
+`b86e575a` unchanged (cache schema **16**), **v1p** = `b86e575a` with `d4a82ef4`
+and `366cb82e` cherry-picked (schema **17**), **v2** = HEAD `366cb82e` (schema
+17). Two measurement-only binaries: **v2i** adds one `eprintln` of
+`Project::workspace_file_listing_count` to `run_tool`, **v2s** adds six
+`profiling::scope` calls inside `build_cargo_routes`. All five featureless
+release builds through `scripts/with-isolated-cargo-target.sh` in throwaway
+detached worktrees, identity verified by distinguishing strings. One cache per
+lineage, each built by its own binary; the schema-16/17 split is a non-issue
+because the version is in the file name. Each cell run twice in the same cache
+state, untimed then timed. Host busy and variable (loadavg 4-399), one
+repetition per cell.
+
+Gate results, product default budget, untimed runs (wall s / peak RSS GB):
+
+| cell | v1 warm | v1p warm | v2 warm |
+| --- | --- | --- | --- |
+| (a) | 79.56 / 14.22 | 16.52 / 0.47 | **12.82 / 0.46** |
+| (b) | 33.15 / 14.22 | 18.92 / 0.47 | **18.12 / 0.46** |
+| (c) edited | 31.54 / 14.35 | 24.23 / 0.56 | **24.05 / 0.56** |
+
+Every cell on every binary: `resolved=0 total_hits=0 failure=1`,
+`reason_kind=time_budget`. Nothing was answered, in either run of this gate.
+
+Verdicts, each with its deciding measurement. **Gate 1(a) FAILS** on the absolute
+bar: v2 (a) warm = **12.82 s** against 5 s, 2.6x over; the relative half passes
+against v1p (0.78x, inside 2x) but the plan's text is an AND and the query
+returns nothing. **Gate 1(b) FAILS**: v2 (b) warm = **18.12 s** against 5 s.
+**Gate 2 FAILS**: v2 (c) = **24.05 s** against 10 s. **Gate 3 PASSES as
+measured**: v2 peak RSS **0.45-0.56 GB** against 4 GB, a 25x reduction from run
+1's 14.2 GB -- but the Decision Log records why that is not a clean pass, and
+V1P measures the same 0.45-0.56 GB, so the reduction belongs to the
+prerequisites rather than to v2.
+
+The GO/NO-GO check failed again: `RustUsageIndex::build` is absent from every v1
+cell and `RustAnalyzer::rust_fact_catch_up` from every v2 cell, so **the gate
+cells did not compare the usage layers.** What consumed the budget is recorded in
+Surprises: `build_cargo_routes` is down from 34-44 s to 9-19 s but is still
+87-91% of the scan, and the surviving cost is Cargo-topology orchestration
+(12.5 s) rather than the per-file read #1793 replaced (0.18 s).
+
+Cell (c) decomposition, v2, warm cache, one edited file: wall 19.12 s, of which
+`searchtools.scan_usages_backend` 16.22 s, of which **`build_cargo_routes`
+15.00 s (78% of wall)** and all other scan work **1.22 s**;
+`mcp_cold.analyzer_construction` 2.40 s, containing `WorkspaceAnalyzer::build`
+1.98 s and the edited file's `reconcile_file_states` 1.84 s. On v2i the same
+cell is 13.81 s with 9.76 s of cargo routes, leaving 4.05 s -- **recorded as a
+decomposition, not as a conditional pass**, exactly as in run 1, because the scan
+still produced no answer. What cell (c) does now establish is that the
+single-file edit itself is cheap: 1.84 s to re-analyze the file, and no
+whole-workspace usage structure rebuilt on either implementation.
+
+The supplementary runs are where this run earns its keep. Raising
+`max_duration_secs` until the layers actually run gives the first direct
+measurement of the thing this plan removes: **`RustUsageIndex::build` fires once
+at 83.68 s** on the v1 lineage, charging `export_index_of_declarations` 35,357
+times and peaking at 30.57 GB, while **`rust_fact_catch_up` fires once at
+0.20 s** on v2. Nothing in either run argues against the redesign's premise.
+
+It also found the first defect that points at v2's own code. Paired at every
+budget: at 30 s both lineages terminate (v1p 33.89 s, v2i 34.90 s); at 60 s v1p
+terminates at 72.15 s and v2i is still running when killed at 540 s; at 120 s
+v1p terminates at 126.96 s and v2i is still running when killed at 1800 s.
+`usages::candidate_discovery` never emits an END on v2 while its inner spans keep
+firing. Candidate causes -- a walk region that does not poll cancellation, or
+#1809 reached on the real module graph -- are recorded in Surprises and neither
+is proven. This must be diagnosed before the gate runs a third time.
+
+The run-1 open attribution is closed. `Project::workspace_file_listing_count` is
+11 with 1 actual walk in every gate cell and 55 requests against 45 walks at a
+30 s budget, on the analyzer snapshot's own project; the walks scale at about two
+per second of scan wall time and the v1 lineage charges the same rate. It is
+shared, time-proportional, and not v2's.
+
+Two blockers remain in front of this gate and one of them is new to this run:
+`RustCargoRouteIndex::build_while`'s Cargo-topology orchestration at 12.5 s
+inside a 3 s budget, and shared candidate discovery which still does not converge
+(105 s of a 121 s scan on v1p). Both want the open-issue search before anything
+is filed. Neither is in this plan's scope; the deadline defect is.
+
 ## Context and Orientation
 
 The repository is Bifrost, a multi-language code analyzer at `/mnt/optane/bifrost-nlp` (branch `bifrost-nlp-ft`). The per-workspace analysis cache is a SQLite database whose schema lives in numbered migrations under `crates/bifrost-core/migrations/cache/` (baseline `0001-current-baseline.sql`; later migrations add to it). The database file name carries the schema version (`bifrost_cache.v15.db` today); find the constant that produces that number and the migration-registration mechanism before adding a migration, and follow the existing pattern exactly. Adding tables bumps the cache version, which invalidates existing prewarmed caches -- acceptable now, because the next benchmark campaign re-prewarms with per-repository caches anyway (see `.agents/plans/codescalebench-grep-hard-cleanup-eval.md` Decision Log).
@@ -666,6 +772,7 @@ No new crates. At the end: four new store tables as specified in Milestone 1 (fi
 
 ## Revision notes
 
+- 2026-08-08 (Milestone 4 run 2, measurement only): recorded the rerun of the kill gate after both prerequisites landed. Updated the Milestone 4 entry in Progress with the run-2 verdict. Added six observations to Surprises & Discoveries -- the sub-span decomposition showing #1793's read is 1.4% of `build_cargo_routes` and the surviving 12.5 s is Cargo-topology orchestration, the V1P finding that the prerequisites rather than v2 moved every run-1 number, the first direct measurement of `RustUsageIndex::build` (83.68 s) against `rust_fact_catch_up` (0.20 s), the new v2-specific non-termination at a 60 s and 120 s budget with paired v1p comparators, the now-settled `collect_workspace_files` attribution, and the absence of a measurable macro-expansion cost in the analyzer build. Added three decisions covering the choice of V1P as the comparator and how its cherry-pick conflicts were resolved, why gate 3 is recorded as pass-as-measured rather than a clean pass, and the untimed/timed split of every cell. Wrote the run-2 entry in Outcomes & Retrospective. No source file changed; the two instrumented binaries were built in throwaway detached worktrees, which were removed. Milestone 5 stays blocked.
 - 2026-08-08 (Milestone 4 prerequisite, issues #1748 and #1774): added a second sub-entry under Milestone 4 in Progress recording that the `sql_definition_candidates` half of the shared candidate-discovery storm is fixed and that the listing half is not. Added four observations to Surprises & Discoveries -- the arithmetic identifying the multiplicity as one store round trip per `use` statement and the double charge that comes with it, the per-language precedents (Python, JS/TS) that Rust was missed by and why per-file caching alone would not have sufficed at this scale, the open and explicitly unattributed `collect_workspace_files` count with the two facts that make it plausible without per-lookup amplification and the measurement that would settle it, and the out-of-scope superlinear blowup of the Rust usage walks on a cyclic module import graph that constrains any fixture here. Added six decisions covering what the #1774 memo holds and why `keep` stays outside it, why a cancelled walk publishes nothing, the request-scoped `definitions` memo, the defaulted provider hook instead of a signature change, the shared assembly function behind both the point and batched paths, and why no count-based early trip was added. Wrote the prerequisite entry in Outcomes & Retrospective with before/after counters. Milestone 5 stays blocked; the gate rerun is still a separate task.
 - 2026-08-08 (Milestone 4 prerequisite, issue #1793): added a sub-entry under Milestone 4 in Progress recording that the Cargo-route rebuild the kill-gate run blamed is fixed, and that the gate rerun is a separate task. Added five observations to Surprises & Discoveries -- the three-item list of what the route build actually read from a tree, the macro-passthrough verdict being the one thing that is not a per-file fact and the gate that carries it, the symlink reason a `#[path]` chain cannot be collapsed, the manifest measurement that kept manifests on disk, and the shared-blob effect on the batched read. Added seven decisions covering the four-table shape, the manifest call, optimistic macro expansion, the per-file parse recovery instead of the Milestone 3 catch-up, the edge-level equivalence pin with the frozen syntax walk, the batched reader beside the per-blob one, and the per-analyzer fallback counter. Wrote the prerequisite entry in Outcomes & Retrospective. Milestone 5 stays blocked; nothing in this change licenses it.
 - 2026-08-07 (Milestone 4 run 1, measurement only): recorded the kill-gate result in Progress and Outcomes & Retrospective, and added three observations to Surprises & Discoveries -- that `build_cargo_routes` is charged inside the scan's own three-second budget and consumes 87-97% of every cell rather than only cell (c), that neither implementation reaches its usage layer at all so the benchmark did not compare them, and that the costs behind cargo_routes belong to shared candidate discovery rather than to v2. Added one decision recording why two extra instrumented binaries were built and why the cell-(c) subtraction is not a passing verdict. No source file changed; the instrumented binaries were built in throwaway detached worktrees, which were removed. Milestone 5 is marked blocked.
