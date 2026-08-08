@@ -19,10 +19,21 @@
 //! that, a whole-workspace index build started off the request path is still
 //! duplicated -- serially -- by the first request whose parallel fan-out
 //! touches the index (issue #1757).
+//!
+//! Running on the dedicated pool is one way to reach a value without a
+//! global-pool worker, not the only one. A build that is pure store I/O -- a
+//! SQLite read on its own reader connection -- also reaches its value with no
+//! rayon worker at all, so a global-pool worker may park on it for exactly the
+//! same reason. [`PoolSafeMemo::get_or_try_build_pool_independent`] is that
+//! claim, and [`KeyedPoolSafeMemo`] applies it per key to the request-scoped
+//! read-through memos whose stampede it exists to stop (issue #1748).
 
 use std::cell::Cell;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::hash::Hash;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::Duration;
+
+use crate::hash::HashMap;
 
 const CANCELLABLE_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -69,29 +80,31 @@ pub(crate) struct PoolSafeMemo<T> {
 struct MemoState<T> {
     value: Option<Arc<T>>,
     builders: usize,
-    /// Of `builders`, how many run on [`dedicated_build_pool`].
-    dedicated_builders: usize,
+    /// Of `builders`, how many reach their value without consuming a worker of
+    /// the global rayon pool: a build running on [`dedicated_build_pool`], or a
+    /// store read that only blocks on its own SQLite reader connection.
+    pool_independent_builders: usize,
 }
 
 impl<T> MemoState<T> {
     /// Whether the calling thread may park on an in-flight build.
     ///
     /// Off the rayon pool: always -- parking cannot starve a rayon build. On a
-    /// global-pool worker: only while a dedicated-pool build is in flight,
+    /// global-pool worker: only while a pool-independent build is in flight,
     /// because that build reaches its value without this worker. On a
     /// dedicated-pool worker: never.
     fn parking_is_safe(&self) -> bool {
         if rayon::current_thread_index().is_none() {
             return true;
         }
-        !ON_DEDICATED_BUILD_POOL.with(Cell::get) && self.dedicated_builders > 0
+        !ON_DEDICATED_BUILD_POOL.with(Cell::get) && self.pool_independent_builders > 0
     }
 }
 
 /// Releases one builder claim and wakes waiters when a build finishes.
 struct BuildingGuard<'a, T> {
     memo: &'a PoolSafeMemo<T>,
-    dedicated: bool,
+    pool_independent: bool,
 }
 
 impl<T> Drop for BuildingGuard<'_, T> {
@@ -99,12 +112,12 @@ impl<T> Drop for BuildingGuard<'_, T> {
         let mut state = self.memo.state.lock().expect("pool memo poisoned");
         assert!(state.builders > 0, "pool memo builder count underflow");
         state.builders -= 1;
-        if self.dedicated {
+        if self.pool_independent {
             assert!(
-                state.dedicated_builders > 0,
-                "pool memo dedicated builder count underflow"
+                state.pool_independent_builders > 0,
+                "pool memo pool-independent builder count underflow"
             );
-            state.dedicated_builders -= 1;
+            state.pool_independent_builders -= 1;
         }
         self.memo.ready.notify_all();
     }
@@ -116,7 +129,7 @@ impl<T> PoolSafeMemo<T> {
             state: Mutex::new(MemoState {
                 value: None,
                 builders: 0,
-                dedicated_builders: 0,
+                pool_independent_builders: 0,
             }),
             ready: Condvar::new(),
         }
@@ -142,9 +155,9 @@ impl<T> PoolSafeMemo<T> {
 
     /// Wait for an in-flight build when this caller may block, or claim the
     /// builder role. Returns the value if one became available while waiting.
-    /// A rayon worker only waits for a build running on
-    /// [`dedicated_build_pool`]: parking a worker on a build whose `par_iter`
-    /// join may steal a job that re-enters this memo deadlocks the pool, so
+    /// A rayon worker only waits for a build that reaches its value without a
+    /// global-pool worker: parking a worker on a build whose `par_iter` join
+    /// may steal a job that re-enters this memo deadlocks the pool, so
     /// otherwise it duplicates the build serially (first write wins).
     fn wait_or_claim_build(&self, claim: BuildClaim) -> Option<Arc<T>> {
         let mut state = self.state.lock().expect("pool memo poisoned");
@@ -157,8 +170,8 @@ impl<T> PoolSafeMemo<T> {
                 continue;
             }
             state.builders += 1;
-            if claim == BuildClaim::Dedicated {
-                state.dedicated_builders += 1;
+            if claim == BuildClaim::PoolIndependent {
+                state.pool_independent_builders += 1;
             }
             return None;
         }
@@ -205,7 +218,7 @@ impl<T> PoolSafeMemo<T> {
     /// (ExecPlan Milestone 3, and Milestone 5 deleted the index itself).
     /// Issue #1772 wants this for the type-hierarchy warm, which is the next
     /// whole-workspace build to move off the request path, and deleting it
-    /// would also delete the `dedicated_builders` parking rule that is the
+    /// would also delete the pool-independent parking rule that is the
     /// whole #1757 fix -- so the mechanism and its regression tests stay.
     ///
     /// Use from a background warm. While this build runs, a global-pool worker
@@ -218,12 +231,12 @@ impl<T> PoolSafeMemo<T> {
     where
         T: Send,
     {
-        if let Some(value) = self.wait_or_claim_build(BuildClaim::Dedicated) {
+        if let Some(value) = self.wait_or_claim_build(BuildClaim::PoolIndependent) {
             return value;
         }
         let _guard = BuildingGuard {
             memo: self,
-            dedicated: true,
+            pool_independent: true,
         };
 
         let built = Arc::new(dedicated_build_pool().install(build));
@@ -258,7 +271,7 @@ impl<T> PoolSafeMemo<T> {
         }
         let _guard = BuildingGuard {
             memo: self,
-            dedicated: false,
+            pool_independent: false,
         };
 
         let built = Arc::new(match policy {
@@ -285,7 +298,7 @@ impl<T> PoolSafeMemo<T> {
         }
         let _guard = BuildingGuard {
             memo: self,
-            dedicated: false,
+            pool_independent: false,
         };
 
         let built = Arc::new(if rayon::current_thread_index().is_some() {
@@ -293,6 +306,45 @@ impl<T> PoolSafeMemo<T> {
         } else {
             build_parallel()?
         });
+
+        let mut state = self.state.lock().expect("pool memo poisoned");
+        if let Some(existing) = state.value.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
+        state.value = Some(Arc::clone(&built));
+        Ok(built)
+    }
+
+    /// Single-flight a fallible build that reaches its value without any rayon
+    /// worker, so every caller -- global-pool workers included -- waits for the
+    /// one build instead of duplicating it.
+    ///
+    /// This is the store-read claim. The whole safety question of this module
+    /// is issue #549: a rayon worker that parks on a build whose completion
+    /// needs rayon workers can deadlock the pool. `build` here does no rayon
+    /// work at all -- it blocks only on a SQLite reader connection -- so it
+    /// reaches its value with zero global-pool workers, exactly like a
+    /// [`Self::get_or_build_on_dedicated_pool`] build does. The invariant holds
+    /// for the same reason, and `parking_is_safe` enforces it from the same
+    /// counter rather than from a comment. Do not use this for a build that
+    /// can enter rayon.
+    ///
+    /// A failed build publishes nothing: the guard drops, waiters wake, and one
+    /// of them retries. An error is never cached, so a follower is never handed
+    /// a leader's failure (see `failed_build_is_not_published`).
+    pub(crate) fn get_or_try_build_pool_independent<E>(
+        &self,
+        build: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Arc<T>, E> {
+        if let Some(value) = self.wait_or_claim_build(BuildClaim::PoolIndependent) {
+            return Ok(value);
+        }
+        let _guard = BuildingGuard {
+            memo: self,
+            pool_independent: true,
+        };
+
+        let built = Arc::new(build()?);
 
         let mut state = self.state.lock().expect("pool memo poisoned");
         if let Some(existing) = state.value.as_ref() {
@@ -317,7 +369,7 @@ impl<T> PoolSafeMemo<T> {
         }
         let _guard = BuildingGuard {
             memo: self,
-            dedicated: false,
+            pool_independent: false,
         };
 
         let built = Arc::new(if rayon::current_thread_index().is_some() {
@@ -346,12 +398,13 @@ enum BuildPolicy {
     ForceParallel,
 }
 
-/// Which pool a claimed build will run on. A `Dedicated` claim is what tells
-/// global-pool waiters that parking on this build is safe.
+/// Whether a claimed build needs a worker of the global rayon pool to reach its
+/// value. A `PoolIndependent` claim is what tells global-pool waiters that
+/// parking on this build is safe.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BuildClaim {
     Shared,
-    Dedicated,
+    PoolIndependent,
 }
 
 impl<T> Default for PoolSafeMemo<T> {
@@ -360,9 +413,87 @@ impl<T> Default for PoolSafeMemo<T> {
     }
 }
 
+/// One [`PoolSafeMemo`] per key: a read-through cache whose concurrent same-key
+/// misses collapse into a single read.
+///
+/// The request memos in `QueryReadCache` were plain
+/// check-then-read-then-insert maps. That deduplicates *sequential* repeats
+/// only. A parallel candidate fan-out asks for the same hot key from many
+/// rayon workers at once, they all miss the check, and they all run the read.
+/// The D4 measurement on the rustc tree caught the shape exactly: of 146,678
+/// `sql_definition_candidates` row lookups in one `scan_usages` request, 68.5%
+/// returned in under 0.1 ms (the sequential memo working) while the slowest 1%
+/// carried 87.8% of the time -- 8 and more concurrent reads of the *same* short
+/// name, each taking 9-11 seconds (issue #1748).
+///
+/// This type owns only the key-to-cell map. The cells decide who builds, and a
+/// per-key cell is what keeps distinct keys fully parallel: nothing is held
+/// across a build except that key's own cell.
+pub(crate) struct KeyedPoolSafeMemo<K, V> {
+    cells: RwLock<HashMap<K, Arc<PoolSafeMemo<V>>>>,
+}
+
+impl<K, V> KeyedPoolSafeMemo<K, V>
+where
+    K: Eq + Hash + Clone,
+{
+    pub(crate) fn new() -> Self {
+        Self {
+            cells: RwLock::new(HashMap::default()),
+        }
+    }
+
+    /// The single-flight cell for `key`, created on first ask. Only the map
+    /// lock is held here, never a build.
+    pub(crate) fn cell(&self, key: &K) -> Arc<PoolSafeMemo<V>> {
+        if let Some(cell) = self
+            .cells
+            .read()
+            .expect("keyed pool memo read lock poisoned")
+            .get(key)
+        {
+            return Arc::clone(cell);
+        }
+        let mut cells = self
+            .cells
+            .write()
+            .expect("keyed pool memo write lock poisoned");
+        Arc::clone(
+            cells
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(PoolSafeMemo::new())),
+        )
+    }
+}
+
+impl<K, V> Default for KeyedPoolSafeMemo<K, V>
+where
+    K: Eq + Hash + Clone,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K, V> std::fmt::Debug for KeyedPoolSafeMemo<K, V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KeyedPoolSafeMemo")
+            .field(
+                "keys",
+                &self
+                    .cells
+                    .read()
+                    .map(|cells| cells.len())
+                    .unwrap_or_default(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PoolSafeMemo;
+    use super::{KeyedPoolSafeMemo, PoolSafeMemo};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Barrier};
@@ -768,5 +899,190 @@ mod tests {
         let value = memo.get_or_build(|| 7usize, || 7usize);
         assert!(panicking.join().is_err());
         assert_eq!(*value, 7);
+    }
+
+    /// The #1748 stampede, reduced. Every worker of a rayon pool asks one key
+    /// at once while the read is slow. Before the single-flight cell the
+    /// request memo was a check-then-read-then-insert map and each worker ran
+    /// the read; the cell must run it once and hand every worker that value.
+    #[test]
+    fn concurrent_same_key_callers_run_one_pool_independent_read() {
+        use std::time::Duration;
+
+        const WORKERS: usize = 8;
+
+        let memo: KeyedPoolSafeMemo<&str, usize> = KeyedPoolSafeMemo::new();
+        let reads = AtomicUsize::new(0);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(WORKERS)
+            .build()
+            .expect("rayon pool");
+
+        let answers = pool.broadcast(|_| {
+            memo.cell(&"hot")
+                .get_or_try_build_pool_independent(|| -> Result<usize, ()> {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    // Stand in for the 9-11 second store read the measurement
+                    // caught eight-deep on one short name.
+                    thread::sleep(Duration::from_millis(200));
+                    Ok(7)
+                })
+                .expect("read should succeed")
+        });
+
+        assert_eq!(
+            1,
+            reads.load(Ordering::SeqCst),
+            "{WORKERS} concurrent callers of one key must run one read"
+        );
+        for answer in &answers {
+            assert!(Arc::ptr_eq(answer, &answers[0]));
+            assert_eq!(**answer, 7);
+        }
+    }
+
+    /// Single flight is per key, not global: two keys asked at once must both
+    /// be in flight at once. A shared build lock would make the second read
+    /// wait for the first, which would serialize the whole fan-out this fix
+    /// exists to speed up.
+    #[test]
+    fn distinct_keys_build_concurrently() {
+        use std::time::{Duration, Instant};
+
+        let memo: KeyedPoolSafeMemo<usize, bool> = KeyedPoolSafeMemo::new();
+        let in_flight = AtomicUsize::new(0);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("rayon pool");
+
+        let overlapped = pool.broadcast(|context| {
+            memo.cell(&context.index())
+                .get_or_try_build_pool_independent(|| -> Result<bool, ()> {
+                    in_flight.fetch_add(1, Ordering::SeqCst);
+                    // Wait for the other key's build rather than blocking
+                    // forever, so a serialized implementation fails the
+                    // assertion instead of hanging the suite.
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while in_flight.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+                        thread::yield_now();
+                    }
+                    Ok(in_flight.load(Ordering::SeqCst) >= 2)
+                })
+                .expect("read should succeed")
+        });
+
+        assert!(
+            overlapped.iter().all(|both_in_flight| **both_in_flight),
+            "two keys must build at the same time"
+        );
+    }
+
+    /// A rayon worker may park on a pool-independent build, and while parked it
+    /// still honours its own keep-going predicate: the cancellable wait polls
+    /// on `CANCELLABLE_WAIT_INTERVAL` instead of riding the leader to the end.
+    /// Callers with no predicate -- the definition-candidate row read has none
+    /// -- ride the leader's completion by construction.
+    #[test]
+    fn cancelled_pool_worker_stops_waiting_on_a_pool_independent_build() {
+        use std::time::Duration;
+
+        let memo = Arc::new(PoolSafeMemo::new());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+
+        let leader_memo = Arc::clone(&memo);
+        let leader = thread::spawn(move || {
+            leader_memo.get_or_try_build_pool_independent(|| -> Result<usize, ()> {
+                started_tx.send(()).expect("send start");
+                resume_rx.recv().expect("resume leader");
+                Ok(7)
+            })
+        });
+        started_rx.recv().expect("leader should start");
+
+        let keep_going = Arc::new(AtomicBool::new(true));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("rayon pool");
+        let waiter_memo = Arc::clone(&memo);
+        let waiter_flag = Arc::clone(&keep_going);
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let result = pool.install(|| {
+                waiter_memo.get_or_build_while(
+                    &|| {
+                        let _ = waiting_tx.send(());
+                        waiter_flag.load(Ordering::Acquire)
+                    },
+                    || panic!("a parked waiter must not build"),
+                    || panic!("a parked waiter must not build"),
+                )
+            });
+            result_tx.send(result).expect("send waiter result");
+        });
+
+        waiting_rx.recv().expect("waiter should park");
+        keep_going.store(false, Ordering::Release);
+        assert!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("cancelled waiter did not stop")
+                .is_none()
+        );
+        waiter.join().expect("waiter should finish");
+
+        resume_tx.send(()).expect("resume leader");
+        assert_eq!(*leader.join().expect("leader should finish").unwrap(), 7);
+    }
+
+    /// A failed leader must not poison its followers. The error is not cached,
+    /// so the woken follower runs its own read and answers normally.
+    #[test]
+    fn a_failed_pool_independent_leader_does_not_poison_its_followers() {
+        use std::time::Duration;
+
+        let memo = Arc::new(PoolSafeMemo::new());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+
+        let leader_memo = Arc::clone(&memo);
+        let leader = thread::spawn(move || {
+            leader_memo.get_or_try_build_pool_independent(|| -> Result<usize, &'static str> {
+                started_tx.send(()).expect("send start");
+                resume_rx.recv().expect("resume leader");
+                Err("store read failed")
+            })
+        });
+        started_rx.recv().expect("leader should start");
+
+        let follower_memo = Arc::clone(&memo);
+        let (follower_tx, follower_rx) = mpsc::channel();
+        let follower = thread::spawn(move || {
+            let value = follower_memo
+                .get_or_try_build_pool_independent(|| -> Result<usize, &'static str> { Ok(7) });
+            follower_tx.send(()).expect("send follower completion");
+            value
+        });
+        assert!(
+            follower_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the follower did not wait for the leader"
+        );
+
+        resume_tx.send(()).expect("resume leader");
+        assert_eq!(
+            leader.join().expect("leader should finish").unwrap_err(),
+            "store read failed"
+        );
+        assert_eq!(
+            *follower
+                .join()
+                .expect("follower should finish")
+                .expect("the follower must retry, not inherit the failure"),
+            7
+        );
+        assert_eq!(*memo.get().expect("the retry publishes"), 7);
     }
 }

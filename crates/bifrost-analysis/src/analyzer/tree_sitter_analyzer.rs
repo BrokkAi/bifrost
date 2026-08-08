@@ -1,6 +1,7 @@
 use arc_swap::ArcSwapOption;
 
 use crate::analyzer::cognitive_complexity;
+use crate::analyzer::pool_memo::KeyedPoolSafeMemo;
 use crate::analyzer::project::{OverlayRevision, ProjectSourceOrigin, ProjectSourceSnapshot};
 use crate::analyzer::store::liveness::{LivePathEntry, LivePathMap, LiveSnapshot, Liveness};
 use crate::analyzer::store::query::QueryResolver;
@@ -1210,6 +1211,10 @@ struct QueryReadCache {
     /// targets than there are import statements (#1748). Same plain-`HashMap`
     /// shape and reasoning as `parent_units`: each entry is one bounded
     /// lookup, so a racing duplicate is cheaper than per-key single flight.
+    /// The expensive half of a duplicate -- the persisted row read -- is
+    /// single-flighted one level down by `definition_candidate_rows`, so what
+    /// a racing duplicate here repeats is the per-name assembly, not a store
+    /// round trip.
     definition_units: Arc<RwLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
     /// The persisted candidate rows for one short name, read at most once per
     /// (short name, lookup kind) per request.
@@ -1225,9 +1230,19 @@ struct QueryReadCache {
     ///
     /// The rows, not the assembled answer: assembly still merges each fq
     /// name's own dirty units and path-symbol units, and narrows to that name.
-    /// Same plain-`HashMap` shape and reasoning as `definition_units`.
+    ///
+    /// [`KeyedPoolSafeMemo`], not the plain `HashMap` the memos above use: this
+    /// is the one request memo whose key is *hot*, and a plain map only
+    /// deduplicates sequential repeats. The scan's parallel candidate fan-out
+    /// asks for the same short name from many rayon workers at once; they all
+    /// miss the check and they all run the read. The D4 measurement on the
+    /// rustc tree found 8 and more concurrent reads of one short name each
+    /// taking 9-11 seconds, with the slowest 1% of 146,678 lookups carrying
+    /// 87.8% of the time (#1748). A per-key single-flight cell collapses a
+    /// same-key burst to one read; see `KeyedPoolSafeMemo` for why parking a
+    /// rayon worker on this particular build is safe under #549.
     definition_candidate_rows:
-        Arc<RwLock<HashMap<DefinitionCandidateRowsKey, Arc<Vec<DefinitionOrderCandidateRow>>>>>,
+        Arc<KeyedPoolSafeMemo<DefinitionCandidateRowsKey, Vec<DefinitionOrderCandidateRow>>>,
     /// The workspace's path-synthetic module units, walked at most once per
     /// request (#1774). See [`TreeSitterAnalyzer::workspace_module_walk`].
     workspace_module_walk: Arc<RwLock<Option<Arc<WorkspaceModuleWalk>>>>,
@@ -1313,7 +1328,7 @@ impl QueryReadCache {
         self.prepared_syntax = Arc::new(RwLock::new(HashMap::default()));
         self.parent_units = Arc::new(RwLock::new(HashMap::default()));
         self.definition_units = Arc::new(RwLock::new(HashMap::default()));
-        self.definition_candidate_rows = Arc::new(RwLock::new(HashMap::default()));
+        self.definition_candidate_rows = Arc::new(KeyedPoolSafeMemo::new());
         self.workspace_module_walk = Arc::new(RwLock::new(None));
     }
 
@@ -6294,13 +6309,14 @@ where
         self.sql_definition_candidates_vec(fq_name, true)
     }
 
-    /// The persisted candidate rows for one short name, read once per request.
+    /// The persisted candidate rows for one short name, read once per request
+    /// *and* once per concurrent same-name burst.
     ///
     /// See `QueryReadCache::definition_candidate_rows` for why the memo is
-    /// keyed here and not one level up. With no query scope open there is no
-    /// memo and this is exactly the unmemoized read; a failed read is never
-    /// published, so the next caller retries instead of inheriting an empty
-    /// answer that would read as proven absence.
+    /// keyed here and not one level up, and why it single-flights. With no
+    /// query scope open there is no memo and this is exactly the unmemoized
+    /// read; a failed read is never published, so the next caller retries
+    /// instead of inheriting an empty answer that would read as proven absence.
     fn definition_candidate_rows(
         &self,
         langs: &[String],
@@ -6313,41 +6329,32 @@ where
             short_name,
             include_definition_lookup_units,
         };
-        let memo = self.active_query_cache_handle(|cache| &cache.definition_candidate_rows);
-        if let Some(cached) = memo.as_ref().and_then(|memo| {
-            memo.read()
-                .expect("query definition-candidate-row cache read lock poisoned")
-                .get(&key)
-                .cloned()
-        }) {
-            return Ok(cached);
-        }
-
-        self.definition_candidate_row_read_count
-            .fetch_add(1, Ordering::Relaxed);
-        let rows = Arc::new(if include_definition_lookup_units {
-            self.store_context
-                .store
-                .definition_lookup_order_candidate_rows_by_short_name_for_langs(
-                    langs,
-                    self.store_context.generations.as_ref(),
-                    &key.short_name,
-                )
-        } else {
-            self.store_context
-                .store
-                .declaration_order_candidate_rows_by_short_name_for_langs(
-                    langs,
-                    self.store_context.generations.as_ref(),
-                    &key.short_name,
-                )
-        }?);
-        if let Some(memo) = memo.as_ref() {
-            memo.write()
-                .expect("query definition-candidate-row cache write lock poisoned")
-                .insert(key, Arc::clone(&rows));
-        }
-        Ok(rows)
+        let read = || {
+            self.definition_candidate_row_read_count
+                .fetch_add(1, Ordering::Relaxed);
+            if include_definition_lookup_units {
+                self.store_context
+                    .store
+                    .definition_lookup_order_candidate_rows_by_short_name_for_langs(
+                        langs,
+                        self.store_context.generations.as_ref(),
+                        &key.short_name,
+                    )
+            } else {
+                self.store_context
+                    .store
+                    .declaration_order_candidate_rows_by_short_name_for_langs(
+                        langs,
+                        self.store_context.generations.as_ref(),
+                        &key.short_name,
+                    )
+            }
+        };
+        let Some(memo) = self.active_query_cache_handle(|cache| &cache.definition_candidate_rows)
+        else {
+            return Ok(Arc::new(read()?));
+        };
+        memo.cell(&key).get_or_try_build_pool_independent(read)
     }
 
     fn sql_definition_candidates_vec(
@@ -7909,10 +7916,14 @@ where
             .expect("query read cache read lock poisoned")
     }
 
-    fn active_query_cache_handle<T>(
+    /// Clone one request memo's handle out from under the coarse cache lock, or
+    /// `None` with no request open. Generic over the handle's own type: most
+    /// memos are `Arc<RwLock<Map>>`, the definition-candidate rows are an
+    /// `Arc<KeyedPoolSafeMemo<..>>` that synchronizes itself.
+    fn active_query_cache_handle<T: ?Sized>(
         &self,
-        select: impl for<'a> FnOnce(&'a QueryReadCache) -> &'a Arc<RwLock<T>>,
-    ) -> Option<Arc<RwLock<T>>> {
+        select: impl for<'a> FnOnce(&'a QueryReadCache) -> &'a Arc<T>,
+    ) -> Option<Arc<T>> {
         let cache = self.query_read_cache_lock();
         cache.is_active().then(|| Arc::clone(select(&cache)))
     }
@@ -10420,6 +10431,63 @@ mod tests {
             2 * 6 + 1,
             row_reads,
             "each distinct short name is read once, and the shared one is not read per fq name"
+        );
+    }
+
+    /// #1748 D4: the row memo above deduplicates *sequential* repeats only. A
+    /// scan's parallel candidate fan-out asks for the same hot short name from
+    /// many rayon workers at once; every one of them misses the
+    /// check-then-read-then-insert map and every one of them runs the read.
+    /// On the rustc tree that was eight and more concurrent reads of a single
+    /// short name, each taking 9-11 seconds: the slowest 1% of 146,678 lookups
+    /// carried 87.8% of one request's candidate time. The per-key
+    /// single-flight cell must collapse the burst to one read.
+    ///
+    /// Fails before the cell: ten runs against the duplicating memo charged
+    /// 19-24 reads for the seventeen distinct keys, ten times out of ten.
+    #[test]
+    fn issue_1748_concurrent_lookups_of_one_short_name_read_the_rows_once() {
+        const WORKERS: usize = 8;
+
+        let (_temp, project) = shared_short_name_project(WORKERS);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let names: Vec<String> = (0..WORKERS)
+            .map(|index| format!("pkg.mod_{index}.Shared"))
+            .collect();
+
+        let sequential: Vec<Vec<CodeUnit>> = names
+            .iter()
+            .map(|name| IAnalyzer::definitions(&analyzer, name).collect())
+            .collect();
+
+        let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&scope);
+        analyzer.reset_definition_candidate_row_read_count_for_test();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(WORKERS)
+            .build()
+            .expect("rayon pool");
+        // Every worker starts its lookup at the same instant, so all eight
+        // reach the shared `Shared` key while the first read is still in
+        // flight -- the fan-out shape the measurement caught.
+        let start = std::sync::Barrier::new(WORKERS);
+        let concurrent = pool.broadcast(|context| {
+            start.wait();
+            IAnalyzer::definitions(&analyzer, &names[context.index()]).collect::<Vec<CodeUnit>>()
+        });
+        let row_reads = analyzer.definition_candidate_row_read_count_for_test();
+        analyzer.end_query(&scope);
+
+        assert_eq!(
+            sequential, concurrent,
+            "single flight must not change any answer"
+        );
+        // The same thirteen keys as the sequential case: two of each worker's
+        // own spellings, plus the one `Shared` they all share.
+        assert_eq!(
+            2 * WORKERS + 1,
+            row_reads,
+            "concurrent callers of one short name must run one row read"
         );
     }
 
