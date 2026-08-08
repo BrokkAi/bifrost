@@ -4737,6 +4737,74 @@ mod watcher_startup_tests {
             .unwrap();
         assert_eq!(symbols["files"][0]["path"], "Old.java");
     }
+
+    /// Issues #1848 and #1847, coupled: the loop's by-product was
+    /// `.git/index.lock` recorded as a changed project file, and draining that
+    /// delta ran `snapshot.update`, which allocates a fresh
+    /// `global_usage_definition_index` `OnceLock` (pinned by
+    /// `shared_usage_indices_reuse_generation_allocations_and_reset_on_update`
+    /// in `tree_sitter_analyzer.rs`; a snapshot *clone*, as every query takes,
+    /// keeps it). So Git's own bookkeeping rebuilt the resident workspace
+    /// index over and over. It must now leave the session snapshot -- and with
+    /// it the published index -- exactly where it was.
+    #[test]
+    fn git_bookkeeping_in_a_watched_session_keeps_the_definition_index() {
+        let (_temp, root) = workspace("Model.java", "class Model { void run() {} }\n");
+        let repository = git2::Repository::init(&root).unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(std::path::Path::new("Model.java")).unwrap();
+        index.write().unwrap();
+        drop(index);
+        drop(repository);
+        // Written before the watcher exists and staged after it, so the only
+        // events in this test are Git's own.
+        std::fs::write(root.join("Later.java"), "class Later {}\n").unwrap();
+
+        let service = SearchToolsService::new_without_semantic_index(root.clone()).unwrap();
+        let warm = service.snapshot_for_query().unwrap();
+        warm.analyzer().global_usage_definition_index();
+        let builds = warm
+            .analyzer()
+            .global_usage_definition_index_build_count_for_test();
+        assert!(
+            builds >= 1,
+            "the definition index must be published before the pin means anything"
+        );
+        let published = Arc::clone(&warm.source_snapshot);
+        warm.finish("warm_definition_index", Ok(())).unwrap();
+
+        for arguments in [
+            ["status", "--porcelain"].as_slice(),
+            ["add", "-A"].as_slice(),
+        ] {
+            let output = std::process::Command::new("git")
+                .current_dir(&root)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+
+        let after = service.snapshot_for_query().unwrap();
+        assert!(
+            Arc::ptr_eq(&published, &after.source_snapshot),
+            "Git bookkeeping must not replace the session snapshot: replacing it drops the resident definition index"
+        );
+        after.analyzer().global_usage_definition_index();
+        assert_eq!(
+            after
+                .analyzer()
+                .global_usage_definition_index_build_count_for_test(),
+            builds,
+            "the published definition index must be reused, not rebuilt"
+        );
+        after.finish("definition_index_pin", Ok(())).unwrap();
+    }
 }
 
 #[cfg(test)]

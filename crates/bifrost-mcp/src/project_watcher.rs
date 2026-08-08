@@ -110,6 +110,40 @@ fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>
         return;
     }
 
+    if event.paths.is_empty() {
+        project.invalidate_cached_file_listing();
+        mark_full_refresh(pending);
+        return;
+    }
+
+    // `.git` internals are never project files: the workspace walk refuses to
+    // descend a `.git` directory and the git-backed listing cannot report one,
+    // so they are split off before anything below reads or drops the listing.
+    // Doing this here is what breaks the watcher's feedback loop (#1848):
+    // classification calls `is_bifrostignored`, which walks the whole tree and
+    // runs `git status`, and `git status` writes `.git/index.lock`, which is
+    // the next event. Ref state is exempt from the listing and project-file
+    // decisions too, but still reaches the full-refresh decision below,
+    // because HEAD movement changes tracked membership and blob identity for
+    // files whose own contents never change.
+    let mut git_ref_state_changed = false;
+    let mut paths = Vec::with_capacity(event.paths.len());
+    for path in &event.paths {
+        match git_internal_disposition(project.as_ref(), path) {
+            Some(GitInternalPath::RefState) => git_ref_state_changed = true,
+            Some(GitInternalPath::Churn) => {}
+            None => paths.push(path.as_path()),
+        }
+    }
+
+    if git_ref_state_changed && triggers_refresh_fallback(&event) {
+        mark_full_refresh(pending);
+    }
+
+    if paths.is_empty() {
+        return;
+    }
+
     // Any real change may add or remove listed paths, or alter what the
     // listing means (`.gitignore` edits, git index updates), so drop the
     // session's cached workspace listing before classification below --
@@ -118,22 +152,14 @@ fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>
     // analyzer's own SQLite state are exempt, exactly like the snapshot: those
     // writes follow every analyzed change, and letting them drop the listing
     // would defeat the cache during normal operation.
-    if event.paths.is_empty()
-        || event
-            .paths
-            .iter()
-            .any(|path| !is_internal_state_path(project.as_ref(), path))
+    if paths
+        .iter()
+        .any(|path| !is_internal_state_path(project.as_ref(), path))
     {
         project.invalidate_cached_file_listing();
     }
 
-    if event.paths.is_empty() {
-        mark_full_refresh(pending);
-        return;
-    }
-
-    if event
-        .paths
+    if paths
         .iter()
         .any(|path| is_bifrost_ignore_path(project.as_ref(), path))
     {
@@ -142,7 +168,7 @@ fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>
     }
 
     let mut saw_refresh_fallback_path = false;
-    for path in &event.paths {
+    for path in &paths {
         match classify_project_path(project.as_ref(), path) {
             PathDisposition::ProjectFile(project_file) => {
                 let mut state = pending
@@ -155,14 +181,68 @@ fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>
         }
     }
 
-    if saw_refresh_fallback_path
-        && matches!(
-            event.kind,
-            EventKind::Any | EventKind::Other | EventKind::Modify(_) | EventKind::Remove(_)
-        )
-    {
+    if saw_refresh_fallback_path && triggers_refresh_fallback(&event) {
         mark_full_refresh(pending);
     }
+}
+
+/// Event kinds that can invalidate more than the paths they name, so a path
+/// the incremental update cannot represent forces a whole-workspace refresh.
+fn triggers_refresh_fallback(event: &Event) -> bool {
+    matches!(
+        event.kind,
+        EventKind::Any | EventKind::Other | EventKind::Modify(_) | EventKind::Remove(_)
+    )
+}
+
+/// Git's own bookkeeping inside a `.git` directory, split by whether the
+/// analyzer's view of the workspace can depend on it.
+enum GitInternalPath {
+    /// HEAD, refs, and merge state: a branch switch or commit changes which
+    /// blobs are live and which paths are tracked, so the workspace needs a
+    /// full refresh even though no working-tree file was reported.
+    RefState,
+    /// The index, its lockfile, objects, logs, and the rest: pure VCS churn
+    /// that the analyzer never reads. `git status` -- which every workspace
+    /// listing runs -- writes `.git/index.lock` on each invocation, so
+    /// treating this churn as a change is a self-sustaining walk loop.
+    Churn,
+}
+
+/// The `.git` entries whose changes reach the full-refresh decision. Census in
+/// `.agents/docs/fenced-followups-investigation-2026-08.md` (Part B): nothing
+/// in the workspace reads any other `.git` path in response to an event.
+const GIT_REF_STATE_FILE_NAMES: [&str; 4] = ["HEAD", "packed-refs", "MERGE_HEAD", "ORIG_HEAD"];
+const GIT_REFS_DIR_NAME: &str = "refs";
+const GIT_DIR_NAME: &str = ".git";
+
+/// Classify a path that lives inside a `.git` directory of the watched tree,
+/// or `None` when the path is not `.git`-internal. The `.git` boundary matches
+/// the workspace walk, which refuses to descend *any* directory named `.git`
+/// ("VCS internals, never source", `collect_workspace_files`), so a vendored
+/// sub-repository's internals are outside the project-file universe exactly
+/// like the workspace's own. Paths outside the root are not classified here:
+/// they keep feeding the refresh fallback.
+fn git_internal_disposition(project: &dyn Project, path: &Path) -> Option<GitInternalPath> {
+    let path = path.to_path_buf().normalize();
+    let rel_path = path.strip_prefix(project.root()).ok()?;
+    let mut components = rel_path.components();
+    components.find(|component| component.as_os_str() == GIT_DIR_NAME)?;
+
+    let Some(entry) = components.next() else {
+        // The `.git` entry itself. A repository appearing or disappearing also
+        // creates or removes its `HEAD`, which is ref state below, so this
+        // event carries nothing of its own.
+        return Some(GitInternalPath::Churn);
+    };
+    let entry = entry.as_os_str();
+    if entry == GIT_REFS_DIR_NAME {
+        return Some(GitInternalPath::RefState);
+    }
+    if components.next().is_none() && GIT_REF_STATE_FILE_NAMES.iter().any(|name| entry == *name) {
+        return Some(GitInternalPath::RefState);
+    }
+    Some(GitInternalPath::Churn)
 }
 
 enum PathDisposition {
@@ -582,6 +662,242 @@ mod tests {
             cache.files().unwrap().contains(&extra),
             "a watcher event must drop the cached listing"
         );
+    }
+
+    /// Issue #1848. `git status` -- which every workspace listing runs -- writes
+    /// and removes `.git/index.lock`, so classifying that churn as a change made
+    /// the watcher walk the tree, which ran `git status`, which produced the next
+    /// event. The exemption must cost nothing: no walk, no pending change.
+    fn git_churn_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        vec![
+            root.join(".git/index.lock"),
+            root.join(".git/index"),
+            root.join(".git/objects/ab/cdef"),
+            root.join(".git/logs/HEAD"),
+            root.join(".git"),
+        ]
+    }
+
+    #[test]
+    fn git_churn_events_neither_walk_the_workspace_nor_update_the_project() {
+        let (_temp, project) = project_with_files(&["src/main.rs"]);
+        let baseline = project.workspace_file_listing_count();
+
+        for path in git_churn_paths(project.root()) {
+            for kind in [
+                EventKind::Create(CreateKind::File),
+                EventKind::Modify(ModifyKind::Any),
+                EventKind::Remove(RemoveKind::File),
+            ] {
+                let pending = Arc::new(Mutex::new(PendingChanges::default()));
+                handle_event(&project, &pending, Event::new(kind).add_path(path.clone()));
+
+                let state = pending.lock().unwrap();
+                assert!(
+                    state.files.is_empty(),
+                    "{} must never be a project file",
+                    path.display()
+                );
+                assert!(
+                    !state.requires_full_refresh,
+                    "{} must not force a full refresh",
+                    path.display()
+                );
+            }
+        }
+
+        assert_eq!(
+            project.workspace_file_listing_count(),
+            baseline,
+            "Git's own bookkeeping must not walk the workspace"
+        );
+    }
+
+    #[test]
+    fn git_ref_state_events_refresh_the_workspace_without_walking_it() {
+        let (_temp, project) = project_with_files(&["src/main.rs"]);
+        let baseline = project.workspace_file_listing_count();
+
+        for relative in [
+            ".git/HEAD",
+            ".git/ORIG_HEAD",
+            ".git/MERGE_HEAD",
+            ".git/packed-refs",
+            ".git/refs/heads/main",
+        ] {
+            let pending = Arc::new(Mutex::new(PendingChanges::default()));
+            handle_event(
+                &project,
+                &pending,
+                Event::new(EventKind::Modify(ModifyKind::Any))
+                    .add_path(project.root().join(relative)),
+            );
+
+            let state = pending.lock().unwrap();
+            assert!(state.files.is_empty(), "{relative} is never a project file");
+            assert!(
+                state.requires_full_refresh,
+                "{relative} changes tracked membership, so it must still refresh"
+            );
+        }
+
+        assert_eq!(
+            project.workspace_file_listing_count(),
+            baseline,
+            "the refresh decision is a path decision and must not walk the workspace"
+        );
+    }
+
+    #[test]
+    fn nested_repository_internals_follow_the_same_boundary_as_the_workspace_walk() {
+        let (_temp, project) = project_with_files(&["src/main.rs", ".github/workflows/ci.yml"]);
+        let baseline = project.workspace_file_listing_count();
+
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        handle_event(
+            &project,
+            &pending,
+            Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(project.root().join("vendor/lib/.git/index.lock")),
+        );
+        {
+            let state = pending.lock().unwrap();
+            assert!(
+                state.files.is_empty(),
+                "a vendored repository's index churn"
+            );
+            assert!(!state.requires_full_refresh);
+        }
+        assert_eq!(
+            project.workspace_file_listing_count(),
+            baseline,
+            "the workspace walk skips every `.git` directory, so the watcher must too"
+        );
+
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        handle_event(
+            &project,
+            &pending,
+            Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(project.root().join("vendor/lib/.git/HEAD")),
+        );
+        {
+            let state = pending.lock().unwrap();
+            assert!(state.files.is_empty());
+            assert!(
+                state.requires_full_refresh,
+                "a vendored repository's HEAD moves its blobs too"
+            );
+        }
+
+        // `.github` only starts with `.git`: it is ordinary tracked input.
+        let workflow = ProjectFile::new(project.root().to_path_buf(), ".github/workflows/ci.yml");
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        handle_event(
+            &project,
+            &pending,
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(workflow.abs_path()),
+        );
+        let state = pending.lock().unwrap();
+        assert!(state.files.contains(&workflow));
+        assert!(!state.requires_full_refresh);
+    }
+
+    #[test]
+    fn source_events_still_invalidate_the_listing_and_classify() {
+        use crate::WorkspaceFileListingCache;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project: Arc<dyn Project> = Arc::new(
+            FilesystemProject::with_cached_listing(root.clone(), Arc::clone(&cache)).unwrap(),
+        );
+
+        cache.files().unwrap();
+        let extra = ProjectFile::new(root.clone(), "src/extra.rs");
+        fs::write(extra.abs_path(), "fn extra() {}\n").unwrap();
+
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        handle_event(
+            &project,
+            &pending,
+            Event::new(EventKind::Create(CreateKind::File)).add_path(extra.abs_path()),
+        );
+
+        assert!(
+            cache.files().unwrap().contains(&extra),
+            "a source event must still drop the cached listing"
+        );
+        let state = pending.lock().unwrap();
+        assert!(
+            state.files.contains(&extra),
+            "a source event must still classify as a project file"
+        );
+        assert!(!state.requires_full_refresh);
+    }
+
+    /// The live loop, reproduced end to end: a real watcher over a real
+    /// repository, driven only by Git's own bookkeeping. Before the exemption
+    /// the first `.git` event walked the tree, that walk ran `git status`, and
+    /// `git status` wrote the next `.git/index.lock` event -- 50-56 walks per
+    /// second, indefinitely (issue #1848). No walk is legitimate here: nothing
+    /// under the working tree changes.
+    #[test]
+    fn git_bookkeeping_in_a_watched_repository_never_walks_the_workspace() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        let repository = git2::Repository::init(&root).unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(std::path::Path::new("main.rs")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        {
+            let tree = repository.find_tree(tree_id).unwrap();
+            let signature = git2::Signature::now("T", "t@example.com").unwrap();
+            repository
+                .commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+                .unwrap();
+        }
+        drop(index);
+        drop(repository);
+        // Written before the watcher starts and staged after it, so every
+        // event the watcher sees comes from Git's index, not from a source
+        // file.
+        fs::write(root.join("later.rs"), "fn later() {}\n").unwrap();
+
+        let project = Arc::new(FilesystemProject::new(root.clone()).unwrap()) as Arc<dyn Project>;
+        let watcher = ProjectChangeWatcher::start(Arc::clone(&project)).unwrap();
+        let baseline = project.workspace_file_listing_count();
+
+        for arguments in [
+            ["status", "--porcelain"].as_slice(),
+            ["add", "-A"].as_slice(),
+            ["status", "--porcelain"].as_slice(),
+        ] {
+            let output = std::process::Command::new("git")
+                .current_dir(&root)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+
+        assert_eq!(
+            project.workspace_file_listing_count(),
+            baseline,
+            "Git's index bookkeeping must not make the watcher walk the workspace"
+        );
+        let delta = watcher.take_changed_files();
+        assert_eq!(delta, super::ChangeDelta::default());
     }
 
     #[test]
