@@ -13433,6 +13433,635 @@ mod tests {
 
     const TEST_OID: &str = "1111111111111111111111111111111111111111";
 
+    /// The bincode encoding migration 0018 retired, frozen here so the
+    /// equivalence test below cannot drift with the production encoders.
+    ///
+    /// `import_details.info` was written by `bincode::serialize`, whose legacy
+    /// defaults are fixed-width integers, u64 length prefixes, and u32 enum
+    /// discriminants. Round-tripping a fixture through it reproduces exactly
+    /// what the old reader would have handed a consumer.
+    fn frozen_import_blob_round_trip(import: &ImportInfo) -> ImportInfo {
+        let bytes = bincode::serialize(import).expect("frozen import encode");
+        bincode::deserialize(&bytes).expect("frozen import decode")
+    }
+
+    /// One `ImportInfo` per shape the ten language adapters actually produce,
+    /// from `.agents/docs/opaque-blob-inventory-2026-08.md` section 1.3.
+    ///
+    /// The point is coverage of the SHAPE space, not of any one language's
+    /// grammar: a pathless import, every path kind, a path with prefixes, a
+    /// path with scopes, a wildcard, an alias, a global, and the empty
+    /// segment/scope/prefix lists that make `Some(path)` and `None` distinct.
+    fn import_shape_fixture() -> Vec<ImportInfo> {
+        let path = |segments: &[&str],
+                    kind: Option<StructuredImportPathKind>,
+                    prefixes: &[&str],
+                    scopes: &[(usize, usize)],
+                    declaration_start_byte: usize| {
+            Some(StructuredImportPath {
+                segments: segments.iter().map(|value| value.to_string()).collect(),
+                kind,
+                lexical_prefixes: prefixes.iter().map(|value| value.to_string()).collect(),
+                lexical_scopes: scopes
+                    .iter()
+                    .map(|(start_byte, end_byte)| StructuredImportScope {
+                        start_byte: *start_byte,
+                        end_byte: *end_byte,
+                    })
+                    .collect(),
+                declaration_start_byte,
+            })
+        };
+        vec![
+            // cpp: only the snippet is meaningful; no path, no binder.
+            ImportInfo {
+                raw_snippet: "#include <vector>".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: None,
+                alias: None,
+                path: None,
+                binder_span: None,
+            },
+            // ruby: the required path string rides in `identifier`, still no path.
+            ImportInfo {
+                raw_snippet: "require 'json'".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: Some("json".to_string()),
+                alias: None,
+                path: None,
+                binder_span: None,
+            },
+            // js/ts named import: no path, but a binder span for the bound name.
+            ImportInfo {
+                raw_snippet: "import { Alpha as Beta } from 'm'".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: Some("Alpha".to_string()),
+                alias: Some("Beta".to_string()),
+                path: None,
+                binder_span: Some(crate::analyzer::structural::facts::Span {
+                    start_byte: 9,
+                    end_byte: 14,
+                }),
+            },
+            // ts namespace import: wildcard with an alias and no path.
+            ImportInfo {
+                raw_snippet: "import * as ns from 'm'".to_string(),
+                is_wildcard: true,
+                is_global: false,
+                identifier: None,
+                alias: Some("ns".to_string()),
+                path: None,
+                binder_span: Some(crate::analyzer::structural::facts::Span {
+                    start_byte: 12,
+                    end_byte: 14,
+                }),
+            },
+            // java wildcard: Namespace kind, no binder because nothing is bound.
+            ImportInfo {
+                raw_snippet: "import java.util.*;".to_string(),
+                is_wildcard: true,
+                is_global: false,
+                identifier: None,
+                alias: None,
+                path: path(
+                    &["java", "util"],
+                    Some(StructuredImportPathKind::Namespace),
+                    &[],
+                    &[],
+                    0,
+                ),
+                binder_span: None,
+            },
+            // java static member import.
+            ImportInfo {
+                raw_snippet: "import static java.util.Map.entry;".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: Some("entry".to_string()),
+                alias: None,
+                path: path(
+                    &["java", "util", "Map", "entry"],
+                    Some(StructuredImportPathKind::StaticMember),
+                    &[],
+                    &[],
+                    20,
+                ),
+                binder_span: Some(crate::analyzer::structural::facts::Span {
+                    start_byte: 42,
+                    end_byte: 47,
+                }),
+            },
+            // python from-import.
+            ImportInfo {
+                raw_snippet: "from pkg import alpha".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: Some("alpha".to_string()),
+                alias: None,
+                path: path(
+                    &["pkg", "alpha"],
+                    Some(StructuredImportPathKind::ImportFrom),
+                    &[],
+                    &[],
+                    3,
+                ),
+                binder_span: Some(crate::analyzer::structural::facts::Span {
+                    start_byte: 19,
+                    end_byte: 24,
+                }),
+            },
+            // go: a '/'-segmented path with an alias.
+            ImportInfo {
+                raw_snippet: "import svc \"example.com/app/service\"".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: Some("svc".to_string()),
+                alias: Some("svc".to_string()),
+                path: path(
+                    &["example.com", "app", "service"],
+                    Some(StructuredImportPathKind::Namespace),
+                    &[],
+                    &[],
+                    11,
+                ),
+                binder_span: Some(crate::analyzer::structural::facts::Span {
+                    start_byte: 4,
+                    end_byte: 7,
+                }),
+            },
+            // rust: lexical scopes, no prefixes, no kind distinctions beyond Namespace.
+            ImportInfo {
+                raw_snippet: "use serde::Deserialize;".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: Some("Deserialize".to_string()),
+                alias: None,
+                path: path(
+                    &["serde", "Deserialize"],
+                    Some(StructuredImportPathKind::Namespace),
+                    &[],
+                    &[(100, 400), (150, 260)],
+                    686,
+                ),
+                binder_span: Some(crate::analyzer::structural::facts::Span {
+                    start_byte: 698,
+                    end_byte: 709,
+                }),
+            },
+            // scala: the only shape with lexical prefixes, and no path kind.
+            ImportInfo {
+                raw_snippet: "import a.B".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: Some("B".to_string()),
+                alias: None,
+                path: path(
+                    &["a", "B"],
+                    None,
+                    &["outer", "inner"],
+                    &[(0, 900), (40, 300)],
+                    64,
+                ),
+                binder_span: Some(crate::analyzer::structural::facts::Span {
+                    start_byte: 71,
+                    end_byte: 72,
+                }),
+            },
+            // csharp: a plain `global using`, wildcard with a structured path.
+            ImportInfo {
+                raw_snippet: "global using System.Text;".to_string(),
+                is_wildcard: true,
+                is_global: true,
+                identifier: Some("Text".to_string()),
+                alias: None,
+                path: path(
+                    &["System", "Text"],
+                    Some(StructuredImportPathKind::Namespace),
+                    &[],
+                    &[],
+                    0,
+                ),
+                binder_span: None,
+            },
+            // An empty structured path still round-trips as `Some`, not `None`:
+            // `declaration_start_byte` is the presence marker, and NULL vs 0 is
+            // the difference the child tables cannot express.
+            ImportInfo {
+                raw_snippet: "using;".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: None,
+                alias: None,
+                path: path(&[], None, &[], &[], 0),
+                binder_span: None,
+            },
+        ]
+    }
+
+    fn write_import_fixture(store: &AnalyzerStore, lang: &str, imports: &[ImportInfo]) {
+        let mut conn = store.conn.lock().expect("store mutex");
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, ?2)",
+            params![TEST_OID, lang],
+        )
+        .unwrap();
+        insert_import_rows(
+            &tx,
+            TEST_OID,
+            lang,
+            &ImportRows::from_imports(imports).unwrap(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// The relational rows must hand back exactly what the retired bincode
+    /// decoder would have. Every language's variance is in the fixture, so a
+    /// field this migration forgot to persist shows up as a mismatch here
+    /// rather than as a resolution bug in one language months later.
+    #[test]
+    fn import_rows_hydrate_what_the_frozen_blob_decoder_produced() {
+        let imports = import_shape_fixture();
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        write_import_fixture(&store, "rust", &imports);
+
+        let conn = store.conn.lock().expect("store mutex");
+        let hydrated = read_import_infos(&conn, TEST_OID, "rust").unwrap();
+        let frozen: Vec<ImportInfo> = imports.iter().map(frozen_import_blob_round_trip).collect();
+        assert_eq!(hydrated, frozen);
+        assert_eq!(hydrated, imports);
+
+        let bulk = read_import_infos_bulk(&conn, "rust", &[TEST_OID.to_string()]).unwrap();
+        assert_eq!(
+            bulk.get(TEST_OID).map(Vec::as_slice),
+            None,
+            "a blob with no blob_meta row is not complete, so the bulk read skips it"
+        );
+    }
+
+    /// The child tables exist to hold the three variable-length parts, and
+    /// they only exist where the language builds a structured path.
+    #[test]
+    fn import_child_rows_follow_the_structured_path() {
+        let imports = import_shape_fixture();
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        write_import_fixture(&store, "rust", &imports);
+        let conn = store.conn.lock().expect("store mutex");
+
+        let count = |table: &str| -> i64 {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE blob_oid = ?1 AND lang = 'rust'"),
+                [TEST_OID],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let expected_segments: usize = imports
+            .iter()
+            .filter_map(|import| import.path.as_ref())
+            .map(|path| path.segments.len())
+            .sum();
+        assert_eq!(count("import_statements"), imports.len() as i64);
+        assert_eq!(count("import_path_segments"), expected_segments as i64);
+        assert_eq!(count("import_lexical_scopes"), 4);
+        assert_eq!(count("import_lexical_prefixes"), 2);
+
+        let pathless: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM import_statements
+                 WHERE blob_oid = ?1 AND lang = 'rust' AND declaration_start_byte IS NULL",
+                [TEST_OID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pathless, 4,
+            "cpp, ruby and the two js/ts shapes store no structured path"
+        );
+    }
+
+    /// Deleting the blob has to reach all four tables. The child tables cascade
+    /// through `import_statements`, not directly from `blobs`, so this pins the
+    /// two-hop chain rather than one FK.
+    #[test]
+    fn deleting_a_blob_cascades_every_import_table() {
+        let imports = import_shape_fixture();
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        write_import_fixture(&store, "rust", &imports);
+        let conn = store.conn.lock().expect("store mutex");
+        conn.execute("DELETE FROM blobs WHERE blob_oid = ?1", [TEST_OID])
+            .unwrap();
+        for table in [
+            "import_statements",
+            "import_path_segments",
+            "import_lexical_scopes",
+            "import_lexical_prefixes",
+        ] {
+            let remaining: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE blob_oid = ?1"),
+                    [TEST_OID],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(remaining, 0, "{table} must cascade with its blob");
+        }
+    }
+
+    /// The schema, not Rust, rejects a malformed import row.
+    #[test]
+    fn import_row_constraints_are_enforced_by_the_schema() {
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
+            [TEST_OID],
+        )
+        .unwrap();
+        let insert = |columns: &str, values: &str| -> rusqlite::Error {
+            conn.execute(
+                &format!(
+                    "INSERT INTO import_statements(blob_oid, lang, ordinal, statement, {columns})
+                     VALUES(?1, 'rust', 0, 'use x;', {values})"
+                ),
+                [TEST_OID],
+            )
+            .unwrap_err()
+        };
+        assert_constraint_error(insert("is_wildcard, is_global", "2, 0"), "CHECK");
+        assert_constraint_error(insert("is_wildcard, is_global", "0, 7"), "CHECK");
+        assert_constraint_error(
+            insert(
+                "is_wildcard, is_global, path_kind, declaration_start_byte",
+                "0, 0, 'not_a_kind', 0",
+            ),
+            "CHECK",
+        );
+        assert_constraint_error(
+            insert("is_wildcard, is_global, path_kind", "0, 0, 'namespace'"),
+            "CHECK",
+        );
+        assert_constraint_error(
+            insert(
+                "is_wildcard, is_global, binder_start, binder_end",
+                "0, 0, 9, 3",
+            ),
+            "CHECK",
+        );
+        assert_constraint_error(
+            insert("is_wildcard, is_global, binder_start", "0, 0, 9"),
+            "CHECK",
+        );
+        let negative_ordinal = conn
+            .execute(
+                "INSERT INTO import_statements(
+                   blob_oid, lang, ordinal, statement, is_wildcard, is_global
+                 ) VALUES(?1, 'rust', -1, 'use x;', 0, 0)",
+                [TEST_OID],
+            )
+            .unwrap_err();
+        assert_constraint_error(negative_ordinal, "CHECK");
+
+        conn.execute(
+            "INSERT INTO import_statements(
+               blob_oid, lang, ordinal, statement, is_wildcard, is_global
+             ) VALUES(?1, 'rust', 0, 'use x;', 0, 0)",
+            [TEST_OID],
+        )
+        .unwrap();
+        let inverted_scope = conn
+            .execute(
+                "INSERT INTO import_lexical_scopes(
+                   blob_oid, lang, ordinal, scope_ordinal, start_byte, end_byte
+                 ) VALUES(?1, 'rust', 0, 0, 20, 10)",
+                [TEST_OID],
+            )
+            .unwrap_err();
+        assert_constraint_error(inverted_scope, "CHECK");
+        let orphan_segment = conn
+            .execute(
+                "INSERT INTO import_path_segments(
+                   blob_oid, lang, ordinal, seg_ordinal, segment
+                 ) VALUES(?1, 'rust', 41, 0, 'nobody')",
+                [TEST_OID],
+            )
+            .unwrap_err();
+        assert_constraint_error(orphan_segment, "FOREIGN KEY");
+    }
+
+    /// Nothing an import row stores may depend on where the file lives: two
+    /// byte-identical files share one blob row. Writing the same source at two
+    /// paths must therefore produce identical import rows.
+    #[test]
+    fn import_rows_are_content_stable_across_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = "package demo\nimport a.{B, C}\nimport d.E as F\nclass Uses\n";
+        let first = write_file(temp.path(), "one/Uses.scala", source);
+        let second = write_file(temp.path(), "two/other/Uses.scala", source);
+        let oid = oid_for(source.as_bytes());
+
+        let dump = |file: &ProjectFile| {
+            let state = parse_state(&ScalaAdapter, file);
+            let store = AnalyzerStore::open_in_memory().unwrap();
+            store
+                .write_parsed_blob(oid, "scala", &ScalaAdapter, &state)
+                .unwrap();
+            let conn = store.conn.lock().expect("store mutex");
+            let mut statement = conn
+                .prepare(
+                    "SELECT ordinal, statement, is_wildcard, is_global, identifier, alias,
+                            path_kind, declaration_start_byte, binder_start, binder_end
+                     FROM import_statements WHERE blob_oid = ?1 AND lang = 'scala'
+                     ORDER BY ordinal",
+                )
+                .unwrap();
+            let rows = statement
+                .query_map([oid.to_string()], |row| {
+                    Ok(format!(
+                        "{:?}",
+                        (
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<i64>>(7)?,
+                            row.get::<_, Option<i64>>(8)?,
+                            row.get::<_, Option<i64>>(9)?,
+                        )
+                    ))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            let mut children = conn
+                .prepare(
+                    "SELECT 'seg', ordinal, seg_ordinal, segment
+                     FROM import_path_segments WHERE blob_oid = ?1 AND lang = 'scala'
+                     UNION ALL
+                     SELECT 'prefix', ordinal, prefix_ordinal, prefix
+                     FROM import_lexical_prefixes WHERE blob_oid = ?1 AND lang = 'scala'
+                     ORDER BY 1, 2, 3",
+                )
+                .unwrap()
+                .query_map([oid.to_string()], |row| {
+                    Ok(format!(
+                        "{:?}",
+                        (
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                        )
+                    ))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            children.sort();
+            (rows, children)
+        };
+
+        assert!(!dump(&first).0.is_empty(), "fixture must persist imports");
+        assert_eq!(dump(&first), dump(&second));
+    }
+
+    /// Every row the four import tables write is priced by the batch cost
+    /// model. Before this migration the child rows did not exist; if a later
+    /// change adds a fourth child table and forgets the accounting, the
+    /// prepared path and the SQL fallback stop agreeing here.
+    #[test]
+    fn import_child_rows_are_counted_by_the_cost_model() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Uses.scala",
+            "package demo\nimport a.{B, C}\nclass Uses\n",
+        );
+        let state = parse_state(&ScalaAdapter, &file);
+        let rows = ImportRows::from_imports(&state.imports).unwrap();
+        assert!(
+            !rows.segments.is_empty() && !rows.prefixes.is_empty(),
+            "the Scala fixture must exercise segments and prefixes"
+        );
+        assert_eq!(
+            rows.logical_rows(),
+            rows.statements.len() + rows.segments.len() + rows.scopes.len() + rows.prefixes.len()
+        );
+
+        let source = file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let prepared = AnalyzerStore::open_in_memory().unwrap();
+        let generation = prepared
+            .ensure_language_epoch_value("scala", "import-cost-accounting-v1")
+            .unwrap();
+        let blob = prepare_parsed_blob(
+            oid,
+            "scala",
+            generation,
+            &ScalaAdapter,
+            Arc::new(state.clone()),
+        )
+        .unwrap();
+        let direct = AnalyzerStore::open_in_memory().unwrap();
+        let direct_generation = direct
+            .ensure_language_epoch_value("scala", "import-cost-accounting-v1")
+            .unwrap();
+        direct
+            .write_parsed_blob_at_generation(oid, "scala", direct_generation, &ScalaAdapter, &state)
+            .unwrap();
+        prepared.persist_prepared_blobs(vec![blob], PersistBatchLimits::PRODUCTION);
+
+        let cost = |store: &AnalyzerStore| {
+            let conn = store.conn.lock().expect("store mutex");
+            let mut statement = conn
+                .prepare_cached(persisted_blob_mutation_cost_fallback_sql())
+                .unwrap();
+            persisted_blob_mutation_cost_fallback_statement(
+                &mut statement,
+                oid.to_string().as_str(),
+                "scala",
+            )
+            .unwrap()
+        };
+        assert_eq!(cost(&prepared), cost(&direct));
+    }
+
+    /// Every new import read is an indexed seek. The child reads are the ones
+    /// this migration added, and their `ORDER BY` matches the primary key, so
+    /// they must not need an ordering b-tree either.
+    #[test]
+    fn import_reads_use_the_import_primary_keys() {
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let explain = |query: &str, parameters: &[&str]| {
+            let sql = format!("EXPLAIN QUERY PLAN {query}");
+            let mut statement = conn.prepare(&sql).unwrap();
+            statement
+                .query_map(params_from_iter(parameters.iter().copied()), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        let per_blob = explain(
+            &format!(
+                "SELECT {IMPORT_STATEMENT_COLUMNS} FROM import_statements
+                 WHERE blob_oid = ?1 AND lang = ?2
+                 ORDER BY ordinal"
+            ),
+            &[TEST_OID, "rust"],
+        );
+        assert!(
+            per_blob
+                .iter()
+                .any(|detail| detail.contains("SEARCH import_statements USING PRIMARY KEY")),
+            "{per_blob:#?}"
+        );
+        assert!(
+            per_blob
+                .iter()
+                .all(|detail| !detail.contains("SCAN import_statements")
+                    && !detail.contains("USE TEMP B-TREE")),
+            "{per_blob:#?}"
+        );
+
+        for (table, value_columns) in [
+            ("import_path_segments", "segment"),
+            ("import_lexical_prefixes", "prefix"),
+            ("import_lexical_scopes", "start_byte, end_byte"),
+        ] {
+            let plan = explain(
+                &format!(
+                    "SELECT blob_oid, ordinal, {value_columns}
+                     FROM {table}
+                     WHERE lang = ? AND blob_oid IN (?, ?)
+                     ORDER BY blob_oid, ordinal"
+                ),
+                &["rust", TEST_OID, TEST_OID],
+            );
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains(&format!("SEARCH {table} USING PRIMARY KEY"))),
+                "{table}: {plan:#?}"
+            );
+            assert!(
+                plan.iter()
+                    .all(|detail| !detail.contains(&format!("SCAN {table}"))
+                        && !detail.contains("USE TEMP B-TREE")),
+                "{table}: {plan:#?}"
+            );
+        }
+    }
+
     fn insert_test_blob_and_unit(conn: &Connection) {
         conn.execute(
             "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",

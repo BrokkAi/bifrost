@@ -47,9 +47,52 @@ fn test_static_import() {
     let analyzer = ScalaAnalyzer::from_project(project.clone());
     let file = ProjectFile::new(project.root().to_path_buf(), "Foo.scala");
     let imports: BTreeSet<_> = analyzer.import_statements(&file).into_iter().collect();
+    // One binding, so one statement, and it is the binding's own rendered
+    // spelling rather than the braced source clause. See
+    // `scala_group_import_reports_one_statement_per_binding` below.
     assert_eq!(
-        BTreeSet::from(["import foo.bar.{Baz as Bar}".to_string()]),
+        BTreeSet::from(["import foo.bar.Baz as Bar".to_string()]),
         imports
+    );
+}
+
+/// The store holds one row per import BINDING (migration 0018), and Scala emits
+/// one `ImportInfo` per selector with its own rendered snippet. A braced clause
+/// that binds three names therefore reports three statements, not the one
+/// clause the source spells.
+///
+/// Before that migration `import_statements` and `import_details` were separate
+/// tables with independent ordinals -- this fixture produced one statement row
+/// and three detail rows -- so no join between them was sound. This test pins
+/// the reconciliation: the two counts are now equal by construction.
+#[test]
+fn scala_group_import_reports_one_statement_per_binding() {
+    let project = inline_scala_project(&[(
+        "Foo.scala",
+        r#"
+        import foo.bar.{Baz, Qux as Quux, *}
+
+        class Foo
+        "#,
+    )]);
+    let analyzer = ScalaAnalyzer::from_project(project.clone());
+    let file = ProjectFile::new(project.root().to_path_buf(), "Foo.scala");
+    assert_eq!(
+        analyzer.import_statements(&file),
+        vec![
+            "import foo.bar.Baz".to_string(),
+            "import foo.bar.Qux as Quux".to_string(),
+            "import foo.bar.*".to_string(),
+        ]
+    );
+    assert_eq!(
+        analyzer
+            .import_info_of(&file)
+            .iter()
+            .map(|import| import.raw_snippet.clone())
+            .collect::<Vec<_>>(),
+        analyzer.import_statements(&file),
+        "statements are exactly the bindings' snippets"
     );
 }
 

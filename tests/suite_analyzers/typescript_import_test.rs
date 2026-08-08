@@ -489,3 +489,68 @@ fn test_referencing_files_uses_resolved_typescript_import_targets() {
         analyzer.referencing_files_of(&target).into_iter().collect()
     );
 }
+
+/// The store holds one row per import BINDING (migration 0018), and a
+/// TypeScript declaration that binds several names emits one `ImportInfo` per
+/// name, all sharing the declaration's snippet. `import_statements` collapses
+/// those equal adjacent snippets, so one declaration is still one statement.
+///
+/// Before that migration `import_statements` and `import_details` were separate
+/// tables with independent ordinals -- this fixture produced two statement rows
+/// and four detail rows -- so no join between them was sound. This test pins
+/// the reconciliation: the binding count and the statement count are now both
+/// derived from one list.
+#[test]
+fn typescript_multi_binding_import_reports_one_statement_per_declaration() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let file = write_file(
+        root,
+        "bindings.ts",
+        r#"
+import Default, { Alpha, Beta as Gamma } from './m';
+import 'side-effect';
+
+export function use(): void {}
+        "#,
+    );
+    let analyzer = analyzer_for(root);
+
+    assert_eq!(
+        analyzer.import_statements(&file),
+        vec![
+            "import Default, { Alpha, Beta as Gamma } from './m';".to_string(),
+            "import 'side-effect';".to_string(),
+        ]
+    );
+    assert_eq!(
+        analyzer
+            .import_info_of(&file)
+            .iter()
+            .map(|import| (
+                import.raw_snippet.clone(),
+                import.identifier.clone(),
+                import.alias.clone()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "import Default, { Alpha, Beta as Gamma } from './m';".to_string(),
+                Some("Default".to_string()),
+                None
+            ),
+            (
+                "import Default, { Alpha, Beta as Gamma } from './m';".to_string(),
+                Some("Alpha".to_string()),
+                None
+            ),
+            (
+                "import Default, { Alpha, Beta as Gamma } from './m';".to_string(),
+                Some("Beta".to_string()),
+                Some("Gamma".to_string())
+            ),
+            ("import 'side-effect';".to_string(), None, None),
+        ],
+        "four bindings across two declarations"
+    );
+}
