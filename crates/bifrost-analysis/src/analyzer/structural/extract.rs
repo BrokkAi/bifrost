@@ -317,7 +317,7 @@ mod tests {
         let spec = &brokk_bifrost_jvm::scala::structural::SCALA_STRUCTURAL_SPEC;
         assert!(spec.occurrence_role_support().is_empty());
 
-        let grammar = tree_sitter_scala::LANGUAGE.into();
+        let grammar = brokk_bifrost_jvm::scala::language::LANGUAGE.into();
         let source = "class Widget(label: String) {\n  def render(): String = label\n}\n";
         let facts =
             extract_file_facts(spec, &grammar, source).expect("scala fixture extracts facts");
