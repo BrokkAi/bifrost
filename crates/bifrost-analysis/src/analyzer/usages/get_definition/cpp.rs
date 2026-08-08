@@ -5238,21 +5238,14 @@ fn cpp_merge_using_introduced_members(
 ///
 /// An in-class using-declaration is not indexed as a member of its class, so
 /// the declaration node in `owner`'s own source is the only structural record
-/// of it. Only a derived class can re-expose a base member, so the memoized
-/// ancestor edges gate the read: a class with no ancestors never pays for a
-/// parse, and the ancestor set is also what a named scope is matched against.
+/// of it. That parse is the cheap gate: a class that declares no
+/// `using <Base>::<member>;` never touches the hierarchy provider, whose
+/// ancestor computation classifies every visible alias on first use.
 fn cpp_member_using_declaration_bases(
     analyzer: &dyn IAnalyzer,
     owner: &CodeUnit,
     member: &str,
 ) -> Vec<CodeUnit> {
-    let Some(hierarchy) = analyzer.type_hierarchy_provider() else {
-        return Vec::new();
-    };
-    let ancestors = hierarchy.get_ancestors(owner);
-    if ancestors.is_empty() {
-        return Vec::new();
-    }
     let Some(source) = analyzer.get_source(owner, false) else {
         return Vec::new();
     };
@@ -5272,6 +5265,13 @@ fn cpp_member_using_declaration_bases(
         pending.extend(node.named_children(&mut cursor));
     }
     if scopes.is_empty() {
+        return Vec::new();
+    }
+    let Some(hierarchy) = analyzer.type_hierarchy_provider() else {
+        return Vec::new();
+    };
+    let ancestors = hierarchy.get_ancestors(owner);
+    if ancestors.is_empty() {
         return Vec::new();
     }
     ancestors
