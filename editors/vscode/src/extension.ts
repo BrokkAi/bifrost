@@ -142,7 +142,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   const policyWorkspaceWatcher = vscode.workspace.createFileSystemWatcher(
-    "**/*.{java,go,c,cc,cpp,cxx,h,hpp,hh,hxx,js,mjs,cjs,jsx,ts,tsx,py,rs,php,scala,kt,kts,cs,rb,rql,rqlp,json,toml}"
+    "**/*.{java,go,c,cc,cpp,cxx,h,hpp,hh,hxx,inc,js,mjs,cjs,jsx,ts,tsx,py,rs,php,scala,kt,kts,cs,rb,rql,rqlp,json,toml}"
   );
   const markWorkspacePolicyResultsStale = (uri: vscode.Uri): void => {
     if (!isGeneratedWorkspacePath(uri)) {

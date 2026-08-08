@@ -357,8 +357,36 @@ impl MultiAnalyzer {
         }
     }
 
+    /// The delegate language a file's queries route to.
+    ///
+    /// The extension registry answers for every file it names. A file it does
+    /// not name may still be analyzed, because a language claimed it through
+    /// its own imports (#1837): route those to the one language that infers
+    /// claims, so a query positioned inside an adopted `.inc` reaches the
+    /// analyzer that indexed it instead of falling off the routing table.
+    ///
+    /// An unclaimed-extension file that inference did NOT adopt routes to that
+    /// same delegate and finds nothing there, which is the same empty answer it
+    /// got when it routed nowhere. Asking each delegate whether it analyzed the
+    /// file would be exact, but that is a store round-trip on a path every
+    /// query takes.
+    ///
+    /// CLAIMS SEAM: see [`crate::analyzer::languages::claim_inferring_languages`].
+    /// With two inferring languages this must become a real lookup.
+    fn dispatch_language(&self, file: &ProjectFile) -> Language {
+        let language = language_for_file(file);
+        if language != Language::None {
+            return language;
+        }
+        crate::analyzer::languages::claim_inferring_languages()
+            .iter()
+            .copied()
+            .find(|language| self.delegates.contains_key(language))
+            .unwrap_or(Language::None)
+    }
+
     pub(crate) fn delegate_for_file(&self, file: &ProjectFile) -> Option<&AnalyzerDelegate> {
-        self.delegates.get(&language_for_file(file))
+        self.delegates.get(&self.dispatch_language(file))
     }
 
     pub(crate) fn program_semantics_provider_for_file(
@@ -440,7 +468,7 @@ impl ImportAnalysisProvider for MultiAnalyzer {
         let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
         for file in files {
             grouped
-                .entry(language_for_file(file))
+                .entry(self.dispatch_language(file))
                 .or_default()
                 .push(file.clone());
         }
@@ -1353,7 +1381,7 @@ impl IAnalyzer for MultiAnalyzer {
         let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
         for file in files {
             grouped
-                .entry(language_for_file(file))
+                .entry(self.dispatch_language(file))
                 .or_default()
                 .push(file.clone());
         }
@@ -1494,7 +1522,7 @@ impl IAnalyzer for MultiAnalyzer {
         let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
         for file in files {
             grouped
-                .entry(language_for_file(file))
+                .entry(self.dispatch_language(file))
                 .or_default()
                 .push(file.clone());
         }
@@ -1516,7 +1544,7 @@ impl IAnalyzer for MultiAnalyzer {
         let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
         for file in files {
             grouped
-                .entry(language_for_file(file))
+                .entry(self.dispatch_language(file))
                 .or_default()
                 .push(file.clone());
         }
