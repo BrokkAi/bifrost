@@ -388,6 +388,17 @@ If more than one location needs the same interpretation, add a shared structured
 
 Backward compatibility is not yet a requirement. When requirements change, simplify or correct the APIs instead.
 
+# SQL and the analyzer store
+
+The analyzer cache is a SQLite database. The schema and its views are the interface.
+
+- Prefer SQL at the call site to a data-access layer. Write the query that fits the problem at hand. Do not add a wrapper method for each question. Half the value of SQL is that you can adapt the query to the problem.
+- When more than one client uses one query shape, create a view for that shape. Put the shared predicates in the view, not in each query.
+- Put domain invariants in the schema and in views, not in Rust method bodies. Examples: live-blob and generation filtering, definition-lookup membership, language scope. A call-site query against a view cannot forget the invariant.
+- Keep connection handling, transactions, write batching, and cancellation in the store infrastructure. That layer is infrastructure, not wrapping.
+- Pin query cost in tests with EXPLAIN QUERY PLAN assertions. Assert that the query uses the intended index and does not scan a large table. Prefer this to Rust-side scan counters for new pins.
+- Do not store serialized Rust structures as opaque blobs when the data has queryable structure. Store rows. Binary payloads that SQL cannot usefully query, such as embedding vectors, can stay binary.
+
 # Implementation details
 
 - Bifrost builds and tests on Windows and on Unix-like systems. Keep file and path handling independent of the operating system. Use `Path` and `PathBuf`. Use temporary and project roots that are absolute on the current system. Normalize slashes only at API or rendering boundaries that require a stable workspace-relative string.

@@ -71,6 +71,23 @@ the store's normal per-blob row replacement.
   IntelliJ ships no "all declarations" heap structure at all (research doc sections 4.2-4.3,
   6.3) - `code_units` + its indexes already are the stub-index level.
   Date/Author: 2026-08-08 / Fable (from the investigation; pending owner approval).
+- Decision (OWNER, 2026-08-08, supersedes the cohort targets below where they conflict): the
+  schema and its views are the store's interface. Consumers migrate onto call-site SQL against
+  views, NOT onto more wrapper methods -- "prefer SQL to DAL" and "create a view as soon as a
+  query shape has more than one client" are now recorded in AGENTS.md (section "SQL and the
+  analyzer store"). Concretely for this plan: Milestone 1 additionally ships the liveness/
+  generation views (live_code_units and siblings) that encode the invariants every query
+  needs; cohort migrations write their queries at the call site against those views, reusing
+  only shape-level row mappers; new pins are EXPLAIN QUERY PLAN assertions rather than Rust
+  scan counters. Where a bounded wrapper method already exists and already serves (the five
+  in-production operations), re-pointing onto it remains acceptable for cohort 1 -- the rule
+  governs NEW query surface, and those methods may themselves be dissolved into view queries
+  opportunistically.
+  Rationale: the wrapper tax is measured (one query change touched 13 wrappers plus a trait in
+  2ba5dda4; the 366cb82e and 3d57cafd reports both cite wrapper plumbing as a design
+  constraint), the database is in-process so there is no boundary to mediate, and invariants
+  belong in the schema -- views make call-site SQL unable to forget them.
+  Date/Author: 2026-08-08 / Jonathan (direction), Fable (recorded).
 - Decision: milestones ship per-operation cohorts, not per-consumer big-bang. Cohort 1 is the
   five operations whose bounded equivalents already ship (mechanical re-pointing + parity
   tests); cohort 2 the five rows-backed ones (store methods/indexes exist, call paths need
