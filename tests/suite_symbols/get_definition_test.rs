@@ -3904,6 +3904,184 @@ fn csharp_nested_sibling_type_resolves_from_property_type_position() {
     );
 }
 
+// #1802 (naps2 `XmlSerializer.cs`): C# simple-name lookup continues into every
+// ENCLOSING type declaration after the innermost type and its base chain are
+// exhausted. The nested caller's own base chain is empty here, so only the
+// enclosing scope can supply `Helper`.
+#[test]
+fn csharp_bare_call_resolves_to_an_enclosing_types_member() {
+    let source = "namespace N\n{\n    public abstract class Outer\n    {\n        protected static object Helper(object a, object b) { return a; }\n\n        protected class Inner\n        {\n            public object Use(object a, object b) { return Helper(a, b); }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("enclosing-type call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "N.Outer.Helper", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "P.cs", "{value}");
+}
+
+// The same shape with an INSTANCE member on the enclosing type. C# puts the
+// name in scope and binds it; the call is an error only because a nested type
+// has no implicit outer instance (CS0120). get_definition answers the
+// declaration the name binds to, exactly as it does for an instance member
+// reached through the base chain from a static context, so this resolves.
+#[test]
+fn csharp_bare_call_resolves_to_an_enclosing_types_instance_member() {
+    let source = "namespace N\n{\n    public abstract class Outer\n    {\n        protected object Helper(object a, object b) { return a; }\n\n        protected class Inner\n        {\n            public object Use(object a, object b) { return Helper(a, b); }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("enclosing-type call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "N.Outer.Helper", "{value}");
+}
+
+// The walk continues past the first enclosing type: `Inner` is nested in `Mid`
+// which is nested in `Outer`, and only `Outer` declares `Helper`.
+#[test]
+fn csharp_bare_call_resolves_to_an_enclosing_type_two_levels_out() {
+    let source = "namespace N\n{\n    public abstract class Outer\n    {\n        protected static object Helper(object a, object b) { return a; }\n\n        protected class Mid\n        {\n            protected class Inner\n            {\n                public object Use(object a, object b) { return Helper(a, b); }\n            }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("enclosing-type call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "N.Outer.Helper", "{value}");
+}
+
+// The faithful naps2 shape: the nested caller DOES have a base class, and that
+// base edge resolves fine, but the base declares nothing named
+// `DeserializeInternal`. Only the enclosing type does. This removes the
+// confound with #1801's nested-base-resolution defect.
+#[test]
+fn csharp_bare_call_reaches_the_enclosing_type_past_an_unrelated_base() {
+    let source = "namespace NAPS2.Serialization;\n\npublic abstract class XmlSerializer\n{\n    protected static object DeserializeInternal(object element, System.Type type)\n    {\n        return element;\n    }\n\n    protected class CollectionSerializer : CustomXmlSerializer\n    {\n        public override object DeserializeObject(object element, System.Type type)\n        {\n            return DeserializeInternal(element, type);\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("XmlSerializer.cs", source)
+        .file(
+            "CustomXmlSerializer.cs",
+            "namespace NAPS2.Serialization;\n\npublic abstract class CustomXmlSerializer\n{\n    public abstract object DeserializeObject(object element, System.Type type);\n}\n",
+        )
+        .build();
+
+    let call = source
+        .rfind("DeserializeInternal(element, type)")
+        .expect("enclosing-type call");
+    let value = lookup(
+        project.root(),
+        &location_reference("XmlSerializer.cs", source, call),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "NAPS2.Serialization.XmlSerializer.DeserializeInternal",
+        "{value}"
+    );
+}
+
+// #1802's ordering constraint. `Helper` is declared BOTH on `Inner`'s base and
+// on the enclosing `Outer`. C# exhausts the innermost type's whole base chain
+// before it looks at any enclosing type, so the base member wins. Merging the
+// enclosing types into one owners vector would let `Outer.Helper` win at depth
+// 0 and break this.
+#[test]
+fn csharp_base_chain_member_beats_an_enclosing_types_member() {
+    let source = "namespace N\n{\n    public class Base\n    {\n        protected static object Helper(object a, object b) { return b; }\n    }\n\n    public class Outer\n    {\n        protected static object Helper(object a, object b) { return a; }\n\n        public class Inner : Base\n        {\n            public object Use(object a, object b) { return Helper(a, b); }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("shadowed call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "the base-chain member must win outright, not tie: {value}"
+    );
+    assert_eq!(result["definitions"][0]["fqn"], "N.Base.Helper", "{value}");
+}
+
+// The non-invocation half of the same rule: a bare FIELD read reaches the
+// enclosing type through the identifier branch, not the invocation branch.
+#[test]
+fn csharp_bare_field_read_resolves_to_an_enclosing_types_field() {
+    let source = "namespace N\n{\n    public class Outer\n    {\n        protected static int Counter = 1;\n\n        public class Inner\n        {\n            public int Use() { return Counter; }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let read = source.rfind("Counter;").expect("enclosing-type field read");
+    let value = lookup(project.root(), &location_reference("P.cs", source, read));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "N.Outer.Counter",
+        "{value}"
+    );
+}
+
+// Near miss: a SIBLING nested type is not an enclosing type. `Sibling.Helper`
+// is not in scope for a bare call written inside `Inner`.
+#[test]
+fn csharp_bare_call_does_not_reach_a_sibling_nested_types_member() {
+    let source = "namespace N\n{\n    public class Outer\n    {\n        public class Sibling\n        {\n            public static object Helper(object a, object b) { return a; }\n        }\n\n        public class Inner\n        {\n            public object Use(object a, object b) { return Helper(a, b); }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("sibling call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_ne!(result["status"], "resolved", "{value}");
+}
+
+// #1801 (nunit `TestNameGenerator`): a bare call to a member inherited from a
+// nested base type spelled by its simple name. Supertype resolution searched
+// only the file's namespace and `using` scopes, so `Derived : Base` inside
+// `Outer` had no ancestors at all and `Helper(a, b)` was unreachable.
+// `Other.Base.Helper` is the near miss: a same-short-name type in another
+// namespace must not supply the definition.
+#[test]
+fn csharp_bare_call_resolves_through_a_nested_base_spelled_by_simple_name() {
+    let source = "namespace N\n{\n    public class Outer\n    {\n        private abstract class Base\n        {\n            protected static string Helper(object a, int b) { return \"x\"; }\n        }\n\n        private sealed class Derived : Base\n        {\n            public void Use(object a, int b) { var s = Helper(a, b); }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .file(
+            "Other.cs",
+            "namespace Other\n{\n    public class Base\n    {\n        public static string Helper(object a, int b) { return \"y\"; }\n    }\n}\n",
+        )
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("inherited call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "N.Outer$Base.Helper",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "P.cs", "{value}");
+}
+
 // A bare field reference inside a method must resolve through the enclosing
 // class's members, not fall through to the type path and claim a using
 // boundary for a field declared in the same class (tier-3 CsvHelper:
@@ -3924,6 +4102,98 @@ fn csharp_private_field_reference_resolves_via_enclosing_class() {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
         result["definitions"][0]["fqn"], "Ns.CsvParser.delimiterPosition",
+        "{value}"
+    );
+}
+
+// A C# statement label is not a member reference. `goto Render;` and the
+// `Render:` label declaration must not forward-resolve to a same-named method
+// of the enclosing class, while a real call to that method in the same body
+// still resolves (census-seeded FIRD on markdig RendererBase.cs, #1799).
+#[test]
+fn csharp_goto_label_and_label_declaration_are_not_member_references() {
+    let source = "namespace Demo\n{\n    public abstract class RendererBase\n    {\n        public abstract object Render(object o);\n\n        public object Write(object obj, bool flag)\n        {\n            if (flag)\n            {\n                goto Render;\n            }\n\n            obj = null;\n\n        Render:\n            return Render(obj);\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/RendererBase.cs", source)
+        .build();
+
+    let goto_target = source.find("goto Render;").expect("goto statement") + "goto ".len();
+    let label = source.find("\n        Render:").expect("label declaration") + "\n        ".len();
+    let call = source.find("return Render(obj);").expect("call") + "return ".len();
+
+    for (start, position) in [(goto_target, "goto target"), (label, "label declaration")] {
+        let value = lookup(
+            project.root(),
+            &location_reference("src/RendererBase.cs", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "no_definition", "{position}: {value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "statement_label_site",
+            "{position}: {value}"
+        );
+    }
+
+    let value = lookup(
+        project.root(),
+        &location_reference("src/RendererBase.cs", source, call),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.RendererBase.Render",
+        "{value}"
+    );
+}
+
+// The label answer must not depend on a same-named method existing: a label the
+// workspace has no member for is still a label site, not an unresolved member
+// reference (#1799).
+#[test]
+fn csharp_goto_label_without_a_same_named_member_is_still_a_label_site() {
+    let source = "namespace Demo\n{\n    public class Loader\n    {\n        public void Load(bool flag)\n        {\n            if (flag)\n            {\n                goto Cleanup;\n            }\n\n        Cleanup:\n            return;\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Loader.cs", source)
+        .build();
+
+    let goto_target = source.find("goto Cleanup;").expect("goto statement") + "goto ".len();
+    let label = source
+        .find("\n        Cleanup:")
+        .expect("label declaration")
+        + "\n        ".len();
+
+    for (start, position) in [(goto_target, "goto target"), (label, "label declaration")] {
+        let value = lookup(
+            project.root(),
+            &location_reference("src/Loader.cs", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "no_definition", "{position}: {value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "statement_label_site",
+            "{position}: {value}"
+        );
+    }
+}
+
+// `goto case <constant>;` names a constant, not a statement label, so the label
+// exclusion must leave that expression a live reference (#1799).
+#[test]
+fn csharp_goto_case_constant_stays_a_member_reference() {
+    let source = "namespace Demo\n{\n    public class Router\n    {\n        public const int Retry = 1;\n        public const int Fallback = 2;\n\n        public string Route(int value)\n        {\n            switch (value)\n            {\n                case Retry:\n                    goto case Fallback;\n                case Fallback:\n                    return \"fallback\";\n                default:\n                    return \"none\";\n            }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Router.cs", source)
+        .build();
+
+    let start = source.find("goto case Fallback;").expect("goto case") + "goto case ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/Router.cs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.Router.Fallback",
         "{value}"
     );
 }
@@ -19558,9 +19828,18 @@ fn csharp_inapplicable_direct_member_rejects_unrelated_extension_receiver() {
         ),
     );
 
-    assert_eq!(
-        value["results"][0]["definitions"][0]["fqn"], "Demo.Listener.Signal",
-        "an extension with an incompatible known receiver must not replace the legacy direct fallback: {value}"
+    // The direct member is the only same-named declaration the receiver's type
+    // offers, and its three parameters cannot accept a one-argument call, so
+    // nothing here is the target: the extension's receiver is a `string`, and
+    // binding the inapplicable direct member was the #1797 defect. `Listener`
+    // is sealed and derives from nothing indexed-or-otherwise, so the missing
+    // overload is a workspace fact rather than a boundary.
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(
+        value["results"][0]["definitions"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "an extension with an incompatible known receiver must not be the answer either: {value}"
     );
 }
 
@@ -20070,21 +20349,35 @@ namespace App {
 }
 "#;
 
+    let definition_at = |needle: &str| {
+        let start = source.find(needle).expect("constructor site") + "new ".len();
+        lookup(
+            project.root(),
+            &location_reference("App/Controller.cs", source, start),
+        )
+    };
+
     for (needle, expected) in [
         ("new PixelRect()", "Lib.PixelRect"),
         ("new PixelRect(pixels)", "Lib.PixelRect.PixelRect"),
         ("new ExplicitZero()", "Lib.ExplicitZero.ExplicitZero"),
-        ("new Service()", "Lib.Service.Service"),
     ] {
-        let start = source.find(needle).expect("constructor site") + "new ".len();
-        let value = lookup(
-            project.root(),
-            &location_reference("App/Controller.cs", source, start),
-        );
+        let value = definition_at(needle);
         let result = &value["results"][0];
         assert_eq!(result["status"], "resolved", "{value}");
         assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
     }
+
+    // Only a value type has the implicit parameterless constructor, so this
+    // class's single one-parameter constructor cannot accept `new Service()` --
+    // and handing it back anyway was the #1797 defect.
+    let value = definition_at("new Service()");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "no_applicable_overload",
+        "{value}"
+    );
 }
 
 #[test]
@@ -20231,8 +20524,12 @@ public static class ImmutableEquatableArray
     }
 }
 
+/// #1797: a call no indexed overload can accept is not resolved by handing back
+/// the overloads that rejected it. `Service` is declared in this workspace and
+/// derives from nothing, so the three-argument call has no target here and none
+/// beyond the workspace either.
 #[test]
-fn csharp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
+fn csharp_typed_receiver_method_wrong_arity_reports_no_applicable_overload() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
             "Lib/Service.cs",
@@ -20254,19 +20551,13 @@ fn csharp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "ambiguous", "{value}");
-    assert_eq!(
-        result["definitions"].as_array().unwrap().len(),
-        2,
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
         "{value}"
     );
     assert_eq!(
-        result["definitions"][0]["fqn"], "Lib.Service.GetFilePaths",
-        "{value}"
-    );
-    assert_eq!(result["definitions"][0]["signature"], "(string)", "{value}");
-    assert_eq!(
-        result["definitions"][1]["signature"], "(string, bool)",
+        result["diagnostics"][0]["kind"], "no_applicable_overload",
         "{value}"
     );
 }
@@ -33161,4 +33452,436 @@ fn javascript_var_binder_in_a_sibling_function_reports_no_definition() {
     let value =
         javascript_var_scoping_definition(JAVASCRIPT_VAR_IN_SIBLING_FUNCTION, "toBigNumber(1)");
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+/// nunit's `ExtendedTextWriter` shape (#1797): the receiver's own type declares
+/// only a two-parameter `WriteLine`, and the parameterless call the site makes
+/// is `System.IO.TextWriter.WriteLine()`, on the far side of a base type this
+/// workspace does not index.
+const CSHARP_UNINDEXED_BASE_WRITER: &str = r#"using System.IO;
+
+namespace Demo
+{
+    public abstract class ExtendedTextWriter : TextWriter
+    {
+        public abstract void WriteLine(int style, string value);
+        public abstract void WriteLabel(string label, object option = null);
+        public abstract void WriteAll(string label, params object[] values);
+    }
+}
+"#;
+
+const CSHARP_UNINDEXED_BASE_CALLER: &str = r#"namespace Demo
+{
+    public class TextUI
+    {
+        public ExtendedTextWriter Writer { get; }
+
+        public void Show()
+        {
+            Writer.WriteLine();
+            Writer.WriteLine(1, "hello");
+            Writer.WriteLabel("a");
+            Writer.WriteAll("a", 1, 2, 3);
+        }
+    }
+}
+"#;
+
+fn csharp_unindexed_base_definition(needle: &str) -> Value {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Writer.cs", CSHARP_UNINDEXED_BASE_WRITER)
+        .file("src/Ui.cs", CSHARP_UNINDEXED_BASE_CALLER)
+        .build();
+    lookup(
+        project.root(),
+        &location_reference(
+            "src/Ui.cs",
+            CSHARP_UNINDEXED_BASE_CALLER,
+            CSHARP_UNINDEXED_BASE_CALLER
+                .find(needle)
+                .expect("call site in source"),
+        ),
+    )
+}
+
+#[test]
+fn csharp_arity_inapplicable_call_through_an_unindexed_base_answers_boundary() {
+    let value = csharp_unindexed_base_definition("WriteLine();");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
+        "the two-parameter overload cannot accept a parameterless call: {value}"
+    );
+}
+
+#[test]
+fn csharp_applicable_call_through_an_unindexed_base_still_resolves() {
+    let value = csharp_unindexed_base_definition("WriteLine(1,");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.ExtendedTextWriter.WriteLine",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_omitted_optional_argument_through_an_unindexed_base_still_resolves() {
+    let value = csharp_unindexed_base_definition("WriteLabel(\"a\")");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.ExtendedTextWriter.WriteLabel",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_params_array_call_through_an_unindexed_base_still_resolves() {
+    let value = csharp_unindexed_base_definition("WriteAll(\"a\"");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.ExtendedTextWriter.WriteAll",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_arity_inapplicable_call_with_an_indexed_base_chain_answers_no_definition() {
+    let source = r#"namespace Demo
+{
+    public class BaseWriter
+    {
+        public void Flush() {}
+    }
+
+    public class LocalWriter : BaseWriter
+    {
+        public void WriteLine(int style, string value) {}
+    }
+
+    public class Caller
+    {
+        public void Show(LocalWriter writer)
+        {
+            writer.WriteLine();
+            writer.WriteLine(1, "hello");
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Local.cs", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "src/Local.cs",
+            source,
+            source.find("WriteLine();").expect("parameterless call"),
+        ),
+    );
+    let result = &value["results"][0];
+    assert_eq!(
+        result["status"], "no_definition",
+        "every type in the receiver's base chain is indexed, so the missing overload is a workspace fact: {value}"
+    );
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
+        "{value}"
+    );
+
+    let control = lookup(
+        project.root(),
+        &location_reference(
+            "src/Local.cs",
+            source,
+            source.find("WriteLine(1,").expect("two-argument call"),
+        ),
+    );
+    assert_eq!(control["results"][0]["status"], "resolved", "{control}");
+    assert_eq!(
+        control["results"][0]["definitions"][0]["fqn"], "Demo.LocalWriter.WriteLine",
+        "{control}"
+    );
+}
+
+/// neo's `WitnessCondition` shape (#1810): the class declares only the one-argument
+/// `Equals` override, and the bare two-argument call in a static member is the
+/// external `static object.Equals(object, object)` -- inherited from the implicit
+/// `object` base every C# type has and no workspace indexes.
+const CSHARP_IMPLICIT_OBJECT_BASE_SOURCE: &str = r#"namespace Demo
+{
+    public abstract class WitnessCondition
+    {
+        public abstract override bool Equals(object obj);
+
+        public override string ToString()
+        {
+            return "witness";
+        }
+
+        public static bool NotEqual(WitnessCondition left, WitnessCondition right)
+        {
+            return !Equals(left, right);
+        }
+
+        public bool Same(WitnessCondition other)
+        {
+            return Equals(other);
+        }
+
+        public string Describe()
+        {
+            return ToString();
+        }
+    }
+}
+"#;
+
+fn csharp_implicit_object_base_definition(needle: &str, offset: usize) -> Value {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/WitnessCondition.cs",
+            CSHARP_IMPLICIT_OBJECT_BASE_SOURCE,
+        )
+        .build();
+    let start = CSHARP_IMPLICIT_OBJECT_BASE_SOURCE
+        .find(needle)
+        .expect("call site in source")
+        + offset;
+    lookup(
+        project.root(),
+        &location_reference(
+            "src/WitnessCondition.cs",
+            CSHARP_IMPLICIT_OBJECT_BASE_SOURCE,
+            start,
+        ),
+    )
+}
+
+#[test]
+fn csharp_arity_rejected_object_member_call_answers_boundary() {
+    let value = csharp_implicit_object_base_definition("Equals(left, right)", 0);
+    let result = &value["results"][0];
+    assert_eq!(
+        result["status"], "unresolvable_import_boundary",
+        "the one-argument override cannot accept two arguments, and the accepting \
+         `static object.Equals(object, object)` lives beyond the implicit object base: {value}"
+    );
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_correct_arity_object_member_override_still_resolves() {
+    let value = csharp_implicit_object_base_definition("Equals(other)", 0);
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.WitnessCondition.Equals",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_bare_object_member_call_matching_a_same_class_override_still_resolves() {
+    let value = csharp_implicit_object_base_definition("return ToString();", "return ".len());
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.WitnessCondition.ToString",
+        "{value}"
+    );
+}
+
+/// jint's `IsoDateTime` shape (#1797, face 2): a record's primary constructor is
+/// a real constructor with its own arity, and an explicit constructor beside it
+/// is a distinct overload.
+const CSHARP_PRIMARY_CONSTRUCTOR_SOURCE: &str = r#"namespace Demo
+{
+    internal readonly record struct IsoDate(int Year, int Month, int Day);
+
+    internal readonly record struct IsoDateTime(IsoDate Date, int Hour)
+    {
+        public IsoDateTime(int year, int month, int day, int hour)
+            : this(new IsoDate(year, month, day), hour)
+        {
+        }
+    }
+
+    internal record Simple(int A, int B);
+
+    internal record class Titled(string Name);
+
+    public class Widget(int size)
+    {
+        public int Size => size;
+    }
+
+    public static class Use
+    {
+        public static void Go()
+        {
+            var pair = new IsoDateTime(new IsoDate(1, 2, 3), 4);
+            var parts = new IsoDateTime(1, 2, 3, 4);
+            var simple = new Simple(1, 2);
+            var titled = new Titled("name");
+            var widget = new Widget(3);
+        }
+    }
+}
+"#;
+
+fn csharp_primary_constructor_definition(needle: &str) -> Value {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Records.cs", CSHARP_PRIMARY_CONSTRUCTOR_SOURCE)
+        .build();
+    let start = CSHARP_PRIMARY_CONSTRUCTOR_SOURCE
+        .find(needle)
+        .expect("creation site in source")
+        + "new ".len();
+    lookup(
+        project.root(),
+        &location_reference("src/Records.cs", CSHARP_PRIMARY_CONSTRUCTOR_SOURCE, start),
+    )
+}
+
+#[test]
+fn csharp_record_struct_primary_constructor_wins_the_arity_match() {
+    let value = csharp_primary_constructor_definition("new IsoDateTime(new IsoDate");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    let definitions = result["definitions"].as_array().expect("definitions");
+    assert_eq!(definitions.len(), 1, "{value}");
+    assert_eq!(
+        definitions[0]["fqn"], "Demo.IsoDateTime.IsoDateTime",
+        "{value}"
+    );
+    assert_eq!(
+        definitions[0]["signature"], "(IsoDate, int)",
+        "the primary constructor, not the four-parameter explicit one: {value}"
+    );
+}
+
+#[test]
+fn csharp_record_explicit_constructor_still_wins_its_own_arity() {
+    let value = csharp_primary_constructor_definition("new IsoDateTime(1, 2, 3, 4)");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    let definitions = result["definitions"].as_array().expect("definitions");
+    assert_eq!(definitions.len(), 1, "{value}");
+    assert_eq!(
+        definitions[0]["fqn"], "Demo.IsoDateTime.IsoDateTime",
+        "{value}"
+    );
+    assert_eq!(
+        definitions[0]["signature"], "(int, int, int, int)",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_record_only_primary_constructor_resolves_to_it_not_the_type() {
+    for (needle, fqn) in [
+        ("new Simple(1, 2)", "Demo.Simple.Simple"),
+        ("new Titled(\"name\")", "Demo.Titled.Titled"),
+        ("new Widget(3)", "Demo.Widget.Widget"),
+    ] {
+        let value = csharp_primary_constructor_definition(needle);
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{needle}: {value}");
+        assert_eq!(result["definitions"][0]["fqn"], fqn, "{needle}: {value}");
+    }
+}
+
+/// Pillow's `src/Tk/_tkmini.h` declares `typedef Tcl_Command
+/// (*Tcl_CreateCommand_t)(...)`. Recovering the alias target from the
+/// declaration text served `Tcl_Command`, the return type, so the alias
+/// resolved to `struct Tcl_Command_` (issue #1815). A function-pointer typedef
+/// names a function type, which the analyzer's type model cannot name, so the
+/// alias has no canonical target and the typedef itself is the definition.
+#[test]
+fn cpp_function_pointer_typedef_does_not_resolve_to_its_return_type() {
+    let source = r#"
+struct Tcl_Command_ { int value; };
+typedef struct Tcl_Command_ *Tcl_Command;
+struct Tcl_Interp_ { int value; };
+typedef struct Tcl_Interp_ Tcl_Interp;
+typedef Tcl_Command (*Tcl_CreateCommand_t)(Tcl_Interp *interp, const char *cmdName);
+typedef Tcl_Command Tcl_CreateCommandDirect_t(Tcl_Interp *interp);
+struct impl_s { int value; };
+typedef struct impl_s alias_t;
+struct S { int value; };
+typedef struct S *A;
+typedef int arr_t[4];
+typedef const struct S *csp_t;
+void use(Tcl_CreateCommand_t fp, Tcl_CreateCommandDirect_t *direct, alias_t plain,
+         A pointer, arr_t array, csp_t qualified, Tcl_Command command) {
+    (void)fp; (void)direct; (void)plain; (void)pointer;
+    (void)array; (void)qualified; (void)command;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.c", source)
+        .build();
+
+    // Each alias use resolves to the definition its declaration names. A
+    // function-type alias names no declared type, so it resolves to itself.
+    for (needle, fqn) in [
+        ("Tcl_CreateCommand_t fp", "Tcl_CreateCommand_t"),
+        (
+            "Tcl_CreateCommandDirect_t *direct",
+            "Tcl_CreateCommandDirect_t",
+        ),
+        ("alias_t plain", "impl_s"),
+        ("A pointer", "S"),
+        ("arr_t array", "arr_t"),
+        ("csp_t qualified", "S"),
+        ("Tcl_Command command", "Tcl_Command_"),
+    ] {
+        let start = source.find(needle).expect("alias use in fixture");
+        let value = lookup(project.root(), &location_reference("app.c", source, start));
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{needle}: {value}");
+        let definitions = result["definitions"].as_array().expect("definitions array");
+        assert_eq!(definitions.len(), 1, "{needle}: {value}");
+        assert_eq!(definitions[0]["fqn"], fqn, "{needle}: {value}");
+    }
+}
+
+/// The C++ `using` spelling of a function-pointer alias has the same target:
+/// the aliased type is a function type, not the return type.
+#[test]
+fn cpp_using_function_pointer_alias_does_not_resolve_to_its_return_type() {
+    let source = r#"namespace app {
+struct Command { int value; };
+using CommandPtr = Command *;
+using Handler = Command (*)(int);
+void use(Handler handler, CommandPtr pointer) { (void)handler; (void)pointer; }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+
+    for (needle, fqn) in [
+        ("Handler handler", "app.Handler"),
+        ("CommandPtr pointer", "app.Command"),
+    ] {
+        let start = source.find(needle).expect("alias use in fixture");
+        let value = lookup(
+            project.root(),
+            &location_reference("app.cpp", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{needle}: {value}");
+        assert_eq!(result["definitions"][0]["fqn"], fqn, "{needle}: {value}");
+    }
 }

@@ -11667,6 +11667,91 @@ mod shadowed {
 }
 
 #[test]
+fn issue_1377_cfg_alternatives_keep_both_inverse_targets() {
+    let consumer = r#"
+#[cfg(feature = "query_apply")]
+use crate::apply::apply_from_stdin;
+
+fn run() -> u8 {
+    apply_from_stdin()
+}
+
+#[cfg(not(feature = "query_apply"))]
+fn apply_from_stdin() -> u8 {
+    1
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod apply;\npub mod consumer;\n"),
+        ("src/apply.rs", "pub fn apply_from_stdin() -> u8 { 0 }\n"),
+        ("src/consumer.rs", consumer),
+    ]);
+    let candidate = project.file("src/consumer.rs");
+    let call = consumer.find("apply_from_stdin()").expect("reported call");
+
+    for target_name in ["apply.apply_from_stdin", "consumer.apply_from_stdin"] {
+        let target = definition(&analyzer, target_name);
+        let hits = UsageFinder::new()
+            .find_usages_default(&analyzer, &[target])
+            .all_hits();
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == candidate
+                    && (hit.start_offset, hit.end_offset) == (call, call + "apply_from_stdin".len())
+                    && hit.kind == UsageHitKind::Reference
+            }),
+            "{target_name} must retain the cfg-alternative call: {hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn issue_1377_function_scoped_import_beats_enclosing_function_name() {
+    let consumer = r#"
+fn recognize() -> u8 {
+    use crate::combinator::recognize;
+
+    fn nested() -> u8 {
+        recognize()
+    }
+
+    nested()
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod combinator;\npub mod consumer;\n"),
+        ("src/combinator.rs", "pub fn recognize() -> u8 { 0 }\n"),
+        ("src/consumer.rs", consumer),
+    ]);
+    let candidate = project.file("src/consumer.rs");
+    let call = consumer.rfind("recognize()").expect("reported nested call");
+    let imported = definition(&analyzer, "combinator.recognize");
+    let imported_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[imported])
+        .all_hits();
+    assert!(
+        imported_hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset) == (call, call + "recognize".len())
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "the function-scoped import must win: {imported_hits:#?}"
+    );
+
+    let enclosing = definition(&analyzer, "consumer.recognize");
+    let enclosing_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[enclosing])
+        .all_hits();
+    assert!(
+        enclosing_hits.iter().all(|hit| {
+            hit.file != candidate
+                || (hit.start_offset, hit.end_offset) != (call, call + "recognize".len())
+        }),
+        "the enclosing function must not receive the imported call: {enclosing_hits:#?}"
+    );
+}
+
+#[test]
 fn rust_graph_concurrent_workspace_bare_function_queries_stay_isolated() {
     let consumer = r#"
 #[cfg(test)]

@@ -5501,6 +5501,142 @@ public sealed class BinaryAmbiguous {
     }
 }
 
+/// #1798: the inverse recognized method-group *values* only in a whitelist of
+/// parent contexts that omitted `==`/`!=` comparisons and both arms of a
+/// ternary, so those sites produced no evidence at all while the forward
+/// resolver reported them. The controls (assignment, argument, switch arm,
+/// `+`, `??`, `base.Hook`) were already consistent and must stay that way.
+#[test]
+fn usage_finder_csharp_finds_comparison_and_ternary_method_groups() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "Demo/Hooks.cs",
+        r#"
+namespace Demo;
+
+public class Base {
+    public virtual void Hook(int data) { }
+    public virtual void Other(int data) { }
+}
+
+public sealed class Derived : Base {
+    private bool Ready(int data) => data > 0;
+
+    public void Register(System.Action<int> handler) { }
+
+    public void Run(bool flag) {
+        if (Hook != base.Hook) { }
+        if (Hook == base.Hook) { }
+        System.Action<int> assigned = Hook;
+        Register(Hook);
+        System.Action<int> ternary = flag ? Hook : Other;
+        System.Action<int> switched = flag switch { true => Hook, false => Other };
+        System.Action<int> added = Hook + Other;
+        System.Action<int> coalesced = Hook ?? Other;
+        System.Action<int> gated = Ready ? Hook : Other;
+    }
+}
+"#,
+    )]);
+
+    let consumer = project.file("Demo/Hooks.cs");
+    let source = consumer.read_to_string().expect("method-group source");
+    // (line, occurrence of `Hook` on that line) for every site that must be reported.
+    let expected = [
+        ("        if (Hook != base.Hook) { }", 0),
+        ("        if (Hook != base.Hook) { }", 1),
+        ("        if (Hook == base.Hook) { }", 0),
+        ("        if (Hook == base.Hook) { }", 1),
+        ("        System.Action<int> assigned = Hook;", 0),
+        ("        Register(Hook);", 0),
+        (
+            "        System.Action<int> ternary = flag ? Hook : Other;",
+            0,
+        ),
+        (
+            "        System.Action<int> switched = flag switch { true => Hook, false => Other };",
+            0,
+        ),
+        ("        System.Action<int> added = Hook + Other;", 0),
+        ("        System.Action<int> coalesced = Hook ?? Other;", 0),
+        (
+            "        System.Action<int> gated = Ready ? Hook : Other;",
+            0,
+        ),
+    ]
+    .into_iter()
+    .map(|(line, occurrence)| {
+        let start = source.find(line).unwrap_or_else(|| panic!("line {line}"));
+        start
+            + line
+                .match_indices("Hook")
+                .nth(occurrence)
+                .unwrap_or_else(|| panic!("occurrence {occurrence} of Hook in {line}"))
+                .0
+    })
+    .collect::<Vec<_>>();
+
+    let hook = member_function_with_arity(&analyzer, "Demo.Base", "Hook", 1);
+    let graph = graph_hits(&analyzer, &hook);
+    for start in &expected {
+        assert!(
+            graph
+                .iter()
+                .any(|hit| hit.start_offset <= *start && *start + "Hook".len() <= hit.end_offset),
+            "missing inverted method-group hit at {start}: {graph:#?}"
+        );
+    }
+    assert_eq!(
+        expected.len(),
+        graph.len(),
+        "the method-group value contexts must be reported exactly once each: {graph:#?}"
+    );
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let routed = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&hook),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("method-group query should resolve");
+    assert_eq!(
+        expected.len(),
+        routed.len(),
+        "targeted extraction must match the inverted method-group hits: {routed:#?}"
+    );
+
+    // Near miss: the ternary *condition* is not a delegate value position, so a
+    // bare identifier there must not become a method-group reference.
+    let ready = member_function_with_arity(&analyzer, "Demo.Derived", "Ready", 1);
+    let result = graph_result(&analyzer, &ready);
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } => {
+            assert!(
+                hits_by_overload
+                    .get(&ready)
+                    .is_none_or(|hits| hits.is_empty()),
+                "a ternary condition must not be a method-group value: {hits_by_overload:#?}"
+            );
+            assert_eq!(
+                None,
+                unproven_total_by_overload.get(&ready),
+                "a ternary condition must not produce unproven method-group evidence"
+            );
+        }
+        other => panic!("expected a resolved ternary-condition result, got {other:#?}"),
+    }
+}
+
 #[test]
 fn usage_finder_csharp_finds_unique_private_method_group_argument() {
     let (project, analyzer) = csharp_analyzer_with_files(&[(
@@ -7726,6 +7862,244 @@ public sealed class Consumer {
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
 }
 
+/// The #1796 shape: named-argument labels that share a spelling with a visible
+/// type. `[Svc(Lifetime = ...)]` names `SvcAttribute.Lifetime`, never the
+/// `Lifetime` enum; `[Mark(Palette = 1)]` names nothing at all because
+/// `MarkAttribute` has no `Palette` member; `new NodeBox(Color: "x")` names a
+/// constructor parameter, which is not an indexed declaration.
+fn csharp_named_argument_label_project() -> (crate::common::BuiltInlineTestProject, CSharpAnalyzer)
+{
+    csharp_analyzer_with_files(&[
+        (
+            "src/Attributes.cs",
+            r#"using System;
+
+namespace Fx;
+
+public enum Lifetime { Transient, Scoped }
+
+public enum Color { Alpha, Beta }
+
+public sealed class Palette { }
+
+public abstract class BaseAttribute : Attribute {
+    public string HelpText { get; set; } = "";
+}
+
+[AttributeUsage(AttributeTargets.Class)]
+public sealed class SvcAttribute : BaseAttribute {
+    public SvcAttribute() { }
+    public SvcAttribute(Type serviceType) { }
+    public Lifetime Lifetime { get; set; } = Lifetime.Transient;
+}
+
+[AttributeUsage(AttributeTargets.Class)]
+public sealed class TagAttribute : Attribute {
+    public TagAttribute() { }
+    public int Duration { get; set; }
+}
+
+[AttributeUsage(AttributeTargets.Class)]
+public sealed class MarkAttribute : Attribute {
+    public MarkAttribute() { }
+    public int Level { get; set; }
+}
+
+public sealed class NodeBox {
+    public NodeBox(int Hash, string Color) { }
+}
+
+public sealed class Holder {
+    public int Level { get; set; }
+}
+"#,
+        ),
+        (
+            "src/Uses.cs",
+            r#"namespace Fx;
+
+[Svc(typeof(Palette), Lifetime = Lifetime.Scoped, HelpText = "svc")]
+public sealed class Collide { }
+
+[Tag(Duration = 3)]
+public sealed class NoCollide { }
+
+[Mark(Palette = 1)]
+public sealed class NoProperty { }
+
+public static class Sites {
+    public static object Build() {
+        var box = new NodeBox(Hash: 1, Color: "x");
+        var holder = new Holder { Level = 4 };
+        return box.ToString() + holder;
+    }
+}
+"#,
+        ),
+    ])
+}
+
+#[test]
+fn csharp_definition_resolves_attribute_named_argument_label_to_attribute_property() {
+    let (project, _analyzer) = csharp_named_argument_label_project();
+    let source = project.file("src/Uses.cs").read_to_string().unwrap();
+
+    let lifetime_label = source
+        .find("Lifetime = Lifetime.Scoped")
+        .expect("attribute label colliding with the enum");
+    let lifetime_receiver = lifetime_label + "Lifetime = ".len();
+    let lifetime_member = lifetime_receiver + "Lifetime.".len();
+    let help_text_label = source
+        .find("HelpText = \"svc\"")
+        .expect("inherited attribute label");
+    let duration_label = source
+        .find("Duration = 3")
+        .expect("attribute label matching no type");
+    let typeof_argument = source
+        .find("typeof(Palette)")
+        .expect("positional attribute argument")
+        + "typeof(".len();
+    let attribute_name = source.find("[Svc(").expect("attribute name") + "[".len();
+    let initializer_label = source
+        .find("Level = 4")
+        .expect("object initializer label control");
+
+    for (offset, expected_fqn) in [
+        (lifetime_label, "Fx.SvcAttribute.Lifetime"),
+        (help_text_label, "Fx.BaseAttribute.HelpText"),
+        (duration_label, "Fx.TagAttribute.Duration"),
+        (lifetime_receiver, "Fx.Lifetime"),
+        (lifetime_member, "Fx.Lifetime.Scoped"),
+        (typeof_argument, "Fx.Palette"),
+        (attribute_name, "Fx.SvcAttribute"),
+        (initializer_label, "Fx.Holder.Level"),
+    ] {
+        let value = definition_lookup(project.root(), "src/Uses.cs", offset, offset);
+        assert_eq!(
+            value["results"][0]["status"], "resolved",
+            "byte {offset} should resolve to {expected_fqn}: {value}"
+        );
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], expected_fqn,
+            "byte {offset}: {value}"
+        );
+    }
+}
+
+#[test]
+fn csharp_definition_refuses_named_argument_labels_without_a_member() {
+    let (project, _analyzer) = csharp_named_argument_label_project();
+    let source = project.file("src/Uses.cs").read_to_string().unwrap();
+
+    let palette_label = source
+        .find("Palette = 1")
+        .expect("attribute label matching no attribute member");
+    let color_label = source
+        .find("Color: \"x\"")
+        .expect("constructor label colliding with the enum");
+    let hash_label = source
+        .find("Hash: 1")
+        .expect("constructor label matching no type");
+
+    for (offset, label) in [
+        (palette_label, "Palette"),
+        (color_label, "Color"),
+        (hash_label, "Hash"),
+    ] {
+        let value = definition_lookup(project.root(), "src/Uses.cs", offset, offset);
+        assert_eq!(
+            value["results"][0]["status"], "no_definition",
+            "`{label}` names no declaration: {value}"
+        );
+        let message = value["results"][0]["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !message.contains("boundary"),
+            "`{label}` is a named-argument label, not a crossing of a using boundary: {value}"
+        );
+    }
+
+    assert_eq!(
+        definition_lookup(project.root(), "src/Uses.cs", color_label, color_label)["results"][0]["diagnostics"]
+            [0]["kind"],
+        "named_argument_parameter_label",
+        "a plain `Name:` label names a parameter"
+    );
+}
+
+#[test]
+fn csharp_graph_attribute_named_argument_labels_are_property_usages() {
+    let (project, analyzer) = csharp_named_argument_label_project();
+    let uses = project.file("src/Uses.cs");
+    let source = uses.read_to_string().unwrap();
+    let lifetime_label = source
+        .find("Lifetime = Lifetime.Scoped")
+        .expect("attribute label colliding with the enum");
+    let help_text_label = source
+        .find("HelpText = \"svc\"")
+        .expect("inherited attribute label");
+    let palette_label = source
+        .find("Palette = 1")
+        .expect("attribute label matching no attribute member");
+    let color_label = source
+        .find("Color: \"x\"")
+        .expect("constructor label colliding with the enum");
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(uses.clone()).collect()));
+    for (owner, member, label) in [
+        ("Fx.SvcAttribute", "Lifetime", lifetime_label),
+        ("Fx.BaseAttribute", "HelpText", help_text_label),
+    ] {
+        let target = member_field(&analyzer, owner, member);
+        let graph = graph_hits(&analyzer, &target);
+        let scanned = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                1000,
+            )
+            .result
+            .into_either()
+            .unwrap_or_else(|error| panic!("{owner}.{member} should resolve: {error}"));
+        for hits in [
+            &graph.iter().cloned().collect::<Vec<_>>(),
+            &scanned.iter().cloned().collect::<Vec<_>>(),
+        ] {
+            assert!(
+                hits.iter().any(|hit| {
+                    hit.file == uses
+                        && hit.start_offset <= label
+                        && label + member.len() <= hit.end_offset
+                }),
+                "the attribute named-argument label must count as a usage of {owner}.{member}: {hits:#?}"
+            );
+        }
+    }
+
+    for (fq_name, label, spelling) in [
+        ("Fx.Lifetime", lifetime_label, "Lifetime"),
+        ("Fx.Palette", palette_label, "Palette"),
+        ("Fx.Color", color_label, "Color"),
+    ] {
+        let target = type_definition(&analyzer, fq_name);
+        let hits = graph_hits(&analyzer, &target);
+        assert!(
+            !hits.iter().any(|hit| {
+                hit.file == uses
+                    && hit.start_offset <= label
+                    && label + spelling.len() <= hit.end_offset
+            }),
+            "a named-argument label must never count as a usage of the same-named type {fq_name}: {hits:#?}"
+        );
+    }
+}
+
 #[test]
 fn csharp_partial_property_receiver_usages_share_one_type_surface() {
     let (project, analyzer) = csharp_analyzer_with_files(&[
@@ -8235,4 +8609,81 @@ namespace App
             .is_some_and(|caveats| { caveats.iter().any(|c| c == "candidate_files_truncated") }),
         "truncated zero-hit scan should carry truncation evidence: {result}"
     );
+}
+
+/// jint's `IsoDateTime` shape (#1797, face 2). A record's primary constructor is
+/// an indexed constructor with its own arity, so forward and inverse agree on
+/// every `new` site: each creation binds the overload whose parameter count
+/// accepts it, and the inverse reports exactly that site back.
+#[test]
+fn usage_finder_csharp_reports_record_primary_constructor_creation_sites() {
+    let source = r#"namespace Demo;
+
+internal readonly record struct IsoDate(int Year, int Month, int Day);
+
+internal readonly record struct IsoDateTime(IsoDate Date, int Hour)
+{
+    public IsoDateTime(int year, int month, int day, int hour)
+        : this(new IsoDate(year, month, day), hour)
+    {
+    }
+}
+
+public static class Use
+{
+    public static void Go()
+    {
+        var pair = new IsoDateTime(new IsoDate(1, 2, 3), 4);
+        var parts = new IsoDateTime(1, 2, 3, 4);
+    }
+}
+"#;
+    let (project, analyzer) = csharp_analyzer_with_files(&[("Demo/Records.cs", source)]);
+    let consumer = project.file("Demo/Records.cs");
+
+    let primary = member_function_with_signature(
+        &analyzer,
+        "Demo.IsoDateTime",
+        "IsoDateTime",
+        "(IsoDate, int)",
+    );
+    let explicit = member_function_with_signature(
+        &analyzer,
+        "Demo.IsoDateTime",
+        "IsoDateTime",
+        "(int, int, int, int)",
+    );
+
+    let primary_site = source
+        .find("new IsoDateTime(new IsoDate")
+        .expect("primary constructor creation")
+        + "new ".len();
+    let explicit_site = source
+        .find("new IsoDateTime(1, 2, 3, 4)")
+        .expect("explicit constructor creation")
+        + "new ".len();
+
+    for (target, site) in [(&primary, primary_site), (&explicit, explicit_site)] {
+        let forward = definition_lookup(
+            project.root(),
+            "Demo/Records.cs",
+            site,
+            site + "IsoDateTime".len(),
+        );
+        assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+        assert_eq!(
+            forward["results"][0]["definitions"][0]["signature"],
+            target.signature().expect("constructor signature"),
+            "{forward}"
+        );
+
+        let hits = graph_hits(&analyzer, target);
+        assert_eq!(hits.len(), 1, "{hits:#?}");
+        let hit = hits.iter().next().expect("one creation site");
+        assert_eq!(hit.file, consumer, "{hits:#?}");
+        assert!(
+            hit.start_offset <= site && site <= hit.end_offset,
+            "the inverse must report the creation site the forward answer came from: {hits:#?}"
+        );
+    }
 }

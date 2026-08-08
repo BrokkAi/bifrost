@@ -156,15 +156,19 @@ public:
         "                          const OpenSourceLocation &loc = OpenSourceLocation::current());",
         "OpenSourceLocation",
     );
+    // Issue #1814: `sourcelocation.h` picks its branch before
+    // `symboldatabase.h` is parsed. Both `OpenSourceLocation` branches are
+    // compatible with the unguarded reference and both are in this target
+    // group, so the owner component is reported.
     let open_ranges = usage_ranges(&analyzer, &open_targets, &caller);
     assert!(
-        !open_ranges.contains(&open_expected),
-        "a conditional family without an else branch is not exhaustive: {open_ranges:?}"
+        open_ranges.contains(&open_expected),
+        "a compatible conditional family reports the owner component: {open_ranges:?}"
     );
     let open_authoritative_ranges = authoritative_usage_ranges(&analyzer, &open_targets, &caller);
     assert!(
-        !open_authoritative_ranges.contains(&open_expected),
-        "authoritative batch must reject a non-exhaustive conditional family: \
+        open_authoritative_ranges.contains(&open_expected),
+        "authoritative batch must agree with the sequential query: \
          {open_authoritative_ranges:?}"
     );
 
@@ -187,16 +191,22 @@ public:
         "                             const MutatedSourceLocation &loc = MutatedSourceLocation::current());",
         "MutatedSourceLocation",
     );
+    // Issue #1814 also relaxes this row. The analyzer has no macro-state
+    // evaluation, so it cannot tell that `#define MUTATED_SOURCE_LOCATION`
+    // between the two blocks makes BOTH branches inactive. The old refusal
+    // came from the cross-file subset test, which the same rule change
+    // removes. Each declaration guard set is individually compatible with the
+    // unguarded reference, so the reference reports the owner component.
     let mutated_ranges = usage_ranges(&analyzer, &mutated_targets, &caller);
     assert!(
-        !mutated_ranges.contains(&mutated_expected),
-        "separate conditionals split by macro mutation are not complementary: {mutated_ranges:?}"
+        mutated_ranges.contains(&mutated_expected),
+        "macro-mutation branches are individually compatible: {mutated_ranges:?}"
     );
     let mutated_authoritative_ranges =
         authoritative_usage_ranges(&analyzer, &mutated_targets, &caller);
     assert!(
-        !mutated_authoritative_ranges.contains(&mutated_expected),
-        "authoritative batch must reject separate macro-mutation declarations: \
+        mutated_authoritative_ranges.contains(&mutated_expected),
+        "authoritative batch must agree with the sequential query: \
          {mutated_authoritative_ranges:?}"
     );
 }

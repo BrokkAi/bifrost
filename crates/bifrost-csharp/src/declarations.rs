@@ -2,8 +2,8 @@ use brokk_bifrost_core::analyzer::common::IdentifierSigil;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
 use brokk_bifrost_core::analyzer::model::{
-    CallableArity, CodeUnitType, DispatchExtensibility, ParameterMetadata, SignatureMetadata,
-    StructuredTypeIdentity, StructuredTypeName,
+    CallableArity, CodeUnitType, DispatchExtensibility, ParameterMetadata, Range,
+    SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
@@ -65,15 +65,27 @@ pub fn parse_csharp_file(file: &ProjectFile, source: &str, tree: &Tree) -> Parse
         source,
         parsed: &mut parsed,
     };
-    visitor.visit_container(tree.root_node(), "", None);
+    visitor.visit_container(tree.root_node(), "");
     parsed
+}
+
+/// The type declaration whose body is currently being walked.
+#[derive(Clone)]
+struct CSharpEnclosingType {
+    unit: CodeUnit,
+    /// The type declaration's own `name` field text, exactly as written. This is
+    /// neither `unit.short_name()` (which carries the `Outer$` nesting prefix)
+    /// nor the identity name (which carries the generic-arity suffix, so that
+    /// `class Box<T>` is spelled ``Box`1``), so it is the only spelling a
+    /// `constructor_declaration`'s name can be compared against.
+    declared_name: String,
 }
 
 #[derive(Clone)]
 struct CSharpScope {
     package_name: String,
     lexical_scope: Vec<String>,
-    class_unit: Option<CodeUnit>,
+    enclosing_type: Option<CSharpEnclosingType>,
 }
 
 struct CSharpWork<'tree> {
@@ -88,19 +100,14 @@ struct CSharpVisitor<'a> {
 }
 
 impl<'a> CSharpVisitor<'a> {
-    fn visit_container(
-        &mut self,
-        node: Node<'_>,
-        package_name: &str,
-        class_unit: Option<CodeUnit>,
-    ) {
+    fn visit_container(&mut self, node: Node<'_>, package_name: &str) {
         let mut stack = Vec::new();
         self.push_children(
             node,
             CSharpScope {
                 package_name: package_name.to_string(),
                 lexical_scope: Vec::new(),
-                class_unit,
+                enclosing_type: None,
             },
             &mut stack,
         );
@@ -133,7 +140,7 @@ impl<'a> CSharpVisitor<'a> {
                     current = CSharpScope {
                         package_name,
                         lexical_scope,
-                        class_unit: current.class_unit.clone(),
+                        enclosing_type: current.enclosing_type.clone(),
                     };
                 }
                 continue;
@@ -208,7 +215,7 @@ impl<'a> CSharpVisitor<'a> {
                 CSharpScope {
                     package_name,
                     lexical_scope,
-                    class_unit: scope.class_unit.clone(),
+                    enclosing_type: scope.enclosing_type.clone(),
                 },
                 stack,
             );
@@ -238,8 +245,8 @@ impl<'a> CSharpVisitor<'a> {
         } else {
             format!("{name}`{arity}")
         };
-        let short_name = if let Some(parent) = &scope.class_unit {
-            format!("{}${identity_name}", parent.short_name())
+        let short_name = if let Some(enclosing) = &scope.enclosing_type {
+            format!("{}${identity_name}", enclosing.unit.short_name())
         } else {
             identity_name.clone()
         };
@@ -248,8 +255,9 @@ impl<'a> CSharpVisitor<'a> {
         // JVM-derived binary names), which is exactly what `SegmentKind::Nested`
         // renders regardless of the preceding segment's kind; a top-level type
         // hangs off the namespace-path `Package` chain as a plain `Type`.
-        let fq = match &scope.class_unit {
-            Some(parent) => parent
+        let fq = match &scope.enclosing_type {
+            Some(enclosing) => enclosing
+                .unit
                 .fq()
                 .clone()
                 .with_pushed(cs_segment(&identity_name, SegmentKind::Nested)),
@@ -267,7 +275,10 @@ impl<'a> CSharpVisitor<'a> {
             code_unit.clone(),
             node,
             self.source,
-            scope.class_unit.clone(),
+            scope
+                .enclosing_type
+                .as_ref()
+                .map(|enclosing| enclosing.unit.clone()),
             None,
         );
         self.parsed.add_raw_supertypes(
@@ -279,6 +290,7 @@ impl<'a> CSharpVisitor<'a> {
             SignatureMetadata::new(csharp_type_signature(node, self.source), Vec::new())
                 .with_type_parameters(csharp_declaration_type_parameters(node, self.source)),
         );
+        self.visit_primary_constructor(node, scope, &code_unit, name);
 
         if let Some(body) = cs_type_body(node) {
             let mut lexical_scope = scope.lexical_scope.clone();
@@ -288,7 +300,10 @@ impl<'a> CSharpVisitor<'a> {
                 CSharpScope {
                     package_name: scope.package_name.clone(),
                     lexical_scope,
-                    class_unit: Some(code_unit),
+                    enclosing_type: Some(CSharpEnclosingType {
+                        unit: code_unit,
+                        declared_name: name.to_string(),
+                    }),
                 },
                 stack,
             );
@@ -296,9 +311,10 @@ impl<'a> CSharpVisitor<'a> {
     }
 
     fn visit_method(&mut self, node: Node<'_>, scope: &CSharpScope) {
-        let Some(parent) = &scope.class_unit else {
+        let Some(enclosing) = &scope.enclosing_type else {
             return;
         };
+        let parent = &enclosing.unit;
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
@@ -334,15 +350,88 @@ impl<'a> CSharpVisitor<'a> {
         );
     }
 
-    fn visit_constructor(&mut self, node: Node<'_>, scope: &CSharpScope) {
-        let Some(parent) = &scope.class_unit else {
+    /// A primary constructor (`record Point(int X, int Y)`, and the C# 12
+    /// `class Widget(int size)` / `struct Pair(int a, int b)` spelling of the
+    /// same thing) declares a constructor with its own parameter arity, so it
+    /// is indexed exactly like an explicit one (#1797).
+    ///
+    /// Without it a record's only constructor is invisible: `new Point(1, 2)`
+    /// resolved to the *type*, and a record that also writes an explicit
+    /// constructor resolved every creation to that one whatever its arity. The
+    /// declaration node stays the type declaration -- it carries the parameter
+    /// list, the modifiers and the type parameters the metadata is built from
+    /// -- while the recorded range stops at the parameter list so the
+    /// constructor never claims the type's body.
+    fn visit_primary_constructor(
+        &mut self,
+        node: Node<'_>,
+        scope: &CSharpScope,
+        parent: &CodeUnit,
+        declared_name: &str,
+    ) {
+        // Only a class, struct or record declaration can carry one; the grammar
+        // gives no other visited type declaration a `parameter_list` child.
+        let Some(parameters) = csharp_parameter_list_node(node) else {
             return;
         };
+        let fq = parent
+            .fq()
+            .clone()
+            .with_pushed(cs_segment(declared_name, SegmentKind::Member));
+        let code_unit = CodeUnit::with_signature_and_fq(
+            self.file.clone(),
+            CodeUnitType::Function,
+            scope.package_name.clone(),
+            format!("{}.{declared_name}", parent.short_name()),
+            Some(csharp_parameter_key(node, self.source)),
+            false,
+            fq,
+        );
+        self.parsed.add_code_unit_with_range(
+            code_unit.clone(),
+            Range {
+                start_byte: node.start_byte(),
+                end_byte: parameters.end_byte(),
+                start_line: node.start_position().row + 1,
+                end_line: parameters.end_position().row + 1,
+            },
+            Some(parent.clone()),
+            None,
+        );
+        let signature = format!(
+            "{declared_name}{}",
+            csharp_rendered_parameter_text(node, self.source)
+        );
+        self.parsed.add_signature_with_metadata(
+            code_unit,
+            csharp_signature_metadata(signature, node, self.source, &scope.lexical_scope)
+                // No constructor is dynamically dispatched, which
+                // `csharp_callable_dispatch_extensibility` states for the
+                // explicit spelling by its node kind. This one's node is the
+                // type declaration, so an `abstract`/`virtual` modifier there
+                // would otherwise be read as the constructor's own.
+                .with_dispatch_extensibility(DispatchExtensibility::Closed),
+        );
+    }
+
+    fn visit_constructor(&mut self, node: Node<'_>, scope: &CSharpScope) {
+        let Some(enclosing) = &scope.enclosing_type else {
+            return;
+        };
+        let parent = &enclosing.unit;
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
         let name = cs_node_text(name_node, self.source).trim();
-        if name.is_empty() {
+        // C# requires a constructor to be named after the type that declares it,
+        // so a mismatch never occurs in source the compiler accepts. It is still
+        // reachable through parse recovery: an `#if !DEBUG` region between a
+        // `try` block and its `catch` chain makes tree-sitter re-parse trailing
+        // catch clauses at class-body level as `constructor_declaration` nodes
+        // named `catch` (issue #1800), which used to reach the index as real
+        // `Function` members. Skip silently rather than assert -- this is a
+        // misparse of otherwise valid source, not a broken internal invariant.
+        if name != enclosing.declared_name {
             return;
         }
         let fq = parent
@@ -373,9 +462,10 @@ impl<'a> CSharpVisitor<'a> {
     }
 
     fn visit_property(&mut self, node: Node<'_>, scope: &CSharpScope) {
-        let Some(parent) = &scope.class_unit else {
+        let Some(enclosing) = &scope.enclosing_type else {
             return;
         };
+        let parent = &enclosing.unit;
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
@@ -409,9 +499,10 @@ impl<'a> CSharpVisitor<'a> {
     }
 
     fn visit_field_declaration(&mut self, node: Node<'_>, scope: &CSharpScope) {
-        let Some(parent) = &scope.class_unit else {
+        let Some(enclosing) = &scope.enclosing_type else {
             return;
         };
+        let parent = &enclosing.unit;
         let Some(declaration) = node
             .child_by_field_name("declaration")
             .or_else(|| first_named_child_of_kind(node, "variable_declaration"))
@@ -472,9 +563,10 @@ impl<'a> CSharpVisitor<'a> {
     }
 
     fn visit_enum_member(&mut self, node: Node<'_>, scope: &CSharpScope) {
-        let Some(parent) = &scope.class_unit else {
+        let Some(enclosing) = &scope.enclosing_type else {
             return;
         };
+        let parent = &enclosing.unit;
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
@@ -737,7 +829,7 @@ fn csharp_extension_receiver_type_node<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<Node<'tree>> {
-    let parameters = node.child_by_field_name("parameters")?;
+    let parameters = csharp_parameter_list_node(node)?;
     let mut parameters_cursor = parameters.walk();
     let first_parameter = parameters
         .named_children(&mut parameters_cursor)
@@ -1033,7 +1125,7 @@ fn csharp_join_namespace(prefix: &str, path: &[String]) -> String {
 }
 
 fn csharp_callable_arity(node: Node<'_>, source: &str) -> CallableArity {
-    let Some(parameters) = node.child_by_field_name("parameters") else {
+    let Some(parameters) = csharp_parameter_list_node(node) else {
         return CallableArity::exact(0);
     };
     let mut required = 0usize;
@@ -1095,14 +1187,26 @@ fn csharp_parameter_list_has_params(parameters: Node<'_>) -> bool {
         .any(|child| child.kind() == "params")
 }
 
-fn csharp_rendered_parameter_text(node: Node<'_>, source: &str) -> String {
+/// The parameter list a callable declaration declares.
+///
+/// A method, constructor or delegate carries it as the `parameters` field. A
+/// primary constructor is written on its type declaration, where the grammar
+/// admits the list as a plain named child (`repeat(choice($.type_parameter_list,
+/// $.parameter_list))`) with no field name, so the field lookup alone cannot see
+/// it (#1797).
+fn csharp_parameter_list_node<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
     node.child_by_field_name("parameters")
+        .or_else(|| first_named_child_of_kind(node, "parameter_list"))
+}
+
+fn csharp_rendered_parameter_text(node: Node<'_>, source: &str) -> String {
+    csharp_parameter_list_node(node)
         .map(|parameters| normalize_cs_whitespace(cs_node_text(parameters, source)))
         .unwrap_or_else(|| "()".to_string())
 }
 
 fn csharp_parameter_label_nodes(node: Node<'_>) -> Vec<Node<'_>> {
-    let Some(parameters) = node.child_by_field_name("parameters") else {
+    let Some(parameters) = csharp_parameter_list_node(node) else {
         return Vec::new();
     };
     let mut labels = Vec::new();
@@ -1136,7 +1240,7 @@ fn csharp_property_signature(node: Node<'_>, source: &str) -> String {
 }
 
 fn csharp_parameter_key(node: Node<'_>, source: &str) -> String {
-    let Some(parameters) = node.child_by_field_name("parameters") else {
+    let Some(parameters) = csharp_parameter_list_node(node) else {
         return "()".to_string();
     };
     let mut parts = Vec::new();

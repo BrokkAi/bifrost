@@ -627,6 +627,56 @@ pub fn csharp_attribute_name_node(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
+/// What a C# named-argument label names.
+///
+/// C# writes two of them, and neither is a type reference or an unqualified
+/// member of the enclosing class: `[Svc(Lifetime = ...)]` sets a member of the
+/// attribute type, and `Run(Mode: 1)` names a parameter of the callable. Both
+/// sit in the grammar's `name` field of their argument node, which is why a
+/// label that shares its spelling with a visible type must not answer with that
+/// type (#1796).
+#[derive(Clone, Copy)]
+pub enum CSharpNamedArgumentLabel<'tree> {
+    /// An attribute argument's label, carrying the enclosing attribute's name
+    /// node so the owning attribute type can be resolved.
+    AttributeMember { attribute_name: Node<'tree> },
+    /// A call or object-creation argument's label. It names a parameter, which
+    /// C# analysis does not index as a declaration.
+    Parameter,
+}
+
+/// Return what `node` labels when it is a named argument's label.
+pub fn csharp_named_argument_label<'tree>(
+    node: Node<'tree>,
+) -> Option<CSharpNamedArgumentLabel<'tree>> {
+    let parent = node.parent()?;
+    if parent.child_by_field_name("name") != Some(node) {
+        return None;
+    }
+    match parent.kind() {
+        "attribute_argument" => {
+            let attribute_name = csharp_attribute_of_argument(parent)
+                .and_then(|attribute| attribute.child_by_field_name("name"))?;
+            Some(CSharpNamedArgumentLabel::AttributeMember { attribute_name })
+        }
+        "argument" => Some(CSharpNamedArgumentLabel::Parameter),
+        _ => None,
+    }
+}
+
+/// The `attribute` node an `attribute_argument` belongs to. The grammar nests
+/// every attribute argument in one attribute's argument list, so the walk is two
+/// fixed steps; error recovery can break that chain, and then the label has no
+/// resolvable owner.
+fn csharp_attribute_of_argument(argument: Node<'_>) -> Option<Node<'_>> {
+    let list = argument.parent()?;
+    if list.kind() != "attribute_argument_list" {
+        return None;
+    }
+    let attribute = list.parent()?;
+    (attribute.kind() == "attribute").then_some(attribute)
+}
+
 /// C# attribute lookup considers both the written type name and the same name
 /// with `Attribute` appended to its terminal AST segment. A verbatim identifier
 /// suppresses the suffix form.

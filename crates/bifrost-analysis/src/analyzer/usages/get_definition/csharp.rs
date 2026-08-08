@@ -18,8 +18,11 @@ use crate::analyzer::{
     csharp_normalize_full_name, csharp_source_identifier,
 };
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
+use brokk_bifrost_csharp::graph_support::CSharpSource;
 use brokk_bifrost_csharp::syntax::{
-    csharp_using_directive_is_static, csharp_using_directive_target_node,
+    CSharpNamedArgumentLabel, csharp_named_argument_label, csharp_using_directive_is_static,
+    csharp_using_directive_target_node,
 };
 
 pub(super) struct CSharpDefinitionProvider<'a> {
@@ -167,6 +170,26 @@ impl<'a> CSharpDefinitionProvider<'a> {
         )
     }
 
+    /// Every declaration a base-type spelling on `part` can name. C# looks in
+    /// the declaring type's enclosing type chain before the file's namespace
+    /// and `using` scopes, which is the only way a nested base spelled by its
+    /// simple name is reachable (#1801).
+    fn supertype_candidates(&self, part: &CodeUnit, raw: &str) -> Vec<CodeUnit> {
+        graph_support::supertype_candidates_with_lookups(
+            &part.fq_name(),
+            raw,
+            &mut |fqn| {
+                let candidates = self
+                    .fqn(fqn)
+                    .into_iter()
+                    .filter(CodeUnit::is_class)
+                    .collect();
+                self.observe_cancellation().then_some(candidates)
+            },
+            &mut |name| self.visible_type_candidates(part.source(), name),
+        )
+    }
+
     fn partial_type_parts(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
         match self.session {
             Some(session) => session.query_limited_rows(|limit| {
@@ -290,7 +313,7 @@ impl<'a> CSharpDefinitionProvider<'a> {
                     if matches!(normalized_raw.as_str(), "object" | "System.Object") {
                         continue;
                     }
-                    let ancestors = self.visible_type_candidates(part.source(), &raw);
+                    let ancestors = self.supertype_candidates(&part, &raw);
                     if !self.observe_cancellation() {
                         return None;
                     }
@@ -308,6 +331,20 @@ impl<'a> CSharpDefinitionProvider<'a> {
             None
         } else {
             Some(false)
+        }
+    }
+
+    /// The base-type spellings `part` declares, exactly as written.
+    ///
+    /// Unlike [`Self::direct_ancestors`] this keeps a spelling the workspace
+    /// cannot resolve, which is what tells a complete hierarchy apart from one
+    /// that leaves the indexed workspace (#1797).
+    fn raw_supertypes(&self, part: &CodeUnit) -> Vec<String> {
+        match self.session {
+            Some(session) => {
+                session.query_limited_rows(|limit| self.csharp.raw_supertypes_limited(part, limit))
+            }
+            None => self.csharp.raw_supertypes_of(part),
         }
     }
 
@@ -341,16 +378,11 @@ impl<'a> CSharpDefinitionProvider<'a> {
                 return Vec::new();
             }
             for raw in raw_supertypes {
-                let mut candidates = self.visible_type_candidates(part.source(), &raw);
+                let candidates = self.supertype_candidates(&part, &raw);
                 if !self.observe_cancellation() {
                     return Vec::new();
                 }
-                if graph_support::logical_type_count(&candidates) == 1 {
-                    graph_support::sort_type_candidates(&mut candidates);
-                    if let Some(ancestor) = candidates.into_iter().next() {
-                        ancestors.push(ancestor);
-                    }
-                }
+                ancestors.extend(graph_support::unique_logical_type(candidates));
             }
         }
         graph_support::sort_dedup_type_candidates(&mut ancestors);
@@ -512,6 +544,12 @@ fn resolve_csharp_in_session(
             format!("`{}` is not a C# reference site", site.text),
         );
     }
+    if csharp_is_statement_label(node) {
+        return no_definition(
+            "statement_label_site",
+            format!("`{}` is a C# statement label, not a reference", site.text),
+        );
+    }
 
     match csharp_reference_node(node, definitions) {
         Some(CSharpReferenceNode::Attribute(name)) => {
@@ -596,7 +634,6 @@ fn resolve_csharp_in_session(
                 member,
                 arity,
                 explicit_generic_arity,
-                false,
             );
             // #1477: an extension candidate stays unattributed. The seam below
             // admits a method by matching its declared receiver spelling
@@ -607,7 +644,13 @@ fn resolve_csharp_in_session(
             // holds no owner and no hop distance for the find. Attributing the
             // receiver's own type at depth zero would claim the extension was
             // declared on it, which an extension of a base type contradicts.
-            if outcome.status == DefinitionLookupStatus::NoDefinition && should_try_extensions {
+            // The member walk binds nothing both when it never saw the name and
+            // when every declaration it saw was arity-inapplicable (#1797, which
+            // reports a boundary rather than no_definition when the receiver's
+            // bases leave the workspace). An extension method is a candidate for
+            // either, so the escalation is gated on "bound nothing", not on one
+            // particular unresolved status.
+            if outcome.definitions.is_empty() && should_try_extensions {
                 let extensions = match definitions.session() {
                     Some(session) => csharp_visible_extension_method_candidates_in_session(
                         csharp,
@@ -637,18 +680,6 @@ fn resolve_csharp_in_session(
                 };
                 if !extensions.is_empty() {
                     return candidates_outcome(extensions);
-                }
-                let fallback = csharp_member_outcome(
-                    analyzer,
-                    definitions,
-                    owners.clone(),
-                    member,
-                    arity,
-                    explicit_generic_arity,
-                    true,
-                );
-                if fallback.status != DefinitionLookupStatus::NoDefinition {
-                    return fallback;
                 }
                 let extensions = match definitions.session() {
                     Some(session) => csharp_visible_extension_method_candidates_in_session(
@@ -680,7 +711,6 @@ fn resolve_csharp_in_session(
                 if !extensions.is_empty() {
                     return candidates_outcome(extensions);
                 }
-                return fallback;
             }
             outcome
         }
@@ -703,18 +733,16 @@ fn resolve_csharp_in_session(
                     format!("`{member}` is a local C# value or local function"),
                 );
             }
-            let owners = csharp_enclosing_class(analyzer, definitions, file, name.start_byte())
-                .into_iter()
-                .collect();
+            let owners =
+                csharp_enclosing_class_chain(analyzer, definitions, file, name.start_byte());
             let arity = csharp_invocation_arity(name, source, definitions);
-            let outcome = csharp_member_outcome(
+            let outcome = csharp_member_outcome_in_enclosing_chain(
                 analyzer,
                 definitions,
                 owners,
                 member,
                 arity,
                 explicit_generic_arity,
-                true,
             );
             if outcome.status == DefinitionLookupStatus::NoDefinition
                 && csharp_static_using_boundary_for_member(csharp, definitions, file)
@@ -734,6 +762,9 @@ fn resolve_csharp_in_session(
                 );
             }
             outcome
+        }
+        Some(CSharpReferenceNode::NamedArgumentLabel { label, shape }) => {
+            csharp_named_argument_label_outcome(analyzer, definitions, file, source, label, shape)
         }
         Some(CSharpReferenceNode::Identifier(identifier)) => {
             let text = csharp_node_text(identifier, source);
@@ -771,17 +802,20 @@ fn resolve_csharp_in_session(
             }
             if !bindings.is_shadowed(text) {
                 if csharp_is_unqualified_member_reference(identifier) {
-                    if let Some(owner) =
-                        csharp_enclosing_class(analyzer, definitions, file, identifier.start_byte())
-                    {
-                        let outcome = csharp_member_outcome(
+                    let owners = csharp_enclosing_class_chain(
+                        analyzer,
+                        definitions,
+                        file,
+                        identifier.start_byte(),
+                    );
+                    if !owners.is_empty() {
+                        let outcome = csharp_member_outcome_in_enclosing_chain(
                             analyzer,
                             definitions,
-                            vec![owner],
+                            owners,
                             text,
                             None,
                             None,
-                            true,
                         );
                         if outcome.status != DefinitionLookupStatus::NoDefinition {
                             return outcome;
@@ -1389,37 +1423,41 @@ fn csharp_dynamic_binding_is_visible(
         return false;
     }
 
-    let Some(owner) = csharp_enclosing_class(
+    // A bare identifier can name a member of any enclosing type, not just the
+    // innermost one (#1802). Missing that member here reports a `dynamic`
+    // binding as statically typed.
+    let owners = csharp_enclosing_class_chain(
         csharp as &dyn IAnalyzer,
         definitions,
         file,
         identifier.start_byte(),
-    ) else {
-        return false;
-    };
-    for candidate in definitions.members_for_owner_name(&owner.fq_name(), name) {
-        if !definitions.scope_step() {
-            return false;
-        }
-        let metadata = definitions.signature_metadata(&candidate);
-        let is_dynamic = if let Some(session) = definitions.session() {
-            metadata.iter().any(|metadata| {
-                metadata
-                    .return_type_identity()
-                    .and_then(|identity| identity.nominal_name_with(|| session.scope_step()))
-                    .is_some_and(|name| {
-                        !name.is_absolute() && matches!(name.path(), [name] if name == "dynamic")
-                    })
-            })
-        } else {
-            metadata.iter().any(|metadata| {
-                metadata
-                    .return_type_text()
-                    .is_some_and(csharp_is_dynamic_type_reference)
-            })
-        };
-        if is_dynamic {
-            return true;
+    );
+    for owner in owners {
+        for candidate in definitions.members_for_owner_name(&owner.fq_name(), name) {
+            if !definitions.scope_step() {
+                return false;
+            }
+            let metadata = definitions.signature_metadata(&candidate);
+            let is_dynamic = if let Some(session) = definitions.session() {
+                metadata.iter().any(|metadata| {
+                    metadata
+                        .return_type_identity()
+                        .and_then(|identity| identity.nominal_name_with(|| session.scope_step()))
+                        .is_some_and(|name| {
+                            !name.is_absolute()
+                                && matches!(name.path(), [name] if name == "dynamic")
+                        })
+                })
+            } else {
+                metadata.iter().any(|metadata| {
+                    metadata
+                        .return_type_text()
+                        .is_some_and(csharp_is_dynamic_type_reference)
+                })
+            };
+            if is_dynamic {
+                return true;
+            }
         }
     }
     false
@@ -1699,6 +1737,10 @@ enum CSharpReferenceNode<'tree> {
         name: Node<'tree>,
     },
     UnqualifiedMember(Node<'tree>),
+    NamedArgumentLabel {
+        label: Node<'tree>,
+        shape: CSharpNamedArgumentLabel<'tree>,
+    },
     Identifier(Node<'tree>),
 }
 
@@ -1711,6 +1753,13 @@ fn csharp_reference_node<'tree>(
     }
     if let Some(name) = csharp_attribute_name_node(node) {
         return Some(CSharpReferenceNode::Attribute(name));
+    }
+    // A named-argument label is a leaf in its argument's `name` field, so the
+    // walk below never reaches it, and every shape it could otherwise fall
+    // through to -- type reference, unqualified member, bare identifier --
+    // answers with something the label does not name (#1796).
+    if let Some(shape) = csharp_named_argument_label(node) {
+        return Some(CSharpReferenceNode::NamedArgumentLabel { label: node, shape });
     }
 
     let original = node;
@@ -1937,7 +1986,16 @@ fn resolve_csharp_constructor(
         return candidates_outcome(implicit_parameterless_owners);
     }
     if !constructors.is_empty() {
-        return candidates_outcome(constructors);
+        // Every indexed constructor of every candidate owner was rejected by
+        // the argument count, and a constructor is never inherited, so no base
+        // type can supply the accepting one either. Binding one anyway was the
+        // forward side's #1797 defect: the inverse scan refuses the site
+        // (`scan_constructor_reference` applies the same `CallableArity`), so
+        // the pair disagreed about it.
+        return no_definition(
+            "no_applicable_overload",
+            format!("no `{reference}` constructor overload accepts this call"),
+        );
     }
     csharp_type_outcome(
         analyzer,
@@ -2140,7 +2198,6 @@ fn csharp_member_outcome(
     member: &str,
     arity: Option<usize>,
     explicit_generic_arity: Option<usize>,
-    fallback_when_inapplicable: bool,
 ) -> DefinitionLookupOutcome {
     if !definitions.scope_step() {
         return no_definition(
@@ -2209,14 +2266,14 @@ fn csharp_member_outcome(
         let mut seen = HashSet::default();
         let mut level = Vec::new();
         let mut depth = 0usize;
-        for owner in owners {
+        for owner in &owners {
             if !definitions.scope_step() {
                 break;
             }
             seen.insert(owner.clone());
-            let expanded = definitions.direct_ancestors(provider, &owner);
+            let expanded = definitions.direct_ancestors(provider, owner);
             if let Some(state) = member_trace.as_mut() {
-                state.record_expansion(&owner, &expanded);
+                state.record_expansion(owner, &expanded);
             }
             level.extend(expanded);
         }
@@ -2272,28 +2329,129 @@ fn csharp_member_outcome(
         }
     }
     if !fallback_candidates.is_empty() {
-        return if fallback_when_inapplicable {
-            if let Some(state) = member_trace.as_ref() {
-                // Bound despite the call shape: the arity filter accepted none
-                // of them, and this seam binds them anyway. The verdict says so.
-                debug_assert!(
-                    arity.is_some(),
-                    "an unknown arity accepts every candidate, so the fallback is unreachable"
-                );
-                state.stage_selection(&fallback_candidates, ApplicabilityVerdict::Inapplicable);
-            }
-            candidates_outcome(fallback_candidates)
-        } else {
-            no_definition(
-                "no_applicable_overload",
-                format!("no C# member `{member}` overload accepts this call"),
-            )
-        };
+        debug_assert!(
+            arity.is_some(),
+            "an unknown arity accepts every candidate, so a rejected set is unreachable"
+        );
+        if let Some(state) = member_trace.as_ref() {
+            // Discarded, never bound: the arity filter accepted none of them,
+            // and the inverse usage scan refuses such a site for exactly the
+            // same reason (#1797). Record the discard while the walk still
+            // knows the rows.
+            state.stage_selection(&fallback_candidates, ApplicabilityVerdict::Inapplicable);
+        }
+        // An overload whose parameter list cannot accept this argument list is
+        // not the target. When the receiver's own hierarchy leaves the indexed
+        // workspace, the accepting declaration is on the far side of that
+        // boundary -- `Writer.WriteLine()` against a type deriving from the
+        // unindexed `System.IO.TextWriter` -- which is what the site reports.
+        // The implicit `object` base is such a departure too, but only for the
+        // members `object` itself declares (#1810).
+        return gated_boundary(
+            || {
+                !csharp_hierarchy_crosses_unindexed_supertype(definitions, &owners)
+                    && !csharp_object_declares_overload(member, arity)
+            },
+            format!("`{member}` is inherited from a C# base type not indexed in this workspace"),
+            "no_applicable_overload",
+            format!("no C# member `{member}` overload accepts this call"),
+        );
     }
     no_definition(
         "no_indexed_definition",
         format!("C# member `{member}` is not indexed as a definition"),
     )
+}
+
+/// Whether the receiver's own supertype closure names a type this workspace
+/// does not index.
+///
+/// [`CSharpDefinitionProvider::direct_ancestors`] drops a base-type spelling it
+/// cannot resolve, so the resolved ancestors alone cannot tell a complete
+/// hierarchy from a truncated one. The raw `: Base, IFace` spellings can, put
+/// through the very same supertype resolution that dropped them (#1797, the C#
+/// face of Java's #1755).
+fn csharp_hierarchy_crosses_unindexed_supertype(
+    definitions: &CSharpDefinitionProvider<'_>,
+    owners: &[CodeUnit],
+) -> bool {
+    let mut seen: HashSet<CodeUnit> = owners.iter().cloned().collect();
+    let mut queue = owners.to_vec();
+    while let Some(unit) = queue.pop() {
+        if !definitions.scope_step() {
+            return false;
+        }
+        let mut parts = definitions.partial_type_parts(&unit);
+        if parts.is_empty() {
+            parts.push(unit);
+        }
+        for part in parts {
+            if !definitions.scope_step() {
+                return false;
+            }
+            for raw in definitions.raw_supertypes(&part) {
+                // Every C# type derives from `object`, which no workspace
+                // indexes; naming it is not evidence of a truncated hierarchy.
+                if matches!(
+                    csharp_normalize_full_name(&raw).as_str(),
+                    "object" | "System.Object"
+                ) {
+                    continue;
+                }
+                let candidates = definitions.supertype_candidates(&part, &raw);
+                if candidates.is_empty() {
+                    return true;
+                }
+                for candidate in candidates {
+                    if seen.insert(candidate.clone()) {
+                        queue.push(candidate);
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Whether `System.Object` itself declares a `member` overload this call's
+/// argument count could reach.
+///
+/// [`csharp_hierarchy_crosses_unindexed_supertype`] skips `object` because
+/// naming it says nothing about a truncated hierarchy -- every C# type derives
+/// from it. That is right for resolution, and it is right for the boundary
+/// verdict on *most* names: an unconditional "the implicit object base is
+/// unindexed" rule would turn every arity-rejected call into a boundary claim,
+/// including calls whose owner chain this workspace indexes completely, which
+/// #1797's `LocalWriter.WriteLine()` face answers `no_definition` on purpose.
+///
+/// `object`'s own declared members are the exception (#1810). neo's
+/// `WitnessCondition` declares only the one-argument `Equals` override, and the
+/// bare `Equals(left, right)` beside it binds the external static
+/// `object.Equals(object, object)` -- a declaration that exists, that the
+/// workspace genuinely does not index, and that no explicit base type leads to.
+/// Matching the identifier against the members `object` declares is what makes
+/// that claim specific to this call rather than a blanket one.
+///
+/// The arity is part of the entry because the name alone would over-claim:
+/// `object` has no three-argument `Equals`, so an `Equals(a, b, c)` call is not
+/// reaching across this boundary either.
+fn csharp_object_declares_overload(member: &str, arity: Option<usize>) -> bool {
+    /// `System.Object`'s declared members, with the parameter counts each name
+    /// offers. `Finalize` is omitted: C# forbids calling it by name.
+    const OBJECT_MEMBERS: &[(&str, &[usize])] = &[
+        ("Equals", &[1, 2]),
+        ("GetHashCode", &[0]),
+        ("GetType", &[0]),
+        ("MemberwiseClone", &[0]),
+        ("ReferenceEquals", &[2]),
+        ("ToString", &[0]),
+    ];
+    let Some(arity) = arity else {
+        return false;
+    };
+    OBJECT_MEMBERS
+        .iter()
+        .any(|(name, arities)| *name == member && arities.contains(&arity))
 }
 
 /// The verdict a winning C# member candidate carries: the member seams check
@@ -2554,8 +2712,52 @@ fn csharp_object_initializer_label_outcome(
         csharp_node_text(label, source),
         None,
         None,
-        true,
     ))
+}
+
+/// Resolve a named-argument label the same way the object-initializer label
+/// above resolves: through the owner the label writes into, never through the
+/// label's own spelling as a type (#1796).
+///
+/// An attribute label's owner is the attribute type, so `[Svc(Lifetime = ...)]`
+/// answers `SvcAttribute.Lifetime` and reaches an inherited property through the
+/// member walk's base chain. A label the attribute type does not declare has no
+/// definition at all -- neither the same-named type nor a using-boundary claim
+/// about a property name. A plain `Name:` label names a parameter, which C#
+/// analysis does not index as a declaration.
+fn csharp_named_argument_label_outcome(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    label: Node<'_>,
+    shape: CSharpNamedArgumentLabel<'_>,
+) -> DefinitionLookupOutcome {
+    let name = csharp_node_text(label, source);
+    let CSharpNamedArgumentLabel::AttributeMember { attribute_name } = shape else {
+        return no_definition(
+            "named_argument_parameter_label",
+            format!(
+                "`{name}` is a C# named-argument label naming a parameter, which is not an indexed declaration"
+            ),
+        );
+    };
+    let attribute_names = csharp_attribute_type_names(attribute_name, source);
+    let (owners, _ambiguous_spelling) =
+        definitions.attribute_type_candidates(file, &attribute_names);
+    if owners.is_empty() {
+        let attribute = attribute_names
+            .first()
+            .map(String::as_str)
+            .unwrap_or_default();
+        return no_definition(
+            "unresolved_attribute_named_argument_owner",
+            format!(
+                "C# attribute type `{attribute}` owning named argument `{name}` did not resolve to an indexed definition"
+            ),
+        );
+    }
+    csharp_member_outcome(analyzer, definitions, owners, name, None, None)
 }
 
 fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
@@ -2615,24 +2817,29 @@ fn csharp_filter_candidates_by_arity(
     let Some(expected) = arity else {
         return candidates.to_vec();
     };
-    let applicable: Vec<_> = candidates
+    candidates
         .iter()
-        .filter_map(|unit| {
+        .filter(|unit| {
             if !definitions.scope_step() {
-                return None;
+                return false;
             }
+            // A non-callable member declares no parameter list: a
+            // delegate-valued property or field is invoked through its own
+            // type's signature, which this side does not read. The inverse scan
+            // gates such a target on nothing but its name
+            // (`TargetSpec::callable_arity` is `None` for a field), so neither
+            // does this side -- otherwise the two disagree about every
+            // `configuration.Select(1)` site.
             if !unit.is_function() {
-                return None;
+                return true;
             }
-            let callable_arity = definitions
+            definitions
                 .query(|| csharp_callable_arity(analyzer, unit))
-                .unwrap_or_else(|| crate::analyzer::CallableArity::exact(0));
-            callable_arity
+                .unwrap_or_else(|| crate::analyzer::CallableArity::exact(0))
                 .accepts(expected)
-                .then(|| (unit.clone(), callable_arity))
         })
-        .collect();
-    applicable.into_iter().map(|(unit, _)| unit).collect()
+        .cloned()
+        .collect()
 }
 
 fn csharp_filter_candidates_by_generic_arity(
@@ -3255,34 +3462,40 @@ fn csharp_enclosing_member_types(
     if !definitions.scope_step() {
         return CSharpReceiverTypes::default();
     }
-    let Some(owner) = csharp_enclosing_class(analyzer, definitions, file, receiver.start_byte())
-    else {
-        return CSharpReceiverTypes::default();
-    };
-    let mut candidates = CSharpReceiverTypes::default();
-    csharp_collect_member_types(csharp, definitions, file, &owner, name, &mut candidates);
-    if let Some(provider) = analyzer.type_hierarchy_provider() {
-        let mut seen = HashSet::default();
-        let mut stack = definitions.direct_ancestors(provider, &owner);
-        while let Some(ancestor) = stack.pop() {
-            if !definitions.scope_step() {
-                return CSharpReceiverTypes::default();
+    // Same lexical scope chain as the member walk (#1802): a bare receiver may
+    // name a field or property of an enclosing type. One enclosing type and its
+    // whole base chain are searched before the next one outward, so a nearer
+    // base class's member still supplies the type.
+    for owner in csharp_enclosing_class_chain(analyzer, definitions, file, receiver.start_byte()) {
+        let mut candidates = CSharpReceiverTypes::default();
+        csharp_collect_member_types(csharp, definitions, file, &owner, name, &mut candidates);
+        if let Some(provider) = analyzer.type_hierarchy_provider() {
+            let mut seen = HashSet::default();
+            let mut stack = definitions.direct_ancestors(provider, &owner);
+            while let Some(ancestor) = stack.pop() {
+                if !definitions.scope_step() {
+                    return CSharpReceiverTypes::default();
+                }
+                if !seen.insert(ancestor.clone()) {
+                    continue;
+                }
+                csharp_collect_member_types(
+                    csharp,
+                    definitions,
+                    file,
+                    &ancestor,
+                    name,
+                    &mut candidates,
+                );
+                stack.extend(definitions.direct_ancestors(provider, &ancestor));
             }
-            if !seen.insert(ancestor.clone()) {
-                continue;
-            }
-            csharp_collect_member_types(
-                csharp,
-                definitions,
-                file,
-                &ancestor,
-                name,
-                &mut candidates,
-            );
-            stack.extend(definitions.direct_ancestors(provider, &ancestor));
+        }
+        let candidates = candidates.normalized();
+        if !candidates.units.is_empty() || !candidates.fq_names.is_empty() {
+            return candidates;
         }
     }
-    candidates.normalized()
+    CSharpReceiverTypes::default()
 }
 
 fn csharp_collect_member_types(
@@ -3365,6 +3578,85 @@ fn csharp_enclosing_class(
     let start = analyzer.enclosing_code_unit(file, &range)?;
     crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| analyzer.parent_of(unit))
         .find(CodeUnit::is_class)
+}
+
+/// Every class that lexically encloses `byte`, innermost first: the type the
+/// reference is written in, then the type that declares it, and so on out to
+/// the outermost type declaration.
+///
+/// C# simple-name lookup does not stop at the innermost type (#1802). After
+/// that type, its partial parts and its whole base chain are exhausted, the
+/// search continues in the type that encloses it, on the same terms.
+///
+/// Consume this in order through `csharp_member_outcome_in_enclosing_chain`.
+/// Never hand the whole chain to `csharp_member_outcome` as one owners vector:
+/// that walk sweeps every owner level by level, so an enclosing type's member
+/// would beat a nearer base class's member and invert C# lookup order.
+fn csharp_enclosing_class_chain(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    byte: usize,
+) -> Vec<CodeUnit> {
+    let Some(innermost) = csharp_enclosing_class(analyzer, definitions, file, byte) else {
+        return Vec::new();
+    };
+    crate::analyzer::usages::common::enclosing_owner_chain(innermost, |unit| {
+        definitions
+            .parent_of(analyzer, unit)
+            .filter(CodeUnit::is_class)
+    })
+    .map_while(|owner| definitions.scope_step().then_some(owner))
+    .collect()
+}
+
+/// The C# simple-name member walk over a lexical scope chain: run the full
+/// `csharp_member_outcome` walk -- the type, its partial parts, its whole base
+/// chain -- for one enclosing type before moving outward to the next, and
+/// answer with the first type that resolves the name (#1802).
+///
+/// A failure reports the innermost type's verdict, which is the scope the
+/// reference is actually written in.
+fn csharp_member_outcome_in_enclosing_chain(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    owners: Vec<CodeUnit>,
+    member: &str,
+    arity: Option<usize>,
+    explicit_generic_arity: Option<usize>,
+) -> DefinitionLookupOutcome {
+    if owners.is_empty() {
+        return csharp_member_outcome(
+            analyzer,
+            definitions,
+            owners,
+            member,
+            arity,
+            explicit_generic_arity,
+        );
+    }
+    let mut innermost_failure = None;
+    for owner in owners {
+        if !definitions.scope_step() {
+            return no_definition(
+                "csharp_resolution_stopped",
+                "C# member resolution stopped before completion",
+            );
+        }
+        let outcome = csharp_member_outcome(
+            analyzer,
+            definitions,
+            vec![owner],
+            member,
+            arity,
+            explicit_generic_arity,
+        );
+        if outcome.status != DefinitionLookupStatus::NoDefinition {
+            return outcome;
+        }
+        innermost_failure.get_or_insert(outcome);
+    }
+    innermost_failure.expect("a non-empty owner chain records the innermost type's verdict")
 }
 
 fn resolve_csharp_in_enclosing_scopes(

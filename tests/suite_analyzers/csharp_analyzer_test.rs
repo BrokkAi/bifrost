@@ -190,6 +190,100 @@ namespace Demo
     assert_eq!(ancestors, vec!["Demo.BaseType", "Demo.IService"]);
 }
 
+fn direct_ancestor_fq_names(analyzer: &CSharpAnalyzer, fq_name: &str) -> Vec<String> {
+    let owner = analyzer
+        .get_definitions(fq_name)
+        .into_iter()
+        .find(|unit| unit.kind() == CodeUnitType::Class)
+        .unwrap_or_else(|| panic!("{fq_name} must be indexed as a class"));
+    analyzer
+        .get_direct_ancestors(&owner)
+        .into_iter()
+        .map(|unit| unit.fq_name().to_string())
+        .collect()
+}
+
+/// #1801: supertype resolution searched only the declaring file's namespace,
+/// `using` and alias scopes, so a base type that is itself nested and spelled
+/// by its simple name resolved to nothing and the derived type reported no
+/// ancestors at all. C# looks in the enclosing type chain first, so `Base`
+/// written inside `Outer` names `Outer`'s own nested `Base`.
+///
+/// `Other.Base` is the near miss: an unrelated type with the same short name
+/// in another namespace must not become the ancestor.
+#[test]
+fn test_csharp_nested_base_by_simple_name_resolves_to_the_sibling_nested_type() {
+    let project = inline_csharp_project(&[
+        (
+            "P.cs",
+            "namespace N\n{\n    public class Outer\n    {\n        private abstract class Base\n        {\n            protected static string Helper(object a, int b) { return \"x\"; }\n        }\n\n        private sealed class Derived : Base\n        {\n            public void Use(object a, int b) { var s = Helper(a, b); }\n        }\n    }\n}\n",
+        ),
+        (
+            "Other.cs",
+            "namespace Other\n{\n    public class Base { }\n}\n",
+        ),
+    ]);
+    let analyzer = CSharpAnalyzer::from_project(project);
+
+    assert_eq!(
+        direct_ancestor_fq_names(&analyzer, "N.Outer$Derived"),
+        vec!["N.Outer$Base"]
+    );
+
+    // The descendant index and everything built on it (type hierarchy,
+    // polymorphic matching) is derived from the same ancestor walk, so the
+    // nested relationship has to show up in the inverse direction too.
+    let base = analyzer
+        .get_definitions("N.Outer$Base")
+        .into_iter()
+        .find(|unit| unit.kind() == CodeUnitType::Class)
+        .expect("nested base type");
+    let descendants = analyzer
+        .get_direct_descendants(&base)
+        .into_iter()
+        .map(|unit| unit.fq_name().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(descendants, vec!["N.Outer$Derived"]);
+}
+
+/// The #1801 matrix's namespace-free cell: the file-keyed search has no
+/// namespace to compose with at all there, so the enclosing type chain is the
+/// only scope that can name the base.
+#[test]
+fn test_csharp_nested_base_by_simple_name_resolves_without_a_namespace() {
+    let project = inline_csharp_project(&[(
+        "P.cs",
+        "public class Outer\n{\n    private abstract class Base { }\n\n    private sealed class Derived : Base { }\n}\n",
+    )]);
+    let analyzer = CSharpAnalyzer::from_project(project);
+
+    assert_eq!(
+        direct_ancestor_fq_names(&analyzer, "Outer$Derived"),
+        vec!["Outer$Base"]
+    );
+}
+
+/// The controls from the #1801 matrix: a nested type whose base is spelled
+/// with its enclosing type (`Outer.Base`), and a nested type whose base is a
+/// top-level type, both already resolved and must keep resolving.
+#[test]
+fn test_csharp_qualified_and_top_level_bases_resolve_from_a_nested_type() {
+    let project = inline_csharp_project(&[(
+        "P.cs",
+        "namespace N\n{\n    public class TopLevelBase { }\n\n    public class Outer\n    {\n        private abstract class Base { }\n\n        private sealed class Qualified : Outer.Base { }\n\n        private sealed class FromTopLevel : TopLevelBase { }\n    }\n}\n",
+    )]);
+    let analyzer = CSharpAnalyzer::from_project(project);
+
+    assert_eq!(
+        direct_ancestor_fq_names(&analyzer, "N.Outer$Qualified"),
+        vec!["N.Outer$Base"]
+    );
+    assert_eq!(
+        direct_ancestor_fq_names(&analyzer, "N.Outer$FromTopLevel"),
+        vec!["N.TopLevelBase"]
+    );
+}
+
 #[test]
 fn test_csharp_interface_skeleton_and_sources() {
     let analyzer = fixture_analyzer();

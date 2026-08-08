@@ -1,5 +1,6 @@
 use crate::analyzer::cpp::cpp_is_range_for_binding_name;
 use crate::analyzer::{Language, Range};
+use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
 use brokk_bifrost_js_ts::syntax::JsTsLexicalBindingIndex;
 use tree_sitter::Node;
 
@@ -234,6 +235,23 @@ fn is_excluded_reference_candidate(
     node: Node<'_>,
     frontier: CandidateFrontier,
 ) -> bool {
+    // A C# statement label (`Render:`, `goto Render;`) is not an occurrence any
+    // frontier can grade. Labels live in the method's own label namespace, so no
+    // declaration index will ever hold one, and the census grades what it
+    // proposes: left in, every label sharing a name with a same-file member
+    // becomes a tier-2 "same-file declaration exists but forward returned
+    // no_definition" gap that no analyzer change can close (#1799). This is the
+    // same reason the census stops at ERROR subtrees. Semantic tokens keep the
+    // label, because the editor still colors it.
+    if language == Language::CSharp
+        && matches!(
+            frontier,
+            CandidateFrontier::References | CandidateFrontier::Census
+        )
+        && csharp_is_statement_label(node)
+    {
+        return true;
+    }
     if !matches!(frontier, CandidateFrontier::References) {
         return false;
     }
@@ -878,6 +896,56 @@ func run() {
                 offsets.contains(&reference),
                 "neighboring C# type/reference at byte {reference} must remain in the frontier: {offsets:?}"
             );
+        }
+    }
+
+    // Both the reference frontier and the census must drop C# statement labels:
+    // no declaration index holds a label, so a proposed label whose name matches
+    // a same-file member can only be graded as a gap that never closes (#1799).
+    // The `goto case <constant>;` expression is a real constant reference and
+    // stays proposed.
+    #[test]
+    fn csharp_frontiers_exclude_statement_labels_but_keep_goto_case_constants() {
+        let source = r#"class RendererBase {
+    const int Retry = 1;
+
+    object Render(object o) { return o; }
+
+    object Write(object obj, bool flag) {
+        if (flag) { goto Render; }
+        switch (obj) { case 0: goto case Retry; }
+    Render:
+        return Render(obj);
+    }
+}
+"#;
+        let goto_label = source.find("goto Render;").expect("goto statement") + "goto ".len();
+        let label = source.find("\n    Render:").expect("label declaration") + "\n    ".len();
+        let goto_case = source.find("goto case Retry;").expect("goto case") + "goto case ".len();
+        let call = source.find("return Render(obj);").expect("call") + "return ".len();
+
+        for (frontier, offsets) in [
+            (
+                "reference",
+                reference_candidate_offsets(Language::CSharp, "RendererBase.cs", source),
+            ),
+            (
+                "census",
+                census_offsets(Language::CSharp, "RendererBase.cs", source),
+            ),
+        ] {
+            for excluded in [goto_label, label] {
+                assert!(
+                    !offsets.contains(&excluded),
+                    "{frontier} frontier must drop the C# statement label at byte {excluded}: {offsets:?}"
+                );
+            }
+            for kept in [goto_case, call] {
+                assert!(
+                    offsets.contains(&kept),
+                    "{frontier} frontier must keep the C# reference at byte {kept}: {offsets:?}"
+                );
+            }
         }
     }
 

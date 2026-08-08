@@ -288,10 +288,12 @@ void use_unrelated_varint(unrelated::StructuredProtoField::Varint value) {
 
     let (guarded_proven, guarded_unproven) =
         authoritative_ranges(&analyzer, &guarded_widget, &owner_file);
+    // Issue #1814: `owner.h` selects the `PLATFORM_WIDGET` branch before
+    // `owner.cpp` is parsed. `owner.cpp` compiles only when that branch is
+    // active, so a compatible guard set proves the out-of-line owner.
     assert!(
-        !contains_range(&guarded_proven, guarded_constructor)
-            && contains_range(&guarded_unproven, guarded_constructor),
-        "unknown guard owner must remain unproven: proven={guarded_proven:#?}, unproven={guarded_unproven:#?}"
+        contains_range(&guarded_proven, guarded_constructor),
+        "a compatible guarded owner is proven: proven={guarded_proven:#?}, unproven={guarded_unproven:#?}"
     );
 
     let (enable_if_hits, enable_if_unproven) =

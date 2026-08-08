@@ -12,8 +12,9 @@ pub use profile::{
     CodeQueryAccessPathProfile, CodeQueryBoundedDispatchProfile, CodeQueryCacheMetricsKind,
     CodeQueryDerivedLayerCacheCounters, CodeQueryOperatorDisposition, CodeQueryOperatorObservation,
     CodeQueryOperatorTermination, CodeQueryOperatorTimings, CodeQueryProfile,
-    CodeQueryProfileCacheCounters, CodeQueryProfileCacheLayer, CodeQueryProfileScheduling,
-    CodeQueryProfileTimings, CodeQueryProfileWork, CodeQueryStructuralFactsCacheCounters,
+    CodeQueryProfileCacheCounters, CodeQueryProfileCacheLayer, CodeQueryProfileRequestTimings,
+    CodeQueryProfileScheduling, CodeQueryProfileTimings, CodeQueryProfileWork,
+    CodeQueryStructuralFactsCacheCounters,
 };
 
 #[cfg(test)]

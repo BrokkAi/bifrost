@@ -1211,7 +1211,13 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     ref unit,
                     ref candidates,
                     ..
-                } if type_resolution_matches_target(hit_node, unit, candidates, ctx)
+                } if type_resolution_identifies_unit_target(
+                    hit_node,
+                    unit,
+                    candidates,
+                    &ctx.spec.target,
+                    ctx,
+                )
             );
             if raw_matches
                 || type_node_has_exact_target_identity_without_visibility(
@@ -2031,6 +2037,15 @@ fn resolve_callable_candidates(
         return BareCallTargetResolution::Missing;
     }
     let Some(call_arity) = call_arity else {
+        // An unproven argument count cannot create ambiguity where lookup found
+        // exactly one name binding: there is nothing to be ambiguous between.
+        // C has no overloading at all, and a lone C++ candidate is the only
+        // declaration unqualified lookup reached, so arity cannot pick another
+        // one (#1811). Keeping it unproven discarded the proven candidate and
+        // answered `ambiguous` with an empty definition list.
+        if candidates.len() == 1 {
+            return BareCallTargetResolution::FreeFunctions(candidates);
+        }
         return BareCallTargetResolution::UnprovenFreeFunctions(candidates);
     };
     let applicable = candidates
@@ -2220,9 +2235,10 @@ pub fn resolve_bare_call_target(
             })
             .collect::<Vec<_>>();
         if !direct_types.is_empty() {
-            if call_arity.is_none() {
-                return BareCallTargetResolution::Ambiguous;
-            }
+            // `resolve_direct_type_candidates` never consults the argument
+            // count: it answers the one type the name binds to, or reports the
+            // competing types. An unknown count therefore cannot make this
+            // ambiguous (#1812).
             return resolve_direct_type_candidates(direct_types, analyzer, visibility, file);
         }
         let directives = at_tier
@@ -2325,9 +2341,10 @@ pub fn resolve_bare_call_target(
             direct_types.push((unit.clone(), components.clone()));
         }
         if !direct_types.is_empty() {
-            if call_arity.is_none() {
-                return BareCallTargetResolution::Ambiguous;
-            }
+            // `resolve_direct_type_candidates` never consults the argument
+            // count: it answers the one type the name binds to, or reports the
+            // competing types. An unknown count therefore cannot make this
+            // ambiguous (#1812).
             return resolve_direct_type_candidates(direct_types, analyzer, visibility, file);
         }
         let directives = at_tier
@@ -2355,9 +2372,9 @@ pub fn resolve_bare_call_target(
             );
         }
         if type_components.is_some_and(|components| components == qualified.as_slice()) {
-            if call_arity.is_none() {
-                return BareCallTargetResolution::Ambiguous;
-            }
+            // The lexical type resolution below already answers with the single
+            // type, or with its own ambiguity verdict; the argument count adds
+            // nothing to that decision (#1812).
             return match type_resolution {
                 LexicalTypeResolution::Resolved { unit, .. } => {
                     BareCallTargetResolution::Type(unit)
@@ -2367,9 +2384,14 @@ pub fn resolve_bare_call_target(
             };
         }
     }
-    if call_arity.is_none() {
-        return BareCallTargetResolution::Ambiguous;
-    }
+    // Every lookup tier is exhausted: no callable and no type candidate was
+    // found. Reporting that as `Ambiguous` claimed an ambiguity between nothing
+    // at all, and its early return in get_definition preempted the same-file
+    // macro fallback - so a call to a macro defined in the referencing file
+    // (libyang's `RBN_RIGHT`, glpk's `#define error dmx_error`) could never
+    // resolve once an unresolvable include made the argument count unknown.
+    // A no-candidate outcome is Missing, which is what makes the fallback
+    // reachable (#1812).
     match type_resolution {
         LexicalTypeResolution::Resolved { unit, .. } => BareCallTargetResolution::Type(unit),
         LexicalTypeResolution::Ambiguous => BareCallTargetResolution::Ambiguous,
@@ -2909,9 +2931,25 @@ fn type_resolution_matches_unit_target(
     target: &CodeUnit,
     ctx: &ScanCtx<'_>,
 ) -> bool {
-    if !template_alias_owner_matches_reference(node, target, ctx)
-        || !target_alias_candidates_visible(candidates, node, ctx)
-    {
+    target_alias_candidates_visible(candidates, node, ctx)
+        && type_resolution_identifies_unit_target(node, unit, candidates, target, ctx)
+}
+
+/// The identity half of the type-resolution match, without the alias
+/// visibility gate.
+///
+/// Use it only on the without-visibility fallback path, which reports an
+/// unproven hit. An alias spelling does not contain the target identifier, so
+/// the name-mention fallback can never recover a rejected alias reference: the
+/// site would disappear instead of degrading to a reviewable hit.
+fn type_resolution_identifies_unit_target(
+    node: Node<'_>,
+    unit: &CodeUnit,
+    candidates: &[CodeUnit],
+    target: &CodeUnit,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    if !template_alias_owner_matches_reference(node, target, ctx) {
         return false;
     }
     if ctx.visibility.is_template_specialization(target)
@@ -4517,8 +4555,16 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             Some(true) => {}
             Some(false) => return,
             None => {
-                push_unproven_hit(function_terminal_node(function), ctx);
-                return;
+                // The argument count is unknown after macro expansion. It still
+                // cannot select a *different* target when the bare name binds
+                // to exactly one visible callable, so let the bare-call
+                // resolution below prove that site; every other shape stays
+                // unproven (#1811, the scan side of the same over-conservatism
+                // that made the forward answer discard its lone candidate).
+                if !bare_name_binds_only_target(node, function, text, ctx) {
+                    push_unproven_hit(function_terminal_node(function), ctx);
+                    return;
+                }
             }
         }
     }
@@ -4606,6 +4652,34 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     } else {
         push_unproven_hit(function_terminal_node(function), ctx);
     }
+}
+
+/// Whether the bare name at `call` binds to exactly one visible callable, and
+/// that callable is the scan target.
+///
+/// This is the scan-side reading of the #1811 rule: with one name binding there
+/// is nothing an unknown argument count could select instead, so the site is a
+/// proven reference rather than an unproven one. Only bare identifiers qualify;
+/// a member or qualified call reaches its target through a receiver this cannot
+/// judge.
+fn bare_name_binds_only_target(
+    call: Node<'_>,
+    function: Node<'_>,
+    text: &str,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    if !matches!(function.kind(), "identifier" | "template_function") {
+        return false;
+    }
+    let mut candidates = ctx
+        .visibility
+        .named_candidates(ctx.file, text, TargetKind::FreeFunction);
+    candidates.retain(|candidate| {
+        ctx.visibility
+            .declaration_visible_at(&ctx.analyzer, ctx.file, candidate, call.start_byte())
+    });
+    dedupe_callable_candidates(&mut candidates);
+    matches!(candidates.as_slice(), [only] if same_visible_symbol(only, &ctx.spec.target))
 }
 
 fn free_function_call_may_target(call: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {

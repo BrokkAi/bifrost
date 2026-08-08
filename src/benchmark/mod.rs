@@ -28,8 +28,8 @@ pub use report::{
     BenchmarkCompareReport, BenchmarkRepoReport, BenchmarkRunReport, CompareThresholds,
     EnvironmentVarianceReport, McpFairnessTimingReport, McpTransportPhaseReport,
     QueryCodeAccessPathMetrics, QueryCodeBenchmarkMetrics, QueryCodeDerivedLayerMetrics,
-    QueryCodeFactsCacheMetrics, QueryCodeProfileMetrics, ScenarioCompareOutcome,
-    ScenarioCompareReport, ScenarioReport, ScenarioTransport,
+    QueryCodeFactsCacheMetrics, QueryCodeProfileMetrics, QueryCodeRequestTimingMetrics,
+    ScenarioCompareOutcome, ScenarioCompareReport, ScenarioReport, ScenarioTransport,
 };
 pub use runner::{BenchmarkProfile, RunRequest, run_benchmark};
 #[cfg(feature = "release-tooling")]

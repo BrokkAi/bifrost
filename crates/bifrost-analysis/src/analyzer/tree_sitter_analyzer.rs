@@ -3664,6 +3664,31 @@ where
             .any(|(known, _)| known == storage_key)
     }
 
+    /// The storage key and store generation this analyzer would serve `file`
+    /// under, or `None` when `file` belongs to another language.
+    ///
+    /// [`LanguageAdapter::storage_language_key_for_file`] reports the FILE's
+    /// own language rather than this adapter's, on purpose (see its doc), while
+    /// `store_context.generations` is published once at construction from this
+    /// adapter's own [`LanguageAdapter::storage_language_keys`]. The two agree
+    /// only for files this analyzer owns, so a per-file query holding a foreign
+    /// file must not index the map: that is the #1805 "no entry found for key"
+    /// panic, hit by the Scala forward resolver, which asks its own analyzer
+    /// about Java candidates on purpose
+    /// (`ForwardScalaNameResolver::resolve_candidate_tier`), and reachable the
+    /// same way from any multi-analyzer fan-out that asks every provider about
+    /// an arbitrary file. This analyzer holds no rows for a file it never
+    /// analyzed, so those callers answer empty instead.
+    ///
+    /// Construction-time paths do not need this: `reconcile_file_states` drops
+    /// files outside its served keys at its single entry, and the sync and
+    /// prefix-scan paths iterate the adapter's own declared keys.
+    fn storage_key_and_generation(&self, file: &ProjectFile) -> Option<(String, GenerationId)> {
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        let generation = self.store_context.generations.get(&storage_key).copied()?;
+        Some((storage_key, generation))
+    }
+
     fn streaming_file_read_id(&self) -> usize {
         Arc::as_ptr(&self.adapter) as *const () as usize
     }
@@ -3737,7 +3762,9 @@ where
         }
 
         let oid = self.resolve_live_oid_for_file(file)?;
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // A foreign file has no state here and must not be parsed as this
+        // adapter's language. See `storage_key_and_generation`.
+        let (storage_key, generation) = self.storage_key_and_generation(file)?;
         self.full_hydration_count.fetch_add(1, Ordering::Relaxed);
         let source = self.source_for_oid(file, oid)?;
         let mut state = match self
@@ -3745,7 +3772,7 @@ where
                 self.store_context.store.hydrate_file_state_with_source(
                     oid,
                     &storage_key,
-                    self.store_context.generations[&storage_key],
+                    generation,
                     self.adapter.as_ref(),
                     file,
                     &source,
@@ -4691,8 +4718,10 @@ where
         oid: Oid,
         source: String,
     ) -> Option<FileState> {
-        let storage_key = self.adapter.storage_language_key_for_file(file);
-        let generation = self.store_context.generations[&storage_key];
+        // This parses `file` as this adapter's language and writes the result
+        // under its storage key, so a foreign file must not reach the store at
+        // all. See `storage_key_and_generation`.
+        let (storage_key, generation) = self.storage_key_and_generation(file)?;
         let mut parser = Self::build_parser(self.adapter.parser_language());
         let state = Self::analyze_source(&mut parser, self.adapter.as_ref(), file, source)?;
         let key = Self::transient_cache_key(oid, file);
@@ -5701,13 +5730,17 @@ where
             return limited_projection_rows(state.children.get(owner).map(Vec::as_slice), limit);
         }
 
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`: `owner` may come from another
+        // language's file, which this analyzer holds no children for.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         let persisted = self
             .store_query_or_record(
                 self.store_context.store.direct_children_for_unit_limited(
                     oid,
                     &storage_key,
-                    self.store_context.generations[&storage_key],
+                    generation,
                     owner,
                     limit,
                 ),
@@ -6880,13 +6913,13 @@ where
         if let Some(content_qualifier) = self.state.dirty_content_qualifier(&key) {
             return Some(content_qualifier);
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`: a foreign file has no persisted
+        // qualifier here, and the snapshot fallbacks below refuse it too.
+        let (storage_key, generation) = self.storage_key_and_generation(file)?;
         self.store_query_or_record(
-            self.store_context.store.content_package(
-                oid,
-                &storage_key,
-                self.store_context.generations[&storage_key],
-            ),
+            self.store_context
+                .store
+                .content_package(oid, &storage_key, generation),
             format!("querying the content qualifier for `{file}`"),
         )
         .flatten()
@@ -6930,8 +6963,10 @@ where
         if let Some(state) = self.source_snapshot_file_state(file) {
             return from_state(&state, limit);
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
-        let generation = self.store_context.generations[&storage_key];
+        // See `storage_key_and_generation`.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         let content_qualifier = self.store_query_or_record(
             self.store_context
                 .store
@@ -7019,14 +7054,17 @@ where
                 limit,
             );
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         self.store_query_or_record(
             self.store_context
                 .store
                 .ruby_method_dispatch_modes_for_unit_limited(
                     oid,
                     &storage_key,
-                    self.store_context.generations[&storage_key],
+                    generation,
                     code_unit,
                     limit,
                 ),
@@ -7127,12 +7165,16 @@ where
         if let Some(retained) = self.import_info_store_get(&key) {
             return limited_projection_rows(Some(retained.as_ref()), limit);
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`: `ImportAnalysisProvider` fan-outs
+        // legitimately ask every provider about an arbitrary file.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         self.store_query_or_record(
             self.store_context.store.import_infos_for_key_limited(
                 oid,
                 &storage_key,
-                self.store_context.generations[&storage_key],
+                generation,
                 limit,
             ),
             format!("querying bounded imports for `{file}`"),
@@ -7233,12 +7275,15 @@ where
                 limit,
             );
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         self.store_query_or_record(
             self.store_context.store.raw_supertypes_for_unit_limited(
                 oid,
                 &storage_key,
-                self.store_context.generations[&storage_key],
+                generation,
                 code_unit,
                 limit,
             ),
@@ -7272,14 +7317,17 @@ where
                 limit,
             );
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         self.store_query_or_record(
             self.store_context
                 .store
                 .supertype_lookup_paths_for_unit_limited(
                     oid,
                     &storage_key,
-                    self.store_context.generations[&storage_key],
+                    generation,
                     code_unit,
                     limit,
                 ),
@@ -7441,13 +7489,18 @@ where
         if let Some(aliases) = self.type_alias_store_get(&key) {
             return aliases.contains(code_unit);
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // A unit from another language's file cannot be one of this analyzer's
+        // type aliases, and its storage key is by design absent from this
+        // adapter's generations (#1805). See `storage_key_and_generation`.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return false;
+        };
         let aliases = self
             .store_query_or_record(
                 self.store_context.store.type_aliases_for_file(
                     oid,
                     &storage_key,
-                    self.store_context.generations[&storage_key],
+                    generation,
                     self.adapter.as_ref(),
                     file,
                 ),
@@ -7548,12 +7601,15 @@ where
                 limit,
             );
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         self.store_query_or_record(
             self.store_context.store.signatures_for_unit_limited(
                 oid,
                 &storage_key,
-                self.store_context.generations[&storage_key],
+                generation,
                 code_unit,
                 limit,
             ),
@@ -7599,14 +7655,17 @@ where
                 limit,
             );
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         self.store_query_or_record(
             self.store_context
                 .store
                 .signature_metadata_for_unit_limited(
                     oid,
                     &storage_key,
-                    self.store_context.generations[&storage_key],
+                    generation,
                     code_unit,
                     limit,
                 ),
@@ -7646,12 +7705,15 @@ where
                 limit,
             );
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         self.store_query_or_record(
             self.store_context.store.ranges_for_unit_limited(
                 oid,
                 &storage_key,
-                self.store_context.generations[&storage_key],
+                generation,
                 code_unit,
                 limit,
             ),
@@ -7992,13 +8054,16 @@ where
             return self.enclosing_code_unit_from_cached_state(&key, &state, range);
         }
 
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`: `CodeUnitIndex` consumers fan a file
+        // out to every provider, and this analyzer encloses nothing in a file
+        // it never analyzed.
+        let (storage_key, generation) = self.storage_key_and_generation(file)?;
         if let Some(candidates) = self
             .store_query_or_record(
                 self.store_context.store.enclosing_declarations_for_range(
                     oid,
                     &storage_key,
-                    self.store_context.generations[&storage_key],
+                    generation,
                     self.adapter.as_ref(),
                     file,
                     range,

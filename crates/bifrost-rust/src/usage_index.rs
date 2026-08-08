@@ -38,6 +38,7 @@ use crate::imports::{
     rust_crate_root_package, rust_import_projection, rust_module_extents,
     rust_target_kind_root_package,
 };
+use crate::lexical_scope::{RustCfgCondition, rust_cfg_condition};
 
 /// How a local binding in an importer refers to its target: a named import
 /// (`use path::Item;`) or a namespace import (`use crate::module;`). A glob
@@ -65,6 +66,7 @@ pub struct RustImportEdge {
     domain: Domain,
     namespace: Option<RustSymbolNamespace>,
     provenance: RustRouteProvenance,
+    cfg_condition: RustCfgCondition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -167,6 +169,10 @@ impl RustImportExtent {
                 end,
             } => *module_start <= byte && byte < *module_end && *start <= byte && byte < *end,
         }
+    }
+
+    fn is_local_only(&self) -> bool {
+        matches!(self, Self::LocalOnly { .. })
     }
 }
 
@@ -291,6 +297,7 @@ pub struct RustOriginRoute {
     origin: RustSymbolIdentity,
     domain: Domain,
     provenance: RustRouteProvenance,
+    cfg_condition: RustCfgCondition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -488,6 +495,7 @@ pub struct RustUsageIndex {
     /// `binding_seeds` avoids scanning every import edge per call.
     pub module_importers: HashMap<ModuleKey, HashSet<ProjectFile>>,
     pub declaration_identities: HashMap<CodeUnit, RustSymbolIdentity>,
+    declaration_cfg_conditions: HashMap<RustSymbolIdentity, Vec<RustCfgCondition>>,
     pub value_constructor_identities: HashMap<CodeUnit, RustSymbolIdentity>,
     pub module_domains: HashMap<ModuleKey, Vec<Domain>>,
     pub module_extents: HashMap<ProjectFile, Vec<(ModuleKey, usize, usize)>>,
@@ -1234,6 +1242,7 @@ impl RustUsageIndex {
             declarations: BTreeSet<CodeUnit>,
             module_extents: Vec<(ModuleKey, usize, usize)>,
             declaration_identities: Vec<(CodeUnit, RustSymbolIdentity)>,
+            declaration_cfg_conditions: Vec<(RustSymbolIdentity, RustCfgCondition)>,
             declared_module_domains: Vec<(ModuleKey, Domain)>,
             declaration_domains: Vec<(RustSymbolIdentity, Domain)>,
             value_constructor_identities: Vec<(CodeUnit, RustSymbolIdentity)>,
@@ -1253,6 +1262,8 @@ impl RustUsageIndex {
             HashMap::default();
         let mut declaration_domains: HashMap<RustSymbolIdentity, Vec<Domain>> = HashMap::default();
         let mut declaration_identities: HashMap<CodeUnit, RustSymbolIdentity> = HashMap::default();
+        let mut declaration_cfg_conditions: HashMap<RustSymbolIdentity, Vec<RustCfgCondition>> =
+            HashMap::default();
         let mut value_constructor_identities: HashMap<CodeUnit, RustSymbolIdentity> =
             HashMap::default();
         let mut declared_module_domains: HashMap<ModuleKey, Vec<Domain>> = HashMap::default();
@@ -1337,6 +1348,21 @@ impl RustUsageIndex {
                 facts
                     .declaration_identities
                     .push((declaration.clone(), identity.clone()));
+                let cfg_condition = prepared
+                    .as_ref()
+                    .and_then(|syntax| {
+                        rust_named_declaration_node(
+                            rust.code_units(),
+                            declaration,
+                            syntax.tree().root_node(),
+                            syntax.source(),
+                        )
+                        .map(|node| rust_cfg_condition(node, syntax.source()))
+                    })
+                    .unwrap_or(RustCfgCondition::Unknown);
+                facts
+                    .declaration_cfg_conditions
+                    .push((identity.clone(), cfg_condition));
                 let constructor_domain = prepared.as_ref().and_then(|syntax| {
                     let node = rust_named_declaration_node(
                         rust.code_units(),
@@ -1408,6 +1434,12 @@ impl RustUsageIndex {
                 module_extents.insert(file.clone(), facts.module_extents);
             }
             declaration_identities.extend(facts.declaration_identities);
+            for (identity, condition) in facts.declaration_cfg_conditions {
+                declaration_cfg_conditions
+                    .entry(identity)
+                    .or_default()
+                    .push(condition);
+            }
             for (declared_module, domain) in facts.declared_module_domains {
                 declared_module_domains
                     .entry(declared_module)
@@ -1531,6 +1563,7 @@ impl RustUsageIndex {
             identities_by_name,
             module_importers,
             declaration_identities,
+            declaration_cfg_conditions,
             value_constructor_identities,
             module_domains,
             module_extents,
@@ -2228,7 +2261,7 @@ pub fn usage_reference_at(
             )
             || (leading_absolute_local && provenance == RustRouteProvenance::Local)
     };
-    let mut matches: HashSet<RustSymbolIdentity> = index
+    let origin_routes = index
         .origin_routes_by_file
         .get(file)
         .and_then(|routes| routes.get(segments[0]))
@@ -2245,8 +2278,22 @@ pub fn usage_reference_at(
                     .copied()
                     .eq(route.path.iter().map(String::as_str))
         })
+        .collect::<Vec<_>>();
+    let local_import_visible = origin_routes
+        .iter()
+        .any(|route| route.extent.is_local_only());
+    let mut matches: HashSet<RustSymbolIdentity> = origin_routes
+        .iter()
         .map(|route| route.origin.clone())
         .collect();
+    let mut candidate_conditions: HashMap<RustSymbolIdentity, Vec<RustCfgCondition>> =
+        HashMap::default();
+    for route in &origin_routes {
+        candidate_conditions
+            .entry(route.origin.clone())
+            .or_default()
+            .push(route.cfg_condition.clone());
+    }
     if namespace == RustReferenceNamespace::Macro
         && segments.len() == 1
         && (!leading_absolute || leading_absolute_local)
@@ -2325,8 +2372,8 @@ pub fn usage_reference_at(
         && namespace != RustReferenceNamespace::Macro
         && (!leading_absolute || leading_absolute_local)
     {
-        matches.extend(
-            index
+        if !local_import_visible {
+            for identity in index
                 .identities_by_name
                 .get(segments[0])
                 .into_iter()
@@ -2343,8 +2390,19 @@ pub fn usage_reference_at(
                         && domains.iter().any(|domain| domain.contains_module(module))
                         && index.declaration_owner_visible_to(rust, identity, file, module)
                 })
-                .cloned(),
-        );
+            {
+                matches.insert(identity.clone());
+                candidate_conditions
+                    .entry(identity.clone())
+                    .or_insert_with(|| {
+                        index
+                            .declaration_cfg_conditions
+                            .get(identity)
+                            .cloned()
+                            .unwrap_or_else(|| vec![RustCfgCondition::Unknown])
+                    });
+            }
+        }
         if matches.is_empty() {
             let scoped_import = scoped_explicit_import(rust, file, byte, segments[0]);
             let identity = match scoped_import {
@@ -2523,6 +2581,30 @@ pub fn usage_reference_at(
         }
     }
 
+    if segments.len() == 1 && namespace != RustReferenceNamespace::Macro {
+        let exact_roots = matches
+            .iter()
+            .filter(|candidate| seeds.root_origins.contains(*candidate))
+            .filter(|candidate| {
+                let Some(root_conditions) = candidate_conditions.get(*candidate) else {
+                    return false;
+                };
+                matches.iter().all(|other| {
+                    other == *candidate
+                        || candidate_conditions
+                            .get(other)
+                            .is_some_and(|other_conditions| {
+                                cfg_conditions_proven_disjoint(root_conditions, other_conditions)
+                            })
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if exact_roots.len() == 1 {
+            return RustReferenceResolution::Exact(exact_roots.into_iter().next().unwrap());
+        }
+    }
+
     let mut matches = matches.into_iter().collect::<Vec<_>>();
     matches.sort_by(|left, right| {
         left.file
@@ -2537,6 +2619,16 @@ pub fn usage_reference_at(
         1 => RustReferenceResolution::Unresolved,
         _ => RustReferenceResolution::Ambiguous(matches),
     }
+}
+
+fn cfg_conditions_proven_disjoint(left: &[RustCfgCondition], right: &[RustCfgCondition]) -> bool {
+    !left.is_empty()
+        && !right.is_empty()
+        && left.iter().all(|left| {
+            right
+                .iter()
+                .all(|right| left.proven_mutually_exclusive(right))
+        })
 }
 
 pub fn exported_targets_from_files(
@@ -2950,6 +3042,7 @@ fn build_origin_routes(
                     origin: origin.clone(),
                     domain: effective_domain.clone(),
                     provenance: edge.provenance,
+                    cfg_condition: edge.cfg_condition.clone(),
                 });
 
             let propagated_alias = match &edge.kind {
@@ -3154,6 +3247,7 @@ fn build_importer_reverse(
                             domain: edge_domain.clone(),
                             namespace: None,
                             provenance: resolved.provenance,
+                            cfg_condition: projected.cfg_condition.clone(),
                         },
                     );
                 }
@@ -3185,6 +3279,7 @@ fn build_importer_reverse(
                         domain: edge_domain.clone(),
                         namespace: None,
                         provenance: resolved.provenance,
+                        cfg_condition: projected.cfg_condition.clone(),
                     },
                 );
             }
@@ -3208,6 +3303,7 @@ fn build_importer_reverse(
                         domain: edge_domain.clone(),
                         namespace: None,
                         provenance: resolved.provenance,
+                        cfg_condition: projected.cfg_condition.clone(),
                     },
                 );
             }

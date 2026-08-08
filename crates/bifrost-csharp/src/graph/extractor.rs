@@ -16,8 +16,9 @@ use crate::graph::resolver::{
 use crate::graph_support::{self, CSharpSource};
 use crate::hierarchy;
 use crate::syntax::{
-    csharp_attribute_terminal_name, csharp_attribute_type_names, csharp_conditional_member_access,
-    csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver, csharp_member_name,
+    CSharpNamedArgumentLabel, csharp_attribute_terminal_name, csharp_attribute_type_names,
+    csharp_conditional_member_access, csharp_constant_pattern_type_candidate,
+    csharp_member_access_type_receiver, csharp_member_name, csharp_named_argument_label,
     csharp_nameof_type_candidates, csharp_type_leftmost_identifier, csharp_type_reference_root,
     csharp_type_terminal_identifier, csharp_unqualified_invocation_for_name,
 };
@@ -681,7 +682,7 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 ctx.source,
                 &mut bindings,
             );
-            match object_initializer_label_owner_resolution(node, ctx) {
+            match member_label_owner_resolution(node, ctx) {
                 LabelOwnerResolution::MatchesTarget => {
                     push_hit(node, ctx);
                     return;
@@ -753,6 +754,13 @@ fn containing_method_group_value_context(node: Node<'_>) -> bool {
                 return parent.child_by_field_name("value") == Some(current);
             }
             "binary_expression" => return is_delegate_binary_operand(current, parent),
+            // Both ternary arms are delegate value positions (#1798). The
+            // condition is not: an identifier there is a boolean expression,
+            // never a method group.
+            "conditional_expression" => {
+                return parent.child_by_field_name("consequence") == Some(current)
+                    || parent.child_by_field_name("alternative") == Some(current);
+            }
             _ => {}
         }
         if transparent_expression_parent(current, parent) {
@@ -778,11 +786,14 @@ fn transparent_expression_parent(current: Node<'_>, parent: Node<'_>) -> bool {
                 .is_some_and(|operator| operator.kind() == "!"))
 }
 
+/// `+ - ??` combine delegates and `== !=` compare them, as in the common
+/// `if (Hook != base.Hook)` guard (#1798). Every one of those operands reads
+/// the method group as a value.
 fn is_delegate_binary_operand(current: Node<'_>, parent: Node<'_>) -> bool {
     parent.kind() == "binary_expression"
         && parent
             .child_by_field_name("operator")
-            .is_some_and(|operator| matches!(operator.kind(), "+" | "-" | "??"))
+            .is_some_and(|operator| matches!(operator.kind(), "+" | "-" | "??" | "==" | "!="))
         && (parent.child_by_field_name("left") == Some(current)
             || parent.child_by_field_name("right") == Some(current))
 }
@@ -904,6 +915,31 @@ enum LabelOwnerResolution {
     Unknown,
 }
 
+/// The owner resolution for a label that writes a member: an object-initializer
+/// label (`new Foo { Bar = .. }`) or an attribute named-argument label
+/// (`[Foo(Bar = ..)]`), whose owner is the attribute type (#1796). A plain
+/// `name:` argument label names a parameter, so it is provably not this member.
+fn member_label_owner_resolution(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> LabelOwnerResolution {
+    let Some(shape) = csharp_named_argument_label(node) else {
+        return object_initializer_label_owner_resolution(node, ctx);
+    };
+    let CSharpNamedArgumentLabel::AttributeMember { attribute_name } = shape else {
+        return LabelOwnerResolution::KnownOther;
+    };
+    let names = csharp_attribute_type_names(attribute_name, ctx.source);
+    let owners =
+        hierarchy::usage_unambiguous_attribute_type_candidates(ctx.csharp, ctx.file, &names);
+    let mut resolution = LabelOwnerResolution::Unknown;
+    for owner in owners {
+        match receiver_fqn_target_member_resolution(&owner.fq_name(), None, None, ctx) {
+            TargetMemberResolution::MatchesTarget => return LabelOwnerResolution::MatchesTarget,
+            TargetMemberResolution::KnownOther => resolution = LabelOwnerResolution::KnownOther,
+            TargetMemberResolution::NotFound => {}
+        }
+    }
+    resolution
+}
+
 fn object_initializer_label_owner_resolution(
     node: Node<'_>,
     ctx: &mut ScanCtx<'_>,
@@ -978,6 +1014,39 @@ pub fn is_declaration_name(node: Node<'_>) -> bool {
         return true;
     }
     false
+}
+
+/// Whether `node` names a C# statement label: the label of a `labeled_statement`
+/// (`Render:`) or the target of a bare `goto Render;`.
+///
+/// A label lives in the method's own label namespace, so it is not a reference
+/// to a declaration. It must never resolve against the enclosing class the way
+/// a bare member reference does, and no declaration index will ever hold one
+/// (#1799).
+///
+/// `goto case <constant>;` and `goto default;` are deliberately not labels: the
+/// grammar admits any expression after `case`, and that expression names a real
+/// constant.
+pub fn is_statement_label(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        // `labeled_statement: seq($.identifier, ':', $.statement)` - the label is
+        // the first named child, the labelled statement is the second.
+        "labeled_statement" => parent
+            .named_child(0)
+            .is_some_and(|label| same_node(label, node)),
+        // `goto_statement: seq('goto', optional(choice('case', 'default')),
+        // optional($.expression), ';')`.
+        "goto_statement" => {
+            let mut cursor = parent.walk();
+            !parent
+                .children(&mut cursor)
+                .any(|child| matches!(child.kind(), "case" | "default"))
+        }
+        _ => false,
+    }
 }
 
 pub fn member_access_receiver(node: Node<'_>) -> Option<Node<'_>> {

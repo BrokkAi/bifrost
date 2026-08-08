@@ -36,8 +36,9 @@ use crate::graph::resolver::{
 use crate::graph_support::CSharpSource;
 use crate::hierarchy;
 use crate::syntax::{
-    CSharpMemberName, csharp_attribute_type_names, csharp_conditional_member_access,
-    csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver, csharp_member_name,
+    CSharpMemberName, CSharpNamedArgumentLabel, csharp_attribute_type_names,
+    csharp_conditional_member_access, csharp_constant_pattern_type_candidate,
+    csharp_member_access_type_receiver, csharp_member_name, csharp_named_argument_label,
     csharp_nameof_type_candidates, csharp_type_leftmost_identifier, csharp_type_reference_root,
     csharp_unqualified_invocation_for_name,
 };
@@ -327,6 +328,35 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
         // node. `new Foo()`'s type child is itself a type reference, so it is
         // covered here without a separate object-creation case.
         "identifier" | "type" => {
+            if node.kind() == "identifier"
+                && let Some(shape) = csharp_named_argument_label(node)
+            {
+                // `[Svc(Lifetime = ..)]` writes a member of the attribute type,
+                // so the label is a usage of that member (#1796). A plain
+                // `name:` label names a parameter, which is not a declaration.
+                if let CSharpNamedArgumentLabel::AttributeMember { attribute_name } = shape {
+                    let name = node_text(node, ctx.source);
+                    let names = csharp_attribute_type_names(attribute_name, ctx.source);
+                    let owners = hierarchy::usage_unambiguous_attribute_type_candidates(
+                        ctx.csharp, ctx.file, &names,
+                    );
+                    if owners.is_empty() {
+                        ctx.record_unproven(name, node);
+                    } else {
+                        for owner in owners {
+                            ctx.record_nearest_member(
+                                &owner.fq_name(),
+                                name,
+                                node,
+                                None,
+                                None,
+                                false,
+                            );
+                        }
+                    }
+                }
+                return;
+            }
             if node.kind() == "identifier"
                 && let Some(initializer) = object_initializer_for_label(node)
             {

@@ -325,6 +325,65 @@ public sealed class Density {
     );
 }
 
+/// #1798: the inverted builder shares
+/// `extractor::is_unqualified_method_group_value`, so the comparison and
+/// ternary-arm value contexts must reach the graph through the same predicate.
+#[test]
+fn inverted_graph_resolves_comparison_and_ternary_method_group_values() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo.cs",
+            r#"
+namespace Demo;
+
+public class Base {
+    public virtual void Hook(int data) { }
+    public virtual void Other(int data) { }
+}
+
+public sealed class Derived : Base {
+    private bool Ready(int data) => data > 0;
+
+    public bool Differs(System.Action<int> other) => Hook != other;
+
+    public bool Matches(System.Action<int> other) => Hook == other;
+
+    public System.Action<int> Pick(bool flag) => flag ? Hook : Other;
+
+    public System.Action<int> Gated() => Ready ? Hook : Other;
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for from in ["Demo.Derived.Differs", "Demo.Derived.Matches"] {
+        assert!(
+            has_edge(&value, from, "Demo.Base.Hook"),
+            "a delegate comparison operand should produce a method-group edge from {from}: {}",
+            value["edges"]
+        );
+    }
+    for to in ["Demo.Base.Hook", "Demo.Base.Other"] {
+        assert!(
+            has_edge(&value, "Demo.Derived.Pick", to),
+            "both ternary arms should produce method-group edges, missing {to}: {}",
+            value["edges"]
+        );
+        assert!(
+            has_edge(&value, "Demo.Derived.Gated", to),
+            "ternary arms stay visible beside a non-value condition, missing {to}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        !has_edge(&value, "Demo.Derived.Gated", "Demo.Derived.Ready"),
+        "a ternary condition is not a delegate value position: {}",
+        value["edges"]
+    );
+    assert_every_edge_endpoint_is_a_node(&value);
+}
+
 #[test]
 fn inverted_graph_resolves_inherited_members_at_the_nearest_declaring_type() {
     let project = InlineTestProject::with_language(Language::CSharp)

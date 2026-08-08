@@ -864,6 +864,25 @@ fn visible_type_candidates_in_session(
     )
 }
 
+/// The bounded fork of [`graph_support::supertype_candidates`]: the enclosing
+/// type chain of `part` first, then the file-keyed search (#1801).
+fn supertype_candidates_in_session(
+    csharp: &dyn CSharpSource,
+    part: &CodeUnit,
+    raw: &str,
+    session: &ResolutionSession,
+) -> Vec<CodeUnit> {
+    graph_support::supertype_candidates_with_lookups(
+        &part.fq_name(),
+        raw,
+        &mut |fqn| {
+            let candidates = forward_type_declarations_for_fq_name_in_session(csharp, fqn, session);
+            session.observe_cancellation().then_some(candidates)
+        },
+        &mut |name| visible_type_candidates_in_session(csharp, part.source(), name, true, session),
+    )
+}
+
 fn forward_direct_ancestors_in_session(
     csharp: &dyn CSharpSource,
     owner: &CodeUnit,
@@ -901,16 +920,11 @@ fn forward_direct_ancestors_in_session(
             if !session.scope_step() {
                 return Vec::new();
             }
-            let mut candidates =
-                visible_type_candidates_in_session(csharp, part.source(), &raw, true, session);
+            let candidates = supertype_candidates_in_session(csharp, &part, &raw, session);
             if !session.observe_cancellation() {
                 return Vec::new();
             }
-            if graph_support::logical_type_count(&candidates) != 1 {
-                continue;
-            }
-            graph_support::sort_type_candidates(&mut candidates);
-            let Some(ancestor) = candidates.into_iter().next() else {
+            let Some(ancestor) = graph_support::unique_logical_type(candidates) else {
                 continue;
             };
             if !session.scope_step() {
