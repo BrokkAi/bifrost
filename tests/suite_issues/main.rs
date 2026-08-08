@@ -37,6 +37,7 @@ mod issue_1347_rust_alias_cycle;
 mod issue_1546_rust_cfg_test_module_files;
 mod issue_1811_c_single_candidate_unproven_arity;
 mod issue_1812_c_no_candidate_macro_fallback;
+mod issue_1824_cpp_complete_guard_family_callable;
 mod issue_1825_cpp_macro_namespace_callable;
 mod issue_1826_cpp_member_unproven_arity;
 mod issue_1827_cpp_signature_identity;

@@ -130,7 +130,7 @@ pub(super) fn select_navigation_targets(
     for candidate in candidates {
         let Some(tree) = context.cpp_indexed_tree(candidate.source()) else {
             if operation == NavigationOperation::Declaration {
-                classified.push((candidate.clone(), None, CppOccurrenceRole::Unknown));
+                classified.push((candidate.clone(), None, CppOccurrenceRole::Unknown, None));
             }
             structure_unavailable = true;
             continue;
@@ -138,7 +138,7 @@ pub(super) fn select_navigation_targets(
         let root = tree.root_node();
         let Some(index) = context.cpp_navigation_index(candidate.source()) else {
             if operation == NavigationOperation::Declaration {
-                classified.push((candidate.clone(), None, CppOccurrenceRole::Unknown));
+                classified.push((candidate.clone(), None, CppOccurrenceRole::Unknown, None));
             }
             structure_unavailable = true;
             continue;
@@ -146,20 +146,25 @@ pub(super) fn select_navigation_targets(
         let ranges = index.ranges(candidate);
         source_ranges_truncated |= index.is_truncated(candidate);
         if ranges.is_empty() && !candidate.is_callable() && !candidate.is_class() {
-            classified.push((candidate.clone(), None, CppOccurrenceRole::Both));
+            classified.push((candidate.clone(), None, CppOccurrenceRole::Both, None));
             continue;
         }
         classified.extend(ranges.iter().copied().map(|range| {
             let kind = cpp_occurrence_role_for_range(root, candidate, &range);
-            (candidate.clone(), Some(range), kind)
+            let family = brokk_bifrost_cpp::graph::resolver::preprocessor_conditional_family_range(
+                root,
+                range.start_byte,
+                range.end_byte,
+            );
+            (candidate.clone(), Some(range), kind, family)
         }));
     }
     let has_declaration_only = classified
         .iter()
-        .any(|(_, _, kind)| *kind == CppOccurrenceRole::DeclarationOnly);
+        .any(|(_, _, kind, _)| *kind == CppOccurrenceRole::DeclarationOnly);
     let mut selected: Vec<_> = classified
         .into_iter()
-        .filter(|(_, _, kind)| match operation {
+        .filter(|(_, _, kind, _)| match operation {
             NavigationOperation::Declaration => {
                 if has_declaration_only {
                     *kind == CppOccurrenceRole::DeclarationOnly
@@ -175,6 +180,25 @@ pub(super) fn select_navigation_targets(
         .collect();
     selected.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
     selected.dedup();
+    // The branches of one #if/#elif/#else chain are alternate spellings of a
+    // single declaration: at most one of them is compiled. Keep the first
+    // branch so a completed conditional family answers with one target instead
+    // of an ambiguity between build configurations.
+    let mut seen_families = HashSet::default();
+    selected.retain(|(candidate, _, _, family)| {
+        family.is_none_or(|family| {
+            seen_families.insert((
+                candidate.source().clone(),
+                definition_symbol_key(candidate),
+                candidate.signature().map(str::to_owned),
+                family,
+            ))
+        })
+    });
+    let mut selected: Vec<_> = selected
+        .into_iter()
+        .map(|(candidate, range, kind, _)| (candidate, range, kind))
+        .collect();
     let unproven_link_unit = operation == NavigationOperation::Definition
         && selected
             .iter()

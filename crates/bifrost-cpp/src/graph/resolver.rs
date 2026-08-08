@@ -2363,6 +2363,14 @@ impl<'a> VisibilityIndex<'a> {
                 declaration,
                 &reference,
             )
+            .or_else(|| {
+                self.exhaustive_guard_family_activation(
+                    analyzer,
+                    prepared.as_ref(),
+                    declaration,
+                    &reference,
+                )
+            })
             .is_some_and(|activation| activation < reference_byte);
         }
         let Some(donor_syntax) = self.cpp.prepared_syntax(declaration.source()) else {
@@ -2374,6 +2382,14 @@ impl<'a> VisibilityIndex<'a> {
             declaration,
             &reference,
         )
+        .or_else(|| {
+            self.exhaustive_guard_family_activation(
+                analyzer,
+                donor_syntax.as_ref(),
+                declaration,
+                &reference,
+            )
+        })
         .is_none()
         {
             return false;
@@ -4114,45 +4130,40 @@ impl<'a> VisibilityIndex<'a> {
         true
     }
 
+    /// The byte range of the one `#if` family with a terminal `#else` that holds
+    /// every physical declaration of every candidate, or `None` when they do not
+    /// share one such family.
+    ///
+    /// Guard terms alone cannot distinguish one `#if` family from separate blocks
+    /// whose macros changed between declarations. Require every physical range to
+    /// belong to one syntax-tree family with a terminal `#else` before the terms
+    /// can prove branch coverage.
     fn declarations_share_exhaustive_conditional_family(
         &self,
         analyzer: &CppGraphSource<'_>,
         candidates: &[&CodeUnit],
-    ) -> bool {
-        // Guard terms alone cannot distinguish one #if family from separate
-        // blocks whose macros changed between declarations. Require every
-        // physical range to belong to one syntax-tree family with a terminal
-        // #else before the terms can prove branch coverage.
+    ) -> Option<(usize, usize)> {
         let mut family_range = None;
         for candidate in candidates {
-            let Some(prepared) = self.cpp.prepared_syntax(candidate.source()) else {
-                return false;
-            };
+            let prepared = self.cpp.prepared_syntax(candidate.source())?;
             let root = prepared.tree().root_node();
             let mut candidate_family = None;
             for range in analyzer.ranges(candidate) {
-                let Some(node) = root.descendant_for_byte_range(range.start_byte, range.end_byte)
-                else {
-                    return false;
-                };
-                let Some(family) = preprocessor_conditional_family_for_declaration(node) else {
-                    return false;
-                };
+                let node = root.descendant_for_byte_range(range.start_byte, range.end_byte)?;
+                let family = preprocessor_conditional_family_for_declaration(node)?;
                 let key = (family.start_byte(), family.end_byte());
                 if candidate_family.is_some_and(|existing| existing != key) {
-                    return false;
+                    return None;
                 }
                 candidate_family = Some(key);
             }
-            let Some(candidate_family) = candidate_family else {
-                return false;
-            };
+            let candidate_family = candidate_family?;
             if family_range.is_some_and(|existing| existing != candidate_family) {
-                return false;
+                return None;
             }
             family_range = Some(candidate_family);
         }
-        family_range.is_some()
+        family_range
     }
 
     pub fn complementary_same_fqn_type_declarations(
@@ -4163,19 +4174,86 @@ impl<'a> VisibilityIndex<'a> {
     ) -> bool {
         if candidates.len() < 2
             || !self.alternate_same_fqn_type_declarations(analyzer, candidates, target)
-            || !self.declarations_share_exhaustive_conditional_family(analyzer, candidates)
+            || self
+                .declarations_share_exhaustive_conditional_family(analyzer, candidates)
+                .is_none()
         {
             return false;
         }
-        let requirements = candidates
+        Self::preprocessor_guard_terms_cover_all_paths(
+            &self.declaration_family_guard_terms(analyzer, candidates),
+        )
+    }
+
+    fn declaration_family_guard_terms(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        candidates: &[&CodeUnit],
+    ) -> Vec<HashSet<PreprocessorGuard>> {
+        candidates
             .iter()
-            .map(|candidate| declaration_guard_requirements(analyzer, self.cpp, candidate))
+            .flat_map(|candidate| declaration_guard_requirements(analyzer, self.cpp, candidate))
+            .map(|(_, guards)| guards)
+            .collect()
+    }
+
+    /// A callable name declared on every branch of one completed `#if`/`#else`
+    /// family is declared on every configuration path, so a reference below the
+    /// whole family sees one of the branches whatever the preprocessor decides.
+    /// Answer the family's end byte: only past `#endif` is every branch's
+    /// declaration behind the reference.
+    ///
+    /// This is the callable analogue of `complementary_same_fqn_type_declarations`
+    /// and shares both of its primitives. It does not require two distinct
+    /// `CodeUnit`s: branches that declare the same signature can collapse into
+    /// one unit carrying one physical range per branch.
+    ///
+    /// The branches are alternate spellings of one declaration, never competing
+    /// declarations, so only the first branch stands for the family. Reporting
+    /// every branch as visible would turn a name the source declares exactly
+    /// once into an ambiguity between build configurations.
+    fn exhaustive_guard_family_activation(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        prepared: &PreparedSyntaxTree,
+        candidate: &CodeUnit,
+        reference: &CallableReferenceContext<'_>,
+    ) -> Option<usize> {
+        // Branch coverage says nothing about scope: a block-local declaration
+        // stays invisible however many branches declare it.
+        if nameable_callable_declaration_nodes(analyzer, prepared, candidate).is_empty() {
+            return None;
+        }
+        let family = self
+            .visible_identifier_candidates(candidate.source(), candidate.identifier())
+            .filter(|peer| {
+                peer.kind() == candidate.kind()
+                    && peer.fq_name() == candidate.fq_name()
+                    && peer.source() == candidate.source()
+            })
             .collect::<Vec<_>>();
-        let terms = requirements
-            .into_iter()
-            .flat_map(|ranges| ranges.into_iter().map(|(_, guards)| guards))
-            .collect::<Vec<_>>();
-        Self::preprocessor_guard_terms_cover_all_paths(&terms)
+        let (_, family_end) =
+            self.declarations_share_exhaustive_conditional_family(analyzer, &family)?;
+        if !Self::preprocessor_guard_terms_cover_all_paths(
+            &self.declaration_family_guard_terms(analyzer, &family),
+        ) {
+            return None;
+        }
+        // A reference whose own guards pick one branch already reaches that
+        // branch through the ordinary same-guard path; the family must not
+        // resurrect the branch the reference contradicts.
+        if !declaration_guard_requirements(analyzer, self.cpp, candidate)
+            .iter()
+            .any(|(_, guards)| guards_compatible_at_reference(guards, reference.guards()))
+        {
+            return None;
+        }
+        (first_declaration_byte(analyzer, candidate)?
+            == family
+                .iter()
+                .filter_map(|peer| first_declaration_byte(analyzer, peer))
+                .min()?)
+        .then_some(family_end)
     }
 
     fn type_candidate_preserving_target(
@@ -6116,6 +6194,14 @@ fn declaration_guard_requirements(
         .collect()
 }
 
+fn first_declaration_byte(analyzer: &CppGraphSource<'_>, candidate: &CodeUnit) -> Option<usize> {
+    analyzer
+        .ranges(candidate)
+        .into_iter()
+        .map(|range| range.start_byte)
+        .min()
+}
+
 fn guard_requirements_hold_at_reference(
     required: &HashSet<PreprocessorGuard>,
     reference: Option<&HashSet<PreprocessorGuard>>,
@@ -6132,6 +6218,31 @@ fn guards_compatible_at_reference(
     reference: Option<&HashSet<PreprocessorGuard>>,
 ) -> bool {
     reference.is_some_and(|active| merge_preprocessor_guards(declaration, active).is_some())
+}
+
+/// The byte range of the `#if`/`#elif`/`#else` chain that encloses the smallest
+/// node covering `[start_byte, end_byte)`, or `None` when nothing there is
+/// conditional.
+///
+/// Two declarations of one name that report the same chain stand in different
+/// branches of it, so at most one of them is compiled in any configuration.
+/// They are alternate spellings of a single declaration, not competing
+/// declarations, and navigation must not present them as an ambiguity.
+pub fn preprocessor_conditional_family_range(
+    root: Node<'_>,
+    start_byte: usize,
+    end_byte: usize,
+) -> Option<(usize, usize)> {
+    let node = root.descendant_for_byte_range(start_byte, end_byte)?;
+    let mut ancestor = Some(node);
+    while let Some(current) = ancestor {
+        if is_preprocessor_conditional(current) {
+            let family = preprocessor_conditional_family_root(current);
+            return Some((family.start_byte(), family.end_byte()));
+        }
+        ancestor = current.parent();
+    }
+    None
 }
 
 fn preprocessor_conditional_family_for_declaration(node: Node<'_>) -> Option<Node<'_>> {
