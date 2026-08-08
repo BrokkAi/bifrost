@@ -47,5 +47,6 @@ mod issue_1833_cpp_template_derived_bases;
 mod issue_1835_cpp_using_declaration_overloads;
 mod issue_1843_cpp_using_declaration_hiding;
 mod issue_1844_cpp_include_closure_definition;
+mod issue_1852_scala_duplicate_wildcard_imports;
 mod issue_693_profile;
 mod issue_csharp_verbatim_identifiers;

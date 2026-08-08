@@ -8960,8 +8960,13 @@ fn scala_wildcard_imported_member_outcome(
     call_shape: Option<&ScalaCallSiteShape>,
 ) -> Option<DefinitionLookupOutcome> {
     let file_package = scala_package_name_of(ctx.scala, ctx.file).unwrap_or_default();
-    let mut contributing_imports = 0_usize;
-    let mut candidates = Vec::new();
+    // One entry per distinct exporter, identified by the member units the
+    // import resolves to (#1852). Two spellings of one target
+    // (`import UciCharPair.implementation.*` beside `import implementation.*`)
+    // and the same statement repeated in sibling templates both land on the
+    // same units, and a name exported by one object is not ambiguous however
+    // many times the file imports that object.
+    let mut exporters: Vec<Vec<CodeUnit>> = Vec::new();
     for import in ctx.scala.import_info_of(ctx.file) {
         if !import.is_wildcard {
             continue;
@@ -8994,7 +8999,7 @@ fn scala_wildcard_imported_member_outcome(
             .as_ref()
             .map(|structured_path| structured_path.segments.as_slice())
             .unwrap_or(&[]);
-        let import_candidates = scala_wildcard_imported_member_units(
+        let mut import_candidates = scala_wildcard_imported_member_units(
             ctx.support,
             &path,
             &file_package,
@@ -9006,24 +9011,22 @@ fn scala_wildcard_imported_member_outcome(
         .filter(|unit| !ctx.scala.is_type_alias(unit))
         .filter(|unit| scala_member_candidate_applies(ctx, unit, call_shape, false))
         .collect::<Vec<_>>();
-        if !import_candidates.is_empty() {
-            contributing_imports += 1;
-            candidates.extend(import_candidates);
+        if import_candidates.is_empty() {
+            continue;
         }
-        if contributing_imports > 1 {
-            return Some(no_definition(
-                "ambiguous_scala_wildcard_import",
-                format!("Scala wildcard imports expose multiple `{member}` definitions"),
-            ));
+        sort_units(&mut import_candidates);
+        import_candidates.dedup();
+        if !exporters.contains(&import_candidates) {
+            exporters.push(import_candidates);
         }
     }
-    sort_units(&mut candidates);
-    candidates.dedup();
-    if candidates.is_empty() {
-        None
-    } else {
-        Some(candidates_outcome(candidates))
+    if exporters.len() > 1 {
+        return Some(no_definition(
+            "ambiguous_scala_wildcard_import",
+            format!("Scala wildcard imports expose multiple `{member}` definitions"),
+        ));
     }
+    exporters.pop().map(candidates_outcome)
 }
 
 fn scala_wildcard_imported_member_units(
