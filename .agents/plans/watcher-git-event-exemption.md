@@ -3,7 +3,7 @@
 This ExecPlan is a living document maintained per `.agents/PLANS.md`. Sections `Progress`,
 `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept current.
 
-STATUS: PLAN FOR OWNER REVIEW. Do not implement until approved.
+STATUS: APPROVED, IMPLEMENTING (Milestone 1). Milestone 2 stays behind its own approval gate.
 
 ## Purpose / Big Picture
 
@@ -46,7 +46,7 @@ server on a git repo) shows the triggered walks for the touch itself and then si
 - [x] (2026-08-08) Runtime confirmation, mechanism chain, counterfactual, consumer census, and
   option analysis completed (investigation report; issue #1848).
 - [ ] Milestone 1: `.git`-internal event exemption in the watcher, with the loop reproduced in a
-  test and pinned by a walk counter.
+  test and pinned by a walk counter. (2026-08-08: owner approved; implementation in progress.)
 - [ ] Milestone 2 (evidence-gated, separate approval): path-rule classification that does not
   materialize the listing.
 
