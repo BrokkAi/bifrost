@@ -144,8 +144,15 @@ pub fn collect_js_ts_semantic_diagnostics(
     collect_parse_errors(tree.root_node(), &mut parse_errors);
     if !parse_errors.is_empty() {
         // A malformed file's scope surface is not the one the author meant.
-        // Parse errors travel the separate LSP path; the semantic report stays
-        // complete and empty rather than claiming anything about the wreckage.
+        // Parse errors travel the separate LSP path; the semantic report
+        // records that this file could not be judged, so an empty result is
+        // not mistaken for clean.
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "JS/TS source has parse errors".to_string(),
+            }],
+        );
         return report;
     }
 

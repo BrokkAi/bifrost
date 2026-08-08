@@ -1207,6 +1207,19 @@ impl IAnalyzer for MultiAnalyzer {
                 self, file, source,
             );
         }
+        // C# reads the retained dependency-discovery evidence that refines an
+        // unindexed assembly boundary, and a host publishes that on the
+        // analyzer it ran discovery against, which is this composite one.
+        // Delegating to the `CSharpAnalyzer` would hand the collector no
+        // evidence at all, so every miss past a `using` would report the
+        // weakest boundary even where the build declares the assembly.
+        if language_for_file(file) == Language::CSharp
+            && self.delegates.contains_key(&Language::CSharp)
+        {
+            return crate::analyzer::csharp::diagnostics::collect_csharp_semantic_diagnostics(
+                self, file, source,
+            );
+        }
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().semantic_diagnostics(file, source))
             .unwrap_or_default()

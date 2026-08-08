@@ -64,6 +64,10 @@ impl IndexWarmer {
                         let _scope = profiling::scope("mcp_cold.query_index_construction");
                         current.warm_query_indexes();
                     }));
+                    // Release the snapshot before publishing idle. On Windows,
+                    // the snapshot can own SQLite handles that prevent its
+                    // temporary workspace from being removed.
+                    drop(current);
                     let mut state = warmer.state.lock().expect("index warmer lock poisoned");
                     if let Err(panic) = outcome {
                         // A panicking index build installs nothing, so the
@@ -92,8 +96,8 @@ impl IndexWarmer {
         }
     }
 
-    /// Test support: block until no warm is running or queued. Panics if the
-    /// warmer does not go idle within 30 seconds.
+    /// Block until no warm is running or queued. Panics if the warmer does not
+    /// go idle within 30 seconds.
     pub fn wait_until_idle(&self) {
         let state = self.state.lock().expect("index warmer lock poisoned");
         let (state, timeout) = self

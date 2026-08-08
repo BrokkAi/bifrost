@@ -1,0 +1,769 @@
+//! C#'s proof-gated semantic diagnostics (#1621).
+//!
+//! Every assertion is outcome-level: what a report *claims* matters more than
+//! how many diagnostics it printed, because the contract is that a diagnostic
+//! exists only where a complete surface proved absence.
+//!
+//! No test here writes an assembly, a `project.assets.json` or a NuGet cache,
+//! and none runs `dotnet`. Where a test needs the assembly index to exist it
+//! calls `warm_query_indexes`, which is the same off-request hook a host uses;
+//! over a workspace with no dependency inputs that builds an empty index
+//! without touching anything outside the temporary project root.
+
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
+use brokk_bifrost::analyzer::AnalyzerConfig;
+use brokk_bifrost::{Language, WorkspaceAnalyzer};
+use brokk_bifrost_analysis::analyzer::structural::BoundaryStatus;
+use brokk_bifrost_analysis::analyzer::{
+    SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason, SemanticDiagnosticOutcome,
+    SemanticDiagnosticReport, SemanticDiagnosticReportStatus,
+};
+
+use crate::common::{BuiltInlineTestProject, InlineTestProject};
+
+const APP: &str = "App.cs";
+
+/// The checked-in offline fixture assembly, built once and committed. Its
+/// source is `tests/fixtures/csharp-external/ExternalLibrary.cs`: namespace
+/// `Fixture.Api`, holding `IClient`, `Client<T>`, `Message`, `Status`,
+/// `MessageHandler` and `GenericSurface`. Nothing here builds or downloads it.
+const FIXTURE_ASSEMBLY: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/csharp-external/ExternalLibrary.dll"
+));
+
+/// Where each fixture writes the assembly inside its own temporary project.
+/// `.dll` is a C# dependency input, so rewriting this path is also what the
+/// invalidation test changes.
+const ASSEMBLY_REL: &str = "libs/ExternalLibrary.dll";
+
+struct CSharpFixture {
+    project: BuiltInlineTestProject,
+    analyzer: WorkspaceAnalyzer,
+}
+
+impl CSharpFixture {
+    fn new(files: &[(&str, &str)]) -> Self {
+        let mut builder = InlineTestProject::with_language(Language::CSharp);
+        for (path, source) in files {
+            builder = builder.file(*path, *source);
+        }
+        let project = builder.build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        Self { project, analyzer }
+    }
+
+    /// Build the assembly index off the request path, the way a host's index
+    /// warmer does. A diagnostic request must never do this itself.
+    fn warmed(files: &[(&str, &str)]) -> Self {
+        let fixture = Self::new(files);
+        fixture.analyzer.analyzer().warm_query_indexes();
+        assert!(
+            fixture.analyzer.analyzer().query_indexes_warm(),
+            "warming must build the C# assembly index"
+        );
+        fixture
+    }
+
+    /// A workspace whose C# configuration points at one assembly, written into
+    /// the project's own temporary root, with the index warmed off the request
+    /// path. `bytes` is the assembly's content, so a test can hand it a
+    /// deliberately malformed one.
+    fn with_assembly(files: &[(&str, &str)], bytes: &[u8]) -> Self {
+        let mut builder = InlineTestProject::with_language(Language::CSharp);
+        for (path, source) in files {
+            builder = builder.file(*path, *source);
+        }
+        let project = builder.build();
+        let assembly = project.root().join(ASSEMBLY_REL);
+        std::fs::create_dir_all(assembly.parent().expect("assembly has a parent")).unwrap();
+        std::fs::write(&assembly, bytes).unwrap();
+        let mut config = AnalyzerConfig::default();
+        config.csharp.assembly_paths = vec![PathBuf::from(ASSEMBLY_REL)];
+        let analyzer = project.workspace_analyzer(config);
+        analyzer.analyzer().warm_query_indexes();
+        Self { project, analyzer }
+    }
+
+    fn report(&self, rel_path: &str) -> SemanticDiagnosticReport {
+        self.report_from(&self.analyzer, rel_path)
+    }
+
+    fn report_from(
+        &self,
+        analyzer: &WorkspaceAnalyzer,
+        rel_path: &str,
+    ) -> SemanticDiagnosticReport {
+        let file = self.project.file(rel_path);
+        let source = file.read_to_string().expect("read fixture source");
+        analyzer.analyzer().semantic_diagnostics(&file, &source)
+    }
+}
+
+fn resolved_at(report: &SemanticDiagnosticReport, boundary: BoundaryStatus) -> bool {
+    report.outcomes().iter().any(|outcome| {
+        matches!(outcome, SemanticDiagnosticOutcome::Resolved { boundary: found, .. }
+            if *found == boundary)
+    })
+}
+
+fn absence_domains(report: &SemanticDiagnosticReport) -> Vec<&SemanticDiagnosticDomain> {
+    report
+        .outcomes()
+        .iter()
+        .filter_map(|outcome| match outcome {
+            SemanticDiagnosticOutcome::Absent(proof) => Some(&proof.domain),
+            _ => None,
+        })
+        .collect()
+}
+
+fn absence_boundaries(report: &SemanticDiagnosticReport) -> Vec<BoundaryStatus> {
+    report
+        .outcomes()
+        .iter()
+        .filter_map(|outcome| match outcome {
+            SemanticDiagnosticOutcome::Absent(proof) => Some(proof.boundary),
+            _ => None,
+        })
+        .collect()
+}
+
+fn incomplete_reasons(
+    report: &SemanticDiagnosticReport,
+) -> Vec<&SemanticDiagnosticIncompleteReason> {
+    report
+        .outcomes()
+        .iter()
+        .filter_map(|outcome| match outcome {
+            SemanticDiagnosticOutcome::Incomplete { reasons, .. } => Some(reasons),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+fn ambiguity_widths(report: &SemanticDiagnosticReport) -> Vec<usize> {
+    report
+        .outcomes()
+        .iter()
+        .filter_map(|outcome| match outcome {
+            SemanticDiagnosticOutcome::Ambiguous { boundaries, .. } => Some(boundaries.len()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn absent_type(report: &SemanticDiagnosticReport, name: &str) -> bool {
+    absence_domains(report).into_iter().any(|domain| {
+        *domain
+            == SemanticDiagnosticDomain::Type {
+                name: name.to_owned(),
+            }
+    })
+}
+
+fn absent_member(report: &SemanticDiagnosticReport, owner: &str, member: &str) -> bool {
+    absence_domains(report).into_iter().any(|domain| {
+        *domain
+            == SemanticDiagnosticDomain::MemberSurface {
+                owner: owner.to_owned(),
+                member: member.to_owned(),
+            }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Workspace resolution
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_workspace_type_reference_resolves_without_erroring() {
+    let fixture = CSharpFixture::warmed(&[
+        (
+            "Widget.cs",
+            "namespace App { public class Widget { public int Size; } }\n",
+        ),
+        (
+            APP,
+            "namespace App { public class Host { Widget MakeOne() { return null; } } }\n",
+        ),
+    ]);
+    let report = fixture.report(APP);
+    assert!(
+        resolved_at(&report, BoundaryStatus::WorkspaceLocal),
+        "{report:#?}"
+    );
+    assert!(report.diagnostics().is_empty(), "{report:#?}");
+    assert_eq!(report.status(), SemanticDiagnosticReportStatus::Complete);
+}
+
+#[test]
+fn a_missing_local_type_errors_after_complete_resolution() {
+    let fixture = CSharpFixture::warmed(&[(
+        APP,
+        "namespace App { public class Host { Missing MakeOne() { return null; } } }\n",
+    )]);
+    let report = fixture.report(APP);
+    assert!(absent_type(&report, "Missing"), "{report:#?}");
+    assert_eq!(
+        absence_boundaries(&report),
+        vec![BoundaryStatus::WorkspaceLocal],
+        "{report:#?}"
+    );
+    assert_eq!(report.diagnostics().len(), 1, "{report:#?}");
+    assert_eq!(report.diagnostics()[0].kind, "csharp_unrecognized_symbol");
+}
+
+// ---------------------------------------------------------------------------
+// The read-only rule
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unbuilt_assembly_index_never_proves_absence_and_is_not_built_by_the_request() {
+    let fixture = CSharpFixture::new(&[(
+        APP,
+        "namespace App { public class Host { Missing MakeOne() { return null; } } }\n",
+    )]);
+    assert!(
+        !fixture.analyzer.analyzer().query_indexes_warm(),
+        "the fixture must start with an unbuilt index"
+    );
+    let report = fixture.report(APP);
+    assert!(report.diagnostics().is_empty(), "{report:#?}");
+    assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
+    assert!(
+        incomplete_reasons(&report).iter().any(|reason| matches!(
+            reason,
+            SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                boundary: BoundaryStatus::ExternalUnknown
+            }
+        )),
+        "{report:#?}"
+    );
+    assert!(
+        !fixture.analyzer.analyzer().query_indexes_warm(),
+        "a diagnostic request must not build the assembly index"
+    );
+}
+
+#[test]
+fn a_using_of_a_namespace_no_dependency_input_declares_suppresses_every_claim() {
+    let fixture = CSharpFixture::warmed(&[(
+        APP,
+        "using System.Text;\nnamespace App { public class Host { Missing MakeOne() { return null; } } }\n",
+    )]);
+    let report = fixture.report(APP);
+    assert!(
+        report.diagnostics().is_empty(),
+        "a file that opens an unseen namespace proves nothing: {report:#?}"
+    );
+    assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
+    assert!(
+        incomplete_reasons(&report).iter().any(|reason| matches!(
+            reason,
+            SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                boundary: BoundaryStatus::ExternalUnknown
+            }
+        )),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn a_using_of_a_workspace_namespace_resolves() {
+    let fixture = CSharpFixture::warmed(&[
+        (
+            "Widget.cs",
+            "namespace App.Models { public class Widget { } }\n",
+        ),
+        (
+            APP,
+            "using App.Models;\nnamespace App { public class Host { Widget MakeOne() { return null; } } }\n",
+        ),
+    ]);
+    let report = fixture.report(APP);
+    assert!(report.diagnostics().is_empty(), "{report:#?}");
+    assert!(
+        resolved_at(&report, BoundaryStatus::WorkspaceLocal),
+        "{report:#?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Near misses
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_same_type_name_under_two_usings_is_ambiguous_not_absent() {
+    let fixture = CSharpFixture::warmed(&[
+        (
+            "Left.cs",
+            "namespace App.Left { public class Widget { } }\n",
+        ),
+        (
+            "Right.cs",
+            "namespace App.Right { public class Widget { } }\n",
+        ),
+        (
+            APP,
+            "using App.Left;\nusing App.Right;\nnamespace App { public class Host { Widget MakeOne() { return null; } } }\n",
+        ),
+    ]);
+    let report = fixture.report(APP);
+    assert!(
+        report.diagnostics().is_empty(),
+        "an ambiguous name is not an absence: {report:#?}"
+    );
+    assert!(ambiguity_widths(&report).contains(&2), "{report:#?}");
+}
+
+#[test]
+fn a_using_alias_resolves_the_name_it_binds() {
+    let fixture = CSharpFixture::warmed(&[
+        (
+            "Widget.cs",
+            "namespace App.Models { public class Widget { } }\n",
+        ),
+        (
+            APP,
+            "using Gadget = App.Models.Widget;\nnamespace App { public class Host { Gadget MakeOne() { return null; } } }\n",
+        ),
+    ]);
+    let report = fixture.report(APP);
+    assert!(report.diagnostics().is_empty(), "{report:#?}");
+    assert!(
+        resolved_at(&report, BoundaryStatus::WorkspaceLocal),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn a_partial_class_declared_twice_is_one_logical_type() {
+    let fixture = CSharpFixture::warmed(&[
+        (
+            "WidgetA.cs",
+            "namespace App { public partial class Widget { public int Left; } }\n",
+        ),
+        (
+            "WidgetB.cs",
+            "namespace App { public partial class Widget { public int Right; } }\n",
+        ),
+        (
+            APP,
+            "namespace App { public class Host { Widget MakeOne() { return null; } } }\n",
+        ),
+    ]);
+    let report = fixture.report(APP);
+    assert!(
+        ambiguity_widths(&report).is_empty(),
+        "a partial type's parts are one type: {report:#?}"
+    );
+    assert!(
+        resolved_at(&report, BoundaryStatus::WorkspaceLocal),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn a_generic_type_reference_is_matched_on_arity() {
+    let fixture = CSharpFixture::warmed(&[
+        ("Box.cs", "namespace App { public class Box<T> { } }\n"),
+        (
+            APP,
+            "namespace App { public class Host { Box<int> One() { return null; } } }\n",
+        ),
+    ]);
+    let report = fixture.report(APP);
+    assert!(report.diagnostics().is_empty(), "{report:#?}");
+    assert!(
+        resolved_at(&report, BoundaryStatus::WorkspaceLocal),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn a_generic_arity_mismatch_does_not_resolve_to_the_other_arity() {
+    let fixture = CSharpFixture::warmed(&[
+        ("Box.cs", "namespace App { public class Box<T> { } }\n"),
+        (
+            APP,
+            "namespace App { public class Host { Box<int, string> One() { return null; } } }\n",
+        ),
+    ]);
+    let report = fixture.report(APP);
+    assert!(
+        absent_type(&report, "Box`2"),
+        "a two-argument reference must not match the one-parameter type: {report:#?}"
+    );
+}
+
+#[test]
+fn a_generic_parameter_is_not_looked_up_as_a_type() {
+    let fixture = CSharpFixture::warmed(&[(
+        APP,
+        "namespace App { public class Host<T> { T Keep(T value) { return value; } } }\n",
+    )]);
+    let report = fixture.report(APP);
+    assert!(
+        report.diagnostics().is_empty(),
+        "`T` names a generic parameter, not a declaration: {report:#?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Members
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_missing_member_on_a_complete_workspace_owner_errors() {
+    let fixture = CSharpFixture::warmed(&[(
+        APP,
+        "namespace App {\n  public class Widget { public int Size; }\n  public class Host { void Use() { Widget w = new Widget(); int n = w.Missing; } }\n}\n",
+    )]);
+    let report = fixture.report(APP);
+    assert!(
+        absent_member(&report, "App.Widget", "Missing"),
+        "{report:#?}"
+    );
+    assert!(
+        report
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "csharp_unrecognized_member"),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn a_member_inherited_from_a_workspace_base_resolves() {
+    let fixture = CSharpFixture::warmed(&[(
+        APP,
+        "namespace App {\n  public class Base { public int Size; }\n  public class Widget : Base { }\n  public class Host { void Use() { Widget w = new Widget(); int n = w.Size; } }\n}\n",
+    )]);
+    let report = fixture.report(APP);
+    assert!(
+        report.diagnostics().is_empty(),
+        "an inherited member is present: {report:#?}"
+    );
+}
+
+#[test]
+fn an_unresolvable_ancestor_suppresses_the_member_absence() {
+    let fixture = CSharpFixture::warmed(&[(
+        APP,
+        "using App.Unknown;\nnamespace App {\n  public class Widget : SomeUnknownBase { }\n  public class Host { void Use() { Widget w = new Widget(); int n = w.Missing; } }\n}\n",
+    )]);
+    let report = fixture.report(APP);
+    assert!(
+        report.diagnostics().is_empty(),
+        "an owner whose base chain leaves the workspace has no complete surface: {report:#?}"
+    );
+    assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
+}
+
+#[test]
+fn a_static_member_with_a_known_owner_is_checked_against_that_owner() {
+    let fixture = CSharpFixture::warmed(&[(
+        APP,
+        "namespace App {\n  public class Widget { public static int Count; }\n  public class Host { void Use() { int n = Widget.Count; int m = Widget.Missing; } }\n}\n",
+    )]);
+    let report = fixture.report(APP);
+    assert!(
+        absent_member(&report, "App.Widget", "Missing"),
+        "{report:#?}"
+    );
+    assert_eq!(
+        report.diagnostics().len(),
+        1,
+        "`Count` is declared, so only `Missing` may error: {report:#?}"
+    );
+}
+
+#[test]
+fn a_local_shadowing_a_type_name_is_read_as_the_value_it_binds() {
+    // C#'s "Color Color" rule: in `E.I`, `E` is looked up as a value before it
+    // is looked up as a type. Reading `Gadget.Size` against the *type* `Gadget`
+    // would report a member the local's own type declares as absent.
+    let fixture = CSharpFixture::warmed(&[(
+        APP,
+        "namespace App {\n  public class Widget { public int Size; }\n  public class Gadget { public int Other; }\n  public class Host { void Use() { Widget Gadget = new Widget(); int n = Gadget.Size; } }\n}\n",
+    )]);
+    let report = fixture.report(APP);
+    assert!(
+        report.diagnostics().is_empty(),
+        "the local binding outranks the same-named type: {report:#?}"
+    );
+}
+
+#[test]
+fn this_names_the_enclosing_type_as_the_member_owner() {
+    let fixture = CSharpFixture::warmed(&[(
+        APP,
+        "namespace App {\n  public class Widget { public int Size; int Read() { return this.Size; } int Bad() { return this.Missing; } }\n}\n",
+    )]);
+    let report = fixture.report(APP);
+    assert!(
+        absent_member(&report, "App.Widget", "Missing"),
+        "`this` needs no inference to name its own type: {report:#?}"
+    );
+    assert_eq!(
+        report.diagnostics().len(),
+        1,
+        "`this.Size` is declared, so only `this.Missing` may error: {report:#?}"
+    );
+}
+
+#[test]
+fn a_partial_owner_cannot_prove_a_member_absent() {
+    // A source generator writes its half into the build's intermediate output,
+    // which is not analyzed, so a `partial` type's declared members are only
+    // part of its surface.
+    let fixture = CSharpFixture::warmed(&[(
+        APP,
+        "namespace App {\n  public partial class Widget { public int Size; }\n  public class Host { void Use() { Widget w = new Widget(); int n = w.Generated; } }\n}\n",
+    )]);
+    let report = fixture.report(APP);
+    assert!(
+        !absent_member(&report, "App.Widget", "Generated"),
+        "a partial owner has no complete member surface: {report:#?}"
+    );
+    assert!(
+        incomplete_reasons(&report).iter().any(|reason| matches!(
+            reason,
+            SemanticDiagnosticIncompleteReason::UnsupportedGeneratedSurface { .. }
+        )),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn a_dynamic_receiver_suppresses_the_member_lookup() {
+    let fixture = CSharpFixture::warmed(&[(
+        APP,
+        "namespace App {\n  public class Host { void Use(dynamic bag) { var n = bag.Anything; } }\n}\n",
+    )]);
+    let report = fixture.report(APP);
+    assert!(
+        report.diagnostics().is_empty(),
+        "a `dynamic` value's members are decided at run time: {report:#?}"
+    );
+    assert!(
+        incomplete_reasons(&report).iter().any(|reason| matches!(
+            reason,
+            SemanticDiagnosticIncompleteReason::DynamicBehavior { .. }
+        )),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn an_extension_method_lookalike_suppresses_the_member_absence() {
+    let fixture = CSharpFixture::warmed(&[(
+        APP,
+        "namespace App {\n  public class Widget { }\n  public static class Extras { public static int Frob(this Widget widget) { return 1; } }\n  public class Host { void Use() { Widget w = new Widget(); int n = w.Frob(); } }\n}\n",
+    )]);
+    let report = fixture.report(APP);
+    assert!(
+        !absent_member(&report, "App.Widget", "Frob"),
+        "an extension method in scope explains the miss: {report:#?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Parse errors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_errors_report_a_typed_incomplete_rather_than_an_empty_report() {
+    let fixture = CSharpFixture::warmed(&[(
+        APP,
+        "namespace App { public class Host { Missing MakeOne() { return\n",
+    )]);
+    let report = fixture.report(APP);
+    assert!(report.diagnostics().is_empty(), "{report:#?}");
+    assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
+    assert!(
+        incomplete_reasons(&report).iter().any(|reason| matches!(
+            reason,
+            SemanticDiagnosticIncompleteReason::UnsupportedSemantics { detail }
+                if detail.contains("parse errors")
+        )),
+        "{report:#?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The indexed assembly surface
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_indexed_assembly_type_resolves_at_the_external_boundary() {
+    let fixture = CSharpFixture::with_assembly(
+        &[(
+            APP,
+            "using Fixture.Api;\nnamespace App { public class Host { IClient Make() { return null; } } }\n",
+        )],
+        FIXTURE_ASSEMBLY,
+    );
+    let report = fixture.report(APP);
+    assert!(
+        report.diagnostics().is_empty(),
+        "an indexed assembly symbol must never error: {report:#?}"
+    );
+    assert!(
+        resolved_at(&report, BoundaryStatus::ExternalIndexed),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn a_type_absent_from_a_complete_indexed_surface_errors() {
+    let fixture = CSharpFixture::with_assembly(
+        &[(
+            APP,
+            "using Fixture.Api;\nnamespace App { public class Host { Nonexistent Make() { return null; } } }\n",
+        )],
+        FIXTURE_ASSEMBLY,
+    );
+    let report = fixture.report(APP);
+    assert!(absent_type(&report, "Nonexistent"), "{report:#?}");
+    assert!(
+        absence_boundaries(&report).contains(&BoundaryStatus::ExternalIndexed),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn an_internal_assembly_type_is_not_visible_and_stays_absent() {
+    let fixture = CSharpFixture::with_assembly(
+        &[(
+            APP,
+            "using Fixture.Api;\nnamespace App { public class Host { InternalOnly Make() { return null; } } }\n",
+        )],
+        FIXTURE_ASSEMBLY,
+    );
+    let report = fixture.report(APP);
+    assert!(
+        absent_type(&report, "InternalOnly"),
+        "an assembly-internal type is not part of the visible surface: {report:#?}"
+    );
+}
+
+#[test]
+fn a_member_published_by_an_indexed_type_resolves() {
+    let fixture = CSharpFixture::with_assembly(
+        &[(
+            APP,
+            "using Fixture.Api;\nnamespace App { public class Host { void Use(IClient c) { var s = c.Send(null); } } }\n",
+        )],
+        FIXTURE_ASSEMBLY,
+    );
+    let report = fixture.report(APP);
+    assert!(
+        report.diagnostics().is_empty(),
+        "`Send` is published on the indexed interface: {report:#?}"
+    );
+    assert!(
+        resolved_at(&report, BoundaryStatus::ExternalIndexed),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn a_member_absent_from_a_complete_indexed_owner_errors() {
+    let fixture = CSharpFixture::with_assembly(
+        &[(
+            APP,
+            "using Fixture.Api;\nnamespace App { public class Host { void Use(IClient c) { var s = c.Missing; } } }\n",
+        )],
+        FIXTURE_ASSEMBLY,
+    );
+    let report = fixture.report(APP);
+    assert!(
+        absent_member(&report, "Fixture.Api.IClient", "Missing"),
+        "an interface declares no base type, so its indexed surface is whole: {report:#?}"
+    );
+}
+
+#[test]
+fn an_indexed_owner_whose_base_chain_leaves_the_index_cannot_prove_a_member_absent() {
+    let fixture = CSharpFixture::with_assembly(
+        &[(
+            APP,
+            "using Fixture.Api;\nnamespace App { public class Host { void Use(Client<int> c) { var s = c.Missing; } } }\n",
+        )],
+        FIXTURE_ASSEMBLY,
+    );
+    let report = fixture.report(APP);
+    assert!(
+        !absent_member(&report, "Fixture.Api.Client`1", "Missing"),
+        "`Client<T>` extends `System.Object`, which no indexed assembly \
+         declares, so its surface is not complete: {report:#?}"
+    );
+    assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
+}
+
+#[test]
+fn malformed_assembly_metadata_cannot_prove_absence() {
+    let fixture = CSharpFixture::with_assembly(
+        &[(
+            APP,
+            "using Fixture.Api;\nnamespace App { public class Host { Nonexistent Make() { return null; } } }\n",
+        )],
+        b"MZ this is not a CLI assembly",
+    );
+    let report = fixture.report(APP);
+    assert!(
+        report.diagnostics().is_empty(),
+        "an index that could not read its input proves nothing: {report:#?}"
+    );
+    assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
+    assert!(
+        incomplete_reasons(&report).iter().any(|reason| matches!(
+            reason,
+            SemanticDiagnosticIncompleteReason::CorruptSemanticPack { .. }
+                | SemanticDiagnosticIncompleteReason::Truncated
+        )),
+        "{report:#?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Invalidation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn changed_dependency_inputs_withdraw_a_previously_proven_absence() {
+    let fixture = CSharpFixture::with_assembly(
+        &[(
+            APP,
+            "using Fixture.Api;\nnamespace App { public class Host { Nonexistent Make() { return null; } } }\n",
+        )],
+        FIXTURE_ASSEMBLY,
+    );
+    let before = fixture.report(APP);
+    assert!(
+        absent_type(&before, "Nonexistent"),
+        "the absence must be proven before it can be withdrawn: {before:#?}"
+    );
+
+    // Rewriting the assembly is a dependency-input change, which drops the
+    // retained index. The next request peeks at an unbuilt cell and must fall
+    // back to an unknown boundary rather than reusing the old proof.
+    let assembly = fixture.project.file(ASSEMBLY_REL);
+    let updated = fixture.analyzer.update(&BTreeSet::from([assembly]));
+    assert!(
+        !updated.analyzer().query_indexes_warm(),
+        "a changed dependency input must drop the retained assembly index"
+    );
+
+    let after = fixture.report_from(&updated, APP);
+    assert!(
+        after.diagnostics().is_empty(),
+        "the proof must be withdrawn, not carried forward: {after:#?}"
+    );
+    assert_eq!(after.status(), SemanticDiagnosticReportStatus::Incomplete);
+}

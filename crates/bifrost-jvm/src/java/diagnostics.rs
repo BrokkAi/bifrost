@@ -80,6 +80,15 @@ pub fn collect_java_semantic_diagnostics(
     let mut parse_errors = Vec::new();
     collect_parse_errors(tree.root_node(), &mut parse_errors);
     if !parse_errors.is_empty() {
+        // The parse errors themselves reach the host through the analyzer's
+        // parse-diagnostic path. The semantic report records that this file
+        // could not be judged, so an empty result is not mistaken for clean.
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "Java source has parse errors".to_string(),
+            }],
+        );
         return report;
     }
     let line_starts = compute_line_starts(source);
