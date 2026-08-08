@@ -245,6 +245,129 @@ pub struct SemanticModelOverlayMatch<'a, T> {
     pub disposition: SemanticModelOverlayDisposition,
 }
 
+/// Why one hierarchy edge does not reach exactly one published declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticModelEdgeDefect {
+    /// No active pack published the target at all. A base class nothing
+    /// indexed is indistinguishable from no base class without this fact.
+    Unpublished,
+    /// The target matched only a simple-name or alias posting, never a
+    /// declaration identity and never a qualified name. A bare `Widget` can
+    /// match `com.acme.Widget` that way, so the match is a guess.
+    NameResolved,
+    /// More than one published declaration answers the target.
+    Ambiguous,
+}
+
+/// One hierarchy edge an ancestor walk could not cross cleanly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticModelUnresolvedEdge {
+    /// Qualified name of the type that declares the edge.
+    pub from: String,
+    /// The target the pack recorded: a declaration identity, a qualified
+    /// name, or the language's implicit universal root.
+    pub to: String,
+    pub defect: SemanticModelEdgeDefect,
+}
+
+impl std::fmt::Display for SemanticModelUnresolvedEdge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { from, to, defect } = self;
+        match defect {
+            SemanticModelEdgeDefect::Unpublished => write!(
+                formatter,
+                "`{from}` inherits `{to}`, which no active semantic pack published"
+            ),
+            SemanticModelEdgeDefect::NameResolved => write!(
+                formatter,
+                "`{from}` inherits `{to}`, which matched only by simple name"
+            ),
+            SemanticModelEdgeDefect::Ambiguous => write!(
+                formatter,
+                "`{from}` inherits `{to}`, which more than one active semantic pack declares"
+            ),
+        }
+    }
+}
+
+/// A model type's ancestors, plus every hierarchy edge the walk could not
+/// cross cleanly.
+///
+/// `records` stays best effort so navigation keeps every ancestor candidate it
+/// had before. `defects` is what a proof must consult: it is the complete list
+/// of edges whose target the overlay could not pin to one published
+/// declaration, which is exactly the difference between "this type has no base"
+/// and "nothing published this type's base".
+#[derive(Debug)]
+pub struct SemanticModelAncestry<'a> {
+    pub records: Vec<&'a SemanticModelSymbol>,
+    pub disposition: SemanticModelOverlayDisposition,
+    pub defects: Vec<SemanticModelUnresolvedEdge>,
+}
+
+/// What one hierarchy edge target resolved to, and whether the resolution is
+/// clean. Produced only by [`SemanticModelOverlay::resolve_edge_target`].
+struct ResolvedEdgeTarget<'a> {
+    records: Vec<&'a SemanticModelSymbol>,
+    defect: Option<SemanticModelEdgeDefect>,
+}
+
+/// A reason one owner's inherited surface may not be all of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticModelSurfaceGap {
+    /// An edge in the closure did not reach one published declaration.
+    UnresolvedEdge(SemanticModelUnresolvedEdge),
+    /// The pack that published this type claims only a partial surface, so a
+    /// member it does not list may still exist.
+    PartialType { qualified_name: String },
+    /// More than one active pack publishes this type.
+    AmbiguousType { qualified_name: String },
+}
+
+impl std::fmt::Display for SemanticModelSurfaceGap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnresolvedEdge(edge) => edge.fmt(formatter),
+            Self::PartialType { qualified_name } => write!(
+                formatter,
+                "the active semantic pack for `{qualified_name}` is partial"
+            ),
+            Self::AmbiguousType { qualified_name } => write!(
+                formatter,
+                "more than one active semantic pack declares `{qualified_name}`"
+            ),
+        }
+    }
+}
+
+/// One type's whole inherited surface, and every reason that surface may be
+/// incomplete.
+///
+/// This is the three-layer gate a member-absence proof needs: every recorded
+/// edge in the closure resolves cleanly, every type in the closure comes from a
+/// pack that claims a complete surface, and the closure bottoms out either at a
+/// type that declares no supertype or at the language's published universal
+/// root. A gap in any layer means a member missing from `closure` may still
+/// exist, so the caller must suppress rather than prove.
+#[derive(Debug)]
+pub struct SemanticModelOwnerSurface<'a> {
+    /// The owner first, then every ancestor whose members belong to the
+    /// owner's surface.
+    pub closure: Vec<&'a SemanticModelSymbol>,
+    /// Empty exactly when the closure is provably the whole surface. Otherwise
+    /// the gaps in gate order: unresolved edges first, then the types whose own
+    /// provenance does not support a proof.
+    pub gaps: Vec<SemanticModelSurfaceGap>,
+}
+
+impl SemanticModelOwnerSurface<'_> {
+    /// Whether a member absent from every type in `closure` is absent from the
+    /// owner.
+    pub fn proves_absence(&self) -> bool {
+        self.gaps.is_empty()
+    }
+}
+
 #[derive(Debug)]
 pub struct SemanticModelOverlay {
     active_model_set_hash: String,
@@ -509,17 +632,16 @@ impl SemanticModelOverlay {
 
     /// Resolve a model type's transitive ancestors without materializing
     /// universal-root edges for every declaration in the overlay.
-    pub fn ancestors_of(
-        &self,
-        symbol: &SemanticModelSymbol,
-    ) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
+    pub fn ancestors_of(&self, symbol: &SemanticModelSymbol) -> SemanticModelAncestry<'_> {
         let mut records = Vec::new();
+        let mut defects = Vec::new();
         let mut queue = VecDeque::from([symbol]);
         let mut seen = HashSet::from_iter([symbol.id.as_str()]);
         let mut conflict = symbol.provenance.ambiguous;
         while let Some(current) = queue.pop_front() {
             let direct = self.direct_ancestors_of(current);
             conflict |= direct.disposition == SemanticModelOverlayDisposition::Conflict;
+            defects.extend(direct.defects);
             for ancestor in direct.records {
                 if seen.insert(&ancestor.id) {
                     records.push(ancestor);
@@ -534,31 +656,67 @@ impl SemanticModelOverlay {
         } else {
             SemanticModelOverlayDisposition::Unique
         };
-        SemanticModelOverlayMatch {
+        SemanticModelAncestry {
             records,
             disposition,
+            defects,
         }
     }
 
-    /// Return the active universal root for Java or Scala when it is uniquely
-    /// present. The name indexes are already retained by the overlay, so this
-    /// lazy lookup is cheaper than another per-type cache or authored edge.
+    /// One type's whole inherited surface, gated on the three conditions a
+    /// member-absence proof needs.
+    ///
+    /// The owner leads the closure because its own members are part of the
+    /// surface, and its own provenance is subject to the same gate as every
+    /// ancestor's.
+    pub fn owner_surface<'a>(
+        &'a self,
+        owner: &'a SemanticModelSymbol,
+    ) -> SemanticModelOwnerSurface<'a> {
+        let ancestry = self.ancestors_of(owner);
+        let mut closure = Vec::with_capacity(ancestry.records.len().saturating_add(1));
+        closure.push(owner);
+        closure.extend(ancestry.records);
+        // Edges first: a base nothing published is the most specific reason a
+        // surface is short, and the one a suppression detail should name.
+        let mut gaps = ancestry
+            .defects
+            .into_iter()
+            .map(SemanticModelSurfaceGap::UnresolvedEdge)
+            .collect::<Vec<_>>();
+        for record in &closure {
+            if record.provenance.ambiguous {
+                gaps.push(SemanticModelSurfaceGap::AmbiguousType {
+                    qualified_name: record.qualified_name.clone(),
+                });
+            }
+            // A producer that could not enumerate a type's whole surface marks
+            // its pack partial, which also covers every edge it never
+            // recorded: an unrecorded base cannot show up as a defect.
+            if record.provenance.completeness != SemanticModelCompleteness::Complete {
+                gaps.push(SemanticModelSurfaceGap::PartialType {
+                    qualified_name: record.qualified_name.clone(),
+                });
+            }
+        }
+        SemanticModelOwnerSurface { closure, gaps }
+    }
+
+    /// Return the active universal root for a language that has one, when it is
+    /// uniquely present. The name indexes are already retained by the overlay,
+    /// so this lazy lookup is cheaper than another per-type cache or authored
+    /// edge.
     pub fn universal_root_for_language(
         &self,
         language: &str,
     ) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
-        let root = match language {
-            "java" => "java.lang.Object",
-            "scala" => "scala.Any",
-            _ => return self.symbol_match(None),
+        let Some(root) = universal_root_name_for_language(language) else {
+            return self.symbol_match(None);
         };
         self.symbols_named(root)
     }
 
-    fn direct_ancestors_of(
-        &self,
-        symbol: &SemanticModelSymbol,
-    ) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
+    fn direct_ancestors_of(&self, symbol: &SemanticModelSymbol) -> SemanticModelAncestry<'_> {
         let hierarchy = self
             .relations_from(&symbol.id)
             .records
@@ -572,27 +730,44 @@ impl SemanticModelOverlay {
             .collect::<Vec<_>>();
         let has_class_parent = hierarchy.iter().any(|relation| relation.kind == "extends");
         let mut records = Vec::new();
+        let mut defects = Vec::new();
         let mut conflict = hierarchy
             .iter()
             .any(|relation| relation.provenance.ambiguous);
         for relation in hierarchy {
-            let mut matched = self.symbols_with_id(&relation.to);
-            if matched.records.is_empty() {
-                matched = self.symbols_named(&relation.to);
+            let resolved = self.resolve_edge_target(&relation.to);
+            conflict |= resolved.defect == Some(SemanticModelEdgeDefect::Ambiguous);
+            if let Some(defect) = resolved.defect {
+                defects.push(SemanticModelUnresolvedEdge {
+                    from: symbol.qualified_name.clone(),
+                    to: relation.to.clone(),
+                    defect,
+                });
             }
-            conflict |= matched.disposition == SemanticModelOverlayDisposition::Conflict;
-            records.extend(matched.records);
+            records.extend(resolved.records);
         }
+        // A declaration that names no class parent still inherits the
+        // language's universal root, and that root's members are part of its
+        // surface. An unpublished root is therefore a hole in the surface, not
+        // a clean bottom.
         if !has_class_parent
-            && universal_root_name(symbol).is_some_and(|root| root != symbol.qualified_name)
+            && let Some(root_name) =
+                universal_root_name(symbol).filter(|root| *root != symbol.qualified_name)
         {
-            let root = self.universal_root_for_language(&symbol.language);
-            conflict |= root.disposition == SemanticModelOverlayDisposition::Conflict;
-            records.extend(root.records);
+            let resolved = self.resolve_edge_target(root_name);
+            conflict |= resolved.defect == Some(SemanticModelEdgeDefect::Ambiguous);
+            if let Some(defect) = resolved.defect {
+                defects.push(SemanticModelUnresolvedEdge {
+                    from: symbol.qualified_name.clone(),
+                    to: root_name.to_string(),
+                    defect,
+                });
+            }
+            records.extend(resolved.records);
         }
         let mut seen = HashSet::default();
         records.retain(|record| seen.insert(record.id.as_str()));
-        SemanticModelOverlayMatch {
+        SemanticModelAncestry {
             disposition: if conflict {
                 SemanticModelOverlayDisposition::Conflict
             } else if records.is_empty() {
@@ -601,6 +776,56 @@ impl SemanticModelOverlay {
                 SemanticModelOverlayDisposition::Unique
             },
             records,
+            defects,
+        }
+    }
+
+    /// Resolve one hierarchy edge target to the declarations it names, and say
+    /// whether that resolution is clean enough to carry a proof.
+    ///
+    /// A pack records a target either as a declaration identity or as a name,
+    /// and the name it records ranges from a fully qualified one (PHP resolves
+    /// its `extends` clause through the file's `use` aliases) to the bare
+    /// source spelling (Python records `class Child(Base)` as `Base`). Matching
+    /// a bare spelling against the overlay's simple-name postings is a guess:
+    /// two indexed packages can each declare a `Base`. The records still carry
+    /// the guess, because navigation wants the candidate, but the defect says a
+    /// proof must not treat it as a crossed edge.
+    fn resolve_edge_target(&self, target: &str) -> ResolvedEdgeTarget<'_> {
+        let by_id = self.symbols_with_id(target);
+        if !by_id.records.is_empty() {
+            return ResolvedEdgeTarget {
+                defect: (by_id.disposition == SemanticModelOverlayDisposition::Conflict)
+                    .then_some(SemanticModelEdgeDefect::Ambiguous),
+                records: by_id.records,
+            };
+        }
+        let by_name = self.symbols_named(target);
+        if by_name.records.is_empty() {
+            return ResolvedEdgeTarget {
+                records: Vec::new(),
+                defect: Some(SemanticModelEdgeDefect::Unpublished),
+            };
+        }
+        let qualified = by_name
+            .records
+            .iter()
+            .copied()
+            .filter(|record| record.qualified_name == target)
+            .collect::<Vec<_>>();
+        match qualified.as_slice() {
+            [] => ResolvedEdgeTarget {
+                records: by_name.records,
+                defect: Some(SemanticModelEdgeDefect::NameResolved),
+            },
+            [record] if !record.provenance.ambiguous => ResolvedEdgeTarget {
+                records: qualified,
+                defect: None,
+            },
+            _ => ResolvedEdgeTarget {
+                records: qualified,
+                defect: Some(SemanticModelEdgeDefect::Ambiguous),
+            },
         }
     }
 
@@ -763,36 +988,50 @@ impl SemanticModelSymbol {
     }
 }
 
+/// The qualified name every declaration of `language` implicitly inherits,
+/// when the language has such a root.
+///
+/// Python's `builtins.object` is here because a Python class with no written
+/// base still inherits `object`'s members, so an absence claim that has not
+/// seen `object`'s surface is not a proof.
+pub fn universal_root_name_for_language(language: &str) -> Option<&'static str> {
+    match language {
+        "java" => Some("java.lang.Object"),
+        "scala" => Some("scala.Any"),
+        "python" => Some("builtins.object"),
+        _ => None,
+    }
+}
+
 fn universal_root_name(symbol: &SemanticModelSymbol) -> Option<&'static str> {
     if symbol.owner_id.is_some() {
         return None;
     }
-    match symbol.language.as_str() {
-        "java"
-            if matches!(
-                symbol.kind,
-                SemanticModelSymbolKind::Class
-                    | SemanticModelSymbolKind::Enum
-                    | SemanticModelSymbolKind::Record
-            ) =>
-        {
-            Some("java.lang.Object")
-        }
-        "scala"
-            if matches!(
-                symbol.kind,
-                SemanticModelSymbolKind::Class
-                    | SemanticModelSymbolKind::Interface
-                    | SemanticModelSymbolKind::Trait
-                    | SemanticModelSymbolKind::Enum
-                    | SemanticModelSymbolKind::Record
-                    | SemanticModelSymbolKind::Module
-            ) =>
-        {
-            Some("scala.Any")
-        }
-        _ => None,
-    }
+    let inherits_root = match symbol.language.as_str() {
+        "java" => matches!(
+            symbol.kind,
+            SemanticModelSymbolKind::Class
+                | SemanticModelSymbolKind::Enum
+                | SemanticModelSymbolKind::Record
+        ),
+        "scala" => matches!(
+            symbol.kind,
+            SemanticModelSymbolKind::Class
+                | SemanticModelSymbolKind::Interface
+                | SemanticModelSymbolKind::Trait
+                | SemanticModelSymbolKind::Enum
+                | SemanticModelSymbolKind::Record
+                | SemanticModelSymbolKind::Module
+        ),
+        // A Python module is a namespace, not a class, so only class-shaped
+        // declarations inherit `object`.
+        "python" => matches!(
+            symbol.kind,
+            SemanticModelSymbolKind::Class | SemanticModelSymbolKind::Enum
+        ),
+        _ => false,
+    };
+    inherits_root.then(|| universal_root_name_for_language(&symbol.language))?
 }
 
 impl SemanticModelProvenance {
@@ -3473,4 +3712,307 @@ fn render_named_type(name: &str, arguments: &[TypeRef], nullable: bool) -> Strin
         rendered.push('?');
     }
     rendered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an overlay straight from records. The pack pipeline that
+    /// ordinarily produces them is exercised by the semantic-model suites; what
+    /// these tests pin is the ancestor walk and the surface gate over an
+    /// arbitrary published shape, including shapes a producer emits only when
+    /// half a dependency set is indexed.
+    fn overlay(
+        symbols: Vec<SemanticModelSymbol>,
+        relations: Vec<SemanticModelRelation>,
+    ) -> SemanticModelOverlay {
+        let mut overlay = SemanticModelOverlay {
+            active_model_set_hash: "test".to_string(),
+            symbols,
+            relations,
+            symbols_by_id: HashMap::default(),
+            symbols_by_name: HashMap::default(),
+            symbols_by_uri: HashMap::default(),
+            symbols_by_authored_path: HashMap::default(),
+            symbols_by_owner: HashMap::default(),
+            relations_from: HashMap::default(),
+            relations_to: HashMap::default(),
+        };
+        overlay
+            .rebuild_indexes(&crate::CancellationToken::default())
+            .expect("indexes build");
+        overlay
+    }
+
+    fn provenance(completeness: SemanticModelCompleteness) -> SemanticModelProvenance {
+        SemanticModelProvenance {
+            active_model_set_hash: "test".to_string(),
+            pack_digest: "digest".to_string(),
+            pack_id: "test.pack".to_string(),
+            pack_version: "1.0.0".to_string(),
+            producer: "test".to_string(),
+            producer_version: "1.0.0".to_string(),
+            record_id: "record".to_string(),
+            rule_id: None,
+            origin: SemanticModelOriginKind::DependencySource,
+            activation: SemanticModelActivationProvenance {
+                status: "active".to_string(),
+                reason: "test".to_string(),
+                source_kind: "test".to_string(),
+                source_id: "test".to_string(),
+                matched_evidence: SemanticModelMatchedEvidence {
+                    language: "python".to_string(),
+                    ecosystem: "python".to_string(),
+                    package: None,
+                    module: None,
+                    toolchain: None,
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: None,
+                },
+            },
+            proof: SemanticModelProof::PackFact,
+            completeness,
+            ambiguous: false,
+        }
+    }
+
+    /// A published class. Its identity is deliberately distinct from its
+    /// qualified name so a test can tell an identity resolution apart from a
+    /// name one.
+    fn class(qualified_name: &str, language: &str) -> SemanticModelSymbol {
+        SemanticModelSymbol {
+            id: format!("type.{qualified_name}"),
+            owner_id: None,
+            name: qualified_name
+                .rsplit('.')
+                .next()
+                .expect("a qualified name has a terminal segment")
+                .to_string(),
+            qualified_name: qualified_name.to_string(),
+            language: language.to_string(),
+            kind: SemanticModelSymbolKind::Class,
+            visibility: Visibility::Public,
+            is_static: false,
+            signature: None,
+            structured_signature: None,
+            has_explicit_type_terms: false,
+            callable_shape: None,
+            aliases: Vec::new(),
+            type_parameter_constraints: Vec::new(),
+            underlying_type: None,
+            embedded_types: Vec::new(),
+            receiver: None,
+            extension_receiver: None,
+            extension_receiver_constraints: Vec::new(),
+            location: SemanticModelLocation::Model(SemanticModelVirtualLocation {
+                uri: format!("bifrost-model://v1/{qualified_name}"),
+                range: SemanticModelRange {
+                    start_byte: 0,
+                    end_byte: 0,
+                    start_line: 0,
+                    end_line: 0,
+                },
+            }),
+            provenance: provenance(SemanticModelCompleteness::Complete),
+        }
+    }
+
+    fn extends(from: &SemanticModelSymbol, to: &str) -> SemanticModelRelation {
+        SemanticModelRelation {
+            id: format!("hierarchy:{}:extends:{to}", from.id),
+            kind: "extends".to_string(),
+            from: from.id.clone(),
+            to: to.to_string(),
+            declaration_ordinal: Some(0),
+            provenance: provenance(SemanticModelCompleteness::Complete),
+        }
+    }
+
+    fn named<'a>(
+        overlay: &'a SemanticModelOverlay,
+        qualified_name: &str,
+    ) -> &'a SemanticModelSymbol {
+        overlay
+            .symbols_named(qualified_name)
+            .records
+            .into_iter()
+            .find(|symbol| symbol.qualified_name == qualified_name)
+            .unwrap_or_else(|| panic!("`{qualified_name}` is published"))
+    }
+
+    fn closure_names<'a>(surface: &'a SemanticModelOwnerSurface<'a>) -> Vec<&'a str> {
+        surface
+            .closure
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_direct_edge_to_an_unpublished_target_is_reported_rather_than_dropped() {
+        let child = class("pkg.Child", "php");
+        let edge = extends(&child, "vendor.Base");
+        let overlay = overlay(vec![child], vec![edge]);
+
+        let ancestry = overlay.ancestors_of(named(&overlay, "pkg.Child"));
+
+        assert!(ancestry.records.is_empty(), "{ancestry:#?}");
+        assert_eq!(
+            vec![SemanticModelUnresolvedEdge {
+                from: "pkg.Child".to_string(),
+                to: "vendor.Base".to_string(),
+                defect: SemanticModelEdgeDefect::Unpublished,
+            }],
+            ancestry.defects,
+            "an unpublished base must be distinguishable from no base"
+        );
+    }
+
+    #[test]
+    fn a_type_that_declares_no_supertype_bottoms_out_cleanly() {
+        let root = class("pkg.Root", "php");
+        let overlay = overlay(vec![root], Vec::new());
+
+        let surface = overlay.owner_surface(named(&overlay, "pkg.Root"));
+
+        assert!(surface.proves_absence(), "{surface:#?}");
+        assert_eq!(vec!["pkg.Root"], closure_names(&surface));
+    }
+
+    #[test]
+    fn a_dangling_edge_deeper_in_the_closure_still_fails_the_gate() {
+        let child = class("pkg.Child", "php");
+        let middle = class("pkg.Middle", "php");
+        let child_edge = extends(&child, "pkg.Middle");
+        let middle_edge = extends(&middle, "vendor.Missing");
+        let overlay = overlay(vec![child, middle], vec![child_edge, middle_edge]);
+
+        let surface = overlay.owner_surface(named(&overlay, "pkg.Child"));
+
+        assert!(!surface.proves_absence(), "{surface:#?}");
+        assert_eq!(
+            vec![SemanticModelSurfaceGap::UnresolvedEdge(
+                SemanticModelUnresolvedEdge {
+                    from: "pkg.Middle".to_string(),
+                    to: "vendor.Missing".to_string(),
+                    defect: SemanticModelEdgeDefect::Unpublished,
+                }
+            )],
+            surface.gaps,
+            "the transitive edge must name the type that declares it"
+        );
+        assert!(
+            surface.gaps[0].to_string().contains("vendor.Missing"),
+            "{surface:#?}"
+        );
+    }
+
+    #[test]
+    fn a_fully_qualified_edge_across_a_complete_closure_proves_absence() {
+        let child = class("pkg.Child", "php");
+        let base = class("pkg.Base", "php");
+        let edge = extends(&child, "pkg.Base");
+        let overlay = overlay(vec![child, base], vec![edge]);
+
+        let surface = overlay.owner_surface(named(&overlay, "pkg.Child"));
+
+        assert!(surface.proves_absence(), "{surface:#?}");
+        assert_eq!(vec!["pkg.Child", "pkg.Base"], closure_names(&surface));
+    }
+
+    #[test]
+    fn a_simple_name_edge_resolves_for_navigation_but_never_for_a_proof() {
+        // What Python's producer records for `class Child(Base)` is the source
+        // spelling `Base`, which the overlay's simple-name postings will happily
+        // match against any indexed `Base`.
+        let child = class("pkg.Child", "php");
+        let base = class("pkg.Base", "php");
+        let edge = extends(&child, "Base");
+        let overlay = overlay(vec![child, base], vec![edge]);
+
+        let surface = overlay.owner_surface(named(&overlay, "pkg.Child"));
+
+        assert_eq!(
+            vec!["pkg.Child", "pkg.Base"],
+            closure_names(&surface),
+            "the candidate stays available to navigation"
+        );
+        assert_eq!(
+            vec![SemanticModelSurfaceGap::UnresolvedEdge(
+                SemanticModelUnresolvedEdge {
+                    from: "pkg.Child".to_string(),
+                    to: "Base".to_string(),
+                    defect: SemanticModelEdgeDefect::NameResolved,
+                }
+            )],
+            surface.gaps
+        );
+    }
+
+    #[test]
+    fn a_partial_pack_anywhere_in_the_closure_fails_the_gate() {
+        let child = class("pkg.Child", "php");
+        let mut base = class("pkg.Base", "php");
+        base.provenance.completeness = SemanticModelCompleteness::Partial;
+        let edge = extends(&child, "pkg.Base");
+        let overlay = overlay(vec![child, base], vec![edge]);
+
+        let surface = overlay.owner_surface(named(&overlay, "pkg.Child"));
+
+        assert_eq!(
+            vec![SemanticModelSurfaceGap::PartialType {
+                qualified_name: "pkg.Base".to_string(),
+            }],
+            surface.gaps
+        );
+    }
+
+    #[test]
+    fn a_python_class_reaches_the_published_object_root() {
+        let klass = class("theta.Klass", "python");
+        let object = class("builtins.object", "python");
+        let overlay = overlay(vec![klass, object], Vec::new());
+
+        let surface = overlay.owner_surface(named(&overlay, "theta.Klass"));
+
+        assert!(surface.proves_absence(), "{surface:#?}");
+        assert_eq!(
+            vec!["theta.Klass", "builtins.object"],
+            closure_names(&surface),
+            "Python's implicit `object` base contributes universal members"
+        );
+    }
+
+    #[test]
+    fn a_python_class_without_a_published_object_root_cannot_prove_absence() {
+        let klass = class("theta.Klass", "python");
+        let overlay = overlay(vec![klass], Vec::new());
+
+        let surface = overlay.owner_surface(named(&overlay, "theta.Klass"));
+
+        assert_eq!(
+            vec![SemanticModelSurfaceGap::UnresolvedEdge(
+                SemanticModelUnresolvedEdge {
+                    from: "theta.Klass".to_string(),
+                    to: "builtins.object".to_string(),
+                    defect: SemanticModelEdgeDefect::Unpublished,
+                }
+            )],
+            surface.gaps,
+            "an unseen `object` surface is a hole, not a clean bottom"
+        );
+    }
+
+    #[test]
+    fn the_object_root_itself_does_not_inherit_itself() {
+        let object = class("builtins.object", "python");
+        let overlay = overlay(vec![object], Vec::new());
+
+        let surface = overlay.owner_surface(named(&overlay, "builtins.object"));
+
+        assert!(surface.proves_absence(), "{surface:#?}");
+        assert_eq!(vec!["builtins.object"], closure_names(&surface));
+    }
 }
