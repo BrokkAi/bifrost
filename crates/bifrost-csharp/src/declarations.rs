@@ -2,8 +2,8 @@ use brokk_bifrost_core::analyzer::common::IdentifierSigil;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
 use brokk_bifrost_core::analyzer::model::{
-    CallableArity, CodeUnitType, DispatchExtensibility, ParameterMetadata, SignatureMetadata,
-    StructuredTypeIdentity, StructuredTypeName,
+    CallableArity, CodeUnitType, DispatchExtensibility, ParameterMetadata, Range,
+    SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
@@ -290,6 +290,7 @@ impl<'a> CSharpVisitor<'a> {
             SignatureMetadata::new(csharp_type_signature(node, self.source), Vec::new())
                 .with_type_parameters(csharp_declaration_type_parameters(node, self.source)),
         );
+        self.visit_primary_constructor(node, scope, &code_unit, name);
 
         if let Some(body) = cs_type_body(node) {
             let mut lexical_scope = scope.lexical_scope.clone();
@@ -346,6 +347,70 @@ impl<'a> CSharpVisitor<'a> {
         self.parsed.add_signature_with_metadata(
             code_unit,
             csharp_signature_metadata(signature, node, self.source, &scope.lexical_scope),
+        );
+    }
+
+    /// A primary constructor (`record Point(int X, int Y)`, and the C# 12
+    /// `class Widget(int size)` / `struct Pair(int a, int b)` spelling of the
+    /// same thing) declares a constructor with its own parameter arity, so it
+    /// is indexed exactly like an explicit one (#1797).
+    ///
+    /// Without it a record's only constructor is invisible: `new Point(1, 2)`
+    /// resolved to the *type*, and a record that also writes an explicit
+    /// constructor resolved every creation to that one whatever its arity. The
+    /// declaration node stays the type declaration -- it carries the parameter
+    /// list, the modifiers and the type parameters the metadata is built from
+    /// -- while the recorded range stops at the parameter list so the
+    /// constructor never claims the type's body.
+    fn visit_primary_constructor(
+        &mut self,
+        node: Node<'_>,
+        scope: &CSharpScope,
+        parent: &CodeUnit,
+        declared_name: &str,
+    ) {
+        // Only a class, struct or record declaration can carry one; the grammar
+        // gives no other visited type declaration a `parameter_list` child.
+        let Some(parameters) = csharp_parameter_list_node(node) else {
+            return;
+        };
+        let fq = parent
+            .fq()
+            .clone()
+            .with_pushed(cs_segment(declared_name, SegmentKind::Member));
+        let code_unit = CodeUnit::with_signature_and_fq(
+            self.file.clone(),
+            CodeUnitType::Function,
+            scope.package_name.clone(),
+            format!("{}.{declared_name}", parent.short_name()),
+            Some(csharp_parameter_key(node, self.source)),
+            false,
+            fq,
+        );
+        self.parsed.add_code_unit_with_range(
+            code_unit.clone(),
+            Range {
+                start_byte: node.start_byte(),
+                end_byte: parameters.end_byte(),
+                start_line: node.start_position().row + 1,
+                end_line: parameters.end_position().row + 1,
+            },
+            Some(parent.clone()),
+            None,
+        );
+        let signature = format!(
+            "{declared_name}{}",
+            csharp_rendered_parameter_text(node, self.source)
+        );
+        self.parsed.add_signature_with_metadata(
+            code_unit,
+            csharp_signature_metadata(signature, node, self.source, &scope.lexical_scope)
+                // No constructor is dynamically dispatched, which
+                // `csharp_callable_dispatch_extensibility` states for the
+                // explicit spelling by its node kind. This one's node is the
+                // type declaration, so an `abstract`/`virtual` modifier there
+                // would otherwise be read as the constructor's own.
+                .with_dispatch_extensibility(DispatchExtensibility::Closed),
         );
     }
 
@@ -764,7 +829,7 @@ fn csharp_extension_receiver_type_node<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<Node<'tree>> {
-    let parameters = node.child_by_field_name("parameters")?;
+    let parameters = csharp_parameter_list_node(node)?;
     let mut parameters_cursor = parameters.walk();
     let first_parameter = parameters
         .named_children(&mut parameters_cursor)
@@ -1060,7 +1125,7 @@ fn csharp_join_namespace(prefix: &str, path: &[String]) -> String {
 }
 
 fn csharp_callable_arity(node: Node<'_>, source: &str) -> CallableArity {
-    let Some(parameters) = node.child_by_field_name("parameters") else {
+    let Some(parameters) = csharp_parameter_list_node(node) else {
         return CallableArity::exact(0);
     };
     let mut required = 0usize;
@@ -1122,14 +1187,26 @@ fn csharp_parameter_list_has_params(parameters: Node<'_>) -> bool {
         .any(|child| child.kind() == "params")
 }
 
-fn csharp_rendered_parameter_text(node: Node<'_>, source: &str) -> String {
+/// The parameter list a callable declaration declares.
+///
+/// A method, constructor or delegate carries it as the `parameters` field. A
+/// primary constructor is written on its type declaration, where the grammar
+/// admits the list as a plain named child (`repeat(choice($.type_parameter_list,
+/// $.parameter_list))`) with no field name, so the field lookup alone cannot see
+/// it (#1797).
+fn csharp_parameter_list_node<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
     node.child_by_field_name("parameters")
+        .or_else(|| first_named_child_of_kind(node, "parameter_list"))
+}
+
+fn csharp_rendered_parameter_text(node: Node<'_>, source: &str) -> String {
+    csharp_parameter_list_node(node)
         .map(|parameters| normalize_cs_whitespace(cs_node_text(parameters, source)))
         .unwrap_or_else(|| "()".to_string())
 }
 
 fn csharp_parameter_label_nodes(node: Node<'_>) -> Vec<Node<'_>> {
-    let Some(parameters) = node.child_by_field_name("parameters") else {
+    let Some(parameters) = csharp_parameter_list_node(node) else {
         return Vec::new();
     };
     let mut labels = Vec::new();
@@ -1163,7 +1240,7 @@ fn csharp_property_signature(node: Node<'_>, source: &str) -> String {
 }
 
 fn csharp_parameter_key(node: Node<'_>, source: &str) -> String {
-    let Some(parameters) = node.child_by_field_name("parameters") else {
+    let Some(parameters) = csharp_parameter_list_node(node) else {
         return "()".to_string();
     };
     let mut parts = Vec::new();

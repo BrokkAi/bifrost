@@ -19828,9 +19828,18 @@ fn csharp_inapplicable_direct_member_rejects_unrelated_extension_receiver() {
         ),
     );
 
-    assert_eq!(
-        value["results"][0]["definitions"][0]["fqn"], "Demo.Listener.Signal",
-        "an extension with an incompatible known receiver must not replace the legacy direct fallback: {value}"
+    // The direct member is the only same-named declaration the receiver's type
+    // offers, and its three parameters cannot accept a one-argument call, so
+    // nothing here is the target: the extension's receiver is a `string`, and
+    // binding the inapplicable direct member was the #1797 defect. `Listener`
+    // is sealed and derives from nothing indexed-or-otherwise, so the missing
+    // overload is a workspace fact rather than a boundary.
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(
+        value["results"][0]["definitions"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "an extension with an incompatible known receiver must not be the answer either: {value}"
     );
 }
 
@@ -20340,21 +20349,35 @@ namespace App {
 }
 "#;
 
+    let definition_at = |needle: &str| {
+        let start = source.find(needle).expect("constructor site") + "new ".len();
+        lookup(
+            project.root(),
+            &location_reference("App/Controller.cs", source, start),
+        )
+    };
+
     for (needle, expected) in [
         ("new PixelRect()", "Lib.PixelRect"),
         ("new PixelRect(pixels)", "Lib.PixelRect.PixelRect"),
         ("new ExplicitZero()", "Lib.ExplicitZero.ExplicitZero"),
-        ("new Service()", "Lib.Service.Service"),
     ] {
-        let start = source.find(needle).expect("constructor site") + "new ".len();
-        let value = lookup(
-            project.root(),
-            &location_reference("App/Controller.cs", source, start),
-        );
+        let value = definition_at(needle);
         let result = &value["results"][0];
         assert_eq!(result["status"], "resolved", "{value}");
         assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
     }
+
+    // Only a value type has the implicit parameterless constructor, so this
+    // class's single one-parameter constructor cannot accept `new Service()` --
+    // and handing it back anyway was the #1797 defect.
+    let value = definition_at("new Service()");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "no_applicable_overload",
+        "{value}"
+    );
 }
 
 #[test]
@@ -20501,8 +20524,12 @@ public static class ImmutableEquatableArray
     }
 }
 
+/// #1797: a call no indexed overload can accept is not resolved by handing back
+/// the overloads that rejected it. `Service` is declared in this workspace and
+/// derives from nothing, so the three-argument call has no target here and none
+/// beyond the workspace either.
 #[test]
-fn csharp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
+fn csharp_typed_receiver_method_wrong_arity_reports_no_applicable_overload() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
             "Lib/Service.cs",
@@ -20524,19 +20551,13 @@ fn csharp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "ambiguous", "{value}");
-    assert_eq!(
-        result["definitions"].as_array().unwrap().len(),
-        2,
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
         "{value}"
     );
     assert_eq!(
-        result["definitions"][0]["fqn"], "Lib.Service.GetFilePaths",
-        "{value}"
-    );
-    assert_eq!(result["definitions"][0]["signature"], "(string)", "{value}");
-    assert_eq!(
-        result["definitions"][1]["signature"], "(string, bool)",
+        result["diagnostics"][0]["kind"], "no_applicable_overload",
         "{value}"
     );
 }
@@ -33431,4 +33452,260 @@ fn javascript_var_binder_in_a_sibling_function_reports_no_definition() {
     let value =
         javascript_var_scoping_definition(JAVASCRIPT_VAR_IN_SIBLING_FUNCTION, "toBigNumber(1)");
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+/// nunit's `ExtendedTextWriter` shape (#1797): the receiver's own type declares
+/// only a two-parameter `WriteLine`, and the parameterless call the site makes
+/// is `System.IO.TextWriter.WriteLine()`, on the far side of a base type this
+/// workspace does not index.
+const CSHARP_UNINDEXED_BASE_WRITER: &str = r#"using System.IO;
+
+namespace Demo
+{
+    public abstract class ExtendedTextWriter : TextWriter
+    {
+        public abstract void WriteLine(int style, string value);
+        public abstract void WriteLabel(string label, object option = null);
+        public abstract void WriteAll(string label, params object[] values);
+    }
+}
+"#;
+
+const CSHARP_UNINDEXED_BASE_CALLER: &str = r#"namespace Demo
+{
+    public class TextUI
+    {
+        public ExtendedTextWriter Writer { get; }
+
+        public void Show()
+        {
+            Writer.WriteLine();
+            Writer.WriteLine(1, "hello");
+            Writer.WriteLabel("a");
+            Writer.WriteAll("a", 1, 2, 3);
+        }
+    }
+}
+"#;
+
+fn csharp_unindexed_base_definition(needle: &str) -> Value {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Writer.cs", CSHARP_UNINDEXED_BASE_WRITER)
+        .file("src/Ui.cs", CSHARP_UNINDEXED_BASE_CALLER)
+        .build();
+    lookup(
+        project.root(),
+        &location_reference(
+            "src/Ui.cs",
+            CSHARP_UNINDEXED_BASE_CALLER,
+            CSHARP_UNINDEXED_BASE_CALLER
+                .find(needle)
+                .expect("call site in source"),
+        ),
+    )
+}
+
+#[test]
+fn csharp_arity_inapplicable_call_through_an_unindexed_base_answers_boundary() {
+    let value = csharp_unindexed_base_definition("WriteLine();");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
+        "the two-parameter overload cannot accept a parameterless call: {value}"
+    );
+}
+
+#[test]
+fn csharp_applicable_call_through_an_unindexed_base_still_resolves() {
+    let value = csharp_unindexed_base_definition("WriteLine(1,");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.ExtendedTextWriter.WriteLine",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_omitted_optional_argument_through_an_unindexed_base_still_resolves() {
+    let value = csharp_unindexed_base_definition("WriteLabel(\"a\")");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.ExtendedTextWriter.WriteLabel",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_params_array_call_through_an_unindexed_base_still_resolves() {
+    let value = csharp_unindexed_base_definition("WriteAll(\"a\"");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.ExtendedTextWriter.WriteAll",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_arity_inapplicable_call_with_an_indexed_base_chain_answers_no_definition() {
+    let source = r#"namespace Demo
+{
+    public class BaseWriter
+    {
+        public void Flush() {}
+    }
+
+    public class LocalWriter : BaseWriter
+    {
+        public void WriteLine(int style, string value) {}
+    }
+
+    public class Caller
+    {
+        public void Show(LocalWriter writer)
+        {
+            writer.WriteLine();
+            writer.WriteLine(1, "hello");
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Local.cs", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "src/Local.cs",
+            source,
+            source.find("WriteLine();").expect("parameterless call"),
+        ),
+    );
+    let result = &value["results"][0];
+    assert_eq!(
+        result["status"], "no_definition",
+        "every type in the receiver's base chain is indexed, so the missing overload is a workspace fact: {value}"
+    );
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
+        "{value}"
+    );
+
+    let control = lookup(
+        project.root(),
+        &location_reference(
+            "src/Local.cs",
+            source,
+            source.find("WriteLine(1,").expect("two-argument call"),
+        ),
+    );
+    assert_eq!(control["results"][0]["status"], "resolved", "{control}");
+    assert_eq!(
+        control["results"][0]["definitions"][0]["fqn"], "Demo.LocalWriter.WriteLine",
+        "{control}"
+    );
+}
+
+/// jint's `IsoDateTime` shape (#1797, face 2): a record's primary constructor is
+/// a real constructor with its own arity, and an explicit constructor beside it
+/// is a distinct overload.
+const CSHARP_PRIMARY_CONSTRUCTOR_SOURCE: &str = r#"namespace Demo
+{
+    internal readonly record struct IsoDate(int Year, int Month, int Day);
+
+    internal readonly record struct IsoDateTime(IsoDate Date, int Hour)
+    {
+        public IsoDateTime(int year, int month, int day, int hour)
+            : this(new IsoDate(year, month, day), hour)
+        {
+        }
+    }
+
+    internal record Simple(int A, int B);
+
+    internal record class Titled(string Name);
+
+    public class Widget(int size)
+    {
+        public int Size => size;
+    }
+
+    public static class Use
+    {
+        public static void Go()
+        {
+            var pair = new IsoDateTime(new IsoDate(1, 2, 3), 4);
+            var parts = new IsoDateTime(1, 2, 3, 4);
+            var simple = new Simple(1, 2);
+            var titled = new Titled("name");
+            var widget = new Widget(3);
+        }
+    }
+}
+"#;
+
+fn csharp_primary_constructor_definition(needle: &str) -> Value {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Records.cs", CSHARP_PRIMARY_CONSTRUCTOR_SOURCE)
+        .build();
+    let start = CSHARP_PRIMARY_CONSTRUCTOR_SOURCE
+        .find(needle)
+        .expect("creation site in source")
+        + "new ".len();
+    lookup(
+        project.root(),
+        &location_reference("src/Records.cs", CSHARP_PRIMARY_CONSTRUCTOR_SOURCE, start),
+    )
+}
+
+#[test]
+fn csharp_record_struct_primary_constructor_wins_the_arity_match() {
+    let value = csharp_primary_constructor_definition("new IsoDateTime(new IsoDate");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    let definitions = result["definitions"].as_array().expect("definitions");
+    assert_eq!(definitions.len(), 1, "{value}");
+    assert_eq!(
+        definitions[0]["fqn"], "Demo.IsoDateTime.IsoDateTime",
+        "{value}"
+    );
+    assert_eq!(
+        definitions[0]["signature"], "(IsoDate, int)",
+        "the primary constructor, not the four-parameter explicit one: {value}"
+    );
+}
+
+#[test]
+fn csharp_record_explicit_constructor_still_wins_its_own_arity() {
+    let value = csharp_primary_constructor_definition("new IsoDateTime(1, 2, 3, 4)");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    let definitions = result["definitions"].as_array().expect("definitions");
+    assert_eq!(definitions.len(), 1, "{value}");
+    assert_eq!(
+        definitions[0]["fqn"], "Demo.IsoDateTime.IsoDateTime",
+        "{value}"
+    );
+    assert_eq!(
+        definitions[0]["signature"], "(int, int, int, int)",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_record_only_primary_constructor_resolves_to_it_not_the_type() {
+    for (needle, fqn) in [
+        ("new Simple(1, 2)", "Demo.Simple.Simple"),
+        ("new Titled(\"name\")", "Demo.Titled.Titled"),
+        ("new Widget(3)", "Demo.Widget.Widget"),
+    ] {
+        let value = csharp_primary_constructor_definition(needle);
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{needle}: {value}");
+        assert_eq!(result["definitions"][0]["fqn"], fqn, "{needle}: {value}");
+    }
 }

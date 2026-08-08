@@ -8610,3 +8610,80 @@ namespace App
         "truncated zero-hit scan should carry truncation evidence: {result}"
     );
 }
+
+/// jint's `IsoDateTime` shape (#1797, face 2). A record's primary constructor is
+/// an indexed constructor with its own arity, so forward and inverse agree on
+/// every `new` site: each creation binds the overload whose parameter count
+/// accepts it, and the inverse reports exactly that site back.
+#[test]
+fn usage_finder_csharp_reports_record_primary_constructor_creation_sites() {
+    let source = r#"namespace Demo;
+
+internal readonly record struct IsoDate(int Year, int Month, int Day);
+
+internal readonly record struct IsoDateTime(IsoDate Date, int Hour)
+{
+    public IsoDateTime(int year, int month, int day, int hour)
+        : this(new IsoDate(year, month, day), hour)
+    {
+    }
+}
+
+public static class Use
+{
+    public static void Go()
+    {
+        var pair = new IsoDateTime(new IsoDate(1, 2, 3), 4);
+        var parts = new IsoDateTime(1, 2, 3, 4);
+    }
+}
+"#;
+    let (project, analyzer) = csharp_analyzer_with_files(&[("Demo/Records.cs", source)]);
+    let consumer = project.file("Demo/Records.cs");
+
+    let primary = member_function_with_signature(
+        &analyzer,
+        "Demo.IsoDateTime",
+        "IsoDateTime",
+        "(IsoDate, int)",
+    );
+    let explicit = member_function_with_signature(
+        &analyzer,
+        "Demo.IsoDateTime",
+        "IsoDateTime",
+        "(int, int, int, int)",
+    );
+
+    let primary_site = source
+        .find("new IsoDateTime(new IsoDate")
+        .expect("primary constructor creation")
+        + "new ".len();
+    let explicit_site = source
+        .find("new IsoDateTime(1, 2, 3, 4)")
+        .expect("explicit constructor creation")
+        + "new ".len();
+
+    for (target, site) in [(&primary, primary_site), (&explicit, explicit_site)] {
+        let forward = definition_lookup(
+            project.root(),
+            "Demo/Records.cs",
+            site,
+            site + "IsoDateTime".len(),
+        );
+        assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+        assert_eq!(
+            forward["results"][0]["definitions"][0]["signature"],
+            target.signature().expect("constructor signature"),
+            "{forward}"
+        );
+
+        let hits = graph_hits(&analyzer, target);
+        assert_eq!(hits.len(), 1, "{hits:#?}");
+        let hit = hits.iter().next().expect("one creation site");
+        assert_eq!(hit.file, consumer, "{hits:#?}");
+        assert!(
+            hit.start_offset <= site && site <= hit.end_offset,
+            "the inverse must report the creation site the forward answer came from: {hits:#?}"
+        );
+    }
+}

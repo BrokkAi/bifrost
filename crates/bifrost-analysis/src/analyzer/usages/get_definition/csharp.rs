@@ -19,6 +19,7 @@ use crate::analyzer::{
 };
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
+use brokk_bifrost_csharp::graph_support::CSharpSource;
 use brokk_bifrost_csharp::syntax::{
     CSharpNamedArgumentLabel, csharp_named_argument_label, csharp_using_directive_is_static,
     csharp_using_directive_target_node,
@@ -333,6 +334,20 @@ impl<'a> CSharpDefinitionProvider<'a> {
         }
     }
 
+    /// The base-type spellings `part` declares, exactly as written.
+    ///
+    /// Unlike [`Self::direct_ancestors`] this keeps a spelling the workspace
+    /// cannot resolve, which is what tells a complete hierarchy apart from one
+    /// that leaves the indexed workspace (#1797).
+    fn raw_supertypes(&self, part: &CodeUnit) -> Vec<String> {
+        match self.session {
+            Some(session) => {
+                session.query_limited_rows(|limit| self.csharp.raw_supertypes_limited(part, limit))
+            }
+            None => self.csharp.raw_supertypes_of(part),
+        }
+    }
+
     fn direct_ancestors(
         &self,
         provider: &dyn TypeHierarchyProvider,
@@ -619,7 +634,6 @@ fn resolve_csharp_in_session(
                 member,
                 arity,
                 explicit_generic_arity,
-                false,
             );
             // #1477: an extension candidate stays unattributed. The seam below
             // admits a method by matching its declared receiver spelling
@@ -630,7 +644,13 @@ fn resolve_csharp_in_session(
             // holds no owner and no hop distance for the find. Attributing the
             // receiver's own type at depth zero would claim the extension was
             // declared on it, which an extension of a base type contradicts.
-            if outcome.status == DefinitionLookupStatus::NoDefinition && should_try_extensions {
+            // The member walk binds nothing both when it never saw the name and
+            // when every declaration it saw was arity-inapplicable (#1797, which
+            // reports a boundary rather than no_definition when the receiver's
+            // bases leave the workspace). An extension method is a candidate for
+            // either, so the escalation is gated on "bound nothing", not on one
+            // particular unresolved status.
+            if outcome.definitions.is_empty() && should_try_extensions {
                 let extensions = match definitions.session() {
                     Some(session) => csharp_visible_extension_method_candidates_in_session(
                         csharp,
@@ -660,18 +680,6 @@ fn resolve_csharp_in_session(
                 };
                 if !extensions.is_empty() {
                     return candidates_outcome(extensions);
-                }
-                let fallback = csharp_member_outcome(
-                    analyzer,
-                    definitions,
-                    owners.clone(),
-                    member,
-                    arity,
-                    explicit_generic_arity,
-                    true,
-                );
-                if fallback.status != DefinitionLookupStatus::NoDefinition {
-                    return fallback;
                 }
                 let extensions = match definitions.session() {
                     Some(session) => csharp_visible_extension_method_candidates_in_session(
@@ -703,7 +711,6 @@ fn resolve_csharp_in_session(
                 if !extensions.is_empty() {
                     return candidates_outcome(extensions);
                 }
-                return fallback;
             }
             outcome
         }
@@ -736,7 +743,6 @@ fn resolve_csharp_in_session(
                 member,
                 arity,
                 explicit_generic_arity,
-                true,
             );
             if outcome.status == DefinitionLookupStatus::NoDefinition
                 && csharp_static_using_boundary_for_member(csharp, definitions, file)
@@ -810,7 +816,6 @@ fn resolve_csharp_in_session(
                             text,
                             None,
                             None,
-                            true,
                         );
                         if outcome.status != DefinitionLookupStatus::NoDefinition {
                             return outcome;
@@ -1981,7 +1986,16 @@ fn resolve_csharp_constructor(
         return candidates_outcome(implicit_parameterless_owners);
     }
     if !constructors.is_empty() {
-        return candidates_outcome(constructors);
+        // Every indexed constructor of every candidate owner was rejected by
+        // the argument count, and a constructor is never inherited, so no base
+        // type can supply the accepting one either. Binding one anyway was the
+        // forward side's #1797 defect: the inverse scan refuses the site
+        // (`scan_constructor_reference` applies the same `CallableArity`), so
+        // the pair disagreed about it.
+        return no_definition(
+            "no_applicable_overload",
+            format!("no `{reference}` constructor overload accepts this call"),
+        );
     }
     csharp_type_outcome(
         analyzer,
@@ -2184,7 +2198,6 @@ fn csharp_member_outcome(
     member: &str,
     arity: Option<usize>,
     explicit_generic_arity: Option<usize>,
-    fallback_when_inapplicable: bool,
 ) -> DefinitionLookupOutcome {
     if !definitions.scope_step() {
         return no_definition(
@@ -2253,14 +2266,14 @@ fn csharp_member_outcome(
         let mut seen = HashSet::default();
         let mut level = Vec::new();
         let mut depth = 0usize;
-        for owner in owners {
+        for owner in &owners {
             if !definitions.scope_step() {
                 break;
             }
             seen.insert(owner.clone());
-            let expanded = definitions.direct_ancestors(provider, &owner);
+            let expanded = definitions.direct_ancestors(provider, owner);
             if let Some(state) = member_trace.as_mut() {
-                state.record_expansion(&owner, &expanded);
+                state.record_expansion(owner, &expanded);
             }
             level.extend(expanded);
         }
@@ -2316,28 +2329,83 @@ fn csharp_member_outcome(
         }
     }
     if !fallback_candidates.is_empty() {
-        return if fallback_when_inapplicable {
-            if let Some(state) = member_trace.as_ref() {
-                // Bound despite the call shape: the arity filter accepted none
-                // of them, and this seam binds them anyway. The verdict says so.
-                debug_assert!(
-                    arity.is_some(),
-                    "an unknown arity accepts every candidate, so the fallback is unreachable"
-                );
-                state.stage_selection(&fallback_candidates, ApplicabilityVerdict::Inapplicable);
-            }
-            candidates_outcome(fallback_candidates)
-        } else {
-            no_definition(
-                "no_applicable_overload",
-                format!("no C# member `{member}` overload accepts this call"),
-            )
-        };
+        debug_assert!(
+            arity.is_some(),
+            "an unknown arity accepts every candidate, so a rejected set is unreachable"
+        );
+        if let Some(state) = member_trace.as_ref() {
+            // Discarded, never bound: the arity filter accepted none of them,
+            // and the inverse usage scan refuses such a site for exactly the
+            // same reason (#1797). Record the discard while the walk still
+            // knows the rows.
+            state.stage_selection(&fallback_candidates, ApplicabilityVerdict::Inapplicable);
+        }
+        // An overload whose parameter list cannot accept this argument list is
+        // not the target. When the receiver's own hierarchy leaves the indexed
+        // workspace, the accepting declaration is on the far side of that
+        // boundary -- `Writer.WriteLine()` against a type deriving from the
+        // unindexed `System.IO.TextWriter` -- which is what the site reports.
+        return gated_boundary(
+            || !csharp_hierarchy_crosses_unindexed_supertype(definitions, &owners),
+            format!("`{member}` is inherited from a C# base type not indexed in this workspace"),
+            "no_applicable_overload",
+            format!("no C# member `{member}` overload accepts this call"),
+        );
     }
     no_definition(
         "no_indexed_definition",
         format!("C# member `{member}` is not indexed as a definition"),
     )
+}
+
+/// Whether the receiver's own supertype closure names a type this workspace
+/// does not index.
+///
+/// [`CSharpDefinitionProvider::direct_ancestors`] drops a base-type spelling it
+/// cannot resolve, so the resolved ancestors alone cannot tell a complete
+/// hierarchy from a truncated one. The raw `: Base, IFace` spellings can, put
+/// through the very same supertype resolution that dropped them (#1797, the C#
+/// face of Java's #1755).
+fn csharp_hierarchy_crosses_unindexed_supertype(
+    definitions: &CSharpDefinitionProvider<'_>,
+    owners: &[CodeUnit],
+) -> bool {
+    let mut seen: HashSet<CodeUnit> = owners.iter().cloned().collect();
+    let mut queue = owners.to_vec();
+    while let Some(unit) = queue.pop() {
+        if !definitions.scope_step() {
+            return false;
+        }
+        let mut parts = definitions.partial_type_parts(&unit);
+        if parts.is_empty() {
+            parts.push(unit);
+        }
+        for part in parts {
+            if !definitions.scope_step() {
+                return false;
+            }
+            for raw in definitions.raw_supertypes(&part) {
+                // Every C# type derives from `object`, which no workspace
+                // indexes; naming it is not evidence of a truncated hierarchy.
+                if matches!(
+                    csharp_normalize_full_name(&raw).as_str(),
+                    "object" | "System.Object"
+                ) {
+                    continue;
+                }
+                let candidates = definitions.supertype_candidates(&part, &raw);
+                if candidates.is_empty() {
+                    return true;
+                }
+                for candidate in candidates {
+                    if seen.insert(candidate.clone()) {
+                        queue.push(candidate);
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// The verdict a winning C# member candidate carries: the member seams check
@@ -2598,7 +2666,6 @@ fn csharp_object_initializer_label_outcome(
         csharp_node_text(label, source),
         None,
         None,
-        true,
     ))
 }
 
@@ -2704,24 +2771,29 @@ fn csharp_filter_candidates_by_arity(
     let Some(expected) = arity else {
         return candidates.to_vec();
     };
-    let applicable: Vec<_> = candidates
+    candidates
         .iter()
-        .filter_map(|unit| {
+        .filter(|unit| {
             if !definitions.scope_step() {
-                return None;
+                return false;
             }
+            // A non-callable member declares no parameter list: a
+            // delegate-valued property or field is invoked through its own
+            // type's signature, which this side does not read. The inverse scan
+            // gates such a target on nothing but its name
+            // (`TargetSpec::callable_arity` is `None` for a field), so neither
+            // does this side -- otherwise the two disagree about every
+            // `configuration.Select(1)` site.
             if !unit.is_function() {
-                return None;
+                return true;
             }
-            let callable_arity = definitions
+            definitions
                 .query(|| csharp_callable_arity(analyzer, unit))
-                .unwrap_or_else(|| crate::analyzer::CallableArity::exact(0));
-            callable_arity
+                .unwrap_or_else(|| crate::analyzer::CallableArity::exact(0))
                 .accepts(expected)
-                .then(|| (unit.clone(), callable_arity))
         })
-        .collect();
-    applicable.into_iter().map(|(unit, _)| unit).collect()
+        .cloned()
+        .collect()
 }
 
 fn csharp_filter_candidates_by_generic_arity(
