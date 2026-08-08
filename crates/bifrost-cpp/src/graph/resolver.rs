@@ -25,6 +25,7 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::borrow::Cow;
 #[cfg(any(test, feature = "test-support"))]
 use std::cell::Cell;
+use std::cell::OnceCell;
 use std::collections::BTreeSet;
 use std::hash::Hash;
 #[cfg(any(test, feature = "test-support"))]
@@ -2021,16 +2022,22 @@ impl<'a> VisibilityIndex<'a> {
             return Vec::new();
         }
         let mut arities = Vec::with_capacity(differing_candidates.len());
+        // The activation ranges here describe the whole file rather than one
+        // reference, so there is no reference guard environment to consult.
+        let reference = CallableReferenceContext {
+            file,
+            position: None,
+        };
         for (candidate, candidate_arity) in differing_candidates {
             let declaration_activation = if candidate.source() == file {
-                callable_declaration_activation_in_file(analyzer, prepared, candidate, file)
+                callable_declaration_activation_in_file(analyzer, prepared, candidate, &reference)
             } else {
                 cpp.prepared_syntax(candidate.source()).and_then(|syntax| {
                     callable_declaration_activation_in_file(
                         analyzer,
                         syntax.as_ref(),
                         candidate,
-                        file,
+                        &reference,
                     )
                 })
             };
@@ -2254,6 +2261,7 @@ impl<'a> VisibilityIndex<'a> {
         declaration: &CodeUnit,
         reference_byte: usize,
     ) -> bool {
+        let reference_guards = OnceCell::new();
         self.visible_identifier_candidates(file, declaration.identifier())
             .filter(|candidate| {
                 same_logical_symbol(candidate, declaration)
@@ -2267,7 +2275,13 @@ impl<'a> VisibilityIndex<'a> {
                     )
             })
             .any(|candidate| {
-                self.physical_declaration_visible_at(analyzer, file, candidate, reference_byte)
+                self.physical_declaration_visible_at(
+                    analyzer,
+                    file,
+                    candidate,
+                    reference_byte,
+                    &reference_guards,
+                )
             })
     }
 
@@ -2306,16 +2320,25 @@ impl<'a> VisibilityIndex<'a> {
         file: &ProjectFile,
         declaration: &CodeUnit,
         reference_byte: usize,
+        reference_guards: &OnceCell<Option<HashSet<PreprocessorGuard>>>,
     ) -> bool {
         let Some(prepared) = self.cpp.prepared_syntax(file) else {
             return false;
+        };
+        let reference = CallableReferenceContext {
+            file,
+            position: Some(CallableReferencePosition {
+                prepared: prepared.as_ref(),
+                byte: reference_byte,
+                guards: reference_guards,
+            }),
         };
         if declaration.source() == file {
             return callable_declaration_activation_in_file(
                 analyzer,
                 prepared.as_ref(),
                 declaration,
-                file,
+                &reference,
             )
             .is_some_and(|activation| activation < reference_byte);
         }
@@ -2326,7 +2349,7 @@ impl<'a> VisibilityIndex<'a> {
             analyzer,
             donor_syntax.as_ref(),
             declaration,
-            file,
+            &reference,
         )
         .is_none()
         {
@@ -5754,10 +5777,19 @@ fn find_include_activation(
     let include_targets = cpp.include_target_index();
     let mut direct_includes = Vec::new();
     let mut nodes = vec![prepared.tree().root_node()];
+    // An include activates for the whole file, so only an unconditional
+    // directive counts here.
+    let reference = CallableReferenceContext {
+        file,
+        position: None,
+    };
     while let Some(node) = nodes.pop() {
         if node.kind() == "preproc_include" {
-            if callable_preprocessor_context_is_visible_for_reference(node, prepared.source(), file)
-            {
+            if callable_preprocessor_context_is_visible_for_reference(
+                node,
+                prepared.source(),
+                &reference,
+            ) {
                 let raw = normalize_cpp_whitespace(node_text(node, prepared.source()));
                 for include in cpp_include_paths(std::slice::from_ref(&raw)) {
                     if let Some(target) = unique_include_target(resolve_include_targets_with_index(
@@ -5940,6 +5972,12 @@ fn unconditional_include_reaches(
     }
     let mut visited = HashSet::default();
     let mut files = vec![first.clone()];
+    // Only an unconditional directive extends the include reach, so the walk
+    // asks the question without a reference position.
+    let reference = CallableReferenceContext {
+        file: reference_file,
+        position: None,
+    };
     while let Some(file) = files.pop() {
         if file == *donor_source {
             cpp.cache_unconditional_include_reachability(first, donor_source, reference_is_c, true);
@@ -5957,7 +5995,7 @@ fn unconditional_include_reaches(
                 if callable_preprocessor_context_is_visible_for_reference(
                     node,
                     prepared.source(),
-                    reference_file,
+                    &reference,
                 ) {
                     let raw = normalize_cpp_whitespace(node_text(node, prepared.source()));
                     for include in cpp_include_paths(std::slice::from_ref(&raw)) {
@@ -6192,7 +6230,7 @@ fn callable_declaration_activation_in_file(
     analyzer: &CppGraphSource<'_>,
     prepared: &PreparedSyntaxTree,
     candidate: &CodeUnit,
-    reference_file: &ProjectFile,
+    reference: &CallableReferenceContext<'_>,
 ) -> Option<usize> {
     let root = prepared.tree().root_node();
     analyzer
@@ -6246,23 +6284,78 @@ fn callable_declaration_activation_in_file(
             callable_preprocessor_context_is_visible_for_reference(
                 declaration,
                 prepared.source(),
-                reference_file,
+                reference,
             )
-            .then_some(declaration.end_byte())
+            .then_some(callable_declaration_activation_byte(declaration))
         })
         .min()
+}
+
+/// C and C++ activate a declared name at the end of its declarator, not at the
+/// end of the whole declaration. A function definition ends at the closing
+/// brace of its body, so the declaration end byte would hide the function from
+/// its own body and make self recursion unresolvable without a prototype.
+fn callable_declaration_activation_byte(declaration: Node<'_>) -> usize {
+    if declaration.kind() != "function_definition" {
+        return declaration.end_byte();
+    }
+    declaration
+        .child_by_field_name("declarator")
+        .map_or(declaration.end_byte(), |declarator| declarator.end_byte())
+}
+
+/// The reference side of a callable visibility question.
+///
+/// An include-graph walk and a whole-file arity activation ask the question
+/// without one reference position, so they carry no `position` and therefore no
+/// guard environment.
+struct CallableReferenceContext<'a> {
+    file: &'a ProjectFile,
+    position: Option<CallableReferencePosition<'a>>,
+}
+
+/// One reference position plus its preprocessor guard environment. The
+/// environment is computed on demand because most declarations carry no
+/// non-trivial guard.
+struct CallableReferencePosition<'a> {
+    prepared: &'a PreparedSyntaxTree,
+    byte: usize,
+    guards: &'a OnceCell<Option<HashSet<PreprocessorGuard>>>,
+}
+
+impl CallableReferenceContext<'_> {
+    fn is_c(&self) -> bool {
+        self.file
+            .rel_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("c")
+    }
+
+    fn guards(&self) -> Option<&HashSet<PreprocessorGuard>> {
+        let position = self.position.as_ref()?;
+        position
+            .guards
+            .get_or_init(|| {
+                position
+                    .prepared
+                    .tree()
+                    .root_node()
+                    .descendant_for_byte_range(position.byte, position.byte)
+                    .and_then(|node| {
+                        preprocessor_guard_environment(node, position.prepared.source())
+                    })
+            })
+            .as_ref()
+    }
 }
 
 fn callable_preprocessor_context_is_visible_for_reference(
     node: Node<'_>,
     source: &str,
-    reference_file: &ProjectFile,
+    reference: &CallableReferenceContext<'_>,
 ) -> bool {
-    let reference_is_c = reference_file
-        .rel_path()
-        .extension()
-        .and_then(|extension| extension.to_str())
-        == Some("c");
+    let reference_is_c = reference.is_c();
     let mut ancestor = node.parent();
     while let Some(conditional) = ancestor {
         if matches!(conditional.kind(), "preproc_if" | "preproc_ifdef")
@@ -6285,7 +6378,20 @@ fn callable_preprocessor_context_is_visible_for_reference(
                         return false;
                     }
                 }
-                _ => return false,
+                // The declaration stands under a guard whose value this
+                // analyzer cannot decide. It is still co-active with a
+                // reference that stands under the same guard, so accept the
+                // guard when the reference already requires it. Collecting one
+                // guard per ancestor makes the whole walk a subset test of the
+                // declaration guards against the reference guards.
+                guard => {
+                    if !reference
+                        .guards()
+                        .is_some_and(|active| active.contains(&guard))
+                    {
+                        return false;
+                    }
+                }
             }
         }
         ancestor = conditional.parent();

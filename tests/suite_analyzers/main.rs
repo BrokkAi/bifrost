@@ -10,6 +10,7 @@
 mod common;
 
 mod cpp_analyzer_test;
+mod cpp_callable_activation_visibility;
 mod cpp_macro_call_arity;
 mod cpp_macro_sentinel_recovery_test;
 mod cpp_type_hierarchy_test;
