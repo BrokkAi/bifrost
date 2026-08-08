@@ -6310,12 +6310,19 @@ fn unique_include_target(mut targets: Vec<ProjectFile>) -> Option<ProjectFile> {
     }
 }
 
-fn callable_declaration_activation_in_file(
+/// The declaration nodes of `candidate` in `prepared` that stand at a scope a
+/// later reference can name.
+///
+/// A declaration inside a real function body, lambda, or nested block is block
+/// local and is dropped. A declaration inside a parser-recovery wrapper that
+/// merely looks callable -- an export macro between `class` and its name, or a
+/// namespace-opening macro token before `namespace x {` -- keeps class or
+/// namespace scope and is kept.
+fn nameable_callable_declaration_nodes<'tree>(
     analyzer: &CppGraphSource<'_>,
-    prepared: &PreparedSyntaxTree,
+    prepared: &'tree PreparedSyntaxTree,
     candidate: &CodeUnit,
-    reference: &CallableReferenceContext<'_>,
-) -> Option<usize> {
+) -> Vec<Node<'tree>> {
     let root = prepared.tree().root_node();
     analyzer
         .ranges(candidate)
@@ -6331,27 +6338,15 @@ fn callable_declaration_activation_in_file(
             }
             let mut ancestor = declaration.parent();
             while let Some(node) = ancestor {
-                // An export macro between `class` and its name can make
-                // tree-sitter recover the class body as the compound body of
-                // a synthetic function_definition.  A member declaration in
-                // that body is still namespace/class scoped; do not discard
-                // its declaration activation merely because the malformed
-                // wrapper looks callable.
                 if node.kind() == "function_definition"
-                    && crate::declarations::is_recovered_exported_class_container(
-                        node,
-                        prepared.source(),
-                    )
+                    && is_recovered_declaration_scope_container(node, prepared.source())
                 {
                     ancestor = node.parent();
                     continue;
                 }
                 if node.kind() == "compound_statement"
                     && node.parent().is_some_and(|parent| {
-                        crate::declarations::is_recovered_exported_class_container(
-                            parent,
-                            prepared.source(),
-                        )
+                        is_recovered_declaration_scope_container(parent, prepared.source())
                     })
                 {
                     ancestor = node.parent().and_then(|parent| parent.parent());
@@ -6365,13 +6360,27 @@ fn callable_declaration_activation_in_file(
                 }
                 ancestor = node.parent();
             }
+            Some(declaration)
+        })
+        .collect()
+}
+
+fn callable_declaration_activation_in_file(
+    analyzer: &CppGraphSource<'_>,
+    prepared: &PreparedSyntaxTree,
+    candidate: &CodeUnit,
+    reference: &CallableReferenceContext<'_>,
+) -> Option<usize> {
+    nameable_callable_declaration_nodes(analyzer, prepared, candidate)
+        .into_iter()
+        .filter(|declaration| {
             callable_preprocessor_context_is_visible_for_reference(
-                declaration,
+                *declaration,
                 prepared.source(),
                 reference,
             )
-            .then_some(callable_declaration_activation_byte(declaration))
         })
+        .map(callable_declaration_activation_byte)
         .min()
 }
 
@@ -6565,12 +6574,33 @@ fn flattened_macro_function_namespace_components(
     let body = declaration
         .parent()
         .filter(|parent| parent.kind() == "compound_statement")?;
-    let function = body
-        .parent()
-        .filter(|parent| parent.kind() == "function_definition" && parent.has_error())?;
+    let function = body.parent()?;
     if function.child_by_field_name("body") != Some(body) {
         return None;
     }
+    let namespace_name = recovered_macro_namespace_name(function, source)?;
+    let mut components = enclosing_namespace_components(declaration, source)?;
+    components.push(namespace_name);
+    Some(components)
+}
+
+/// The namespace name a namespace-opening macro token displaced into a
+/// synthetic `function_definition`, or `None` when `function` is not that
+/// recovery shape.
+///
+/// `ABSL_NAMESPACE_BEGIN` (or `FMT_BEGIN_NAMESPACE`, ...) immediately before
+/// `namespace x {` leaves tree-sitter with a `function_definition` whose type is
+/// the macro token, whose declarator is the namespace name behind an `ERROR`
+/// holding the `namespace` keyword, and whose body spans the whole namespace
+/// region. The matching `*_NAMESPACE_END` sibling is what separates the recovery
+/// artifact from a real function definition.
+fn recovered_macro_namespace_name(function: Node<'_>, source: &str) -> Option<String> {
+    if function.kind() != "function_definition" || !function.has_error() {
+        return None;
+    }
+    let body = function
+        .child_by_field_name("body")
+        .filter(|body| body.kind() == "compound_statement")?;
     let mut cursor = function.walk();
     let prefix = function
         .named_children(&mut cursor)
@@ -6579,7 +6609,7 @@ fn flattened_macro_function_namespace_components(
         .collect::<Vec<_>>();
     let begin_index = prefix.iter().rposition(|child| {
         flattened_macro_sentinel_name(*child, source)
-            .is_some_and(|name| name.ends_with("NAMESPACE_BEGIN"))
+            .is_some_and(|name| is_namespace_begin_sentinel(&name))
     })?;
     let mut identifiers = Vec::new();
     let mut stack = prefix[begin_index + 1..]
@@ -6611,14 +6641,18 @@ fn flattened_macro_function_namespace_components(
             break candidate;
         }
     };
-    if !flattened_macro_sentinel_name(next, source)
-        .is_some_and(|name| name.ends_with("NAMESPACE_END"))
-    {
-        return None;
-    }
-    let mut components = enclosing_namespace_components(declaration, source)?;
-    components.push(namespace_name.clone());
-    Some(components)
+    flattened_macro_sentinel_name(next, source)
+        .is_some_and(|name| is_namespace_end_sentinel(&name))
+        .then(|| namespace_name.clone())
+}
+
+/// A `function_definition` that exists only because tree-sitter recovered a
+/// macro-decorated class head or a namespace-opening macro token. A declaration
+/// in such a body keeps class or namespace scope, so a scope walk must step over
+/// the wrapper instead of treating the declaration as block local.
+fn is_recovered_declaration_scope_container(node: Node<'_>, source: &str) -> bool {
+    crate::declarations::is_recovered_exported_class_container(node, source)
+        || recovered_macro_namespace_name(node, source).is_some()
 }
 
 fn flattened_macro_error_namespace_components(
@@ -6635,7 +6669,7 @@ fn flattened_macro_error_namespace_components(
         .position(|candidate| same_node(*candidate, declaration))?;
     let begin_index = (0..declaration_index).rev().find(|index| {
         flattened_macro_sentinel_name(siblings[*index], source)
-            .is_some_and(|name| name.ends_with("NAMESPACE_BEGIN"))
+            .is_some_and(|name| is_namespace_begin_sentinel(&name))
     })?;
 
     let significant = siblings[begin_index + 1..declaration_index]
@@ -6652,7 +6686,7 @@ fn flattened_macro_error_namespace_components(
     let namespace_name = flattened_macro_namespace_name(*namespace_name, source)?;
     if significant[2..].iter().any(|node| {
         flattened_macro_sentinel_name(*node, source).is_some_and(|name| {
-            name.ends_with("NAMESPACE_BEGIN") || name.ends_with("NAMESPACE_END")
+            is_namespace_begin_sentinel(&name) || is_namespace_end_sentinel(&name)
         })
     }) {
         return None;
@@ -6674,7 +6708,7 @@ fn flattened_macro_error_namespace_components(
             continue;
         }
         if !flattened_macro_sentinel_name(sibling, source)
-            .is_some_and(|name| name.ends_with("NAMESPACE_END"))
+            .is_some_and(|name| is_namespace_end_sentinel(&name))
         {
             return None;
         }
@@ -6686,13 +6720,31 @@ fn flattened_macro_error_namespace_components(
 }
 
 fn flattened_macro_sentinel_name(node: Node<'_>, source: &str) -> Option<String> {
+    // At translation-unit scope the trailing `X_NAMESPACE_END` token parses as
+    // an `expression_statement` with a missing semicolon; inside a namespace
+    // body the same token stays a bare `type_identifier`.
+    let node = if node.kind() == "expression_statement" && node.named_child_count() == 1 {
+        node.named_child(0)?
+    } else {
+        node
+    };
     let candidate = direct_cpp_identifier_name(node, source).or_else(|| {
         node.child_by_field_name("type")
             .and_then(|type_node| direct_cpp_identifier_name(type_node, source))
     })?;
     (cpp_export_macro_token(&candidate)
-        && (candidate.ends_with("NAMESPACE_BEGIN") || candidate.ends_with("NAMESPACE_END")))
+        && (is_namespace_begin_sentinel(&candidate) || is_namespace_end_sentinel(&candidate)))
     .then_some(candidate)
+}
+
+/// Namespace-opening macros are spelled both ways in the wild:
+/// `ABSL_NAMESPACE_BEGIN` (abseil, nlohmann) and `FMT_BEGIN_NAMESPACE` (fmt).
+fn is_namespace_begin_sentinel(name: &str) -> bool {
+    name.ends_with("NAMESPACE_BEGIN") || name.ends_with("BEGIN_NAMESPACE")
+}
+
+fn is_namespace_end_sentinel(name: &str) -> bool {
+    name.ends_with("NAMESPACE_END") || name.ends_with("END_NAMESPACE")
 }
 
 fn flattened_macro_namespace_name(node: Node<'_>, source: &str) -> Option<String> {

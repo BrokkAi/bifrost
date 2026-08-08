@@ -6514,18 +6514,30 @@ fn cpp_enclosing_local_scope(mut node: Node<'_>) -> Option<Node<'_>> {
             // function declaration in its body.  The wrapper's declarator is
             // not callable, so keep the narrower recovered declaration as
             // the local scope instead of letting the wrapper swallow it.
+            //
+            // With no narrower scope the wrapper is pure parser recovery -- a
+            // namespace-opening macro token, an export-macro class head -- and
+            // what it encloses is namespace or class scoped.  Walk past it
+            // instead of binding those declarations as block-local values.
             if parent.kind() == "function_definition"
                 && cpp_malformed_wrapper_function_definition(parent)
-                && fallback.is_some()
             {
-                return fallback;
+                if fallback.is_some() {
+                    return fallback;
+                }
+                node = parent;
+                continue;
             }
             return Some(parent);
         }
-        if fallback.is_none() && cpp_local_scope_node(parent) {
-            fallback = Some(parent);
-        }
-        if fallback.is_none() && parent.kind() == "compound_statement" {
+        let recovered_wrapper_body = parent.kind() == "compound_statement"
+            && parent
+                .parent()
+                .is_some_and(cpp_malformed_wrapper_function_definition);
+        if fallback.is_none()
+            && !recovered_wrapper_body
+            && (cpp_local_scope_node(parent) || parent.kind() == "compound_statement")
+        {
             fallback = Some(parent);
         }
         node = parent;
