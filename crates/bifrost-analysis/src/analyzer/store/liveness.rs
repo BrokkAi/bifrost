@@ -16,9 +16,28 @@ type Result<T> = std::result::Result<T, String>;
 pub struct Liveness {
     repo: Mutex<Repository>,
     workdir: PathBuf,
-    startup_oids: Mutex<Option<Arc<HashMap<String, Oid>>>>,
+    /// Working-tree blob identity per repository-relative path.
+    ///
+    /// Seeded by one batched Git index plus dirty-tree scan, which is what
+    /// keeps cold start on a 400k-file repository from hashing every file, and
+    /// then kept current per path by that path's filesystem stat. The batched
+    /// scan describes one instant, so serving it unconditionally to a later
+    /// caller reports the pre-edit blob for every file edited since -- which
+    /// made `update_paths` re-register the stale blob and hid the edit from
+    /// every blob-keyed reader.
+    working_tree_oids: Mutex<Option<HashMap<String, TrackedOid>>>,
     snapshot: Mutex<Option<MemoizedSnapshot>>,
     overlay: Mutex<OverlayState>,
+}
+
+/// One path's last resolved blob identity and the stat it was resolved
+/// against. `stat` is `None` for a seeded entry that no caller has been served
+/// yet: the batched scan reads the Git index rather than the file, so there is
+/// no stat to compare until the first serve takes one.
+#[derive(Clone)]
+struct TrackedOid {
+    oid: Oid,
+    stat: Option<FileStat>,
 }
 
 impl Liveness {
@@ -31,7 +50,7 @@ impl Liveness {
         Ok(Self {
             repo: Mutex::new(repo),
             workdir,
-            startup_oids: Mutex::new(None),
+            working_tree_oids: Mutex::new(None),
             snapshot: Mutex::new(None),
             overlay: Mutex::new(OverlayState::default()),
         })
@@ -49,29 +68,24 @@ impl Liveness {
             .map_err(|err| err.to_string())
     }
 
-    /// Resolve a complete analyzer file set with one Git index and dirty-tree
-    /// scan. This is the startup path for large repositories. Point resolution
-    /// reads every file and is reserved for small watcher updates.
+    /// Resolve a set of analyzer files to the blob identity their bytes have
+    /// in the working tree right now.
+    ///
+    /// One batched Git index plus dirty-tree scan seeds every path, so a cold
+    /// start on a large repository does not hash the clean files it can read
+    /// from the index. That scan describes the instant it ran, so it is not an
+    /// answer for later calls: every path is stat-checked against the stat it
+    /// was last resolved under, and a path whose file has moved since is
+    /// re-hashed from the working tree. That is what makes an incremental
+    /// re-resolution -- `update_paths`, a watcher delta, `refresh` -- report
+    /// the edited blob rather than the one the scan saw.
     pub fn oids_for_files(&self, files: &[ProjectFile]) -> Result<HashMap<ProjectFile, Oid>> {
-        let startup_oids = {
-            let mut guard = self
-                .startup_oids
-                .lock()
-                .expect("liveness startup OID mutex poisoned");
-            if guard.is_none() {
-                let repo = self.repo.lock().expect("liveness repo mutex poisoned");
-                *guard = Some(Arc::new(
-                    gitblob::all_working_tree_oid_values(&repo)?
-                        .into_iter()
-                        .collect(),
-                ));
-            }
-            Arc::clone(guard.as_ref().expect("startup OIDs were initialized above"))
-        };
+        self.seed_working_tree_oids()?;
 
         // Apache Camel has tens of thousands of Java files. Keep the lock only
-        // around one-time Git discovery, then use the existing Rayon pool for
-        // independent path conversion and immutable OID lookup work.
+        // around one-time Git discovery and the individual map operations, and
+        // use the existing Rayon pool for the independent per-path stat, hash
+        // and path-conversion work.
         let planned = files
             .par_iter()
             .map(|file| {
@@ -86,7 +100,9 @@ impl Liveness {
                 // Git paths use forward slashes on every host. This conversion
                 // stays at the Git API boundary.
                 let rel = rel_path.to_string_lossy().replace('\\', "/");
-                Ok(startup_oids.get(&rel).map(|oid| (file.clone(), *oid)))
+                Ok(self
+                    .current_working_tree_oid(&rel, &abs_path)?
+                    .map(|oid| (file.clone(), oid)))
             })
             .collect::<Vec<Result<Option<(ProjectFile, Oid)>>>>();
         let mut resolved = map_with_capacity(files.len());
@@ -96,6 +112,83 @@ impl Liveness {
             }
         }
         Ok(resolved)
+    }
+
+    /// Run the batched working-tree scan once per repository handle. Every
+    /// language delegate's build resolves its own files through the same
+    /// handle, so without this each of them would pay the whole scan.
+    fn seed_working_tree_oids(&self) -> Result<()> {
+        let mut guard = self
+            .working_tree_oids
+            .lock()
+            .expect("liveness working-tree OID mutex poisoned");
+        if guard.is_some() {
+            return Ok(());
+        }
+        let repo = self.repo.lock().expect("liveness repo mutex poisoned");
+        *guard = Some(
+            gitblob::all_working_tree_oid_values(&repo)?
+                .into_iter()
+                .map(|(rel, oid)| (rel, TrackedOid { oid, stat: None }))
+                .collect(),
+        );
+        Ok(())
+    }
+
+    /// The blob identity of `abs_path` now: the tracked one when the file's
+    /// stat is unchanged since it was resolved, otherwise the hash of the
+    /// bytes on disk. `None` when nothing is there to hash.
+    fn current_working_tree_oid(&self, rel: &str, abs_path: &Path) -> Result<Option<Oid>> {
+        let stat = FileStat::from_path(abs_path);
+        let tracked = {
+            let guard = self
+                .working_tree_oids
+                .lock()
+                .expect("liveness working-tree OID mutex poisoned");
+            guard
+                .as_ref()
+                .expect("working-tree OIDs are seeded before resolution")
+                .get(rel)
+                .cloned()
+        };
+        let Some(stat) = stat else {
+            // The path is gone (or is not a file), so it has no live blob --
+            // including when the scan still lists the deleted path.
+            return Ok(None);
+        };
+        if let Some(tracked) = &tracked {
+            match &tracked.stat {
+                Some(resolved_under) if resolved_under == &stat => return Ok(Some(tracked.oid)),
+                // A seeded entry the scan produced and nobody has been served
+                // yet: the scan read it at this instant, so record the stat it
+                // is being served under and answer from it.
+                None => {
+                    self.track_working_tree_oid(rel, tracked.oid, stat);
+                    return Ok(Some(tracked.oid));
+                }
+                Some(_) => {}
+            }
+        }
+        let oid = Oid::hash_file(ObjectType::Blob, abs_path).map_err(|err| err.to_string())?;
+        self.track_working_tree_oid(rel, oid, stat);
+        Ok(Some(oid))
+    }
+
+    fn track_working_tree_oid(&self, rel: &str, oid: Oid, stat: FileStat) {
+        let mut guard = self
+            .working_tree_oids
+            .lock()
+            .expect("liveness working-tree OID mutex poisoned");
+        guard
+            .as_mut()
+            .expect("working-tree OIDs are seeded before resolution")
+            .insert(
+                rel.to_string(),
+                TrackedOid {
+                    oid,
+                    stat: Some(stat),
+                },
+            );
     }
 
     /// Full live view; rebuilt when the Git index bytes or overlay generation change.
@@ -732,6 +825,64 @@ mod tests {
 
         assert_eq!(resolved_a.get(&file_a), Some(&oid_a));
         assert_eq!(resolved_b.get(&file_b), Some(&oid_b));
+    }
+
+    /// The batched projection is seeded by one working-tree scan, so it must
+    /// answer for the working tree as it is now and not as that scan found it.
+    /// Serving the scan's answer to a later call is what made `update_paths`
+    /// re-register the pre-edit blob, which hid the edit from every
+    /// blob-keyed reader for the rest of the session.
+    #[test]
+    fn editing_file_changes_bulk_oid_after_the_first_projection() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("a.rs"), "fn old() {}\n").unwrap();
+        commit_all(&repo, "init");
+
+        let file = project_file(temp.path(), "a.rs");
+        let liveness = Liveness::new(repo).unwrap();
+        let before = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            before.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn old() {}\n").unwrap())
+        );
+
+        std::fs::write(temp.path().join("a.rs"), "fn new() {}\n").unwrap();
+        let after = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+
+        assert_eq!(
+            after.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn new() {}\n").unwrap())
+        );
+    }
+
+    /// A file created after the seeding scan has no scanned entry at all, so
+    /// the projection must read it rather than report it as absent.
+    #[test]
+    fn bulk_projection_resolves_a_file_created_after_the_first_projection() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        commit_all(&repo, "init");
+
+        let existing = project_file(temp.path(), "a.rs");
+        let liveness = Liveness::new(repo).unwrap();
+        liveness.oids_for_files(&[existing]).unwrap();
+
+        std::fs::write(temp.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let created = project_file(temp.path(), "b.rs");
+        let resolved = liveness
+            .oids_for_files(std::slice::from_ref(&created))
+            .unwrap();
+
+        assert_eq!(
+            resolved.get(&created),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn b() {}\n").unwrap())
+        );
     }
 
     #[test]

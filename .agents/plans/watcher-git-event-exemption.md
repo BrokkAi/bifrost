@@ -230,7 +230,10 @@ Milestone 1 results (2026-08-08): `cargo fmt`; `cargo check -p brokk-bifrost-mcp
 164 pass, the one failure being `bifrost_searchtools_server_speaks_mcp_stdio`, verified failing
 at HEAD in the scratch worktree too; the workspace selection
 `-E 'test(/watcher|project_watcher|searchtools_service/)'` 261 tests, 260 pass, the one failure
-being the documented `manual_service_sees_change_after_explicit_update_paths`;
+being `manual_service_sees_change_after_explicit_update_paths` (which this plan recorded as
+"documented"; it was in fact a regression, fixed on 2026-08-08 by stat-validating the memoized
+working-tree scan in `Liveness::oids_for_files` -- see `.agents/plans/rust-usage-index-v2.md`
+Surprises -- and this selection is now expected to be fully green);
 `cargo clippy -p brokk-bifrost-mcp -p brokk-bifrost-core --all-targets -- -D warnings` clean.
 The full `--workspace` clippy could not be scored for this change: a concurrent unrelated change
 to `brokk-bifrost-analysis` was uncommitted in the same checkout and failed four lints of its own

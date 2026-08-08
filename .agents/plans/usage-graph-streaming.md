@@ -94,6 +94,29 @@ measurement is a separate task run after review; it is not part of this plan's a
   a bounded per-question cost every time, instead of an unbounded precomputation once -- but it is
   a real difference in repeat-query behavior and worth naming.
 
+- Resolution (2026-08-08) of the three update-visibility failures this plan listed below as "beyond
+  the documented set": `issue_1450_cross_request_prepared_syntax`,
+  `issue_1451_cross_request_import_infos` and
+  `searchtools_service::manual_service_sees_change_after_explicit_update_paths` were REGRESSIONS,
+  not stale pins, and all three are now green. One root cause, one fix, in
+  `crates/bifrost-analysis/src/analyzer/store/liveness.rs`: `Liveness::oids_for_files` memoized the
+  batched working-tree scan for the lifetime of the repository handle and served it to every later
+  caller, so `TreeSitterAnalyzer::resolve_live_oids` re-registered the *pre-edit* blob oid for an
+  edited file. `reconcile_file_states` then found that blob already parsed
+  (`missing={}`) and skipped the re-parse, and the new generation's `LivePathMap` entry paired the
+  stale oid with the *post-edit* stat, so every later blob-keyed read served the old file. The scan
+  is now stat-validated per path: a path whose file has moved since it was last resolved is
+  re-hashed from the working tree.
+  Evidence: instrumented run at `8f6eb602` showed `resolve_live_oids` returning oid
+  `b3490886` for `src/callers.rs` both before and after `update_paths`, and
+  `reconcile files=["src/callers.rs"] missing={}`; after the fix the second resolution returns
+  `f5668bc1` and the file is re-parsed. The same instrumentation at the last green commit
+  `c1b08f54` also printed the stale `b3490886`, which proves the stale registration predates both
+  first-bad commits: `48f8cc20` (#1757) and `d4a82ef4` (#1793) did not introduce it, they removed
+  the downstream re-read-from-disk that had been masking it. The failure being language-agnostic
+  (the Java `get_summaries` sibling shares it) is the tell that it never belonged to the Rust usage
+  work at all.
+
 ## Decision Log
 
 - Decision: keep the public type name `RustReferenceContext` and its four resolution methods
@@ -519,6 +542,14 @@ The last eight are beyond the documented set and are not caused by this work. Th
 own triage; `issue_1450` and `issue_1451` in particular are named in the investigation as behavioral
 coverage of the Rust scan, so their being red on the branch means that coverage is currently not
 protecting anything.
+
+Update (2026-08-08): that triage happened. `issue_1450`, `issue_1451` and
+`manual_service_sees_change_after_explicit_update_paths` were one regression with one root cause
+(the memoized working-tree scan in `Liveness::oids_for_files`; see the Surprises entry of the same
+date) and are green again. They are removed from every "documented pre-existing" list. The
+remaining tolerated failures for this plan's selections are the JVM artifact test needing
+`javac`/`jar`, the two `live_oid_resolution_*` rendezvous tests, and
+`scan_usages_resolves_public_typescript_static_method_symbol`.
 
 ## Idempotence and Recovery
 

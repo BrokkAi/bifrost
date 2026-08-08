@@ -43,6 +43,25 @@ The design transliterates IntelliJ's indexing architecture, verified against `/h
   Evidence: `build_importer_reverse` (`rust/usage_index.rs`) takes `module_files`, `module_aliases` and `physical_owners` as parameters; `RustPhysicalOwnerIndex::build` takes `module_files`, `physical_roots`, `declaration_identities` and `actual_crate_roots`.
 - Observation (Milestone 2a): `importer_reverse` is keyed by TARGET file, and the persisted inverted key is the module path AS WRITTEN. Those do not match: one target module is written `crate::a::b`, `super::b`, `self::b`, `mycrate::a::b`, or through an alias, so "which files import target T" cannot be a `rust_import_targets` lookup. It has to become the IntelliJ shape -- candidates are the files whose text mentions the target's NAME (`rust_identifier_occurrences`), then each candidate's own forward edges are computed and filtered. That is exactly why the identifier-occurrence table is the load-bearing one, and it is a rewrite of `binding_seeds` rather than a re-pointing of it.
 - Observation (Milestone 2a): the store-backed path works without a git repository. `resolve_live_oids` (`tree_sitter_analyzer.rs`) falls back to hashing files directly when `store_context.liveness` is `None`, and publishes the result into `store_context.live_paths` either way, so `LiveSnapshot` answers both blob-to-files and file-to-blob in a plain directory too. That removes the availability risk that store-backed usage analysis would silently degrade outside git checkouts.
+- Correction (2026-08-08, after this plan closed): two commits of this plan each unmasked a
+  long-latent update-visibility defect, and the resulting failures were carried as "documented
+  pre-existing" rather than triaged. `48f8cc20` (#1757) turned
+  `issue_1450_cross_request_prepared_syntax` red and `d4a82ef4` (#1793) turned
+  `issue_1451_cross_request_import_infos` red. Neither introduced the defect. The cause is older
+  than both and lives in `Liveness::oids_for_files`
+  (`crates/bifrost-analysis/src/analyzer/store/liveness.rs`): it memoized the batched working-tree
+  scan for the lifetime of the repository handle, so `resolve_live_oids` re-registered the pre-edit
+  blob oid for a file the caller had just told it changed; `reconcile_file_states` then found that
+  blob already parsed and skipped the re-parse. What #1757 and #1793 removed was the downstream
+  re-read-from-disk that had been covering for it -- #1793 explicitly, by composing the Cargo route
+  index from per-blob rows keyed by the live oid (`rust_module_route_facts`, `rust/mod.rs`) instead
+  of parsing every file. Proof that the defect predates both: the same instrumentation at the last
+  green commit `c1b08f54` printed the identical stale oid after `update_paths` while both tests
+  still passed. The fix stat-validates the scan per path; all three affected tests (including the
+  Java `manual_service_sees_change_after_explicit_update_paths`, which never involved Rust at all)
+  are green. Lesson for this plan's own practice: "fails identically with the work stashed" proves
+  the cause is older, not that the behavior is intended -- a red test that pins a stated contract
+  needs bisection, not a tolerated-failure line.
 - Observation (Milestone 2b): two of the three `identities_by_name` call sites in `usage_reference_at` were per-file questions wearing a name-search costume. Both took the workspace-wide bucket for a name and then filtered it by `identity.file == <a file the caller already holds>` -- the reference's own file in one case, the resolved target file in the other. Only the third, which knows the resolved MODULE but not which file declares the terminal, is a genuine name search. Applying the filter first turns two workspace-wide map probes into one per-file read each, and it is exactly equivalent because the filter was already there.
   Evidence: `usage_reference_at` in `rust/usage_index.rs`, the three former `index.identities_by_name.get(...)` sites.
 - Observation (Milestone 2b): the candidate false positive that matters here is not a prose mention. `identities_named`'s candidate source is the store's short-name index over `code_units`, which only ever offers declarations, so a comment or string can never produce one. The real false positive is a declaration whose structural parent is not a module -- an associated function in an `impl` block -- which the v1 derivation skipped (`Some(_) => continue`) and which therefore has no identity and no domain. Verification is what rejects it; the regression test `a_candidate_file_without_a_module_scope_identity_is_rejected` fails when that skip is removed (demonstrated).
