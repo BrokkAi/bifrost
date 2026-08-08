@@ -8475,10 +8475,15 @@ fn macro_expanded_cpp_name_components(
     .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolved_type_import(
     candidates: Vec<(CodeUnit, Vec<String>)>,
     lexical_depth: usize,
     is_direct: bool,
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    direct_target: Option<&CodeUnit>,
 ) -> OrdinaryTypeImportResolution {
     let mut logical = Vec::<(CodeUnit, Vec<String>)>::new();
     for candidate in candidates {
@@ -8489,15 +8494,34 @@ fn resolved_type_import(
             logical.push(candidate);
         }
     }
-    match logical.as_slice() {
-        [] => OrdinaryTypeImportResolution::Missing,
-        [(target, target_components)] => OrdinaryTypeImportResolution::Resolved {
-            target: target.clone(),
-            target_components: target_components.clone(),
-            lexical_depth,
-            is_direct,
-        },
-        _ => OrdinaryTypeImportResolution::Ambiguous { lexical_depth },
+    let selected = match logical.as_slice() {
+        [] => return OrdinaryTypeImportResolution::Missing,
+        [only] => only,
+        // Several declarations of one FQN in one file are configuration
+        // spellings of one entity, not competing types (#1845): the imported
+        // name is unambiguous, only the branch that supplies it depends on the
+        // build.
+        several => {
+            let units = several
+                .iter()
+                .map(|(unit, _)| unit)
+                .collect::<Vec<&CodeUnit>>();
+            let Some(spelling) = direct_target.and_then(|target| {
+                visibility.same_fqn_type_spelling_for_target(analyzer, file, &units, target)
+            }) else {
+                return OrdinaryTypeImportResolution::Ambiguous { lexical_depth };
+            };
+            several
+                .iter()
+                .find(|(unit, _)| same_symbol(unit, spelling))
+                .expect("the selected spelling is one of the imported candidates")
+        }
+    };
+    OrdinaryTypeImportResolution::Resolved {
+        target: selected.0.clone(),
+        target_components: selected.1.clone(),
+        lexical_depth,
+        is_direct,
     }
 }
 
@@ -8517,7 +8541,6 @@ fn ordinary_type_import_resolution(
     if global || components.len() != 1 {
         return OrdinaryTypeImportResolution::Missing;
     }
-    let _ = analyzer;
     let name = &components[0];
     let bindings =
         effective_using_bindings_for_name(visibility, imports, file, root_node(node), source, name);
@@ -8574,7 +8597,15 @@ fn ordinary_type_import_resolution(
             })
             .collect::<Vec<_>>();
         if !direct.is_empty() {
-            return resolved_type_import(direct, lexical_scope.len(), true);
+            return resolved_type_import(
+                direct,
+                lexical_scope.len(),
+                true,
+                analyzer,
+                visibility,
+                file,
+                direct_target,
+            );
         }
         let directives = at_tier
             .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Namespace { .. }))
@@ -8591,7 +8622,15 @@ fn ordinary_type_import_resolution(
             })
             .collect::<Vec<_>>();
         if !directives.is_empty() {
-            return resolved_type_import(directives, lexical_scope.len(), false);
+            return resolved_type_import(
+                directives,
+                lexical_scope.len(),
+                false,
+                analyzer,
+                visibility,
+                file,
+                direct_target,
+            );
         }
     }
     for prefix_len in (0..=lexical_scope.len()).rev() {
@@ -8616,7 +8655,15 @@ fn ordinary_type_import_resolution(
             })
             .collect::<Vec<_>>();
         if !direct.is_empty() {
-            return resolved_type_import(direct, prefix_len, true);
+            return resolved_type_import(
+                direct,
+                prefix_len,
+                true,
+                analyzer,
+                visibility,
+                file,
+                direct_target,
+            );
         }
         let directives = at_tier
             .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Namespace { .. }))
@@ -8633,7 +8680,15 @@ fn ordinary_type_import_resolution(
             })
             .collect::<Vec<_>>();
         if !directives.is_empty() {
-            return resolved_type_import(directives, prefix_len, false);
+            return resolved_type_import(
+                directives,
+                prefix_len,
+                false,
+                analyzer,
+                visibility,
+                file,
+                direct_target,
+            );
         }
     }
     OrdinaryTypeImportResolution::Missing

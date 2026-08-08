@@ -4035,11 +4035,65 @@ impl<'a> VisibilityIndex<'a> {
                 continue;
             }
             resolved_candidates.push(resolved);
-            if resolved_candidates.len() > 1 {
-                return None;
-            }
         }
-        resolved_candidates.pop()
+        match resolved_candidates.as_slice() {
+            [] => None,
+            [single] => Some(single.clone()),
+            // The branches disagree about what the name aliases. When they are
+            // spellings of one entity (#1845) that disagreement is a build
+            // configuration, not a choice between types, so it must not deny
+            // the requested target its reference.
+            _ => self
+                .same_fqn_type_spelling_for_target(analyzer, visible_from, candidates, target)
+                .map(|_| target.clone()),
+        }
+    }
+
+    /// The declaration a same-file same-FQN family stands for when a reference
+    /// names `target`, or `None` when the candidates are not one family or the
+    /// family does not name `target`.
+    ///
+    /// A translation unit cannot hold two different types under one qualified
+    /// name, so several same-kind declarations of one FQN in one file are
+    /// alternate spellings of one entity - the configuration branches of an
+    /// `#if` family, for example log4cxx's `logchar`, which aliases `char` in
+    /// the UTF-8 branch and `UniChar` in the unichar branch. Their alias
+    /// targets differ; canonicalizing each branch on its own and then demanding
+    /// agreement reports an ambiguity that denies every declaration in the
+    /// family its usages (#1845). The family names `target` when it declares
+    /// it, or when one branch's alias chain reaches it.
+    ///
+    /// Declarations in different files or namespaces are distinct entities and
+    /// are deliberately excluded: their disagreement is a real ambiguity.
+    pub fn same_fqn_type_spelling_for_target<'b>(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        visible_from: &ProjectFile,
+        candidates: &[&'b CodeUnit],
+        target: &CodeUnit,
+    ) -> Option<&'b CodeUnit> {
+        let [first, rest @ ..] = candidates else {
+            return None;
+        };
+        if rest.is_empty()
+            || !rest.iter().all(|candidate| {
+                candidate.kind() == first.kind()
+                    && candidate.fq_name() == first.fq_name()
+                    && candidate.source() == first.source()
+            })
+        {
+            return None;
+        }
+        candidates
+            .iter()
+            .copied()
+            .find(|candidate| same_symbol(candidate, target))
+            .or_else(|| {
+                candidates.iter().copied().find(|candidate| {
+                    self.type_candidate_preserving_target(analyzer, visible_from, candidate, target)
+                        .is_some_and(|resolved| same_visible_symbol(&resolved, target))
+                })
+            })
     }
 
     pub fn alternate_same_fqn_type_declarations(

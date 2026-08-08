@@ -51,6 +51,7 @@ mod usages_cpp_qualified_destructor_test;
 mod usages_cpp_recursive_free_function_test;
 mod usages_cpp_repeated_tag_test;
 mod usages_cpp_return_tag_shadow_test;
+mod usages_cpp_same_fqn_alias_targets_test;
 mod usages_cpp_sentinel_scope_test;
 mod usages_cpp_sentinel_visibility_test;
 mod usages_cpp_source_location_test;
