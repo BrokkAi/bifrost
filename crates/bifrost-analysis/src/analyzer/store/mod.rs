@@ -9585,6 +9585,49 @@ mod tests {
     }
 
     #[test]
+    fn scala_published_parser_epoch_invalidates_vendored_parser_rows() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Syntax.scala",
+            "object Syntax:\n  extension (value: String)\n    def twice: String = value + value\n",
+        );
+        let state = Arc::new(parse_state(&ScalaAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_epoch = epoch::scala_epoch_before_tree_sitter_scala_0_26_2();
+        let prior_generation = store
+            .ensure_language_epoch_value("scala", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "scala",
+                prior_generation,
+                &ScalaAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "scala").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(
+                Language::Scala,
+                &crate::analyzer::scala::language::LANGUAGE.into(),
+            )
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "scala").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "scala".to_string())])
+                .unwrap(),
+            vec![(oid, "scala".to_string())]
+        );
+    }
+
+    #[test]
     fn structural_snapshot_roundtrips_replaces_and_updates_cascade_costs() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(temp.path(), "Model.java", "class Model { int value; }\n");

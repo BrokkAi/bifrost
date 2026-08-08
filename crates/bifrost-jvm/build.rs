@@ -38,34 +38,6 @@ fn compile_vendored_grammar(
 
 fn main() {
     compile_vendored_grammar(
-        "vendor/tree-sitter-scala/src",
-        "brokk-bifrost-tree-sitter-scala",
-        &[
-            ("tree_sitter_scala", "brokk_bifrost_tree_sitter_scala"),
-            (
-                "tree_sitter_scala_external_scanner_create",
-                "brokk_bifrost_tree_sitter_scala_external_scanner_create",
-            ),
-            (
-                "tree_sitter_scala_external_scanner_destroy",
-                "brokk_bifrost_tree_sitter_scala_external_scanner_destroy",
-            ),
-            (
-                "tree_sitter_scala_external_scanner_scan",
-                "brokk_bifrost_tree_sitter_scala_external_scanner_scan",
-            ),
-            (
-                "tree_sitter_scala_external_scanner_serialize",
-                "brokk_bifrost_tree_sitter_scala_external_scanner_serialize",
-            ),
-            (
-                "tree_sitter_scala_external_scanner_deserialize",
-                "brokk_bifrost_tree_sitter_scala_external_scanner_deserialize",
-            ),
-            ("token_name", "brokk_bifrost_tree_sitter_scala_token_name"),
-        ],
-    );
-    compile_vendored_grammar(
         "vendor/tree-sitter-kotlin/src",
         "brokk-bifrost-tree-sitter-kotlin",
         &[

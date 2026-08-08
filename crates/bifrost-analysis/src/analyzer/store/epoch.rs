@@ -359,6 +359,14 @@ pub(super) fn scala_epoch_before_scalachess_fqn_recovery() -> String {
 }
 
 #[cfg(test)]
+pub(super) fn scala_epoch_before_tree_sitter_scala_0_26_2() -> String {
+    compute_epoch::<Scala>(
+        &crate::analyzer::scala::language::LANGUAGE.into(),
+        "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08",
+    )
+}
+
+#[cfg(test)]
 mod query_content_tests {
     use super::normalized_query_contents;
 
@@ -464,11 +472,11 @@ pub(super) fn php_epoch_before_conditional_free_function_declarations() -> Strin
         "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07",
     )
 }
-// The live grammar fingerprint does not include parser tables. Keep the
-// vendored Scala revision in the salt so conflict-resolution-only grammar
-// changes cannot reuse analysis produced by an older parser.
+// The live grammar fingerprint does not include parser tables. Keep the Scala
+// release revision in the salt so grammar changes cannot reuse analysis
+// produced by an older parser.
 // Salt bumped (#1548 stage 3 fleet): the Scala `.scm` query assets and the
-// vendored grammar itself moved from this crate into `brokk-bifrost-jvm`, so
+// Scala grammar itself moved from this crate into `brokk-bifrost-jvm`, so
 // the salted content now comes from a different crate's `include_str!`. The
 // bytes are unchanged, which is exactly why the salt has to carry the
 // relocation.
@@ -476,7 +484,7 @@ lang_epoch!(
     Scala,
     "scala",
     "treesitter/scala/",
-    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08"
+    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;tree-sitter-scala-0.26.2-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the C# `.scm` query assets moved from this
 // crate's `resources/treesitter/c_sharp/` into `brokk-bifrost-csharp`, so the

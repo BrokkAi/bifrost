@@ -164,19 +164,10 @@ require_archive_file brokk-bifrost-semantic-packs src/lib.rs
 require_archive_file brokk-bifrost-semantic-packs src/release_bundle.rs
 require_archive_file brokk-bifrost-semantic-packs src/bin/bifrost-semantic-pack.rs
 
-# The vendored Scala and Kotlin grammars moved into brokk-bifrost-jvm with
-# build.rs; their `parser.c` bytes are named in the Scala and Kotlin epoch
-# salts, so an archive missing one would publish a crate that cannot build the
-# parser those salts promise.
+# The vendored Kotlin grammar lives in brokk-bifrost-jvm with build.rs. Its
+# `parser.c` bytes are named in the Kotlin epoch salt, so an archive missing it
+# would publish a crate that cannot build the parser that salt promises.
 required_jvm_vendor_files=(
-  vendor/tree-sitter-scala/LICENSE
-  vendor/tree-sitter-scala/BIFROST_PATCH.md
-  vendor/tree-sitter-scala/grammar.js
-  vendor/tree-sitter-scala/src/parser.c
-  vendor/tree-sitter-scala/src/scanner.c
-  vendor/tree-sitter-scala/src/tree_sitter/alloc.h
-  vendor/tree-sitter-scala/src/tree_sitter/array.h
-  vendor/tree-sitter-scala/src/tree_sitter/parser.h
   vendor/tree-sitter-kotlin/LICENSE
   vendor/tree-sitter-kotlin/BIFROST_PROVENANCE.md
   vendor/tree-sitter-kotlin/grammar.js
