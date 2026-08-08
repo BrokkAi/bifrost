@@ -7943,6 +7943,7 @@ pub fn is_declarator_node(node: Node<'_>) -> bool {
 pub enum RecoveredDeclaratorTypeContext {
     Declaration,
     FunctionDefinition,
+    Parameter,
 }
 
 /// Recognize a real type displaced into a qualified declarator by parser
@@ -7950,8 +7951,10 @@ pub enum RecoveredDeclaratorTypeContext {
 ///
 /// Tree-sitter parses `API Result *make(Arg);` as if `API` were the declared
 /// type and `Result` were the scope of a qualified declarator with a missing
-/// `::`. The same recovery occurs for macro-prefixed definitions and extern
-/// variables. Keep this intentionally structural: the recovered scope must
+/// `::`. The same recovery occurs for macro-prefixed definitions, extern
+/// variables, and macro-decorated parameters (`f(MACRO T* p)`, where the
+/// parameter's own `type` field takes the macro). Keep this intentionally
+/// structural: the recovered scope must
 /// have the grammar's missing separator, the qualified node must occupy the
 /// declaration's declarator chain, a separate nonempty type must occupy the
 /// normal type field, and the recovered name must unwrap to a real declarator
@@ -8016,6 +8019,18 @@ fn recovered_declarator_container(
             && has_field_child(parent, "declarator", declarator)
         {
             return Some((parent, RecoveredDeclaratorTypeContext::FunctionDefinition));
+        }
+        // `f(MACRO T* p)` recovers exactly like `MACRO T *make(...)` does, one
+        // level down: the parameter's `type` field takes the macro token and
+        // the real type `T` becomes the recovered scope of the declarator.
+        // Declining here left every xxhash `XXH_NOESCAPE` parameter with no
+        // candidate at all (#1830).
+        if matches!(
+            parent.kind(),
+            "parameter_declaration" | "optional_parameter_declaration"
+        ) && has_field_child(parent, "declarator", declarator)
+        {
+            return Some((parent, RecoveredDeclaratorTypeContext::Parameter));
         }
         if !matches!(
             parent.kind(),
