@@ -552,6 +552,12 @@ fn render_scan_usages_entry_text(entry: &ScanUsagesEntry) -> String {
             entry.candidate_targets.join(", ")
         ));
     }
+    if let Some(too_many) = &entry.too_many_candidates {
+        lines.push(format!(
+            "  resolution cap: {} declaration(s) matched, over the limit {}; no candidate list was produced",
+            too_many.total_candidates, too_many.cap
+        ));
+    }
     if let Some(total_callsites) = entry.total_callsites {
         let limit = entry
             .limit

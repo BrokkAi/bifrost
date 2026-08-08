@@ -35,5 +35,6 @@ mod issue_1341_rust_submodule_fn_exports;
 mod issue_1342_rust_module_declaration_files;
 mod issue_1347_rust_alias_cycle;
 mod issue_1546_rust_cfg_test_module_files;
+mod issue_1839_scan_usages_resolution_budget;
 mod issue_693_profile;
 mod issue_csharp_verbatim_identifiers;

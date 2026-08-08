@@ -11,8 +11,92 @@ pub(crate) enum CodeUnitResolution {
     NotFound,
 }
 
+/// Why a budgeted fuzzy resolution produced no answer.
+///
+/// Both arms report the *caller's own* limits back to it, never an analyzer
+/// failure: the caller asked for an answer under conditions the selector could
+/// not be answered under, and gets those conditions named.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FuzzyResolveStop {
+    /// The caller's `keep_going` predicate went false. Nothing was concluded.
+    Cancelled,
+    /// The selector names more declarations than the caller will process.
+    /// `total` is the true count of matched declarations, counted before any
+    /// per-declaration store read.
+    TooManyCandidates { total: usize, limit: usize },
+}
+
+/// One caller's limits on one fuzzy resolution.
+///
+/// `keep_going` is the caller's budget or cancellation predicate. Every loop
+/// here whose length is proportional to the workspace polls it, so a caller
+/// whose budget already expired stops paying for an answer it would discard
+/// (#1839; the same rule 575c2ffb applied to the Rust usage walks).
+///
+/// `max_candidates` bounds how many distinct declarations one selector may
+/// name before the resolver reports the count instead of building the list.
+/// The expensive phase of a fuzzy resolution is per matched declaration -- one
+/// `definitions` store read each -- so a selector that tens of thousands of
+/// declarations answer costs tens of thousands of reads to produce a candidate
+/// list nobody can act on. Skipping that phase and reporting the true count is
+/// the `searchtools-too-broad-scope-guards` skip-not-truncate idiom.
+#[derive(Clone, Copy)]
+pub(crate) struct FuzzyResolveBudget<'a> {
+    keep_going: Option<&'a dyn Fn() -> bool>,
+    max_candidates: usize,
+}
+
+impl<'a> FuzzyResolveBudget<'a> {
+    /// No cancellation and no fan-out limit: what every caller that does not
+    /// carry a budget has always done.
+    pub(crate) fn unbounded() -> Self {
+        Self {
+            keep_going: None,
+            max_candidates: usize::MAX,
+        }
+    }
+
+    pub(crate) fn new(keep_going: &'a dyn Fn() -> bool, max_candidates: usize) -> Self {
+        assert!(
+            max_candidates > 0,
+            "a fuzzy resolution budget must admit at least one candidate"
+        );
+        Self {
+            keep_going: Some(keep_going),
+            max_candidates,
+        }
+    }
+
+    fn keep_going(&self) -> Result<(), FuzzyResolveStop> {
+        match self.keep_going {
+            Some(predicate) if !predicate() => Err(FuzzyResolveStop::Cancelled),
+            _ => Ok(()),
+        }
+    }
+
+    fn admits(&self, total: usize) -> Result<(), FuzzyResolveStop> {
+        if total > self.max_candidates {
+            return Err(FuzzyResolveStop::TooManyCandidates {
+                total,
+                limit: self.max_candidates,
+            });
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn resolve_codeunit_fuzzy(analyzer: &dyn IAnalyzer, input: &str) -> CodeUnitResolution {
     resolve_codeunit_fuzzy_with(analyzer, input, |_| true)
+}
+
+/// [`resolve_codeunit_fuzzy`] under a caller's cancellation and fan-out
+/// budget. See [`FuzzyResolveBudget`].
+pub(crate) fn resolve_codeunit_fuzzy_bounded(
+    analyzer: &dyn IAnalyzer,
+    input: &str,
+    budget: FuzzyResolveBudget<'_>,
+) -> Result<CodeUnitResolution, FuzzyResolveStop> {
+    resolve_codeunit_fuzzy_bounded_with(analyzer, input, |_| true, budget)
 }
 
 /// Resolve the deepest indexed symbol that encloses an unresolved descendant
@@ -81,7 +165,10 @@ pub(crate) fn resolve_enclosing_codeunits(analyzer: &dyn IAnalyzer, input: &str)
         }
     }
 
-    match resolution_from_matches(analyzer, matches, |_| true) {
+    let resolved =
+        resolution_from_matches(analyzer, matches, |_| true, FuzzyResolveBudget::unbounded())
+            .expect("an unbounded enclosing-scope resolution has no stop condition");
+    match resolved {
         Some(CodeUnitResolution::Resolved(units) | CodeUnitResolution::Ambiguous(units)) => units,
         Some(CodeUnitResolution::NotFound) | None => Vec::new(),
     }
@@ -111,10 +198,21 @@ pub(crate) fn resolve_codeunit_fuzzy_with(
     input: &str,
     include: impl Copy + Fn(&CodeUnit) -> bool,
 ) -> CodeUnitResolution {
+    resolve_codeunit_fuzzy_bounded_with(analyzer, input, include, FuzzyResolveBudget::unbounded())
+        .expect("an unbounded fuzzy resolution has no stop condition")
+}
+
+pub(crate) fn resolve_codeunit_fuzzy_bounded_with(
+    analyzer: &dyn IAnalyzer,
+    input: &str,
+    include: impl Copy + Fn(&CodeUnit) -> bool,
+    budget: FuzzyResolveBudget<'_>,
+) -> Result<CodeUnitResolution, FuzzyResolveStop> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return CodeUnitResolution::NotFound;
+        return Ok(CodeUnitResolution::NotFound);
     }
+    budget.keep_going()?;
 
     // Bare (single-segment) queries must see same-named members. Otherwise
     // stage 1 (exact) silently returns a lone top-level namesake the instant it
@@ -126,20 +224,21 @@ pub(crate) fn resolve_codeunit_fuzzy_with(
     // preference used by the later stages. Non-bare (qualified/anchored)
     // queries are untouched: they already reach members via the suffix stages.
     if let Some(leaf) = bare_query_leaf(analyzer, trimmed)
-        && let Some(resolved) = bare_name_resolution(analyzer, trimmed, &leaf, include)
+        && let Some(resolved) = bare_name_resolution(analyzer, trimmed, &leaf, include, budget)?
     {
-        return resolved;
+        return Ok(resolved);
     }
 
+    budget.keep_going()?;
     if let Some(resolved) = exact_resolution(analyzer, trimmed, include) {
-        return resolved;
+        return Ok(resolved);
     }
 
     let stripped = strip_trailing_call_suffix(trimmed);
     if stripped != trimmed
         && let Some(resolved) = exact_resolution(analyzer, &stripped, include)
     {
-        return resolved;
+        return Ok(resolved);
     }
 
     // The indexed suffix stage answers only when its answer is *unique*. A
@@ -148,13 +247,13 @@ pub(crate) fn resolve_codeunit_fuzzy_with(
     // stage already matched instead of throwing them away: they are the same
     // candidates the ambiguity decision needs.
     let mut indexed = FuzzyMatches::default();
-    match suffix_stage_from_index(analyzer, trimmed, include) {
-        SuffixStageOutcome::Decided(resolved) => return resolved,
+    match suffix_stage_from_index(analyzer, trimmed, include, budget)? {
+        SuffixStageOutcome::Decided(resolved) => return Ok(resolved),
         SuffixStageOutcome::Undecided(matches) => indexed.merge(matches),
     }
     if stripped != trimmed {
-        match suffix_stage_from_index(analyzer, &stripped, include) {
-            SuffixStageOutcome::Decided(resolved) => return resolved,
+        match suffix_stage_from_index(analyzer, &stripped, include, budget)? {
+            SuffixStageOutcome::Decided(resolved) => return Ok(resolved),
             SuffixStageOutcome::Undecided(matches) => indexed.merge(matches),
         }
     }
@@ -172,9 +271,12 @@ pub(crate) fn resolve_codeunit_fuzzy_with(
     // those reads, 55 of them at 6.63 s across the request -- to feed a match
     // loop that takes 2.6 s.
     if analyzer.has_complete_symbol_lookup_index() {
-        return resolution_from_matches(analyzer, indexed.full, include)
-            .or_else(|| resolution_from_matches(analyzer, indexed.suffix, include))
-            .unwrap_or(CodeUnitResolution::NotFound);
+        let full = resolution_from_matches(analyzer, indexed.full, include, budget)?;
+        let resolved = match full {
+            Some(resolved) => Some(resolved),
+            None => resolution_from_matches(analyzer, indexed.suffix, include, budget)?,
+        };
+        return Ok(resolved.unwrap_or(CodeUnitResolution::NotFound));
     }
 
     // No complete index to seek (in-memory and third-party analyzers, whose
@@ -210,6 +312,7 @@ pub(crate) fn resolve_codeunit_fuzzy_with(
     let mut query_paths_by_language: BTreeMap<Language, LanguageQueryPaths> = BTreeMap::new();
 
     for candidate in &declarations {
+        budget.keep_going()?;
         let language = code_unit_language(candidate);
         let query = query_paths_by_language.entry(language).or_insert_with(|| {
             let paths: BTreeSet<Vec<String>> = query_inputs
@@ -238,9 +341,12 @@ pub(crate) fn resolve_codeunit_fuzzy_with(
         );
     }
 
-    resolution_from_matches(analyzer, full_matches, include)
-        .or_else(|| resolution_from_matches(analyzer, suffix_matches, include))
-        .unwrap_or(CodeUnitResolution::NotFound)
+    let full = resolution_from_matches(analyzer, full_matches, include, budget)?;
+    let resolved = match full {
+        Some(resolved) => Some(resolved),
+        None => resolution_from_matches(analyzer, suffix_matches, include, budget)?,
+    };
+    Ok(resolved.unwrap_or(CodeUnitResolution::NotFound))
 }
 
 /// Whether `input` is a bare (single-segment) terminal name in every language
@@ -291,19 +397,27 @@ fn bare_name_resolution(
     trimmed: &str,
     leaf: &str,
     include: impl Copy + Fn(&CodeUnit) -> bool,
-) -> Option<CodeUnitResolution> {
+    budget: FuzzyResolveBudget<'_>,
+) -> Result<Option<CodeUnitResolution>, FuzzyResolveStop> {
     let mut matches = BTreeMap::new();
     for definition in analyzer.definitions(trimmed) {
+        budget.keep_going()?;
         if include(&definition) {
             insert_match(&mut matches, &definition);
         }
     }
+    // One indexed lookup answers "how many declarations carry this name" for
+    // the whole workspace. On a large tree that count reaches the tens of
+    // thousands for a name like `main`, and each of them costs a store read in
+    // `resolution_from_matches` below -- so the count has to be taken here,
+    // before that phase, not discovered by paying for it (#1839).
     for candidate in analyzer.lookup_candidates_by_identifier(leaf) {
+        budget.keep_going()?;
         if include(&candidate) && candidate.identifier() == leaf {
             insert_match(&mut matches, &candidate);
         }
     }
-    resolution_from_matches(analyzer, matches, include)
+    resolution_from_matches(analyzer, matches, include, budget)
 }
 
 pub(crate) fn strip_trailing_call_suffix(symbol: &str) -> String {
@@ -387,7 +501,8 @@ fn suffix_stage_from_index(
     analyzer: &dyn IAnalyzer,
     symbol: &str,
     include: impl Copy + Fn(&CodeUnit) -> bool,
-) -> SuffixStageOutcome {
+    budget: FuzzyResolveBudget<'_>,
+) -> Result<SuffixStageOutcome, FuzzyResolveStop> {
     let _scope = crate::profiling::scope(format!("suffix_resolution_from_index[{symbol}]"));
     let stage1_scope = crate::profiling::scope("suffix_resolution.short_name_stage");
     let mut exact_matches = BTreeMap::new();
@@ -409,9 +524,11 @@ fn suffix_stage_from_index(
     // Use the indexed terminal identifier before the substring fallback. On a
     // large shared cache, that fallback otherwise scans all code_units (#1688).
     for terminal in terminal_identifiers {
+        budget.keep_going()?;
         indexed_candidates.extend(analyzer.lookup_candidates_by_identifier(&terminal));
     }
     for candidate in indexed_candidates {
+        budget.keep_going()?;
         let language = code_unit_language(&candidate);
         let Some(query_paths) = query_paths_by_language.get(&language) else {
             continue;
@@ -430,16 +547,18 @@ fn suffix_stage_from_index(
     }
     let no_indexed_matches = exact_matches.is_empty() && exact_suffix_matches.is_empty();
     if let Some(CodeUnitResolution::Resolved(matches)) =
-        unique_resolution_from_matches(analyzer, &exact_matches, include)
+        unique_resolution_from_matches(analyzer, &exact_matches, include, budget)?
     {
-        return SuffixStageOutcome::Decided(CodeUnitResolution::Resolved(matches));
+        return Ok(SuffixStageOutcome::Decided(CodeUnitResolution::Resolved(
+            matches,
+        )));
     }
 
     // The persisted identifier index is complete for tree-sitter analyzers.
     // If it found no alias for the terminal, the suffix regex cannot find a
     // declaration either. Avoid the unbounded SQLite scan on this miss.
     if analyzer.has_complete_symbol_lookup_index() && no_indexed_matches {
-        return SuffixStageOutcome::Decided(CodeUnitResolution::NotFound);
+        return Ok(SuffixStageOutcome::Decided(CodeUnitResolution::NotFound));
     }
 
     drop(stage1_scope);
@@ -448,12 +567,14 @@ fn suffix_stage_from_index(
     let mut full_matches = BTreeMap::new();
     let mut suffix_matches = BTreeMap::new();
     for language in analyzer.languages() {
+        budget.keep_going()?;
         let query_paths = query_symbol_interpretations(language, symbol);
         if query_paths.iter().all(|path| path.len() < 2) {
             continue;
         }
 
         for query_path in &query_paths {
+            budget.keep_going()?;
             let pattern = suffix_search_pattern(language, query_path);
             if pattern.is_empty() {
                 continue;
@@ -463,6 +584,7 @@ fn suffix_stage_from_index(
                 &suffix_terminal_identifiers(query_path),
                 language,
             ) {
+                budget.keep_going()?;
                 if code_unit_language(&candidate) != language || !include(&candidate) {
                     continue;
                 }
@@ -479,12 +601,12 @@ fn suffix_stage_from_index(
     }
 
     let decided = if full_matches.is_empty() {
-        unique_resolution_from_matches(analyzer, &suffix_matches, include)
+        unique_resolution_from_matches(analyzer, &suffix_matches, include, budget)?
     } else {
-        unique_resolution_from_matches(analyzer, &full_matches, include)
+        unique_resolution_from_matches(analyzer, &full_matches, include, budget)?
     };
     if let Some(resolution) = decided {
-        return SuffixStageOutcome::Decided(resolution);
+        return Ok(SuffixStageOutcome::Decided(resolution));
     }
 
     // Both stages matched against the same query paths with the same
@@ -497,7 +619,7 @@ fn suffix_stage_from_index(
         full: full_matches,
         suffix: suffix_matches,
     });
-    SuffixStageOutcome::Undecided(matched)
+    Ok(SuffixStageOutcome::Undecided(matched))
 }
 
 /// The resolution for `matches` when it names exactly one declaration.
@@ -508,10 +630,12 @@ fn unique_resolution_from_matches(
     analyzer: &dyn IAnalyzer,
     matches: &BTreeMap<String, CodeUnit>,
     include: impl Copy + Fn(&CodeUnit) -> bool,
-) -> Option<CodeUnitResolution> {
-    (matches.len() == 1)
-        .then(|| resolution_from_matches(analyzer, matches.clone(), include))
-        .flatten()
+    budget: FuzzyResolveBudget<'_>,
+) -> Result<Option<CodeUnitResolution>, FuzzyResolveStop> {
+    if matches.len() != 1 {
+        return Ok(None);
+    }
+    resolution_from_matches(analyzer, matches.clone(), include, budget)
 }
 
 fn suffix_search_pattern(language: Language, query_path: &[String]) -> String {
@@ -624,20 +748,31 @@ fn resolution_from_matches(
     analyzer: &dyn IAnalyzer,
     mut matches: BTreeMap<String, CodeUnit>,
     include: impl Copy + Fn(&CodeUnit) -> bool,
-) -> Option<CodeUnitResolution> {
+    budget: FuzzyResolveBudget<'_>,
+) -> Result<Option<CodeUnitResolution>, FuzzyResolveStop> {
+    // The fan-out gate, before any per-match work. Everything below is one
+    // store read per surviving key -- `prefer_types_over_their_owner_named_constructors`
+    // asks `parent_of` per JVM-family function and the `_` arm asks
+    // `definitions` per key -- so a selector that tens of thousands of
+    // declarations answer must be reported by its count here rather than
+    // expanded into a candidate list nobody can act on (#1839). The count is
+    // the deduplicated matched-declaration count: the constructor pruning
+    // below can only shrink it, and running that pruning first would be the
+    // very per-match work the gate exists to skip.
+    budget.admits(matches.len())?;
     prefer_types_over_their_owner_named_constructors(analyzer, &mut matches);
 
     match matches.len() {
-        0 => None,
+        0 => Ok(None),
         1 => {
             let fq_name = matches.keys().next().expect("one match").clone();
             let definitions = matching_definitions(analyzer, &fq_name, include);
             if definitions.is_empty() {
-                Some(CodeUnitResolution::Resolved(
+                Ok(Some(CodeUnitResolution::Resolved(
                     matches.into_values().collect(),
-                ))
+                )))
             } else {
-                Some(CodeUnitResolution::Resolved(definitions))
+                Ok(Some(CodeUnitResolution::Resolved(definitions)))
             }
         }
         _ => {
@@ -667,6 +802,7 @@ fn resolution_from_matches(
             // ambiguity was ever computed.
             let mut expanded = Vec::with_capacity(matches.len());
             for (fq_name, representative) in matches {
+                budget.keep_going()?;
                 let definitions = matching_definitions(analyzer, &fq_name, include);
                 if definitions.is_empty() {
                     expanded.push(representative);
@@ -674,7 +810,7 @@ fn resolution_from_matches(
                     expanded.extend(definitions);
                 }
             }
-            Some(CodeUnitResolution::Ambiguous(expanded))
+            Ok(Some(CodeUnitResolution::Ambiguous(expanded)))
         }
     }
 }
@@ -1151,6 +1287,153 @@ fn path_ends_with(candidate: &[String], query: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::python::PythonAdapter;
+    use crate::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
+    use crate::analyzer::{Project, TestProject};
+    use std::cell::Cell;
+    use std::sync::Arc;
+
+    /// A workspace where one identifier names `count` distinct declarations —
+    /// the shape #1839 measured at 20,935 on the rustc tree for `main`.
+    fn same_named_declarations(
+        count: usize,
+    ) -> (tempfile::TempDir, TreeSitterAnalyzer<PythonAdapter>) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("pkg")).expect("create pkg");
+        std::fs::write(root.join("pkg/__init__.py"), "").expect("write package marker");
+        for index in 0..count {
+            std::fs::write(
+                root.join(format!("pkg/mod_{index}.py")),
+                "class Shared:\n    pass\n",
+            )
+            .expect("write module");
+        }
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        (temp, analyzer)
+    }
+
+    /// A predicate that survives `polls` questions and then reports the
+    /// caller's budget as spent, so the stop point is deterministic rather
+    /// than a race against a wall clock.
+    fn budget_spent_after(polls: usize) -> impl Fn() -> bool {
+        let asked = Cell::new(0usize);
+        move || {
+            let seen = asked.get();
+            asked.set(seen + 1);
+            seen < polls
+        }
+    }
+
+    /// #1839 component 1: the caller's budget reaches the resolver's loops.
+    /// Without the polls the resolution runs to completion and charges one
+    /// `definitions` read per matched declaration — the 20,935-read storm.
+    /// `definitions` reads charged by one resolution in its own fresh request
+    /// scope. The fixture is warmed outside any scope first, so the figure is
+    /// steady-state store traffic rather than first-touch analysis.
+    fn definition_reads_for(
+        analyzer: &TreeSitterAnalyzer<PythonAdapter>,
+        resolve: impl FnOnce() -> Result<CodeUnitResolution, FuzzyResolveStop>,
+    ) -> (Result<CodeUnitResolution, FuzzyResolveStop>, usize) {
+        let _scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+        analyzer.reset_definition_candidates_query_count_for_test();
+        let resolution = resolve();
+        let reads = analyzer.definition_candidates_query_count_for_test();
+        (resolution, reads)
+    }
+
+    #[test]
+    fn issue_1839_a_spent_budget_stops_resolution_before_the_per_candidate_reads() {
+        let (_temp, analyzer) = same_named_declarations(6);
+        let warm = resolve_codeunit_fuzzy(&analyzer, "Shared");
+        assert!(
+            matches!(&warm, CodeUnitResolution::Ambiguous(units) if units.len() == 6),
+            "fixture must offer six same-named declarations: {warm:?}"
+        );
+        let (_, complete_reads) = definition_reads_for(&analyzer, || {
+            Ok(resolve_codeunit_fuzzy(&analyzer, "Shared"))
+        });
+
+        let keep_going = budget_spent_after(1);
+        let (stopped, stopped_reads) = definition_reads_for(&analyzer, || {
+            resolve_codeunit_fuzzy_bounded(
+                &analyzer,
+                "Shared",
+                FuzzyResolveBudget::new(&keep_going, usize::MAX),
+            )
+        });
+
+        assert!(
+            matches!(stopped, Err(FuzzyResolveStop::Cancelled)),
+            "a spent budget must stop the resolution: {stopped:?}"
+        );
+        assert!(
+            stopped_reads < complete_reads,
+            "a stopped resolution must charge fewer reads than the completed one: \
+             {stopped_reads} against {complete_reads}"
+        );
+    }
+
+    /// #1839 component 3: a selector that too many declarations answer reports
+    /// the true count instead of expanding a candidate list nobody can act on.
+    /// The count is exact and is taken before any per-candidate store read.
+    #[test]
+    fn issue_1839_an_over_cap_selector_reports_its_true_count_and_skips_the_expansion() {
+        let (_temp, analyzer) = same_named_declarations(6);
+        let _ = resolve_codeunit_fuzzy(&analyzer, "Shared");
+        let (_, complete_reads) = definition_reads_for(&analyzer, || {
+            Ok(resolve_codeunit_fuzzy(&analyzer, "Shared"))
+        });
+
+        let keep_going = || true;
+        let (over, over_reads) = definition_reads_for(&analyzer, || {
+            resolve_codeunit_fuzzy_bounded(
+                &analyzer,
+                "Shared",
+                FuzzyResolveBudget::new(&keep_going, 5),
+            )
+        });
+
+        match over {
+            Err(FuzzyResolveStop::TooManyCandidates { total, limit }) => {
+                assert_eq!(6, total, "the reported count must be the true match count");
+                assert_eq!(5, limit);
+            }
+            other => panic!("an over-cap selector must report its count: {other:?}"),
+        }
+        assert!(
+            over_reads < complete_reads,
+            "an over-cap selector must skip the per-candidate expansion: \
+             {over_reads} reads against {complete_reads}"
+        );
+    }
+
+    /// The same selector one candidate under the cap is untouched: the whole
+    /// candidate set resolves exactly as an unbudgeted call resolves it.
+    #[test]
+    fn issue_1839_an_under_cap_selector_resolves_exactly_as_an_unbudgeted_call() {
+        let (_temp, analyzer) = same_named_declarations(6);
+        let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let keep_going = || true;
+
+        let unbudgeted = resolve_codeunit_fuzzy(&analyzer, "Shared");
+        let budgeted = resolve_codeunit_fuzzy_bounded(
+            &analyzer,
+            "Shared",
+            FuzzyResolveBudget::new(&keep_going, 6),
+        )
+        .expect("six candidates are within a six-candidate budget");
+
+        let units = |resolution: &CodeUnitResolution| match resolution {
+            CodeUnitResolution::Resolved(units) | CodeUnitResolution::Ambiguous(units) => {
+                units.iter().map(CodeUnit::fq_name).collect::<Vec<_>>()
+            }
+            CodeUnitResolution::NotFound => Vec::new(),
+        };
+        assert_eq!(units(&unbudgeted), units(&budgeted));
+        assert_eq!(6, units(&budgeted).len());
+    }
 
     #[test]
     fn terminal_segment_prefilter_matches_only_boundary_delimited_occurrences() {

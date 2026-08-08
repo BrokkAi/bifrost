@@ -7,7 +7,8 @@ use crate::analyzer::declaration_range::{
 };
 use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::symbol_lookup::{
-    CodeUnitResolution, is_bare_symbol_query, resolve_codeunit_exact, resolve_codeunit_fuzzy,
+    CodeUnitResolution, FuzzyResolveBudget, FuzzyResolveStop, is_bare_symbol_query,
+    resolve_codeunit_exact, resolve_codeunit_fuzzy, resolve_codeunit_fuzzy_bounded,
     resolve_codeunit_fuzzy_with, resolve_enclosing_codeunits, strip_trailing_call_suffix,
     symbol_selector_leaf,
 };
@@ -153,6 +154,7 @@ pub use scan_usages::SymbolUsages;
 pub use scan_usages::TestFileClassification;
 pub use scan_usages::TestFileKind;
 pub use scan_usages::TooManyCallsitesInfo;
+pub use scan_usages::TooManyResolutionCandidates;
 pub use scan_usages::UsageEnclosingCount;
 pub use scan_usages::UsageFailureInfo;
 pub use scan_usages::UsageFileGroup;
@@ -243,6 +245,24 @@ const SCAN_USAGES_SUMMARY_FILE_LIMIT: usize = 20;
 const SCAN_USAGES_TOP_ENCLOSING_LIMIT: usize = 10;
 
 const SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT: usize = 3;
+
+/// Declarations one `scan_usages` selector may resolve to before the tool
+/// stops resolving and answers with the count.
+///
+/// Resolution costs one `definitions` store read per matched declaration, and
+/// the reply that work produces is a `candidate_targets` list. Both ends fail
+/// at scale: on the rustc tree the bare name `main` matched 20,935
+/// declarations, charged one store read each, and ran for 653-749 s against a
+/// 3 s budget (#1839), for a list far larger than the
+/// `SCAN_USAGES_RESPONSE_BUDGET_BYTES` reply can carry. Above this cap the
+/// candidate list is skipped, not truncated, and the true count is reported so
+/// the caller knows to qualify the selector.
+///
+/// The value is provisional and deliberately well above any ambiguity a caller
+/// can act on: an 8 KB reply holds on the order of a hundred selectors, so a
+/// list of two hundred is already past the point of usefulness while staying
+/// two orders of magnitude below the measured explosion.
+pub const SCAN_USAGES_MAX_RESOLUTION_CANDIDATES: usize = 200;
 
 const SCAN_USAGES_PATH_SELECTOR_MATCH_LIMIT: usize = 5;
 

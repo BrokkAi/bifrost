@@ -241,7 +241,7 @@ fn scan_usages_by_reference_descriptor() -> Value {
                     "type": "array",
                     "minItems": 1,
                     "items": { "type": "string", "pattern": "\\S" },
-                    "description": "Fully qualified symbols from search_symbols are preferred; short names may resolve fuzzily or become ambiguous."
+                    "description": "Fully qualified symbols from search_symbols are preferred; short names may resolve fuzzily or become ambiguous. A short name that hundreds of declarations answer is reported as ambiguous with `too_many_candidates` (the true count and the cap) and no candidate list -- qualify it and re-call."
                 },
                 "include_tests": {
                     "type": "boolean",

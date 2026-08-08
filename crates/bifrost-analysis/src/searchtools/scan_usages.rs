@@ -197,6 +197,9 @@ pub enum ScanUsagesIncompleteReason {
     SourceBytes,
     Callsites,
     ResponseBudget,
+    /// The selector matched more declarations than the tool will resolve, so
+    /// no candidate list was produced. See [`TooManyResolutionCandidates`].
+    ResolutionCandidates,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -256,6 +259,8 @@ pub struct ScanUsagesEntry {
     pub candidate_details_truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub candidates: Vec<AmbiguousUsageCandidate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub too_many_candidates: Option<TooManyResolutionCandidates>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fq_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -365,7 +370,20 @@ pub struct AmbiguousUsageSymbol {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub definition_sites_excluded: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub too_many_candidates: Option<TooManyResolutionCandidates>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+/// The selector matched more declarations than `scan_usages` will resolve.
+/// The candidate list was skipped, not truncated, so `candidate_targets` is
+/// empty and `total_candidates` is the true count of matched declarations --
+/// taken from the deduplicated match set before any per-declaration store
+/// read. Mirrors `search_symbols`' `too_many_matches` block (#1839).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct TooManyResolutionCandidates {
+    pub total_candidates: usize,
+    pub cap: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -574,6 +592,7 @@ pub(super) fn ambiguous_usage_symbol_from_groups(
         candidates: Vec::new(),
         candidate_files_truncated: false,
         definition_sites_excluded: None,
+        too_many_candidates: None,
         note: Some(
             if surface == ScanUsagesSurface::Location && total > SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT
             {
@@ -586,6 +605,40 @@ pub(super) fn ambiguous_usage_symbol_from_groups(
             },
         ),
     }
+}
+
+/// The reply for a selector that matched more declarations than the tool will
+/// resolve. `candidate_targets` is empty on purpose: producing it is the work
+/// that was skipped, and an arbitrary subset of twenty thousand namesakes
+/// would read as the answer while being meaningless. The count and the cap
+/// carry the honest part (#1839).
+fn too_many_resolution_candidates_symbol(
+    symbol: String,
+    total_candidates: usize,
+    cap: usize,
+) -> AmbiguousUsageSymbol {
+    AmbiguousUsageSymbol {
+        short_name: symbol.clone(),
+        symbol,
+        candidate_targets: Vec::new(),
+        candidate_details: Vec::new(),
+        candidate_details_total: None,
+        candidate_details_truncated: false,
+        candidates: Vec::new(),
+        candidate_files_truncated: false,
+        definition_sites_excluded: None,
+        too_many_candidates: Some(TooManyResolutionCandidates {
+            total_candidates,
+            cap,
+        }),
+        note: Some(too_many_resolution_candidates_note(total_candidates, cap)),
+    }
+}
+
+pub(super) fn too_many_resolution_candidates_note(total_candidates: usize, cap: usize) -> String {
+    format!(
+        "The symbol matched {total_candidates} declarations, over the {cap}-declaration resolution limit for one selector, so no candidate list was produced. Qualify the symbol (add its owner or module), or pick one declaration with `path#symbol`, and re-call."
+    )
 }
 
 pub(super) fn scan_usages_ambiguity_note(surface: ScanUsagesSurface) -> &'static str {
@@ -948,6 +1001,10 @@ fn incomplete_recovery_message(
         ),
         ScanUsagesIncompleteReason::ResponseBudget => format!(
             "usage results were summarized to fit the response budget; re-call {} with one target to maximize retained detail, but exhaustive modeled relation retrieval is unavailable",
+            surface.tool_name()
+        ),
+        ScanUsagesIncompleteReason::ResolutionCandidates => format!(
+            "the selector matched more declarations than usage analysis will resolve; qualify it (or use `path#symbol` from a previous ambiguous reply), then re-call {}",
             surface.tool_name()
         ),
     }
@@ -1343,6 +1400,7 @@ pub(super) fn resolve_scan_usages_target(
                 candidates: Vec::new(),
                 candidate_files_truncated: false,
                 definition_sites_excluded: None,
+                too_many_candidates: None,
                 note: Some(
                     "Ambiguous modeled location; provide an exact model declaration selector."
                         .to_owned(),
@@ -2033,9 +2091,41 @@ pub(super) fn scan_usages_backend(
             DefinitionSelector::Name(name) => (None, name),
             DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
         };
+        // Resolution is inside the scan's budget, not beside it. It is the
+        // phase that reads the identifier index and then one `definitions`
+        // page per matched declaration, so on a large workspace a common name
+        // spends the whole budget several hundred times over here, before the
+        // scan proper starts (#1839).
+        let keep_scanning = || !context.cancellation.is_cancelled();
         let resolution = {
             let _scope = profiling::scope("searchtools::scan_usages_symbol_resolution");
-            resolve_codeunit_fuzzy(analyzer, lookup)
+            resolve_codeunit_fuzzy_bounded(
+                analyzer,
+                lookup,
+                FuzzyResolveBudget::new(&keep_scanning, SCAN_USAGES_MAX_RESOLUTION_CANDIDATES),
+            )
+        };
+        let resolution = match resolution {
+            Ok(resolution) => resolution,
+            // The budget expired mid-resolution. Reported through the same
+            // incomplete entry a budget expiry anywhere else in the scan uses.
+            Err(FuzzyResolveStop::Cancelled) => {
+                work_entries.push(incomplete_work_entry(
+                    request,
+                    Some(symbol),
+                    context.interruption_reason(),
+                ));
+                continue;
+            }
+            Err(FuzzyResolveStop::TooManyCandidates { total, limit }) => {
+                let item = too_many_resolution_candidates_symbol(symbol, total, limit);
+                work_entries.push(ScanUsagesWorkEntry::Ambiguous {
+                    request,
+                    item,
+                    incomplete_reason: Some(ScanUsagesIncompleteReason::ResolutionCandidates),
+                });
+                continue;
+            }
         };
         if context.cancellation.is_cancelled() {
             work_entries.push(incomplete_work_entry(
@@ -2343,6 +2433,7 @@ pub(super) fn scan_usages_backend(
                     candidates,
                     candidate_files_truncated: truncated,
                     definition_sites_excluded: some_if_nonzero(definition_sites_excluded),
+                    too_many_candidates: None,
                     note: detail_source.note,
                 };
                 work_entries.push(ScanUsagesWorkEntry::Ambiguous {
@@ -3290,6 +3381,7 @@ pub(super) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
             result.candidate_details_total = item.candidate_details_total;
             result.candidate_details_truncated = item.candidate_details_truncated;
             result.candidates = item.candidates.clone();
+            result.too_many_candidates = item.too_many_candidates;
             result.definition_sites_excluded = item.definition_sites_excluded;
             result.complete = incomplete_reason.is_none() && !item.candidate_files_truncated;
             result.incomplete_reason = incomplete_reason.or_else(|| {
@@ -3346,6 +3438,9 @@ pub(super) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
                     ScanUsagesIncompleteReason::SourceBytes => "source_bytes_budget",
                     ScanUsagesIncompleteReason::Callsites => "callsites_budget",
                     ScanUsagesIncompleteReason::ResponseBudget => "response_budget",
+                    ScanUsagesIncompleteReason::ResolutionCandidates => {
+                        "resolution_candidates_budget"
+                    }
                 }
                 .to_string(),
             );
@@ -3590,6 +3685,7 @@ pub(super) fn scan_usages_entry_base(
         candidate_details_total: None,
         candidate_details_truncated: false,
         candidates: Vec::new(),
+        too_many_candidates: None,
         fq_name: None,
         definition_path: None,
         definition_line: None,

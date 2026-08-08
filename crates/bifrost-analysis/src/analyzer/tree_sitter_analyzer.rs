@@ -1211,9 +1211,34 @@ struct QueryReadCache {
     /// shape and reasoning as `parent_units`: each entry is one bounded
     /// lookup, so a racing duplicate is cheaper than per-key single flight.
     definition_units: Arc<RwLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
+    /// The persisted candidate rows for one short name, read at most once per
+    /// (short name, lookup kind) per request.
+    ///
+    /// `definition_units` above memoizes by *fq name*, but the store read it
+    /// wraps is keyed by the candidate *short name*: `Foo::main`,
+    /// `Bar::main` and twenty thousand other fq names all reduce to the one
+    /// short name `main` and each re-reads the same page. That is not a repeat
+    /// the fq memo can ever see -- every key is distinct and new -- and it is
+    /// what charged 20,935 identical `main` reads inside a single
+    /// `scan_usages` request on the rustc tree (#1839). Memoizing at the key
+    /// the store read actually uses collapses them to one.
+    ///
+    /// The rows, not the assembled answer: assembly still merges each fq
+    /// name's own dirty units and path-symbol units, and narrows to that name.
+    /// Same plain-`HashMap` shape and reasoning as `definition_units`.
+    definition_candidate_rows:
+        Arc<RwLock<HashMap<DefinitionCandidateRowsKey, Arc<Vec<DefinitionOrderCandidateRow>>>>>,
     /// The workspace's path-synthetic module units, walked at most once per
     /// request (#1774). See [`TreeSitterAnalyzer::workspace_module_walk`].
     workspace_module_walk: Arc<RwLock<Option<Arc<WorkspaceModuleWalk>>>>,
+}
+
+/// What one persisted candidate-row read is keyed by: the short name the store
+/// seeks, and which of the two candidate orderings the caller asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DefinitionCandidateRowsKey {
+    short_name: String,
+    include_definition_lookup_units: bool,
 }
 
 /// One request's materialization of the workspace's path-synthetic module
@@ -1288,6 +1313,7 @@ impl QueryReadCache {
         self.prepared_syntax = Arc::new(RwLock::new(HashMap::default()));
         self.parent_units = Arc::new(RwLock::new(HashMap::default()));
         self.definition_units = Arc::new(RwLock::new(HashMap::default()));
+        self.definition_candidate_rows = Arc::new(RwLock::new(HashMap::default()));
         self.workspace_module_walk = Arc::new(RwLock::new(None));
     }
 
@@ -1941,6 +1967,7 @@ pub struct TreeSitterAnalyzer<A> {
     sql_definitions_query_count: Arc<AtomicUsize>,
     definition_candidates_query_count: Arc<AtomicUsize>,
     definition_prefetch_batch_count: Arc<AtomicUsize>,
+    definition_candidate_row_read_count: Arc<AtomicUsize>,
     enclosing_code_unit_query_count: Arc<AtomicUsize>,
     full_declaration_scan_count: Arc<AtomicUsize>,
     /// Persisted declarations that a `search_symbols` request hydrated into
@@ -1999,6 +2026,9 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             sql_definitions_query_count: Arc::clone(&self.sql_definitions_query_count),
             definition_candidates_query_count: Arc::clone(&self.definition_candidates_query_count),
             definition_prefetch_batch_count: Arc::clone(&self.definition_prefetch_batch_count),
+            definition_candidate_row_read_count: Arc::clone(
+                &self.definition_candidate_row_read_count,
+            ),
             enclosing_code_unit_query_count: Arc::clone(&self.enclosing_code_unit_query_count),
             full_declaration_scan_count: Arc::clone(&self.full_declaration_scan_count),
             search_candidate_hydration_count: Arc::clone(&self.search_candidate_hydration_count),
@@ -2194,6 +2224,7 @@ where
             sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
             definition_prefetch_batch_count: Arc::new(AtomicUsize::new(0)),
+            definition_candidate_row_read_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             search_candidate_hydration_count: Arc::new(AtomicUsize::new(0)),
@@ -2392,6 +2423,7 @@ where
             sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
             definition_prefetch_batch_count: Arc::new(AtomicUsize::new(0)),
+            definition_candidate_row_read_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             search_candidate_hydration_count: Arc::new(AtomicUsize::new(0)),
@@ -5717,6 +5749,23 @@ where
         self.definition_prefetch_batch_count.load(Ordering::Relaxed)
     }
 
+    /// Persisted candidate-row reads that actually reached the store, one per
+    /// (short name, ordering) the request has not already read. Paired with
+    /// `definition_candidates_query_count_for_test` it separates "one read for
+    /// every fq name that shares a short name" from "one read per fq name"
+    /// (#1839).
+    #[doc(hidden)]
+    pub fn reset_definition_candidate_row_read_count_for_test(&self) {
+        self.definition_candidate_row_read_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn definition_candidate_row_read_count_for_test(&self) -> usize {
+        self.definition_candidate_row_read_count
+            .load(Ordering::Relaxed)
+    }
+
     #[doc(hidden)]
     pub fn reset_package_declaration_scan_count_for_test(&self) {
         self.package_declaration_scan_count
@@ -6245,6 +6294,62 @@ where
         self.sql_definition_candidates_vec(fq_name, true)
     }
 
+    /// The persisted candidate rows for one short name, read once per request.
+    ///
+    /// See `QueryReadCache::definition_candidate_rows` for why the memo is
+    /// keyed here and not one level up. With no query scope open there is no
+    /// memo and this is exactly the unmemoized read; a failed read is never
+    /// published, so the next caller retries instead of inheriting an empty
+    /// answer that would read as proven absence.
+    fn definition_candidate_rows(
+        &self,
+        langs: &[String],
+        short_name: String,
+        include_definition_lookup_units: bool,
+    ) -> std::result::Result<Arc<Vec<DefinitionOrderCandidateRow>>, StoreError> {
+        let _rows_scope =
+            crate::profiling::scope(format!("sql_definition_candidates.rows[{short_name}]"));
+        let key = DefinitionCandidateRowsKey {
+            short_name,
+            include_definition_lookup_units,
+        };
+        let memo = self.active_query_cache_handle(|cache| &cache.definition_candidate_rows);
+        if let Some(cached) = memo.as_ref().and_then(|memo| {
+            memo.read()
+                .expect("query definition-candidate-row cache read lock poisoned")
+                .get(&key)
+                .cloned()
+        }) {
+            return Ok(cached);
+        }
+
+        self.definition_candidate_row_read_count
+            .fetch_add(1, Ordering::Relaxed);
+        let rows = Arc::new(if include_definition_lookup_units {
+            self.store_context
+                .store
+                .definition_lookup_order_candidate_rows_by_short_name_for_langs(
+                    langs,
+                    self.store_context.generations.as_ref(),
+                    &key.short_name,
+                )
+        } else {
+            self.store_context
+                .store
+                .declaration_order_candidate_rows_by_short_name_for_langs(
+                    langs,
+                    self.store_context.generations.as_ref(),
+                    &key.short_name,
+                )
+        }?);
+        if let Some(memo) = memo.as_ref() {
+            memo.write()
+                .expect("query definition-candidate-row cache write lock poisoned")
+                .insert(key, Arc::clone(&rows));
+        }
+        Ok(rows)
+    }
+
     fn sql_definition_candidates_vec(
         &self,
         fq_name: &str,
@@ -6260,29 +6365,18 @@ where
         } else {
             let mut rows = Vec::new();
             for short_name in candidate_names {
-                let _rows_scope = crate::profiling::scope(format!(
-                    "sql_definition_candidates.rows[{short_name}]"
-                ));
-                let candidates = if include_definition_lookup_units {
-                    self.store_context
-                        .store
-                        .definition_lookup_order_candidate_rows_by_short_name_for_langs(
-                            &langs,
-                            self.store_context.generations.as_ref(),
-                            &short_name,
-                        )
-                } else {
-                    self.store_context
-                        .store
-                        .declaration_order_candidate_rows_by_short_name_for_langs(
-                            &langs,
-                            self.store_context.generations.as_ref(),
-                            &short_name,
-                        )
-                };
-                rows.extend(candidates.map_err(|error| {
-                    error.context(format!("querying definition candidates for `{fq_name}`"))
-                })?);
+                rows.extend(
+                    self.definition_candidate_rows(
+                        &langs,
+                        short_name,
+                        include_definition_lookup_units,
+                    )
+                    .map_err(|error| {
+                        error.context(format!("querying definition candidates for `{fq_name}`"))
+                    })?
+                    .iter()
+                    .cloned(),
+                );
             }
             rows
         };
@@ -10261,6 +10355,72 @@ mod tests {
         let _ = IAnalyzer::definitions(&analyzer, "pkg.mod_0.Widget0").count();
 
         assert_eq!(2, analyzer.definition_candidates_query_count_for_test());
+    }
+
+    /// A workspace where one short name is shared by `count` distinct fq
+    /// names -- the shape that defeated #1748's fq-keyed memo (#1839).
+    fn shared_short_name_project(count: usize) -> (tempfile::TempDir, Arc<dyn Project>) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("pkg")).expect("create pkg");
+        std::fs::write(root.join("pkg/__init__.py"), "").expect("write package marker");
+        for index in 0..count {
+            std::fs::write(
+                root.join(format!("pkg/mod_{index}.py")),
+                "class Shared:\n    pass\n",
+            )
+            .expect("write module");
+        }
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
+        (temp, project)
+    }
+
+    /// #1839: the #1748 memo is keyed by fq name, but the store read it wraps
+    /// is keyed by the candidate short name. Distinct fq names that share one
+    /// short name are all memo misses, and each re-read the same page: on the
+    /// rustc tree that was 20,935 identical `main` reads in one request. Fails
+    /// at one read per name before the row memo.
+    #[test]
+    fn issue_1839_distinct_fq_names_sharing_a_short_name_read_the_rows_once() {
+        let (_temp, project) = shared_short_name_project(6);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let names: Vec<String> = (0..6)
+            .map(|index| format!("pkg.mod_{index}.Shared"))
+            .collect();
+
+        let point: Vec<Vec<CodeUnit>> = names
+            .iter()
+            .map(|name| IAnalyzer::definitions(&analyzer, name).collect())
+            .collect();
+
+        let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&scope);
+        analyzer.reset_definition_candidates_query_count_for_test();
+        analyzer.reset_definition_candidate_row_read_count_for_test();
+        let memoized: Vec<Vec<CodeUnit>> = names
+            .iter()
+            .map(|name| IAnalyzer::definitions(&analyzer, name).collect())
+            .collect();
+        let row_reads = analyzer.definition_candidate_row_read_count_for_test();
+        let point_lookups = analyzer.definition_candidates_query_count_for_test();
+        analyzer.end_query(&scope);
+
+        assert_eq!(point, memoized, "the memo must not change any answer");
+        assert_eq!(
+            6, point_lookups,
+            "each distinct fq name is still its own question"
+        );
+        // Each `pkg.mod_i.Shared` seeks three spellings -- itself,
+        // `mod_i.Shared`, and the bare `Shared` -- so six names name thirteen
+        // distinct keys: two of their own each, plus the one they all share.
+        // Every key is read once. Before the memo this was eighteen reads,
+        // six of them the identical `Shared` page, which is the shape that
+        // charged 20,935 identical `main` reads on the rustc tree.
+        assert_eq!(
+            2 * 6 + 1,
+            row_reads,
+            "each distinct short name is read once, and the shared one is not read per fq name"
+        );
     }
 
     /// The batched prefetch must fill the memo with the same answers the point
