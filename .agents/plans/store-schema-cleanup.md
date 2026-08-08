@@ -38,9 +38,12 @@ compatibility is explicitly not a requirement here (AGENTS.md).
 
 - [x] (2026-08-08) Check in the measured inventory as `.agents/docs/opaque-blob-inventory-2026-08.md`;
       flip the design document's status to APPROVED, IMPLEMENTING; seed this ExecPlan.
-- [ ] Step 1, imports merge (in progress). `import_details` is dropped; `import_statements`
-      becomes one row per import binding carrying the `ImportInfo` scalars, with three child
-      tables for the path segments, the lexical scopes, and the lexical prefixes.
+- [x] (2026-08-08) Step 1, imports merge. Migration 0018 drops `import_details` and gives
+      `import_statements` the `ImportInfo` scalars plus `import_path_segments`,
+      `import_lexical_scopes`, and `import_lexical_prefixes`. Schema version 18, epoch salt v8.
+      Landed as 7737ec9f (schema, writers, readers, Go and C# write-side cleanups) and 8f9cc55b
+      (frozen-equivalence, schema, cascade, content-stability, cost, and EQP tests plus the
+      Scala and TypeScript reconciliation pins).
 - [ ] Step 2, signature split: `SignatureMetadata`'s fourteen scalars move onto `unit_signatures`;
       its parameter list and its two type arenas become child tables.
 - [ ] Step 3, supertype lookup paths: replace the dual-shape JSON `unit_supertypes.lookup_path`
@@ -57,6 +60,18 @@ order by measured value.
 
 ## Surprises & Discoveries
 
+- Observation: SQLite's `ALTER TABLE ... DROP COLUMN` accepts a column carrying its own
+  single-column `CHECK`; the documented restriction is about a column named in a *table*
+  CHECK. That turned the `blob_meta.import_count` removal from a table rebuild into one
+  statement, which matters because two `cache_db` tests pin that later migrations stay additive
+  for an already-populated cache and a rebuild would have dropped `blob_meta` rows and orphaned
+  the two tables whose foreign keys point at it.
+  Evidence: `ALTER TABLE blob_meta DROP COLUMN import_count` against a database built from
+  migrations 0001 to 0017 succeeded and left every other CHECK in place;
+  `populated_v5_cache_migrates_additively_to_v7` and
+  `analyzer_migrations_preserve_populated_v3_rows_with_lazy_payload_costs` both fail against
+  the rebuild version and pass against this one.
+
 - Observation: `FileState::import_statements` and `FileState::imports` are two independently
   produced lists, not two views of one list, and for Scala and TypeScript they have different
   lengths. Merging the two tables therefore cannot preserve both; it necessarily makes the
@@ -69,6 +84,46 @@ order by measured value.
 
 ## Decision Log
 
+- Decision: `ImportInfo` survives as the hydrated shape rather than dissolving into per-call-site
+  column reads.
+  Rationale: about forty consumers across ten language modules take it by value, and several take
+  it as a slice from a bulk read. Dissolving it is a consumer-retirement decision with its own
+  measurements, not a consequence of where the bytes live. The storage change stands alone.
+  Date/Author: 2026-08-08, Fable/Opus.
+
+- Decision: `declaration_start_byte` doubles as the structured path's presence marker instead of
+  a separate `has_path` flag.
+  Rationale: `StructuredImportPath` always carries a declaration start byte, so the two columns
+  would always agree, and two columns that must agree eventually disagree. A NULL here means the
+  three child tables hold nothing for the row, which the DDL states.
+  Date/Author: 2026-08-08, Fable/Opus.
+
+- Decision: `ImportInfo` gains `is_global` and the table an `is_global` column, which the approved
+  design's column list did not name.
+  Rationale: the design says C#'s twelve snippet-parsing sites should read `path_kind` and
+  segments instead. Five of them do. The other seven detect `global using` by matching the prefix
+  "global using " against the snippet, and globalness is orthogonal to the path kind -- `global
+  using static X` is legal -- so no value of a three-valued path-kind enum can carry it. Leaving
+  the text test alive next to a structured path is exactly the smell the merge exists to remove.
+  Date/Author: 2026-08-08, Fable/Opus.
+
+- Decision: `import_statements()` collapses runs of equal adjacent snippets rather than returning
+  one entry per binding.
+  Rationale: the accessor's callers treat an entry as a statement. `module_import_skeleton` joins
+  them into a summary and the Java and C++ resolvers iterate them, so a TypeScript declaration
+  binding three names would print three identical lines and do the same work three times.
+  Bindings of one declaration are contiguous because every adapter emits them while walking that
+  declaration, so adjacency is sufficient and no second stored list is needed.
+  Date/Author: 2026-08-08, Fable/Opus.
+
+- Decision: the bounded read's byte budget prices the parent row's own text and not the child
+  rows.
+  Rationale: `statement` is the only import column that can be arbitrarily large, and the child
+  rows are pieces of the same declaration, so budgeting `statement` bounds them within a small
+  constant factor. Correlated subqueries over three child tables inside the bounded query would
+  buy exactness at the cost of the clean indexed plan the EQP pin asserts.
+  Date/Author: 2026-08-08, Fable/Opus.
+
 - Decision: track the seven steps in this one ExecPlan rather than one plan per step.
   Rationale: the steps share one substrate, one set of cross-cutting schema rules, and one
   migration corridor, so a single Decision Log keeps the reasoning for later steps next to the
@@ -77,7 +132,31 @@ order by measured value.
 
 ## Outcomes & Retrospective
 
-Pending. To be written at the end of each step and again at the end of the plan.
+Step 1, 2026-08-08. An import is now one row per binding in one table, the duplicate snippet is
+gone, and the two ordinal sequences that were never co-keyed are one sequence by construction.
+Four things came out of it that were not in the design:
+
+The design assumed `path_kind` and segments would retire all twelve of C#'s snippet-parsing
+sites. They retire five. The other seven ask whether a `using` is `global`, which is orthogonal
+to the path kind, so the merge had to add a column and an `ImportInfo` field for it. The general
+lesson for the remaining steps: count the consumers a step claims to retire before promising the
+retirement, because "read the structure instead of the text" only works if the structure has a
+place for every fact the text carried.
+
+`FileState::import_statements` could not survive as an independent list, which the design said in
+one clause and which turned out to be the widest part of the change: fifteen adapters wrote to
+it. Removing it is what forces the Scala and TypeScript reconciliation, and it is why this step
+touched ten language modules rather than the store alone.
+
+The migration corridor cares about populated caches even though the store file name embeds the
+schema version. Two `cache_db` tests pin that later migrations stay additive, so a table rebuild
+is not free even when the new binary would never open the old file. `DROP COLUMN` was available
+and is the right tool here; a later step that genuinely needs a rebuild will have to argue with
+those tests first.
+
+What remains from this step: `rust_import_targets` (migration 0016) still overlaps the merged
+table for Rust, which the design says to collapse only once the consumer retirement plan settles.
+Nothing else is outstanding.
 
 ## Context and Orientation
 
@@ -227,7 +306,74 @@ Nothing in this plan authorizes a version change, a tag, a publication, or a dep
 
 ## Artifacts and Notes
 
-To be filled in per step with the landed DDL, the fail-before transcripts, and the EQP output.
+Step 1's landed DDL is `crates/bifrost-core/migrations/cache/0018-import-bindings.sql`. Its
+shape, with the comments stripped:
+
+    CREATE TABLE import_statements(
+      blob_oid TEXT NOT NULL, lang TEXT NOT NULL,
+      ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+      statement TEXT NOT NULL,
+      is_wildcard INTEGER NOT NULL CHECK(is_wildcard IN (0, 1)),
+      is_global INTEGER NOT NULL CHECK(is_global IN (0, 1)),
+      identifier TEXT, alias TEXT,
+      path_kind TEXT CHECK(path_kind IN ('namespace','import_from','static_member')),
+      declaration_start_byte INTEGER CHECK(declaration_start_byte >= 0),
+      binder_start INTEGER CHECK(binder_start >= 0),
+      binder_end INTEGER CHECK(binder_end >= 0),
+      CHECK((binder_start IS NULL) = (binder_end IS NULL)),
+      CHECK(binder_start IS NULL OR binder_start <= binder_end),
+      CHECK(path_kind IS NULL OR declaration_start_byte IS NOT NULL),
+      PRIMARY KEY(blob_oid, lang, ordinal),
+      FOREIGN KEY(blob_oid, lang) REFERENCES blobs(blob_oid, lang) ON DELETE CASCADE
+    ) WITHOUT ROWID, STRICT;
+
+    import_path_segments(blob_oid, lang, ordinal, seg_ordinal, segment TEXT NOT NULL)
+    import_lexical_scopes(blob_oid, lang, ordinal, scope_ordinal, start_byte, end_byte)
+    import_lexical_prefixes(blob_oid, lang, ordinal, prefix_ordinal, prefix TEXT NOT NULL)
+
+Each child table has `PRIMARY KEY(blob_oid, lang, ordinal, <its ordinal>)`, `CHECK(... >= 0)` on
+both ordinals, and `FOREIGN KEY(blob_oid, lang, ordinal) REFERENCES import_statements(...) ON
+DELETE CASCADE`; `import_lexical_scopes` also carries `CHECK(start_byte <= end_byte)`. The
+migration ends with `ALTER TABLE blob_meta DROP COLUMN import_count`.
+
+The fail-before evidence, one mutation at a time with the file restored after each:
+
+    mutation 1: writer stops persisting lexical prefixes
+      FAIL import_child_rows_follow_the_structured_path
+      FAIL import_rows_hydrate_what_the_frozen_blob_decoder_produced
+    mutation 2: writer forgets is_global
+      FAIL import_rows_hydrate_what_the_frozen_blob_decoder_produced
+    mutation 3: reader drops the binder span
+      FAIL import_rows_hydrate_what_the_frozen_blob_decoder_produced
+    mutation 4: cost model counts only the parent rows
+      FAIL import_child_rows_are_counted_by_the_cost_model
+    mutation 5: segments child table stops cascading
+      FAIL deleting_a_blob_cascades_every_import_table
+    mutation 6: path_kind no longer implies a structured path
+      FAIL import_row_constraints_are_enforced_by_the_schema
+    mutation 7: import_statements() stops collapsing adjacent equal snippets
+      FAIL typescript_multi_binding_import_reports_one_statement_per_declaration
+
+`scala_import_test::test_static_import` is its own fail-before: against the pre-merge code it
+expected `import foo.bar.{Baz as Bar}` and the merge makes it `import foo.bar.Baz as Bar`.
+
+The EQP plans `import_reads_use_the_import_primary_keys` asserts, all of them a bare
+`SEARCH ... USING PRIMARY KEY` with no `SCAN` and no `USE TEMP B-TREE`:
+
+    SELECT <scalars> FROM import_statements WHERE blob_oid = ? AND lang = ? ORDER BY ordinal
+    SELECT blob_oid, ordinal, segment FROM import_path_segments
+      WHERE lang = ? AND blob_oid IN (?, ?) ORDER BY blob_oid, ordinal
+    ... the same for import_lexical_prefixes and import_lexical_scopes
+
+The bulk parent read keeps the `blob_meta` join and therefore the ordering b-tree it already had
+before this change; `replacement_cost_set_uses_only_bounded_primary_key_probes` covers the cost
+SQL's new `import_path_segments` and `import_lexical_prefixes` branches.
+
+Validation for step 1: `cargo nextest run -p brokk-bifrost-analysis -p brokk-bifrost-core` ran
+2040 tests with three failures, all on the pre-existing tolerated list for this revision (the JVM
+source-and-class-jar artifact test and the two `live_oid_resolution` concurrency tests).
+`cargo nextest run --workspace -E 'test(/import|suite_analyzers|suite_usages/)'` ran 669 tests
+with none failing. `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 
 ## Interfaces and Dependencies
 
