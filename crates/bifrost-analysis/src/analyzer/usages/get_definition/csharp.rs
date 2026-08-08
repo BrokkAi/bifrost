@@ -2711,7 +2711,7 @@ fn csharp_named_argument_label_outcome(
             ),
         );
     }
-    csharp_member_outcome(analyzer, definitions, owners, name, None, None, true)
+    csharp_member_outcome(analyzer, definitions, owners, name, None, None)
 }
 
 fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
@@ -3578,7 +3578,6 @@ fn csharp_member_outcome_in_enclosing_chain(
     member: &str,
     arity: Option<usize>,
     explicit_generic_arity: Option<usize>,
-    fallback_when_inapplicable: bool,
 ) -> DefinitionLookupOutcome {
     if owners.is_empty() {
         return csharp_member_outcome(
@@ -3588,7 +3587,6 @@ fn csharp_member_outcome_in_enclosing_chain(
             member,
             arity,
             explicit_generic_arity,
-            fallback_when_inapplicable,
         );
     }
     let mut innermost_failure = None;
@@ -3606,7 +3604,6 @@ fn csharp_member_outcome_in_enclosing_chain(
             member,
             arity,
             explicit_generic_arity,
-            fallback_when_inapplicable,
         );
         if outcome.status != DefinitionLookupStatus::NoDefinition {
             return outcome;
