@@ -650,6 +650,17 @@ remaining tolerated failures for this plan's selections are the JVM artifact tes
 `javac`/`jar`, the two `live_oid_resolution_*` rendezvous tests, and
 `scan_usages_resolves_public_typescript_static_method_symbol`.
 
+Update (2026-08-08, second): the same treatment reached the four selector tests, so none of them
+is tolerated any more either. Bisected in
+`.agents/docs/selector-failures-bisection-2026-08.md` to two adjacent commits of 2026-08-06:
+`6da767e9` for `summaries_route_file_anchored_selector_with_extension_like_symbol_member` and
+`summaries_and_ancestors_accept_js_file_anchored_selectors`, and `7e7ac9ee` for
+`csharp_generic_type_resolves_without_arity_spelling` and
+`scan_usages_resolves_public_typescript_static_method_symbol` (the last of which had been on this
+plan's list since the start). Fixed by `7a22bf53` and `8a27e0cd`; both original commits' latency
+fast paths survive and are pinned. The tolerated set for this plan's selections is now the JVM
+artifact test and the two `live_oid_resolution_*` rendezvous tests.
+
 ## Idempotence and Recovery
 
 Every step is an ordinary source edit under version control, and each milestone is a separate
