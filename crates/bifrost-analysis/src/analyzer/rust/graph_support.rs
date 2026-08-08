@@ -663,6 +663,7 @@ impl RustAnalyzer {
         forward: bool,
         progress: &dyn Fn() -> bool,
     ) -> ReferenceContextResult<Option<String>> {
+        self.note_export_name_canonicalization();
         let targets = if forward {
             self.forward_exported_targets_from_files_with_progress(module_files, name, progress)?
         } else {

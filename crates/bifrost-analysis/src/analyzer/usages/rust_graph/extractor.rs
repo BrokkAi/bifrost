@@ -113,6 +113,7 @@ pub(super) fn scan_files_for_target(
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
+        rust.note_scanned_candidate_file();
         let Some(prepared) = rust.prepared_syntax(file) else {
             return;
         };
@@ -1144,6 +1145,7 @@ pub(super) fn scan_files_for_member_target(
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
+        rust.note_scanned_candidate_file();
         let Some(prepared) = rust.prepared_syntax(file) else {
             return;
         };

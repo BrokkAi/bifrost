@@ -89,6 +89,19 @@ pub struct RustAnalyzer {
     /// the export name being resolved, so this count is what proves the
     /// per-export-name recomputation is gone (#1230 item 4).
     module_file_resolution_count: Arc<AtomicUsize>,
+    /// `canonical_export_fqn_from_files` calls: one re-export walk for one
+    /// name. Before the per-site rewrite the eager reference-context builders
+    /// ran one of these per export name of every namespace- and glob-imported
+    /// module, per file, per direction; afterwards a scan runs one per name
+    /// actually written at a site the fact-backed prover could not answer. It
+    /// is the direct measure of the streaming design's central claim
+    /// (`.agents/plans/usage-graph-streaming.md`).
+    export_name_canonicalization_count: Arc<AtomicUsize>,
+    /// Candidate files a usage scan actually opened. The callsite cap used to
+    /// be a post-filter over every candidate's hits; it is now a stop
+    /// condition, so this count falls below the candidate count once the cap
+    /// is proven.
+    scanned_candidate_file_count: Arc<AtomicUsize>,
     /// Files the Cargo-route build had to parse because their blob carried no
     /// persisted module-route facts. Zero is the structural claim of issue
     /// #1793: the index composes from rows, never from a workspace parse.
@@ -293,6 +306,39 @@ impl RustAnalyzer {
     #[doc(hidden)]
     pub fn module_file_resolution_count_for_test(&self) -> usize {
         self.module_file_resolution_count.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn note_export_name_canonicalization(&self) {
+        self.export_name_canonicalization_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn reset_export_name_canonicalization_count_for_test(&self) {
+        self.export_name_canonicalization_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn export_name_canonicalization_count_for_test(&self) -> usize {
+        self.export_name_canonicalization_count
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_scanned_candidate_file(&self) {
+        self.scanned_candidate_file_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn reset_scanned_candidate_file_count_for_test(&self) {
+        self.scanned_candidate_file_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn scanned_candidate_file_count_for_test(&self) -> usize {
+        self.scanned_candidate_file_count.load(Ordering::Relaxed)
     }
 
     #[doc(hidden)]
@@ -547,6 +593,8 @@ impl RustAnalyzer {
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
+            export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
+            scanned_candidate_file_count: Arc::new(AtomicUsize::new(0)),
             rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
@@ -586,6 +634,8 @@ impl RustAnalyzer {
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
+            export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
+            scanned_candidate_file_count: Arc::new(AtomicUsize::new(0)),
             rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
@@ -840,6 +890,8 @@ impl IAnalyzer for RustAnalyzer {
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
+            export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
+            scanned_candidate_file_count: Arc::new(AtomicUsize::new(0)),
             rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
@@ -869,6 +921,8 @@ impl IAnalyzer for RustAnalyzer {
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
+            export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
+            scanned_candidate_file_count: Arc::new(AtomicUsize::new(0)),
             rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),

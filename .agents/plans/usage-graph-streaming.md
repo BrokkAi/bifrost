@@ -44,9 +44,11 @@ measurement is a separate task run after review; it is not part of this plan's a
 - [x] (2026-08-08 12:00Z) Read the approved design, the investigation, and the code it cites.
 - [x] (2026-08-08 12:40Z) Wrote this ExecPlan; set the design document's status to
       `APPROVED, IMPLEMENTING`.
-- [ ] Milestone 1: freeze the current closure-based resolution under `#[cfg(test)]` and add the
-      equivalence fixture.
-- [ ] Milestone 2: add the three counters and their pins, observed failing before the rewrite.
+- [x] (2026-08-08 14:10Z) Milestone 1: froze the closure-based resolution under `#[cfg(test)]` and
+      added the equivalence fixture and pin (commit `02e221a0`).
+- [x] (2026-08-08 14:55Z) Milestone 2: added the two counters and observed all three pins failing
+      before the rewrite; numbers in `Artifacts and Notes`. The pins themselves land with the
+      milestone that makes each one pass, so the tree stays green at every commit.
 - [ ] Milestone 3 (D1 + D3): replace `RustReferenceContext` with a lazy per-site resolver; delete
       the eager builders, the two analyzer caches, and the mis-weighing weigher.
 - [ ] Milestone 4 (D2): check the callsite cap before dispatching each candidate; bound
@@ -394,6 +396,21 @@ abandon the work, reset to the commit before the first milestone.
 ## Artifacts and Notes
 
 Fail-before and after evidence for the counter pins is recorded here as each milestone lands.
+
+Fail-before, all three pins, at commit `02e221a0` plus the Milestone 2 counters, from
+`cargo test -p brokk-bifrost-analysis --lib analyzer::usages::rust_graph::tests::`:
+
+    a scan of one site behind one namespace import canonicalized 21 export names;
+      the module exports 21 and only one is written
+    a cancelled scan canonicalized 21 export names
+    the scan opened 24 of 24 candidates after the cap was proven
+
+The first number is exact and diagnostic: 21 canonicalizations for a module with 21 exports, from a
+consumer that writes one of them. The cancellation budget of four was found by sweeping budgets one
+through twenty-three against a cold analyzer; the counts are 0, 0, 0, then 21 from four upward,
+which locates the boundary precisely. At three checks the scan bails before the candidate's context
+would be built; at four the token is already cancelled and the build runs to completion anyway,
+which is the investigation's "a single build is uninterruptible end to end", measured.
 
 ## Interfaces and Dependencies
 
