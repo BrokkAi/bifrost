@@ -16,8 +16,9 @@ use crate::graph::resolver::{
 use crate::graph_support::{self, CSharpSource};
 use crate::hierarchy;
 use crate::syntax::{
-    csharp_attribute_terminal_name, csharp_attribute_type_names, csharp_conditional_member_access,
-    csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver, csharp_member_name,
+    CSharpNamedArgumentLabel, csharp_attribute_terminal_name, csharp_attribute_type_names,
+    csharp_conditional_member_access, csharp_constant_pattern_type_candidate,
+    csharp_member_access_type_receiver, csharp_member_name, csharp_named_argument_label,
     csharp_nameof_type_candidates, csharp_type_leftmost_identifier, csharp_type_reference_root,
     csharp_type_terminal_identifier, csharp_unqualified_invocation_for_name,
 };
@@ -681,7 +682,7 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 ctx.source,
                 &mut bindings,
             );
-            match object_initializer_label_owner_resolution(node, ctx) {
+            match member_label_owner_resolution(node, ctx) {
                 LabelOwnerResolution::MatchesTarget => {
                     push_hit(node, ctx);
                     return;
@@ -912,6 +913,31 @@ enum LabelOwnerResolution {
     MatchesTarget,
     KnownOther,
     Unknown,
+}
+
+/// The owner resolution for a label that writes a member: an object-initializer
+/// label (`new Foo { Bar = .. }`) or an attribute named-argument label
+/// (`[Foo(Bar = ..)]`), whose owner is the attribute type (#1796). A plain
+/// `name:` argument label names a parameter, so it is provably not this member.
+fn member_label_owner_resolution(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> LabelOwnerResolution {
+    let Some(shape) = csharp_named_argument_label(node) else {
+        return object_initializer_label_owner_resolution(node, ctx);
+    };
+    let CSharpNamedArgumentLabel::AttributeMember { attribute_name } = shape else {
+        return LabelOwnerResolution::KnownOther;
+    };
+    let names = csharp_attribute_type_names(attribute_name, ctx.source);
+    let owners =
+        hierarchy::usage_unambiguous_attribute_type_candidates(ctx.csharp, ctx.file, &names);
+    let mut resolution = LabelOwnerResolution::Unknown;
+    for owner in owners {
+        match receiver_fqn_target_member_resolution(&owner.fq_name(), None, None, ctx) {
+            TargetMemberResolution::MatchesTarget => return LabelOwnerResolution::MatchesTarget,
+            TargetMemberResolution::KnownOther => resolution = LabelOwnerResolution::KnownOther,
+            TargetMemberResolution::NotFound => {}
+        }
+    }
+    resolution
 }
 
 fn object_initializer_label_owner_resolution(

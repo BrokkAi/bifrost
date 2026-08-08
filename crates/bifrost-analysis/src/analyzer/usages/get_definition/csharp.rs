@@ -20,7 +20,8 @@ use crate::analyzer::{
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
 use brokk_bifrost_csharp::syntax::{
-    csharp_using_directive_is_static, csharp_using_directive_target_node,
+    CSharpNamedArgumentLabel, csharp_named_argument_label, csharp_using_directive_is_static,
+    csharp_using_directive_target_node,
 };
 
 pub(super) struct CSharpDefinitionProvider<'a> {
@@ -755,6 +756,9 @@ fn resolve_csharp_in_session(
                 );
             }
             outcome
+        }
+        Some(CSharpReferenceNode::NamedArgumentLabel { label, shape }) => {
+            csharp_named_argument_label_outcome(analyzer, definitions, file, source, label, shape)
         }
         Some(CSharpReferenceNode::Identifier(identifier)) => {
             let text = csharp_node_text(identifier, source);
@@ -1728,6 +1732,10 @@ enum CSharpReferenceNode<'tree> {
         name: Node<'tree>,
     },
     UnqualifiedMember(Node<'tree>),
+    NamedArgumentLabel {
+        label: Node<'tree>,
+        shape: CSharpNamedArgumentLabel<'tree>,
+    },
     Identifier(Node<'tree>),
 }
 
@@ -1740,6 +1748,13 @@ fn csharp_reference_node<'tree>(
     }
     if let Some(name) = csharp_attribute_name_node(node) {
         return Some(CSharpReferenceNode::Attribute(name));
+    }
+    // A named-argument label is a leaf in its argument's `name` field, so the
+    // walk below never reaches it, and every shape it could otherwise fall
+    // through to -- type reference, unqualified member, bare identifier --
+    // answers with something the label does not name (#1796).
+    if let Some(shape) = csharp_named_argument_label(node) {
+        return Some(CSharpReferenceNode::NamedArgumentLabel { label: node, shape });
     }
 
     let original = node;
@@ -2585,6 +2600,51 @@ fn csharp_object_initializer_label_outcome(
         None,
         true,
     ))
+}
+
+/// Resolve a named-argument label the same way the object-initializer label
+/// above resolves: through the owner the label writes into, never through the
+/// label's own spelling as a type (#1796).
+///
+/// An attribute label's owner is the attribute type, so `[Svc(Lifetime = ...)]`
+/// answers `SvcAttribute.Lifetime` and reaches an inherited property through the
+/// member walk's base chain. A label the attribute type does not declare has no
+/// definition at all -- neither the same-named type nor a using-boundary claim
+/// about a property name. A plain `Name:` label names a parameter, which C#
+/// analysis does not index as a declaration.
+fn csharp_named_argument_label_outcome(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    label: Node<'_>,
+    shape: CSharpNamedArgumentLabel<'_>,
+) -> DefinitionLookupOutcome {
+    let name = csharp_node_text(label, source);
+    let CSharpNamedArgumentLabel::AttributeMember { attribute_name } = shape else {
+        return no_definition(
+            "named_argument_parameter_label",
+            format!(
+                "`{name}` is a C# named-argument label naming a parameter, which is not an indexed declaration"
+            ),
+        );
+    };
+    let attribute_names = csharp_attribute_type_names(attribute_name, source);
+    let (owners, _ambiguous_spelling) =
+        definitions.attribute_type_candidates(file, &attribute_names);
+    if owners.is_empty() {
+        let attribute = attribute_names
+            .first()
+            .map(String::as_str)
+            .unwrap_or_default();
+        return no_definition(
+            "unresolved_attribute_named_argument_owner",
+            format!(
+                "C# attribute type `{attribute}` owning named argument `{name}` did not resolve to an indexed definition"
+            ),
+        );
+    }
+    csharp_member_outcome(analyzer, definitions, owners, name, None, None, true)
 }
 
 fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
