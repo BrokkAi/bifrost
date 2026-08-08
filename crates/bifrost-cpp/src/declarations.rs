@@ -3747,11 +3747,7 @@ fn extract_function_info(
         }
         split_cpp_name(&raw_name, scope)
     };
-    let full_text = normalize_cpp_whitespace(node_text(declarator, source));
-    let suffix = full_text
-        .split_once(node_text(parameters_node, source))
-        .map(|(_, tail)| normalize_cpp_qualifier_suffix(tail))
-        .unwrap_or_default();
+    let suffix = cpp_declarator_identity_suffix(declarator, parameters_node, source);
     let mut signature = if suffix.is_empty() {
         parameters_text
     } else {
@@ -3767,6 +3763,47 @@ fn extract_function_info(
         name,
         signature,
     })
+}
+
+/// The part of a `function_declarator` after its parameter list that belongs to
+/// the callable's identity: the cv-qualifiers, the ref-qualifier, the exception
+/// specification, a trailing return type and a trailing requires-clause.
+///
+/// The grammar makes each of these a distinct sibling of the `parameters`
+/// field, so they are read from the tree. Splitting the declarator's text on
+/// the parameter list instead silently dropped every qualifier whenever the
+/// parameter list was spelled with whitespace that normalization rewrote - a
+/// line break or a double space was enough to make a `const` member definition
+/// a different logical symbol from its declaration (#1827).
+///
+/// Attributes, `asm` blocks and the virtual specifiers (`override`, `final`)
+/// are deliberately excluded. C++ does not make them part of the signature and
+/// an out-of-line definition never repeats them, so including them would split
+/// a declaration from its own definition.
+fn cpp_declarator_identity_suffix(
+    declarator: Node<'_>,
+    parameters_node: Node<'_>,
+    source: &str,
+) -> String {
+    let mut cursor = declarator.walk();
+    let parts = declarator
+        .named_children(&mut cursor)
+        .filter(|child| child.start_byte() >= parameters_node.end_byte())
+        .filter(|child| {
+            matches!(
+                child.kind(),
+                "type_qualifier"
+                    | "ref_qualifier"
+                    | "noexcept"
+                    | "throw_specifier"
+                    | "trailing_return_type"
+                    | "requires_clause"
+            )
+        })
+        .map(|child| normalize_cpp_whitespace(node_text(child, source)))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    normalize_cpp_qualifier_suffix(&parts.join(" "))
 }
 
 fn extract_function_declarator(node: Node<'_>) -> Option<Node<'_>> {
@@ -6216,11 +6253,20 @@ fn cpp_parameter_type(parameter: Node<'_>, source: &str) -> String {
         .child_by_field_name("type")
         .map(|node| normalize_cpp_whitespace(node_text(node, source)))
         .unwrap_or_default();
+    let declarator = cpp_parameter_declarator(parameter);
+    // [dcl.fct]/5: after parameter-type adjustment the top-level cv-qualifiers
+    // are discarded, so `f(const int)` and `f(int)` declare one function. A
+    // qualifier written next to the parameter's type is only top-level when
+    // the declarator adds no indirection; behind a pointer, reference or array
+    // declarator the same qualifier belongs to the pointee, referent or
+    // element and keeps distinguishing the type (#1827).
+    let keeps_top_level_cv = declarator.is_some_and(cpp_declarator_adds_indirection);
     let mut cursor = parameter.walk();
     let qualifiers = parameter
         .named_children(&mut cursor)
         .filter(|child| child.kind() == "type_qualifier")
         .map(|child| normalize_cpp_whitespace(node_text(child, source)))
+        .filter(|text| keeps_top_level_cv || !matches!(text.as_str(), "const" | "volatile"))
         .collect::<Vec<_>>()
         .join(" ");
     let type_text = match (qualifiers.is_empty(), base_type.is_empty()) {
@@ -6228,7 +6274,7 @@ fn cpp_parameter_type(parameter: Node<'_>, source: &str) -> String {
         (_, true) => qualifiers,
         (false, false) => format!("{qualifiers} {base_type}"),
     };
-    let declarator_suffix = cpp_parameter_declarator(parameter)
+    let declarator_suffix = declarator
         .map(|node| cpp_declarator_suffix_without_name(node, source))
         .unwrap_or_default();
 
@@ -6254,6 +6300,29 @@ fn cpp_parameter_declarator(parameter: Node<'_>) -> Option<Node<'_>> {
             .named_children(&mut cursor)
             .find(|child| is_cpp_abstract_declarator(child.kind()))
     })
+}
+
+/// Whether a parameter's declarator chain adds indirection - a pointer,
+/// reference, array or function declarator - to the parameter's written type.
+fn cpp_declarator_adds_indirection(declarator: Node<'_>) -> bool {
+    let mut current = Some(declarator);
+    while let Some(node) = current {
+        if matches!(
+            node.kind(),
+            "pointer_declarator"
+                | "abstract_pointer_declarator"
+                | "reference_declarator"
+                | "abstract_reference_declarator"
+                | "array_declarator"
+                | "abstract_array_declarator"
+                | "function_declarator"
+                | "abstract_function_declarator"
+        ) {
+            return true;
+        }
+        current = cpp_nested_declarator(node);
+    }
+    false
 }
 
 fn is_cpp_abstract_declarator(kind: &str) -> bool {
@@ -11045,6 +11114,165 @@ typename broken<T>::value_type broken<T>::method() {
                 .all(|owner| owner.range.start_byte > method_start
                     || owner.range.end_byte <= method_start),
             "missing ABSL_NAMESPACE_END must not attach outer sibling owners: {broken:#?}"
+        );
+    }
+
+    /// Every identity signature emitted for `fq_name`, deduplicated, sorted.
+    fn identity_signatures(parsed: &ParsedFile, fq_name: &str) -> Vec<String> {
+        let mut signatures = parsed
+            .declarations()
+            .iter()
+            .filter(|unit| unit.is_function() && unit.fq_name() == fq_name)
+            .filter_map(|unit| unit.signature().map(str::to_string))
+            .collect::<Vec<_>>();
+        signatures.sort();
+        signatures.dedup();
+        signatures
+    }
+
+    #[test]
+    fn trailing_qualifiers_survive_parameter_list_whitespace() {
+        // #1827: the trailing `const`/`noexcept`/ref-qualifier belongs to the
+        // declarator's structure, so an out-of-line definition that spells its
+        // parameter list with different whitespace than the declaration must
+        // still carry it.
+        let source = r#"
+struct Widget {
+  bool multiline(int settings, int supprs) const;
+  bool doublespace(int settings, int supprs) const;
+  bool noexcept_multiline(int settings, int supprs) noexcept;
+  bool ref_multiline(int settings, int supprs) &&;
+};
+bool
+Widget::multiline (int settings,
+                   int supprs) const
+{ return settings + supprs > 0; }
+bool Widget::doublespace(int settings,  int supprs) const { return true; }
+bool Widget::noexcept_multiline(int settings,
+                                int supprs) noexcept { return true; }
+bool Widget::ref_multiline(int settings,
+                           int supprs) && { return true; }
+"#;
+        let parsed = parse_cpp_declarations(source, "trailing-qualifiers.cpp");
+        assert_eq!(
+            vec!["(int, int) const".to_string()],
+            identity_signatures(&parsed, "Widget.multiline")
+        );
+        assert_eq!(
+            vec!["(int, int) const".to_string()],
+            identity_signatures(&parsed, "Widget.doublespace")
+        );
+        assert_eq!(
+            vec!["(int, int) noexcept".to_string()],
+            identity_signatures(&parsed, "Widget.noexcept_multiline")
+        );
+        assert_eq!(
+            vec!["(int, int) &&".to_string()],
+            identity_signatures(&parsed, "Widget.ref_multiline")
+        );
+    }
+
+    #[test]
+    fn trailing_qualifiers_still_separate_genuine_overloads() {
+        // The qualifier must keep distinguishing the real C++ overload sets it
+        // exists for: a const and a non-const accessor, and a `&`/`&&` pair.
+        let source = r#"
+struct Widget {
+  int* slot(int index);
+  const int* slot(int index) const;
+  int log(int severity) &;
+  int log(int severity) &&;
+};
+"#;
+        let parsed = parse_cpp_declarations(source, "qualifier-overloads.cpp");
+        assert_eq!(
+            vec!["(int)".to_string(), "(int) const".to_string()],
+            identity_signatures(&parsed, "Widget.slot")
+        );
+        assert_eq!(
+            vec!["(int) &".to_string(), "(int) &&".to_string()],
+            identity_signatures(&parsed, "Widget.log")
+        );
+    }
+
+    #[test]
+    fn virtual_specifier_is_not_part_of_the_identity_signature() {
+        // `override` never appears on the out-of-line definition, and C++ does
+        // not make it part of the signature, so it must not split the identity.
+        let source = r#"
+struct Base {
+  virtual void run(int value) const;
+};
+struct Widget : Base {
+  void run(int value) const override;
+};
+void Widget::run(int value) const {}
+"#;
+        let parsed = parse_cpp_declarations(source, "virtual-specifier.cpp");
+        assert_eq!(
+            vec!["(int) const".to_string()],
+            identity_signatures(&parsed, "Widget.run")
+        );
+    }
+
+    #[test]
+    fn top_level_parameter_cv_qualifiers_do_not_split_identity() {
+        // [dcl.fct]/5: top-level cv-qualifiers on a parameter are not part of
+        // the function type, so a declaration that spells `const int` and a
+        // definition that spells `int` are one entity.
+        let source = r#"
+struct Widget {
+  bool value_params(const int settings, const int supprs);
+  void pointee_const(const int* p);
+  void pointer_const(int* const p);
+  void both_const(const int* const p);
+  void reference_const(const int& p);
+  void array_const(const int values[4]);
+};
+bool Widget::value_params(int settings, int supprs) { return true; }
+void Widget::pointer_const(int* p) {}
+void Widget::both_const(const int* p) {}
+"#;
+        let parsed = parse_cpp_declarations(source, "top-level-const.cpp");
+        assert_eq!(
+            vec!["(int, int)".to_string()],
+            identity_signatures(&parsed, "Widget.value_params")
+        );
+        assert_eq!(
+            vec!["(int *)".to_string()],
+            identity_signatures(&parsed, "Widget.pointer_const")
+        );
+        assert_eq!(
+            vec!["(const int *)".to_string()],
+            identity_signatures(&parsed, "Widget.both_const")
+        );
+        // The const that is not top-level still distinguishes the type.
+        assert_eq!(
+            vec!["(const int *)".to_string()],
+            identity_signatures(&parsed, "Widget.pointee_const")
+        );
+        assert_eq!(
+            vec!["(const int &)".to_string()],
+            identity_signatures(&parsed, "Widget.reference_const")
+        );
+        assert_eq!(
+            vec!["(const int [4])".to_string()],
+            identity_signatures(&parsed, "Widget.array_const")
+        );
+    }
+
+    #[test]
+    fn top_level_parameter_const_still_separates_pointee_overloads() {
+        let source = r#"
+struct Widget {
+  void take(const int* p);
+  void take(int* p);
+};
+"#;
+        let parsed = parse_cpp_declarations(source, "pointee-overloads.cpp");
+        assert_eq!(
+            vec!["(const int *)".to_string(), "(int *)".to_string()],
+            identity_signatures(&parsed, "Widget.take")
         );
     }
 }
