@@ -42,7 +42,7 @@ use super::js_ts::build_weighted_cache;
 pub(crate) use adapter::RustAdapter;
 use cache::{
     weight_code_unit_set, weight_declaration_facts, weight_export_index, weight_project_file_set,
-    weight_reference_context, weight_rust_usage_facts,
+    weight_rust_usage_facts,
 };
 use cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
 use clones::build_rust_clone_candidate_data;
@@ -74,8 +74,6 @@ pub struct RustAnalyzer {
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
-    reference_contexts: Cache<ProjectFile, Arc<RustReferenceContext>>,
-    forward_reference_contexts: Cache<ProjectFile, Arc<RustReferenceContext>>,
     export_indexes: Cache<ProjectFile, Arc<crate::analyzer::usages::ExportIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     // PoolSafeMemo, not OnceLock: this cache is reached from inside rayon
@@ -281,11 +279,6 @@ impl RustAnalyzer {
     #[cfg(test)]
     pub(crate) fn hierarchy_index_built_for_test(&self) -> bool {
         self.hierarchy_index.get().is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reference_context_built_for_test(&self, file: &ProjectFile) -> bool {
-        self.reference_contexts.get(file).is_some()
     }
 
     /// Per-instance counters behind the #1230 complexity pins. Each is shared by
@@ -582,11 +575,6 @@ impl RustAnalyzer {
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
-            reference_contexts: build_weighted_cache(memo_budget / 8, weight_reference_context),
-            forward_reference_contexts: build_weighted_cache(
-                memo_budget / 8,
-                weight_reference_context,
-            ),
             export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(PoolSafeMemo::new()),
@@ -623,11 +611,6 @@ impl RustAnalyzer {
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
-            reference_contexts: build_weighted_cache(memo_budget / 8, weight_reference_context),
-            forward_reference_contexts: build_weighted_cache(
-                memo_budget / 8,
-                weight_reference_context,
-            ),
             export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(PoolSafeMemo::new()),
@@ -876,14 +859,6 @@ impl IAnalyzer for RustAnalyzer {
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
-            reference_contexts: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_reference_context,
-            ),
-            forward_reference_contexts: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_reference_context,
-            ),
             export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(PoolSafeMemo::new()),
@@ -907,14 +882,6 @@ impl IAnalyzer for RustAnalyzer {
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
-            reference_contexts: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_reference_context,
-            ),
-            forward_reference_contexts: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_reference_context,
-            ),
             export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(PoolSafeMemo::new()),

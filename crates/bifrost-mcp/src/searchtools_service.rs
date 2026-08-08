@@ -3822,22 +3822,18 @@ fn assemble_session(
     // persist fact rows for. A query arriving before it finishes runs the same
     // catch-up itself, so nothing depends on the warm having won the race.
     //
-    // The per-file reference contexts are a separate whole-workspace fan-out
-    // that no single request waits on as a unit, and a large C++ workspace can
-    // contain a large vendored Rust tree whose contexts it never queries.
-    // Warming those competes with ordinary symbol requests and delays their
-    // first result, so that half stays opt-out (d8920a38).
+    // There is no longer a second half to this warm. It used to also pre-build
+    // every per-file Rust reference context, a whole-workspace fan-out that a
+    // large C++ workspace with a vendored Rust tree paid for work it never
+    // queried, which is why it was opt-out (d8920a38). Reference resolution is
+    // now per site and has nothing to pre-build.
     if startup_index_warm == StartupIndexWarm::AtStartup {
         let snapshot = Arc::clone(&snapshot);
-        let warm_reference_contexts = rust_usage_reference_context_warming_enabled();
         std::thread::Builder::new()
             .name("bifrost-usage-facts-warm".to_string())
             .spawn(move || {
                 let _scope = profiling::scope("mcp_cold.query_index_construction.rust_usage");
                 snapshot.warm_rust_usage_facts();
-                if warm_reference_contexts {
-                    snapshot.warm_rust_usage_reference_contexts();
-                }
             })
             .map_err(|error| format!("Failed to spawn usage-facts warm thread: {error}"))?;
     }
@@ -3853,20 +3849,6 @@ fn assemble_session(
         #[cfg(feature = "nlp")]
         semantic,
     })
-}
-
-/// Return whether the session should eagerly build every Rust reference
-/// context at startup.
-///
-/// The default keeps the interactive behavior for normal sessions. Benchmark
-/// and symbol-only callers can set `BIFROST_WARM_USAGE_ANALYSIS=off` when a
-/// large workspace contains unrelated Rust sources. This never disables the
-/// fact catch-up: leaving that unstarted only moves it into a request.
-fn rust_usage_reference_context_warming_enabled() -> bool {
-    !matches!(
-        std::env::var("BIFROST_WARM_USAGE_ANALYSIS").as_deref(),
-        Ok("0") | Ok("off") | Ok("false") | Ok("disabled")
-    )
 }
 
 fn start_session_watcher(

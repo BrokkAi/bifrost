@@ -204,7 +204,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) line_starts: &'a [usize],
     pub(super) analyzer: &'a dyn IAnalyzer,
     pub(super) rust: &'a RustAnalyzer,
-    pub(super) refs: &'a RustReferenceContext,
+    pub(super) refs: &'a RustReferenceContext<'a>,
     pub(super) support: &'a DefinitionIndexHandle<'a>,
     seeds: Option<&'a RustBindingSeeds>,
     target: &'a CodeUnit,
@@ -500,7 +500,7 @@ impl ScanCtx<'_> {
         }
         !shadowed
             && self.refs.resolve_bare(text).is_some_and(|fqn| {
-                self.matches_unique_visible_resolved_fqn_in_namespace(fqn, byte, namespace)
+                self.matches_unique_visible_resolved_fqn_in_namespace(&fqn, byte, namespace)
                     && self.authorize_exact_target_segments(&[text], byte, namespace, false)
             })
     }
@@ -605,7 +605,7 @@ impl ScanCtx<'_> {
         match namespace {
             RustReferenceNamespace::PathPrefix => {
                 if let [name] = segments {
-                    self.refs.resolve_bare(name).map(str::to_string)
+                    self.refs.resolve_bare(name)
                 } else {
                     self.refs.resolve_scoped_owner(&segments.join("::"))
                 }
@@ -616,7 +616,7 @@ impl ScanCtx<'_> {
             | RustReferenceNamespace::Any => {
                 let (name, prefix) = segments.split_last()?;
                 if prefix.is_empty() {
-                    self.refs.resolve_bare(name).map(str::to_string)
+                    self.refs.resolve_bare(name)
                 } else {
                     self.refs.resolve_scoped(&prefix.join("::"), name)
                 }
@@ -1292,7 +1292,7 @@ struct MemberScanCtx<'a> {
     analyzer: &'a dyn IAnalyzer,
     rust: &'a RustAnalyzer,
     support: &'a DefinitionIndexHandle<'a>,
-    refs: &'a RustReferenceContext,
+    refs: &'a RustReferenceContext<'a>,
     file: &'a ProjectFile,
     source: &'a str,
     root: Node<'a>,
@@ -2719,7 +2719,7 @@ fn structured_owner_candidate_fqn(
         .collect::<Option<Vec<_>>>()?;
     let (name, prefix) = names.split_last()?;
     let resolved = if prefix.is_empty() {
-        ctx.refs.resolve_bare(name).map(str::to_string)
+        ctx.refs.resolve_bare(name)
     } else {
         let path = prefix.join("::");
         ctx.refs.resolve_scoped(&path, name)
@@ -3024,7 +3024,7 @@ fn constructor_type_node_fqn(
     match type_node.kind() {
         "type_identifier" | "identifier" => {
             let name = simple_node_text(type_node, ctx.source)?;
-            refs.resolve_bare(&name).map(str::to_string)
+            refs.resolve_bare(&name)
         }
         "scoped_type_identifier" | "scoped_identifier" => {
             let path = type_node

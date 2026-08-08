@@ -8,7 +8,6 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use tree_sitter::Node;
 
 /// Owned, query-shaped declaration access used by Rust forward resolution.
@@ -32,11 +31,17 @@ pub(crate) trait RustDefinitionProvider {
         true
     }
 
-    fn forward_reference_context(
-        &self,
-        rust: &RustAnalyzer,
+    /// A forward reference resolver for `file`, or `None` when the caller's
+    /// session is already cancelled.
+    ///
+    /// The returned resolver borrows both the analyzer and `self`, because an
+    /// implementation carrying a resolution session threads that session's
+    /// keep-going predicate into it.
+    fn forward_reference_context<'r>(
+        &'r self,
+        rust: &'r RustAnalyzer,
         file: &ProjectFile,
-    ) -> Option<Arc<RustReferenceContext>> {
+    ) -> Option<RustReferenceContext<'r>> {
         Some(rust.forward_reference_context_of(file))
     }
 
@@ -122,12 +127,11 @@ pub(super) struct RustGraphSeeds {
 
 pub(crate) fn resolve_rust_path_fqn(
     rust: &RustAnalyzer,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     full_path: &str,
 ) -> Option<String> {
     refs.resolve_bare(full_path)
-        .map(str::to_string)
         .or_else(|| refs.resolve_scoped_owner(full_path))
         .or_else(|| rust.resolve_module_package(file, full_path))
 }
@@ -155,7 +159,7 @@ pub(crate) struct ResolvedRustTokenPathSegment<'tree> {
 pub(crate) fn resolve_rust_token_tree_paths<'tree>(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     source: &str,
     token_tree: Node<'tree>,
@@ -175,7 +179,7 @@ pub(crate) fn resolve_rust_token_tree_paths<'tree>(
 pub(crate) fn resolve_rust_token_tree_paths_admitting<'tree>(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     source: &str,
     token_tree: Node<'tree>,
@@ -349,7 +353,7 @@ fn resolve_direct_token_path_child(
 fn resolve_token_path_segment_fqn(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -432,7 +436,6 @@ pub(crate) fn lexical_import_fqn(
         forward
             .resolve_bare(name)
             .filter(|fqn| !support.fqn(fqn).is_empty())
-            .map(str::to_string)
     })
 }
 
@@ -981,7 +984,7 @@ fn rust_member_roles_match(
 pub(crate) fn resolve_scoped_associated_item(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     path: &str,
     method_name: &str,
@@ -1003,7 +1006,7 @@ pub(crate) fn resolve_scoped_associated_item(
 pub(crate) fn resolve_scoped_associated_item_matching(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     path: &str,
     item_name: &str,
@@ -1040,7 +1043,7 @@ pub(crate) fn resolve_scoped_associated_item_matching(
 pub(crate) fn resolve_owner_associated_item_matching(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     owner_fqn: &str,
     item_name: &str,
@@ -1077,7 +1080,7 @@ pub(crate) fn resolve_owner_associated_item_matching(
 pub(crate) fn resolve_exact_owner_associated_item_matching(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     owner: &CodeUnit,
     item_name: &str,
@@ -1122,7 +1125,7 @@ pub(crate) fn resolve_exact_owner_associated_item_matching(
 pub(crate) fn resolve_trait_associated_item(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     owner_fqn: &str,
     method_name: &str,
@@ -1144,7 +1147,7 @@ pub(crate) fn resolve_trait_associated_item(
 pub(crate) fn resolve_trait_associated_item_matching(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     owner_fqn: &str,
     item_name: &str,
@@ -1187,7 +1190,7 @@ pub(crate) fn resolve_trait_associated_item_matching(
 pub(crate) fn resolve_trait_associated_item_for_owner_matching(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
-    _refs: &RustReferenceContext,
+    _refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     owner: &CodeUnit,
     item_name: &str,
@@ -1406,8 +1409,7 @@ fn imported_impl_target_fqn(rust: &RustAnalyzer, target: &CodeUnit) -> Option<St
         return None;
     }
     let refs = rust.reference_context_of(target.source());
-    let resolved = refs.resolve_bare(target.identifier())?;
-    Some(resolved.to_string())
+    refs.resolve_bare(target.identifier())
 }
 
 fn infer_export_names(analyzer: &RustAnalyzer, target: &CodeUnit) -> BTreeSet<String> {

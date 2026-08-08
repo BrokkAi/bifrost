@@ -18,7 +18,6 @@
 use crate::analyzer::usages::{ExportEntry, ImportKind};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
-use rayon::prelude::*;
 use std::collections::{BTreeSet, VecDeque};
 use tree_sitter::Node;
 
@@ -880,22 +879,6 @@ fn rust_declaration_targets_in_files(
 }
 
 impl RustAnalyzer {
-    /// Build every per-file reference context now, so an interactive usage
-    /// query does not spend most of a warm scan constructing them one file at
-    /// a time.
-    ///
-    /// Separate from [`RustAnalyzer::warm_usage_facts`]: this is a
-    /// whole-workspace fan-out over every Rust file, which a large C++
-    /// workspace with a vendored Rust tree pays for work it never queries, so
-    /// sessions can leave it out (d8920a38). The fact catch-up always runs.
-    pub fn warm_usage_reference_contexts(&self) {
-        let _scope = crate::profiling::scope("RustAnalyzer::warm_usage_reference_contexts");
-        let files: Vec<ProjectFile> = self.get_analyzed_files().into_iter().collect();
-        files.par_iter().for_each(|file| {
-            self.reference_context_of(file);
-        });
-    }
-
     /// Candidate files: those importing a seed, plus the seed files themselves.
     pub(crate) fn usage_importers(&self, seeds: &RustBindingSeeds) -> HashSet<ProjectFile> {
         RustUsageWalks::new(self)
@@ -1322,7 +1305,7 @@ impl RustAnalyzer {
                                 file,
                                 byte,
                                 seeds,
-                                resolved_fqn,
+                                &resolved_fqn,
                                 &[],
                                 namespace,
                             )

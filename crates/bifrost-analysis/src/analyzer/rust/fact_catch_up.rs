@@ -310,21 +310,17 @@ mod tests {
 
     /// The warm no longer builds anything: it is the same catch-up, and on a
     /// workspace analysis already persisted it finds nothing to do. It must
-    /// still not drag the hierarchy index or every reference context in behind
-    /// it, which is what kept the two warms separate (#1757, d8920a38).
+    /// still not drag the hierarchy index in behind it, which is what kept the
+    /// warms separate (#1757, d8920a38). The reference contexts it used to be
+    /// paired with no longer exist to be built: resolution is per site.
     #[test]
-    fn warming_the_usage_facts_builds_neither_the_hierarchy_nor_the_reference_contexts() {
+    fn warming_the_usage_facts_does_not_build_the_hierarchy() {
         let (_temp, analyzer) = workspace_of(1);
-        let part = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/part0.rs");
         assert!(!analyzer.rust_usage_facts_warm());
 
         analyzer.warm_usage_facts();
 
         assert!(analyzer.rust_usage_facts_warm());
         assert!(!analyzer.hierarchy_index_built_for_test());
-        assert!(!analyzer.reference_context_built_for_test(&part));
-
-        analyzer.warm_usage_reference_contexts();
-        assert!(analyzer.reference_context_built_for_test(&part));
     }
 }

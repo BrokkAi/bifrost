@@ -333,6 +333,217 @@ impl UsageAnalyzer for RustExportUsageGraphStrategy {
 mod tests {
     use super::*;
     use crate::analyzer::{Language, TestProject};
+    use crate::test_support::AnalyzerFixture;
+
+    /// One crate whose `wide` module exports a broad surface, consumed through
+    /// a single namespace import. The eager reference context canonicalized
+    /// every one of those export names before scanning the consumer; the
+    /// per-site design canonicalizes only the name a site actually wrote.
+    const WIDE_EXPORT_SURFACE: usize = 20;
+
+    fn wide_export_surface_fixture() -> Vec<(String, String)> {
+        let mut wide = String::from("pub fn target() {}\n");
+        for index in 0..WIDE_EXPORT_SURFACE {
+            wide.push_str(&format!("pub struct Filler{index};\n"));
+        }
+        vec![
+            (
+                "Cargo.toml".to_string(),
+                "[package]\nname = \"wide\"\nversion = \"0.1.0\"\nedition = \"2021\"\n".to_string(),
+            ),
+            (
+                "src/lib.rs".to_string(),
+                "pub mod wide;\npub mod consumer;\n".to_string(),
+            ),
+            ("src/wide.rs".to_string(), wide),
+            (
+                "src/consumer.rs".to_string(),
+                "use crate::wide;\npub fn call() { wide::target(); }\n".to_string(),
+            ),
+        ]
+    }
+
+    fn fixture_for(files: &[(String, String)]) -> AnalyzerFixture {
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, body)| (path.as_str(), body.as_str()))
+            .collect();
+        AnalyzerFixture::new_for_language(Language::Rust, &borrowed)
+    }
+
+    fn declaration_named(analyzer: &RustAnalyzer, file: &ProjectFile, name: &str) -> CodeUnit {
+        analyzer
+            .declarations(file)
+            .into_iter()
+            .find(|unit| unit.identifier() == name)
+            .unwrap_or_else(|| panic!("no declaration named {name}"))
+    }
+
+    /// D1's central claim, as a number: a scan resolves the names its sites
+    /// wrote, not the export surface its candidates could reach.
+    ///
+    /// The consumer namespace-imports a module exporting `WIDE_EXPORT_SURFACE`
+    /// + 1 names and writes exactly one of them. Before the per-site rewrite
+    /// the scan built a reference context per candidate file, and building one
+    /// ran `canonical_export_fqn_from_files` once per export name of every
+    /// namespace-imported module -- so the count scaled with the surface, not
+    /// with the sites.
+    #[test]
+    fn usage_scan_does_not_canonicalize_the_whole_namespace_export_surface() {
+        let files = wide_export_surface_fixture();
+        let fixture = fixture_for(&files);
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let root = fixture.project_root();
+        let wide_file = ProjectFile::new(root.clone(), "src/wide.rs");
+        let consumer = ProjectFile::new(root.clone(), "src/consumer.rs");
+        let target = declaration_named(&analyzer, &wide_file, "target");
+        let candidates: HashSet<ProjectFile> = [consumer].into_iter().collect();
+
+        analyzer.reset_export_name_canonicalization_count_for_test();
+        let scope = UsageScanScope::new(&candidates, false);
+        let outcome = RustExportUsageGraphStrategy::new()
+            .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scope, 1000)
+            .into_fuzzy_result();
+        assert!(
+            !outcome.all_hits().is_empty(),
+            "the scan must still prove the one written site"
+        );
+
+        let canonicalizations = analyzer.export_name_canonicalization_count_for_test();
+        assert!(
+            canonicalizations <= 4,
+            "a scan of one site behind one namespace import canonicalized \
+             {canonicalizations} export names; the module exports \
+             {} and only one is written",
+            WIDE_EXPORT_SURFACE + 1
+        );
+    }
+
+    /// D3: the scan's cancellation token must reach reference resolution.
+    ///
+    /// The token trips on its fourth check. The scan checks it three times
+    /// before it would formerly build the candidate's reference context and
+    /// once immediately after, so the eager build ran to completion inside an
+    /// already-doomed scan -- the investigation's "a single build is
+    /// uninterruptible end to end". With resolution moved per site, no
+    /// export-name walk happens before the scan observes the cancellation.
+    ///
+    /// One candidate file keeps this deterministic: there is exactly one rayon
+    /// task, so the checks are consumed in source order. A budget of four is
+    /// the exact boundary -- at three the scan bails before the candidate's
+    /// context would be built, and at four it does not. The analyzer must be
+    /// cold, because a warmed context cache answers without walking anything
+    /// and would make the pin vacuous.
+    #[test]
+    fn cancelled_usage_scan_stops_before_walking_an_export_surface() {
+        let files = wide_export_surface_fixture();
+        let fixture = fixture_for(&files);
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let root = fixture.project_root();
+        let wide_file = ProjectFile::new(root.clone(), "src/wide.rs");
+        let consumer = ProjectFile::new(root.clone(), "src/consumer.rs");
+        let target = declaration_named(&analyzer, &wide_file, "target");
+        let candidates: HashSet<ProjectFile> = [consumer].into_iter().collect();
+
+        analyzer.reset_export_name_canonicalization_count_for_test();
+        let cancellation = CancellationToken::cancel_after_checks_for_test(4);
+        let scope = UsageScanScope::with_cancellation(&candidates, false, &cancellation);
+        let _ = RustExportUsageGraphStrategy::new().find_graph_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &scope,
+            1000,
+        );
+
+        assert!(cancellation.is_cancelled());
+        let canonicalizations = analyzer.export_name_canonicalization_count_for_test();
+        assert!(
+            canonicalizations <= 4,
+            "a cancelled scan canonicalized {canonicalizations} export names"
+        );
+    }
+
+    /// D2: the callsite cap is a stop condition, not a post-filter.
+    ///
+    /// Every caller file holds a hit, and the cap is one. Once the cap plus the
+    /// one hit that proves it is exceeded is reached, no further candidate is
+    /// opened -- so the scanned-file count stays well below the candidate
+    /// count.
+    ///
+    /// The scan is a rayon fan-out, so tasks already in flight when the stop
+    /// flag is set still finish. Running it in a two-thread pool bounds that
+    /// overshoot to one extra file and makes the assertion deterministic
+    /// regardless of how many cores the host has.
+    #[test]
+    #[ignore = "lands with the streaming cap (D2)"]
+    fn usage_scan_stops_opening_candidates_once_the_callsite_cap_is_proven() {
+        const CALLERS: usize = 24;
+        let mut files = vec![
+            (
+                "Cargo.toml".to_string(),
+                "[package]\nname = \"capped\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    .to_string(),
+            ),
+            (
+                "src/wide.rs".to_string(),
+                "pub fn target() {}\n".to_string(),
+            ),
+        ];
+        let mut lib = String::from("pub mod wide;\n");
+        for index in 0..CALLERS {
+            lib.push_str(&format!("pub mod caller{index};\n"));
+            files.push((
+                format!("src/caller{index}.rs"),
+                format!(
+                    "use crate::wide::target;\npub fn call{index}() {{ target(); target(); }}\n"
+                ),
+            ));
+        }
+        files.push(("src/lib.rs".to_string(), lib));
+
+        let fixture = fixture_for(&files);
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let root = fixture.project_root();
+        let wide_file = ProjectFile::new(root.clone(), "src/wide.rs");
+        let target = declaration_named(&analyzer, &wide_file, "target");
+        let candidates: HashSet<ProjectFile> = (0..CALLERS)
+            .map(|index| ProjectFile::new(root.clone(), format!("src/caller{index}.rs")))
+            .collect();
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("two-thread pool");
+        // Warm the analyzer state the scan shares across candidates in the same
+        // pool, so the counted run measures dispatch and nothing else.
+        pool.install(|| {
+            let warm_scope = UsageScanScope::new(&candidates, false);
+            let _ = RustExportUsageGraphStrategy::new().find_graph_usages(
+                &analyzer,
+                std::slice::from_ref(&target),
+                &warm_scope,
+                1000,
+            );
+        });
+
+        analyzer.reset_scanned_candidate_file_count_for_test();
+        let outcome = pool.install(|| {
+            let scope = UsageScanScope::new(&candidates, false);
+            RustExportUsageGraphStrategy::new()
+                .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scope, 1)
+                .into_fuzzy_result()
+        });
+        assert!(
+            matches!(outcome, FuzzyResult::TooManyCallsites { .. }),
+            "the cap must still be reported: {outcome:?}"
+        );
+
+        let scanned = analyzer.scanned_candidate_file_count_for_test();
+        assert!(
+            scanned < CALLERS,
+            "the scan opened {scanned} of {CALLERS} candidates after the cap was proven"
+        );
+    }
 
     #[test]
     fn cancelled_cold_candidate_discovery_does_not_publish_partial_index() {

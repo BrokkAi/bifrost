@@ -227,7 +227,9 @@ fn module_resolution_answers_are_unchanged() {
 /// Before the hoist, `insert_namespace_export_bindings` and
 /// `collect_glob_reference_bindings` recomputed the identical
 /// `resolve_module_files(file, specifier)` inside their per-name loops, so the
-/// count grew with the number of names the imported module exports.
+/// count grew with the number of names the imported module exports. Those two
+/// builders are gone; resolution is per site, and the same claim now applies to
+/// what answering one question costs.
 #[test]
 fn import_expansion_resolves_module_files_once_per_specifier() {
     let mut counts = Vec::new();
@@ -241,11 +243,17 @@ fn import_expansion_resolves_module_files_once_per_specifier() {
         analyzer.reset_module_file_resolution_count_for_test();
 
         let context = analyzer.reference_context_of(&consumer);
-        counts.push(analyzer.module_file_resolution_count_for_test());
         resolutions.push((
             context.resolve_scoped("svc", "EXPORT0"),
-            context.resolve_bare("HELPER0").map(str::to_string),
+            context.resolve_bare("HELPER0"),
         ));
+        // Counted after the questions are asked, not after the context is
+        // built. Constructing a resolver resolves no module files at all since
+        // the per-site rewrite, so reading the count at construction would pin
+        // zero against zero and prove nothing. The claim is unchanged and now
+        // measures the answering work directly: what these two questions cost
+        // must not grow with the number of names `svc` exports.
+        counts.push(analyzer.module_file_resolution_count_for_test());
     }
 
     assert_eq!(

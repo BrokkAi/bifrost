@@ -284,7 +284,7 @@ impl RustDiagnosticCollector<'_, '_> {
         }
         let refs = self.rust.reference_context_of(self.file);
         if let Some(resolved) = refs.resolve_bare(name)
-            && self.fqn_has_matching_declaration(resolved, kind)
+            && self.fqn_has_matching_declaration(&resolved, kind)
         {
             return true;
         }

@@ -96,11 +96,14 @@ where
     let seeds_cache = RustSeedsCache::default();
     let seeds_cache = &seeds_cache;
     build_edge_output(&files, keep_file, |file| {
-        let refs = rust.reference_context_of_with_progress(file, &|| keep_file(file))?;
+        keep_file(file).then_some(())?;
+        // The keep-going predicate goes into the resolver, not around it: an
+        // interrupted per-site walk answers nothing rather than half an answer.
+        let refs = rust.reference_context_of_while(file, || keep_file(file));
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
-            // One shared, cached per-file resolution context. Both this inverted
-            // builder and (from Phase 1b) the forward scan resolve references
-            // through it, so the two paths can't drift.
+            // One per-file resolution view. Both this inverted builder and the
+            // forward scan resolve references through the same primitive, so
+            // the two paths can't drift.
             let factory_returns = collect_factory_return_types(
                 parsed.tree.root_node(),
                 parsed.source.as_str(),
@@ -145,7 +148,7 @@ struct RustScan<'a, 'b> {
     seeds_cache: &'a RustSeedsCache,
     file: &'a ProjectFile,
     source: &'a str,
-    refs: Arc<RustReferenceContext>,
+    refs: RustReferenceContext<'a>,
     lexical_scope: RustLexicalScopeIndex,
     token_tree_roles: RustTokenTreeRoleCache,
     factory_returns: HashMap<String, String>,
@@ -171,7 +174,7 @@ impl RustScan<'_, '_> {
             return Some(local);
         }
         let text = slice(node, self.source);
-        let candidate = self.refs.resolve_bare(text)?.to_string();
+        let candidate = self.refs.resolve_bare(text)?;
         self.authorize_nonmember_candidate(candidate, &[node], namespace)
     }
 
@@ -209,14 +212,11 @@ impl RustScan<'_, '_> {
 
     fn bare_nominal_namespace(&self, node: Node<'_>) -> Option<RustReferenceNamespace> {
         let candidate = self.refs.resolve_bare(slice(node, self.source))?;
-        rust_unique_nominal_reference_namespace(self.rust, self.support, candidate)
+        rust_unique_nominal_reference_namespace(self.rust, self.support, &candidate)
     }
 
     fn bare_pattern_value_callee(&self, node: Node<'_>) -> Option<String> {
-        let candidate = self
-            .refs
-            .resolve_bare(slice(node, self.source))?
-            .to_string();
+        let candidate = self.refs.resolve_bare(slice(node, self.source))?;
         let mut declarations = self.support.fqn(&candidate);
         declarations.sort();
         declarations.dedup();
@@ -526,7 +526,7 @@ impl RustScan<'_, '_> {
         } else {
             let (name, prefix) = path.segments.split_last()?;
             if prefix.is_empty() {
-                self.refs.resolve_bare(name).map(str::to_string)
+                self.refs.resolve_bare(name)
             } else {
                 self.refs.resolve_scoped(&prefix.join("::"), name)
             }
@@ -1028,7 +1028,7 @@ fn callable_return_type(function: Node<'_>, ctx: &RustScan<'_, '_>) -> Option<St
             let name = slice(function, ctx.source);
             ctx.refs
                 .resolve_bare(name)
-                .and_then(|fqn| ctx.factory_returns.get(fqn).cloned())
+                .and_then(|fqn| ctx.factory_returns.get(&fqn).cloned())
         }
         "scoped_identifier" | "scoped_type_identifier" => {
             let path = function.child_by_field_name("path")?;
@@ -1045,7 +1045,7 @@ fn callable_return_type(function: Node<'_>, ctx: &RustScan<'_, '_>) -> Option<St
 fn collect_factory_return_types(
     root: Node<'_>,
     source: &str,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
 ) -> HashMap<String, String> {
     let mut returns = HashMap::default();
     let mut stack = vec![(root, None::<String>)];
@@ -1118,7 +1118,7 @@ fn type_node_fqn(type_node: Node<'_>, ctx: &RustScan<'_, '_>) -> Option<String> 
 fn type_node_fqn_with_impl(
     type_node: Node<'_>,
     source: &str,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     impl_owner_fqn: Option<&str>,
 ) -> Option<String> {
     match type_node.kind() {
@@ -1127,7 +1127,7 @@ fn type_node_fqn_with_impl(
             if name == "Self" {
                 return impl_owner_fqn.map(str::to_string);
             }
-            refs.resolve_bare(&name).map(str::to_string)
+            refs.resolve_bare(&name)
         }
         "scoped_type_identifier" | "scoped_identifier" => {
             let path = type_node

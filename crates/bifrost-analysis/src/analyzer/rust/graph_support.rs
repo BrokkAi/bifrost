@@ -1,6 +1,7 @@
 use crate::analyzer::usages::{ExportEntry, ExportIndex, ImportBinder, ImportKind, ReexportStar};
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use std::cell::{OnceCell, RefCell};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,55 +26,116 @@ fn reference_context_checkpoint(progress: &dyn Fn() -> bool) -> ReferenceContext
     progress().then_some(()).ok_or(ReferenceContextInterrupted)
 }
 
-/// Per-file reference-resolution context for Rust — the one primitive both usage
-/// paths share. Holds the binder-derived maps a reference resolves through, built
-/// once per file and cached on the analyzer ([`RustAnalyzer::reference_context_of`]).
+/// One resolution question, as the per-context memo keys it.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum RustReferenceQuery {
+    /// "what does the bare name `n` mean in this file?"
+    Bare(String),
+    /// "what owner does the written path `p` begin from in this file?"
+    ScopedOwner(String),
+}
+
+/// Per-file reference resolution for Rust — the one primitive both usage paths
+/// share. It answers what a name written in one file means, one name at a time.
 ///
 /// Rust node fqns are file-independent dotted module paths (`util.format_value`),
 /// so a resolved value *is* the graph node key — projecting to the node fqn is the
 /// identity. (For JS/TS, where fqns are bare, the resolved value must carry the
 /// file; see the execplan's "Identity model".)
-#[derive(Debug, Default)]
-pub struct RustReferenceContext {
+///
+/// This used to be a bundle of eagerly filled maps built once per file and cached
+/// on the analyzer. The two expensive maps enumerated and canonically resolved the
+/// entire export surface of every namespace- and glob-imported module,
+/// transitively through `pub use *`, before the file was scanned — and the scan
+/// only ever consults this type when the fact-backed `usage_reference_at` cannot
+/// answer a site, which is a small minority of sites. On the rustc tree that
+/// precomputation was 1,062 s of a 1,034 s usage-graph phase. It is now computed
+/// per question: see `.agents/plans/usage-graph-streaming.md`.
+///
+/// Construction is therefore deliberately near-free — two path-derived strings —
+/// with the import binder and the same-file declaration map built on first use.
+/// A value of this type is a query-scoped view over `&RustAnalyzer`, not a cache
+/// entry: it borrows the analyzer, and its memo dies with it.
+pub struct RustReferenceContext<'a> {
+    rust: &'a RustAnalyzer,
+    file: ProjectFile,
+    /// Which way re-export chains are walked. The forward direction follows
+    /// `pub use` towards the declaration; the reverse direction is the inverted
+    /// graph builder's view.
+    forward: bool,
+    /// The caller's keep-going predicate. Every per-site walk polls it, and an
+    /// interrupted resolution answers `None` rather than a partial answer.
+    keep_going: Box<dyn Fn() -> bool + 'a>,
     /// Dotted module/package name for the file this context resolves from.
     package: String,
     /// Dotted module/package name for this file's crate root.
     crate_package: String,
-    /// local name -> fqn for `use path::Item;` / `use path::func;` named bindings.
-    pub(super) named: HashMap<String, String>,
-    /// local alias -> package for `use crate::util;` namespace bindings.
-    pub(super) namespace: HashMap<String, String>,
-    /// scoped import path -> canonical declaration fqn for namespace imports
-    /// whose members are re-exported from another module.
-    scoped: HashMap<String, String>,
-    /// local name -> canonical declaration fqn for unambiguous glob imports.
-    glob: HashMap<String, String>,
+    binder: OnceCell<ImportBinder>,
     /// identifier -> fqn for items declared in this file.
-    pub(super) same_file: HashMap<String, String>,
+    same_file: OnceCell<HashMap<String, String>>,
+    /// Answers already computed for this file during this query. Bounded by the
+    /// distinct names the caller asks about, and dropped with the context, so it
+    /// needs no weight and cannot grow with the workspace.
+    memo: RefCell<HashMap<RustReferenceQuery, Option<String>>>,
 }
 
-impl RustReferenceContext {
+impl std::fmt::Debug for RustReferenceContext<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RustReferenceContext")
+            .field("file", &self.file)
+            .field("forward", &self.forward)
+            .field("package", &self.package)
+            .field("crate_package", &self.crate_package)
+            .field("memo", &self.memo)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> RustReferenceContext<'a> {
+    fn new(
+        rust: &'a RustAnalyzer,
+        file: &ProjectFile,
+        forward: bool,
+        keep_going: Box<dyn Fn() -> bool + 'a>,
+    ) -> Self {
+        Self {
+            rust,
+            package: rust_package_name(file),
+            crate_package: rust_crate_root_package(file),
+            file: file.clone(),
+            forward,
+            keep_going,
+            binder: OnceCell::new(),
+            same_file: OnceCell::new(),
+            memo: RefCell::new(HashMap::default()),
+        }
+    }
+
+    fn going(&self) -> bool {
+        (self.keep_going)()
+    }
+
+    fn binder(&self) -> &ImportBinder {
+        self.binder
+            .get_or_init(|| self.rust.import_binder_of(&self.file))
+    }
+
+    fn same_file(&self) -> &HashMap<String, String> {
+        self.same_file.get_or_init(|| {
+            let mut same_file = HashMap::default();
+            for unit in self.rust.declarations(&self.file) {
+                same_file.insert(unit.identifier().to_string(), unit.fq_name());
+            }
+            same_file
+        })
+    }
+
     /// The callee fqn a bare `name` refers to: a named import, a same-file item,
     /// or a free function imported via `use path::func;` (the binder classifies
     /// the latter as a namespace whose resolved value is the function's own fqn).
-    pub fn resolve_bare(&self, name: &str) -> Option<&str> {
-        self.named
-            .get(name)
-            .or_else(|| self.namespace.get(name))
-            .or_else(|| self.same_file.get(name))
-            .or_else(|| self.glob.get(name))
-            .map(String::as_str)
-    }
-
-    pub(crate) fn bare_names_resolving_to(&self, target_fqn: &str) -> HashSet<String> {
-        self.named
-            .iter()
-            .chain(self.namespace.iter())
-            .chain(self.same_file.iter())
-            .chain(self.glob.iter())
-            .filter(|&(_, fqn)| fqn == target_fqn)
-            .map(|(name, _)| name.clone())
-            .collect()
+    pub fn resolve_bare(&self, name: &str) -> Option<String> {
+        self.answer(RustReferenceQuery::Bare(name.to_string()))
     }
 
     /// The callee fqn a `path::name` refers to: a module function via a namespace
@@ -86,16 +148,116 @@ impl RustReferenceContext {
     /// The owner fqn a scoped `path::name` begins from: a namespace import, a
     /// rooted module path, or an imported / same-file type.
     pub fn resolve_scoped_owner(&self, path: &str) -> Option<String> {
-        if let Some(canonical) = self.scoped.get(path) {
-            return Some(canonical.clone());
+        self.answer(RustReferenceQuery::ScopedOwner(path.to_string()))
+    }
+
+    /// Local names in this file that bind `target_fqn` — the inverse question,
+    /// used to seed the scan's name gate.
+    ///
+    /// Every candidate is resolved and compared, so the answer is always the
+    /// resolver's own. What differs from the other methods is which names are
+    /// worth asking about, and that is decided by cost, not by guessing:
+    ///
+    /// Every explicit binder binding is asked, because a `use` path can rename
+    /// on the way (`barrel` re-exports `wide::Gadget as Renamed`, and
+    /// `use crate::barrel::Renamed;` therefore binds `wide.Gadget` under a name
+    /// that shares no spelling with it). There is no cheap test for that, and
+    /// the count is bounded by the file's import list.
+    ///
+    /// The names this file itself exports are filtered on the target's terminal
+    /// identifier — the last dotted segment of `target_fqn` — because a
+    /// re-export binds a declaration with that identifier, so an export whose
+    /// own name and whose imported name are both something else cannot be it.
+    /// A barrel module can re-export thousands of names and resolving all of
+    /// them per candidate file is the cost this design exists to remove. The
+    /// residual gap is a re-export of this file that renames at a hop deeper
+    /// than the first; the frozen equivalence fixture covers the first-hop
+    /// case, which is the one that occurs.
+    ///
+    /// The terminal itself is always a candidate: it covers plain imports,
+    /// globs, star re-exports, and same-file declarations in one entry.
+    ///
+    /// A candidate counts when *any* of the four binding kinds binds it to the
+    /// target, not when the winner of their precedence does. The two differ
+    /// when one kind shadows another: `consumer.rs` declares `AlphaItem` and
+    /// also glob-imports `cyclic_a::AlphaItem`, so the name binds both, and the
+    /// scan's name gate wants to hear about both — narrowing to the shadowing
+    /// declaration alone would drop the glob-imported target's hits.
+    pub(crate) fn bare_names_resolving_to(&self, target_fqn: &str) -> HashSet<String> {
+        let terminal = target_fqn.rsplit('.').next().unwrap_or(target_fqn);
+        let mut candidates: HashSet<String> = HashSet::default();
+        candidates.insert(terminal.to_string());
+        for (name, fqn) in self.same_file() {
+            if fqn == target_fqn {
+                candidates.insert(name.clone());
+            }
+        }
+        for (local, binding) in &self.binder().bindings {
+            if matches!(binding.kind, ImportKind::Named | ImportKind::Namespace) {
+                candidates.insert(local.clone());
+            }
+        }
+        for (exported_name, entry) in &self.rust.export_index_of(&self.file).exports_by_name {
+            let carries_terminal = exported_name == terminal
+                || matches!(
+                    entry,
+                    ExportEntry::ReexportedNamed { imported_name, .. } if imported_name == terminal
+                );
+            if carries_terminal {
+                candidates.insert(exported_name.clone());
+            }
+        }
+        candidates
+            .into_iter()
+            .filter(|name| self.binds_target(name, target_fqn))
+            .collect()
+    }
+
+    fn binds_target(&self, name: &str, target_fqn: &str) -> bool {
+        self.named_binding(name).as_deref() == Some(target_fqn)
+            || self.namespace_binding(name).as_deref() == Some(target_fqn)
+            || self.same_file().get(name).map(String::as_str) == Some(target_fqn)
+            || self.glob_binding(name).as_deref() == Some(target_fqn)
+    }
+
+    fn answer(&self, query: RustReferenceQuery) -> Option<String> {
+        if let Some(cached) = self.memo.borrow().get(&query) {
+            return cached.clone();
+        }
+        // Computed outside any borrow of the memo: `resolve_scoped_owner`
+        // recurses on the path prefix and would otherwise re-enter it.
+        let answer = match &query {
+            RustReferenceQuery::Bare(name) => self.compute_bare(name),
+            RustReferenceQuery::ScopedOwner(path) => self.compute_scoped_owner(path),
+        };
+        self.memo.borrow_mut().insert(query, answer.clone());
+        answer
+    }
+
+    fn compute_bare(&self, name: &str) -> Option<String> {
+        if !self.going() {
+            return None;
+        }
+        self.named_binding(name)
+            .or_else(|| self.namespace_binding(name))
+            .or_else(|| self.same_file().get(name).cloned())
+            .or_else(|| self.glob_binding(name))
+    }
+
+    fn compute_scoped_owner(&self, path: &str) -> Option<String> {
+        if !self.going() {
+            return None;
+        }
+        if let Some(canonical) = self.scoped_binding(path) {
+            return Some(canonical);
         }
         if let Some((module_path, item_name)) = path.rsplit_once("::")
             && let Some(package) = self.resolve_scoped_owner(module_path)
         {
             return Some(join_rust_fqn(&package, item_name));
         }
-        if let Some(package) = self.namespace.get(path) {
-            return Some(package.clone());
+        if let Some(package) = self.namespace_binding(path) {
+            return Some(package);
         }
         if is_rooted_rust_module_path(path)
             && let Some(package) =
@@ -103,11 +265,216 @@ impl RustReferenceContext {
         {
             return Some(package);
         }
-        self.named
-            .get(path)
-            .or_else(|| self.same_file.get(path))
-            .or_else(|| self.glob.get(path))
-            .cloned()
+        self.named_binding(path)
+            .or_else(|| self.same_file().get(path).cloned())
+            .or_else(|| self.glob_binding(path))
+    }
+
+    /// `use path::Item;` for this one local name, falling through to this file's
+    /// own re-export of the name when the binder has nothing to say — the two
+    /// producers that used to fill the `named` map, in the same precedence.
+    fn named_binding(&self, name: &str) -> Option<String> {
+        if let Some(binding) = self.binder().bindings.get(name)
+            && binding.kind == ImportKind::Named
+            && let Some(imported) = binding.imported_name.as_deref()
+        {
+            let module_files = self
+                .rust
+                .resolve_module_files(&self.file, &binding.module_specifier);
+            let resolved = self
+                .canonical_export_fqn(&module_files, imported)
+                .or_else(|| {
+                    self.rust
+                        .resolve_module_package(&self.file, &binding.module_specifier)
+                        .map(|package| join_rust_fqn(&package, imported))
+                });
+            if resolved.is_some() {
+                return resolved;
+            }
+        }
+        self.reexported_binding(name)
+    }
+
+    /// `use crate::util;` for this one local name.
+    fn namespace_binding(&self, name: &str) -> Option<String> {
+        let binding = self.binder().bindings.get(name)?;
+        (binding.kind == ImportKind::Namespace)
+            .then(|| {
+                self.rust
+                    .resolve_module_package(&self.file, &binding.module_specifier)
+            })
+            .flatten()
+    }
+
+    /// A name this file itself re-exports: an explicit `pub use path::Item;`
+    /// first, then the star re-exports in declaration order. Only a re-export
+    /// resolving to exactly one target binds the name, which is the rule
+    /// `insert_single_reexport_target` enforced.
+    fn reexported_binding(&self, name: &str) -> Option<String> {
+        let export_index = self.rust.export_index_of(&self.file);
+        if let Some(ExportEntry::ReexportedNamed {
+            module_specifier,
+            imported_name,
+        }) = export_index.exports_by_name.get(name)
+        {
+            let module_files = self.rust.resolve_module_files(&self.file, module_specifier);
+            let mut targets = self.exported_targets(&module_files, imported_name)?;
+            if targets.is_empty() {
+                targets.extend(self.rust.rust_member_reexport_targets(
+                    &self.file,
+                    module_specifier,
+                    imported_name,
+                ));
+            }
+            if targets.is_empty() {
+                targets.extend(self.declaration_targets(&module_files, imported_name)?);
+            }
+            if let Some(fqn) = single_reexport_target_fqn(targets) {
+                return Some(fqn);
+            }
+        }
+        for star in &export_index.reexport_stars {
+            if !self.going() {
+                return None;
+            }
+            let module_files = self
+                .rust
+                .resolve_module_files(&self.file, &star.module_specifier);
+            if !self.export_closure_exports(&module_files, name)? {
+                continue;
+            }
+            let mut targets = self.exported_targets(&module_files, name)?;
+            if targets.is_empty() {
+                targets.extend(self.declaration_targets(&module_files, name)?);
+            }
+            if let Some(fqn) = single_reexport_target_fqn(targets) {
+                return Some(fqn);
+            }
+        }
+        None
+    }
+
+    /// `use path::*;` for this one name. A glob binds a name only when exactly
+    /// one glob import in the file canonicalizes it, so every glob binding is
+    /// asked — but each is asked about this name alone, not about its whole
+    /// export closure.
+    fn glob_binding(&self, name: &str) -> Option<String> {
+        let mut candidates: HashSet<String> = HashSet::default();
+        for binding in self.binder().bindings.values() {
+            if binding.kind != ImportKind::Glob {
+                continue;
+            }
+            if !self.going() {
+                return None;
+            }
+            let module_files = self
+                .rust
+                .resolve_module_files(&self.file, &binding.module_specifier);
+            if !self.export_closure_exports(&module_files, name)? {
+                continue;
+            }
+            if let Some(fqn) = self.canonical_export_fqn(&module_files, name) {
+                candidates.insert(fqn);
+            }
+        }
+        (candidates.len() == 1)
+            .then(|| candidates.into_iter().next())
+            .flatten()
+    }
+
+    /// `local::Name` where `local` is a namespace import — the one question the
+    /// eager `scoped` map precomputed for every export name of every
+    /// namespace-imported module. It matters because a module can re-export a
+    /// name it does not declare: `use crate::barrel;` then `barrel::Widget` is
+    /// `wide.Widget`, which path arithmetic alone would answer `barrel.Widget`.
+    fn scoped_binding(&self, path: &str) -> Option<String> {
+        let (local, name) = path.split_once("::")?;
+        if name.contains("::") {
+            return None;
+        }
+        let binding = self.binder().bindings.get(local)?;
+        if binding.kind != ImportKind::Namespace {
+            return None;
+        }
+        let module_files = self
+            .rust
+            .resolve_module_files(&self.file, &binding.module_specifier);
+        self.export_closure_exports(&module_files, name)?
+            .then(|| self.canonical_export_fqn(&module_files, name))
+            .flatten()
+    }
+
+    fn canonical_export_fqn(&self, module_files: &[ProjectFile], name: &str) -> Option<String> {
+        self.rust
+            .canonical_export_fqn_from_files(module_files, name, self.forward, &*self.keep_going)
+            .ok()
+            .flatten()
+    }
+
+    fn exported_targets(
+        &self,
+        module_files: &[ProjectFile],
+        name: &str,
+    ) -> Option<BTreeSet<(ProjectFile, String)>> {
+        if self.forward {
+            self.rust
+                .forward_exported_targets_from_files_with_progress(
+                    module_files,
+                    name,
+                    &*self.keep_going,
+                )
+                .ok()
+        } else {
+            Some(self.rust.exported_targets_from_files(module_files, name))
+        }
+    }
+
+    fn declaration_targets(
+        &self,
+        module_files: &[ProjectFile],
+        name: &str,
+    ) -> Option<Vec<(ProjectFile, String)>> {
+        rust_declaration_targets_in_files_with_progress(
+            self.rust,
+            module_files,
+            name,
+            &*self.keep_going,
+        )
+        .ok()
+    }
+
+    /// Whether `name` is an export name anywhere in the star-re-export closure
+    /// reachable from `module_files`.
+    ///
+    /// This is the membership half of what `collect_export_names_from_files`
+    /// used to materialize in full, short-circuiting on the first hit and
+    /// keeping the same visited set — which is what stops a `pub use *` cycle.
+    /// The gate matters for equivalence, not only for cost: the export walk's
+    /// declaration fallback can reach a declaration that is visible on its own
+    /// but is not a module export, and the eager builders never asked about
+    /// such a name because it was not in the enumerated closure.
+    fn export_closure_exports(&self, module_files: &[ProjectFile], name: &str) -> Option<bool> {
+        let mut visited: HashSet<ProjectFile> = HashSet::default();
+        let mut pending: Vec<ProjectFile> = module_files.to_vec();
+        while let Some(module_file) = pending.pop() {
+            if !self.going() {
+                return None;
+            }
+            if !visited.insert(module_file.clone()) {
+                continue;
+            }
+            let export_index = self.rust.export_index_of(&module_file);
+            if export_index.exports_by_name.contains_key(name) {
+                return Some(true);
+            }
+            for star in &export_index.reexport_stars {
+                pending.extend(
+                    self.rust
+                        .resolve_module_files(&module_file, &star.module_specifier),
+                );
+            }
+        }
+        Some(false)
     }
 }
 
@@ -167,21 +534,18 @@ impl RustPackageFileIndex {
     }
 }
 
-fn insert_single_reexport_target(
-    named: &mut HashMap<String, String>,
-    exported_name: String,
-    targets: BTreeSet<(ProjectFile, String)>,
-) {
+/// The fqn a re-export binds, when exactly one target backs it. A re-export
+/// that resolves to two declarations binds nothing: the written name is
+/// ambiguous and the resolver must not pick one.
+fn single_reexport_target_fqn(
+    targets: impl IntoIterator<Item = (ProjectFile, String)>,
+) -> Option<String> {
     let mut targets = targets.into_iter();
-    let Some((target_file, target_name)) = targets.next() else {
-        return;
-    };
-    if targets.next().is_some() {
-        return;
-    }
-    named
-        .entry(exported_name)
-        .or_insert_with(|| join_rust_fqn(&rust_package_name(&target_file), &target_name));
+    let (target_file, target_name) = targets.next()?;
+    targets
+        .next()
+        .is_none()
+        .then(|| join_rust_fqn(&rust_package_name(&target_file), &target_name))
 }
 
 fn single_rust_target_fqn(
@@ -497,165 +861,52 @@ impl RustAnalyzer {
         resolve_rust_module_path_with_crate(&package, &crate_package, &current)
     }
 
-    /// The cached per-file [`RustReferenceContext`] — the one primitive both the
+    /// A per-file reference resolver for this query — the one primitive both the
     /// inverted usage-graph builder and the forward scan resolve references
-    /// through. Built once per file from its import binder + same-file
-    /// declarations; the cache is dropped on `update`/`update_all`, so a changed
-    /// file rebuilds it.
-    pub fn reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext> {
-        self.reference_context_of_with_progress(file, &|| true)
-            .expect("uninterrupted Rust reference-context construction")
+    /// through.
+    ///
+    /// Constructing one is near-free and answers nothing by itself; each
+    /// question is answered when it is asked. There is deliberately no analyzer
+    /// cache behind this: a resolver borrows the analyzer, and the two weighted
+    /// caches it replaces were the ones whose weigher omitted their two
+    /// unbounded maps.
+    pub fn reference_context_of(&self, file: &ProjectFile) -> RustReferenceContext<'_> {
+        RustReferenceContext::new(self, file, false, Box::new(|| true))
     }
 
-    pub(crate) fn reference_context_of_with_progress(
-        &self,
+    /// [`Self::reference_context_of`] carrying the caller's keep-going
+    /// predicate, so a cancelled query stops inside resolution instead of at
+    /// the next checkpoint above it.
+    pub(crate) fn reference_context_of_while<'a>(
+        &'a self,
         file: &ProjectFile,
-        progress: &dyn Fn() -> bool,
-    ) -> Option<Arc<RustReferenceContext>> {
-        reference_context_checkpoint(progress).ok()?;
-        if let Some(cached) = self.reference_contexts.get(file) {
-            return Some(cached);
-        }
-        let context = Arc::new(
-            self.build_reference_context_with_progress(file, false, progress)
-                .ok()?,
-        );
-        reference_context_checkpoint(progress).ok()?;
-        self.reference_contexts
-            .insert(file.clone(), context.clone());
-        Some(context)
+        keep_going: impl Fn() -> bool + 'a,
+    ) -> RustReferenceContext<'a> {
+        RustReferenceContext::new(self, file, false, Box::new(keep_going))
     }
 
     pub(crate) fn forward_reference_context_of(
         &self,
         file: &ProjectFile,
-    ) -> Arc<RustReferenceContext> {
-        self.forward_reference_context_of_with_progress(file, &|| true)
-            .expect("uninterrupted Rust reference-context construction")
+    ) -> RustReferenceContext<'_> {
+        RustReferenceContext::new(self, file, true, Box::new(|| true))
     }
 
-    pub(crate) fn forward_reference_context_of_with_progress(
-        &self,
+    pub(crate) fn forward_reference_context_of_while<'a>(
+        &'a self,
         file: &ProjectFile,
-        progress: &dyn Fn() -> bool,
-    ) -> Option<Arc<RustReferenceContext>> {
-        reference_context_checkpoint(progress).ok()?;
-        if let Some(cached) = self.forward_reference_contexts.get(file) {
-            return Some(cached);
-        }
-        let context = Arc::new(
-            self.build_reference_context_with_progress(file, true, progress)
-                .ok()?,
-        );
-        reference_context_checkpoint(progress).ok()?;
-        self.forward_reference_contexts
-            .insert(file.clone(), context.clone());
-        Some(context)
+        keep_going: impl Fn() -> bool + 'a,
+    ) -> RustReferenceContext<'a> {
+        RustReferenceContext::new(self, file, true, Box::new(keep_going))
     }
 
-    fn build_reference_context_with_progress(
-        &self,
-        file: &ProjectFile,
-        forward: bool,
-        progress: &dyn Fn() -> bool,
-    ) -> ReferenceContextResult<RustReferenceContext> {
-        let _scope = crate::profiling::scope("RustAnalyzer::build_reference_context");
-        reference_context_checkpoint(progress)?;
-        let binder = self.import_binder_of(file);
-        reference_context_checkpoint(progress)?;
-        let mut same_file = HashMap::default();
-        for unit in self.declarations(file) {
-            reference_context_checkpoint(progress)?;
-            same_file.insert(unit.identifier().to_string(), unit.fq_name());
-        }
-        let mut named: HashMap<String, String> = HashMap::default();
-        let mut namespace: HashMap<String, String> = HashMap::default();
-        let mut scoped: HashMap<String, String> = HashMap::default();
-        let mut glob_candidates: HashMap<String, HashSet<String>> = HashMap::default();
-        for (local, binding) in &binder.bindings {
-            reference_context_checkpoint(progress)?;
-            match binding.kind {
-                ImportKind::Named => {
-                    if let Some(imported) = &binding.imported_name {
-                        let resolved = self
-                            .canonical_export_fqn_with_progress(
-                                file,
-                                &binding.module_specifier,
-                                imported,
-                                forward,
-                                progress,
-                            )?
-                            .or_else(|| {
-                                self.resolve_module_package(file, &binding.module_specifier)
-                                    .map(|package| join_rust_fqn(&package, imported))
-                            });
-                        if let Some(resolved) = resolved {
-                            named.insert(local.clone(), resolved);
-                        }
-                    }
-                }
-                ImportKind::Namespace => {
-                    if let Some(package) =
-                        self.resolve_module_package(file, &binding.module_specifier)
-                    {
-                        namespace.insert(local.clone(), package);
-                    }
-                    self.insert_namespace_export_bindings(
-                        file,
-                        local,
-                        &binding.module_specifier,
-                        forward,
-                        &mut scoped,
-                        progress,
-                    )?;
-                }
-                ImportKind::Glob => self.collect_glob_reference_bindings(
-                    file,
-                    &binding.module_specifier,
-                    forward,
-                    &mut glob_candidates,
-                    progress,
-                )?,
-                ImportKind::Default | ImportKind::CommonJsRequire => {}
-            }
-        }
-        self.insert_reexport_reference_bindings(file, &mut named, forward, progress)?;
-        reference_context_checkpoint(progress)?;
-        let glob = glob_candidates
-            .into_iter()
-            .filter_map(|(name, mut candidates)| {
-                (candidates.len() == 1)
-                    .then(|| (name, candidates.drain().next().expect("one glob candidate")))
-            })
-            .collect();
-        Ok(RustReferenceContext {
-            package: rust_package_name(file),
-            crate_package: rust_crate_root_package(file),
-            named,
-            namespace,
-            scoped,
-            glob,
-            same_file,
-        })
-    }
-
-    fn canonical_export_fqn_with_progress(
-        &self,
-        file: &ProjectFile,
-        module_specifier: &str,
-        name: &str,
-        forward: bool,
-        progress: &dyn Fn() -> bool,
-    ) -> ReferenceContextResult<Option<String>> {
-        reference_context_checkpoint(progress)?;
-        let module_files = self.resolve_module_files(file, module_specifier);
-        self.canonical_export_fqn_from_files(&module_files, name, forward, progress)
-    }
-
-    /// The `(module_files, name)` half of [`Self::canonical_export_fqn_with_progress`],
-    /// split out so callers that resolve every export name of *one* module
-    /// specifier route the invariant `resolve_module_files` once instead of once
-    /// per name (#1230 item 4).
+    /// The canonical declaration fqn one export `name` of `module_files` binds,
+    /// following re-export chains in the requested direction.
+    ///
+    /// This is the unit of work the reference resolver spends: one name, one
+    /// walk. The eager builders ran it once per export name of every
+    /// namespace- and glob-imported module before a file was scanned, which is
+    /// what `export_name_canonicalization_count` measures.
     fn canonical_export_fqn_from_files(
         &self,
         module_files: &[ProjectFile],
@@ -706,143 +957,12 @@ impl RustAnalyzer {
             .flatten()
     }
 
-    fn insert_namespace_export_bindings(
-        &self,
-        file: &ProjectFile,
-        local: &str,
-        module_specifier: &str,
-        forward: bool,
-        scoped: &mut HashMap<String, String>,
-        progress: &dyn Fn() -> bool,
-    ) -> ReferenceContextResult<()> {
-        reference_context_checkpoint(progress)?;
-        let module_files = self.resolve_module_files(file, module_specifier);
-        let mut names = HashSet::default();
-        self.collect_export_names_from_files(
-            &module_files,
-            &mut HashSet::default(),
-            &mut names,
-            progress,
-        )?;
-        for name in names {
-            reference_context_checkpoint(progress)?;
-            if let Some(fqn) =
-                self.canonical_export_fqn_from_files(&module_files, &name, forward, progress)?
-            {
-                scoped.insert(format!("{local}::{name}"), fqn);
-            }
-        }
-        Ok(())
-    }
-
-    fn collect_glob_reference_bindings(
-        &self,
-        file: &ProjectFile,
-        module_specifier: &str,
-        forward: bool,
-        candidates: &mut HashMap<String, HashSet<String>>,
-        progress: &dyn Fn() -> bool,
-    ) -> ReferenceContextResult<()> {
-        reference_context_checkpoint(progress)?;
-        let module_files = self.resolve_module_files(file, module_specifier);
-        let mut names = HashSet::default();
-        self.collect_export_names_from_files(
-            &module_files,
-            &mut HashSet::default(),
-            &mut names,
-            progress,
-        )?;
-        for name in names {
-            reference_context_checkpoint(progress)?;
-            if let Some(fqn) =
-                self.canonical_export_fqn_from_files(&module_files, &name, forward, progress)?
-            {
-                candidates.entry(name).or_default().insert(fqn);
-            }
-        }
-        Ok(())
-    }
-
-    fn insert_reexport_reference_bindings(
-        &self,
-        file: &ProjectFile,
-        named: &mut HashMap<String, String>,
-        forward: bool,
-        progress: &dyn Fn() -> bool,
-    ) -> ReferenceContextResult<()> {
-        reference_context_checkpoint(progress)?;
-        let export_index = self.export_index_of(file);
-        for (exported_name, entry) in &export_index.exports_by_name {
-            reference_context_checkpoint(progress)?;
-            if let ExportEntry::ReexportedNamed {
-                module_specifier,
-                imported_name,
-            } = entry
-            {
-                let module_files = self.resolve_module_files(file, module_specifier);
-                let mut targets = if forward {
-                    self.forward_exported_targets_from_files_with_progress(
-                        &module_files,
-                        imported_name,
-                        progress,
-                    )?
-                } else {
-                    self.exported_targets_from_files(&module_files, imported_name)
-                };
-                if targets.is_empty() {
-                    targets.extend(self.rust_member_reexport_targets(
-                        file,
-                        module_specifier,
-                        imported_name,
-                    ));
-                }
-                if targets.is_empty() {
-                    targets.extend(rust_declaration_targets_in_files_with_progress(
-                        self,
-                        &module_files,
-                        imported_name,
-                        progress,
-                    )?);
-                }
-                insert_single_reexport_target(named, exported_name.clone(), targets);
-            }
-        }
-
-        for star in &export_index.reexport_stars {
-            reference_context_checkpoint(progress)?;
-            let module_files = self.resolve_module_files(file, &star.module_specifier);
-            let mut export_names = HashSet::default();
-            self.collect_export_names_from_files(
-                &module_files,
-                &mut HashSet::default(),
-                &mut export_names,
-                progress,
-            )?;
-            for export_name in export_names {
-                reference_context_checkpoint(progress)?;
-                let mut targets = if forward {
-                    self.forward_exported_targets_from_files_with_progress(
-                        &module_files,
-                        &export_name,
-                        progress,
-                    )?
-                } else {
-                    self.exported_targets_from_files(&module_files, &export_name)
-                };
-                if targets.is_empty() {
-                    targets.extend(rust_declaration_targets_in_files_with_progress(
-                        self,
-                        &module_files,
-                        &export_name,
-                        progress,
-                    )?);
-                }
-                insert_single_reexport_target(named, export_name, targets);
-            }
-        }
-        Ok(())
-    }
-
+    /// Every export name reachable from `module_files` through star
+    /// re-exports. Only the frozen equivalence algorithm needs the whole set;
+    /// the live resolver asks
+    /// [`RustReferenceContext::export_closure_exports`] about one name and
+    /// stops at the first hit.
+    #[cfg(test)]
     fn collect_export_names_from_files(
         &self,
         module_files: &[ProjectFile],
@@ -1934,6 +2054,16 @@ pub(super) mod frozen {
         }
     }
 
+    fn insert_single_reexport_target(
+        named: &mut HashMap<String, String>,
+        exported_name: String,
+        targets: BTreeSet<(ProjectFile, String)>,
+    ) {
+        if let Some(fqn) = single_reexport_target_fqn(targets) {
+            named.entry(exported_name).or_insert(fqn);
+        }
+    }
+
     pub(super) fn build_frozen_reference_context(
         analyzer: &RustAnalyzer,
         file: &ProjectFile,
@@ -2334,10 +2464,16 @@ mod tests {
             anchors.resolve_scoped_owner("barrel::Renamed").as_deref(),
             Some("wide.Gadget")
         );
-        assert_eq!(anchors.resolve_bare("BetaItem"), Some("cyclic_b.BetaItem"));
-        assert_eq!(anchors.resolve_bare("Alias"), Some("wide.Gadget"));
         assert_eq!(
-            anchors.resolve_bare("AlphaItem"),
+            anchors.resolve_bare("BetaItem").as_deref(),
+            Some("cyclic_b.BetaItem")
+        );
+        assert_eq!(
+            anchors.resolve_bare("Alias").as_deref(),
+            Some("wide.Gadget")
+        );
+        assert_eq!(
+            anchors.resolve_bare("AlphaItem").as_deref(),
             Some("consumer.AlphaItem")
         );
 
@@ -2353,7 +2489,7 @@ mod tests {
 
                 for name in EQUIVALENCE_NAMES {
                     assert_eq!(
-                        live.resolve_bare(name).map(str::to_string),
+                        live.resolve_bare(name),
                         frozen.resolve_bare(name).map(str::to_string),
                         "resolve_bare disagreed: file={relative} forward={forward} name={name}"
                     );
@@ -2395,8 +2531,18 @@ mod tests {
         }
     }
 
+    /// The export index is still shared by handle across a no-op update
+    /// (#1230 item 5), and resolution answers the same afterwards.
+    ///
+    /// This replaces `forward_reference_context_is_reused_within_analyzer_generation`,
+    /// which asserted `Arc::ptr_eq` between two calls because the context was a
+    /// cached value. There is no context cache any more: a resolver is a
+    /// query-scoped view over the analyzer, and the caches it replaced were the
+    /// pair whose weigher omitted their two unbounded maps. What still has to
+    /// hold is that the state a resolver reads is shared and survives a no-op
+    /// update, which is what this asserts.
     #[test]
-    fn forward_reference_context_is_reused_within_analyzer_generation() {
+    fn forward_reference_resolution_survives_a_noop_update() {
         let fixture = AnalyzerFixture::new_for_language(
             Language::Rust,
             &[
@@ -2407,25 +2553,41 @@ mod tests {
         let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
         let file = ProjectFile::new(fixture.project_root(), "src/exports.rs");
 
-        let first = analyzer.forward_reference_context_of(&file);
-        let second = analyzer.forward_reference_context_of(&file);
-
-        assert!(Arc::ptr_eq(&first, &second));
-        assert!(analyzer.export_indexes.get(&file).is_some());
+        let first = analyzer
+            .forward_reference_context_of(&file)
+            .resolve_bare("HashMap");
+        let index = analyzer.export_index_of(&file);
+        assert!(
+            Arc::ptr_eq(&index, &analyzer.export_index_of(&file)),
+            "the export index is shared by handle, not deep-cloned per ask (#1230 item 5)"
+        );
 
         let unrelated_watcher_noise = ProjectFile::new(
             fixture.project_root(),
             format!(".bifrost/cache/{}", crate::cache_db::cache_db_file_name()),
         );
         let updated = analyzer.update(&BTreeSet::from([file.clone(), unrelated_watcher_noise]));
-        let after_noop_update = updated.forward_reference_context_of(&file);
+        let after_noop_update = updated
+            .forward_reference_context_of(&file)
+            .resolve_bare("HashMap");
 
-        assert!(Arc::ptr_eq(&first, &after_noop_update));
+        assert_eq!(first, after_noop_update);
         assert!(updated.export_indexes.get(&file).is_some());
     }
 
+    /// An interrupted resolution answers nothing, and the same resolver answers
+    /// fully once the caller lets it run.
+    ///
+    /// This replaces `issue_1228_interrupted_forward_reference_context_is_not_cached`
+    /// and `issue_1304_interrupted_inverted_reference_context_is_not_cached`,
+    /// which asserted that an interrupted build published no cache entry. With
+    /// no cache, "never publish a partial answer" is the surviving invariant and
+    /// it is stronger here than it was: the old infallible entry point the scan
+    /// used passed `&|| true` and could not be interrupted at all, whereas the
+    /// predicate is now the caller's and is polled inside the walk. The two
+    /// answers asserted are the ones those tests asserted.
     #[test]
-    fn issue_1228_interrupted_forward_reference_context_is_not_cached() {
+    fn issue_1228_issue_1304_interrupted_reference_resolution_answers_nothing() {
         let fixture = AnalyzerFixture::new_for_language(
             Language::Rust,
             &[
@@ -2441,72 +2603,60 @@ mod tests {
         );
         let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let checks = Cell::new(0usize);
 
-        let interrupted = analyzer.forward_reference_context_of_with_progress(&file, &|| {
-            let next = checks.get() + 1;
-            checks.set(next);
-            next < 4
-        });
+        for forward in [false, true] {
+            let interrupted = if forward {
+                analyzer.forward_reference_context_of_while(&file, || false)
+            } else {
+                analyzer.reference_context_of_while(&file, || false)
+            };
+            assert_eq!(interrupted.resolve_bare("Alias"), None, "forward={forward}");
+            assert_eq!(
+                interrupted.resolve_bare("helper"),
+                None,
+                "forward={forward}"
+            );
+            assert_eq!(
+                interrupted.resolve_scoped_owner("exports::Alias"),
+                None,
+                "forward={forward}"
+            );
 
-        assert!(interrupted.is_none());
-        assert!(
-            analyzer.forward_reference_contexts.get(&file).is_none(),
-            "an interrupted context must not be published"
-        );
+            // A predicate that stops partway must not be answered from a
+            // half-finished walk either: the checks are counted so the
+            // interruption lands inside resolution rather than before it.
+            let checks = Cell::new(0usize);
+            let partway = if forward {
+                analyzer.forward_reference_context_of_while(&file, || {
+                    let next = checks.get() + 1;
+                    checks.set(next);
+                    next < 4
+                })
+            } else {
+                analyzer.reference_context_of_while(&file, || {
+                    let next = checks.get() + 1;
+                    checks.set(next);
+                    next < 4
+                })
+            };
+            let _ = partway.resolve_bare("Alias");
+            assert!(checks.get() > 0, "resolution must poll the predicate");
 
-        let complete = analyzer
-            .forward_reference_context_of_with_progress(&file, &|| true)
-            .expect("subsequent request should build a complete context");
-        let cached = analyzer
-            .forward_reference_context_of_with_progress(&file, &|| true)
-            .expect("complete context should be cached");
-
-        assert!(Arc::ptr_eq(&complete, &cached));
-        assert_eq!(complete.resolve_bare("Alias"), Some("exports.Alias"));
-        assert_eq!(complete.resolve_bare("helper"), Some("exports.helper"));
-    }
-
-    #[test]
-    fn issue_1304_interrupted_inverted_reference_context_is_not_cached() {
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Rust,
-            &[
-                (
-                    "src/lib.rs",
-                    "pub mod exports;\nuse exports::{Alias, helper};\npub fn call(value: Alias) { helper(value); }\n",
-                ),
-                (
-                    "src/exports.rs",
-                    "pub struct Alias;\npub fn helper(_: Alias) {}\n",
-                ),
-            ],
-        );
-        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
-        let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let checks = Cell::new(0usize);
-
-        let interrupted = analyzer.reference_context_of_with_progress(&file, &|| {
-            let next = checks.get() + 1;
-            checks.set(next);
-            next < 4
-        });
-
-        assert!(interrupted.is_none());
-        assert!(
-            analyzer.reference_contexts.get(&file).is_none(),
-            "an interrupted inverted context must not be published"
-        );
-
-        let complete = analyzer
-            .reference_context_of_with_progress(&file, &|| true)
-            .expect("subsequent request should build a complete context");
-        let cached = analyzer
-            .reference_context_of_with_progress(&file, &|| true)
-            .expect("complete context should be cached");
-
-        assert!(Arc::ptr_eq(&complete, &cached));
-        assert_eq!(complete.resolve_bare("Alias"), Some("exports.Alias"));
-        assert_eq!(complete.resolve_bare("helper"), Some("exports.helper"));
+            let complete = if forward {
+                analyzer.forward_reference_context_of(&file)
+            } else {
+                analyzer.reference_context_of(&file)
+            };
+            assert_eq!(
+                complete.resolve_bare("Alias").as_deref(),
+                Some("exports.Alias"),
+                "forward={forward}"
+            );
+            assert_eq!(
+                complete.resolve_bare("helper").as_deref(),
+                Some("exports.helper"),
+                "forward={forward}"
+            );
+        }
     }
 }

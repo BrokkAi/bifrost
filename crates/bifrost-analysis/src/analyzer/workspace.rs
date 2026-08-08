@@ -499,19 +499,6 @@ impl WorkspaceAnalyzer {
         }
     }
 
-    /// Pre-build every per-file Rust reference context. A whole-workspace
-    /// fan-out, kept separate from [`Self::warm_rust_usage_facts`] so a
-    /// session that does not query the Rust usage graph can leave it out.
-    /// A no-op for workspaces without Rust.
-    pub fn warm_rust_usage_reference_contexts(&self) {
-        if let Some(rust) =
-            crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
-        {
-            let _scope = crate::analyzer::AnalyzerQueryScope::new(self.analyzer());
-            rust.warm_usage_reference_contexts();
-        }
-    }
-
     /// Whether a Rust usage query would wait for a fact catch-up batch.
     ///
     /// Re-pointed by ExecPlan Milestone 3 from "is the v1 usage index built"
