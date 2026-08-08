@@ -243,6 +243,70 @@ pub fn source_identifier_for_target(target: &CodeUnit) -> &str {
     }
 }
 
+/// Whether `identifier` is a spelling a caller can address `target` by: the
+/// persisted `identifier`, or the source spelling
+/// ([`source_identifier_for_target`]) when the two differ. This is exactly the
+/// membership [`decorated_identifier_seeks`] widens the index seek to, so a
+/// caller that re-filters seeked rows must use this and not `==` on the raw
+/// identifier, or it narrows the seek back to the bug.
+pub(crate) fn identifier_addresses_target(target: &CodeUnit, identifier: &str) -> bool {
+    target.identifier() == identifier || source_identifier_for_target(target) == identifier
+}
+
+/// One key range in the persisted `(lang, identifier)` index.
+///
+/// `Prefix` is a half-open byte range over the same index, not a scan: see
+/// [`decorated_identifier_seeks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdentifierSeek {
+    Exact(String),
+    /// Every identifier that starts with this string.
+    Prefix(String),
+}
+
+/// The persisted `identifier` spellings, beyond `source_identifier` itself,
+/// whose [`source_identifier_for_target`] is `source_identifier`. The exact
+/// inverse of that function, per language.
+///
+/// Symbol lookup seeks the identifier index by the terminal segment of a query
+/// path, and compares the rows it gets back against a declaration's lookup
+/// aliases. Those aliases are derived from the *source* spelling: `#1063` made
+/// the arity-free `Widget` an alias of the C# generic type indexed as
+/// ``Widget`1``, and the `$`-splitting variant makes `create` an alias of the
+/// TypeScript static member indexed as `create$static`. So an alias tail is
+/// *not* always a spelling of the persisted identifier, and a seek for the
+/// source spelling alone cannot see those declarations.
+///
+/// That matters beyond a missed candidate, because two gates in
+/// `symbol_lookup` treat an indexed miss as conclusive rather than fall back to
+/// a whole-workspace scan (`#1688`, `#1758`; the scan cost 194.3 s and 443.1 s
+/// respectively on the measured workspaces). Both gates rest on exactly the
+/// claim this function repairs: that seeking the query's terminal finds every
+/// candidate an alias comparison could match.
+///
+/// The returned keys are a candidate filter, never the answer. A prefix range
+/// admits spellings that are not decorations at all (``Widget`x`` is not a
+/// generic arity), so the caller must still compare
+/// `source_identifier_for_target` on each row -- the same seek-then-verify
+/// discipline `sql_search_definitions_by_suffix_pattern` uses.
+pub(crate) fn decorated_identifier_seeks(
+    language: Language,
+    source_identifier: &str,
+) -> Vec<IdentifierSeek> {
+    if source_identifier.is_empty() {
+        return Vec::new();
+    }
+    match language {
+        // A generic type or method carries CLR arity: `Widget`1`, and
+        // `Widget``2` for a generic method's own parameters. Arity is a digit
+        // run of no fixed length, so the decorated spellings are a prefix
+        // range rather than an enumerable set.
+        Language::CSharp => vec![IdentifierSeek::Prefix(format!("{source_identifier}`"))],
+        Language::TypeScript => vec![IdentifierSeek::Exact(format!("{source_identifier}$static"))],
+        _ => Vec::new(),
+    }
+}
+
 pub(crate) fn is_valid_rename_identifier(language: Language, name: &str) -> bool {
     is_identifier_text(name) && !is_reserved_identifier(language, name)
 }

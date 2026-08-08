@@ -2413,6 +2413,65 @@ fn issue_1758_ambiguous_selector_project() -> BuiltInlineTestProject {
         .build()
 }
 
+/// Issue #1063, re-broken and re-fixed. A declaration's lookup aliases are
+/// built from its *source* spelling, but the identifier index is keyed on the
+/// persisted one, and the two differ for a C# generic type (``Widget`1``) and
+/// a TypeScript static member (`create$static`). While symbol lookup fell back
+/// to a whole-workspace scan the difference only cost time; once `7e7ac9ee`
+/// (#1688) and `0b35bb12` (#1758) made an indexed miss conclusive, it became a
+/// wrong `NotFound` -- `csharp_generic_type_resolves_without_arity_spelling`
+/// and `scan_usages_resolves_public_typescript_static_method_symbol` are the
+/// resolution pins for that.
+///
+/// This is the cost pin for the repair: the decorated spellings are reached by
+/// widening the *seek* (`decorated_identifier_seeks`), so both conclusive-miss
+/// gates stay in force and neither language's declaration table is read end to
+/// end.
+#[test]
+fn issue_1063_decorated_identifier_spellings_resolve_without_a_full_declaration_scan() {
+    let project = InlineTestProject::new()
+        .file(
+            "src/Primitives.cs",
+            "namespace ScottPlot;\n\npublic class CountingCollection<T> {\n    public void Add(T item) {}\n}\n",
+        )
+        .file(
+            "src/api.ts",
+            "export class ApiClient {\n  static create(baseUrl: string): ApiClient {\n    return new ApiClient();\n  }\n}\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+
+    analyzer.reset_full_declaration_scan_count_for_test();
+
+    let arity_free = source_for(analyzer, "CountingCollection");
+    assert!(arity_free.not_found.is_empty(), "{arity_free:#?}");
+    assert_eq!(1, arity_free.sources.len(), "{arity_free:#?}");
+    assert_eq!(
+        "src/Primitives.cs", arity_free.sources[0].path,
+        "{arity_free:#?}"
+    );
+
+    let static_member = source_for(analyzer, "ApiClient.create");
+    assert!(static_member.not_found.is_empty(), "{static_member:#?}");
+    assert_eq!(1, static_member.sources.len(), "{static_member:#?}");
+    assert_eq!(
+        "src/api.ts", static_member.sources[0].path,
+        "{static_member:#?}"
+    );
+
+    // A genuine miss must still be conclusive, not a scan.
+    let miss = source_for(analyzer, "NoSuchDeclaration");
+    assert!(miss.sources.is_empty(), "{miss:#?}");
+    assert_eq!(1, miss.not_found.len(), "{miss:#?}");
+
+    assert_eq!(
+        0,
+        analyzer.full_declaration_scan_count_for_test(),
+        "reaching a decorated identifier spelling must stay an index seek"
+    );
+}
+
 /// Issue #1758: fuzzy resolution's last stage decided ambiguity by
 /// materializing `get_all_declarations()` -- every declaration of every
 /// workspace language -- and rescanning it. Measured on the reported

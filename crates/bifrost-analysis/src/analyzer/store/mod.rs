@@ -2606,6 +2606,42 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
+    /// Candidate rows whose `identifier` starts with `prefix`.
+    ///
+    /// A half-open range over the same `(lang, identifier)` index the exact
+    /// forms above seek, so this is a bounded range scan and not a table walk:
+    /// `identifier` has the default BINARY collation, and `upper` is `prefix`
+    /// with its last byte incremented. Symbol lookup needs it because C#
+    /// indexes a generic type under a CLR arity of no fixed width
+    /// (``Widget`1``, ``Widget``2``) while the lookup alias is the arity-free
+    /// source spelling, so the decorated spellings cannot be enumerated into
+    /// an `IN` list. See `decorated_identifier_seeks`; the caller verifies
+    /// each row, because the range also admits non-arity spellings.
+    ///
+    /// `prefix` must be non-empty and must not end in `0xFF`, which has no
+    /// byte successor. Every caller derives it by appending an ASCII
+    /// decoration character to an identifier.
+    pub(crate) fn declaration_candidate_rows_by_identifier_prefix_for_langs(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        prefix: &str,
+    ) -> Result<Vec<CandidateRow>> {
+        let upper = byte_successor(prefix)
+            .expect("an identifier prefix is a non-empty string with a byte successor");
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let rows = candidate_rows_for_languages(
+            &tx,
+            langs.iter().map(String::as_str),
+            &identifier_prefix_candidate_sql(),
+            &[&prefix, &upper.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
     pub(crate) fn declaration_candidate_rows_by_identifier_for_langs_limited(
         &self,
         langs: &[String],
@@ -3429,6 +3465,37 @@ impl AnalyzerStore {
 
 fn declaration_candidate_sql(predicate: &str) -> String {
     declaration_candidate_sql_with_order(predicate, "units.blob_oid, units.unit_key")
+}
+
+/// `declaration_candidate_rows_by_identifier_prefix_for_langs`'s query. Named
+/// so `identifier_prefix_lookup_seeks_the_identifier_index` can plan it.
+fn identifier_prefix_candidate_sql() -> String {
+    candidate_rows_sql_with_membership(
+        "units",
+        "FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+        "units.lang = ?1 AND units.identifier >= ?2 AND units.identifier < ?3",
+        "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
+        "units.blob_oid, units.unit_key",
+    )
+}
+
+/// The least string greater than every string starting with `prefix`, under
+/// SQLite's BINARY collation, so that `col >= prefix AND col < successor` is
+/// an index range over exactly the prefix matches.
+///
+/// `None` when `prefix` is empty or ends in a byte with no successor that
+/// keeps the result valid UTF-8 (`0x7f`, or any continuation byte of a
+/// multi-byte character).
+fn byte_successor(prefix: &str) -> Option<String> {
+    let last = *prefix.as_bytes().last()?;
+    if !last.is_ascii() || last == 0x7f {
+        return None;
+    }
+    let mut bytes = prefix.as_bytes().to_vec();
+    *bytes.last_mut().expect("prefix is non-empty") = last + 1;
+    String::from_utf8(bytes).ok()
 }
 
 fn limited_declaration_candidate_sql(predicate: &str) -> String {
@@ -12550,6 +12617,45 @@ mod tests {
                 .all(|detail| !detail.contains("USE TEMP B-TREE")),
             "legacy replacement-cost fallback must not materialize grouping state: {fallback_plan:#?}"
         );
+    }
+
+    // The C# arity-free lookup (#1063) reaches ``Widget`1`` through an
+    // identifier *prefix*, which is only affordable as an index range. If the
+    // planner ever reads `code_units` end to end for it, symbol lookup is back
+    // to the per-language table walk #1688 and #1758 removed (194.3 s and
+    // 443.1 s on the measured workspaces).
+    #[test]
+    fn identifier_prefix_lookup_seeks_the_identifier_index() {
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let sql = format!("EXPLAIN QUERY PLAN {}", identifier_prefix_candidate_sql());
+        let mut statement = conn.prepare(&sql).unwrap();
+        let plan = statement
+            .query_map(params_from_iter(["csharp", "Widget`", "Widgeta"]), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            plan.iter().any(|detail| detail
+                .contains("SEARCH units USING INDEX idx_code_units_lang_identifier_lookup")),
+            "the prefix range must seek the identifier index: {plan:#?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("SCAN units")),
+            "the prefix range must never scan code_units: {plan:#?}"
+        );
+    }
+
+    #[test]
+    fn byte_successor_bounds_a_prefix_range() {
+        assert_eq!(Some("Widgeta".to_string()), byte_successor("Widget`"));
+        assert_eq!(Some("create%".to_string()), byte_successor("create$"));
+        assert_eq!(None, byte_successor(""));
+        // A multi-byte tail has no single-byte successor that stays UTF-8.
+        assert_eq!(None, byte_successor("Wid\u{00e9}"));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::analyzer::common::identifier_addresses_target;
 use crate::analyzer::common::language_for_target as code_unit_language;
 use crate::analyzer::csharp::strip_csharp_generic_arity;
 use crate::analyzer::fq_name::{FqName, SegmentInterner, SegmentKind};
@@ -413,7 +414,14 @@ fn bare_name_resolution(
     // before that phase, not discovered by paying for it (#1839).
     for candidate in analyzer.lookup_candidates_by_identifier(leaf) {
         budget.keep_going()?;
-        if include(&candidate) && candidate.identifier() == leaf {
+        // `identifier_addresses_target`, not `identifier() == leaf`: the
+        // indexed lookup is keyed on the spelling a caller can address, and a
+        // C# generic type or a TypeScript static member is addressed by a
+        // source spelling its persisted identifier decorates. Re-filtering on
+        // the raw identifier would drop exactly those declarations, and a bare
+        // query would then silently resolve a lone same-named namesake instead
+        // of reporting the ambiguity this function exists to report (#1057).
+        if include(&candidate) && identifier_addresses_target(&candidate, leaf) {
             insert_match(&mut matches, &candidate);
         }
     }

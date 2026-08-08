@@ -1,6 +1,9 @@
 use arc_swap::ArcSwapOption;
 
 use crate::analyzer::cognitive_complexity;
+use crate::analyzer::common::{
+    IdentifierSeek, decorated_identifier_seeks, identifier_addresses_target,
+};
 use crate::analyzer::pool_memo::KeyedPoolSafeMemo;
 use crate::analyzer::project::{OverlayRevision, ProjectSourceOrigin, ProjectSourceSnapshot};
 use crate::analyzer::store::liveness::{LivePathEntry, LivePathMap, LiveSnapshot, Liveness};
@@ -6630,9 +6633,19 @@ where
         Some(matches)
     }
 
+    /// Declarations this analyzer indexes under `identifier`, where
+    /// "indexes under" means the spelling a caller can address the declaration
+    /// by -- `source_identifier_for_target`, not the raw persisted
+    /// `identifier`. The two differ for C# generic arity and TypeScript
+    /// `$static`, and the callers in `symbol_lookup` compare against lookup
+    /// aliases built from the source spelling, so a raw-only lookup would miss
+    /// exactly those declarations (#1063). `decorated_identifier_seeks`
+    /// supplies the extra index keys; the row filter below stays authoritative
+    /// because a prefix range also admits spellings that are not decorations.
     pub(crate) fn lookup_declarations_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
         let langs = self.storage_language_keys_for_queries();
-        let rows = self
+        let names = |unit: &CodeUnit| identifier_addresses_target(unit, identifier);
+        let mut rows = self
             .store_query_or_record(
                 self.store_context
                     .store
@@ -6644,21 +6657,44 @@ where
                 format!("querying declarations by identifier `{identifier}`"),
             )
             .unwrap_or_default();
+        for seek in decorated_identifier_seeks(self.adapter.language(), identifier) {
+            let decorated = match &seek {
+                IdentifierSeek::Exact(spelling) => self.store_query_or_record(
+                    self.store_context
+                        .store
+                        .declaration_candidate_rows_by_identifier_for_langs(
+                            &langs,
+                            self.store_context.generations.as_ref(),
+                            spelling,
+                        ),
+                    format!("querying declarations by decorated identifier `{spelling}`"),
+                ),
+                IdentifierSeek::Prefix(prefix) => self.store_query_or_record(
+                    self.store_context
+                        .store
+                        .declaration_candidate_rows_by_identifier_prefix_for_langs(
+                            &langs,
+                            self.store_context.generations.as_ref(),
+                            prefix,
+                        ),
+                    format!("querying declarations by decorated identifier prefix `{prefix}`"),
+                ),
+            };
+            rows.extend(decorated.unwrap_or_default());
+        }
         let mut matches: BTreeSet<_> = self
             .resolve_candidate_rows(rows)
             .into_iter()
-            .filter(|unit| unit.identifier() == identifier)
+            .filter(&names)
             .collect();
         // `true`: dirty (edited-but-not-yet-persisted) file state must offer
         // the same membership as the widened SQL query above, or unsaved
         // edits to a definition-lookup-only unit would regress to invisible
         // while its persisted counterpart resolves.
-        matches.extend(self.dirty_units_matching(true, |unit| unit.identifier() == identifier));
+        matches.extend(self.dirty_units_matching(true, &names));
         matches.extend(
-            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
-                unit.identifier() == identifier
-            })
-            .unwrap_or_default(),
+            self.sql_nonpersisted_workspace_declarations_vec_matching(&names)
+                .unwrap_or_default(),
         );
         matches
     }
