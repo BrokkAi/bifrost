@@ -8520,14 +8520,24 @@ pub fn qualified_owner_components<'tree>(
 /// Return the terminal type-name occurrence in an out-of-line destructor
 /// declarator such as `endpoint::~endpoint`.  Unlike an ordinary terminal
 /// method name, this identifier is a second reference to the owner type.
+///
+/// Every extra qualifier nests another `qualified_identifier` in the `name`
+/// field, so `zmq::pair_t::~pair_t` reaches the destructor only two levels
+/// down. Reading one level dropped the terminal occurrence for every
+/// file-scope out-of-line member libzmq writes (#1831).
 pub fn out_of_line_destructor_type_reference(node: Node<'_>) -> Option<Node<'_>> {
     if node.kind() != "qualified_identifier" {
         return None;
     }
-    let destructor = node.child_by_field_name("name")?;
-    if destructor.kind() != "destructor_name" {
-        return None;
-    }
+    let mut qualified = node;
+    let destructor = loop {
+        let name = qualified.child_by_field_name("name")?;
+        match name.kind() {
+            "qualified_identifier" => qualified = name,
+            "destructor_name" => break name,
+            _ => return None,
+        }
+    };
     (0..destructor.named_child_count())
         .filter_map(|index| destructor.named_child(index))
         .find(|child| matches!(child.kind(), "identifier" | "type_identifier"))

@@ -47,6 +47,7 @@ mod usages_cpp_macro_return_test;
 mod usages_cpp_macro_sentinel_owner_test;
 mod usages_cpp_macro_sentinel_receiver_test;
 mod usages_cpp_macro_sibling_class_test;
+mod usages_cpp_qualified_destructor_test;
 mod usages_cpp_recursive_free_function_test;
 mod usages_cpp_repeated_tag_test;
 mod usages_cpp_return_tag_shadow_test;
