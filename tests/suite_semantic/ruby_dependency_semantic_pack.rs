@@ -353,6 +353,173 @@ end
     );
 }
 
+// #1794: a gem archive is untrusted input. An entry the RBS projection cannot
+// model has to leave the producer with a pack it can still publish, and that
+// pack has to be `Partial` so the absence prover from #1624 refuses to turn the
+// projection's own blind spot into proof that a constant does not exist.
+#[test]
+fn a_gem_declaration_this_producer_cannot_model_yields_a_partial_pack_that_cannot_prove_absence() {
+    let modeled =
+        classify_missing_constant(b"class Widget\n  def call: (String value) -> Integer\nend\n");
+    assert_eq!(modeled.completeness, Completeness::Complete, "{modeled:#?}");
+    assert!(modeled.diagnostic_codes.is_empty(), "{modeled:#?}");
+    assert!(
+        modeled.proved_absent,
+        "a complete gem surface must prove `Widget::Missing` absent: {modeled:#?}"
+    );
+
+    // The same class, plus declarations outside every projected arm, plus
+    // comments that carry no surface and so must stay trivia.
+    let unmodeled = classify_missing_constant(
+        br#"# a gem's own copyright header
+class Widget
+  # a comment between the header and the first member
+  def call: (String value) -> Integer
+  @hidden: untyped
+end
+$hostile: untyped
+type shadow = Integer
+"#,
+    );
+    assert_eq!(
+        unmodeled.completeness,
+        Completeness::Partial,
+        "{unmodeled:#?}"
+    );
+    assert!(
+        unmodeled
+            .diagnostic_codes
+            .iter()
+            .any(|code| code == "ruby.rbs.unsupported_member"),
+        "{unmodeled:#?}"
+    );
+    assert!(
+        unmodeled
+            .diagnostic_codes
+            .iter()
+            .any(|code| code == "ruby.rbs.unsupported_declaration"),
+        "{unmodeled:#?}"
+    );
+    assert!(
+        !unmodeled.proved_absent,
+        "a partial gem surface must not prove `Widget::Missing` absent: {unmodeled:#?}"
+    );
+    assert!(
+        unmodeled
+            .suppressed
+            .as_deref()
+            .is_some_and(|detail| detail.contains("partial")),
+        "{unmodeled:#?}"
+    );
+}
+
+#[derive(Debug)]
+struct GemClassification {
+    completeness: Completeness,
+    diagnostic_codes: Vec<String>,
+    proved_absent: bool,
+    suppressed: Option<String>,
+}
+
+/// Drives one crafted `.rbs` through the whole offline Ruby pack path and
+/// reports how the diagnostics lane then classifies `Widget::Missing`.
+fn classify_missing_constant(rbs: &[u8]) -> GemClassification {
+    let fixture = InlineTestProject::with_language(Language::Ruby)
+        .file("Gemfile.lock", LOCKFILE)
+        .file("main.rb", "Widget::Missing\n")
+        .build();
+    let archives = tempfile::tempdir().unwrap();
+    let archive = gem_archive(&[("sig/widget.rbs", rbs)]);
+    let archive_path = archives.path().join("widget-1.2.3.gem");
+    fs::write(&archive_path, &archive).unwrap();
+    let config = AnalyzerConfig {
+        ruby: RubyAnalyzerConfig {
+            dependency_api_evidence: vec![RubyDependencyApiEvidence {
+                lockfile_path: fixture.root().join("Gemfile.lock"),
+                lockfile_sha256: digest(LOCKFILE.as_bytes()),
+                ruby_version: "3.4.1".to_owned(),
+                platform: "ruby".to_owned(),
+                approved_archive_roots: vec![archives.path().to_path_buf()],
+                gems: vec![RubyGemApiArtifact {
+                    name: "widget".to_owned(),
+                    version: "1.2.3".to_owned(),
+                    source: "https://rubygems.org/".to_owned(),
+                    checksum: Some(digest(&archive)),
+                    gem_archive_path: archive_path.clone(),
+                }],
+            }],
+        },
+        ..AnalyzerConfig::default()
+    };
+    let project = Arc::new(FilesystemProject::new(fixture.root()).unwrap());
+    let analyzer = WorkspaceAnalyzer::build(project.clone(), config.clone());
+    let limits = DependencyPackLimits::default();
+    let discovery =
+        resolve_ruby_semantic_pack_dependencies(&config.ruby, project.as_ref(), &limits, None);
+    assert!(discovery.complete, "{:#?}", discovery.diagnostics);
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let prepared = prepare_discovered_dependency_semantic_packs(
+        &catalog,
+        &RubyDependencyPackAdapter,
+        discovery,
+        &limits,
+        None,
+    );
+    assert_eq!(prepared.packs.len(), 1, "{:#?}", prepared.diagnostics);
+    let completeness = prepared.packs[0].completeness;
+    let diagnostic_codes = prepared
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code.clone())
+        .collect::<Vec<_>>();
+    let request = prepared
+        .compose_activation_request(SemanticModelActivationRequest {
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            evidence: Vec::new(),
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        })
+        .unwrap();
+    let SemanticModelRuntimeOutcome::Ready { .. } = acquire_active_semantic_models(
+        analyzer.analyzer(),
+        &catalog,
+        None,
+        &request,
+        &CancellationToken::default(),
+    ) else {
+        panic!("the crafted Ruby gem pack must still activate");
+    };
+    let main = fixture.file("main.rb");
+    let main_source = project.read_source(&main).unwrap();
+    let report = analyzer
+        .analyzer()
+        .semantic_diagnostics(&main, &main_source);
+    let proved_absent = report.outcomes().iter().any(|outcome| {
+        matches!(
+            outcome,
+            SemanticDiagnosticOutcome::Absent(proof)
+                if proof.boundary == BoundaryStatus::ExternalIndexed
+        )
+    });
+    let suppressed = report.outcomes().iter().find_map(|outcome| match outcome {
+        SemanticDiagnosticOutcome::Incomplete { reasons, .. } => {
+            reasons.iter().find_map(|reason| match reason {
+                SemanticDiagnosticIncompleteReason::UnsupportedSemantics { detail } => {
+                    Some(detail.clone())
+                }
+                _ => None,
+            })
+        }
+        _ => None,
+    });
+    GemClassification {
+        completeness,
+        diagnostic_codes,
+        proved_absent,
+        suppressed,
+    }
+}
+
 fn gem_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut compressed = Vec::new();
     {
