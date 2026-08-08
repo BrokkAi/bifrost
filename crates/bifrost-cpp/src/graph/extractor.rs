@@ -2037,6 +2037,15 @@ fn resolve_callable_candidates(
         return BareCallTargetResolution::Missing;
     }
     let Some(call_arity) = call_arity else {
+        // An unproven argument count cannot create ambiguity where lookup found
+        // exactly one name binding: there is nothing to be ambiguous between.
+        // C has no overloading at all, and a lone C++ candidate is the only
+        // declaration unqualified lookup reached, so arity cannot pick another
+        // one (#1811). Keeping it unproven discarded the proven candidate and
+        // answered `ambiguous` with an empty definition list.
+        if candidates.len() == 1 {
+            return BareCallTargetResolution::FreeFunctions(candidates);
+        }
         return BareCallTargetResolution::UnprovenFreeFunctions(candidates);
     };
     let applicable = candidates
@@ -4539,8 +4548,16 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             Some(true) => {}
             Some(false) => return,
             None => {
-                push_unproven_hit(function_terminal_node(function), ctx);
-                return;
+                // The argument count is unknown after macro expansion. It still
+                // cannot select a *different* target when the bare name binds
+                // to exactly one visible callable, so let the bare-call
+                // resolution below prove that site; every other shape stays
+                // unproven (#1811, the scan side of the same over-conservatism
+                // that made the forward answer discard its lone candidate).
+                if !bare_name_binds_only_target(node, function, text, ctx) {
+                    push_unproven_hit(function_terminal_node(function), ctx);
+                    return;
+                }
             }
         }
     }
@@ -4628,6 +4645,34 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     } else {
         push_unproven_hit(function_terminal_node(function), ctx);
     }
+}
+
+/// Whether the bare name at `call` binds to exactly one visible callable, and
+/// that callable is the scan target.
+///
+/// This is the scan-side reading of the #1811 rule: with one name binding there
+/// is nothing an unknown argument count could select instead, so the site is a
+/// proven reference rather than an unproven one. Only bare identifiers qualify;
+/// a member or qualified call reaches its target through a receiver this cannot
+/// judge.
+fn bare_name_binds_only_target(
+    call: Node<'_>,
+    function: Node<'_>,
+    text: &str,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    if !matches!(function.kind(), "identifier" | "template_function") {
+        return false;
+    }
+    let mut candidates = ctx
+        .visibility
+        .named_candidates(ctx.file, text, TargetKind::FreeFunction);
+    candidates.retain(|candidate| {
+        ctx.visibility
+            .declaration_visible_at(&ctx.analyzer, ctx.file, candidate, call.start_byte())
+    });
+    dedupe_callable_candidates(&mut candidates);
+    matches!(candidates.as_slice(), [only] if same_visible_symbol(only, &ctx.spec.target))
 }
 
 fn free_function_call_may_target(call: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {

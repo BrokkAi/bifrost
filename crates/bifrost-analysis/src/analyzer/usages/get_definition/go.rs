@@ -1288,17 +1288,18 @@ fn resolve_go_local_selector_chain(
 fn go_ambiguous_selector_outcome(
     support: &dyn GoDefinitionProvider,
     member: &str,
-    mut candidates: Vec<CodeUnit>,
+    candidates: Vec<CodeUnit>,
 ) -> DefinitionLookupOutcome {
-    sort_units(&mut candidates);
-    candidates.dedup();
-    let mut outcome = ambiguous_definition(format!(
+    let message = format!(
         "`{member}` resolves to multiple Go embedded members at the nearest promotion depth"
-    ));
-    if support.retain_ambiguous_candidate_evidence() {
-        outcome.definitions = candidates;
+    );
+    if !support.retain_ambiguous_candidate_evidence() {
+        // no candidates: this provider deliberately withholds candidate
+        // evidence, and the ICFG contract reads the ambiguous status as a
+        // `DispatchUnresolved` boundary.
+        return ambiguous_without_candidates(message);
     }
-    outcome
+    ambiguous_candidates_outcome(candidates, message)
 }
 
 fn go_partial_selector_chain_outcome(

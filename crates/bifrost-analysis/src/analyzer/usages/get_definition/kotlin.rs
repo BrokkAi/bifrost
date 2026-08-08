@@ -888,7 +888,9 @@ impl<'a> KotlinCtx<'a> {
             );
         }
         if records.iter().any(|record| record.provenance.ambiguous) {
-            return ambiguous_definition(format!(
+            // no candidates: the conflicting records are semantic-model symbols,
+            // not indexed code units, so none can be offered as a target.
+            return ambiguous_without_candidates(format!(
                 "`{subject}` matches conflicting active Kotlin model declarations"
             ));
         }

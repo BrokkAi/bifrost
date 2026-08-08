@@ -2418,14 +2418,19 @@ fn resolve_cpp_type(
                                     ));
                                 }
                                 Err(error) => {
-                                    return ambiguous_definition(cpp_template_resolution_message(
-                                        &text, &error,
-                                    ));
+                                    // no candidates: the contenders are template
+                                    // specialization patterns, not indexed units;
+                                    // the message names every one of them.
+                                    return ambiguous_without_candidates(
+                                        cpp_template_resolution_message(&text, &error),
+                                    );
                                 }
                             }
                         }
                         Some(CppLexicalTypeResolution::Ambiguous) => {
-                            return ambiguous_definition(format!(
+                            // no candidates: `LexicalTypeResolution::Ambiguous`
+                            // reports the fail-closed verdict without the units.
+                            return ambiguous_without_candidates(format!(
                                 "`{text}` resolves ambiguously in its enclosing C++ class or namespace"
                             ));
                         }
@@ -2435,7 +2440,9 @@ fn resolve_cpp_type(
                     }
                 }
                 CppLexicalScopeResolution::Ambiguous => {
-                    return ambiguous_definition(format!(
+                    // no candidates: the ambiguity is in the enclosing scope, so
+                    // no member candidate was ever collected.
+                    return ambiguous_without_candidates(format!(
                         "the enclosing C++ owner of `{text}` resolves ambiguously"
                     ));
                 }
@@ -2459,7 +2466,11 @@ fn resolve_cpp_type(
                 ));
             }
             Err(error) => {
-                return ambiguous_definition(cpp_template_resolution_message(&text, &error));
+                // no candidates: the contenders are template specialization
+                // patterns, not indexed units; the message names every one.
+                return ambiguous_without_candidates(cpp_template_resolution_message(
+                    &text, &error,
+                ));
             }
             Ok(Some(_)) | Ok(None) => {}
         }
@@ -2746,7 +2757,9 @@ fn resolve_cpp_type_without_focused_qualifier(
                 ) {
                     CppLexicalTypeResolution::Resolved { unit, .. } => Some(unit),
                     CppLexicalTypeResolution::Ambiguous => {
-                        return ambiguous_definition(format!(
+                        // no candidates: `LexicalTypeResolution::Ambiguous`
+                        // reports the fail-closed verdict without the units.
+                        return ambiguous_without_candidates(format!(
                             "`{owner_reference}` resolves ambiguously in its enclosing C++ class or namespace"
                         ));
                     }
@@ -2754,7 +2767,9 @@ fn resolve_cpp_type_without_focused_qualifier(
                 }
             }
             CppLexicalScopeResolution::Ambiguous => {
-                return ambiguous_definition(format!(
+                // no candidates: the ambiguity is in the enclosing scope, so no
+                // member candidate was ever collected.
+                return ambiguous_without_candidates(format!(
                     "enclosing C++ scope for `{owner_reference}` is ambiguous"
                 ));
             }
@@ -2822,7 +2837,9 @@ fn resolve_cpp_type_without_focused_qualifier(
                 return candidates_outcome(candidates);
             }
             if let Some(error) = specialization_failure {
-                return ambiguous_definition(cpp_template_resolution_message(text, &error));
+                // no candidates: the contenders are template specialization
+                // patterns, not indexed units; the message names every one.
+                return ambiguous_without_candidates(cpp_template_resolution_message(text, &error));
             }
         } else {
             // A template type parameter names no indexed type but is
@@ -2919,7 +2936,9 @@ fn resolve_cpp_type_without_focused_qualifier(
             return candidates_outcome(candidates);
         }
         if let Some(error) = specialization_failure {
-            return ambiguous_definition(cpp_template_resolution_message(text, &error));
+            // no candidates: the contenders are template specialization
+            // patterns, not indexed units; the message names every one.
+            return ambiguous_without_candidates(cpp_template_resolution_message(text, &error));
         }
         // #1163 (was pinned at cpp.rs:2402): a `::`-qualified/scoped identifier
         // whose qualifier names a *sibling* nested namespace now resolves through
@@ -2999,7 +3018,9 @@ fn resolve_cpp_type_without_focused_qualifier(
                         ));
                     }
                     CppLexicalTypeResolution::Ambiguous => {
-                        return ambiguous_definition(format!(
+                        // no candidates: `LexicalTypeResolution::Ambiguous`
+                        // reports the fail-closed verdict without the units.
+                        return ambiguous_without_candidates(format!(
                             "`{text}` resolves ambiguously in its enclosing C++ class or namespace"
                         ));
                     }
@@ -3008,7 +3029,9 @@ fn resolve_cpp_type_without_focused_qualifier(
                 }
             }
             CppLexicalScopeResolution::Ambiguous => {
-                return ambiguous_definition(format!(
+                // no candidates: the ambiguity is in the enclosing scope, so no
+                // member candidate was ever collected.
+                return ambiguous_without_candidates(format!(
                     "the enclosing C++ owner of `{text}` resolves ambiguously"
                 ));
             }
@@ -3040,7 +3063,9 @@ fn resolve_cpp_type_without_focused_qualifier(
                             ));
                         }
                         CppLexicalTypeResolution::Ambiguous => {
-                            return ambiguous_definition(format!(
+                            // no candidates: `LexicalTypeResolution::Ambiguous`
+                            // reports the fail-closed verdict without the units.
+                            return ambiguous_without_candidates(format!(
                                 "`{text}` resolves ambiguously in its enclosing C++ namespace"
                             ));
                         }
@@ -3995,9 +4020,14 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 };
                 if !member_candidates.is_empty() {
                     if call_arity.is_none() {
-                        return ambiguous_definition(format!(
-                            "the argument count for C++ call `{name}` is unknown after macro expansion"
-                        ));
+                        // The competing members are in hand; an ambiguous answer
+                        // must carry them rather than drop them (#1811).
+                        return ambiguous_candidates_outcome(
+                            member_candidates,
+                            format!(
+                                "the argument count for C++ call `{name}` is unknown after macro expansion"
+                            ),
+                        );
                     }
                     return cpp_callable_candidates_outcome(member_candidates);
                 }
@@ -4048,11 +4078,14 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     return cpp_callable_candidates_outcome(candidates);
                 }
                 CppBareCallTargetResolution::UnprovenFreeFunctions(units) => {
-                    if units.len() < 2 {
-                        return ambiguous_definition(format!(
-                            "the argument count for C++ call `{name}` is unknown after macro expansion"
-                        ));
-                    }
+                    // `resolve_callable_candidates` answers `FreeFunctions` for a
+                    // lone candidate and never builds an empty candidate set, so
+                    // an unproven-arity answer always has something to be
+                    // ambiguous between (#1811).
+                    debug_assert!(
+                        units.len() >= 2,
+                        "unproven-arity C++ call `{name}` must carry competing candidates, got {units:?}"
+                    );
                     let candidates =
                         cpp_bare_free_function_definition_candidates(ctx, units, call.start_byte());
                     return ambiguous_candidates_outcome(
@@ -4079,7 +4112,9 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     );
                 }
                 CppBareCallTargetResolution::Ambiguous => {
-                    return ambiguous_definition(format!(
+                    // no candidates: `BareCallTargetResolution::Ambiguous` is the
+                    // resolver's fail-closed verdict and carries no units.
+                    return ambiguous_without_candidates(format!(
                         "C++ bare call `{name}` has ambiguous lookup candidates"
                     ));
                 }

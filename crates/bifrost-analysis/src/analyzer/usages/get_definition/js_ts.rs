@@ -667,24 +667,23 @@ fn merge_js_ts_binding_outcomes(
         definitions.extend(outcome.definitions);
         diagnostics.extend(outcome.diagnostics);
     }
+    let competing_imports = format!("`{reference}` is supplied by multiple visible imports");
     let mut outcome = if definitions.is_empty() {
-        DefinitionLookupOutcome {
-            status: DefinitionLookupStatus::Ambiguous,
-            reference: None,
-            definitions,
-            lexical_definition: None,
-            diagnostics,
-        }
+        // no candidates: several imports supply the name and none of them
+        // reached an indexed definition, so there is no unit to offer.
+        let mut outcome = ambiguous_without_candidates(competing_imports);
+        outcome.diagnostics.extend(diagnostics);
+        outcome
     } else {
         let mut outcome = js_ts_candidates_outcome(analyzer, definitions);
         outcome.status = DefinitionLookupStatus::Ambiguous;
         outcome.diagnostics.extend(diagnostics);
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            kind: "ambiguous_definition".to_string(),
+            message: competing_imports,
+        });
         outcome
     };
-    outcome.diagnostics.push(DefinitionLookupDiagnostic {
-        kind: "ambiguous_definition".to_string(),
-        message: format!("`{reference}` is supplied by multiple visible imports"),
-    });
     if crossed_external_boundary {
         outcome.diagnostics.push(DefinitionLookupDiagnostic {
             kind: PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC.to_string(),

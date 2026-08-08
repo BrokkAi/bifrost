@@ -20585,76 +20585,120 @@ void wrong_namespace() {
 
     let unknown_file = project.file("unknown.cc");
     let unknown_source = unknown_file.read_to_string().expect("unknown source");
-    for (target, line, expected_fqn) in [
-        (
-            &widget,
-            "    Widget(UNKNOWN_ARGS); // unproven-unknown-class-arity",
-            widget.fq_name(),
-        ),
-        (
-            &function_wins,
-            "    FunctionWins(UNKNOWN_ARGS); // unproven-unknown-free-arity",
-            function_wins.fq_name(),
-        ),
-    ] {
-        let call = fixture_token_range(&unknown_source, line, target.identifier());
-        let forward = forward_in("unknown.cc", &unknown_source, line, target.identifier());
-        assert_ne!("resolved", forward.status, "{line}: {forward:#?}");
-        assert!(
-            forward
-                .declarations
-                .iter()
-                .all(|definition| definition.fqn.as_deref() != Some(expected_fqn.as_str())),
-            "unknown arity must not produce an exact forward target: {forward:#?}"
-        );
 
-        let provider = ExplicitCandidateProvider::new(Arc::new(
-            std::iter::once(unknown_file.clone()).collect(),
-        ));
-        let targeted = UsageFinder::new()
-            .with_authoritative_scope(true)
-            .query_with_provider(
-                &analyzer,
-                std::slice::from_ref(target),
-                Some(&provider),
-                1,
-                1000,
-            )
-            .result;
-        let FuzzyResult::Success {
-            hits_by_overload,
-            unproven_total_by_overload,
-            ..
-        } = targeted
-        else {
-            panic!("expected targeted unknown-arity success: {targeted:#?}");
-        };
-        assert!(
-            hits_by_overload
-                .values()
-                .flatten()
-                .all(|hit| (hit.start_offset, hit.end_offset) != call)
-        );
-        assert!(unproven_total_by_overload.values().sum::<usize>() > 0);
+    // #1811: an unproven argument count cannot create ambiguity where lookup
+    // reached exactly one binding. `void model::FunctionWins()` is the only
+    // callable `FunctionWins(UNKNOWN_ARGS)` can name -- arity picks nothing
+    // else -- so the call resolves to it and the scan records a proven hit
+    // rather than dropping the proven candidate.
+    let free_call_line = "    FunctionWins(UNKNOWN_ARGS); // unproven-unknown-free-arity";
+    let free_call = fixture_token_range(&unknown_source, free_call_line, "FunctionWins");
+    let free_forward = forward_in(
+        "unknown.cc",
+        &unknown_source,
+        free_call_line,
+        "FunctionWins",
+    );
+    assert_eq!("resolved", free_forward.status, "{free_forward:#?}");
+    assert!(
+        free_forward
+            .declarations
+            .iter()
+            .any(|definition| definition.fqn.as_deref() == Some(function_wins.fq_name().as_str())),
+        "the single visible free function must survive unproven arity: {free_forward:#?}"
+    );
+    let free_provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(unknown_file.clone()).collect()));
+    let free_targeted = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&function_wins),
+            Some(&free_provider),
+            1,
+            1000,
+        )
+        .result;
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = free_targeted
+    else {
+        panic!("expected targeted unknown-arity success: {free_targeted:#?}");
+    };
+    assert!(
+        hits_by_overload
+            .values()
+            .flatten()
+            .any(|hit| (hit.start_offset, hit.end_offset) == free_call),
+        "the resolved single candidate must be a proven usage hit: {hits_by_overload:#?}"
+    );
 
-        let whole = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(target));
-        let FuzzyResult::Success {
-            hits_by_overload,
-            unproven_total_by_overload,
-            ..
-        } = whole
-        else {
-            panic!("expected whole unknown-arity success: {whole:#?}");
-        };
-        assert!(
-            hits_by_overload
-                .values()
-                .flatten()
-                .filter(|hit| hit.file == unknown_file)
-                .all(|hit| (hit.start_offset, hit.end_offset) != call)
-        );
-        assert!(unproven_total_by_overload.values().sum::<usize>() > 0);
-    }
+    // The class temporary keeps the conservative answer: a bare `Widget(...)`
+    // with an unknown argument count is still resolved through the type tier,
+    // which this scan cannot prove without the call shape.
+    let class_call_line = "    Widget(UNKNOWN_ARGS); // unproven-unknown-class-arity";
+    let class_call = fixture_token_range(&unknown_source, class_call_line, widget.identifier());
+    let class_forward = forward_in(
+        "unknown.cc",
+        &unknown_source,
+        class_call_line,
+        widget.identifier(),
+    );
+    assert_ne!("resolved", class_forward.status, "{class_forward:#?}");
+    assert!(
+        class_forward
+            .declarations
+            .iter()
+            .all(|definition| definition.fqn.as_deref() != Some(widget.fq_name().as_str())),
+        "unknown arity must not produce an exact forward target: {class_forward:#?}"
+    );
+
+    let class_provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(unknown_file.clone()).collect()));
+    let class_targeted = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&widget),
+            Some(&class_provider),
+            1,
+            1000,
+        )
+        .result;
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = class_targeted
+    else {
+        panic!("expected targeted unknown-arity success: {class_targeted:#?}");
+    };
+    assert!(
+        hits_by_overload
+            .values()
+            .flatten()
+            .all(|hit| (hit.start_offset, hit.end_offset) != class_call)
+    );
+    assert!(unproven_total_by_overload.values().sum::<usize>() > 0);
+
+    let class_whole =
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&widget));
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = class_whole
+    else {
+        panic!("expected whole unknown-arity success: {class_whole:#?}");
+    };
+    assert!(
+        hits_by_overload
+            .values()
+            .flatten()
+            .filter(|hit| hit.file == unknown_file)
+            .all(|hit| (hit.start_offset, hit.end_offset) != class_call)
+    );
+    assert!(unproven_total_by_overload.values().sum::<usize>() > 0);
 
     let wrong = project.file("wrong.cc");
     assert!(
