@@ -13,8 +13,8 @@ use tree_sitter::{Node, Parser};
 use crate::java::graph::extractor::ScanState;
 use crate::java::graph::resolver::{TargetKind, TargetSpec};
 use crate::scala::graph::syntax::{
-    call_site_shape_for_reference, has_ancestor_kind, is_identifier_node, is_type_like_reference,
-    member_qualifier, member_qualifier_node, node_text, scala_import_path,
+    call_site_shape_for_reference, has_ancestor_kind, is_declaration_name, is_identifier_node,
+    is_type_like_reference, member_qualifier, member_qualifier_node, node_text, scala_import_path,
     scala_pattern_binder_names, stable_type_qualifier,
 };
 use crate::scala::graph_support::ScalaSource;
@@ -27,7 +27,7 @@ pub fn scan_scala_files_for_java_target(
     state: &mut ScanState<'_>,
     cancellation: Option<&CancellationToken>,
 ) {
-    if *state.limit_exceeded || matches!(spec.kind, TargetKind::Constructor) {
+    if *state.limit_exceeded {
         return;
     }
 
@@ -180,7 +180,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
             TargetKind::Type => maybe_record_java_type_hit(node, ctx),
             TargetKind::Method => maybe_record_java_static_method_hit(node, ctx),
             TargetKind::Field => maybe_record_java_static_field_hit(node, ctx),
-            TargetKind::Constructor => {}
+            TargetKind::Constructor => maybe_record_java_constructor_hit(node, ctx),
         }
     }
 
@@ -237,6 +237,85 @@ fn maybe_record_java_type_hit(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>
     }
 }
 
+/// Whether this identifier spells the target's owner type at this site: the
+/// qualified path names the owner, or the simple name is visible in this file
+/// and unshadowed. The syntactic *position* is not part of this answer -- each
+/// caller states the position it accepts.
+fn scala_name_denotes_target_owner(node: Node<'_>, ctx: &ScalaJavaScanCtx<'_, '_>) -> bool {
+    let text = node_text(node, ctx.source).trim_end_matches('$');
+    if text.is_empty() {
+        return false;
+    }
+    if text == ctx.spec.owner.identifier()
+        && let Some(qualifier) =
+            member_qualifier(node, ctx.source).or_else(|| stable_type_qualifier(node, ctx.source))
+    {
+        return qualifier_matches_target_owner(&qualifier, ctx.spec);
+    }
+    ctx.visibility.contains(text) && !is_type_shadowed(ctx, text)
+}
+
+/// `new JavaClass(..)` written from Scala. Tree-sitter models the constructed
+/// type as a child of `instance_expression`, wrapped in the qualified, generic
+/// and annotated type nodes when the source spells any of those, so the type
+/// leaf reaches the `new` only through that chain.
+fn maybe_record_java_constructor_hit(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
+    let Some(constructed) = constructed_type_root(node) else {
+        return;
+    };
+    if !scala_name_denotes_target_owner(node, ctx) {
+        return;
+    }
+    // The argument list belongs to the `instance_expression`, which the shape
+    // helper reads from the outermost type node rather than from the leaf.
+    let Some(call_shape) = call_site_shape_for_reference(constructed) else {
+        return;
+    };
+    if call_shape.type_arguments_only || call_shape.lists.len() != 1 {
+        return;
+    }
+    let Some(expected_arities) = ctx.spec.callable_arities.as_ref() else {
+        return;
+    };
+    let actual_arity = call_shape.lists[0].arity;
+    if expected_arities
+        .iter()
+        .copied()
+        .any(|expected| expected.accepts(actual_arity))
+    {
+        push_scala_hit(node, ctx);
+    }
+}
+
+/// The outermost type node of a `new` expression, reached from the type leaf,
+/// or `None` when the leaf is not the constructed type of any `new`. Only the
+/// last segment of a qualified type is the type itself; `lib` in
+/// `new lib.Stats()` names a package.
+fn constructed_type_root(node: Node<'_>) -> Option<Node<'_>> {
+    let mut constructed = node;
+    loop {
+        let parent = constructed.parent()?;
+        if parent.kind() == "instance_expression" {
+            return Some(constructed);
+        }
+        let wraps_the_constructed_type = match parent.kind() {
+            "stable_type_identifier" => {
+                let mut cursor = parent.walk();
+                parent.named_children(&mut cursor).last() == Some(constructed)
+            }
+            "generic_type" | "applied_constructor_type" | "annotated_type" | "type" => {
+                parent.child_by_field_name("type") == Some(constructed)
+                    || parent.named_child(0) == Some(constructed)
+            }
+            _ => false,
+        };
+        if !wraps_the_constructed_type {
+            return None;
+        }
+        constructed = parent;
+    }
+}
+
 fn java_type_import_owner_matches_target(node: Node<'_>, ctx: &ScalaJavaScanCtx<'_, '_>) -> bool {
     if node_text(node, ctx.source).trim_end_matches('$') != ctx.spec.owner.identifier() {
         return false;
@@ -278,14 +357,26 @@ fn java_type_import_owner_matches_target(node: Node<'_>, ctx: &ScalaJavaScanCtx<
 }
 
 fn is_explicit_static_receiver_simple_name(node: Node<'_>, ctx: &ScalaJavaScanCtx<'_, '_>) -> bool {
+    let name = node_text(node, ctx.source).trim_end_matches('$');
+    is_leading_path_segment(node)
+        && ctx.visibility.contains(name)
+        && !is_type_shadowed(ctx, name)
+        && !is_term_shadowed(ctx, name)
+}
+
+/// The leading segment of a qualified path. Tree-sitter models the three Scala
+/// positions of `Stats.Type` with three node kinds -- `field_expression` for
+/// the expression `Stats.Type.NEWADDR`, `stable_type_identifier` for the type
+/// `t: Stats.Type`, and `stable_identifier` for the pattern
+/// `case Stats.Type.NEWADDR` -- and in all three the leading segment is the
+/// first named child. Accepting only the expression form left the qualifier of
+/// a Java nested type unrecorded in type and pattern position (#1855).
+fn is_leading_path_segment(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
-        parent.kind() == "field_expression"
-            && parent.child_by_field_name("value") == Some(node)
-            && ctx
-                .visibility
-                .contains(node_text(node, ctx.source).trim_end_matches('$'))
-            && !is_type_shadowed(ctx, node_text(node, ctx.source).trim_end_matches('$'))
-            && !is_term_shadowed(ctx, node_text(node, ctx.source).trim_end_matches('$'))
+        matches!(
+            parent.kind(),
+            "field_expression" | "stable_type_identifier" | "stable_identifier"
+        ) && parent.named_child(0) == Some(node)
     })
 }
 
@@ -304,6 +395,12 @@ fn maybe_record_java_static_method_hit(node: Node<'_>, ctx: &mut ScalaJavaScanCt
         return;
     }
     let Some(call_shape) = call_site_shape_for_reference(node) else {
+        // Scala writes a zero-argument Java call, and an eta-expanded method
+        // value, with no argument list at all -- `Stats.origin`, never
+        // `Stats.origin()`. There is no shape to select an overload with, and
+        // the owner-qualified member name proved the reference already, so the
+        // site is recorded against the whole target family.
+        push_scala_hit(node, ctx);
         return;
     };
     if call_shape.type_arguments_only || call_shape.lists.len() != 1 {
@@ -502,10 +599,4 @@ fn is_term_shadowed(ctx: &ScalaJavaScanCtx<'_, '_>, name: &str) -> bool {
         .iter()
         .rev()
         .any(|scope| scope.contains(name))
-}
-
-fn is_declaration_name(node: Node<'_>) -> bool {
-    node.parent()
-        .and_then(|parent| parent.child_by_field_name("name"))
-        == Some(node)
 }
