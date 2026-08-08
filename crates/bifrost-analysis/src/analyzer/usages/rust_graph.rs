@@ -391,12 +391,12 @@ mod tests {
     /// D1's central claim, as a number: a scan resolves the names its sites
     /// wrote, not the export surface its candidates could reach.
     ///
-    /// The consumer namespace-imports a module exporting `WIDE_EXPORT_SURFACE`
-    /// + 1 names and writes exactly one of them. Before the per-site rewrite
-    /// the scan built a reference context per candidate file, and building one
-    /// ran `canonical_export_fqn_from_files` once per export name of every
-    /// namespace-imported module -- so the count scaled with the surface, not
-    /// with the sites.
+    /// The consumer namespace-imports a module exporting one more than
+    /// `WIDE_EXPORT_SURFACE` names and writes exactly one of them. Before the
+    /// per-site rewrite the scan built a reference context per candidate file,
+    /// and building one ran `canonical_export_fqn_from_files` once per export
+    /// name of every namespace-imported module, so the count scaled with the
+    /// surface rather than with the sites.
     #[test]
     fn usage_scan_does_not_canonicalize_the_whole_namespace_export_surface() {
         let files = wide_export_surface_fixture();

@@ -49,11 +49,14 @@ measurement is a separate task run after review; it is not part of this plan's a
 - [x] (2026-08-08 14:55Z) Milestone 2: added the two counters and observed all three pins failing
       before the rewrite; numbers in `Artifacts and Notes`. The pins themselves land with the
       milestone that makes each one pass, so the tree stays green at every commit.
-- [ ] Milestone 3 (D1 + D3): replace `RustReferenceContext` with a lazy per-site resolver; delete
-      the eager builders, the two analyzer caches, and the mis-weighing weigher.
-- [ ] Milestone 4 (D2): check the callsite cap before dispatching each candidate; bound
-      `sample_hits`.
-- [ ] Milestone 5: full multi-language parity run and featureless clippy.
+- [x] (2026-08-08 18:20Z) Milestone 3 (D1 + D3): `RustReferenceContext` is a lazy per-site
+      resolver; the eager builders, both analyzer caches, the mis-weighing weigher and the
+      reference-context warm are deleted; the equivalence pin and the two D1/D3 counter pins pass
+      (commit `48e6e9f1`).
+- [x] (2026-08-08 18:45Z) Milestone 4 (D2): the callsite cap is checked before each candidate is
+      opened and `sample_hits` is a bounded prefix; the D2 counter pin passes (commit `5cb4f4c2`).
+- [x] (2026-08-08 19:30Z) Milestone 5: parity selections and featureless clippy run; every failure
+      reproduced at the branch tip before this work. Results in `Validation and Acceptance`.
 
 ## Surprises & Discoveries
 
@@ -71,6 +74,25 @@ measurement is a separate task run after review; it is not part of this plan's a
   with no cancellation. It is called from `RustQueryResolver::find_usages` whenever the graph seed
   is a local declaration. This is a third eager whole-workspace context build that the
   investigation did not name, and it disappears with the same change.
+
+- Observation: the equivalence pin earned its keep twice, and both times against
+  `bare_names_resolving_to`.
+  Evidence, first failure: `bare_names_resolving_to disagreed: file=src/consumer.rs forward=false
+  target=wide.Gadget / left: ["Alias"] / right: ["Alias", "Renamed"]`. The candidate filter kept
+  only names carrying the target's terminal identifier, and `use crate::barrel::Renamed;` binds
+  `wide.Gadget` through a renaming re-export, sharing no spelling with it. Second failure:
+  `target=cyclic_a.AlphaItem / left: [] / right: ["AlphaItem"]`. The frozen algorithm reports a name
+  bound by *any* of the four map kinds, not by the winner of their precedence, and `consumer.rs`
+  both declares `AlphaItem` and glob-imports `cyclic_a::AlphaItem`. Neither was visible from reading
+  the code; both were caught by a fixture written before the rewrite.
+
+- Observation: the per-site design removes a cache that a repeated query used to ride for free. The
+  old contexts were cached per analyzer generation, so a second scan of the same file resolved
+  nothing. This showed up while tuning the cancellation pin: with a warmed analyzer, every
+  cancellation budget from 1 to 23 gave zero canonicalizations, because the context was already
+  built. The pin therefore requires a cold analyzer. In production the trade is the intended one --
+  a bounded per-question cost every time, instead of an unbounded precomputation once -- but it is
+  a real difference in repeat-query behavior and worth naming.
 
 ## Decision Log
 
@@ -96,16 +118,47 @@ measurement is a separate task run after review; it is not part of this plan's a
   moot by removal rather than by correction.
   Date/Author: 2026-08-08, Opus.
 
-- Decision: `bare_names_resolving_to(target_fqn)` is answered by generating a candidate name set
-  filtered on the target's terminal identifier and then resolving each candidate, rather than by
-  materializing every binding in the file.
-  Rationale: it is an inverse query ("which local names in this file bind this fqn"). Every binding
-  that resolves to `target_fqn` ends at a declaration whose identifier is the last dotted segment of
-  `target_fqn`, so a candidate whose imported name, module tail, exported name, or declaration name
-  is not that terminal cannot resolve to it. The one case this filter can miss is a chain that
-  renames on the way (`pub use inner::Real as Alias;` re-exported and then imported as `Alias`); the
-  equivalence fixture covers that case explicitly, and the fact-backed `usage_binding_names` path
-  already contributes such aliases to the scan's name gate independently.
+- Decision: `bare_names_resolving_to(target_fqn)` asks every explicit binder binding, and applies
+  the terminal-identifier filter only to the names this file itself exports.
+  Rationale: this replaces an earlier decision, and the replacement was forced by the equivalence
+  pin. The first version filtered every candidate on the target's terminal identifier -- the last
+  dotted segment of `target_fqn` -- on the argument that a binding resolving to the target must end
+  at a declaration with that identifier. That argument is sound about the *declaration* and wrong
+  about the *binding*: `barrel` re-exports `wide::Gadget as Renamed`, so `use crate::barrel::Renamed;`
+  binds `wide.Gadget` under a name sharing no spelling with it, and the fixture caught exactly that.
+  There is no cheap test for a chain that renames, so every binder binding is resolved; the count is
+  bounded by the file's import list, which is what the old `named` map already cost. The filter is
+  kept for this file's own export names because a barrel module can re-export thousands of them and
+  resolving all of them per candidate file is the cost this design exists to remove. The residual
+  gap is a re-export of this file renaming at a hop deeper than the first.
+  Date/Author: 2026-08-08, Opus.
+
+- Decision: a candidate counts when *any* of the four binding kinds binds it to the target, not when
+  the winner of their precedence does.
+  Rationale: also forced by the pin. `resolve_bare` collapses named, namespace, same-file and glob
+  into one answer by precedence, but the eager maps were four separate maps and the inverse query
+  read all four. A file that declares `AlphaItem` and also glob-imports `cyclic_a::AlphaItem` binds
+  the name twice, and the scan's name gate wants to hear about both -- narrowing to the shadowing
+  declaration would drop the glob-imported target's hits.
+  Date/Author: 2026-08-08, Opus.
+
+- Decision: `issue_1230_rust_scan_complexity`'s module-file-resolution pin reads its counter after
+  the two resolution questions rather than after constructing the context.
+  Rationale: the task asked for this suite to pass unchanged. It cannot pass literally unchanged --
+  `resolve_bare` returns `Option<String>` now, so `.map(str::to_string)` does not compile -- and
+  leaving the counter read where it was would make the assertion vacuous, because constructing a
+  resolver resolves no module files at all and the test would pin zero against zero. The claim in
+  the assertion message is unchanged and now measures the answering work directly: what those two
+  questions cost must not grow with the number of names the imported module exports.
+  Date/Author: 2026-08-08, Opus.
+
+- Decision: the `debug_assert!` at `extractor.rs:497` survives unchanged, with no equivalent
+  substituted.
+  Rationale: it asserts that the cheap name gate never skips an identifier that would resolve to the
+  target, and it is written in terms of `matches_resolved_identifier`, which is unchanged. What that
+  function resolves *through* changed; what it answers did not, which is what the equivalence pin
+  establishes. The assertion runs in every debug test build, so the whole Rust usage suite exercises
+  it, including `tests/suite_usages/issue_1416_scan_name_gate.rs`, which exists to walk it.
   Date/Author: 2026-08-08, Opus.
 
 - Decision: keep the per-site memo inside one `RustReferenceContext` value (a `RefCell` map living
@@ -118,7 +171,49 @@ measurement is a separate task run after review; it is not part of this plan's a
 
 ## Outcomes & Retrospective
 
-To be written at completion.
+All four design components landed. The usage-graph phase no longer precomputes what a file could
+mean; it answers what a site wrote. The reference context went from a bundle of eagerly filled maps
+cached twice per file on the analyzer to a query-scoped view that borrows the analyzer, derives two
+path strings at construction, and computes each answer when it is asked. The two unbounded maps and
+their two mis-weighed caches are gone rather than corrected, which is what D3 asked for. The
+callsite cap became a stop condition. The keep-going predicate is the caller's and is polled inside
+the walks, where the entry point the scan used could not be interrupted at all.
+
+The numbers, all from the counter pins:
+
+- One site behind a namespace import of a module exporting 21 names: 21 export-name
+  canonicalizations before, 0 after. Zero, not one, because the fact-backed prover answers that
+  site `Exact` and the resolver is never consulted -- which is the design's thesis stated as a
+  measurement.
+- The same scan under a cancellation token tripping on its fourth check: 21 before, 0 after.
+- A 24-candidate scan with the cap at one: 24 of 24 candidates opened before, 2 of 24 after.
+
+What remains. The design's rustc measurement is a separate task; nothing here was measured on a
+large tree, and the numbers above are fixture-scale. The three exclusions the design fenced off are
+untouched: `global_usage_definition_index`, the watcher listing loop, and the ~87 s candidate walk
+in `edges_binding_identity`. The per-site machinery this built is the natural second application for
+the third of those, as the design says.
+
+Two lessons. First, the frozen equivalence pin was not ceremony: it caught two behavioral
+differences in `bare_names_resolving_to` that reading the code did not reveal, and both would have
+silently narrowed the scan's name gate. A fixture written before the rewrite, probing every name
+against every path prefix over every file in both directions, is worth more than a set of
+hand-picked assertions. Second, writing counter pins before the change and recording their failing
+output made the difference between "the design says this should be cheaper" and "21 became 0".
+
+## Note on revisions
+
+2026-08-08, after Milestone 3: the `bare_names_resolving_to` decision in the Decision Log was
+replaced. The original filtered every candidate name on the target's terminal identifier; the
+equivalence pin showed that a renaming re-export binds a target under a name sharing no spelling
+with it, so every explicit binder binding is now resolved and the filter applies only to this file's
+own export names. A second decision was added for the same method, because the frozen algorithm
+reports a name bound by any of the four binding kinds rather than by the winner of their precedence.
+Two further decisions were added: one recording why the `issue_1230` pin reads its counter after the
+questions instead of after construction, and one recording that the `extractor.rs` name-gate
+`debug_assert!` survives unchanged. `Surprises & Discoveries` gained the two pin failures with their
+exact output, and the note that the per-site design gives up a free repeat query in exchange for a
+bounded first one.
 
 ## Context and Orientation
 
@@ -358,6 +453,8 @@ use tens of gigabytes per worktree. Do not run large-tree benchmarks from this p
 
 ## Validation and Acceptance
 
+Results as of Milestone 5, at commit `5cb4f4c2`.
+
 Acceptance is behavioral and is carried by five things.
 
 First, the equivalence pin: `reference_resolution_matches_the_frozen_closure_algorithm` in
@@ -382,8 +479,46 @@ so a violation surfaces as a panic in the suites above. If the per-site rewrite 
 invariant more appropriate, the replacement and its reason go in the Decision Log.
 
 Fifth, the full multi-language selections and featureless clippy from `Concrete Steps`, with any
-new failure verified against a clean stash of the working tree before it is accepted as
-pre-existing.
+new failure verified against a clean checkout before it is accepted as pre-existing.
+
+What was run, and what it produced:
+
+`cargo nextest run --workspace -E 'test(/scan_usages|usages|rust_graph|searchtools/)'`: 2,096 tests,
+2,090 passed, 6 failed. `cargo nextest run -p brokk-bifrost-analysis`: 1,837 tests, 1,834 passed,
+3 failed. `cargo nextest run -p brokk-bifrost --test suite_issues --test suite_usages --test
+issue_1175_scan_usages_reparse --test suite_lsp_parity --test suite_cross_language`: 2,230 tests,
+2,227 passed, 3 failed. `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+
+Every one of those twelve failures was reproduced in a detached worktree at the branch tip and again
+at commit `9a7f2269`, which is this plan's own Milestone 2 and predates any behavior change here.
+They are:
+
+In `brokk-bifrost-analysis`, `analyzer::jvm::java_artifact::tests::
+source_and_class_jars_share_declaration_ids_and_keep_distinct_origins`, and the two live-oid
+rendezvous tests `analyzer::tree_sitter_analyzer::tests::
+live_oid_resolution_hashes_two_overlays_concurrently` and
+`..._reports_first_input_error_after_parallel_planning`. These three are the documented
+pre-existing set.
+
+In `suite_symbols`, `searchtools_fuzzy_symbol_lookup::
+scan_usages_resolves_public_typescript_static_method_symbol` (also documented),
+`searchtools_definition_selectors::csharp_generic_type_resolves_without_arity_spelling`,
+`..._summaries_route_file_anchored_selector_with_extension_like_symbol_member`,
+`..._summaries_and_ancestors_accept_js_file_anchored_selectors`, and
+`searchtools_service::manual_service_sees_change_after_explicit_update_paths`.
+
+In `suite_cross_language`, `code_query_resolution_conformance::
+an_unindexed_declared_dependency_is_a_boundary_row_rather_than_an_empty_answer`. In `suite_usages`,
+`issue_1450_cross_request_prepared_syntax::
+an_edited_file_is_rescanned_rather_than_served_from_the_retained_tree` and
+`issue_1451_cross_request_import_infos::
+a_rewritten_import_is_rehydrated_rather_than_served_from_the_retained_infos`. In
+`brokk-bifrost-mcp`, `bifrost_mcp_server::bifrost_searchtools_server_speaks_mcp_stdio`.
+
+The last eight are beyond the documented set and are not caused by this work. They are worth their
+own triage; `issue_1450` and `issue_1451` in particular are named in the investigation as behavioral
+coverage of the Rust scan, so their being red on the branch means that coverage is currently not
+protecting anything.
 
 ## Idempotence and Recovery
 
@@ -411,6 +546,17 @@ through twenty-three against a cold analyzer; the counts are 0, 0, 0, then 21 fr
 which locates the boundary precisely. At three checks the scan bails before the candidate's context
 would be built; at four the token is already cancelled and the build runs to completion anyway,
 which is the investigation's "a single build is uninterruptible end to end", measured.
+
+After, at commit `5cb4f4c2`, same three pins, same fixtures:
+
+    a scan of one site behind one namespace import canonicalized 0 export names
+    a cancelled scan canonicalized 0 export names
+    the scan opened 2 of 24 candidates after the cap was proven
+
+The two zeros are the strongest form of the result: not "fewer walks" but none, because the
+fact-backed prover answers that site `Exact` and the reference resolver is never consulted at all.
+The 2 of 24 is the two-thread pool's one-task overshoot on top of the first candidate, which is the
+floor for a rayon fan-out that stops.
 
 ## Interfaces and Dependencies
 
