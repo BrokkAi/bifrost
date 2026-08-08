@@ -972,10 +972,14 @@ impl ProjectTypes {
                 return true;
             }
             let ancestors = match self.exact_direct_ancestor_resolution(scala, &current) {
-                ScalaDirectAncestorResolution::Resolved(ancestors) if !ancestors.is_empty() => {
+                ScalaDirectAncestorResolution::Resolved(ancestors)
+                | ScalaDirectAncestorResolution::Incomplete(ancestors)
+                    if !ancestors.is_empty() =>
+                {
                     ancestors
                 }
-                ScalaDirectAncestorResolution::Resolved(_) => {
+                ScalaDirectAncestorResolution::Resolved(_)
+                | ScalaDirectAncestorResolution::Incomplete(_) => {
                     self.direct_ancestors_for_declaration(scala, &current)
                 }
                 ScalaDirectAncestorResolution::Ambiguous => return false,
@@ -1137,10 +1141,14 @@ impl ProjectTypes {
                         .cloned(),
                 );
                 let ancestors = match self.exact_direct_ancestor_resolution(scala, &owner) {
-                    ScalaDirectAncestorResolution::Resolved(ancestors) if !ancestors.is_empty() => {
+                    ScalaDirectAncestorResolution::Resolved(ancestors)
+                    | ScalaDirectAncestorResolution::Incomplete(ancestors)
+                        if !ancestors.is_empty() =>
+                    {
                         ancestors
                     }
-                    ScalaDirectAncestorResolution::Resolved(_) => {
+                    ScalaDirectAncestorResolution::Resolved(_)
+                    | ScalaDirectAncestorResolution::Incomplete(_) => {
                         // The forward hierarchy resolver deliberately fails closed on
                         // ambiguity, but its bounded fallback cannot currently recover
                         // every nested lexical supertype. The analyzer hierarchy retains
@@ -1237,7 +1245,8 @@ impl ProjectTypes {
                         matches.push((*exported).clone());
                     }
                     let ancestors = match self.exact_direct_ancestor_resolution(scala, &owner) {
-                        ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
+                        ScalaDirectAncestorResolution::Resolved(ancestors)
+                        | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
                         ScalaDirectAncestorResolution::Ambiguous => {
                             next_is_ambiguous = true;
                             Vec::new()
@@ -2163,7 +2172,8 @@ impl ProjectTypes {
             let environment = environments.get(&owner)?.clone();
             let owner_facts = self.generic_owner_source_facts(scala, &owner)?;
             let direct_ancestors = match self.exact_direct_ancestor_resolution(scala, &owner) {
-                ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
+                ScalaDirectAncestorResolution::Resolved(ancestors)
+                | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
                 ScalaDirectAncestorResolution::Ambiguous => return None,
             };
             for ancestor in direct_ancestors {
@@ -4105,7 +4115,8 @@ impl ProjectTypes {
                 continue;
             }
             match self.exact_direct_ancestor_resolution(scala, &owner) {
-                ScalaDirectAncestorResolution::Resolved(ancestors) => pending.extend(ancestors),
+                ScalaDirectAncestorResolution::Resolved(ancestors)
+                | ScalaDirectAncestorResolution::Incomplete(ancestors) => pending.extend(ancestors),
                 ScalaDirectAncestorResolution::Ambiguous => return false,
             }
         }

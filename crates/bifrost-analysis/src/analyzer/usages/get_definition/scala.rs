@@ -6638,6 +6638,10 @@ fn resolve_scala_call(
             {
                 return candidates_outcome(vec![unit]);
             }
+            // Set when the enclosing owner's supertype closure is not fully
+            // indexed here. That is a last-resort answer, never a pre-emption:
+            // an unindexed parent cannot hide a target this workspace owns.
+            let mut incomplete_hierarchy_owner = None;
             if function.kind() == "identifier"
                 && let Some(owner) = scala_enclosing_class(
                     ctx.analyzer,
@@ -6673,6 +6677,9 @@ fn resolve_scala_call(
                                 "`{name}` overloads cannot be selected from exact argument type identity"
                             ),
                         );
+                    }
+                    ScalaTypedOverloadResolution::IncompleteHierarchy => {
+                        incomplete_hierarchy_owner = Some(owner.clone());
                     }
                     ScalaTypedOverloadResolution::NotNeeded => {}
                 }
@@ -6842,6 +6849,15 @@ fn resolve_scala_call(
                     name,
                     call_shape.as_ref(),
                 );
+            }
+            if let Some(owner) = incomplete_hierarchy_owner {
+                // gated upstream: every workspace tier above has already failed
+                // to bind `name`, and the owner's supertype closure is provably
+                // not fully indexed, so the declaration can only be outside it.
+                return boundary_unchecked(format!(
+                    "`{name}` may be declared by a supertype of `{}` that is not indexed in this workspace",
+                    owner.fq_name()
+                ));
             }
             gated_boundary(
                 || !scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, name),
@@ -7690,6 +7706,12 @@ enum ScalaTypedOverloadResolution {
     Found(Vec<CodeUnit>),
     NoApplicable,
     Ambiguous,
+    /// The enclosing owner has a supertype this workspace cannot resolve to a
+    /// single indexed declaration, and no visible level declared the member.
+    /// The declaration may live in the part of the hierarchy that is missing,
+    /// so the answer is a boundary - but only once every other tier has failed,
+    /// because an unindexed parent never hides a target the workspace does own.
+    IncompleteHierarchy,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -7802,9 +7824,15 @@ fn scala_exact_owner_typed_overload_resolution(
         return ScalaTypedOverloadResolution::NotNeeded;
     }
 
+    // An ancestor the workspace cannot walk carries no information about the
+    // overloads it CAN see, so neither an unindexed nor a multiply declared
+    // supertype ends this walk. Collect the levels that do resolve, so the
+    // `callable_count < 2` guard below sees the real candidates and the
+    // ordinary fallback chain still gets its turn.
     let mut levels = Vec::new();
     let mut level = vec![owner.clone()];
     let mut seen = HashSet::default();
+    let mut unindexed_supertype = false;
     while !level.is_empty() {
         let mut candidates = Vec::new();
         let mut next = Vec::new();
@@ -7820,9 +7848,14 @@ fn scala_exact_owner_typed_overload_resolution(
             ));
             match ctx.direct_ancestors_for_owner(&current) {
                 ScalaDirectAncestorResolution::Resolved(ancestors) => next.extend(ancestors),
-                ScalaDirectAncestorResolution::Ambiguous => {
-                    return ScalaTypedOverloadResolution::Ambiguous;
+                ScalaDirectAncestorResolution::Incomplete(ancestors) => {
+                    next.extend(ancestors);
+                    unindexed_supertype = true;
                 }
+                // A multiply declared supertype is not a boundary: the
+                // workspace holds those declarations, and the chain below
+                // reports the conflict where it can name it.
+                ScalaDirectAncestorResolution::Ambiguous => {}
             }
         }
         sort_units(&mut candidates);
@@ -7833,7 +7866,14 @@ fn scala_exact_owner_typed_overload_resolution(
 
     let callable_count = levels.iter().map(Vec::len).sum::<usize>();
     if callable_count < 2 {
-        return ScalaTypedOverloadResolution::NotNeeded;
+        // Fewer than two visible overloads is not an overload problem. A walk
+        // that saw nothing at all and could not see the whole hierarchy is a
+        // separate, honest answer the caller only uses as a last resort.
+        return if callable_count == 0 && unindexed_supertype {
+            ScalaTypedOverloadResolution::IncompleteHierarchy
+        } else {
+            ScalaTypedOverloadResolution::NotNeeded
+        };
     }
     let Some(arguments) = scala_exact_constructed_call_arguments(ctx, resolver, call) else {
         return ScalaTypedOverloadResolution::Ambiguous;
@@ -8044,6 +8084,7 @@ fn scala_exact_subtype_relation(
 ) -> ScalaTypedCandidateMatch {
     let mut stack = vec![actual.clone()];
     let mut seen = HashSet::default();
+    let mut incomplete = false;
     while let Some(current) = stack.pop() {
         if !seen.insert(current.clone()) {
             continue;
@@ -8053,10 +8094,20 @@ fn scala_exact_subtype_relation(
         }
         match ctx.direct_ancestors_for_owner(&current) {
             ScalaDirectAncestorResolution::Resolved(ancestors) => stack.extend(ancestors),
+            // The resolved part of the hierarchy can still PROVE the relation,
+            // so keep walking; only an exhausted walk has to admit it did not
+            // see everything.
+            ScalaDirectAncestorResolution::Incomplete(ancestors) => {
+                stack.extend(ancestors);
+                incomplete = true;
+            }
             ScalaDirectAncestorResolution::Ambiguous => {
                 return ScalaTypedCandidateMatch::Unknown;
             }
         }
+    }
+    if incomplete {
+        return ScalaTypedCandidateMatch::Unknown;
     }
     ScalaTypedCandidateMatch::Mismatch
 }
@@ -8364,7 +8415,8 @@ fn scala_exact_owner_member_candidate_units(
     }
 
     let mut level = match ctx.direct_ancestors_for_owner(owner) {
-        ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
+        ScalaDirectAncestorResolution::Resolved(ancestors)
+        | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
         ScalaDirectAncestorResolution::Ambiguous => {
             return ScalaExactMemberResolution::Ambiguous;
         }
@@ -8389,7 +8441,8 @@ fn scala_exact_owner_member_candidate_units(
             }
             matches.extend(found);
             match ctx.direct_ancestors_for_owner(&ancestor) {
-                ScalaDirectAncestorResolution::Resolved(ancestors) => {
+                ScalaDirectAncestorResolution::Resolved(ancestors)
+                | ScalaDirectAncestorResolution::Incomplete(ancestors) => {
                     if let Some(state) = member_trace.as_mut() {
                         state.record_supertypes(ctx.scala, &ancestor, &ancestors);
                     }
@@ -9187,7 +9240,8 @@ fn scala_ancestor_owners(
     let mut discovered = HashSet::from_iter([owner.fq_name()]);
     let mut ancestors = Vec::new();
     while let Some((current, depth)) = queue.pop_front() {
-        let ScalaDirectAncestorResolution::Resolved(direct) =
+        let (ScalaDirectAncestorResolution::Resolved(direct)
+        | ScalaDirectAncestorResolution::Incomplete(direct)) =
             scala_forward_direct_ancestor_resolution(scala, support, &current)
         else {
             break;
@@ -9218,6 +9272,14 @@ fn scala_forward_direct_ancestor_resolution(
     };
     let resolver = scala_name_resolver_for_unit(scala, support, owner);
     let mut ancestors = Vec::new();
+    // `extends Actor`, `extends Serializable`, `extends AnyVal`: the supertype
+    // is real but nothing in this workspace declares it. It contributes no
+    // member a caller could ever name here, so it does not make the owner's
+    // hierarchy AMBIGUOUS - it makes it INCOMPLETE. The distinction matters:
+    // ambiguity must fail closed because the workspace does hold the answer,
+    // while incompleteness must not, or one unindexed library type silences
+    // every member and type lookup made from inside the class (#1849, #1851).
+    let mut unindexed_supertype = false;
     for path in facts.supertype_lookup_paths {
         let identity = match resolver
             .resolve_explicit_owner_segments(path.segments(), ScalaOwnerKind::Class)
@@ -9247,6 +9309,10 @@ fn scala_forward_direct_ancestor_resolution(
                         sort_units(&mut same_source);
                         same_source.dedup();
                         let [ancestor] = same_source.as_slice() else {
+                            // The resolver proved the name has more than one
+                            // indexed declaration and this source does not
+                            // single one out. The workspace holds the
+                            // supertype; it cannot say which one.
                             return ScalaDirectAncestorResolution::Ambiguous;
                         };
                         ancestors.push(ancestor.clone());
@@ -9257,7 +9323,8 @@ fn scala_forward_direct_ancestor_resolution(
                     }
                     ScalaNameResolution::MissingExplicitImport => continue,
                     ScalaNameResolution::Unresolved => {
-                        return ScalaDirectAncestorResolution::Ambiguous;
+                        unindexed_supertype = true;
+                        continue;
                     }
                 }
             }
@@ -9266,7 +9333,11 @@ fn scala_forward_direct_ancestor_resolution(
     }
     sort_units(&mut ancestors);
     ancestors.dedup();
-    ScalaDirectAncestorResolution::Resolved(ancestors)
+    if unindexed_supertype {
+        ScalaDirectAncestorResolution::Incomplete(ancestors)
+    } else {
+        ScalaDirectAncestorResolution::Resolved(ancestors)
+    }
 }
 
 fn scala_direct_member_candidate_units(
@@ -10525,7 +10596,7 @@ fn scala_exact_owner_namespace_children(
 
     let mut level = match ctx.direct_ancestors_for_owner(owner) {
         ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
-        ScalaDirectAncestorResolution::Ambiguous => {
+        ScalaDirectAncestorResolution::Incomplete(_) | ScalaDirectAncestorResolution::Ambiguous => {
             return ScalaExactMemberResolution::Ambiguous;
         }
     };
@@ -10542,7 +10613,8 @@ fn scala_exact_owner_namespace_children(
             ));
             match ctx.direct_ancestors_for_owner(&ancestor) {
                 ScalaDirectAncestorResolution::Resolved(ancestors) => next.extend(ancestors),
-                ScalaDirectAncestorResolution::Ambiguous => {
+                ScalaDirectAncestorResolution::Incomplete(_)
+                | ScalaDirectAncestorResolution::Ambiguous => {
                     return ScalaExactMemberResolution::Ambiguous;
                 }
             }
