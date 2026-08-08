@@ -1187,8 +1187,14 @@ fn test_cpp_include_resolution_and_c_file_support() {
     );
 }
 
+/// The provider resolves an include the way the forward resolver's include
+/// closure does: source-relative, then project-relative, then a *unique*
+/// project header by suffix. A separate include root (`-I include`) is the
+/// ordinary C++ layout, so `"helper.h"` from `src/main.cpp` is a real import
+/// (#1829); an absolute path outside the project is not, and neither is a
+/// basename two project headers answer to.
 #[test]
-fn test_cpp_imported_code_units_only_resolve_relative_quoted_includes() {
+fn test_cpp_imported_code_units_resolve_a_unique_project_header_and_refuse_the_rest() {
     let project = inline_cpp_project(&[
         (
             "src/main.cpp",
@@ -1206,7 +1212,41 @@ fn test_cpp_imported_code_units_only_resolve_relative_quoted_includes() {
 
     let imports = analyzer.imported_code_units_of(&main_cpp);
 
-    assert!(imports.is_empty(), "{imports:?}");
+    assert!(
+        imports.iter().any(|cu| cu.short_name() == "Helper"),
+        "a unique project header is reachable through its own include root: {imports:?}"
+    );
+    assert!(
+        imports
+            .iter()
+            .all(|cu| cu.source().rel_path().ends_with("include/helper.h")),
+        "an absolute include outside the project resolves to nothing: {imports:?}"
+    );
+}
+
+#[test]
+fn test_cpp_imported_code_units_refuse_an_ambiguous_include_basename() {
+    let project = inline_cpp_project(&[
+        (
+            "src/main.cpp",
+            r#"
+            #include "helper.h"
+
+            int main() { return 0; }
+            "#,
+        ),
+        ("first/helper.h", "struct FirstHelper {};"),
+        ("second/helper.h", "struct SecondHelper {};"),
+    ]);
+    let analyzer = CppAnalyzer::from_project(project.clone());
+    let main_cpp = ProjectFile::new(project.root().to_path_buf(), "src/main.cpp");
+
+    let imports = analyzer.imported_code_units_of(&main_cpp);
+
+    assert!(
+        imports.is_empty(),
+        "two headers answer to this basename, so neither is the import: {imports:?}"
+    );
 }
 
 #[test]
