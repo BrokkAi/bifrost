@@ -72,6 +72,13 @@ HEAD-keyed relevance caches, and fragmented C++ export-member recovery from the
 cutoff master, so future comparisons use the current persisted-store, cache,
 concurrency, and declaration contracts.
 
+The August 7 Gin `scan_usages` record is updated from Actions run 31170861236
+at commit `6dc7cc58fc62ef7fc88653b64464116600466c14`. The fresh run measured a
+981.0 ms median. The prior failed run measured 999.1 ms. The old 781.8 ms
+record did not repeat. This narrow update changes only Gin. Click measured
+2784.1 ms in the same run and did not cross the compare limit, so it stays at
+its prior baseline.
+
 It is not written automatically. Promote it deliberately:
 
 1. Run the benchmark workflow or a local `bifrost_benchmark run`.

@@ -10,6 +10,7 @@ use std::fs::Metadata;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 
 use git2::{
     AttrCheckFlags, AttrValue, DiffOptions, IndexEntry, ObjectType, Oid, Repository, Status,
@@ -148,13 +149,12 @@ pub fn working_tree_oid_values(
 pub struct WorkingTreeIdentity {
     tracked: HashMap<String, TrackedIdentity>,
     dirty: HashSet<String>,
+    verified_clean_paths: Mutex<HashSet<String>>,
 }
 
 struct TrackedIdentity {
     oid: Oid,
     file_size: u32,
-    blob_size: Option<u64>,
-    content_transform: bool,
     mtime_seconds: i32,
     mtime_nanoseconds: u32,
 }
@@ -165,20 +165,13 @@ impl WorkingTreeIdentity {
     /// size and mtime match the index entry's cached stat. Dirty, untracked,
     /// ignored, and since-edited paths return `None`; their identity is the
     /// hash of the visible working bytes.
-    pub fn clean_index_oid(&self, rel: &str, abs_path: &Path) -> Option<Oid> {
+    pub fn clean_index_oid(&self, repo: &Repository, rel: &str, abs_path: &Path) -> Option<Oid> {
         if self.dirty.contains(rel) {
             return None;
         }
         let tracked = self.tracked.get(rel)?;
         let metadata = std::fs::metadata(abs_path).ok()?;
         if !metadata.is_file() || metadata.len() != u64::from(tracked.file_size) {
-            return None;
-        }
-        // Git can keep a transformed worktree clean while the index OID still
-        // names the canonical blob. Hash those bytes instead of serving the
-        // canonical OID. A line-ending conversion changes the worktree size,
-        // while other filters need the attribute guard below.
-        if tracked.content_transform || tracked.blob_size != Some(metadata.len()) {
             return None;
         }
         let modified = metadata
@@ -194,6 +187,29 @@ impl WorkingTreeIdentity {
         if tracked.mtime_nanoseconds != 0 && modified.subsec_nanos() != tracked.mtime_nanoseconds {
             return None;
         }
+
+        if self
+            .verified_clean_paths
+            .lock()
+            .expect("working-tree identity verification mutex poisoned")
+            .contains(rel)
+        {
+            return Some(tracked.oid);
+        }
+
+        // Git can keep a transformed worktree clean while the index OID still
+        // names the canonical blob. Hash those bytes instead of serving the
+        // canonical OID. A line-ending conversion changes the worktree size,
+        // while other filters need the attribute guard below.
+        if canonical_blob_size(repo, tracked.oid) != Some(metadata.len())
+            || has_content_transform(repo, Path::new(rel))
+        {
+            return None;
+        }
+        self.verified_clean_paths
+            .lock()
+            .expect("working-tree identity verification mutex poisoned")
+            .insert(rel.to_string());
         Some(tracked.oid)
     }
 }
@@ -205,34 +221,18 @@ pub fn working_tree_identity(repo: &Repository) -> Result<WorkingTreeIdentity> {
     let mut index = repo.index().map_err(|e| e.to_string())?;
     index.read(true).map_err(|e| e.to_string())?;
     let dirty = dirty_worktree_paths(repo)?;
-    // Read object headers only. This gives the canonical blob size without
-    // loading every blob, and lets clean transformed paths use visible bytes.
+    // Keep the startup scan to index and dirty-tree data. Canonical blob sizes
+    // and attributes are checked only when an analyzer requests that path.
+    // This avoids object-database work for unrelated languages and files.
     let entries: Vec<IndexEntry> = index.iter().collect();
-    let clean_oids = entries
-        .iter()
-        .map(|entry| {
-            let rel = index_path_to_string(entry)?;
-            Ok((!dirty.contains(&rel)).then_some(entry.id))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let blob_sizes = canonical_blob_sizes(repo, clean_oids.into_iter().flatten());
     let mut tracked = HashMap::with_capacity(entries.len());
     for entry in entries {
         let rel = index_path_to_string(&entry)?;
-        let blob_size = blob_sizes.get(&entry.id).copied().flatten();
-        let size_allows_fast_path = blob_size == Some(u64::from(entry.file_size));
-        let content_transform = if dirty.contains(&rel) || !size_allows_fast_path {
-            false
-        } else {
-            has_content_transform(repo, Path::new(&rel))
-        };
         tracked.insert(
             rel,
             TrackedIdentity {
                 oid: entry.id,
                 file_size: entry.file_size,
-                blob_size,
-                content_transform,
                 mtime_seconds: entry.mtime.seconds(),
                 mtime_nanoseconds: entry.mtime.nanoseconds(),
             },
@@ -240,14 +240,17 @@ pub fn working_tree_identity(repo: &Repository) -> Result<WorkingTreeIdentity> {
     }
     if crate::profiling::enabled() {
         crate::profiling::note(format!(
-            "git_identity_scan index={} dirty={} blob_headers={} elapsed_ms={:.1}",
+            "git_identity_scan index={} dirty={} blob_headers=0 elapsed_ms={:.1}",
             tracked.len(),
             dirty.len(),
-            blob_sizes.len(),
             started.elapsed().as_secs_f64() * 1000.0,
         ));
     }
-    Ok(WorkingTreeIdentity { tracked, dirty })
+    Ok(WorkingTreeIdentity {
+        tracked,
+        dirty,
+        verified_clean_paths: Mutex::new(HashSet::new()),
+    })
 }
 
 /// Return whether Git may change the bytes visible in the worktree for `path`.
@@ -299,6 +302,13 @@ fn canonical_blob_sizes(
         sizes.insert(oid, size);
     }
     sizes
+}
+
+fn canonical_blob_size(repo: &Repository, oid: Oid) -> Option<u64> {
+    canonical_blob_sizes(repo, std::iter::once(oid))
+        .get(&oid)
+        .copied()
+        .flatten()
 }
 
 fn resolve_working_tree_oid_values(

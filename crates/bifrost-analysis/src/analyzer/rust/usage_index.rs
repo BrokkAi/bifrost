@@ -146,19 +146,15 @@ mod tests {
                 },
             );
         }
-        (
-            RustUsageIndex {
-                exports_by_file,
-                module_files: RustModuleFiles {
-                    files: files.clone(),
-                    by_package,
-                    inline_by_name: HashMap::default(),
-                    cargo_routes: Arc::new(RustCargoRouteIndex::default()),
-                },
-                ..RustUsageIndex::default()
-            },
-            files,
-        )
+        let mut index = RustUsageIndex::default();
+        index.exports_by_file = exports_by_file;
+        index.module_files = RustModuleFiles {
+            files: files.clone(),
+            by_package,
+            inline_by_name: HashMap::default(),
+            cargo_routes: Arc::new(RustCargoRouteIndex::default()),
+        };
+        (index, files)
     }
 
     #[test]

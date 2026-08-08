@@ -18,7 +18,9 @@ use crate::analyzer::{
     IAnalyzer, Language, PhpAnalyzer, ProjectFile, SemanticDiagnosticIncompleteReason,
     SemanticDiagnosticReport, resolve_analyzer,
 };
-use brokk_bifrost_php::external_surface::{PhpExternalSurface, PhpExternalSymbol};
+use brokk_bifrost_php::external_surface::{
+    PhpExternalMember, PhpExternalSurface, PhpExternalSymbol,
+};
 
 pub(crate) fn collect_php_semantic_diagnostics(
     analyzer: &dyn IAnalyzer,
@@ -69,8 +71,6 @@ impl AnalyzerPhpExternalSurface {
             [] => PhpExternalSymbol::Absent,
             [symbol] if !symbol.provenance.ambiguous => PhpExternalSymbol::Indexed {
                 id: symbol.id.clone(),
-                surface_complete: symbol.provenance.completeness
-                    == SemanticModelCompleteness::Complete,
             },
             _ => PhpExternalSymbol::Ambiguous,
         }
@@ -91,33 +91,49 @@ impl PhpExternalSurface for AnalyzerPhpExternalSurface {
         Self::classify(&records)
     }
 
-    fn lookup_member(&self, owner_id: &str, member: &str) -> PhpExternalSymbol {
+    fn lookup_member(&self, owner_id: &str, member: &str) -> PhpExternalMember {
         let Some(overlay) = &self.overlay else {
-            return PhpExternalSymbol::Absent;
+            return PhpExternalMember::Unproven {
+                detail: "no active semantic pack publishes a PHP surface".to_owned(),
+            };
         };
-        let mut owners = vec![owner_id.to_owned()];
-        // A member can be inherited, so the owner's ancestors are part of the
-        // surface the lookup must check before reporting the member absent.
-        if let Some(owner) = overlay.symbols_with_id(owner_id).records.first() {
-            owners.extend(
-                overlay
-                    .ancestors_of(owner)
-                    .records
-                    .iter()
-                    .map(|ancestor| ancestor.id.clone()),
-            );
-        }
+        let owner = overlay
+            .symbols_with_id(owner_id)
+            .records
+            .first()
+            .copied()
+            .expect("the owner identity came from a lookup_type match on this overlay");
+        // A member can be inherited, so the owner's whole ancestry is part of
+        // the surface the lookup must check, and only a closure with no gap can
+        // report the member absent.
+        let surface = overlay.owner_surface(owner);
         let mut found = Vec::new();
-        for owner in &owners {
+        for ancestor in &surface.closure {
             found.extend(
                 overlay
-                    .members_of(owner)
+                    .members_of(&ancestor.id)
                     .records
                     .into_iter()
                     .filter(|symbol| symbol.name == member),
             );
         }
-        Self::classify(&found)
+        if found.is_empty() {
+            return match surface.gaps.first() {
+                Some(gap) => PhpExternalMember::Unproven {
+                    detail: gap.to_string(),
+                },
+                None => PhpExternalMember::Absent,
+            };
+        }
+        // More than one hit is the ordinary shape of an override, not a
+        // conflict: a class and the interface it implements both declare the
+        // method. Only a declaration an indexed pack itself flagged ambiguous
+        // makes the answer ambiguous.
+        if found.iter().any(|symbol| !symbol.provenance.ambiguous) {
+            PhpExternalMember::Indexed
+        } else {
+            PhpExternalMember::Ambiguous
+        }
     }
 
     fn namespace_surface_is_complete(&self, namespace_fq: &str) -> bool {

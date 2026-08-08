@@ -82,7 +82,8 @@ impl Liveness {
                 // stays at the Git API boundary.
                 let rel = rel_path.to_string_lossy().replace('\\', "/");
                 let abs_path = self.workdir.join(&rel_path);
-                if let Some(oid) = identity.clean_index_oid(&rel, &abs_path) {
+                let repo = self.repo.lock().expect("liveness repo mutex poisoned");
+                if let Some(oid) = identity.clean_index_oid(&repo, &rel, &abs_path) {
                     return Ok(Some((file.clone(), oid)));
                 }
                 // Dirty, untracked, ignored, or edited after the scan: the

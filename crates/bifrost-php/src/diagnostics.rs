@@ -9,7 +9,7 @@
 use crate::aliases::{
     PhpFileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
 };
-use crate::external_surface::{PhpExternalSurface, PhpExternalSymbol};
+use crate::external_surface::{PhpExternalMember, PhpExternalSurface, PhpExternalSymbol};
 use crate::graph_support::{
     PhpSource, php_direct_declared_class_parent, php_file_context_from_source,
 };
@@ -514,37 +514,34 @@ impl PhpDiagnosticCollector<'_> {
         }
 
         // An external owner. A member is provable only when the owner resolved
-        // uniquely and its package surface is complete.
+        // uniquely and the packs published its whole inherited surface.
         match self.external.lookup_type(&owner) {
-            PhpExternalSymbol::Indexed {
-                id,
-                surface_complete,
-            } => match self.external.lookup_member(&id, member_name) {
-                PhpExternalSymbol::Indexed { .. } => {
-                    self.report
-                        .push_resolved(range, BoundaryStatus::ExternalIndexed);
-                }
-                PhpExternalSymbol::Ambiguous => {
-                    self.report.push_ambiguous(
-                        range,
-                        vec![
+            PhpExternalSymbol::Indexed { id } => {
+                match self.external.lookup_member(&id, member_name) {
+                    PhpExternalMember::Indexed => {
+                        self.report
+                            .push_resolved(range, BoundaryStatus::ExternalIndexed);
+                    }
+                    PhpExternalMember::Ambiguous => {
+                        self.report.push_ambiguous(
+                            range,
+                            vec![
+                                BoundaryStatus::ExternalIndexed,
+                                BoundaryStatus::ExternalIndexed,
+                            ],
+                        );
+                    }
+                    PhpExternalMember::Absent => {
+                        self.publish_absence(
+                            range,
+                            domain,
                             BoundaryStatus::ExternalIndexed,
-                            BoundaryStatus::ExternalIndexed,
-                        ],
-                    );
+                            diagnostic,
+                        );
+                    }
+                    PhpExternalMember::Unproven { detail } => self.push_unproven(range, detail),
                 }
-                PhpExternalSymbol::Absent if surface_complete => {
-                    self.publish_absence(
-                        range,
-                        domain,
-                        BoundaryStatus::ExternalIndexed,
-                        diagnostic,
-                    );
-                }
-                PhpExternalSymbol::Absent => {
-                    self.push_missing_discovery(range, BoundaryStatus::ExternalDeclaredUnindexed);
-                }
-            },
+            }
             PhpExternalSymbol::Ambiguous => {
                 self.report.push_ambiguous(
                     range,
@@ -719,6 +716,15 @@ impl PhpDiagnosticCollector<'_> {
             vec![SemanticDiagnosticIncompleteReason::DynamicBehavior {
                 detail: detail.to_owned(),
             }],
+        );
+    }
+
+    /// The lookup reached a published surface that cannot carry a proof, and
+    /// `detail` names the part of it that is missing.
+    fn push_unproven(&mut self, range: Range, detail: String) {
+        self.report.push_incomplete(
+            Some(range),
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics { detail }],
         );
     }
 

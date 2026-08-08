@@ -92,9 +92,9 @@ pub use execution::{
     CodeQueryOperatorDisposition, CodeQueryOperatorObservation, CodeQueryOperatorTermination,
     CodeQueryOperatorTimings, CodeQueryPhysicalNode, CodeQueryPhysicalOperator,
     CodeQueryPhysicalPlan, CodeQueryProfile, CodeQueryProfileCacheCounters,
-    CodeQueryProfileCacheLayer, CodeQueryProfileScheduling, CodeQueryProfileTimings,
-    CodeQueryProfileWork, CodeQuerySchedulingPolicy, CodeQuerySelectedScheduling,
-    CodeQueryStructuralFactsCacheCounters,
+    CodeQueryProfileCacheLayer, CodeQueryProfileRequestTimings, CodeQueryProfileScheduling,
+    CodeQueryProfileTimings, CodeQueryProfileWork, CodeQuerySchedulingPolicy,
+    CodeQuerySelectedScheduling, CodeQueryStructuralFactsCacheCounters,
 };
 pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
 pub use identity_routes::{

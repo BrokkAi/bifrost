@@ -580,11 +580,21 @@ impl ScanCtx<'_> {
         // `fn f(value: T) { value::Serializer::new() }` may still name an
         // imported `value` module. Item bindings remain namespace-relevant.
         !matches!(name, "crate" | "self" | "super" | "$crate")
-            && self.item_shadows_target(name, byte)
+            && self.path_item_shadows_target(name, byte)
+    }
+
+    fn path_item_shadows_target(&self, name: &str, byte: usize) -> bool {
+        self.lexical_scope.item_bound_at(name, byte)
+            && self.seeds.is_none_or(|seeds| {
+                !usage_root_declaration_matches_at(self.rust, self.file, seeds, name, byte)
+                    && !usage_local_module_prefix_visible_at(
+                        self.rust, self.file, seeds, name, byte,
+                    )
+            })
     }
 
     fn item_shadows_target(&self, name: &str, byte: usize) -> bool {
-        self.lexical_scope.item_bound_at(name, byte)
+        self.lexical_scope.local_item_bound_at(name, byte)
             && self.seeds.is_none_or(|seeds| {
                 !usage_root_declaration_matches_at(self.rust, self.file, seeds, name, byte)
                     && !usage_local_module_prefix_visible_at(
@@ -2601,9 +2611,13 @@ fn exact_ast_owner(
     let root_name = segment_names.first()?;
     let rooted = matches!(root_name.as_str(), "crate" | "self" | "super");
     let root_shadowed = !rooted
-        && ctx
-            .lexical_scope
-            .item_bound_at(root_name, root.start_byte())
+        && if segments.len() > 1 {
+            ctx.lexical_scope
+                .item_bound_at(root_name, root.start_byte())
+        } else {
+            ctx.lexical_scope
+                .local_item_bound_at(root_name, root.start_byte())
+        }
         && !usage_root_declaration_matches_at(
             ctx.rust,
             ctx.file,

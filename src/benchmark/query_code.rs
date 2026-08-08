@@ -7,7 +7,7 @@ use crate::benchmark::mcp_session::McpSession;
 use crate::benchmark::report::{
     QueryCodeAccessPathMetrics, QueryCodeAccessPathTermMetrics, QueryCodeBenchmarkMetrics,
     QueryCodeDerivedLayerMetrics, QueryCodeFactsCacheMetrics, QueryCodeProfileMetrics,
-    ScenarioReport, ScenarioTransport,
+    QueryCodeRequestTimingMetrics, ScenarioReport, ScenarioTransport,
 };
 use crate::benchmark::runner::BenchmarkProfile;
 use crate::benchmark::{
@@ -246,6 +246,7 @@ struct ProfileWire {
     format: String,
     result: Value,
     timings_ns: TimingWire,
+    request_timings_ns: RequestTimingWire,
     work: WorkWire,
     cache_layers: Vec<CacheLayerWire>,
     access_path: Value,
@@ -253,6 +254,17 @@ struct ProfileWire {
 
 #[derive(Debug, Deserialize)]
 struct TimingWire {
+    total: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequestTimingWire {
+    transport_queue_wait: u64,
+    workspace_ready: u64,
+    preparation: u64,
+    input_decode: u64,
+    query_execution: u64,
+    rendering_serialization: u64,
     total: u64,
 }
 
@@ -383,6 +395,15 @@ fn parse_profile(
             truncated,
             diagnostic_codes,
             total_ns: profile.timings_ns.total,
+            request_timings: QueryCodeRequestTimingMetrics {
+                transport_queue_wait: profile.request_timings_ns.transport_queue_wait,
+                workspace_ready: profile.request_timings_ns.workspace_ready,
+                preparation: profile.request_timings_ns.preparation,
+                input_decode: profile.request_timings_ns.input_decode,
+                query_execution: profile.request_timings_ns.query_execution,
+                rendering_serialization: profile.request_timings_ns.rendering_serialization,
+                total: profile.request_timings_ns.total,
+            },
             scanned_files: profile.work.scanned_files,
             scanned_source_bytes: profile.work.scanned_source_bytes,
             fact_nodes: profile.work.fact_nodes,
@@ -639,6 +660,23 @@ fn aggregate_metrics(
         truncated: first.truncated,
         diagnostic_codes: first.diagnostic_codes.clone(),
         total_ns: median_counter(observations, |value| value.total_ns),
+        request_timings: QueryCodeRequestTimingMetrics {
+            transport_queue_wait: median_counter(observations, |value| {
+                value.request_timings.transport_queue_wait
+            }),
+            workspace_ready: median_counter(observations, |value| {
+                value.request_timings.workspace_ready
+            }),
+            preparation: median_counter(observations, |value| value.request_timings.preparation),
+            input_decode: median_counter(observations, |value| value.request_timings.input_decode),
+            query_execution: median_counter(observations, |value| {
+                value.request_timings.query_execution
+            }),
+            rendering_serialization: median_counter(observations, |value| {
+                value.request_timings.rendering_serialization
+            }),
+            total: median_counter(observations, |value| value.request_timings.total),
+        },
         scanned_files: median_counter(observations, |value| value.scanned_files),
         scanned_source_bytes: median_counter(observations, |value| value.scanned_source_bytes),
         fact_nodes: median_counter(observations, |value| value.fact_nodes),
@@ -816,6 +854,9 @@ mod tests {
         assert_eq!(result["results"][0]["name"], "App");
         assert_eq!(metrics.result_cardinality, 1);
         assert_eq!(metrics.total_ns, 11);
+        assert_eq!(metrics.request_timings.transport_queue_wait, 5);
+        assert_eq!(metrics.request_timings.workspace_ready, 3);
+        assert_eq!(metrics.request_timings.total, 21);
         assert_eq!(metrics.scanned_files, 2);
         assert_eq!(metrics.facts_cache.extractions, 2);
         assert_eq!(metrics.direct_import_topology.lookups, 1);
@@ -958,6 +999,15 @@ mod tests {
                     "execution": 8,
                     "rendering": 2,
                     "total": 11
+                },
+                "request_timings_ns": {
+                    "transport_queue_wait": 5,
+                    "workspace_ready": 3,
+                    "preparation": 2,
+                    "input_decode": 4,
+                    "query_execution": 8,
+                    "rendering_serialization": 1,
+                    "total": 21
                 },
                 "work": {
                     "scanned_files": 2,

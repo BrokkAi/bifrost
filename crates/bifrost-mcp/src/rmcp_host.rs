@@ -55,7 +55,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken as McpCancellationToken;
 
 /// `_meta` key carrying the identity of the binary that hosts this MCP server.
@@ -1138,6 +1138,7 @@ impl BifrostMcpHandler {
         mcp_cancellation: McpCancellationToken,
         permit: AnalyzerPermit,
         cold_workspace: bool,
+        transport_queue_wait: Duration,
     ) -> Result<CallToolResult, ErrorData> {
         // The deadline was set when the request was accepted, not when it
         // reached the analyzer, so time already spent queueing counts against
@@ -1183,11 +1184,12 @@ impl BifrostMcpHandler {
             let _execution_scope = profiling::scope(execution_label);
             let _cold_execution_scope =
                 cold_workspace.then(|| profiling::scope("mcp_cold.first_tool_execution"));
-            let output = execution_service.call_tool_output_with_cancellation(
+            let output = execution_service.call_tool_output_with_transport_queue_wait(
                 &execution_name,
                 arguments,
                 render_options,
                 Some(&execution_cancellation),
+                transport_queue_wait,
             )?;
             let output = if execution_name == "get_summaries" {
                 fit_get_summaries_output_to_budget(
@@ -1747,6 +1749,7 @@ impl ServerHandler for BifrostMcpHandler {
                 context.ct.clone(),
                 permit,
                 cold_workspace,
+                queue_wait,
             )
             .await;
         // The response -- success or execution error -- is ready the moment
