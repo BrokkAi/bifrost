@@ -1419,3 +1419,215 @@ pub fn park(_: SignalHandle) {}
     );
     assert!(decoy.inverse_hit.is_none(), "{decoy:#?}");
 }
+
+fn php_census_differential(
+    files: &[(&str, &str)],
+) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {
+    let mut project = InlineTestProject::with_language(Language::Php);
+    for (path, source) in files {
+        project = project.file(path, *source);
+    }
+    let project = project.build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    run_reference_differential(
+        workspace.analyzer(),
+        &ReferenceDifferentialConfig {
+            corpus_language: "php".to_string(),
+            max_files: 20,
+            max_sites: 1_000,
+            max_candidates_per_file: 1_000,
+            max_source_bytes: 100_000,
+            max_targets: 1_000,
+            max_usage_files: 20,
+            max_usages: 1_000,
+            probe_seed: ProbeSeed::Census,
+            ..ReferenceDifferentialConfig::default()
+        },
+    )
+    .expect("run inline PHP census differential")
+}
+
+/// The census site that starts at the occurrence of `needle` in `source`.
+fn census_site_at<'a>(
+    census: &'a brokk_bifrost::reference_differential::ReferenceDifferentialReport,
+    source: &str,
+    needle: &str,
+) -> &'a brokk_bifrost::reference_differential::ReferenceDifferentialSite {
+    let start = source
+        .find(needle)
+        .unwrap_or_else(|| panic!("`{needle}` is not present in the source"));
+    census
+        .sites
+        .iter()
+        .find(|site| site.start_byte == start)
+        .unwrap_or_else(|| panic!("census must propose `{needle}`: {:#?}", census.sites))
+}
+
+/// A global-namespace helper file, which every Laravel-, CodeIgniter- and
+/// tenancy-style PHP project ships.
+///
+/// It is what makes the bare-call witnesses below GRADABLE: an unqualified name
+/// that reaches neither namespace ends on the global spelling (#1866), whose
+/// namespace prefix is empty, and `php_crosses_unindexed_boundary` calls that a
+/// workspace-internal miss only when the workspace declares global-namespace
+/// symbols. Without this file the same sites answer
+/// `unresolvable_import_boundary` and the census never grades them at all.
+const GLOBAL_HELPERS: &str =
+    "<?php\n\nfunction demo_helper(string $name): string\n{\n    return $name;\n}\n";
+
+/// PHP has no implicit-receiver call, so a bare `substr(...)` inside a class
+/// that declares `Utils::substr` could never have bound to that method (#1867).
+/// The census grouped PHP with Ruby on the opposite premise and graded all 59
+/// corpus sites tier 1; the monolog witness is `src/Monolog/Utils.php`, where 7
+/// bare builtin calls collided with the class's own `substr`. The forward
+/// answer -- no indexed definition, because `substr` is a PHP runtime function
+/// outside the workspace -- is correct, so the site is exploration-grade.
+///
+/// The positive face of this contract -- a bare call that DOES reach a same-file
+/// free function -- has no honest inline tier-1 census witness, because a
+/// same-file free function in the file's own namespace is exactly what the
+/// forward resolver answers (#1866), which excludes the site from grading
+/// altogether. It is pinned instead by the unit tests on the bindability answer
+/// in `bifrost-php/src/bare_name_scopes.rs` and
+/// `bifrost-analysis/src/analyzer/reference_candidates.rs`, and end to end by
+/// `php_free_function_call_stays_consistent` below.
+#[test]
+fn census_php_bare_call_is_not_graded_from_a_method() {
+    let utils = concat!(
+        "<?php\n",
+        "namespace Demo\\Support;\n",
+        "class Utils {\n",
+        "    public static function substr(string $s, int $start): string {\n",
+        "        return substr($s, $start, 8);\n",
+        "    }\n",
+        "    public function shadowed(string $s): string {\n",
+        "        return substr($s, 0, 2);\n",
+        "    }\n",
+        "}\n",
+    );
+    let census = php_census_differential(&[
+        ("src/helpers.php", GLOBAL_HELPERS),
+        ("src/Utils.php", utils),
+    ]);
+
+    let site = census_site_at(&census, utils, "substr($s, 0, 2)");
+    assert_eq!(
+        site.forward_status, "no_definition",
+        "witness requires a forward-unresolvable bare call: {site:#?}"
+    );
+    assert_eq!(
+        site.tier,
+        Some(3),
+        "a method a bare PHP call cannot reach is not same-file evidence: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Inconclusive,
+        "an unreachable method must not produce a missing finding: {site:#?}"
+    );
+}
+
+/// 18 of the 59 corpus sites were credited against a PROPERTY -- tenancy's
+/// `protected Tenancy $tenancy`, monolog's `private $time` -- because
+/// `same_file_names` collapses every declaration to its bare identifier and
+/// discards the kind. A property is not callable at all, so it can never be
+/// evidence for a bare call (#1867).
+#[test]
+fn census_php_bare_call_is_not_graded_from_a_property() {
+    let handler = concat!(
+        "<?php\n",
+        "namespace Demo\\Support;\n",
+        "class Handler {\n",
+        "    private $time = 0;\n",
+        "    public function __construct(private int $max = 1) {}\n",
+        "    public function stamp(): int {\n",
+        "        return time() + max(1, $this->max);\n",
+        "    }\n",
+        "}\n",
+    );
+    let census = php_census_differential(&[
+        ("src/helpers.php", GLOBAL_HELPERS),
+        ("src/Handler.php", handler),
+    ]);
+
+    for needle in ["time()", "max(1,"] {
+        let site = census_site_at(&census, handler, needle);
+        assert_eq!(
+            site.tier,
+            Some(3),
+            "a property or promoted parameter is not callable evidence for `{needle}`: {site:#?}"
+        );
+        assert_eq!(
+            site.classification,
+            ReferenceClassification::Inconclusive,
+            "`{needle}` must not produce a missing finding: {site:#?}"
+        );
+    }
+}
+
+/// A trait member is still a member: `use Roundable` does not put `floor` in
+/// the term scope a bare call binds in. Carbon's 15 sites are this shape
+/// (`src/Carbon/Traits/Rounding.php` declares `floor` and calls the builtin).
+#[test]
+fn census_php_bare_call_is_not_graded_from_a_trait_method() {
+    let mixed = concat!(
+        "<?php\n",
+        "namespace Demo\\Mixed;\n",
+        "trait Roundable {\n",
+        "    public function floor(float $value): float {\n",
+        "        return floor($value);\n",
+        "    }\n",
+        "}\n",
+        "class Rounder {\n",
+        "    use Roundable;\n",
+        "    public function go(float $v): float {\n",
+        "        return floor($v);\n",
+        "    }\n",
+        "}\n",
+    );
+    let census = php_census_differential(&[
+        ("src/helpers.php", GLOBAL_HELPERS),
+        ("src/Mixed.php", mixed),
+    ]);
+
+    for needle in ["floor($value)", "floor($v)"] {
+        let site = census_site_at(&census, mixed, needle);
+        assert_eq!(
+            site.tier,
+            Some(3),
+            "a trait method is unreachable from a bare call at `{needle}`: {site:#?}"
+        );
+    }
+}
+
+/// The end-to-end positive control the grading fix must not cost: a bare call
+/// to a same-file free function is a real PHP binding, and the differential
+/// must keep reporting it as an answered, consistent site rather than as a gap.
+#[test]
+fn php_free_function_call_stays_consistent() {
+    let mixed = concat!(
+        "<?php\n",
+        "namespace Demo\\Mixed;\n",
+        "function local_helper(string $name): string {\n",
+        "    return $name;\n",
+        "}\n",
+        "class Caller {\n",
+        "    public function go(): string {\n",
+        "        return local_helper('a');\n",
+        "    }\n",
+        "}\n",
+    );
+    let census = php_census_differential(&[("src/Mixed.php", mixed)]);
+
+    let site = census_site_at(&census, mixed, "local_helper('a')");
+    assert_eq!(
+        site.forward_status, "resolved",
+        "a same-file free function is reachable from a bare call: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Consistent,
+        "the forward answer and the inverse index must agree: {site:#?}"
+    );
+    assert_eq!(site.tier, None, "an answered site is not graded: {site:#?}");
+}

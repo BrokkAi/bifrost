@@ -23,6 +23,7 @@
 
 pub mod adapter;
 pub mod aliases;
+pub mod bare_name_scopes;
 pub mod clones;
 pub mod composer;
 pub mod declarations;

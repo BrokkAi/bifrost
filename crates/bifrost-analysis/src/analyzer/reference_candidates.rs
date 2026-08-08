@@ -3,6 +3,7 @@ use crate::analyzer::{Language, Range};
 use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
 use brokk_bifrost_js_ts::syntax::JsTsLexicalBindingIndex;
 use brokk_bifrost_jvm::scala::bare_name_scopes::ScalaBareNameDeclarationScopes;
+use brokk_bifrost_php::bare_name_scopes::PhpBareNameFunctionScopes;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +142,7 @@ pub struct CensusBareNameBindings {
 enum CensusBareNameScopes {
     JsTsLexical(JsTsLexicalBindingIndex),
     ScalaDeclarations(ScalaBareNameDeclarationScopes),
+    PhpFreeFunctions(PhpBareNameFunctionScopes),
 }
 
 impl CensusBareNameBindings {
@@ -149,7 +151,9 @@ impl CensusBareNameBindings {
     /// grades bare calls against the same notion of scope the resolver binds
     /// them with. Scala answers with declaration visibility instead, because a
     /// bare Scala call also reaches the enclosing template's own, inherited,
-    /// self-typed and imported members (#1858).
+    /// self-typed and imported members (#1858). PHP answers with the file's free
+    /// FUNCTION declarations and nothing else, because it has no
+    /// implicit-receiver call at all (#1867).
     pub fn build(root: Node<'_>, source: &str, language: Language) -> Option<Self> {
         let scopes = match language {
             Language::JavaScript | Language::TypeScript => {
@@ -157,6 +161,9 @@ impl CensusBareNameBindings {
             }
             Language::Scala => CensusBareNameScopes::ScalaDeclarations(
                 ScalaBareNameDeclarationScopes::build(root, source),
+            ),
+            Language::Php => CensusBareNameScopes::PhpFreeFunctions(
+                PhpBareNameFunctionScopes::build(root, source),
             ),
             _ => return None,
         };
@@ -167,6 +174,7 @@ impl CensusBareNameBindings {
         match &self.scopes {
             CensusBareNameScopes::JsTsLexical(lexical) => lexical.is_bound_at(name, byte),
             CensusBareNameScopes::ScalaDeclarations(scopes) => scopes.is_bound_at(name, byte),
+            CensusBareNameScopes::PhpFreeFunctions(scopes) => scopes.is_bound_at(name, byte),
         }
     }
 }
@@ -470,11 +478,51 @@ mod tests {
             "an object-literal member is not a lexical binding of its bare name"
         );
 
-        // Languages without a lexical-binding index say so, rather than
-        // answering "not bound" and pruning their evidence.
+        // Languages without a scope index say so, rather than answering
+        // "not bound" and pruning their evidence.
         assert!(
             CensusBareNameBindings::build(tree.root_node(), source, Language::Java).is_none(),
-            "only JavaScript and TypeScript answer bare-name bindability today"
+            "Java has no scope index and must not answer bare-name bindability"
+        );
+    }
+
+    /// PHP's arm (#1867): a bare call binds to a free FUNCTION the file
+    /// publishes and to nothing else. It has no implicit-receiver call, so a
+    /// method or property of the enclosing class is not evidence -- the premise
+    /// that grouped PHP with Ruby and over-graded all 59 census sites.
+    #[test]
+    fn census_bare_name_bindings_answer_php_free_functions_only() {
+        let source = concat!(
+            "<?php\n",
+            "namespace Demo\\Support;\n",
+            "function local_helper(string $name): string { return $name; }\n",
+            "class Utils {\n",
+            "    private $time = 0;\n",
+            "    public static function substr(string $s): string { return substr($s, 0, 2); }\n",
+            "    public function go(): string { return local_helper('a') . time(); }\n",
+            "}\n",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, "Utils.php");
+        let tree = parse_tree_for_language(&file, Language::Php, source).expect("php tree");
+        let bindings = CensusBareNameBindings::build(tree.root_node(), source, Language::Php)
+            .expect("PHP answers bare-name bindability");
+
+        assert!(
+            bindings.is_bound_at(
+                "local_helper",
+                source.find("local_helper('a')").expect("site")
+            ),
+            "a same-file free function is reachable from a bare call"
+        );
+        assert!(
+            !bindings.is_bound_at("substr", source.find("substr($s, 0, 2)").expect("site")),
+            "a method needs a receiver, so it is not a bare-call binding"
+        );
+        assert!(
+            !bindings.is_bound_at("time", source.find("time()").expect("site")),
+            "a property is not callable at all"
         );
     }
 

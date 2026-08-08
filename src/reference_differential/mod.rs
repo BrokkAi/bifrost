@@ -1433,14 +1433,23 @@ fn bare_call_reaches_same_file_declaration(
         Language::Scala => bindings
             .expect("a Scala census site with a parsed tree carries a bare-name binding index")
             .is_bound_at(name, byte),
+        // PHP has NO implicit-receiver call: `foo()` inside a class never means
+        // `$this->foo()`. It binds to a function in the current namespace, to a
+        // `use function` alias, or -- failing both -- to the global function
+        // (#1866). So the only same-file declaration a bare PHP call can reach
+        // is a free FUNCTION, which is what this index holds (#1867). Grouping
+        // PHP with Ruby graded all 59 php-census sites tier 1: 40 against a
+        // method that needs a receiver, 5 against a property that is not
+        // callable at all, and the rest the same shape.
+        Language::Php => bindings
+            .expect("a PHP census site with a parsed tree carries a bare-name binding index")
+            .is_bound_at(name, byte),
         // Implicit-receiver languages: a bare call legitimately reaches a
         // member of the enclosing type, so an owned same-file declaration is
         // real evidence. Java, C# and Kotlin reach the enclosing class through
         // implicit `this` (plus inherited and statically imported members);
-        // Ruby and PHP reach it through implicit `self`/`$this`.
-        Language::Java | Language::CSharp | Language::Kotlin | Language::Ruby | Language::Php => {
-            true
-        }
+        // Ruby reaches it through implicit `self`.
+        Language::Java | Language::CSharp | Language::Kotlin | Language::Ruby => true,
         // No lexical-binding index yet, and no cheap sound approximation. An
         // owner test would be wrong here for two independent reasons: these
         // analyzers qualify module-scope declarations with the module or
