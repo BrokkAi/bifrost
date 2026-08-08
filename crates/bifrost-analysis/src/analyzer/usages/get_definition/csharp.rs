@@ -2345,8 +2345,13 @@ fn csharp_member_outcome(
         // workspace, the accepting declaration is on the far side of that
         // boundary -- `Writer.WriteLine()` against a type deriving from the
         // unindexed `System.IO.TextWriter` -- which is what the site reports.
+        // The implicit `object` base is such a departure too, but only for the
+        // members `object` itself declares (#1810).
         return gated_boundary(
-            || !csharp_hierarchy_crosses_unindexed_supertype(definitions, &owners),
+            || {
+                !csharp_hierarchy_crosses_unindexed_supertype(definitions, &owners)
+                    && !csharp_object_declares_overload(member, arity)
+            },
             format!("`{member}` is inherited from a C# base type not indexed in this workspace"),
             "no_applicable_overload",
             format!("no C# member `{member}` overload accepts this call"),
@@ -2406,6 +2411,47 @@ fn csharp_hierarchy_crosses_unindexed_supertype(
         }
     }
     false
+}
+
+/// Whether `System.Object` itself declares a `member` overload this call's
+/// argument count could reach.
+///
+/// [`csharp_hierarchy_crosses_unindexed_supertype`] skips `object` because
+/// naming it says nothing about a truncated hierarchy -- every C# type derives
+/// from it. That is right for resolution, and it is right for the boundary
+/// verdict on *most* names: an unconditional "the implicit object base is
+/// unindexed" rule would turn every arity-rejected call into a boundary claim,
+/// including calls whose owner chain this workspace indexes completely, which
+/// #1797's `LocalWriter.WriteLine()` face answers `no_definition` on purpose.
+///
+/// `object`'s own declared members are the exception (#1810). neo's
+/// `WitnessCondition` declares only the one-argument `Equals` override, and the
+/// bare `Equals(left, right)` beside it binds the external static
+/// `object.Equals(object, object)` -- a declaration that exists, that the
+/// workspace genuinely does not index, and that no explicit base type leads to.
+/// Matching the identifier against the members `object` declares is what makes
+/// that claim specific to this call rather than a blanket one.
+///
+/// The arity is part of the entry because the name alone would over-claim:
+/// `object` has no three-argument `Equals`, so an `Equals(a, b, c)` call is not
+/// reaching across this boundary either.
+fn csharp_object_declares_overload(member: &str, arity: Option<usize>) -> bool {
+    /// `System.Object`'s declared members, with the parameter counts each name
+    /// offers. `Finalize` is omitted: C# forbids calling it by name.
+    const OBJECT_MEMBERS: &[(&str, &[usize])] = &[
+        ("Equals", &[1, 2]),
+        ("GetHashCode", &[0]),
+        ("GetType", &[0]),
+        ("MemberwiseClone", &[0]),
+        ("ReferenceEquals", &[2]),
+        ("ToString", &[0]),
+    ];
+    let Some(arity) = arity else {
+        return false;
+    };
+    OBJECT_MEMBERS
+        .iter()
+        .any(|(name, arities)| *name == member && arities.contains(&arity))
 }
 
 /// The verdict a winning C# member candidate carries: the member seams check

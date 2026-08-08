@@ -33610,6 +33610,97 @@ fn csharp_arity_inapplicable_call_with_an_indexed_base_chain_answers_no_definiti
     );
 }
 
+/// neo's `WitnessCondition` shape (#1810): the class declares only the one-argument
+/// `Equals` override, and the bare two-argument call in a static member is the
+/// external `static object.Equals(object, object)` -- inherited from the implicit
+/// `object` base every C# type has and no workspace indexes.
+const CSHARP_IMPLICIT_OBJECT_BASE_SOURCE: &str = r#"namespace Demo
+{
+    public abstract class WitnessCondition
+    {
+        public abstract override bool Equals(object obj);
+
+        public override string ToString()
+        {
+            return "witness";
+        }
+
+        public static bool NotEqual(WitnessCondition left, WitnessCondition right)
+        {
+            return !Equals(left, right);
+        }
+
+        public bool Same(WitnessCondition other)
+        {
+            return Equals(other);
+        }
+
+        public string Describe()
+        {
+            return ToString();
+        }
+    }
+}
+"#;
+
+fn csharp_implicit_object_base_definition(needle: &str, offset: usize) -> Value {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/WitnessCondition.cs",
+            CSHARP_IMPLICIT_OBJECT_BASE_SOURCE,
+        )
+        .build();
+    let start = CSHARP_IMPLICIT_OBJECT_BASE_SOURCE
+        .find(needle)
+        .expect("call site in source")
+        + offset;
+    lookup(
+        project.root(),
+        &location_reference(
+            "src/WitnessCondition.cs",
+            CSHARP_IMPLICIT_OBJECT_BASE_SOURCE,
+            start,
+        ),
+    )
+}
+
+#[test]
+fn csharp_arity_rejected_object_member_call_answers_boundary() {
+    let value = csharp_implicit_object_base_definition("Equals(left, right)", 0);
+    let result = &value["results"][0];
+    assert_eq!(
+        result["status"], "unresolvable_import_boundary",
+        "the one-argument override cannot accept two arguments, and the accepting \
+         `static object.Equals(object, object)` lives beyond the implicit object base: {value}"
+    );
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_correct_arity_object_member_override_still_resolves() {
+    let value = csharp_implicit_object_base_definition("Equals(other)", 0);
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.WitnessCondition.Equals",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_bare_object_member_call_matching_a_same_class_override_still_resolves() {
+    let value = csharp_implicit_object_base_definition("return ToString();", "return ".len());
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.WitnessCondition.ToString",
+        "{value}"
+    );
+}
+
 /// jint's `IsoDateTime` shape (#1797, face 2): a record's primary constructor is
 /// a real constructor with its own arity, and an explicit constructor beside it
 /// is a distinct overload.
