@@ -10009,18 +10009,13 @@ fn scala_is_direct_member_value_definition_bounded(
         if !session.scope_step() {
             return None;
         }
-        match ancestor.kind() {
-            "function_definition"
-            | "block"
-            | "block_expression"
-            | "indented_block"
-            | "case_clause"
-            | "lambda_expression" => return Some(false),
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
-                return Some(true);
-            }
-            _ => current = ancestor.parent(),
+        if SCALA_LOCAL_DEFINITION_BOUNDARIES.contains(&ancestor.kind()) {
+            return Some(false);
         }
+        if SCALA_TEMPLATE_MEMBER_BOUNDARIES.contains(&ancestor.kind()) {
+            return Some(true);
+        }
+        current = ancestor.parent();
     }
     Some(false)
 }
@@ -10034,18 +10029,13 @@ fn scala_is_local_function_definition_bounded(
         if !session.scope_step() {
             return None;
         }
-        match ancestor.kind() {
-            "function_definition"
-            | "block"
-            | "block_expression"
-            | "indented_block"
-            | "case_clause"
-            | "lambda_expression" => return Some(true),
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
-                return Some(false);
-            }
-            _ => current = ancestor.parent(),
+        if SCALA_LOCAL_DEFINITION_BOUNDARIES.contains(&ancestor.kind()) {
+            return Some(true);
         }
+        if SCALA_TEMPLATE_MEMBER_BOUNDARIES.contains(&ancestor.kind()) {
+            return Some(false);
+        }
+        current = ancestor.parent();
     }
     Some(false)
 }
@@ -11562,21 +11552,46 @@ fn scala_seed_typed(
     seed_scala_binding(name, resolved, None, bindings);
 }
 
+/// The ancestor kinds that end the "is this declaration a template member or a
+/// local?" walk with *member*.
+///
+/// `template_body` and `instance_expression` carry the anonymous class of
+/// `new T { ... }`, which owns its members exactly like a named template does.
+/// Without them the walk sailed past the anonymous body and reached whatever
+/// block the layout happened to wrap the `new` in. A continuation-line
+/// `val x =` followed by an indented `new T { ... }` gets an `indented_block`,
+/// and a same-line one does not, so the same code was called local or not
+/// depending on where the line broke (#1857). Modelling those members is issue
+/// #1860; this only keeps the boundary honest and keeps them out of the
+/// enclosing scope.
+const SCALA_TEMPLATE_MEMBER_BOUNDARIES: [&str; 6] = [
+    "class_definition",
+    "object_definition",
+    "trait_definition",
+    "enum_definition",
+    "template_body",
+    "instance_expression",
+];
+
+const SCALA_LOCAL_DEFINITION_BOUNDARIES: [&str; 6] = [
+    "function_definition",
+    "block",
+    "block_expression",
+    "indented_block",
+    "case_clause",
+    "lambda_expression",
+];
+
 fn scala_is_direct_member_definition(node: Node<'_>) -> bool {
     let mut current = node.parent();
     while let Some(ancestor) = current {
-        match ancestor.kind() {
-            "function_definition"
-            | "block"
-            | "block_expression"
-            | "indented_block"
-            | "case_clause"
-            | "lambda_expression" => return false,
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
-                return true;
-            }
-            _ => current = ancestor.parent(),
+        if SCALA_LOCAL_DEFINITION_BOUNDARIES.contains(&ancestor.kind()) {
+            return false;
         }
+        if SCALA_TEMPLATE_MEMBER_BOUNDARIES.contains(&ancestor.kind()) {
+            return true;
+        }
+        current = ancestor.parent();
     }
     false
 }
@@ -11588,18 +11603,13 @@ fn scala_is_direct_member_value_definition(node: Node<'_>) -> bool {
 fn scala_is_local_function_definition(node: Node<'_>) -> bool {
     let mut current = node.parent();
     while let Some(ancestor) = current {
-        match ancestor.kind() {
-            "function_definition"
-            | "block"
-            | "block_expression"
-            | "indented_block"
-            | "case_clause"
-            | "lambda_expression" => return true,
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
-                return false;
-            }
-            _ => current = ancestor.parent(),
+        if SCALA_LOCAL_DEFINITION_BOUNDARIES.contains(&ancestor.kind()) {
+            return true;
         }
+        if SCALA_TEMPLATE_MEMBER_BOUNDARIES.contains(&ancestor.kind()) {
+            return false;
+        }
+        current = ancestor.parent();
     }
     false
 }

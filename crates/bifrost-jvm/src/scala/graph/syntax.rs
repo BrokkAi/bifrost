@@ -1970,6 +1970,28 @@ pub fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallSiteShap
         expression = generic;
     }
     let mut lists = Vec::new();
+    // `new C(args) with T` does not parse as a `call_expression` under the
+    // `instance_expression`: tree-sitter-scala wraps the first parent in an
+    // `applied_constructor_type` that owns the argument list, and hangs that
+    // off a `compound_type`. It is still a constructor application of `C`, so
+    // its arguments are this reference's call-site shape (#1857). The same
+    // node spells a parent constructor in an `extends` clause.
+    if let Some(applied) = expression.parent().filter(|parent| {
+        parent.kind() == "applied_constructor_type" && parent.named_child(0) == Some(expression)
+    }) {
+        let mut cursor = applied.walk();
+        if let Some(arguments) = applied
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "arguments")
+        {
+            let list = call_argument_list(arguments);
+            if list.kind == ScalaCallArgumentListKind::Ordinary {
+                leading_literal_argument_types = literal_argument_types(arguments);
+            }
+            lists.push(list);
+        }
+        expression = applied;
+    }
     if let Some(instance) = expression
         .parent()
         .filter(|parent| parent.kind() == "instance_expression")
