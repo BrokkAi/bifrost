@@ -33,6 +33,25 @@ pub fn language_for_file(file: &ProjectFile) -> Language {
         .unwrap_or(Language::None)
 }
 
+/// Whether no analyzable language claims this file's extension.
+///
+/// This is the eligibility rule for include-driven language inference (#1837):
+/// an analyzer may adopt a workspace file its own sources reference only when
+/// the static extension registry leaves that file unowned, so inference can
+/// never take a file away from the language whose extension list names it.
+/// A file with no extension at all qualifies, because no extension list can
+/// name it.
+///
+/// [`Language::is_source_extension`] is the whole registry, reference-only
+/// sibling extensions included, so a `.vue` or `.razor` file stays unclaimable
+/// even though no analyzer parses it directly.
+pub fn has_unclaimed_extension(file: &ProjectFile) -> bool {
+    match file.rel_path().extension().and_then(|ext| ext.to_str()) {
+        Some(extension) => !Language::is_source_extension(extension),
+        None => true,
+    }
+}
+
 /// Default longest single line a source file may contain before tree-sitter parsing is
 /// skipped. Minified/generated single-line bundles (committed webpack output, mermaid.min.js,
 /// etc.) have 16KB+ lines and otherwise both livelock the parser and explode downstream

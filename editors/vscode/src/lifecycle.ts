@@ -317,7 +317,7 @@ function normalizedGitignoreEntry(line: string): string | null {
 
 export function sourceFileWatchers(): vscode.FileSystemWatcher[] {
   return [
-    "**/*.{java,go,c,cc,cpp,cxx,h,hpp,hh,hxx,js,mjs,cjs,jsx,ts,tsx,py,rs,php,scala,kt,kts,cs,rb}",
+    "**/*.{java,go,c,cc,cpp,cxx,h,hpp,hh,hxx,inc,js,mjs,cjs,jsx,ts,tsx,py,rs,php,scala,kt,kts,cs,rb}",
     "**/{pom.xml,build.gradle,build.gradle.kts,settings.gradle,settings.gradle.kts,tsconfig.json,jsconfig.json,package.json,Cargo.toml,go.mod,composer.json}"
   ].map((pattern) => vscode.workspace.createFileSystemWatcher(pattern));
 }

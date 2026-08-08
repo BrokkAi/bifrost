@@ -298,9 +298,65 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     /// Multi-key adapters (e.g. TypeScript, which splits `.ts`/`.tsx`
     /// into distinct storage keys) override this.
     fn storage_language_key_for_file(&self, file: &ProjectFile) -> String {
+        // An include-claimed file (#1837) has an extension no language owns, so
+        // the file-derived key would be `Language::None` and its rows would
+        // land under a storage key this adapter never serves a generation for.
+        // Claiming adapters own that whole unclaimed-extension key namespace,
+        // which is sound exactly while one language infers claims -- the
+        // invariant `LanguageAdapter::infer_claimed_files` documents.
+        if self.claims_included_files() && crate::analyzer::common::has_unclaimed_extension(file) {
+            return self.language().config_label().to_string();
+        }
         crate::analyzer::common::language_for_file(file)
             .config_label()
             .to_string()
+    }
+    /// Whether this adapter infers additional analyzable files from the imports
+    /// of the files its extension list already selects (#1837).
+    ///
+    /// The gate exists so the generic pipeline can skip the whole inference
+    /// stage -- a workspace listing scan plus one import-fact hydration -- for
+    /// the eleven languages that do not infer.
+    fn claims_included_files(&self) -> bool {
+        false
+    }
+    /// The claim edges this adapter contributes: for each source file, the
+    /// workspace files it references that no language's extension registry
+    /// claims and that this adapter therefore adopts for indexing (#1837).
+    ///
+    /// `sources` pairs each analyzed file of this adapter with the imports
+    /// recorded for it. `claimable` is every workspace file whose extension no
+    /// language owns (extensionless files included); returning anything outside
+    /// it is a contract violation the caller asserts against. A source with no
+    /// claimable reference contributes no entry.
+    ///
+    /// Edges, not a flat set: the caller closes the relation transitively and
+    /// drops a claim when the last reference to it disappears, and both need
+    /// the attribution. The caller also drives the closure -- it calls this
+    /// with the files it has just adopted and repeats until the set stops
+    /// growing, so an implementation answers only for the `sources` it is
+    /// handed and never walks the graph itself.
+    ///
+    /// Determinism: the answer must be a pure function of `sources`,
+    /// `claimable` and the static extension registry. No discovery order, no
+    /// first-claimant-wins.
+    ///
+    /// CLAIMS SEAM -- single claimant. C++ is the only implementor today, and
+    /// [`crate::analyzer::languages::claim_inferring_languages`] is the registry
+    /// that says so. If a second language ever infers claims, a file both
+    /// languages claim must be dropped from BOTH sets and reported by a
+    /// diagnostic naming the claimants, and
+    /// [`LanguageAdapter::storage_language_key_for_file`] above must stop
+    /// handing the unclaimed-extension key namespace to whichever adapter is
+    /// asking. The registry's own assertion pins the single-claimant premise;
+    /// no multi-claimant machinery exists yet on purpose.
+    fn infer_claimed_files(
+        &self,
+        sources: &[(ProjectFile, Vec<ImportInfo>)],
+        claimable: &BTreeSet<ProjectFile>,
+    ) -> HashMap<ProjectFile, BTreeSet<ProjectFile>> {
+        let _ = (sources, claimable);
+        HashMap::default()
     }
     fn storage_language_keys(&self) -> Vec<(String, TsLanguage)> {
         vec![(
@@ -770,6 +826,14 @@ struct AnalyzerRuntimeState {
     dirty_path_symbol_rows: Mutex<HashMap<ProjectFile, (String, PathSymbolRow)>>,
     seeded_file_states: Vec<(FileStateCacheKey, Arc<FileState>)>,
     persistence_stats: PersistBatchStats,
+    /// Include-driven claim relation for this generation (#1837): analyzed file
+    /// -> the unclaimed-extension workspace files it references. Empty for the
+    /// eleven adapters that do not infer claims. Retained rather than recomputed
+    /// so an incremental update re-reads imports only for the files that
+    /// changed: everything else's edges are still valid, and the claim set is
+    /// the transitive closure of the whole relation from the
+    /// extension-discovered roots.
+    claim_edges: HashMap<ProjectFile, BTreeSet<ProjectFile>>,
 }
 
 impl AnalyzerRuntimeState {
@@ -785,7 +849,42 @@ impl AnalyzerRuntimeState {
             dirty_path_symbol_rows: Mutex::new(dirty_path_symbol_rows),
             seeded_file_states,
             persistence_stats: PersistBatchStats::default(),
+            claim_edges: HashMap::default(),
         }
+    }
+
+    /// Fold `other`'s parse errors and seeded states into this state. Used when
+    /// a build reconciles include-claimed files in a second pass: the two
+    /// passes produce one generation's runtime state, not two.
+    fn absorb(&mut self, other: AnalyzerRuntimeState) {
+        let AnalyzerRuntimeState {
+            fresh_parse_errors,
+            dirty_file_states,
+            dirty_path_symbol_rows,
+            seeded_file_states,
+            persistence_stats,
+            claim_edges,
+        } = other;
+        self.fresh_parse_errors.extend(fresh_parse_errors);
+        // The second pass was handed this pass's dirty maps as input and
+        // returns the merged result, so it replaces rather than extends.
+        *self
+            .dirty_file_states
+            .lock()
+            .expect("dirty file-state mutex poisoned") = dirty_file_states
+            .into_inner()
+            .expect("dirty file-state mutex poisoned");
+        *self
+            .dirty_path_symbol_rows
+            .lock()
+            .expect("dirty path-symbol mutex poisoned") = dirty_path_symbol_rows
+            .into_inner()
+            .expect("dirty path-symbol mutex poisoned");
+        self.seeded_file_states.extend(seeded_file_states);
+        self.seeded_file_states
+            .truncate(SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY);
+        self.persistence_stats.merge(persistence_stats);
+        self.claim_edges.extend(claim_edges);
     }
 
     fn seed_snapshot_file_states(&self, cache: &mut SourceSnapshotFileStateIndex) {
@@ -3002,7 +3101,7 @@ where
                 None,
             ));
         }
-        let state = {
+        let mut state = {
             let _scope = profiling::scope(format!(
                 "TreeSitterAnalyzer::{:?}::reconcile_file_states",
                 adapter.language()
@@ -3021,6 +3120,20 @@ where
                 },
             )
         };
+        // Include-driven inference runs after the extension-discovered files
+        // are reconciled, because the imports it reads are exactly what that
+        // pass persisted: the closure costs one bulk import-fact hydration per
+        // round instead of a second read of every source in the workspace.
+        let mut indexed_files = analyzable_files.clone();
+        indexed_files.extend(Self::reconcile_claimed_files(
+            project,
+            adapter,
+            config,
+            store_context,
+            &analyzable_files,
+            HashMap::default(),
+            &mut state,
+        ));
         {
             let _scope = profiling::scope(format!(
                 "TreeSitterAnalyzer::{:?}::sync_path_symbol_units",
@@ -3032,13 +3145,13 @@ where
                 .expect("dirty path-symbol mutex poisoned")
                 .extend(Self::sync_path_symbol_units(
                     adapter,
-                    &analyzable_files,
+                    &indexed_files,
                     store_context,
                 ));
         }
 
         if let Some(progress) = progress.as_ref() {
-            let total = analyzable_files.len();
+            let total = indexed_files.len();
             progress(BuildProgressEvent::new(
                 adapter.language(),
                 BuildProgressPhase::Index,
@@ -3051,6 +3164,225 @@ where
             .gc
             .schedule(project.root(), Arc::clone(&store_context.store));
         state
+    }
+
+    /// Every workspace file whose extension no language claims: the universe
+    /// include-driven inference may draw from (#1837).
+    ///
+    /// `.bifrostignore` is applied later, to the files inference actually
+    /// adopts, not here. `Project::is_bifrostignored` answers one path at a time
+    /// off a whole-workspace listing, so asking it about every non-source file
+    /// in the repository would cost a listing per file.
+    fn claimable_workspace_files(project: &dyn Project) -> BTreeSet<ProjectFile> {
+        let Ok(files) = project.all_files_shared() else {
+            return BTreeSet::new();
+        };
+        files
+            .iter()
+            .filter(|file| crate::analyzer::common::has_unclaimed_extension(file))
+            .cloned()
+            .collect()
+    }
+
+    /// The import rows recorded for `files`, read from the store rather than
+    /// re-parsed. Files whose state is dirty (a failed persist) answer from the
+    /// dirty entry so a claim is not lost to a transient write failure.
+    fn stored_import_facts(
+        adapter: &A,
+        store_context: &AnalyzerStoreContext,
+        state: &AnalyzerRuntimeState,
+        files: &[ProjectFile],
+    ) -> Vec<(ProjectFile, Vec<ImportInfo>)> {
+        let snapshot = store_context.live_paths.snapshot();
+        let mut entries = Vec::with_capacity(files.len());
+        let mut out = Vec::with_capacity(files.len());
+        for file in files {
+            let Some(oid) = snapshot.validated_oid_for_path(file) else {
+                continue;
+            };
+            let storage_key = adapter.storage_language_key_for_file(file);
+            let key = Self::transient_cache_key(oid, file);
+            match state.dirty_imports(&key) {
+                Some(imports) => out.push((file.clone(), imports)),
+                None => entries.push((file.clone(), oid, storage_key)),
+            }
+        }
+        if entries.is_empty() {
+            return out;
+        }
+        let facts = store_context
+            .store
+            .hydrate_import_facts_by_key(&entries, store_context.generations.as_ref(), adapter)
+            .unwrap_or_default();
+        out.extend(facts.into_iter().map(|(file, facts)| (file, facts.imports)));
+        out
+    }
+
+    /// The claim set implied by `edges`: every file in `claimable` reachable
+    /// from an extension-discovered file of this adapter's language.
+    ///
+    /// Iterative worklist, never recursion -- an include chain is as deep as the
+    /// workspace makes it. The result is a set keyed by file, so it does not
+    /// depend on the order `edges` iterates in. Intersecting with `claimable`
+    /// retires an edge whose target has left the workspace since the generation
+    /// that recorded it.
+    fn closed_claim_set(
+        adapter: &A,
+        edges: &HashMap<ProjectFile, BTreeSet<ProjectFile>>,
+        claimable: &BTreeSet<ProjectFile>,
+    ) -> BTreeSet<ProjectFile> {
+        let mut claimed = BTreeSet::new();
+        let mut worklist = Vec::new();
+        let push_targets = |targets: &BTreeSet<ProjectFile>,
+                            claimed: &mut BTreeSet<ProjectFile>,
+                            worklist: &mut Vec<ProjectFile>| {
+            for target in targets {
+                if claimable.contains(target) && claimed.insert(target.clone()) {
+                    worklist.push(target.clone());
+                }
+            }
+        };
+        for (source, targets) in edges {
+            // Only an extension-discovered file seeds the closure. A claimed
+            // file's own edges are followed when the closure reaches it, so a
+            // cycle of unreferenced `.inc` files claims nothing.
+            if crate::analyzer::common::language_for_file(source) != adapter.language() {
+                continue;
+            }
+            push_targets(targets, &mut claimed, &mut worklist);
+        }
+        while let Some(file) = worklist.pop() {
+            let Some(targets) = edges.get(&file) else {
+                continue;
+            };
+            push_targets(targets, &mut claimed, &mut worklist);
+        }
+        claimed
+    }
+
+    /// Adopt the files this adapter's analyzed sources pull in and reconcile
+    /// them exactly like extension-discovered files (#1837).
+    ///
+    /// `roots` are the files whose imports seed the relation -- the whole
+    /// extension-discovered set on a build, only the changed files on an update.
+    /// `retained_edges` carries the previous generation's relation forward on an
+    /// update and is empty on a build. `state` receives the merged reconcile
+    /// results and the closed relation.
+    ///
+    /// Cost: one bulk import-fact read per round over the frontier, no source
+    /// reads. A build's first frontier is the whole extension-discovered set,
+    /// which is why the imports come from the store the preceding reconcile just
+    /// filled rather than from a second pass over the workspace's bytes. A
+    /// workspace with no unclaimed-extension file at all pays nothing.
+    ///
+    /// Returns the claimed files, which the caller treats as indexed files from
+    /// here on.
+    fn reconcile_claimed_files(
+        project: &dyn Project,
+        adapter: &A,
+        config: &AnalyzerConfig,
+        store_context: &AnalyzerStoreContext,
+        roots: &[ProjectFile],
+        retained_edges: HashMap<ProjectFile, BTreeSet<ProjectFile>>,
+        state: &mut AnalyzerRuntimeState,
+    ) -> Vec<ProjectFile> {
+        if !adapter.claims_included_files() {
+            return Vec::new();
+        }
+        let _scope = profiling::scope(format!(
+            "TreeSitterAnalyzer::{:?}::reconcile_claimed_files",
+            adapter.language()
+        ));
+        let claimable = Self::claimable_workspace_files(project);
+        let mut edges = retained_edges;
+        // With nothing eligible there is no reason to read anyone's imports.
+        // The closure below still runs, so a claim an earlier generation
+        // recorded retires when its target leaves the workspace.
+        let mut frontier: Vec<ProjectFile> = if claimable.is_empty() {
+            Vec::new()
+        } else {
+            roots.to_vec()
+        };
+        let mut visited: HashSet<ProjectFile> = roots.iter().cloned().collect();
+        let mut claimed_files = Vec::new();
+        // Fixpoint over the claim relation. Each round reads one frontier's
+        // imports, reconciles whatever that frontier newly claims, and makes
+        // those files the next frontier; the visited set bounds the loop by the
+        // workspace file count.
+        while !frontier.is_empty() {
+            let sources = Self::stored_import_facts(adapter, store_context, state, &frontier);
+            let round_edges = adapter.infer_claimed_files(&sources, &claimable);
+            debug_assert!(
+                round_edges
+                    .values()
+                    .flatten()
+                    .all(|target| claimable.contains(target)),
+                "{:?} claimed files outside the claimable set: {:?}",
+                adapter.language(),
+                round_edges
+                    .values()
+                    .flatten()
+                    .filter(|target| !claimable.contains(*target))
+                    .collect::<Vec<_>>()
+            );
+            for source in &frontier {
+                // An import-less source drops out of the relation: the removal
+                // of its last claiming `#include` is what test 6 turns on.
+                edges.remove(source);
+            }
+            edges.extend(round_edges);
+
+            let closed = Self::closed_claim_set(adapter, &edges, &claimable);
+            frontier = closed
+                .into_iter()
+                .filter(|file| visited.insert(file.clone()))
+                // Applied here rather than to the whole claimable universe: this
+                // set is small, and the ignore probe is a per-path listing scan.
+                .filter(|file| !project.is_bifrostignored(file.rel_path()))
+                .collect();
+            if frontier.is_empty() {
+                break;
+            }
+            frontier.sort();
+            let round_state = Self::reconcile_file_states(
+                project,
+                adapter,
+                config,
+                store_context,
+                ReconcileFileStates {
+                    files: frontier.clone(),
+                    // Additive: the extension-discovered pass already replaced
+                    // the live path map, and a claimed file joins it.
+                    replace_live_paths: false,
+                    progress: None,
+                    dirty_file_states: state.dirty_snapshot(),
+                    dirty_path_symbol_rows: state.dirty_path_symbol_snapshot(),
+                },
+            );
+            state.absorb(round_state);
+            claimed_files.extend(frontier.iter().cloned());
+        }
+        let closed = Self::closed_claim_set(adapter, &edges, &claimable);
+        // Files that were claimed by the previous generation's relation and are
+        // not claimed by this one leave the analyzed set: drop their live paths
+        // so the GC can collect their rows and no query serves them.
+        let dropped: Vec<ProjectFile> = store_context
+            .live_paths
+            .snapshot()
+            .all_paths()
+            .filter(|file| crate::analyzer::common::has_unclaimed_extension(file))
+            .filter(|file| !closed.contains(*file))
+            .cloned()
+            .collect();
+        if !dropped.is_empty() {
+            store_context.live_paths.remove(dropped.iter().cloned());
+            if let Some(liveness) = store_context.liveness.as_ref() {
+                liveness.remove_overlay_paths(dropped.iter().cloned());
+            }
+        }
+        state.claim_edges = edges;
+        claimed_files.retain(|file| closed.contains(file));
+        claimed_files
     }
 
     fn path_symbol_row(adapter: &A, file: &ProjectFile, blob_oid: Oid) -> Option<PathSymbolRow> {
@@ -4330,10 +4662,11 @@ where
         files: impl IntoIterator<Item = ProjectFile>,
         source_mode: BulkFileStateSource,
     ) -> HashMap<ProjectFile, (FileStateCacheKey, FileState)> {
+        let live = self.live_snapshot();
         let mut entries = Vec::new();
         let mut seen = HashSet::default();
         for file in files {
-            if crate::analyzer::common::language_for_file(&file) != self.adapter.language() {
+            if !self.adapter_owns_file(&file, &live) {
                 continue;
             }
             if !seen.insert(file.clone()) {
@@ -4459,10 +4792,11 @@ where
         &self,
         files: impl IntoIterator<Item = ProjectFile>,
     ) -> HashMap<ProjectFile, ImportFileFacts> {
+        let live = self.live_snapshot();
         let mut entries = Vec::new();
         let mut seen = HashSet::default();
         for file in files {
-            if crate::analyzer::common::language_for_file(&file) != self.adapter.language() {
+            if !self.adapter_owns_file(&file, &live) {
                 continue;
             }
             if !seen.insert(file.clone()) {
@@ -4772,6 +5106,25 @@ where
         self.store_context.live_paths.snapshot()
     }
 
+    /// Whether this adapter analyzes `file`.
+    ///
+    /// The extension registry is the rule. Include-driven inference (#1837)
+    /// adds the second arm: a file whose extension no language owns belongs to
+    /// this adapter once inference has adopted it, and membership in this
+    /// analyzer's live path map is what records that adoption -- the map is
+    /// per-language (`build_language_delegate` gives each delegate its own),
+    /// and only `reconcile_claimed_files` puts an unclaimed-extension file in
+    /// it. `live` is a parameter rather than a fresh snapshot because every
+    /// caller is walking one already.
+    fn adapter_owns_file(&self, file: &ProjectFile, live: &LiveSnapshot) -> bool {
+        if crate::analyzer::common::language_for_file(file) == self.adapter.language() {
+            return true;
+        }
+        self.adapter.claims_included_files()
+            && crate::analyzer::common::has_unclaimed_extension(file)
+            && live.oid_for_path(file).is_some()
+    }
+
     /// The persisted half of [`CodeUnitIndex::parent_of`] — the owner unit named by
     /// popping `code_unit`'s last fq segment — memoized against the request's
     /// read-cache scope (#1230 item 6).
@@ -4844,8 +5197,7 @@ where
             let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
                 continue;
             };
-            if crate::analyzer::common::language_for_file(&project_file) != self.adapter.language()
-            {
+            if !self.adapter_owns_file(&project_file, &snapshot) {
                 continue;
             }
             // Membership in the analyzed set is keyed on the snapshot's
@@ -5223,8 +5575,7 @@ where
             let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
                 continue;
             };
-            if crate::analyzer::common::language_for_file(&project_file) != self.adapter.language()
-            {
+            if !self.adapter_owns_file(&project_file, &snapshot) {
                 continue;
             }
             let Some(module) = self.adapter.path_synthetic_module_unit(&project_file) else {
@@ -5319,7 +5670,7 @@ where
         let mut states = Vec::new();
         for (key, _) in dirty {
             let file = ProjectFile::new(self.project.root().to_path_buf(), key.rel_path.clone());
-            if crate::analyzer::common::language_for_file(&file) != self.adapter.language() {
+            if !self.adapter_owns_file(&file, &snapshot) {
                 continue;
             }
             if snapshot.validated_oid_for_path(&file) != Some(key.oid) {
@@ -5390,7 +5741,7 @@ where
             }
             inspected += 1;
             let file = ProjectFile::new(self.project.root().to_path_buf(), key.rel_path.clone());
-            if crate::analyzer::common::language_for_file(&file) != self.adapter.language()
+            if !self.adapter_owns_file(&file, &snapshot)
                 || snapshot.validated_oid_for_path(&file) != Some(key.oid)
             {
                 continue;
@@ -5477,9 +5828,7 @@ where
                 let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
                     continue;
                 };
-                if crate::analyzer::common::language_for_file(&project_file)
-                    != self.adapter.language()
-                {
+                if !self.adapter_owns_file(&project_file, &snapshot) {
                     continue;
                 }
                 let Some(oid) = snapshot.oid_for_path(file) else {
@@ -7215,7 +7564,7 @@ where
             let Some(file) = self.rebase_live_file_to_project_root(file) else {
                 continue;
             };
-            if crate::analyzer::common::language_for_file(&file) != self.adapter.language() {
+            if !self.adapter_owns_file(&file, &snapshot) {
                 continue;
             }
             let imports = self.import_info_for_oid_limited(&file, oid, limit - inspected);
@@ -8196,7 +8545,7 @@ where
         let Some(oid) = self.resolve_live_oid_for_file(file) else {
             return false;
         };
-        crate::analyzer::common::language_for_file(file) == self.adapter.language() && {
+        self.adapter_owns_file(file, &self.live_snapshot()) && {
             let storage_key = self.adapter.storage_language_key_for_file(file);
             let key = Self::transient_cache_key(oid, file);
             self.retry_dirty_file_state(&key, &storage_key).is_some()
@@ -8493,8 +8842,11 @@ where
         let mut store_context = self.store_context.clone();
         store_context.live_paths = Arc::new(self.store_context.live_paths.fork());
         let mut to_update = Vec::new();
+        let mut claim_roots = Vec::new();
+        let mut new_claimable_file_appeared = false;
         let mut dirty_file_states = self.state.dirty_snapshot();
         let mut dirty_path_symbol_rows = self.state.dirty_path_symbol_snapshot();
+        let live = self.live_snapshot();
 
         for file in changed_files {
             Self::remove_dirty_for_file(&mut dirty_file_states, file);
@@ -8505,12 +8857,29 @@ where
                 if let Some(liveness) = store_context.liveness.as_ref() {
                     liveness.remove_overlay_paths(std::iter::once(file.clone()));
                 }
+                // A deleted file contributes no claim edges. Feeding it to the
+                // inference roots is what retires the ones it used to own.
+                claim_roots.push(file.clone());
+                continue;
+            }
+            // A changed file whose extension names no language reaches this
+            // adapter only once inference has claimed it (#1837); an unclaimed
+            // one must not be parsed as this language.
+            if !self.adapter_owns_file(file, &live) {
+                // A claimable file that did not exist last generation can turn
+                // an `#include` that resolved to nothing into a claim, and the
+                // includer itself did not change. Re-derive the whole relation
+                // in that case -- rare, and the alternative is leaving the new
+                // file unindexed until the next full build.
+                new_claimable_file_appeared |= self.adapter.claims_included_files()
+                    && crate::analyzer::common::has_unclaimed_extension(file);
                 continue;
             }
             to_update.push(file.clone());
+            claim_roots.push(file.clone());
         }
 
-        let state = Self::reconcile_file_states(
+        let mut state = Self::reconcile_file_states(
             self.project.as_ref(),
             self.adapter.as_ref(),
             &self.config,
@@ -8522,6 +8891,26 @@ where
                 dirty_file_states,
                 dirty_path_symbol_rows,
             },
+        );
+        if new_claimable_file_appeared {
+            claim_roots.extend(
+                live.all_paths()
+                    .filter(|file| {
+                        crate::analyzer::common::language_for_file(file) == self.adapter.language()
+                    })
+                    .cloned(),
+            );
+            claim_roots.sort();
+            claim_roots.dedup();
+        }
+        Self::reconcile_claimed_files(
+            self.project.as_ref(),
+            self.adapter.as_ref(),
+            &self.config,
+            &store_context,
+            &claim_roots,
+            self.state.claim_edges.clone(),
+            &mut state,
         );
         dirty_path_symbol_rows = state.dirty_path_symbol_snapshot();
         Self::refresh_path_symbol_units(

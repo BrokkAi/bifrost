@@ -657,6 +657,28 @@ pub(crate) fn candidate_augmentation(ctx: &CandidateCtx<'_>) -> Option<Candidate
     (!augmentation.is_empty()).then_some(augmentation)
 }
 
+/// The languages whose adapters adopt workspace files that no extension list
+/// claims, by resolving their own sources' imports (#1837).
+///
+/// CLAIMS SEAM. This registry is the single-claimant premise every other part
+/// of include-driven inference rests on: `storage_language_key_for_file` hands
+/// the unclaimed-extension storage-key namespace to the asking adapter, and
+/// `MultiAnalyzer::dispatch_language` routes an unclaimed-extension file to the
+/// one language named here. Both are sound only while this list holds at most
+/// one entry. Adding a second language means implementing the drop-and-report
+/// rule stated on [`crate::analyzer::LanguageAdapter::infer_claimed_files`]:
+/// a file two languages claim belongs to neither, and a diagnostic must name
+/// both claimants.
+pub(crate) fn claim_inferring_languages() -> &'static [Language] {
+    const LANGUAGES: &[Language] = &[Language::Cpp];
+    debug_assert!(
+        LANGUAGES.len() <= 1,
+        "include-driven claim inference has no multi-claimant resolution yet, but the registry \
+         lists {LANGUAGES:?}"
+    );
+    LANGUAGES
+}
+
 pub(crate) fn language_support(language: Language) -> Option<&'static dyn LanguageSupport> {
     let support: Option<&'static dyn LanguageSupport> = match language {
         Language::None => None,
