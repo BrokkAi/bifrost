@@ -18,15 +18,35 @@ pub enum PhpExternalSymbol {
     Indexed {
         /// The overlay identity, so a later member lookup can name its owner.
         id: String,
-        /// Whether the pack that supplied the declaration claims a complete
-        /// surface. Only a complete surface can prove a member absent.
-        surface_complete: bool,
     },
     /// More than one indexed declaration, or one an indexed pack flagged
     /// ambiguous. Two Composer packages can install the same class name.
     Ambiguous,
     /// Nothing indexed the name.
     Absent,
+}
+
+/// What the indexed external surface proves about one member of an owner that
+/// already resolved.
+///
+/// A member question has an answer a name question does not: the owner is
+/// published, the member is not on what the packs published, and the packs
+/// still do not add up to the owner's whole inherited surface. Reporting that
+/// as `Absent` would turn an unindexed base class into a fabricated error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhpExternalMember {
+    /// The member is on the owner's surface or on an ancestor's.
+    Indexed,
+    /// Every declaration that answers the name is one an indexed pack flagged
+    /// ambiguous.
+    Ambiguous,
+    /// The owner's whole inherited surface is published and complete, and the
+    /// member is not on it.
+    Absent,
+    /// The published surface is not provably all of it. `detail` names the
+    /// first gap: the base class no pack published, the partial pack, or the
+    /// type two packs both declare.
+    Unproven { detail: String },
 }
 
 /// The read-only external boundary a PHP diagnostic request may consult.
@@ -37,7 +57,12 @@ pub trait PhpExternalSurface {
 
     /// The indexed member of an already-resolved external owner, including
     /// members the owner inherits.
-    fn lookup_member(&self, owner_id: &str, member: &str) -> PhpExternalSymbol;
+    ///
+    /// `owner_id` must be an identity a prior [`Self::lookup_type`] returned.
+    /// The implementation is responsible for the owner's whole ancestry: only
+    /// it can tell an owner with no base apart from an owner whose base no
+    /// pack published.
+    fn lookup_member(&self, owner_id: &str, member: &str) -> PhpExternalMember;
 
     /// Whether an indexed pack covers `namespace_fq` and claims that coverage
     /// complete, so a name missing from it is provably absent.
@@ -72,8 +97,10 @@ impl PhpExternalSurface for UnindexedPhpExternalSurface {
         PhpExternalSymbol::Absent
     }
 
-    fn lookup_member(&self, _owner_id: &str, _member: &str) -> PhpExternalSymbol {
-        PhpExternalSymbol::Absent
+    fn lookup_member(&self, _owner_id: &str, _member: &str) -> PhpExternalMember {
+        PhpExternalMember::Unproven {
+            detail: "no active semantic pack publishes a PHP surface".to_owned(),
+        }
     }
 
     fn namespace_surface_is_complete(&self, _namespace_fq: &str) -> bool {

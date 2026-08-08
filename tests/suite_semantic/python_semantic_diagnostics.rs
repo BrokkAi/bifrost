@@ -255,13 +255,19 @@ fn installed_distribution_symbols_never_error() {
     );
 }
 
+/// `object` is what every Python class inherits, so a type-owner absence proof
+/// cannot be made without it. Its own `__getattribute__` is the default
+/// attribute lookup rather than an override, which is why it must not count as
+/// a dynamic hook.
+const BUILTINS_STUB: &str = "class object:\n    def __init__(self) -> None: ...\n    def __getattribute__(self, name: str) -> object: ...\n";
+
 #[test]
-fn a_member_of_an_indexed_type_states_why_it_was_not_judged() {
-    // The owner of `theta.Klass.method` is a type, not a module surface.
-    // Proving a type's member absent needs the owner's whole inherited
-    // surface, which this pass does not resolve, so it says so rather than
-    // guessing either way.
+fn a_complete_type_closure_proves_a_missing_attribute() {
+    // `theta.Klass` declares no base, so its whole surface is its own members
+    // plus `builtins.object`'s. Both are published and complete, so a name on
+    // neither is absent.
     let environment = Environment::new()
+        .standard_library_module("builtins.pyi", BUILTINS_STUB)
         .standard_library_module("re.pyi", "def compile(pattern: str) -> str: ...\n")
         .distribution(
             "theta",
@@ -274,20 +280,143 @@ fn a_member_of_an_indexed_type_states_why_it_was_not_judged() {
         );
     let fixture = activate(
         environment,
-        "import theta\n\n\ndef run():\n    return theta.Klass.method\n",
+        "import theta\n\n\ndef run():\n    return theta.Klass.method, theta.Klass.nope\n",
+    );
+
+    let report = fixture.report();
+    assert_eq!(1, report.diagnostics().len(), "{report:#?}");
+    assert!(
+        report.diagnostics()[0].message.contains("nope"),
+        "the declared method must not be reported: {report:#?}"
+    );
+    assert!(
+        absence_domains(&report).iter().any(|domain| matches!(
+            domain,
+            SemanticDiagnosticDomain::MemberSurface { owner, member }
+                if owner == "theta.Klass" && member == "nope"
+        )),
+        "{report:#?}"
+    );
+    assert!(
+        resolved_at(&report, BoundaryStatus::ExternalIndexed),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn an_inherited_attribute_from_the_object_root_resolves() {
+    let environment = Environment::new()
+        .standard_library_module("builtins.pyi", BUILTINS_STUB)
+        .standard_library_module("re.pyi", "def compile(pattern: str) -> str: ...\n")
+        .distribution(
+            "theta",
+            "theta",
+            true,
+            &[("__init__.pyi", "class Klass: ...\n")],
+        );
+    let fixture = activate(
+        environment,
+        "import theta\n\n\ndef run():\n    return theta.Klass.__init__\n",
+    );
+
+    let report = fixture.report();
+    assert!(
+        report.diagnostics().is_empty(),
+        "a member `object` supplies is on every class's surface: {report:#?}"
+    );
+}
+
+#[test]
+fn a_type_whose_object_root_is_unpublished_cannot_prove_absence() {
+    // Without `builtins`, nothing has seen the members every Python class
+    // inherits, so a name missing from the class's own stub proves nothing.
+    let environment = Environment::new()
+        .standard_library_module("re.pyi", "def compile(pattern: str) -> str: ...\n")
+        .distribution(
+            "theta",
+            "theta",
+            true,
+            &[("__init__.pyi", "class Klass: ...\n")],
+        );
+    let fixture = activate(
+        environment,
+        "import theta\n\n\ndef run():\n    return theta.Klass.nope\n",
     );
 
     let report = fixture.report();
     assert!(report.diagnostics().is_empty(), "{report:#?}");
     assert!(
-        resolved_at(&report, BoundaryStatus::ExternalIndexed),
-        "the module and the type it declares both resolve: {report:#?}"
+        incomplete_reasons(&report).iter().any(|reason| matches!(
+            reason,
+            SemanticDiagnosticIncompleteReason::UnsupportedSemantics { detail }
+                if detail.contains("builtins.object")
+        )),
+        "the suppression must name the root it did not see: {report:#?}"
+    );
+}
+
+#[test]
+fn a_type_whose_base_is_unpublished_suppresses_and_names_the_base() {
+    let environment = Environment::new()
+        .standard_library_module("builtins.pyi", BUILTINS_STUB)
+        .standard_library_module("re.pyi", "def compile(pattern: str) -> str: ...\n")
+        .distribution(
+            "theta",
+            "theta",
+            true,
+            &[(
+                "__init__.pyi",
+                "class Klass(absent.Base):\n    def method(self) -> None: ...\n",
+            )],
+        );
+    let fixture = activate(
+        environment,
+        "import theta\n\n\ndef run():\n    return theta.Klass.nope\n",
+    );
+
+    let report = fixture.report();
+    assert!(
+        report.diagnostics().is_empty(),
+        "an unindexed base may declare the name: {report:#?}"
     );
     assert!(
         incomplete_reasons(&report).iter().any(|reason| matches!(
             reason,
             SemanticDiagnosticIncompleteReason::UnsupportedSemantics { detail }
-                if detail.contains("not a module surface")
+                if detail.contains("absent.Base")
+        )),
+        "the suppression must name the base it did not see: {report:#?}"
+    );
+}
+
+#[test]
+fn a_class_getattr_can_never_prove_absence() {
+    // A class `__getattr__` answers any name its surface does not list, the
+    // same way PEP 562's module hook does.
+    let environment = Environment::new()
+        .standard_library_module("builtins.pyi", BUILTINS_STUB)
+        .standard_library_module("re.pyi", "def compile(pattern: str) -> str: ...\n")
+        .distribution(
+            "theta",
+            "theta",
+            true,
+            &[(
+                "__init__.pyi",
+                "class Klass:\n    def __getattr__(self, name: str) -> int: ...\n",
+            )],
+        );
+    let fixture = activate(
+        environment,
+        "import theta\n\n\ndef run():\n    return theta.Klass.nope\n",
+    );
+
+    let report = fixture.report();
+    assert!(report.diagnostics().is_empty(), "{report:#?}");
+    assert!(
+        incomplete_reasons(&report).iter().any(|reason| matches!(
+            reason,
+            SemanticDiagnosticIncompleteReason::DynamicBehavior { detail }
+                if detail.contains("__getattr__")
         )),
         "{report:#?}"
     );

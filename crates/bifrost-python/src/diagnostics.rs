@@ -72,10 +72,16 @@ pub trait PythonEnvironmentSurface {
     /// Classify the module a namespace import names (`import a.b`).
     fn module_boundary(&self, module_path: &str) -> PythonEnvironmentBoundary;
 
-    /// Classify `member` on `module_path`. This is one question asked from two
-    /// places: `from a.b import member`, and an attribute read through a
-    /// module binder (`a.b.member`).
-    fn module_member_boundary(&self, module_path: &str, member: &str) -> PythonEnvironmentBoundary;
+    /// Classify `member` on the environment declaration `owner_path` names.
+    /// This is one question asked from two places: `from a.b import member`,
+    /// and an attribute read through a module binder (`a.b.member`).
+    ///
+    /// The owner is a module for an import, and either a module or a type for
+    /// an attribute read: `theta.Klass.method` reaches here with the owner
+    /// `theta.Klass`. An implementation that answers
+    /// [`PythonEnvironmentBoundary::Absent`] for a type owner is claiming to
+    /// have seen that type's whole inherited surface.
+    fn attribute_boundary(&self, owner_path: &str, member: &str) -> PythonEnvironmentBoundary;
 }
 
 /// An environment that has acquired nothing. Every boundary is unknown, which
@@ -88,11 +94,7 @@ impl PythonEnvironmentSurface for UnacquiredPythonEnvironment {
         unknown_boundary()
     }
 
-    fn module_member_boundary(
-        &self,
-        _module_path: &str,
-        _member: &str,
-    ) -> PythonEnvironmentBoundary {
+    fn attribute_boundary(&self, _owner_path: &str, _member: &str) -> PythonEnvironmentBoundary {
         unknown_boundary()
     }
 }
@@ -260,7 +262,7 @@ impl PythonDiagnosticCollector<'_> {
                 // A `from a.b import c` path records the module segments and
                 // the imported name in one list.
                 let module = module.join(".");
-                let boundary = self.environment.module_member_boundary(&module, member);
+                let boundary = self.environment.attribute_boundary(&module, member);
                 (SemanticDiagnosticDomain::Module { name: module }, boundary)
             } else {
                 self.report.push_incomplete(
@@ -303,8 +305,11 @@ impl PythonDiagnosticCollector<'_> {
                 .push_resolved(range, BoundaryStatus::ExternalIndexed),
             PythonEnvironmentBoundary::Absent => {
                 let message = match &domain {
+                    // The owner is a module for an import and either a module
+                    // or an indexed type for an attribute read, so the message
+                    // names it without claiming which.
                     SemanticDiagnosticDomain::MemberSurface { owner, member } => {
-                        format!("Unrecognized Python attribute `{member}` on module `{owner}`")
+                        format!("Unrecognized Python attribute `{member}` on `{owner}`")
                     }
                     _ => format!("Unrecognized Python import `{subject}`"),
                 };
@@ -571,7 +576,7 @@ impl PythonDiagnosticCollector<'_> {
             return;
         };
         let range = node_range(attribute, self.line_starts);
-        let boundary = self.environment.module_member_boundary(&owner, &member);
+        let boundary = self.environment.attribute_boundary(&owner, &member);
         self.record_boundary(
             range,
             SemanticDiagnosticDomain::MemberSurface {

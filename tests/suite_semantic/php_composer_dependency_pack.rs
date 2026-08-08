@@ -197,6 +197,24 @@ class SizedWidget {
 }
 "#;
 
+/// A subclass whose whole inheritance chain the same package publishes.
+const DERIVED_WIDGET_SRC: &str = r#"<?php
+namespace Vendor\Widget;
+
+class DerivedWidget extends Widget {
+    public function derived(): void {}
+}
+"#;
+
+/// A subclass whose base belongs to a package this fixture never installs.
+const ORPHAN_WIDGET_SRC: &str = r#"<?php
+namespace Vendor\Widget;
+
+class OrphanWidget extends \Absent\Vendor\BaseWidget {
+    public function orphan(): void {}
+}
+"#;
+
 const LEGACY_SRC: &str = r#"<?php
 class Vendor_Widget_Legacy {
     public function legacyCall(): void {}
@@ -219,6 +237,8 @@ fn widget_package() -> PackageSpec {
             ("src/Contracts/Renderable.php", RENDERABLE_SRC),
             ("src/Sizeable.php", TRAIT_SRC),
             ("src/SizedWidget.php", SIZED_WIDGET_SRC),
+            ("src/DerivedWidget.php", DERIVED_WIDGET_SRC),
+            ("src/OrphanWidget.php", ORPHAN_WIDGET_SRC),
             ("legacy/Vendor_Widget_Legacy.php", LEGACY_SRC),
             ("helpers.php", HELPERS_SRC),
         ],
@@ -465,6 +485,91 @@ class App {
     let report = fixture.report_for(&analyzer, "src/App.php");
 
     assert!(report.diagnostics().is_empty(), "{:#?}", report.outcomes());
+}
+
+#[test]
+fn a_published_inheritance_chain_resolves_the_inherited_member_and_proves_the_missing_one() {
+    // `DerivedWidget extends Widget implements Renderable`, and the package
+    // publishes every link. The closure is therefore the whole surface: a
+    // member on it resolves, and one that is on no link is absent.
+    let fixture = ComposerFixture::new(
+        &[widget_package()],
+        &[(
+            "src/App.php",
+            r#"<?php
+namespace App;
+
+use Vendor\Widget\DerivedWidget;
+
+class App {
+    public function run(DerivedWidget $widget): void {
+        $widget->render(10);
+        $widget->missingMethod();
+    }
+}
+"#,
+        )],
+    );
+    let (analyzer, _project) = fixture.activated();
+
+    let report = fixture.report_for(&analyzer, "src/App.php");
+
+    assert_eq!(report.diagnostics().len(), 1, "{:#?}", report.outcomes());
+    assert!(
+        report.diagnostics()[0].message.contains("missingMethod"),
+        "the inherited member must not be reported: {:#?}",
+        report.outcomes()
+    );
+    assert!(
+        report.outcomes().iter().any(|outcome| matches!(
+            outcome,
+            SemanticDiagnosticOutcome::Absent(proof)
+                if matches!(
+                    &proof.domain,
+                    SemanticDiagnosticDomain::MemberSurface { member, .. } if member == "missingMethod"
+                ) && proof.boundary == BoundaryStatus::ExternalIndexed
+        )),
+        "{:#?}",
+        report.outcomes()
+    );
+}
+
+#[test]
+fn a_vendor_class_whose_base_is_unpublished_cannot_prove_a_missing_member() {
+    // `OrphanWidget` extends a class from a package this install never
+    // provided. The missing base may declare the member, so the only honest
+    // answer names the base rather than reporting an error.
+    let fixture = ComposerFixture::new(
+        &[widget_package()],
+        &[(
+            "src/App.php",
+            r#"<?php
+namespace App;
+
+use Vendor\Widget\OrphanWidget;
+
+class App {
+    public function run(OrphanWidget $widget): void {
+        $widget->missingMethod();
+    }
+}
+"#,
+        )],
+    );
+    let (analyzer, _project) = fixture.activated();
+
+    let report = fixture.report_for(&analyzer, "src/App.php");
+
+    assert!(report.diagnostics().is_empty(), "{:#?}", report.outcomes());
+    assert!(
+        has_incomplete_reason(&report, |reason| matches!(
+            reason,
+            SemanticDiagnosticIncompleteReason::UnsupportedSemantics { detail }
+                if detail.contains("Absent.Vendor.BaseWidget")
+        )),
+        "the suppression must name the base no pack published: {:#?}",
+        report.outcomes()
+    );
 }
 
 #[test]
