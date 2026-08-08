@@ -92,6 +92,22 @@ fn deleted<'a>(result: &'a Value, name: &str) -> Option<&'a Value> {
         .find(|record| record["before"]["name"].as_str() == Some(name))
 }
 
+fn moved<'a>(result: &'a Value, name: &str) -> Option<&'a Value> {
+    patch_array(result, "/patch_symbols/moved")
+        .iter()
+        .find(|record| record["after"]["name"].as_str() == Some(name))
+}
+
+/// The `to` fully-qualified names of one callee-change list of `record`.
+fn callee_targets(record: &Value, field: &str) -> Vec<String> {
+    record[field]
+        .as_array()
+        .unwrap_or_else(|| panic!("`{field}` must be a list: {record}"))
+        .iter()
+        .map(|change| change["to"].as_str().expect("`to` fqn").to_string())
+        .collect()
+}
+
 fn alternate_tree(root: &Path, objects: &Path, path: &str, contents: &str) -> String {
     fs::create_dir_all(objects).unwrap();
     // `hash-object` reads its blob from stdin, so create it through a direct
@@ -288,12 +304,21 @@ func Caller() string {
                 .iter()
                 .any(|item| item.as_str().unwrap().contains("strings")))
     );
+    // The gained call is reported on the caller that gained it, so nothing is
+    // left for the residual list to hold.
     assert!(
-        result["call_edge_changes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|edge| edge["change"] == "added")
+        callee_targets(
+            edited(&result, "Caller").expect("Caller edited"),
+            "added_calls"
+        )
+        .iter()
+        .any(|to| to.ends_with("Added")),
+        "{result}"
+    );
+    assert_eq!(
+        result["unattributed_call_edge_changes"],
+        serde_json::json!([]),
+        "{result}"
     );
 }
 
@@ -545,11 +570,11 @@ fn analyze_diff_edited_pairs_describe_both_endpoints() {
 }
 
 /// A rename that moves a module without editing it changes every symbol's
-/// fully-qualified name, so both endpoints hold symbols the other lacks -- and
-/// neither overlaps a hunk, because a pure rename has no changed lines. This is
-/// the documented boundary: the file change is reported, the symbols are not.
+/// fully-qualified name, so no key matches across the endpoints. The symbols
+/// still pair through the rename Git reported, which puts them in `moved`; no
+/// hunk touches them, so the other three lists stay empty.
 #[test]
-fn analyze_diff_reports_a_pure_rename_without_patch_symbols() {
+fn analyze_diff_reports_a_pure_rename_as_moved_symbols_only() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path();
     init_repo(root, None);
@@ -581,6 +606,11 @@ fn analyze_diff_reports_a_pure_rename_without_patch_symbols() {
             "{pointer} must be empty for a pure rename: {result}"
         );
     }
+    let relocated = moved(&result, "fn").expect("fn moved");
+    assert_eq!(relocated["before"]["path"], "pkg_a/mod.py");
+    assert_eq!(relocated["after"]["path"], "pkg_b/mod.py");
+    assert_eq!(relocated["before"]["fqn"], "pkg_a.mod.fn");
+    assert_eq!(relocated["after"]["fqn"], "pkg_b.mod.fn");
 }
 
 #[test]
@@ -722,14 +752,13 @@ fn analyze_diff_reports_removed_imports_and_call_edges() {
         "the dropped import is reported as removed: {result}"
     );
     assert!(
-        result["call_edge_changes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|edge| edge["change"] == "removed"
-                && edge["from"].as_str().unwrap().ends_with("Caller")
-                && edge["to"].as_str().unwrap().ends_with("Helper")),
-        "the dropped call is reported as a removed edge: {result}"
+        callee_targets(
+            edited(&result, "Caller").expect("Caller edited"),
+            "removed_calls"
+        )
+        .iter()
+        .any(|to| to.ends_with("Helper")),
+        "the dropped call is reported on the caller that dropped it: {result}"
     );
 }
 
@@ -2097,5 +2126,301 @@ fn analyze_diff_large_snapshot_interval_keeps_structured_result() {
     assert!(
         total >= CALLSITES_ABOVE_CAP as u64,
         "every generated callsite should be counted: {target_notice}"
+    );
+}
+
+/// The join the tool used to leave to its caller: an edited function that swaps
+/// one callee for another reports both on its own record, instead of in a flat
+/// edge list the reader has to match against the symbol lists by name.
+#[test]
+fn analyze_diff_attaches_swapped_callees_to_the_edited_caller() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    let result = analyze_single_file_edit(
+        root,
+        "lib.go",
+        concat!(
+            "package sample\n",
+            "\n",
+            "func Alpha() int {\n",
+            "\treturn 1\n",
+            "}\n",
+            "\n",
+            "func Beta() int {\n",
+            "\treturn 2\n",
+            "}\n",
+            "\n",
+            "func Caller() int {\n",
+            "\treturn Alpha()\n",
+            "}\n",
+        ),
+        concat!(
+            "package sample\n",
+            "\n",
+            "func Alpha() int {\n",
+            "\treturn 1\n",
+            "}\n",
+            "\n",
+            "func Beta() int {\n",
+            "\treturn 2\n",
+            "}\n",
+            "\n",
+            "func Caller() int {\n",
+            "\treturn Beta()\n",
+            "}\n",
+        ),
+    );
+
+    let caller = edited(&result, "Caller").expect("Caller edited");
+    assert_eq!(
+        caller["added_calls"],
+        serde_json::json!([{
+            "to": "sample.Beta",
+            "language": "go",
+            "weight": 1,
+            "sites": [{"path": "lib.go", "line": 12}]
+        }]),
+        "{caller}"
+    );
+    assert_eq!(
+        caller["removed_calls"],
+        serde_json::json!([{
+            "to": "sample.Alpha",
+            "language": "go",
+            "weight": 1,
+            "sites": [{"path": "lib.go", "line": 12}]
+        }]),
+        "the dropped edge keeps its preimage callsite: {caller}"
+    );
+    assert_eq!(
+        result["unattributed_call_edge_changes"],
+        serde_json::json!([]),
+        "every changed edge belongs to a patch symbol here: {result}"
+    );
+    assert!(
+        result.get("call_edge_changes").is_none(),
+        "the flat list the per-symbol deltas replaced is gone: {result}"
+    );
+}
+
+/// A function the patch adds can only add edges, and one it removes can only
+/// lose them, so each carries a single list of everything it calls or called.
+#[test]
+fn analyze_diff_gives_introduced_and_deleted_symbols_their_whole_callee_list() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    let result = analyze_single_file_edit(
+        root,
+        "lib.go",
+        concat!(
+            "package sample\n",
+            "\n",
+            "func Alpha() int {\n",
+            "\treturn 1\n",
+            "}\n",
+            "\n",
+            "func Beta() int {\n",
+            "\treturn 2\n",
+            "}\n",
+            "\n",
+            "func Retired() int {\n",
+            "\treturn Alpha() + Beta()\n",
+            "}\n",
+        ),
+        concat!(
+            "package sample\n",
+            "\n",
+            "func Alpha() int {\n",
+            "\treturn 1\n",
+            "}\n",
+            "\n",
+            "func Beta() int {\n",
+            "\treturn 2\n",
+            "}\n",
+            "\n",
+            "func Fresh() int {\n",
+            "\treturn Alpha() + Beta()\n",
+            "}\n",
+        ),
+    );
+
+    let fresh = introduced(&result, "Fresh").expect("Fresh introduced");
+    assert_eq!(
+        callee_targets(fresh, "calls"),
+        vec!["sample.Alpha", "sample.Beta"],
+        "the new function names every callee it has: {fresh}"
+    );
+    for list in ["added_calls", "removed_calls"] {
+        assert!(
+            fresh.get(list).is_none(),
+            "an introduced symbol carries one call list, not a pair: {fresh}"
+        );
+    }
+
+    let retired = deleted(&result, "Retired").expect("Retired deleted");
+    assert_eq!(
+        callee_targets(retired, "called"),
+        vec!["sample.Alpha", "sample.Beta"],
+        "the removed function names every callee it had: {retired}"
+    );
+    assert!(
+        retired.get("added_calls").is_none() && retired.get("removed_calls").is_none(),
+        "a deleted symbol carries one call list, not a pair: {retired}"
+    );
+
+    assert_eq!(
+        result["unattributed_call_edge_changes"],
+        serde_json::json!([]),
+        "both changed callers are patch symbols: {result}"
+    );
+}
+
+/// Moving a module renames every symbol it declares, because a Python
+/// fully-qualified name follows the path. Compared under the raw names, every
+/// call between two moved symbols would read as one removed edge plus one added
+/// edge. Rewriting the preimage graph through the moves first is what makes a
+/// pure move report no call-edge change at all.
+///
+/// The first comparison is the control that keeps the second one honest: it
+/// shows this fixture's calls really do resolve into the usage graph, so the
+/// empty lists below mean cancellation rather than an absent edge.
+#[test]
+fn analyze_diff_reports_no_call_edge_churn_for_a_pure_module_move() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    init_repo(root, None);
+    fs::create_dir(root.join("pkg_a")).unwrap();
+    let module = |callee: &str| {
+        format!(
+            "def callee():\n    return 1\n\n\ndef other():\n    return 2\n\n\ndef caller():\n    return {callee}()\n"
+        )
+    };
+    fs::write(root.join("pkg_a").join("mod.py"), module("callee")).unwrap();
+    commit(root, "base");
+    fs::write(root.join("pkg_a").join("mod.py"), module("other")).unwrap();
+    let swapped = commit(root, "swap the callee in place");
+
+    let control = analyze(root, serde_json::json!({"target": swapped}));
+    let control_caller = edited(&control, "caller").expect("caller edited");
+    assert_eq!(
+        callee_targets(control_caller, "added_calls"),
+        vec!["pkg_a.mod.other"],
+        "the fixture's calls resolve into the usage graph: {control}"
+    );
+    assert_eq!(
+        callee_targets(control_caller, "removed_calls"),
+        vec!["pkg_a.mod.callee"],
+        "{control}"
+    );
+
+    fs::create_dir(root.join("pkg_b")).unwrap();
+    git(root, &["mv", "pkg_a/mod.py", "pkg_b/mod.py"]);
+    let head = commit(root, "move the module");
+
+    let result = analyze(root, serde_json::json!({"target": head}));
+    let moved_caller = moved(&result, "caller").expect("caller moved");
+    assert_eq!(
+        moved_caller["before"]["fqn"], "pkg_a.mod.caller",
+        "{result}"
+    );
+    assert_eq!(moved_caller["after"]["fqn"], "pkg_b.mod.caller", "{result}");
+    assert_eq!(
+        moved_caller["added_calls"],
+        serde_json::json!([]),
+        "a move is not a new call: {moved_caller}"
+    );
+    assert_eq!(
+        moved_caller["removed_calls"],
+        serde_json::json!([]),
+        "a move is not a dropped call: {moved_caller}"
+    );
+    assert!(
+        moved(&result, "other").is_some() && moved(&result, "callee").is_some(),
+        "every symbol of the moved module is reported moved: {result}"
+    );
+    assert_eq!(
+        result["unattributed_call_edge_changes"],
+        serde_json::json!([]),
+        "the preimage edge is compared under the postimage names: {result}"
+    );
+}
+
+/// The residual list is for a caller no patch symbol names. Renaming the module
+/// that holds a callee changes the callee's fully-qualified name while leaving
+/// the calling function's own lines alone, so that caller is not a patch symbol
+/// and any surviving churn for it could only land in the residual list. The
+/// move rewrite is what keeps that list empty.
+///
+/// As above, the first comparison is the control: it establishes that this
+/// fixture's cross-file call resolves, so the empty residual list below is
+/// cancellation rather than an edge that never existed.
+#[test]
+fn analyze_diff_cancels_a_renamed_callee_for_an_untouched_caller() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    init_repo(root, None);
+    fs::create_dir(root.join("pkg")).unwrap();
+    let helper = |value: &str| format!("def target():\n    return {value}\n");
+    let app = |body: &str, unrelated: &str, module: &str| {
+        format!(
+            "from pkg.{module} import target\n\n\ndef use_target():\n    return {body}\n\n\ndef unrelated():\n    return {unrelated}\n"
+        )
+    };
+    fs::write(root.join("pkg").join("helper.py"), helper("1")).unwrap();
+    fs::write(root.join("pkg").join("app.py"), app("0", "1", "helper")).unwrap();
+    commit(root, "base");
+    // The control has to touch both files: an endpoint analyzer only sees the
+    // paths the diff names, so a callee whose file is unchanged is not there to
+    // resolve against.
+    fs::write(root.join("pkg").join("helper.py"), helper("2")).unwrap();
+    fs::write(
+        root.join("pkg").join("app.py"),
+        app("target()", "1", "helper"),
+    )
+    .unwrap();
+    let wired = commit(root, "call the helper");
+
+    let control = analyze(root, serde_json::json!({"target": wired}));
+    assert_eq!(
+        callee_targets(
+            edited(&control, "use_target").expect("use_target edited"),
+            "added_calls"
+        ),
+        vec!["pkg.helper.target"],
+        "the fixture's cross-file call resolves into the usage graph: {control}"
+    );
+
+    // Rename the callee's module and update the import. `use_target`'s own
+    // lines are untouched; only the import line and `unrelated` change.
+    git(root, &["mv", "pkg/helper.py", "pkg/support.py"]);
+    fs::write(
+        root.join("pkg").join("app.py"),
+        app("target()", "2", "support"),
+    )
+    .unwrap();
+    let head = commit(root, "rename the helper module");
+
+    let result = analyze(root, serde_json::json!({"target": head}));
+    assert!(edited(&result, "unrelated").is_some(), "{result}");
+    assert!(
+        edited(&result, "use_target").is_none()
+            && introduced(&result, "use_target").is_none()
+            && deleted(&result, "use_target").is_none()
+            && moved(&result, "use_target").is_none(),
+        "the caller keeps its lines and its name, so it is no patch symbol: {result}"
+    );
+    let renamed_target = moved(&result, "target").expect("target moved");
+    assert_eq!(
+        renamed_target["before"]["fqn"], "pkg.helper.target",
+        "{result}"
+    );
+    assert_eq!(
+        renamed_target["after"]["fqn"], "pkg.support.target",
+        "{result}"
+    );
+    assert_eq!(
+        result["unattributed_call_edge_changes"],
+        serde_json::json!([]),
+        "the untouched caller's edge survives the callee's rename: {result}"
     );
 }
