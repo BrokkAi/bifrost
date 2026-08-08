@@ -321,7 +321,6 @@ mod tests {
         analyzer.warm_usage_facts();
 
         assert!(analyzer.rust_usage_facts_warm());
-        assert!(!analyzer.rust_usage_index_built_for_test());
         assert!(!analyzer.hierarchy_index_built_for_test());
         assert!(!analyzer.reference_context_built_for_test(&part));
 

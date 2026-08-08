@@ -202,9 +202,11 @@ impl<T> PoolSafeMemo<T> {
     /// Build the value on [`dedicated_build_pool`], off the global rayon pool.
     ///
     /// No production caller since the Rust usage index stopped being built
-    /// (ExecPlan Milestone 3); issue #1772 wants it for the type-hierarchy
-    /// warm, which is the next whole-workspace build to move off the request
-    /// path, so the mechanism and its #1757 regression test stay.
+    /// (ExecPlan Milestone 3, and Milestone 5 deleted the index itself).
+    /// Issue #1772 wants this for the type-hierarchy warm, which is the next
+    /// whole-workspace build to move off the request path, and deleting it
+    /// would also delete the `dedicated_builders` parking rule that is the
+    /// whole #1757 fix -- so the mechanism and its regression tests stay.
     ///
     /// Use from a background warm. While this build runs, a global-pool worker
     /// that reaches the same memo waits for it instead of duplicating it

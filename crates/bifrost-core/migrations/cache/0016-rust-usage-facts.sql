@@ -2,8 +2,8 @@
 -- Milestone 1; design substrate `.agents/docs/intellij-indexing-research-2026-08.md`
 -- section 7.5).
 --
--- Rust usage analysis was answered by `RustUsageIndex`, one process-heap struct
--- of seventeen workspace-wide maps that cost minutes and about 10.8 GB to build
+-- Rust usage analysis was answered by one process-heap index struct of
+-- seventeen workspace-wide maps that cost minutes and about 10.8 GB to build
 -- and was dropped wholesale on any file edit (issue #1758). These four tables
 -- decompose the unit of storage from "the workspace" to "one blob", so a file
 -- edit costs one re-parse and a handful of inserts and the old blob's rows

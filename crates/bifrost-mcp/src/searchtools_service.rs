@@ -3831,7 +3831,7 @@ fn assemble_session(
         let snapshot = Arc::clone(&snapshot);
         let warm_reference_contexts = rust_usage_reference_context_warming_enabled();
         std::thread::Builder::new()
-            .name("bifrost-usage-index-warm".to_string())
+            .name("bifrost-usage-facts-warm".to_string())
             .spawn(move || {
                 let _scope = profiling::scope("mcp_cold.query_index_construction.rust_usage");
                 snapshot.warm_rust_usage_facts();
@@ -3839,7 +3839,7 @@ fn assemble_session(
                     snapshot.warm_rust_usage_reference_contexts();
                 }
             })
-            .map_err(|error| format!("Failed to spawn usage-index warm thread: {error}"))?;
+            .map_err(|error| format!("Failed to spawn usage-facts warm thread: {error}"))?;
     }
     #[cfg(feature = "nlp")]
     let semantic = maybe_start_semantic(semantic_indexing, &snapshot);

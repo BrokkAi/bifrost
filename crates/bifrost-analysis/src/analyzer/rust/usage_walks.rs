@@ -2,8 +2,8 @@
 //!
 //! This is the third layer of `.agents/plans/rust-usage-index-v2.md`. Milestone
 //! 2a made the per-file questions store-backed and 2b did the same for the
-//! inverted-derivable ones; what is left in `RustUsageIndex` is the group that
-//! is genuinely cross-file -- module-file resolution, physical ownership, alias
+//! inverted-derivable ones; what this file carries is the group that is
+//! genuinely cross-file -- module-file resolution, physical ownership, alias
 //! routes, effective module domains, forward import edges, export chains, and
 //! macro scope visibility.
 //!
@@ -42,7 +42,7 @@ use super::imports::{
     resolve_rust_module_path_with_crate, resolve_rust_module_segments_with_crate,
     rust_crate_root_package,
 };
-use super::usage_index::{
+use super::usage::{
     Domain, ModuleKey, RustImportEdge, RustImportEdgeKind, RustImportExtent, RustMacroScopeEdge,
     RustMacroScopeKey, RustMacroScopeRanges, RustModuleAliasRoute, RustOriginRoute,
     RustResolvedModuleRoute, RustRouteProvenance, RustSymbolIdentity, RustSymbolNamespace,

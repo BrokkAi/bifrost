@@ -1,11 +1,11 @@
 //! Query-time composition over the persisted per-file Rust usage facts.
 //!
 //! This is the read side of the tables Milestone 1 of
-//! `.agents/plans/rust-usage-index-v2.md` added. Where `RustUsageIndex` answers
-//! a usage question from seventeen workspace-wide maps built wholesale into
-//! heap, `RustUsageQueries` answers it from rows: the file's own facts for a
-//! per-file question, and one indexed lookup plus per-candidate verification
-//! for a name question.
+//! `.agents/plans/rust-usage-index-v2.md` added. Where Rust usage analysis
+//! used to answer a question from seventeen workspace-wide maps built
+//! wholesale into heap, `RustUsageQueries` answers it from rows: the file's own
+//! facts for a per-file question, and one indexed lookup plus per-candidate
+//! verification for a name question.
 //!
 //! Two contracts govern everything here, both taken from IntelliJ (see
 //! `.agents/docs/intellij-indexing-research-2026-08.md`):
@@ -34,10 +34,10 @@ use crate::hash::HashSet;
 
 use super::RustAnalyzer;
 use super::declarations::rust_package_name;
-use super::facts::{RUST_OCCURRENCE_CODE, RustExportFact, RustImportTargetFact, RustUsageFacts};
+use super::facts::{RustExportFact, RustImportTargetFact, RustUsageFacts};
 use super::graph_support::rust_value_constructor_visibilities;
 use super::imports::RustVisibility;
-use super::usage_index::{
+use super::usage::{
     Domain, ModuleKey, RustImportExtent, RustSymbolIdentity, RustSymbolNamespace,
     direct_import_scope_for_module,
 };
@@ -206,13 +206,10 @@ pub(super) struct RustUsageQueries<'a> {
     analyzer: &'a RustAnalyzer,
 }
 
-/// The query surface. Two products are already served from here --
-/// `module_at_byte` (from `usage_index.rs`) and the re-export half of
-/// `export_index_of_declarations` (from `graph_support.rs`) -- and the rest is
-/// the surface the remaining `RustUsageIndex` consumers move onto. The allow
-/// covers only that not-yet-consumed remainder; every method below is exercised
-/// by the tests at the bottom of this file, so none of it is speculative.
-#[allow(dead_code)]
+/// The query surface every Rust usage answer reads through: `usage.rs` for
+/// `module_at_byte`, `graph_support.rs` for the re-export half of
+/// `export_index_of_declarations`, and `usage_walks.rs` for everything
+/// cross-file.
 impl<'a> RustUsageQueries<'a> {
     pub(super) fn new(analyzer: &'a RustAnalyzer) -> Self {
         Self { analyzer }
@@ -318,20 +315,6 @@ impl<'a> RustUsageQueries<'a> {
             .map(|(module, _, _)| module)
     }
 
-    /// The `mod name;` declarations of `file`, as dotted package names.
-    pub(super) fn declared_file_modules_of(&self, file: &ProjectFile) -> Vec<String> {
-        let Some(facts) = self.facts_of(file) else {
-            return Vec::new();
-        };
-        let package = rust_package_name(file);
-        facts
-            .modules
-            .iter()
-            .filter(|module| !module.is_inline)
-            .map(|module| compose_module(&package, &module.module_name))
-            .collect()
-    }
-
     /// Every `use` binding of `file`, in source order.
     pub(super) fn import_bindings_of(&self, file: &ProjectFile) -> Vec<RustImportBinding> {
         let Some(facts) = self.facts_of(file) else {
@@ -367,22 +350,12 @@ impl<'a> RustUsageQueries<'a> {
         )
     }
 
-    /// Live files that re-export `exported_name`. The seed of an export-chain
-    /// walk, and a candidate set for the same reason as above.
-    pub(super) fn files_exporting(&self, exported_name: &str) -> Vec<ProjectFile> {
-        self.live_files(
-            self.analyzer
-                .analyzer_store()
-                .rust_export_blobs("rust", exported_name)
-                .unwrap_or_default(),
-        )
-    }
-
     /// Live files whose text mentions `identifier` in at least one of the
     /// contexts in `context_mask`.
     ///
     /// This is the `IdIndex` analogue and the entry point of a name search.
-    /// Pass [`RUST_OCCURRENCE_CODE`] to exclude comments and string literals,
+    /// Pass [`RUST_OCCURRENCE_CODE`](super::facts::RUST_OCCURRENCE_CODE) to
+    /// exclude comments and string literals,
     /// which is what a reference search wants.
     pub(super) fn files_mentioning(&self, identifier: &str, context_mask: u32) -> Vec<ProjectFile> {
         let snapshot = self.analyzer.live_path_snapshot();
@@ -399,59 +372,6 @@ impl<'a> RustUsageQueries<'a> {
             files.extend(snapshot.paths_for_oid(oid).iter().cloned());
         }
         dedup_files(files)
-    }
-
-    /// Whether any live file mentioning `identifier` in code satisfies
-    /// `accept`, stopping at the first one that does.
-    ///
-    /// The early-out half of IntelliJ's query-cost mitigation: a caller asking
-    /// "is there at least one" must not pay for verifying the rest. Candidates
-    /// are visited in locality order around `near`, so the common answer is
-    /// found in the first bucket.
-    pub(super) fn any_file_mentioning(
-        &self,
-        identifier: &str,
-        near: &ProjectFile,
-        accept: impl FnMut(&ProjectFile) -> bool,
-    ) -> bool {
-        self.bucket_by_locality(
-            near,
-            self.files_mentioning(identifier, RUST_OCCURRENCE_CODE),
-        )
-        .iter()
-        .any(accept)
-    }
-
-    /// Order `candidates` so the ones most likely to verify come first: the
-    /// anchor file itself, then its directory, then everything else.
-    ///
-    /// This is a heuristic over the candidate set, never a filter -- every
-    /// candidate is still returned. It mirrors
-    /// `PsiSearchHelperImpl.collectFiles`'s target / near-directory / rest
-    /// bucketing, and it pays off exactly when the caller stops early.
-    pub(super) fn bucket_by_locality(
-        &self,
-        anchor: &ProjectFile,
-        candidates: Vec<ProjectFile>,
-    ) -> Vec<ProjectFile> {
-        let anchor_directory = anchor.abs_path().parent().map(std::path::Path::to_path_buf);
-        let mut bucketed = candidates;
-        bucketed.sort_by_key(|candidate| {
-            if candidate == anchor {
-                0
-            } else if anchor_directory.is_some()
-                && candidate
-                    .abs_path()
-                    .parent()
-                    .map(std::path::Path::to_path_buf)
-                    == anchor_directory
-            {
-                1
-            } else {
-                2
-            }
-        });
-        bucketed
     }
 
     fn live_files(&self, oids: Vec<Oid>) -> Vec<ProjectFile> {
@@ -530,6 +450,7 @@ fn dedup_files(files: Vec<ProjectFile>) -> Vec<ProjectFile> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::facts::RUST_OCCURRENCE_CODE;
     use super::*;
     use crate::analyzer::rust::declarations::rust_package_name;
     use crate::analyzer::rust::imports::rust_module_extents;
@@ -650,14 +571,10 @@ mod tests {
     }
 
     #[test]
-    fn declared_file_modules_and_re_exports_come_from_the_rows() {
+    fn re_exports_come_from_the_rows() {
         let (_temp, analyzer, lib, _worker) = analyzer_with_fixture();
         let queries = RustUsageQueries::new(&analyzer);
 
-        assert_eq!(
-            queries.declared_file_modules_of(&lib),
-            vec![compose_module(&rust_package_name(&lib), "worker")]
-        );
         let exports = queries.re_exports_of(&lib);
         assert_eq!(exports.len(), 1, "exports were {exports:?}");
         assert_eq!(exports[0].exported_name.as_deref(), Some("Task"));
@@ -723,11 +640,6 @@ mod tests {
             "the prose mention is still recorded: {prose:?}"
         );
 
-        assert_eq!(queries.files_exporting("Task"), vec![lib.clone()]);
-        assert!(
-            queries.files_exporting("Debug").is_empty(),
-            "a private import is not an export"
-        );
         assert_eq!(queries.files_importing_module_path("crate"), vec![worker]);
         assert_eq!(queries.files_importing_module_path("worker"), vec![lib]);
     }
@@ -780,24 +692,5 @@ mod tests {
             "the module-scope unit struct still declares a type and its \
              value-namespace constructor: {holder_identities:?}"
         );
-    }
-
-    #[test]
-    fn locality_bucketing_orders_candidates_without_dropping_any() {
-        let (_temp, analyzer, lib, worker) = analyzer_with_fixture();
-        let queries = RustUsageQueries::new(&analyzer);
-        let far = ProjectFile::new(lib.root().to_path_buf(), "vendor/other/thing.rs");
-
-        let ordered =
-            queries.bucket_by_locality(&lib, vec![far.clone(), worker.clone(), lib.clone()]);
-
-        assert_eq!(ordered, vec![lib.clone(), worker, far]);
-
-        let mut visited = 0;
-        assert!(queries.any_file_mentioning("root", &lib, |_| {
-            visited += 1;
-            true
-        }));
-        assert_eq!(visited, 1, "an early-out caller verifies one candidate");
     }
 }

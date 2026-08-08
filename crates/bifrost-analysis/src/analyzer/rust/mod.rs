@@ -17,7 +17,7 @@ mod rustdoc_artifact;
 mod semantic;
 pub(crate) mod structural;
 mod tests;
-mod usage_index;
+mod usage;
 mod usage_queries;
 mod usage_walks;
 
@@ -66,8 +66,7 @@ pub use lexical_scope::{
     reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
     rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
-use usage_index::RustUsageIndex;
-pub(crate) use usage_index::{RustBindingSeeds, RustReferenceNamespace};
+pub(crate) use usage::{RustBindingSeeds, RustReferenceNamespace};
 
 #[derive(Clone)]
 pub struct RustAnalyzer {
@@ -94,7 +93,6 @@ pub struct RustAnalyzer {
     /// persisted module-route facts. Zero is the structural claim of issue
     /// #1793: the index composes from rows, never from a workspace parse.
     module_route_fact_fallback_count: Arc<AtomicUsize>,
-    usage_index: Arc<PoolSafeMemo<RustUsageIndex>>,
     /// One blob's persisted per-file usage facts, memoized per
     /// `(analysis generation, blob)`. Content-hash keys make the entry
     /// self-invalidating -- an edited file is a different blob -- and the
@@ -265,15 +263,6 @@ impl RustAnalyzer {
     #[cfg(test)]
     pub(crate) fn prepared_syntax_parse_count_for_test(&self, file: &ProjectFile) -> usize {
         self.inner.prepared_syntax_parse_count_for_test(file)
-    }
-
-    /// Whether the v1 `RustUsageIndex` was built for this analyzer. Nothing
-    /// reads that index since ExecPlan Milestone 2c and nothing warms it since
-    /// Milestone 3; this is what the tests that guard those two facts assert
-    /// against. It goes away with the struct in Milestone 5.
-    #[cfg(test)]
-    pub(crate) fn rust_usage_index_built_for_test(&self) -> bool {
-        self.usage_index.is_ready()
     }
 
     #[cfg(test)]
@@ -558,7 +547,6 @@ impl RustAnalyzer {
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
-            usage_index: Arc::new(PoolSafeMemo::new()),
             rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
@@ -598,7 +586,6 @@ impl RustAnalyzer {
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
-            usage_index: Arc::new(PoolSafeMemo::new()),
             rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
@@ -811,8 +798,8 @@ impl IAnalyzer for RustAnalyzer {
     /// workspace; every other lazy cache on this analyzer fills incrementally
     /// at acceptable cost.
     ///
-    /// The usage half is no longer a build at all. It was the seventeen-map
-    /// `RustUsageIndex`, which cost minutes and 10.8 GB (#1758); ExecPlan
+    /// The usage half is no longer a build at all. It was a seventeen-map
+    /// workspace-wide index costing minutes and 10.8 GB (#1758); ExecPlan
     /// Milestone 3 replaced it with the per-file fact catch-up, which finds
     /// nothing to do on a workspace analysis already persisted. The two still
     /// run on separate threads rather than one after the other: the hierarchy
@@ -853,7 +840,6 @@ impl IAnalyzer for RustAnalyzer {
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
-            usage_index: Arc::new(PoolSafeMemo::new()),
             rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
@@ -883,7 +869,6 @@ impl IAnalyzer for RustAnalyzer {
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
-            usage_index: Arc::new(PoolSafeMemo::new()),
             rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),

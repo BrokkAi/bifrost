@@ -1,9 +1,10 @@
 //! Shared import-edge types for the per-language usage indices.
 //!
-//! Each language's usage index (`RustUsageIndex`, `PythonUsageIndex`,
-//! `GoProjectGraph`, `JsTsUsageIndex`) builds these edges from its own module
-//! resolution, so `scan_usages` and `usage_graph` resolve references through one
-//! index per language.
+//! Each language builds these edges from its own module resolution, so
+//! `scan_usages` and `usage_graph` resolve references through one per-language
+//! source: an index for Python (`PythonUsageIndex`), Go (`GoProjectGraph`) and
+//! JS/TS (`JsTsUsageIndex`), and store-backed walks for Rust
+//! (`rust::usage_walks`).
 
 use crate::analyzer::ProjectFile;
 

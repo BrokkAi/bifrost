@@ -79,10 +79,10 @@ pub(super) fn weight_declaration_facts(
     _key: &ProjectFile,
     value: &Arc<super::usage_queries::RustDeclarationFacts>,
 ) -> u32 {
-    let identity_bytes = |identity: &super::usage_index::RustSymbolIdentity| {
+    let identity_bytes = |identity: &super::usage::RustSymbolIdentity| {
         identity.name.len()
             + identity.module.weight_bytes()
-            + size_of::<super::usage_index::RustSymbolIdentity>()
+            + size_of::<super::usage::RustSymbolIdentity>()
     };
     let identities = value
         .identities
@@ -104,7 +104,7 @@ pub(super) fn weight_declaration_facts(
             identity_bytes(identity)
                 + domains
                     .iter()
-                    .map(super::usage_index::Domain::weight_bytes)
+                    .map(super::usage::Domain::weight_bytes)
                     .sum::<usize>()
         })
         .sum::<usize>();
@@ -176,13 +176,13 @@ pub(super) fn weight_project_file_list<K>(_key: &K, value: &Arc<Vec<ProjectFile>
 /// Byte weight of one module's effective visibility domains. A `None` value is
 /// the answer "no file declares this module", which costs only its key.
 pub(super) fn weight_module_domains(
-    key: &super::usage_index::ModuleKey,
-    value: &Option<Arc<Vec<super::usage_index::Domain>>>,
+    key: &super::usage::ModuleKey,
+    value: &Option<Arc<Vec<super::usage::Domain>>>,
 ) -> u32 {
     let domains = value
         .iter()
         .flat_map(|domains| domains.iter())
-        .map(super::usage_index::Domain::weight_bytes)
+        .map(super::usage::Domain::weight_bytes)
         .sum::<usize>();
     (key.weight_bytes() + domains).min(u32::MAX as usize) as u32
 }
@@ -190,8 +190,8 @@ pub(super) fn weight_module_domains(
 /// Byte weight of one module alias's routes. Each route owns a target path, a
 /// target module key, and a domain.
 pub(super) fn weight_alias_routes(
-    key: &super::usage_index::ModuleKey,
-    value: &Arc<Vec<super::usage_index::RustModuleAliasRoute>>,
+    key: &super::usage::ModuleKey,
+    value: &Arc<Vec<super::usage::RustModuleAliasRoute>>,
 ) -> u32 {
     let routes = value
         .iter()
@@ -199,7 +199,7 @@ pub(super) fn weight_alias_routes(
             route.target_file.rel_path().to_string_lossy().len()
                 + route.target_module.weight_bytes()
                 + route.domain.weight_bytes()
-                + size_of::<super::usage_index::RustModuleAliasRoute>()
+                + size_of::<super::usage::RustModuleAliasRoute>()
         })
         .sum::<usize>();
     (key.weight_bytes() + routes).min(u32::MAX as usize) as u32
@@ -209,33 +209,33 @@ pub(super) fn weight_alias_routes(
 /// and target paths, two module keys, its local name, and its domain.
 pub(super) fn weight_forward_import_edges(
     _key: &ProjectFile,
-    value: &Arc<Vec<super::usage_index::RustImportEdge>>,
+    value: &Arc<Vec<super::usage::RustImportEdge>>,
 ) -> u32 {
     let size = value.iter().map(weight_import_edge).sum::<usize>()
-        + size_of::<Vec<super::usage_index::RustImportEdge>>();
+        + size_of::<Vec<super::usage::RustImportEdge>>();
     size.min(u32::MAX as usize) as u32
 }
 
-fn weight_import_edge(edge: &super::usage_index::RustImportEdge) -> usize {
+fn weight_import_edge(edge: &super::usage::RustImportEdge) -> usize {
     edge.importer.rel_path().to_string_lossy().len()
         + edge.target_file.rel_path().to_string_lossy().len()
         + edge.importer_module.weight_bytes()
         + edge.target_module.weight_bytes()
         + edge.local_name.len()
         + edge.domain.weight_bytes()
-        + size_of::<super::usage_index::RustImportEdge>()
+        + size_of::<super::usage::RustImportEdge>()
 }
 
-fn weight_identity(identity: &super::usage_index::RustSymbolIdentity) -> usize {
+fn weight_identity(identity: &super::usage::RustSymbolIdentity) -> usize {
     identity.name.len()
         + identity.module.weight_bytes()
         + identity.file.rel_path().to_string_lossy().len()
-        + size_of::<super::usage_index::RustSymbolIdentity>()
+        + size_of::<super::usage::RustSymbolIdentity>()
 }
 
 /// Byte weight of what one module binds.
 pub(super) fn weight_module_bindings(
-    key: &(ProjectFile, super::usage_index::ModuleKey),
+    key: &(ProjectFile, super::usage::ModuleKey),
     value: &Arc<Vec<super::usage_walks::RustModuleBinding>>,
 ) -> u32 {
     let bindings = value
@@ -254,7 +254,7 @@ pub(super) fn weight_module_bindings(
 /// Byte weight of one file's origin routes, bucketed by first path segment.
 pub(super) fn weight_origin_routes(
     _key: &ProjectFile,
-    value: &Arc<HashMap<String, Vec<super::usage_index::RustOriginRoute>>>,
+    value: &Arc<HashMap<String, Vec<super::usage::RustOriginRoute>>>,
 ) -> u32 {
     let size = value
         .iter()
@@ -271,7 +271,7 @@ pub(super) fn weight_origin_routes(
                                 .sum::<usize>()
                             + weight_identity(&route.origin)
                             + route.domain.weight_bytes()
-                            + size_of::<super::usage_index::RustOriginRoute>()
+                            + size_of::<super::usage::RustOriginRoute>()
                     })
                     .sum::<usize>()
         })
@@ -282,7 +282,7 @@ pub(super) fn weight_origin_routes(
 /// Byte weight of one file's macro scope edges.
 pub(super) fn weight_macro_scope_edges(
     _key: &ProjectFile,
-    value: &Arc<Vec<super::usage_index::RustMacroScopeEdge>>,
+    value: &Arc<Vec<super::usage::RustMacroScopeEdge>>,
 ) -> u32 {
     let size = value
         .iter()
@@ -290,7 +290,7 @@ pub(super) fn weight_macro_scope_edges(
             edge.parent.module.weight_bytes()
                 + edge.child.module.weight_bytes()
                 + edge.child.file.rel_path().to_string_lossy().len()
-                + size_of::<super::usage_index::RustMacroScopeEdge>()
+                + size_of::<super::usage::RustMacroScopeEdge>()
         })
         .sum::<usize>();
     size.min(u32::MAX as usize) as u32
@@ -299,7 +299,7 @@ pub(super) fn weight_macro_scope_edges(
 /// Byte weight of one macro's visible ranges, per scope.
 pub(super) fn weight_macro_visible_ranges(
     key: &CodeUnit,
-    value: &Arc<super::usage_index::RustMacroScopeRanges>,
+    value: &Arc<super::usage::RustMacroScopeRanges>,
 ) -> u32 {
     let size = value
         .iter()

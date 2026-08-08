@@ -517,10 +517,6 @@ impl Runnable for Worker {}
         assert!(analyzer.query_indexes_warm());
         assert!(analyzer.hierarchy_index.get().is_some());
         assert!(analyzer.rust_usage_facts_warm());
-        assert!(
-            !analyzer.rust_usage_index_built_for_test(),
-            "the warm must not build the v1 usage index"
-        );
 
         let runnable = definition(&analyzer, "Runnable");
         let worker = definition(&analyzer, "Worker");
