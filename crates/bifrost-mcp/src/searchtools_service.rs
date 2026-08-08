@@ -1007,6 +1007,9 @@ impl WorkspaceSession {
 
 impl Drop for WorkspaceSession {
     fn drop(&mut self) {
+        // The warmer owns the snapshot while its thread runs. Wait for it
+        // before the session drops the project and its SQLite connections.
+        self.index_warmer.wait_until_idle();
         let Some(handle) = self.usage_index_warm.take() else {
             return;
         };
