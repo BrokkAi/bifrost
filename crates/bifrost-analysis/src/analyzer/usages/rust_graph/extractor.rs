@@ -10,7 +10,7 @@ use crate::analyzer::usages::get_definition::{
     rust_is_type_definition, rust_resolve_type_node_fqn,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::model::UsageHit;
+use crate::analyzer::usages::model::{UsageHit, UsageHitSurface};
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
 use crate::analyzer::usages::rust_graph::hits::{
     member_hit_enclosing, push_member_hit, push_self_receiver_member_hit, push_unproven_member_hit,
@@ -32,6 +32,7 @@ use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tree_sitter::{Node, Parser, Tree};
 
 pub(super) fn effective_scan_files(
@@ -85,6 +86,47 @@ pub(super) fn effective_scan_files(
         .collect()
 }
 
+/// How many external hits a scan must prove before its result cannot change.
+///
+/// `RustQueryResolver::find_usages` reports `TooManyCallsites` when the external
+/// hit count is *greater than* `max_usages`, so the cap plus the one hit that
+/// proves it exceeded settles the answer. Past that point every remaining
+/// candidate is work whose result is discarded, which is what the streaming
+/// design removes: the cap is a stop condition, not a post-filter.
+struct UsageCapStop {
+    proven_external_hits: AtomicUsize,
+    max_usages: usize,
+}
+
+impl UsageCapStop {
+    fn new(max_usages: usize) -> Self {
+        Self {
+            proven_external_hits: AtomicUsize::new(0),
+            max_usages,
+        }
+    }
+
+    fn reached(&self) -> bool {
+        self.proven_external_hits.load(Ordering::Relaxed) > self.max_usages
+    }
+
+    /// Count the hits from one candidate that would survive the caller's own
+    /// filter. Both predicates must match `RustQueryResolver::find_usages`
+    /// exactly, or the scan would stop on hits the caller then discards.
+    fn record(&self, hits: &BTreeSet<UsageHit>, target: &CodeUnit) {
+        let external = hits
+            .iter()
+            .filter(|hit| {
+                &hit.enclosing != target && hit.kind.included_in(UsageHitSurface::ExternalUsages)
+            })
+            .count();
+        if external > 0 {
+            self.proven_external_hits
+                .fetch_add(external, Ordering::Relaxed);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_files_for_target(
     analyzer: &dyn IAnalyzer,
@@ -93,10 +135,12 @@ pub(super) fn scan_files_for_target(
     target: &CodeUnit,
     seeds: Option<&RustBindingSeeds>,
     cancellation: Option<&CancellationToken>,
+    max_usages: usize,
 ) -> BTreeSet<UsageHit> {
     let target_fqn = target.fq_name();
     let support = analyzer.global_usage_definition_index();
     let hits = Mutex::new(BTreeSet::new());
+    let cap = UsageCapStop::new(max_usages);
     let files_vec: Vec<_> = files.into_iter().collect();
     // Shared across every file: the alias closure reachable from the target
     // roots. `effective_scan_files` already treats these names as the textual
@@ -110,7 +154,9 @@ pub(super) fn scan_files_for_target(
     // up front, keeps hits accumulating from the first file onward: a scan that
     // runs out of budget still reports the sites it proved.
     files_vec.par_iter().for_each(|file| {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        // Checked before the candidate is opened, so no parse, no scope index
+        // and no per-site resolution is spent past the stop.
+        if cap.reached() || cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
         rust.note_scanned_candidate_file();
@@ -190,6 +236,7 @@ pub(super) fn scan_files_for_target(
         }
 
         if !local_hits.is_empty() {
+            cap.record(&local_hits, target);
             let mut sink = hits.lock().expect("poisoned Rust graph collector");
             sink.extend(local_hits);
         }
@@ -1120,6 +1167,7 @@ pub(super) fn scan_files_for_member_target(
     target: &CodeUnit,
     requested_target: &CodeUnit,
     cancellation: Option<&CancellationToken>,
+    max_usages: usize,
 ) -> RustMemberScanResult {
     let Some(owner) = rust
         .structural_parent_of(target)
@@ -1133,6 +1181,7 @@ pub(super) fn scan_files_for_member_target(
     let member_name = target.identifier().to_string();
     let hits = Mutex::new(BTreeSet::new());
     let unproven_hits = Mutex::new(BTreeSet::new());
+    let cap = UsageCapStop::new(max_usages);
     let support = analyzer.global_usage_definition_index();
     let constructor_returns = self_like_constructor_returns(rust, &support, &owner);
     let self_like_constructors = self_like_constructor_seeds(rust, &constructor_returns);
@@ -1142,7 +1191,7 @@ pub(super) fn scan_files_for_member_target(
     // up front, keeps hits accumulating from the first file onward: a scan that
     // runs out of budget still reports the sites it proved.
     files_vec.par_iter().for_each(|file| {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        if cap.reached() || cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
         rust.note_scanned_candidate_file();
@@ -1263,6 +1312,7 @@ pub(super) fn scan_files_for_member_target(
         }
 
         if !local_hits.is_empty() {
+            cap.record(&local_hits, requested_target);
             let mut sink = hits.lock().expect("poisoned Rust member collector");
             sink.extend(local_hits);
         }

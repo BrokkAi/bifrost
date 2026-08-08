@@ -145,6 +145,7 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                 scan_target,
                 target,
                 scan_scope.cancellation(),
+                max_usages,
             );
             (result.hits, result.unproven_hits)
         } else {
@@ -169,6 +170,7 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                     target,
                     Some(&seeds),
                     scan_scope.cancellation(),
+                    max_usages,
                 ),
                 BTreeSet::new(),
             )
@@ -192,7 +194,14 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                 short_name: target.short_name().to_string(),
                 total_callsites: external_hit_count,
                 limit: max_usages,
-                sample_hits: hits,
+                // A bounded prefix, not the whole set. Rendering already
+                // truncates to the limit
+                // (`structural/search/expansions.rs`), so carrying every hit
+                // past the cap only moved memory around. `total_callsites` is
+                // now a lower bound, because the scan stopped as soon as the
+                // cap was proven exceeded -- which is all the consumers'
+                // "too many, evidence inconclusive" messages need.
+                sample_hits: hits.into_iter().take(max_usages).collect(),
             });
         }
 
@@ -475,7 +484,6 @@ mod tests {
     /// overshoot to one extra file and makes the assertion deterministic
     /// regardless of how many cores the host has.
     #[test]
-    #[ignore = "lands with the streaming cap (D2)"]
     fn usage_scan_stops_opening_candidates_once_the_callsite_cap_is_proven() {
         const CALLERS: usize = 24;
         let mut files = vec![
