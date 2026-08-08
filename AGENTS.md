@@ -398,6 +398,7 @@ The analyzer cache is a SQLite database. The schema and its views are the interf
 - Keep connection handling, transactions, write batching, and cancellation in the store infrastructure. That layer is infrastructure, not wrapping.
 - Pin query cost in tests with EXPLAIN QUERY PLAN assertions. Assert that the query uses the intended index and does not scan a large table. Prefer this to Rust-side scan counters for new pins.
 - Do not store serialized Rust structures as opaque blobs when the data has queryable structure. Store rows. Binary payloads that SQL cannot usefully query, such as embedding vectors, can stay binary.
+- A JSON column is an acceptable exception for a genuinely heterogeneous or open shape that is not on a hot read path. It must carry CHECK(json_valid(...)), hold one shape per column, and contain no field that needs a foreign key or its own CHECK. When a second reader wants a field from it, promote that field to a generated column with an index.
 
 # Implementation details
 
