@@ -62,6 +62,12 @@ measurement is a separate task run after review; it is not part of this plan's a
       `usage-graph-d4-gate-v1.md` (session scratchpad). Measured at `9263e2a5`
       (source-identical to `96e86c4e`) against run 3's `5c33701b` binary, on the same tree and
       cells. **This plan should not be treated as closed** -- see `Outcomes & Retrospective`.
+- [x] (2026-08-08) **D4's one open correctness question is closed: the 11 -> 8 hit change is a
+      wall-clock deadline artifact, not a per-site resolver difference.** Report:
+      `hit-delta-triage-v1.md` (session scratchpad). Under non-truncated (narrowed-`paths`)
+      sweeps, HEAD `38800fe5` and the run-3 comparator `5c33701b` return the identical 11-hit set,
+      twice each; under matched full-scope conditions both truncate to the identical 4-hit set.
+      See `Outcomes & Retrospective` for the evidence and for the 300 s budget ceiling it exposed.
 
 ## Surprises & Discoveries
 
@@ -274,6 +280,41 @@ Two further results worth carrying:
   equivalence pin cannot reach. **This wants a load-matched rerun and, if it survives, triage
   before the per-site resolver is considered settled.** It is the one open question here that could
   be correctness rather than performance.
+
+  **CLOSED (2026-08-08, triaged): deadline artifact, not behavior. The per-site resolver is not
+  implicated.** Report: `hit-delta-triage-v1.md` (session scratchpad). Two independent lines,
+  both comparing hit *sets* rather than counts. **(1) When the sweep is not truncated, the two
+  lineages return the identical set, and it is the full 11.** Narrowing `paths` to the six files
+  that carry the hits collapses the graph phase, so the query completes (`partial=false`, no
+  `incomplete_reason`); four such runs -- HEAD `38800fe5` and the run-3 comparator `5c33701b`, two
+  matched repetitions each -- all return **11 hits, byte-identical to each other and to run 3's
+  set**, including all three sites run 4 "lost" (`rustc_codegen_llvm/src/abi.rs:99:49`,
+  `codegen_fn_attrs.rs:249:19`, `:255:26`). Narrowing to just those two files returns all three on
+  both binaries, twice. **(2) Under matched full-scope conditions the sets are nested prefixes of
+  that same 11, and the sign of the original delta reverses.** Two pairs, each with both binaries
+  started at the same instant: pair 1 (loadavg 85) returned the *identical* 4 hits on both, at
+  7,850 CPU-seconds (HEAD side) against 10,734 (comparator); pair 2 (loadavg 14) returned **10 on
+  HEAD and 8 on the comparator**, at 7,287 against 8,751 CPU-seconds, with exact containment
+  `v3(8) < v6(10) < complete(11)`. **The comparator reproduced run 4's "regressed" 8 exactly,
+  while HEAD returned 10.** Every answer this campaign has recorded is a prefix of one
+  deterministic sweep -- 4 <= 8 <= 10 <= 11 -- so the answer size is a property of how much work
+  fitted inside the wall-clock deadline, not of the lineage. Run 4's "reproducible 8" was three
+  runs sharing one load regime (loadavg 84-486); run 3's 11 was one run at loadavg 3.8-4.7.
+
+  Three things this leaves behind for the record. **`max_duration_secs` is clamped to 300 s**
+  (`SCAN_USAGES_MAX_DURATION_CEILING`, `scan_usages.rs:772`), so every "600 s budget" cell in runs
+  3, 4 and 5 ran a 300 s deadline and no budget override can buy a longer sweep. **`paths` is
+  applied after candidate discovery** (`finder.rs`, `candidates.retain(...)` follows
+  `find_default_candidates_with_cancellation`), so it collapses the graph phase but does not
+  shorten discovery -- which is why the narrow cells complete in ~170 s of wall where the
+  full-scope cells run half an hour and still truncate. And **hit counts from truncated cells must
+  not be quoted as a behavior signal**: compare sets from completing queries, or compare at equal
+  CPU-seconds consumed, never at equal wall-clock budgets on a shared host.
+
+  Incidental, measured in the same matched pairs: **`1272c7d7` (single-flight for the
+  definition-candidate row read) costs 1.7-2.1x less CPU** on the completing cell -- 277.2 and
+  284.7 CPU-seconds at HEAD against 474.5 and 488.8 on the comparator, for the identical 11-hit
+  answer. That is the first CPU-normalized confirmation of the stampede fix at rustc scale.
 
 Two lessons. First, the frozen equivalence pin was not ceremony: it caught two behavioral
 differences in `bare_names_resolving_to` that reading the code did not reveal, and both would have

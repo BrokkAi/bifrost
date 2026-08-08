@@ -56,6 +56,13 @@ the store's normal per-blob row replacement.
   normalized views are now materialized only after a declaration actually renames, so an
   identity-normalizing shard reads them off the exact maps. Removes the measured 54.6 MB of
   the 185 MB Rust shard (30%) with no change to C#/Java/Scala lookup semantics.
+- [x] (2026-08-08) RSS attribution investigation complete - the pass the STATUS line names as
+  deciding whether any memory milestone returns. Report: `memory-attribution-v1.md` (session
+  scratchpad). **The ~7 GB remainder is per-connection SQLite reader state (mmap of the cache DB
+  plus page cache), scaled by host CPU count, not by anything the analyzer owns; and 1.3x-3.5x of
+  the headline peak is RSS double-counting one mmap'd file.** See `Surprises & Discoveries` for
+  the top-consumers table, the knob ladder, and the phase boundaries. The finding is recorded
+  here as measurement; what the memory milestones become is an owner decision, not this pass's.
 - [ ] Milestone 1: the package-catalog relation.
 - [ ] Milestone 2: consumer migration, cohort by cohort.
 - [ ] Milestone 3: `usage_facts_index` - same treatment or explicit retention decision.
@@ -107,11 +114,54 @@ the store's normal per-blob row replacement.
   `normalize_full_name(fqn) == fqn`, so **54.6 MB of the 185 MB shard is pure duplication**. This is
   a smaller, faster, lower-risk change than the retirement and can be taken independently of it.
 
-- **Open: the memory is somewhere else, and this baseline cannot name it.** Of the 15.58-17.49 GB
-  answering-regime peak, 9.3 GB is already resident before the first index touch, the index is
-  0.35 GB, `usage_facts_index` is 0.00 GB, and the graph phase adds only +0.75 GB across 880 s.
-  That leaves roughly 7 GB unattributed. Naming it needs its own instrumented pass; it is now the
-  dominant term and the place where memory work would actually pay.
+- **RESOLVED (2026-08-08, measured): the unattributed ~7 GB is SQLite reader state, and most of
+  it is not real memory.** Report: `memory-attribution-v1.md` (session scratchpad). This entry
+  replaces the earlier "Open: the memory is somewhere else" item, which asked for exactly this
+  pass. The decisive observation is one line of `/proc/<pid>/maps` from a live answering-regime
+  process: **`db_mappings=124 db_rss_MB=12318`** - 124 separate mappings of the same 848 MB
+  `bifrost_cache.v17.db`, contributing 12.3 GB of RSS between them. `ReaderPool::new`
+  (`store/mod.rs`) sizes each of the three reader pools at `available_parallelism()` (120 on the
+  measurement host), and `configure_readonly_page_cache` (`cache_db.rs:414-424`) gives every
+  pooled connection `mmap_size = 256 MiB` and `cache_size = -65536` (64 MiB). Top consumers of an
+  8.17 GB peak on the rustc tree, established by a knob ladder that varies only those three
+  values:
+
+  | # | consumer | size at peak | growth phase | bounded or scaled by |
+  | ---: | --- | ---: | --- | --- |
+  | 1 | SQLite `mmap` of the cache DB, one mapping per pooled reader connection | **5.55 GB** (12.3 GB observed) | candidate discovery | `min(mmap_size, db size) x connections`; connections = host CPU count. **Shared, clean, reclaimable - RSS multiply-counts it** |
+  | 2 | SQLite per-connection page cache | **1.32-2.82 GB** | discovery, then graph phase | `64 MiB x connections` -> 7.68 GB ceiling at 120 CPUs. Host-CPU-scaled, genuinely private |
+  | 3 | Rust analyzer heap, everything else | 1.30 GB (120 s cell) to ~3.5 GB (300 s cell) | graph phase | workspace-scaled, modest |
+  | 4 | `global_usage_definition_index`, all 5 shards | **0.354 GB** | graph phase, t=250-259 s | reproduces Milestone 0's 0.349 GB from a second probe |
+  | 5 | binary, 123 thread stacks, loader | ~0.05 GB | startup | bounded |
+  | - | `usage_facts_index` | 0.00 GB | never built | - |
+
+  Knob ladder (same cell, same binary, peak RSS from `/usr/bin/time -v`): defaults **8.17 GB**;
+  `cache_size` 2 MiB **5.16 GB**; `mmap_size` 0 **2.62 GB**; pool capacity 8 **4.12 GB**; all
+  three **1.30 GB**. So **6.87 GB of the 8.17 GB peak is per-connection SQLite state**, and the
+  analyzer owns the remaining 1.30 GB.
+
+- **Correction: peak RSS is the wrong meter for this workload, by 1.3x-3.5x.** Measured
+  simultaneously on live processes: v3 at its mmap peak is **17.30 GB RSS against 4.88 GB PSS**
+  (the DB mapping alone is 12.37 GB RSS but only 38.9 MB private); HEAD at the same instant is
+  11.67 GB RSS against 3.26 GB PSS. The campaign's 15.58/17.49 GB headline figures are dominated
+  by one file counted once per mapping. **Milestone 4's RSS gate must be restated in PSS or
+  Private_Dirty**, or it will move by far more than its own 0.35 GB margin purely from the host's
+  core count and from when the kernel reclaims clean pages.
+
+- **Correction: startup is not where the memory is, and the index builds after discovery, not
+  before it.** Phase-boundary marks in a full answering-regime run: analyzer construction for six
+  languages ends at t=6.2 s with **0.14 GB** resident; `candidate_discovery` runs t=14.7 -> 223.3 s
+  and takes RSS 0.46 -> 2.67 GB with SQLite heap 0.08 -> 1.44 GB; the five `gudi_shard` builds fire
+  at t=250-259 s, *inside* the graph phase, for +354 MB. Milestone 0's "9.3 GB already resident
+  before the first shard build" was therefore not a startup cost and not a floor: it was
+  per-connection SQLite state accrued during discovery, and it is transient (the mmap component
+  peaks at t=400 s and is back to 0.13 GB by the end of the same run).
+
+- **Correction: `max_duration_secs` is clamped to 300 s**
+  (`SCAN_USAGES_MAX_DURATION_CEILING`, `scan_usages.rs:772`). Every "600 s budget" cell in
+  Milestone 0, in the D4 gate, and in this pass ran a **300 s** deadline. Both lineages were
+  always clamped identically, so no prior comparison is invalidated, but the label is wrong
+  wherever it appears and no budget override can buy a longer sweep.
 
 ## Decision Log
 
@@ -230,6 +280,20 @@ budget for repetitions and a load-matched comparator. Second, the baseline was t
 loaded host (1-min loadavg 84-486), so the *latency* figures above should be re-taken quietly
 before they are used as a pass/fail bar; the RSS and count figures are load-insensitive and stand.
 On gate failure, stop and report per house rule.
+
+Three corrections from the 2026-08-08 RSS attribution pass, recorded here because they land on
+this gate specifically (see `Surprises & Discoveries`). **(a) The RSS bar as written is not
+measurable to its own precision.** Peak RSS on this workload is 1.3x-3.5x the process's unique
+footprint, because 100-124 reader connections each map the same 848 MB cache DB and RSS counts
+those pages once per mapping; the multiplier varies with the host's core count and with when the
+kernel reclaims clean pages, which is far more than the 0.35 GB the gate is trying to detect. A
+usable bar must be stated in **PSS or Private_Dirty**. **(b) The 15.58 GB baseline is not a
+constant of the workload**; the same cell measured 8.17-11.89 GB peak in this pass, on the same
+tree, differing only in host load and reader-connection count. **(c) The latency bar's budget
+label is wrong**: `max_duration_secs` is clamped to 300 s
+(`SCAN_USAGES_MAX_DURATION_CEILING`), and the deadline is wall-clock, so under load the same
+budget buys different amounts of work; per the owner's 2026-08-08 directive, comparisons should
+be stated in CPU-seconds (user+sys) with loadavg as a label.
 
 ## Validation and Acceptance
 
