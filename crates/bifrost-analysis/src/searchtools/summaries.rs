@@ -532,7 +532,21 @@ fn summarize_symbol_targets_with_cancellation(
         // not build the workspace-wide definition index to prove that a path
         // typo is not a symbol (#1608: a 399k-row Go index added 20 seconds
         // to an ordinary directory listing request).
-        if (target.contains('/') || target.contains('\\'))
+        //
+        // A file-anchored selector (`src/a.js#Widget`) is also slash-bearing
+        // and is not itself an explicit source file target -- the anchor is,
+        // the whole selector is not -- so the anchor split has to decide the
+        // shape before this bailout sees it. The splitter is the same one
+        // `resolve_selectable_definitions` uses one call below, so the two
+        // cannot disagree about what is anchored. It reads no definitions: a
+        // slash-bearing anchor is accepted on its shape alone, and a target
+        // with no `#` never reaches the file check at all.
+        let file_anchored = matches!(
+            split_workspace_definition_selector(analyzer, &target),
+            DefinitionSelector::FileAnchored { .. }
+        );
+        if !file_anchored
+            && (target.contains('/') || target.contains('\\'))
             && !looks_like_explicit_source_file_target(&target)
         {
             not_found.push(file_not_found_input(target));
