@@ -11,6 +11,15 @@
 //! must not become ambiguous when several are reachable. What it must do is
 //! prefer the declarations the reference file's include closure reaches, and
 //! stay unchanged when the closure reaches none of them.
+//!
+//! The corpus reaches the reference through the shape
+//! `out_of_line_member_reaches_the_reachable_twin` reproduces: a file-scope
+//! `using namespace` plus an out-of-line member definition. The enclosing
+//! lexical scope is then just the class (`Logger`), the namespace-qualified
+//! tier is never tried, and the visibility-aware resolvers all report missing -
+//! so the answer came from the scope-blind `resolve_in_enclosing_scopes`
+//! fallback, which took the first indexed declaration of the composed name with
+//! no reachability test at all.
 
 use crate::common::{BuiltInlineTestProject, InlineTestProject, call_tool};
 use brokk_bifrost::searchtools::{
@@ -163,6 +172,226 @@ fn definition_prefers_the_reachable_same_fqn_twin() {
             .any(|group| group.path.replace('\\', "/").ends_with("logger.cpp")),
         "the answered definition must be the one whose inverse covers the \
          reference: {entry:#?}"
+    );
+}
+
+/// The corpus's `Logger` header, reduced to the three properties that matter.
+/// Its class head is macro-decorated and has a virtual base, which is why the
+/// index classifies even this body as a *forward* declaration - the corpus has
+/// six declarations of `LOG4CXX_NS.Logger` and not one of them is full.
+const LOGGER_H: &str = r#"#ifndef LOGGER_H
+#define LOGGER_H
+#include <log4cxx/level.h>
+#include <log4cxx/spi/location/locationinfo.h>
+namespace LOG4CXX_NS
+{
+
+namespace spi
+{
+class AppenderAttachable;
+}
+
+class Logger;
+
+class LOG4CXX_EXPORT Logger
+	: public virtual spi::AppenderAttachable
+{
+	public:
+		void addEvent(const LevelPtr& level, const spi::LocationInfo& location) const;
+};
+}
+#endif
+"#;
+
+/// A second header that forward-declares `Logger`, as `logmanager.h` does in
+/// the corpus. `logger.cpp` includes both, so the owner lookup sees two forward
+/// declarations and no full one.
+const LOGMANAGER_H: &str = r#"#ifndef LOGMANAGER_H
+#define LOGMANAGER_H
+namespace LOG4CXX_NS
+{
+class Logger;
+
+class LogManager
+{
+	public:
+		static int count;
+};
+}
+#endif
+"#;
+
+const LOCATIONINFO_H: &str = r#"#ifndef LOCATIONINFO_H
+#define LOCATIONINFO_H
+namespace LOG4CXX_NS
+{
+namespace spi
+{
+class LocationInfo
+{
+	public:
+		int line;
+};
+}
+}
+#endif
+"#;
+
+/// The corpus shape, reproduced from the real repository by reduction. Four
+/// properties must hold together, and dropping any one of them makes the answer
+/// correct again:
+///
+/// 1. the owner class's body is not indexed as a full declaration (a
+///    macro-decorated head with a virtual base - `class LOG4CXX_EXPORT Logger :
+///    public virtual spi::AppenderAttachable`);
+/// 2. two headers the file *directly* includes forward-declare that owner, so
+///    the single-forward escape hatch in the owner lookup cannot fire and
+///    `precise_parent_of` answers nothing;
+/// 3. the member is defined out of line under a file-scope `using namespace`,
+///    so the parser supplies no namespace ancestor and, with no indexed owner
+///    to recover it from, the enclosing scope loses its namespace entirely;
+/// 4. the referenced type has same-FQN declarations in two headers, only one of
+///    which the file includes.
+///
+/// Every namespace-qualified tier then misses and resolution falls through to
+/// the scope-blind `resolve_in_enclosing_scopes` walk, which answered the first
+/// indexed declaration of `LOG4CXX_NS.LevelPtr` with no reachability test at
+/// all - and `helpers/optionconverter.h` sorts before `level.h`.
+#[test]
+fn out_of_line_member_reaches_the_reachable_twin() {
+    let logger_cpp = r#"#include <log4cxx/logger.h>
+#include <log4cxx/logmanager.h>
+#include <log4cxx/level.h>
+
+using namespace LOG4CXX_NS;
+using namespace LOG4CXX_NS::spi;
+
+void Logger::addEvent(const LevelPtr& level, const LocationInfo& location) const
+{
+	(void) level;
+	(void) location;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("src/main/include/log4cxx/level.h", LEVEL_H)
+        .file("src/main/include/log4cxx/logger.h", LOGGER_H)
+        .file("src/main/include/log4cxx/logmanager.h", LOGMANAGER_H)
+        .file(
+            "src/main/include/log4cxx/spi/location/locationinfo.h",
+            LOCATIONINFO_H,
+        )
+        .file(
+            "src/main/include/log4cxx/helpers/optionconverter.h",
+            OPTIONCONVERTER_H,
+        )
+        .file("src/main/cpp/logger.cpp", logger_cpp)
+        .build();
+    let result = definition_paths(
+        &project,
+        "src/main/cpp/logger.cpp",
+        logger_cpp,
+        "LevelPtr& level",
+    );
+    let paths = paths_of(&result);
+    assert!(
+        !paths
+            .iter()
+            .any(|path| path.ends_with("helpers/optionconverter.h")),
+        "a declaration the include closure never reaches must not be the \
+         navigation target: {result:#}"
+    );
+    assert!(
+        paths.iter().any(|path| path.ends_with("log4cxx/level.h")),
+        "the reachable declaration must be answered: {result:#}"
+    );
+
+    let definition = &result["definitions"][0];
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let mut scan = scan_usages_by_location(
+        &analyzer,
+        ScanUsagesByLocationParams {
+            targets: vec![ScanUsagesTarget {
+                path: definition["path"]
+                    .as_str()
+                    .expect("definition path")
+                    .to_string(),
+                line: definition["start_line"].as_u64().expect("definition line") as usize,
+                column: None,
+                symbol: None,
+            }],
+            include_tests: true,
+            paths: None,
+            include_same_owner: false,
+            max_duration_secs: None,
+        },
+    );
+    let entry = scan.results.remove(0);
+    assert!(
+        entry
+            .files
+            .iter()
+            .any(|group| group.path.replace('\\', "/").ends_with("logger.cpp")),
+        "the answered definition must be the one whose inverse covers the \
+         reference: {entry:#?}"
+    );
+}
+
+/// Control for the same shape: when the closure reaches no declaration of the
+/// name, the scope-blind answer stays. An out-of-closure target beats none.
+#[test]
+fn out_of_line_member_keeps_an_unreachable_answer() {
+    let logger_cpp = r#"#include <log4cxx/logger.h>
+
+using namespace LOG4CXX_NS;
+
+void Logger::describe(const OnlyPtr& only) const
+{
+	(void) only;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/main/include/log4cxx/logger.h",
+            r#"#ifndef LOGGER_H
+#define LOGGER_H
+namespace LOG4CXX_NS
+{
+class Logger
+{
+	public:
+		void describe(const int& only) const;
+};
+}
+#endif
+"#,
+        )
+        .file(
+            "src/main/include/log4cxx/helpers/only.h",
+            r#"#ifndef ONLY_H
+#define ONLY_H
+#include <memory>
+namespace LOG4CXX_NS
+{
+class Only;
+typedef std::shared_ptr<Only> OnlyPtr;
+}
+#endif
+"#,
+        )
+        .file("src/main/cpp/logger.cpp", logger_cpp)
+        .build();
+    let result = definition_paths(
+        &project,
+        "src/main/cpp/logger.cpp",
+        logger_cpp,
+        "OnlyPtr& only",
+    );
+    assert!(
+        paths_of(&result)
+            .iter()
+            .any(|path| path.ends_with("helpers/only.h")),
+        "the only declaration of the name must still answer even though the \
+         include closure does not reach it: {result:#}"
     );
 }
 

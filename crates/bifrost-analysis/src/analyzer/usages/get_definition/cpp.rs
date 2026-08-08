@@ -3101,9 +3101,27 @@ fn resolve_cpp_type_without_focused_qualifier(
                 }
             }
         }
+        // This walk composes the reference onto each enclosing scope prefix and
+        // answers the *first* indexed declaration of the composed name. When one
+        // name has several declarations that is a pick by index order, with no
+        // reachability test at all: log4cxx declares `LevelPtr` in both
+        // `level.h` and `helpers/optionconverter.h`, `helpers/optionconverter.h`
+        // sorts first, and `logger.cpp` - which includes only `level.h` - was
+        // sent to a file its include closure never reaches (#1844).
+        //
+        // Ask for a declaration the closure reaches first. A file only ever
+        // names declarations its own translation unit supplies, so a reachable
+        // one is the better answer wherever the walk finds it. Keep the
+        // scope-blind answer when the closure reaches none: an out-of-closure
+        // target beats no target.
+        let accepts_type =
+            |unit: &CodeUnit| unit.is_class() || cpp_unit_is_type_alias(analyzer, unit);
         if let Some(unit) =
             resolve_in_enclosing_scopes(analyzer, file, text, node.start_byte(), |unit| {
-                unit.is_class() || cpp_unit_is_type_alias(analyzer, unit)
+                accepts_type(unit) && visibility.is_physically_visible(file, unit)
+            })
+            .or_else(|| {
+                resolve_in_enclosing_scopes(analyzer, file, text, node.start_byte(), accepts_type)
             })
         {
             let candidates = if cpp_unit_is_type_alias(analyzer, &unit) {
