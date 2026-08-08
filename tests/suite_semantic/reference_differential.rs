@@ -458,6 +458,208 @@ fn census_seed_keeps_constructor_call_sites_it_excludes_declarators_from() {
     }
 }
 
+fn scala_census_differential(
+    files: &[(&str, &str)],
+) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {
+    let mut project = InlineTestProject::with_language(Language::Scala);
+    for (path, source) in files {
+        project = project.file(path, *source);
+    }
+    let project = project.build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    run_reference_differential(
+        workspace.analyzer(),
+        &ReferenceDifferentialConfig {
+            corpus_language: "scala".to_string(),
+            max_files: 20,
+            max_sites: 1_000,
+            max_candidates_per_file: 1_000,
+            max_source_bytes: 100_000,
+            max_targets: 1_000,
+            max_usage_files: 20,
+            max_usages: 1_000,
+            probe_seed: ProbeSeed::Census,
+            ..ReferenceDifferentialConfig::default()
+        },
+    )
+    .expect("run inline Scala census differential")
+}
+
+/// A Scala `type` member lives in the type namespace, so a BARE CALL can never
+/// bind to it (#1858). The zio-http witness: `HttpCodec.scala` declares
+/// `type Left = A1` and `type Left = A` as abstract type members of two
+/// unrelated traits, and the file calls the auto-imported `scala.Left`
+/// constructor 127 times; the Scala arm of the bindability policy answered an
+/// unconditional `true`, so every one of those calls was graded an actionable
+/// tier-1 forward gap against a type alias it cannot reach.
+#[test]
+fn census_scala_bare_call_is_not_graded_from_a_type_alias() {
+    let source = concat!(
+        "package fx\n",
+        "\n",
+        "trait Combine[A1] {\n",
+        "  type Left = A1\n",
+        "}\n",
+        "\n",
+        "object Codec {\n",
+        "  def encode(value: Int): Any = Left(value)\n",
+        "}\n",
+    );
+    let census = scala_census_differential(&[("src/main/scala/fx/Codec.scala", source)]);
+
+    let call_start = source.find("Left(value)").expect("bare call site");
+    let site = census
+        .sites
+        .iter()
+        .find(|site| site.start_byte == call_start)
+        .unwrap_or_else(|| panic!("census must propose the bare call: {:#?}", census.sites));
+    assert_eq!(
+        site.forward_status, "no_definition",
+        "witness requires a forward-unresolvable bare call: {site:#?}"
+    );
+    assert_eq!(
+        site.tier,
+        Some(3),
+        "a type-namespace declaration is not bare-call evidence: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Inconclusive,
+        "a type alias must not produce a missing finding: {site:#?}"
+    );
+}
+
+/// A member of an unrelated same-file class is not bare-call evidence either
+/// (#1858): a bare name cannot reach a field of a class that does not enclose
+/// the site. The twitter/util witness is `private final class Oneshot[A](var
+/// more: ...)` 550 lines away from the `more()` it supplied the "same-file
+/// declaration" for.
+#[test]
+fn census_scala_bare_call_is_not_graded_from_an_unrelated_class_field() {
+    let source = concat!(
+        "package fx\n",
+        "\n",
+        "final class Oneshot[A](var more: () => Int)\n",
+        "\n",
+        "object Stream {\n",
+        "  def run(): Int = more()\n",
+        "}\n",
+    );
+    let census = scala_census_differential(&[("src/main/scala/fx/Stream.scala", source)]);
+
+    let call_start = source.find("more()").expect("bare call site");
+    let site = census
+        .sites
+        .iter()
+        .find(|site| site.start_byte == call_start)
+        .unwrap_or_else(|| panic!("census must propose the bare call: {:#?}", census.sites));
+    assert_eq!(
+        site.forward_status, "no_definition",
+        "witness requires a forward-unresolvable bare call: {site:#?}"
+    );
+    assert_eq!(
+        site.tier,
+        Some(3),
+        "a member of a class that does not enclose the site is not evidence: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Inconclusive,
+        "an unreachable class member must not produce a missing finding: {site:#?}"
+    );
+}
+
+/// A `local_variable_reference` is an ADJUDICATED forward answer -- the
+/// resolver proved a local binder shadows the name, and Scala locals are
+/// deliberately not CodeUnits -- so the census must not grade it as a gap at
+/// all (#1858, the 366ece87 boundary precedent). The twitter/util witness:
+/// `case Cons(fa, more) => more()` binds the pattern binder, while the file's
+/// unrelated `class Oneshot[A](var more: ...)` supplied the same-file name that
+/// made it a tier-1 finding. 32 of the 35 such scala-census sites were answers
+/// like this one, not gaps.
+#[test]
+fn census_scala_adjudicated_local_binder_is_not_graded_as_a_gap() {
+    let source = concat!(
+        "package fx\n",
+        "\n",
+        "final class Oneshot[A](var more: () => Int)\n",
+        "\n",
+        "object Stream {\n",
+        "  def run(value: Any): Int = value match {\n",
+        "    case Cons(fa, more) => more()\n",
+        "    case _ => 0\n",
+        "  }\n",
+        "}\n",
+    );
+    let census = scala_census_differential(&[("src/main/scala/fx/Stream.scala", source)]);
+
+    let call_start = source.find("more()").expect("pattern-binder call site");
+    let site = census
+        .sites
+        .iter()
+        .find(|site| site.start_byte == call_start)
+        .unwrap_or_else(|| panic!("census must propose the bare call: {:#?}", census.sites));
+    assert!(
+        site.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "local_variable_reference"),
+        "witness requires the adjudicated local answer: {site:#?}"
+    );
+    assert_eq!(
+        site.tier, None,
+        "an adjudicated forward answer is never graded a census gap: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Inconclusive,
+        "an adjudicated local binder must not produce a missing finding: {site:#?}"
+    );
+}
+
+/// The keep side of the same contract: a bare call in an implicit-receiver
+/// language still reaches a same-file member the site's own template inherits
+/// or self-types to, so the Scala bindability answer must not degrade into a
+/// strict own-template containment test. The sangria witness (`QueryParser`'s
+/// `trait Tokens` members reached through `this: Parser with Tokens =>`) is a
+/// real forward gap the census must keep grading tier 1.
+#[test]
+fn census_scala_bare_call_keeps_self_type_member_evidence() {
+    let source = concat!(
+        "package fx\n",
+        "\n",
+        "trait Tokens {\n",
+        "  protected def ws(c: Char): Boolean = c == ' '\n",
+        "}\n",
+        "\n",
+        "trait Rules {\n",
+        "  this: Tokens =>\n",
+        "  def rule(c: Char): Boolean = ws(c)\n",
+        "}\n",
+    );
+    let census = scala_census_differential(&[("src/main/scala/fx/Rules.scala", source)]);
+
+    let call_start = source.find("ws(c)").expect("self-type member call site");
+    let site = census
+        .sites
+        .iter()
+        .find(|site| site.start_byte == call_start)
+        .unwrap_or_else(|| panic!("census must propose the bare call: {:#?}", census.sites));
+    assert_eq!(
+        site.forward_status, "no_definition",
+        "witness requires a forward-unresolvable bare call: {site:#?}"
+    );
+    assert_eq!(
+        site.tier,
+        Some(1),
+        "a self-type member stays actionable same-file evidence: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Missing,
+        "the self-type forward gap must keep its finding: {site:#?}"
+    );
+}
+
 fn rust_differential(
     files: &[(&str, &str)],
 ) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {

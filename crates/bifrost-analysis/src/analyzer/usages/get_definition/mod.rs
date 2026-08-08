@@ -469,6 +469,33 @@ pub struct DefinitionLookupDiagnostic {
 /// of the originally requested selector chain.
 pub const PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND: &str = "partial_selector_chain";
 
+/// The name binds to a local binder -- a `case` pattern binding, a block-local
+/// `val`/`def`, a parameter -- which no analyzer publishes as a CodeUnit.
+pub const LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND: &str = "local_variable_reference";
+
+/// The site is a declaration or import occurrence, not a reference, so there is
+/// no definition for it to reach.
+pub const DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND: &str = "declaration_or_import_site";
+
+/// Whether a diagnostic kind carries an ADJUDICATED answer: the resolver
+/// identified what the site is and answered it, rather than failing to reach a
+/// target it was looking for.
+///
+/// That distinction is what separates an answer from joint blindness, and any
+/// consumer that grades forward misses must honour it. The status alone cannot:
+/// [`DefinitionLookupStatus::NoDefinition`] carries both "the target exists and
+/// I could not reach it" and "there is no target to reach, and here is why".
+/// [`DefinitionLookupStatus::UnresolvableImportBoundary`] says it in the status;
+/// the kinds here say it in the diagnostic, because the resolver PROVED the name
+/// binds to something the declaration index deliberately does not publish
+/// (#1858).
+pub fn is_adjudicated_answer_diagnostic_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND | DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND
+    )
+}
+
 pub(crate) fn resolve_definition_batch(
     analyzer: &dyn IAnalyzer,
     requests: Vec<DefinitionLookupRequest>,
