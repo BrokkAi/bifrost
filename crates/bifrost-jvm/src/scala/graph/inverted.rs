@@ -10908,12 +10908,13 @@ fn seed_declaration(
         }
         "extension_definition" => seed_parameters(node, ctx, bindings),
         "function_definition" => {
-            if let Some(name) = node.child_by_field_name("name") {
-                let name = node_text(name, ctx.source).trim();
-                if !name.is_empty() {
-                    bindings.declare_shadow(name.to_string());
-                }
-            }
+            // #1854: a method's own name is NOT a local binding inside its own
+            // body. Declaring it here made every bare `name(..)` inside
+            // `def name(..)` opaque, so recursion and same-name overload
+            // siblings were dropped before any owner, import, or overload
+            // lookup. A genuinely nested `def` still shadows, because
+            // `seed_parent_scope_declaration` declares it in the ENCLOSING
+            // scope, where the shadow belongs.
             preseed_enclosing_owner_fields(node, ctx, bindings);
             if let Some(extension) = node
                 .parent()
