@@ -18,7 +18,8 @@ use crate::analyzer::{SignatureMetadata, StructuredTypeName};
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_cpp::call_match::{
     CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_parameter_type_text,
-    cpp_signature_param_types, cpp_type_text_pointer_depth, normalize_cpp_type_name,
+    cpp_signature_param_types, cpp_signature_trailing_qualifiers, cpp_type_text_pointer_depth,
+    normalize_cpp_type_name,
 };
 use brokk_bifrost_cpp::graph::resolver::{cpp_alias_declaration_target_text, same_logical_symbol};
 
@@ -5187,6 +5188,15 @@ fn cpp_member_lookup(
 /// signature reported `no_applicable_overload` even though the overload was
 /// indexed, visible, and explicitly re-exposed by the source (#1835).
 ///
+/// What the using-declaration re-exposes is bounded by [namespace.udecl]/14:
+/// a member of the deriving class with the same name *and the same
+/// parameter-type-list* hides the base member the using-declaration would
+/// otherwise introduce. Merging without that exclusion turned a call that had
+/// resolved to a derived `override` into an ambiguity between the override and
+/// the very base declaration it overrides (#1843). Hiding is per deriving-class
+/// relationship, so each worklist entry carries the deriving class's own
+/// declarations of the name.
+///
 /// `depth` is the base-class depth `declared` was found at, so the trace can
 /// keep reporting an exact route. The walk is an explicit worklist: a
 /// using-declaration can name a base that re-exposes the member through a
@@ -5199,38 +5209,181 @@ fn cpp_merge_using_introduced_members(
     mut declared: Vec<CodeUnit>,
     mut member_trace: Option<&mut CppMemberTrace>,
 ) -> Vec<CodeUnit> {
-    let mut pending: Vec<(CodeUnit, CodeUnit, usize)> = Vec::new();
+    let mut pending: Vec<(CodeUnit, CodeUnit, CppHidingSet, usize)> = Vec::new();
     for owner in owners {
-        for base in cpp_member_using_declaration_bases(ctx.analyzer, owner, member) {
-            pending.push((base, owner.clone(), depth + 1));
+        let bases = cpp_member_using_declaration_bases(ctx.analyzer, owner, member);
+        if bases.is_empty() {
+            continue;
+        }
+        let hiding = CppHidingSet::declared_by(ctx, owner, &declared);
+        for base in bases {
+            pending.push((base, owner.clone(), hiding.clone(), depth + 1));
         }
     }
     if pending.is_empty() {
         return declared;
     }
     let mut visited: HashSet<String> = owners.iter().map(CodeUnit::fq_name).collect();
-    while let Some((base, deriving, base_depth)) = pending.pop() {
+    while let Some((base, deriving, hiding, base_depth)) = pending.pop() {
         if !visited.insert(base.fq_name()) {
             continue;
         }
         if let Some(state) = member_trace.as_deref_mut() {
             state.parents.entry(base.clone()).or_insert(deriving);
         }
-        declared.extend(cpp_direct_member_candidates_traced(
+        let introduced = cpp_direct_member_candidates_traced(
             ctx.analyzer,
             ctx.support,
             std::slice::from_ref(&base),
             member,
             member_trace.as_deref_mut(),
             base_depth,
-        ));
-        for next in cpp_member_using_declaration_bases(ctx.analyzer, &base, member) {
-            pending.push((next, base.clone(), base_depth + 1));
+        );
+        let chained = cpp_member_using_declaration_bases(ctx.analyzer, &base, member);
+        if !chained.is_empty() {
+            // What `base` re-exposes in turn is hidden by `base`'s own
+            // declarations as well as by everything nearer the call already
+            // hides, so the chained set accumulates rather than replaces.
+            let mut next_hiding = hiding.clone();
+            next_hiding.extend(CppHidingSet::declared_by(ctx, &base, &introduced));
+            for next in chained {
+                pending.push((next, base.clone(), next_hiding.clone(), base_depth + 1));
+            }
         }
+        declared.extend(
+            introduced
+                .into_iter()
+                .filter(|unit| !hiding.hides(ctx, unit)),
+        );
     }
     sort_units(&mut declared);
     declared.dedup();
     declared
+}
+
+/// One declaration's parameter-type-list, in the terms [namespace.udecl]/14
+/// measures a using-introduced base overload against.
+///
+/// The trailing cv-/ref-qualifiers travel with the types because the #1827
+/// signature identity records them and they are part of what makes two member
+/// declarations the same declaration: a `const` member does not hide a
+/// non-`const` one of the same shape.
+#[derive(Clone, PartialEq, Eq)]
+enum CppParameterTypeList {
+    Types {
+        types: Vec<String>,
+        trailing: String,
+    },
+    /// A parameter list spelled with a macro whose replacement the file's macro
+    /// environment cannot pin down - log4cxx's
+    /// `LOG4CXX_FORMAT_EVENT_FORMAL_PARAMETERS` under its ABI-version `#if` is
+    /// the witness. Read as an ordinary type name it would compare unequal to
+    /// every base overload and let all of them through, which is the failure
+    /// #1843 reports; it is an unknown, and an unknown in the deriving class
+    /// hides rather than defers.
+    Opaque,
+}
+
+/// The parameter-type-lists one deriving class declares for the member.
+#[derive(Clone)]
+struct CppHidingSet(Vec<CppParameterTypeList>);
+
+impl CppHidingSet {
+    /// The lists `declarations` contributes for `owner` - the members of
+    /// `owner` itself, which is the only class whose declarations hide what
+    /// `owner`'s using-declaration introduces.
+    fn declared_by(ctx: CppLookupCtx<'_, '_>, owner: &CodeUnit, declarations: &[CodeUnit]) -> Self {
+        Self(
+            declarations
+                .iter()
+                // The unit's owner is a segment pop on its structured `fq()`
+                // (`default_parent_fq_name`), not a re-split of its rendered
+                // fqn string.
+                .filter(|unit| {
+                    crate::analyzer::default_parent_fq_name(unit) == Some(owner.fq_name())
+                })
+                .filter_map(|unit| cpp_parameter_type_list(ctx, unit))
+                .collect(),
+        )
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
+    /// Whether the deriving class declares `introduced`'s parameter-type-list,
+    /// so [namespace.udecl]/14 keeps the base member out of the overload set.
+    fn hides(&self, ctx: CppLookupCtx<'_, '_>, introduced: &CodeUnit) -> bool {
+        if self.0.is_empty() {
+            return false;
+        }
+        if self.0.contains(&CppParameterTypeList::Opaque) {
+            return true;
+        }
+        cpp_parameter_type_list(ctx, introduced)
+            .is_some_and(|introduced| self.0.contains(&introduced))
+    }
+}
+
+/// A declaration's parameter-type-list, read from the signature identity the
+/// index stores and with any object-like macro standing in for a type expanded
+/// in that declaration's own macro environment.
+fn cpp_parameter_type_list(
+    ctx: CppLookupCtx<'_, '_>,
+    unit: &CodeUnit,
+) -> Option<CppParameterTypeList> {
+    let signature = unit.signature()?;
+    let types = cpp_signature_param_types(signature)?;
+    let trailing = cpp_signature_trailing_qualifiers(signature).to_string();
+    if !types
+        .iter()
+        .any(|text| cpp_type_text_is_bare_identifier(text))
+    {
+        return Some(CppParameterTypeList::Types { types, trailing });
+    }
+    // Only a bare identifier can be an object-like macro rather than a type,
+    // and only then is the macro environment worth building.
+    let Some(range) = ctx.analyzer.ranges_of(unit).into_iter().next() else {
+        return Some(CppParameterTypeList::Types { types, trailing });
+    };
+    let mut expanded = Vec::with_capacity(types.len());
+    for text in types {
+        if !cpp_type_text_is_bare_identifier(&text) {
+            expanded.push(text);
+            continue;
+        }
+        match ctx
+            .visibility
+            .object_macro_replacement_at(unit.source(), &text, range.start_byte)
+        {
+            Some(replacement) => match cpp_signature_param_types(&format!("({replacement})")) {
+                Some(replacement_types) => expanded.extend(replacement_types),
+                None => return Some(CppParameterTypeList::Opaque),
+            },
+            None if ctx
+                .visibility
+                .names_a_macro_at(unit.source(), &text, range.start_byte) =>
+            {
+                return Some(CppParameterTypeList::Opaque);
+            }
+            None => expanded.push(text),
+        }
+    }
+    Some(CppParameterTypeList::Types {
+        types: expanded,
+        trailing,
+    })
+}
+
+/// Whether a normalized parameter type is one unqualified identifier, which is
+/// the only shape an object-like macro can wear.
+fn cpp_type_text_is_bare_identifier(text: &str) -> bool {
+    text.chars()
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && text
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 /// The base classes a member `using <Base>::<member>;` declaration in `owner`'s

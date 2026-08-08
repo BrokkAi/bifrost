@@ -1478,6 +1478,20 @@ impl<'a> VisibilityIndex<'a> {
         Arc::clone(&cursor.environment)
     }
 
+    /// Whether `name` is bound as a macro at `before_byte` in `file`,
+    /// including a binding this environment cannot pin to one replacement
+    /// (a conditional `#define`, or a function-like macro).
+    ///
+    /// [`Self::object_macro_replacement_at`] collapses every such binding to
+    /// `None`, which is indistinguishable from "not a macro at all". A caller
+    /// that must not read a macro token as an ordinary type name needs the two
+    /// apart: an unexpandable macro is an unknown, a plain identifier is not.
+    pub fn names_a_macro_at(&self, file: &ProjectFile, name: &str, before_byte: usize) -> bool {
+        self.macro_environment(file, before_byte)
+            .binding(name)
+            .is_some()
+    }
+
     pub fn object_macro_replacement_at(
         &self,
         file: &ProjectFile,
