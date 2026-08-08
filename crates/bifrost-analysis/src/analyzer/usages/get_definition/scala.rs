@@ -10596,8 +10596,9 @@ fn scala_exact_owner_namespace_children(
     }
 
     let mut level = match ctx.direct_ancestors_for_owner(owner) {
-        ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
-        ScalaDirectAncestorResolution::Incomplete(_) | ScalaDirectAncestorResolution::Ambiguous => {
+        ScalaDirectAncestorResolution::Resolved(ancestors)
+        | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
+        ScalaDirectAncestorResolution::Ambiguous => {
             return ScalaExactMemberResolution::Ambiguous;
         }
     };
@@ -10613,9 +10614,9 @@ fn scala_exact_owner_namespace_children(
                 ctx, &ancestor, name, None,
             ));
             match ctx.direct_ancestors_for_owner(&ancestor) {
-                ScalaDirectAncestorResolution::Resolved(ancestors) => next.extend(ancestors),
-                ScalaDirectAncestorResolution::Incomplete(_)
-                | ScalaDirectAncestorResolution::Ambiguous => {
+                ScalaDirectAncestorResolution::Resolved(ancestors)
+                | ScalaDirectAncestorResolution::Incomplete(ancestors) => next.extend(ancestors),
+                ScalaDirectAncestorResolution::Ambiguous => {
                     return ScalaExactMemberResolution::Ambiguous;
                 }
             }

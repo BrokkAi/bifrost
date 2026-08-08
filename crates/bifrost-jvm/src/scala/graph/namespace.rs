@@ -126,9 +126,9 @@ where
         }
 
         let mut level = match direct_ancestors(&owner) {
-            ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
-            ScalaDirectAncestorResolution::Incomplete(_)
-            | ScalaDirectAncestorResolution::Ambiguous => {
+            ScalaDirectAncestorResolution::Resolved(ancestors)
+            | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
+            ScalaDirectAncestorResolution::Ambiguous => {
                 return ScalaTypeNamespaceResolution::Ambiguous;
             }
         };
@@ -143,9 +143,11 @@ where
                 }
                 matches.extend(direct_members(&ancestor, name));
                 match direct_ancestors(&ancestor) {
-                    ScalaDirectAncestorResolution::Resolved(ancestors) => next.extend(ancestors),
-                    ScalaDirectAncestorResolution::Incomplete(_)
-                    | ScalaDirectAncestorResolution::Ambiguous => next_is_ambiguous = true,
+                    ScalaDirectAncestorResolution::Resolved(ancestors)
+                    | ScalaDirectAncestorResolution::Incomplete(ancestors) => {
+                        next.extend(ancestors)
+                    }
+                    ScalaDirectAncestorResolution::Ambiguous => next_is_ambiguous = true,
                 }
             }
             let matches = unique_units(matches);
