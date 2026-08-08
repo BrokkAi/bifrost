@@ -4262,8 +4262,8 @@ impl<'a> VisibilityIndex<'a> {
     }
 
     pub fn alias_target(&self, alias: &CodeUnit) -> Option<CodeUnit> {
-        let raw_target = type_alias_target_text(alias)?;
-        let resolved = self.resolve_type_for_declaration(alias.source(), alias, raw_target)?;
+        let raw_target = cpp_alias_declaration_target_text(alias.signature()?)?;
+        let resolved = self.resolve_type_for_declaration(alias.source(), alias, &raw_target)?;
         match resolved.kind() {
             CodeUnitType::Class => Some(resolved),
             _ if is_type_alias(&resolved) => self.alias_target(&resolved),
@@ -6910,21 +6910,6 @@ pub fn field_declared_binding(
     ))
 }
 
-fn type_alias_target_text(alias: &CodeUnit) -> Option<&str> {
-    alias
-        .signature()?
-        .strip_prefix("using ")
-        .and_then(|rest| rest.split_once('=').map(|(_, rhs)| rhs))
-        .or_else(|| {
-            alias
-                .signature()?
-                .strip_prefix("typedef ")
-                .and_then(|rest| rest.rsplit_once(' ').map(|(lhs, _)| lhs))
-        })
-        .map(str::trim)
-        .map(|target| target.trim_end_matches(';').trim())
-}
-
 fn unique_logical_type_candidate(candidates: Vec<&CodeUnit>) -> Option<CodeUnit> {
     let first = candidates.first()?;
     candidates
@@ -7018,6 +7003,79 @@ fn decode_field_declared_type_fact(
     None
 }
 
+/// Text of the type that a C or C++ alias declaration names, read from the
+/// `type_definition` or `alias_declaration` node's `type` field.
+///
+/// The declaration text is never scanned. A function-pointer typedef
+/// interleaves its aliased type with its declarator (`typedef R (*F)(int)`),
+/// so no prefix or suffix of the spelling isolates the target.
+///
+/// An alias whose declarator is a function declarator names a function type:
+/// `typedef R F(int)`, `typedef R (*F)(int)`, `typedef R *F(int)`, and
+/// `using F = R (*)(int)`. The analyzer's type model names declared types only,
+/// so such an alias has no canonical target. Its `type` field holds the return
+/// type `R`, which is a different type from the alias, so this returns `None`
+/// rather than that return type.
+pub fn cpp_alias_declaration_target_text(declaration: &str) -> Option<String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(declaration, None)?;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let type_node = match node.kind() {
+            "type_definition" => {
+                let mut cursor = node.walk();
+                if node
+                    .children_by_field_name("declarator", &mut cursor)
+                    .any(declarator_names_function_type)
+                {
+                    return None;
+                }
+                node.child_by_field_name("type")?
+            }
+            "alias_declaration" => {
+                let type_node = node.child_by_field_name("type")?;
+                if type_node
+                    .child_by_field_name("declarator")
+                    .is_some_and(declarator_names_function_type)
+                {
+                    return None;
+                }
+                type_node
+            }
+            _ => {
+                let mut cursor = node.walk();
+                let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+                stack.extend(children.into_iter().rev());
+                continue;
+            }
+        };
+        return Some(node_text(type_node, declaration).to_string());
+    }
+    None
+}
+
+/// True when an alias declarator names a function type.
+///
+/// The declarator chain is walked through the `declarator` field, so the
+/// parameter list -- a sibling field -- is never entered and a parameter's own
+/// function declarator cannot be mistaken for the alias's.
+fn declarator_names_function_type(declarator: Node<'_>) -> bool {
+    let mut current = Some(declarator);
+    while let Some(node) = current {
+        match node.kind() {
+            "function_declarator" | "abstract_function_declarator" => return true,
+            "parenthesized_declarator" | "abstract_parenthesized_declarator" => {
+                current = node.named_child(0);
+            }
+            _ => current = node.child_by_field_name("declarator"),
+        }
+    }
+    false
+}
+
 fn decode_structured_alias_target(
     analyzer: &CppGraphSource<'_>,
     unit: &CodeUnit,
@@ -7055,13 +7113,16 @@ fn decode_structured_alias_target_source(
                     continue;
                 }
                 let mut declarator_cursor = node.walk();
-                let declares_unit = node
+                let declarator = node
                     .children_by_field_name("declarator", &mut declarator_cursor)
-                    .any(|declarator| {
-                        extract_typedef_declarator_name(declarator, declaration)
+                    .find(|declarator| {
+                        extract_typedef_declarator_name(*declarator, declaration)
                             .is_some_and(|name| name == unit.identifier())
-                    });
-                declares_unit.then(|| node.child_by_field_name("type"))??
+                    })?;
+                if declarator_names_function_type(declarator) {
+                    return None;
+                }
+                node.child_by_field_name("type")?
             }
             "alias_declaration" => {
                 if require_top_level
@@ -7074,8 +7135,17 @@ fn decode_structured_alias_target_source(
                     continue;
                 }
                 let name = node.child_by_field_name("name")?;
-                (node_text(name, declaration) == unit.identifier())
-                    .then(|| node.child_by_field_name("type"))??
+                if node_text(name, declaration) != unit.identifier() {
+                    return None;
+                }
+                let type_node = node.child_by_field_name("type")?;
+                if type_node
+                    .child_by_field_name("declarator")
+                    .is_some_and(declarator_names_function_type)
+                {
+                    return None;
+                }
+                type_node
             }
             _ => {
                 let mut cursor = node.walk();

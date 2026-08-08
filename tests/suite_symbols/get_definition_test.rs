@@ -33800,3 +33800,88 @@ fn csharp_record_only_primary_constructor_resolves_to_it_not_the_type() {
         assert_eq!(result["definitions"][0]["fqn"], fqn, "{needle}: {value}");
     }
 }
+
+/// Pillow's `src/Tk/_tkmini.h` declares `typedef Tcl_Command
+/// (*Tcl_CreateCommand_t)(...)`. Recovering the alias target from the
+/// declaration text served `Tcl_Command`, the return type, so the alias
+/// resolved to `struct Tcl_Command_` (issue #1815). A function-pointer typedef
+/// names a function type, which the analyzer's type model cannot name, so the
+/// alias has no canonical target and the typedef itself is the definition.
+#[test]
+fn cpp_function_pointer_typedef_does_not_resolve_to_its_return_type() {
+    let source = r#"
+struct Tcl_Command_ { int value; };
+typedef struct Tcl_Command_ *Tcl_Command;
+struct Tcl_Interp_ { int value; };
+typedef struct Tcl_Interp_ Tcl_Interp;
+typedef Tcl_Command (*Tcl_CreateCommand_t)(Tcl_Interp *interp, const char *cmdName);
+typedef Tcl_Command Tcl_CreateCommandDirect_t(Tcl_Interp *interp);
+struct impl_s { int value; };
+typedef struct impl_s alias_t;
+struct S { int value; };
+typedef struct S *A;
+typedef int arr_t[4];
+typedef const struct S *csp_t;
+void use(Tcl_CreateCommand_t fp, Tcl_CreateCommandDirect_t *direct, alias_t plain,
+         A pointer, arr_t array, csp_t qualified, Tcl_Command command) {
+    (void)fp; (void)direct; (void)plain; (void)pointer;
+    (void)array; (void)qualified; (void)command;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.c", source)
+        .build();
+
+    // Each alias use resolves to the definition its declaration names. A
+    // function-type alias names no declared type, so it resolves to itself.
+    for (needle, fqn) in [
+        ("Tcl_CreateCommand_t fp", "Tcl_CreateCommand_t"),
+        (
+            "Tcl_CreateCommandDirect_t *direct",
+            "Tcl_CreateCommandDirect_t",
+        ),
+        ("alias_t plain", "impl_s"),
+        ("A pointer", "S"),
+        ("arr_t array", "arr_t"),
+        ("csp_t qualified", "S"),
+        ("Tcl_Command command", "Tcl_Command_"),
+    ] {
+        let start = source.find(needle).expect("alias use in fixture");
+        let value = lookup(project.root(), &location_reference("app.c", source, start));
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{needle}: {value}");
+        let definitions = result["definitions"].as_array().expect("definitions array");
+        assert_eq!(definitions.len(), 1, "{needle}: {value}");
+        assert_eq!(definitions[0]["fqn"], fqn, "{needle}: {value}");
+    }
+}
+
+/// The C++ `using` spelling of a function-pointer alias has the same target:
+/// the aliased type is a function type, not the return type.
+#[test]
+fn cpp_using_function_pointer_alias_does_not_resolve_to_its_return_type() {
+    let source = r#"namespace app {
+struct Command { int value; };
+using CommandPtr = Command *;
+using Handler = Command (*)(int);
+void use(Handler handler, CommandPtr pointer) { (void)handler; (void)pointer; }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+
+    for (needle, fqn) in [
+        ("Handler handler", "app.Handler"),
+        ("CommandPtr pointer", "app.Command"),
+    ] {
+        let start = source.find(needle).expect("alias use in fixture");
+        let value = lookup(
+            project.root(),
+            &location_reference("app.cpp", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{needle}: {value}");
+        assert_eq!(result["definitions"][0]["fqn"], fqn, "{needle}: {value}");
+    }
+}

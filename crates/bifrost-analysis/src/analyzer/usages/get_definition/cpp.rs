@@ -20,6 +20,7 @@ use brokk_bifrost_cpp::call_match::{
     CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_parameter_type_text,
     cpp_signature_param_types, cpp_type_text_pointer_depth, normalize_cpp_type_name,
 };
+use brokk_bifrost_cpp::graph::resolver::cpp_alias_declaration_target_text;
 
 pub(crate) const CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC: &str = "unproven_cpp_link_unit";
 
@@ -7369,18 +7370,7 @@ fn cpp_alias_target_texts<'a>(
     signatures
         .into_iter()
         .chain(source)
-        .filter_map(|signature| cpp_alias_target_text(&signature))
-}
-
-fn cpp_alias_target_text(signature: &str) -> Option<String> {
-    let signature = signature.trim();
-    let rhs = if let Some((_, rhs)) = signature.split_once('=') {
-        rhs
-    } else {
-        let rest = signature.strip_prefix("typedef ")?;
-        rest.rsplit_once(char::is_whitespace)?.0
-    };
-    Some(rhs.trim().trim_end_matches(';').trim().to_string())
+        .filter_map(|declaration| cpp_alias_declaration_target_text(&declaration))
 }
 
 fn cpp_infer_type_from_value(
