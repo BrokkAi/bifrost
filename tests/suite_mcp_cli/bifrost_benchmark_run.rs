@@ -202,7 +202,7 @@ while IFS= read -r line; do
       printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"fake-bifrost","version":"0"},"_meta":{"io.bifrost/build-identity":"__IDENTITY__"}}}'
       ;;
     *'"method":"tools/call"'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"format":"bifrost_code_query_profile/v2","result":{"results":[],"truncated":false},"timings_ns":{"total":1},"work":{"scanned_files":0,"scanned_source_bytes":0,"fact_nodes":0,"pipeline_rows":0,"examined_references":0,"import_files_resolved":0,"import_edges_resolved":0},"cache_layers":[],"access_path":{}}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"format":"bifrost_code_query_profile/v2","result":{"results":[],"truncated":false},"timings_ns":{"total":1},"request_timings_ns":{"transport_queue_wait":0,"workspace_ready":0,"preparation":0,"input_decode":0,"query_execution":0,"rendering_serialization":0,"total":1},"work":{"scanned_files":0,"scanned_source_bytes":0,"fact_nodes":0,"pipeline_rows":0,"examined_references":0,"import_files_resolved":0,"import_edges_resolved":0},"cache_layers":[],"access_path":{}}}}'
       ;;
     *'"method":"bifrost/benchmark-profile-boundary"'*)
       printf '\n\036bifrost-benchmark-profile-boundary\036\n' >&2
