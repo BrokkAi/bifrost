@@ -227,10 +227,11 @@ async function main() {
       "Unicode data used by tree-sitter",
       "compiled into the tree-sitter runtime used on every release target",
     ),
-    await vendoredLegalFile(
-      "crates/bifrost-jvm/vendor/tree-sitter-scala/LICENSE",
-      "Bifrost-patched tree-sitter-scala parser",
-      "https://github.com/tree-sitter/tree-sitter-scala/tree/a067c39163b62b19e76cea17476f3188da8c9e51",
+    await legalFile(
+      metadata,
+      "tree-sitter-scala",
+      "LICENSE",
+      "tree-sitter-scala parser",
       "compiled into Bifrost on every release target",
     ),
     await vendoredLegalFile(
