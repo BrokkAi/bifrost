@@ -207,6 +207,15 @@ fn find_direct_importers_with_cancellation(
     let mut files: Vec<_> = files.into_iter().collect();
     files.sort();
     let import_infos = import_provider.import_infos_for_files(&files);
+    // The walk below is about to ask the provider the same shape of question
+    // once per candidate. Every key it will ask about is derivable from the
+    // import facts already in hand, so give the provider one chance to resolve
+    // the whole set in a batch first (#1748). Providers without a shared
+    // lookup do nothing here.
+    if cancellation.is_cancelled() {
+        return HashSet::default();
+    }
+    import_provider.prefetch_import_targets(&files, import_infos.as_ref(), cancellation);
     // Each candidate's resolution is independent (own cache entries, own store-reader-pool
     // checkout) and the pool is sized for `num_cpus` concurrent readers -- running this
     // workspace-wide loop on a single thread leaves that capacity idle. `ImportAnalysisProvider:
@@ -873,6 +882,135 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::Acquire), 1);
         assert_eq!(importers, [importer].into_iter().collect());
+    }
+
+    struct PrefetchingImportProvider {
+        prefetched_files: Arc<Mutex<Vec<usize>>>,
+        per_candidate_calls: Arc<AtomicUsize>,
+        prefetches_before_first_candidate: Arc<AtomicUsize>,
+    }
+
+    impl ImportAnalysisProvider for PrefetchingImportProvider {
+        fn imported_code_units_of(&self, _file: &ProjectFile) -> HashSet<CodeUnit> {
+            HashSet::default()
+        }
+
+        fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {
+            panic!("cancellable discovery must not build the global reverse index");
+        }
+
+        fn import_info_of(&self, _file: &ProjectFile) -> Vec<ImportInfo> {
+            Vec::new()
+        }
+
+        fn could_import_file(
+            &self,
+            _source_file: &ProjectFile,
+            _imports: &[ImportInfo],
+            _target: &ProjectFile,
+        ) -> bool {
+            if self.per_candidate_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                self.prefetches_before_first_candidate.store(
+                    self.prefetched_files
+                        .lock()
+                        .expect("prefetch record poisoned")
+                        .len(),
+                    Ordering::Release,
+                );
+            }
+            false
+        }
+
+        fn prefetch_import_targets(
+            &self,
+            files: &[ProjectFile],
+            _import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
+            _cancellation: &CancellationToken,
+        ) {
+            self.prefetched_files
+                .lock()
+                .expect("prefetch record poisoned")
+                .push(files.len());
+        }
+    }
+
+    /// #1748: the walk asks the provider the same shape of question once per
+    /// workspace file, so a provider whose answer needs a shared lookup must
+    /// get one chance to resolve the whole set first. Fails with zero
+    /// prefetches before the hook is called.
+    #[test]
+    fn importer_scan_prefetches_import_targets_once_before_asking_per_candidate() {
+        let root = std::env::temp_dir();
+        let target_file = ProjectFile::new(root.clone(), "Target.java");
+        let candidates: Vec<ProjectFile> = (0..64)
+            .map(|index| ProjectFile::new(root.clone(), format!("Candidate{index}.java")))
+            .collect();
+        let provider = PrefetchingImportProvider {
+            prefetched_files: Arc::new(Mutex::new(Vec::new())),
+            per_candidate_calls: Arc::new(AtomicUsize::new(0)),
+            prefetches_before_first_candidate: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let importers = find_direct_importers_with_cancellation(
+            candidates.clone(),
+            &provider,
+            &[target_file].into_iter().collect(),
+            &CancellationToken::default(),
+        );
+
+        assert!(importers.is_empty());
+        assert_eq!(
+            vec![candidates.len()],
+            *provider
+                .prefetched_files
+                .lock()
+                .expect("prefetch record poisoned"),
+            "the whole candidate set must be offered to the provider exactly once"
+        );
+        assert_eq!(
+            1,
+            provider
+                .prefetches_before_first_candidate
+                .load(Ordering::Acquire),
+            "the batch must run before the first per-candidate question"
+        );
+        assert_eq!(
+            candidates.len(),
+            provider.per_candidate_calls.load(Ordering::Acquire)
+        );
+    }
+
+    /// A cancelled scan must not spend the batch either.
+    #[test]
+    fn cancelled_importer_scan_skips_the_prefetch_and_the_walk() {
+        let root = std::env::temp_dir();
+        let target_file = ProjectFile::new(root.clone(), "Target.java");
+        let candidate = ProjectFile::new(root, "Candidate.java");
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let provider = PrefetchingImportProvider {
+            prefetched_files: Arc::new(Mutex::new(Vec::new())),
+            per_candidate_calls: Arc::new(AtomicUsize::new(0)),
+            prefetches_before_first_candidate: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let importers = find_direct_importers_with_cancellation(
+            [candidate],
+            &provider,
+            &[target_file].into_iter().collect(),
+            &cancellation,
+        );
+
+        assert!(importers.is_empty());
+        assert_eq!(0, provider.per_candidate_calls.load(Ordering::Acquire));
+        assert!(
+            provider
+                .prefetched_files
+                .lock()
+                .expect("prefetch record poisoned")
+                .is_empty(),
+            "a pre-cancelled scan must not spend the batch either"
+        );
     }
 
     #[test]

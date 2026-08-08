@@ -316,6 +316,47 @@ impl ImportAnalysisProvider for RustAnalyzer {
                 })
         })
     }
+
+    /// Rust answers "could this file import the target" by resolving each
+    /// `use` path to an fq name and asking the store which files define it,
+    /// so the shared candidate walk charged one `definition_candidates` query
+    /// per `use` statement in the workspace (#1748). Every path the walk will
+    /// ask about is derivable from the import facts it already has, so resolve
+    /// them all here and hand the whole set to one batched store read.
+    fn prefetch_import_targets(
+        &self,
+        files: &[ProjectFile],
+        import_infos: Option<&crate::hash::HashMap<ProjectFile, Vec<ImportInfo>>>,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) {
+        use rayon::prelude::*;
+
+        let mut fq_names: Vec<String> = files
+            .par_iter()
+            .flat_map_iter(|file| {
+                if cancellation.is_cancelled() {
+                    return Vec::new().into_iter();
+                }
+                let package = rust_package_name(file);
+                let imports = import_infos
+                    .and_then(|infos| infos.get(file).cloned())
+                    .unwrap_or_else(|| self.inner.import_info_of(file));
+                imports
+                    .iter()
+                    .filter_map(|import| {
+                        resolve_rust_import_fq_name(file, &package, &import.raw_snippet)
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+            })
+            .collect();
+        if cancellation.is_cancelled() {
+            return;
+        }
+        fq_names.sort_unstable();
+        fq_names.dedup();
+        self.inner.prefetch_definitions(&fq_names);
+    }
 }
 
 pub(super) fn rust_imports_from_use_declaration(node: Node<'_>, source: &str) -> Vec<ImportInfo> {

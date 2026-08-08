@@ -2464,6 +2464,56 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
+    /// The many-name form of
+    /// [`Self::declaration_order_candidate_rows_by_short_name_for_langs`], for
+    /// callers that can enumerate every name they will ask about before they
+    /// ask about any of them (#1748).
+    ///
+    /// One chunked `IN` seek per `SHORT_NAMES_PER_QUERY` names against the
+    /// same `(lang, short_name)` index, inside one transaction and one
+    /// generation check, instead of a pooled reader checkout plus transaction
+    /// plus generation check per name. Rows carry their `short_name`, so the
+    /// caller regroups them without a second read.
+    ///
+    /// The `IN` list is the same idiom as
+    /// `declaration_candidate_rows_by_identifiers_for_langs` (#1688); the
+    /// chunk bound matches the 400-key bulk readers in this file.
+    pub(crate) fn declaration_order_candidate_rows_by_short_names_for_langs(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        short_names: &[String],
+    ) -> Result<Vec<DefinitionOrderCandidateRow>> {
+        const SHORT_NAMES_PER_QUERY: usize = 400;
+        if short_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let mut rows = Vec::new();
+        for chunk in short_names.chunks(SHORT_NAMES_PER_QUERY) {
+            // `?1` is the language, so the names start at `?2`.
+            let placeholders = (0..chunk.len())
+                .map(|index| format!("?{}", index + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = definition_order_candidate_sql(
+                &format!("units.lang = ?1 AND units.short_name IN ({placeholders})"),
+                "units.in_declarations = 1",
+            );
+            let values: Vec<&dyn ToSql> = chunk.iter().map(|name| name as &dyn ToSql).collect();
+            rows.extend(definition_order_candidate_rows_for_languages(
+                &tx,
+                langs.iter().map(String::as_str),
+                &sql,
+                &values,
+            )?);
+        }
+        tx.commit()?;
+        Ok(rows)
+    }
+
     /// Returns name-bounded declaration-lookup candidates together with the
     /// persisted range fact needed for definition ordering.
     pub(crate) fn definition_lookup_order_candidate_rows_by_short_name_for_langs(

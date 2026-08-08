@@ -1725,12 +1725,15 @@ pub(super) fn present_reference_only_sibling_extensions_by_language(
     analyzer: &dyn IAnalyzer,
 ) -> BTreeMap<Language, Vec<&'static str>> {
     let mut present = BTreeMap::new();
-    let Ok(files) = analyzer.project().all_files() else {
+    // `all_files_shared`, not `all_files`: this reads each path's extension and
+    // keeps nothing, so deep-cloning the project's whole listing to do it is
+    // pure waste (the same swap as `route_summary_targets_with_cancellation`).
+    let Ok(files) = analyzer.project().all_files_shared() else {
         return present;
     };
 
     let mut workspace_extensions = HashSet::default();
-    for file in files {
+    for file in files.iter() {
         if let Some(extension) = file
             .rel_path()
             .extension()

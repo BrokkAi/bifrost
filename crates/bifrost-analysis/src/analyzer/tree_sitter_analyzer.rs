@@ -5,8 +5,9 @@ use crate::analyzer::project::{OverlayRevision, ProjectSourceOrigin, ProjectSour
 use crate::analyzer::store::liveness::{LivePathEntry, LivePathMap, LiveSnapshot, Liveness};
 use crate::analyzer::store::query::QueryResolver;
 use crate::analyzer::store::{
-    AnalyzerStore, GenerationId, HierarchyStorageKey, LimitedQueryRows, PathSymbolRow,
-    PersistBatchLimits, PersistBatchStats, PreparedParsedBlob, StoreError,
+    AnalyzerStore, DefinitionOrderCandidateRow, GenerationId, HierarchyStorageKey,
+    LimitedQueryRows, PathSymbolRow, PersistBatchLimits, PersistBatchStats, PreparedParsedBlob,
+    StoreError,
 };
 use crate::analyzer::structural::materialization::MaterializationRecord;
 use crate::analyzer::{
@@ -1200,6 +1201,42 @@ struct QueryReadCache {
     /// hydration, so a racing duplicate query is cheap and single-flighting per
     /// key would cost more than it saves.
     parent_units: Arc<RwLock<HashMap<String, Option<CodeUnit>>>>,
+    /// Definition candidates keyed by fq name, resolved at most once per name
+    /// per request.
+    ///
+    /// `definitions` is the single hottest store read in candidate discovery:
+    /// the shared import-graph walk asks it once per import statement in the
+    /// workspace, and a workspace's import statements name far fewer distinct
+    /// targets than there are import statements (#1748). Same plain-`HashMap`
+    /// shape and reasoning as `parent_units`: each entry is one bounded
+    /// lookup, so a racing duplicate is cheaper than per-key single flight.
+    definition_units: Arc<RwLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
+    /// The workspace's path-synthetic module units, walked at most once per
+    /// request (#1774). See [`TreeSitterAnalyzer::workspace_module_walk`].
+    workspace_module_walk: Arc<RwLock<Option<Arc<WorkspaceModuleWalk>>>>,
+}
+
+/// One request's materialization of the workspace's path-synthetic module
+/// units, plus the live snapshot it was read from. See
+/// [`TreeSitterAnalyzer::workspace_module_walk`].
+struct WorkspaceModuleWalk {
+    snapshot: Arc<LiveSnapshot>,
+    entries: Vec<(ProjectFile, Oid, CodeUnit)>,
+    /// Live paths visited by the walk, so a memo hit reports the same
+    /// `inspected` budget figure the walk itself would have reported.
+    inspected: usize,
+}
+
+// `LiveSnapshot` is not `Debug`, and the entry list is workspace-sized, so
+// report the shape rather than the contents.
+impl std::fmt::Debug for WorkspaceModuleWalk {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspaceModuleWalk")
+            .field("entries", &self.entries.len())
+            .field("inspected", &self.inspected)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1250,6 +1287,8 @@ impl QueryReadCache {
         self.file_states = Arc::new(RwLock::new(HashMap::default()));
         self.prepared_syntax = Arc::new(RwLock::new(HashMap::default()));
         self.parent_units = Arc::new(RwLock::new(HashMap::default()));
+        self.definition_units = Arc::new(RwLock::new(HashMap::default()));
+        self.workspace_module_walk = Arc::new(RwLock::new(None));
     }
 
     fn is_active(&self) -> bool {
@@ -1901,6 +1940,7 @@ pub struct TreeSitterAnalyzer<A> {
     bulk_hydration_count: Arc<AtomicUsize>,
     sql_definitions_query_count: Arc<AtomicUsize>,
     definition_candidates_query_count: Arc<AtomicUsize>,
+    definition_prefetch_batch_count: Arc<AtomicUsize>,
     enclosing_code_unit_query_count: Arc<AtomicUsize>,
     full_declaration_scan_count: Arc<AtomicUsize>,
     /// Persisted declarations that a `search_symbols` request hydrated into
@@ -1958,6 +1998,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             bulk_hydration_count: Arc::clone(&self.bulk_hydration_count),
             sql_definitions_query_count: Arc::clone(&self.sql_definitions_query_count),
             definition_candidates_query_count: Arc::clone(&self.definition_candidates_query_count),
+            definition_prefetch_batch_count: Arc::clone(&self.definition_prefetch_batch_count),
             enclosing_code_unit_query_count: Arc::clone(&self.enclosing_code_unit_query_count),
             full_declaration_scan_count: Arc::clone(&self.full_declaration_scan_count),
             search_candidate_hydration_count: Arc::clone(&self.search_candidate_hydration_count),
@@ -2152,6 +2193,7 @@ where
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
             sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
+            definition_prefetch_batch_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             search_candidate_hydration_count: Arc::new(AtomicUsize::new(0)),
@@ -2349,6 +2391,7 @@ where
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
             sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
+            definition_prefetch_batch_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             search_candidate_hydration_count: Arc::new(AtomicUsize::new(0)),
@@ -5014,7 +5057,7 @@ where
 
     fn resolve_definition_order_candidate_rows(
         &self,
-        rows: Vec<crate::analyzer::store::DefinitionOrderCandidateRow>,
+        rows: Vec<DefinitionOrderCandidateRow>,
     ) -> Vec<DefinitionSortCandidate> {
         QueryResolver::from_snapshot(
             self.adapter.as_ref(),
@@ -5203,23 +5246,47 @@ where
             .rows)
     }
 
-    fn try_sql_nonpersisted_workspace_declarations_vec_matching_limited(
+    /// The live-path prefix shared by every non-persisted workspace
+    /// declaration scan: one pass over the snapshot's paths that keeps the
+    /// entries carrying a path-synthetic module unit for this analyzer's
+    /// language, together with the snapshot it was taken from.
+    ///
+    /// Materialized at most once per request (#1774). Every caller of
+    /// `sql_nonpersisted_workspace_declarations_vec_matching` used to pay this
+    /// whole-workspace walk again, and the callers are per-name (short-name
+    /// lookup, package-scoped class listings, identifier lookup), so a single
+    /// query re-walked the workspace once per name it resolved. The narrowing
+    /// `keep` predicate is deliberately *not* part of the memo: it runs after
+    /// the walk, so the expensive tail (stat validation, the structured-import
+    /// blob query, declaration hydration) stays scoped to the matching subset
+    /// exactly as before.
+    ///
+    /// The snapshot travels with the walk so a memo hit and its tail read the
+    /// same live-path state. `Err(inspected)` reports a cancelled walk and
+    /// publishes nothing: a partial walk must never be served to a later
+    /// caller as the workspace.
+    fn workspace_module_walk(
         &self,
-        mut keep: impl FnMut(&CodeUnit) -> bool,
-        mut continue_query: impl FnMut() -> bool,
-    ) -> std::result::Result<LimitedQueryRows<CodeUnit>, StoreError> {
-        if !self.adapter.has_path_synthetic_module_units() {
-            return Ok(LimitedQueryRows::complete(Vec::new(), 0));
+        continue_query: &mut impl FnMut() -> bool,
+    ) -> std::result::Result<Arc<WorkspaceModuleWalk>, usize> {
+        let memo = self.active_query_cache_handle(|cache| &cache.workspace_module_walk);
+        let cached = memo.as_ref().and_then(|memo| {
+            memo.read()
+                .expect("query workspace-module walk cache read lock poisoned")
+                .clone()
+        });
+        if let Some(walk) = cached {
+            return Ok(walk);
         }
+
         self.workspace_path_scan_count
             .fetch_add(1, Ordering::Relaxed);
         let snapshot = self.live_snapshot();
-        let mut candidates = Vec::new();
-        let mut candidate_files = Vec::new();
+        let mut entries = Vec::new();
         let mut inspected = 0usize;
         for file in snapshot.all_paths() {
             if !continue_query() {
-                return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+                return Err(inspected);
             }
             inspected = inspected.saturating_add(1);
             let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
@@ -5232,14 +5299,51 @@ where
             let Some(module) = self.adapter.path_synthetic_module_unit(&project_file) else {
                 continue;
             };
-            if !keep(&module) {
-                continue;
-            }
             let Some(oid) = snapshot.oid_for_path(file) else {
                 continue;
             };
+            entries.push((file.clone(), oid, module));
+        }
+
+        let walk = Arc::new(WorkspaceModuleWalk {
+            snapshot,
+            entries,
+            inspected,
+        });
+        if let Some(memo) = memo.as_ref() {
+            *memo
+                .write()
+                .expect("query workspace-module walk cache write lock poisoned") =
+                Some(Arc::clone(&walk));
+        }
+        Ok(walk)
+    }
+
+    fn try_sql_nonpersisted_workspace_declarations_vec_matching_limited(
+        &self,
+        mut keep: impl FnMut(&CodeUnit) -> bool,
+        mut continue_query: impl FnMut() -> bool,
+    ) -> std::result::Result<LimitedQueryRows<CodeUnit>, StoreError> {
+        if !self.adapter.has_path_synthetic_module_units() {
+            return Ok(LimitedQueryRows::complete(Vec::new(), 0));
+        }
+        let walk = match self.workspace_module_walk(&mut continue_query) {
+            Ok(walk) => walk,
+            Err(inspected) => return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected)),
+        };
+        let snapshot = Arc::clone(&walk.snapshot);
+        let mut candidates = Vec::new();
+        let mut candidate_files = Vec::new();
+        let mut inspected = walk.inspected;
+        for (file, oid, module) in &walk.entries {
+            if !continue_query() {
+                return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+            }
+            if !keep(module) {
+                continue;
+            }
             candidate_files.push(file.clone());
-            candidates.push((file.clone(), oid, module));
+            candidates.push((file.clone(), *oid, module.clone()));
         }
 
         if !continue_query() {
@@ -5596,6 +5700,21 @@ where
     pub fn definition_candidates_query_count_for_test(&self) -> usize {
         self.definition_candidates_query_count
             .load(Ordering::Relaxed)
+    }
+
+    /// Batched definition-candidate store reads performed by
+    /// [`Self::prefetch_definitions`]. Paired with
+    /// `definition_candidates_query_count_for_test` it separates "one batch
+    /// for the whole request" from "one point lookup per name".
+    #[doc(hidden)]
+    pub fn reset_definition_prefetch_batch_count_for_test(&self) {
+        self.definition_prefetch_batch_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn definition_prefetch_batch_count_for_test(&self) -> usize {
+        self.definition_prefetch_batch_count.load(Ordering::Relaxed)
     }
 
     #[doc(hidden)]
@@ -6092,10 +6211,31 @@ where
         )
     }
 
+    /// Request-scoped memo behind [`IAnalyzer::definitions`]. With no query
+    /// scope open there is no memo and the behaviour is exactly the unmemoized
+    /// lookup, matching `definition_parent_unit` (#1230 item 6).
     fn sql_definitions_vec(&self, fq_name: &str) -> std::result::Result<Vec<CodeUnit>, StoreError> {
         self.sql_definitions_query_count
             .fetch_add(1, Ordering::Relaxed);
-        self.sql_definition_candidates_vec(fq_name, false)
+        let memo = self.active_query_cache_handle(|cache| &cache.definition_units);
+        if let Some(cached) = memo.as_ref().and_then(|memo| {
+            memo.read()
+                .expect("query definition-unit cache read lock poisoned")
+                .get(fq_name)
+                .cloned()
+        }) {
+            return Ok((*cached).clone());
+        }
+        let definitions = self.sql_definition_candidates_vec(fq_name, false)?;
+        // A failed read is never memoized: the `?` above leaves the entry
+        // missing so the next caller retries instead of inheriting an empty
+        // answer that reads as proven absence.
+        if let Some(memo) = memo.as_ref() {
+            memo.write()
+                .expect("query definition-unit cache write lock poisoned")
+                .insert(fq_name.to_string(), Arc::new(definitions.clone()));
+        }
+        Ok(definitions)
     }
 
     fn sql_bounded_definitions_vec(
@@ -6146,6 +6286,36 @@ where
             }
             rows
         };
+        let path_units = {
+            let _path_scope = crate::profiling::scope(format!(
+                "sql_definition_candidates.path_symbol[{fq_name}]"
+            ));
+            self.sql_path_symbol_units(fq_name, &normalized)?
+        };
+        Ok(self.assemble_definition_candidates(
+            fq_name,
+            &normalized,
+            rows,
+            path_units,
+            include_definition_lookup_units,
+        ))
+    }
+
+    /// The store-independent half of [`Self::sql_definition_candidates_vec`]:
+    /// merge persisted candidate rows, dirty units and path-symbol units for
+    /// one fq name, then apply the exact/normalized precedence, definition
+    /// ordering and single-module rule.
+    ///
+    /// Split out so the batched prefetch can assemble many names from one
+    /// chunked row read without duplicating (or drifting from) this ordering.
+    fn assemble_definition_candidates(
+        &self,
+        fq_name: &str,
+        normalized: &str,
+        rows: Vec<DefinitionOrderCandidateRow>,
+        path_units: Vec<CodeUnit>,
+        include_definition_lookup_units: bool,
+    ) -> Vec<CodeUnit> {
         let mut candidates = {
             let _resolve_scope = crate::profiling::scope(format!(
                 "sql_definition_candidates.resolve_rows[{fq_name}]"
@@ -6168,19 +6338,10 @@ where
                 }),
             );
         }
-        {
-            let _path_scope = crate::profiling::scope(format!(
-                "sql_definition_candidates.path_symbol[{fq_name}]"
-            ));
-            candidates.extend(
-                self.sql_path_symbol_units(fq_name, &normalized)?
-                    .into_iter()
-                    .map(|unit| DefinitionSortCandidate {
-                        unit,
-                        range_start: DefinitionRangeStart::FileState,
-                    }),
-            );
-        }
+        candidates.extend(path_units.into_iter().map(|unit| DefinitionSortCandidate {
+            unit,
+            range_start: DefinitionRangeStart::FileState,
+        }));
         let has_exact = candidates
             .iter()
             .any(|candidate| candidate.unit.fq_name() == fq_name);
@@ -6209,10 +6370,127 @@ where
                 true
             }
         });
-        Ok(matches
+        matches
             .into_iter()
             .map(|candidate| candidate.unit)
-            .collect())
+            .collect()
+    }
+
+    /// Resolve many fq names into the request-scoped `definitions` memo using
+    /// chunked `IN`-list seeks instead of one point lookup per name (#1748).
+    ///
+    /// The shared import-graph candidate walk enumerates every import target
+    /// in the workspace before it inspects any file, so the keys are known up
+    /// front. Asking per name cost one pooled reader checkout, one
+    /// transaction and one generation check each -- on a 35k-file Rust
+    /// workspace that was 397k-662k round trips inside a single
+    /// `scan_usages` query. Here it is two batched reads: one chunked
+    /// short-name seek for the persisted rows and one shared-transaction pass
+    /// for the path-symbol rows.
+    ///
+    /// A no-op without an open query scope: with no memo to fill there is
+    /// nothing to prefetch into, and every caller falls back to the point
+    /// lookup with unchanged results. Prefetch failures are equally
+    /// non-binding -- the name is simply left unmemoized.
+    pub(crate) fn prefetch_definitions(&self, fq_names: &[String]) {
+        let Some(memo) = self.active_query_cache_handle(|cache| &cache.definition_units) else {
+            return;
+        };
+        let _scope = crate::profiling::scope("TreeSitterAnalyzer::prefetch_definitions");
+        let missing: Vec<String> = {
+            let seen = memo
+                .read()
+                .expect("query definition-unit cache read lock poisoned");
+            let mut unique: BTreeSet<&str> = BTreeSet::new();
+            fq_names
+                .iter()
+                .filter(|fq_name| !seen.contains_key(fq_name.as_str()))
+                .filter(|fq_name| unique.insert(fq_name.as_str()))
+                .cloned()
+                .collect()
+        };
+        if missing.is_empty() {
+            return;
+        }
+
+        let short_names_by_name: Vec<Vec<String>> = missing
+            .iter()
+            .map(|fq_name| self.definition_candidate_short_names(fq_name))
+            .collect();
+        let mut unique_short_names: Vec<String> = short_names_by_name
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        unique_short_names.sort();
+
+        self.definition_prefetch_batch_count
+            .fetch_add(1, Ordering::Relaxed);
+        let rows = match self
+            .store_context
+            .store
+            .declaration_order_candidate_rows_by_short_names_for_langs(
+                &self.storage_language_keys_for_queries(),
+                self.store_context.generations.as_ref(),
+                &unique_short_names,
+            ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.record_store_error(
+                    error.context("prefetching definition candidates by short name"),
+                );
+                return;
+            }
+        };
+        let mut rows_by_short_name: HashMap<String, Vec<DefinitionOrderCandidateRow>> =
+            HashMap::default();
+        for row in rows {
+            rows_by_short_name
+                .entry(row.candidate.short_name.clone())
+                .or_default()
+                .push(row);
+        }
+
+        let path_units_by_name = self.forward_path_module_fqns_batch(&missing);
+        let mut resolved = Vec::with_capacity(missing.len());
+        for ((fq_name, short_names), path_units) in missing
+            .iter()
+            .zip(short_names_by_name)
+            .zip(path_units_by_name)
+        {
+            // `None` means this name's path-symbol read failed on its own.
+            // Leaving it unmemoized sends the next caller down the point
+            // lookup, which is the honest answer rather than a short one.
+            let Some(path_units) = path_units else {
+                continue;
+            };
+            let mut name_rows = Vec::new();
+            for short_name in &short_names {
+                if let Some(matching) = rows_by_short_name.get(short_name) {
+                    name_rows.extend(matching.iter().cloned());
+                }
+            }
+            let normalized = self.adapter.normalize_full_name(fq_name);
+            resolved.push((
+                fq_name.clone(),
+                Arc::new(self.assemble_definition_candidates(
+                    fq_name,
+                    &normalized,
+                    name_rows,
+                    path_units,
+                    false,
+                )),
+            ));
+        }
+
+        let mut sink = memo
+            .write()
+            .expect("query definition-unit cache write lock poisoned");
+        for (fq_name, units) in resolved {
+            sink.entry(fq_name).or_insert(units);
+        }
     }
 
     fn sql_lookup_candidates_by_short_name(&self, symbol: &str) -> Option<BTreeSet<CodeUnit>> {
@@ -9846,6 +10124,178 @@ mod tests {
                 .iter()
                 .any(|unit| unit.fq_name() == "pkg.dirty.Dirty"),
             "a sufficient bounded lookup must retain dirty declarations"
+        );
+    }
+
+    /// A Python workspace whose files each declare one distinctly named class,
+    /// so every lookup below names a different identifier and cannot be
+    /// answered from a name-keyed memo.
+    fn workspace_scan_probe_project(file_count: usize) -> (tempfile::TempDir, Arc<dyn Project>) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("pkg")).expect("create pkg");
+        std::fs::write(root.join("pkg/__init__.py"), "").expect("write package marker");
+        for index in 0..file_count {
+            std::fs::write(
+                root.join(format!("pkg/mod_{index}.py")),
+                format!("class Widget{index}:\n    pass\n"),
+            )
+            .expect("write module");
+        }
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
+        (temp, project)
+    }
+
+    /// #1774: every caller of the non-persisted workspace declaration scan used
+    /// to re-walk the whole live-path set, and the callers are per-name. One
+    /// request that resolves several names therefore walked the workspace once
+    /// per name. Fails at 3 (one per lookup) before the walk is memoized.
+    #[test]
+    fn issue_1774_one_request_walks_the_live_path_set_once_for_many_lookups() {
+        let (_temp, project) = workspace_scan_probe_project(3);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+
+        let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&scope);
+        analyzer.reset_workspace_path_scan_count_for_test();
+        for index in 0..3 {
+            let _ =
+                IAnalyzer::lookup_candidates_by_identifier(&analyzer, &format!("Widget{index}"));
+        }
+        let scans_in_one_request = analyzer.workspace_path_scan_count_for_test();
+        analyzer.end_query(&scope);
+
+        assert_eq!(
+            1, scans_in_one_request,
+            "a request must materialize the workspace live-path set at most once"
+        );
+    }
+
+    /// The memo is request scoped, not analyzer scoped: a second request must
+    /// see the workspace again rather than inherit the first request's walk.
+    #[test]
+    fn issue_1774_a_later_request_walks_the_live_path_set_again() {
+        let (_temp, project) = workspace_scan_probe_project(2);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+
+        analyzer.reset_workspace_path_scan_count_for_test();
+        for _ in 0..2 {
+            let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+            analyzer.begin_query(&scope);
+            let _ = IAnalyzer::lookup_candidates_by_identifier(&analyzer, "Widget0");
+            analyzer.end_query(&scope);
+        }
+
+        assert_eq!(
+            2,
+            analyzer.workspace_path_scan_count_for_test(),
+            "each request must re-read the workspace it was opened against"
+        );
+    }
+
+    /// The `keep` predicate stays outside the memo, so the narrowed answer is
+    /// the same whether the walk was just taken or served from the memo.
+    #[test]
+    fn issue_1774_memoized_walk_answers_each_name_with_its_own_narrowed_result() {
+        let (_temp, project) = workspace_scan_probe_project(3);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+
+        let unscoped: Vec<BTreeSet<CodeUnit>> = (0..3)
+            .map(|index| {
+                IAnalyzer::lookup_candidates_by_identifier(&analyzer, &format!("Widget{index}"))
+            })
+            .collect();
+
+        let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&scope);
+        let scoped: Vec<BTreeSet<CodeUnit>> = (0..3)
+            .map(|index| {
+                IAnalyzer::lookup_candidates_by_identifier(&analyzer, &format!("Widget{index}"))
+            })
+            .collect();
+        analyzer.end_query(&scope);
+
+        assert_eq!(unscoped, scoped);
+        for (index, matches) in scoped.iter().enumerate() {
+            assert!(
+                matches
+                    .iter()
+                    .any(|unit| unit.identifier() == format!("Widget{index}")),
+                "lookup {index} must still find its own declaration: {matches:?}"
+            );
+        }
+    }
+
+    /// #1748: `definitions` is asked the same name many times inside one
+    /// candidate-discovery pass. Fails at 2 before the request-scoped memo.
+    #[test]
+    fn issue_1748_repeated_definition_lookups_in_one_request_charge_one_store_read() {
+        let (_temp, project) = workspace_scan_probe_project(1);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+
+        let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&scope);
+        analyzer.reset_definition_candidates_query_count_for_test();
+        let first: Vec<CodeUnit> = IAnalyzer::definitions(&analyzer, "pkg.mod_0.Widget0").collect();
+        let second: Vec<CodeUnit> =
+            IAnalyzer::definitions(&analyzer, "pkg.mod_0.Widget0").collect();
+        let queries = analyzer.definition_candidates_query_count_for_test();
+        analyzer.end_query(&scope);
+
+        assert_eq!(first, second, "the memo must not change what is resolved");
+        assert_eq!(
+            1, queries,
+            "a request must resolve one definition name with one store read"
+        );
+    }
+
+    /// With no request open there is no memo, so the behaviour is exactly the
+    /// unmemoized lookup. This is what keeps direct-analyzer callers honest.
+    #[test]
+    fn issue_1748_definition_lookups_outside_a_request_are_not_memoized() {
+        let (_temp, project) = workspace_scan_probe_project(1);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+
+        analyzer.reset_definition_candidates_query_count_for_test();
+        let _ = IAnalyzer::definitions(&analyzer, "pkg.mod_0.Widget0").count();
+        let _ = IAnalyzer::definitions(&analyzer, "pkg.mod_0.Widget0").count();
+
+        assert_eq!(2, analyzer.definition_candidates_query_count_for_test());
+    }
+
+    /// The batched prefetch must fill the memo with the same answers the point
+    /// lookups produce, in one store read for the whole key set.
+    #[test]
+    fn issue_1748_prefetched_definitions_match_the_point_lookups_they_replace() {
+        let (_temp, project) = workspace_scan_probe_project(4);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let names: Vec<String> = (0..4)
+            .map(|index| format!("pkg.mod_{index}.Widget{index}"))
+            .collect();
+
+        let point: Vec<Vec<CodeUnit>> = names
+            .iter()
+            .map(|name| IAnalyzer::definitions(&analyzer, name).collect())
+            .collect();
+
+        let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&scope);
+        analyzer.reset_definition_candidates_query_count_for_test();
+        analyzer.reset_definition_prefetch_batch_count_for_test();
+        analyzer.prefetch_definitions(&names);
+        let batches = analyzer.definition_prefetch_batch_count_for_test();
+        let prefetched: Vec<Vec<CodeUnit>> = names
+            .iter()
+            .map(|name| IAnalyzer::definitions(&analyzer, name).collect())
+            .collect();
+        let point_lookups = analyzer.definition_candidates_query_count_for_test();
+        analyzer.end_query(&scope);
+
+        assert_eq!(point, prefetched, "batched rows must resolve identically");
+        assert_eq!(1, batches, "one batched read serves the whole key set");
+        assert_eq!(
+            0, point_lookups,
+            "a prefetched name must not fall back to a point lookup"
         );
     }
 

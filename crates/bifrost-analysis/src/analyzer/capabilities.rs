@@ -69,6 +69,30 @@ pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
     ) -> bool {
         false
     }
+
+    /// Resolve, in one batch, whatever [`Self::could_import_file`] would look
+    /// up once per candidate.
+    ///
+    /// The shared import-graph candidate walk visits every workspace file, so
+    /// a provider that answers each visit with its own store lookup pays that
+    /// lookup once per import statement in the workspace -- 397k to 662k
+    /// `definition_candidates` round trips inside a single `scan_usages`
+    /// query on a 35k-file Rust workspace (#1748). The walk knows its whole
+    /// candidate set before it inspects any of it, so this hook lets the
+    /// provider enumerate its keys up front and collapse them into batched
+    /// reads.
+    ///
+    /// Doing nothing is always correct: the per-candidate path still answers
+    /// exactly as before, just without the shared warm result. Providers whose
+    /// per-candidate answer is already file-local (Python, JS/TS, Go, C++)
+    /// keep the default.
+    fn prefetch_import_targets(
+        &self,
+        _files: &[ProjectFile],
+        _import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
+        _cancellation: &crate::cancellation::CancellationToken,
+    ) {
+    }
 }
 
 /// Resolve direct project-file edges from structured import facts. Prefer a

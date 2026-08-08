@@ -327,6 +327,16 @@ impl RustAnalyzer {
         self.inner.definition_candidates_query_count_for_test()
     }
 
+    #[doc(hidden)]
+    pub fn reset_definition_prefetch_batch_count_for_test(&self) {
+        self.inner.reset_definition_prefetch_batch_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn definition_prefetch_batch_count_for_test(&self) -> usize {
+        self.inner.definition_prefetch_batch_count_for_test()
+    }
+
     fn indexed_sources_unchanged(&self, changed_files: &BTreeSet<ProjectFile>) -> bool {
         changed_files
             .iter()
