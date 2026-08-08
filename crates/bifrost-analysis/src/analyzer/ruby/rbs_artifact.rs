@@ -25,6 +25,26 @@ pub(crate) struct RubyMemberAlias {
     pub is_static: bool,
 }
 
+/// A tree-sitter RBS arrangement that this projection does not model.
+///
+/// Gem archives are untrusted input. The `has_error` guard below rejects a
+/// tree that failed to parse, but it cannot reject a tree that parsed cleanly
+/// into an arrangement the projection did not anticipate: a newer RBS
+/// construct, a grammar version change, or a crafted `.rbs`. Every grammar
+/// shape lookup therefore returns this value instead of panicking.
+///
+/// `project_rbs` converts a miss in exactly two places: the declaration walk
+/// skips one declaration, and the member walk inside `project_type` skips one
+/// member. Both route through `report_unmodeled_shape`, which records one
+/// `ruby.rbs.unmodeled_shape` warning and sets `partial`. The warning demotes
+/// the produced pack to `Completeness::Partial`, so surface this projection
+/// skipped can never be mistaken for surface it proved absent (#1624).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnmodeledShape {
+    node_kind: &'static str,
+    expected: String,
+}
+
 pub(crate) fn project_rbs(
     archive_sha256: &str,
     entry_path: &str,
@@ -34,12 +54,19 @@ pub(crate) fn project_rbs(
 ) -> RbsProjection {
     let mut diagnostics = BoundedProducerDiagnostics::new(limits);
     let mut parser = Parser::new();
+    // The language is compiled in, so a load failure is a build defect rather
+    // than anything the gem archive can reach.
     parser
         .set_language(&tree_sitter_rbs::LANGUAGE.into())
         .expect("tree-sitter RBS language must load");
-    let tree = parser
-        .parse(source, None)
-        .expect("tree-sitter RBS parser must return a tree");
+    let Some(tree) = parser.parse(source, None) else {
+        diagnostics.error(
+            "ruby.rbs.parse",
+            Some(logical_path(archive_sha256, entry_path)),
+            "tree-sitter returned no RBS tree for this declaration",
+        );
+        return abandoned(diagnostics);
+    };
     let root = tree.root_node();
     if root.has_error() {
         diagnostics.error(
@@ -47,26 +74,29 @@ pub(crate) fn project_rbs(
             Some(logical_path(archive_sha256, entry_path)),
             "could not parse RBS declaration",
         );
-        let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-        return RbsProjection {
-            types: Vec::new(),
-            members: Vec::new(),
-            diagnostics,
-            suppressed_diagnostics,
-            complete: false,
-            aliases: Vec::new(),
-        };
+        return abandoned(diagnostics);
     }
 
     let mut types = Vec::<TypeFact>::new();
     let mut members = Vec::new();
     let mut partial = false;
     let mut aliases = Vec::new();
-    let mut declarations = named_children(root)
-        .into_iter()
-        .rev()
-        .map(|node| (declaration_body(node), String::new()))
-        .collect::<Vec<_>>();
+    let mut declarations = Vec::new();
+    for node in named_children(root).into_iter().rev() {
+        match declaration_body(node) {
+            Ok(declaration) => declarations.push((declaration, String::new())),
+            Err(miss) => {
+                report_unmodeled_shape(
+                    &mut diagnostics,
+                    archive_sha256,
+                    entry_path,
+                    "declaration",
+                    miss,
+                );
+                partial = true;
+            }
+        }
+    }
     while let Some((declaration, parent_namespace)) = declarations.pop() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             diagnostics.error(
@@ -89,18 +119,24 @@ pub(crate) fn project_rbs(
             partial = true;
             break;
         }
+        if is_trivia(declaration.kind()) {
+            continue;
+        }
         if declaration.kind() == "const_decl" {
-            let constant_name = declaration
-                .named_child(0)
-                .expect("RBS constant declaration must have a name");
-            let top_level =
-                direct_child(constant_name, "namespace").is_none() && parent_namespace.is_empty();
-            let object_id = type_declaration_id(TypeIdentity {
-                ecosystem: "rubygems",
-                name: "Object",
-            });
-            let required =
-                1 + usize::from(top_level && !types.iter().any(|fact| fact.id == object_id));
+            let required = match constant_record_cost(declaration, &parent_namespace, &types) {
+                Ok(required) => required,
+                Err(miss) => {
+                    report_unmodeled_shape(
+                        &mut diagnostics,
+                        archive_sha256,
+                        entry_path,
+                        "declaration",
+                        miss,
+                    );
+                    partial = true;
+                    continue;
+                }
+            };
             if types
                 .len()
                 .saturating_add(members.len())
@@ -119,8 +155,8 @@ pub(crate) fn project_rbs(
                 break;
             }
         }
-        let projected_namespace = match declaration.kind() {
-            "class_decl" => Some(project_class(
+        let projected = match declaration.kind() {
+            "class_decl" => project_class(
                 declaration,
                 &parent_namespace,
                 archive_sha256,
@@ -133,8 +169,9 @@ pub(crate) fn project_rbs(
                 &mut partial,
                 &mut aliases,
                 cancellation,
-            )),
-            "module_decl" => Some(project_module(
+            )
+            .map(Some),
+            "module_decl" => project_module(
                 declaration,
                 &parent_namespace,
                 archive_sha256,
@@ -147,8 +184,9 @@ pub(crate) fn project_rbs(
                 &mut partial,
                 &mut aliases,
                 cancellation,
-            )),
-            "interface_decl" => Some(project_interface(
+            )
+            .map(Some),
+            "interface_decl" => project_interface(
                 declaration,
                 &parent_namespace,
                 archive_sha256,
@@ -161,20 +199,19 @@ pub(crate) fn project_rbs(
                 &mut partial,
                 &mut aliases,
                 cancellation,
-            )),
-            "const_decl" => {
-                project_constant(
-                    declaration,
-                    &parent_namespace,
-                    archive_sha256,
-                    entry_path,
-                    source,
-                    limits,
-                    &mut types,
-                    &mut members,
-                );
-                None
-            }
+            )
+            .map(Some),
+            "const_decl" => project_constant(
+                declaration,
+                &parent_namespace,
+                archive_sha256,
+                entry_path,
+                source,
+                limits,
+                &mut types,
+                &mut members,
+            )
+            .map(|()| None),
             unsupported => {
                 diagnostics.warning(
                     "ruby.rbs.unsupported_declaration",
@@ -185,16 +222,42 @@ pub(crate) fn project_rbs(
                     ),
                 );
                 partial = true;
-                None
+                Ok(None)
+            }
+        };
+        let projected_namespace = match projected {
+            Ok(namespace) => namespace,
+            Err(miss) => {
+                report_unmodeled_shape(
+                    &mut diagnostics,
+                    archive_sha256,
+                    entry_path,
+                    "declaration",
+                    miss,
+                );
+                partial = true;
+                continue;
             }
         };
         if let Some(namespace) = projected_namespace
             && let Some(body) = declaration.child_by_field_name("body")
         {
             for nested in named_children(body).into_iter().rev() {
-                let nested = declaration_body(nested);
-                if is_declaration(nested.kind()) {
-                    declarations.push((nested, namespace.clone()));
+                match declaration_body(nested) {
+                    Ok(nested) if is_declaration(nested.kind()) => {
+                        declarations.push((nested, namespace.clone()));
+                    }
+                    Ok(_) => {}
+                    Err(miss) => {
+                        report_unmodeled_shape(
+                            &mut diagnostics,
+                            archive_sha256,
+                            entry_path,
+                            "declaration",
+                            miss,
+                        );
+                        partial = true;
+                    }
                 }
             }
         }
@@ -221,6 +284,35 @@ pub(crate) fn project_rbs(
     }
 }
 
+fn abandoned(diagnostics: BoundedProducerDiagnostics) -> RbsProjection {
+    let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+    RbsProjection {
+        types: Vec::new(),
+        members: Vec::new(),
+        diagnostics,
+        suppressed_diagnostics,
+        complete: false,
+        aliases: Vec::new(),
+    }
+}
+
+fn report_unmodeled_shape(
+    diagnostics: &mut BoundedProducerDiagnostics,
+    archive_sha256: &str,
+    entry_path: &str,
+    skipped: &str,
+    miss: UnmodeledShape,
+) {
+    diagnostics.warning(
+        "ruby.rbs.unmodeled_shape",
+        Some(logical_path(archive_sha256, entry_path)),
+        format!(
+            "RBS {} node is missing {}, so this {skipped} is not projected",
+            miss.node_kind, miss.expected
+        ),
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn project_interface(
     interface: Node<'_>,
@@ -235,8 +327,8 @@ fn project_interface(
     partial: &mut bool,
     aliases: &mut Vec<RubyMemberAlias>,
     cancellation: Option<&CancellationToken>,
-) -> String {
-    let name = declaration_name(interface, parent_namespace, source);
+) -> Result<String, UnmodeledShape> {
+    let name = declaration_name(interface, parent_namespace, source)?;
     project_type(
         name.clone(),
         TypeKind::Interface,
@@ -254,7 +346,24 @@ fn project_interface(
         aliases,
         cancellation,
     );
-    name
+    Ok(name)
+}
+
+/// Records a top-level constant needs before it can be projected: the constant
+/// itself, plus the synthetic `Object` owner when this is the first one.
+fn constant_record_cost(
+    constant: Node<'_>,
+    parent_namespace: &str,
+    types: &[TypeFact],
+) -> Result<usize, UnmodeledShape> {
+    let constant_name = required_child(constant, "const_name")?;
+    let top_level =
+        direct_child(constant_name, "namespace").is_none() && parent_namespace.is_empty();
+    let object_id = type_declaration_id(TypeIdentity {
+        ecosystem: "rubygems",
+        name: "Object",
+    });
+    Ok(1 + usize::from(top_level && !types.iter().any(|fact| fact.id == object_id)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -267,13 +376,9 @@ fn project_constant(
     limits: &ArtifactProducerLimits,
     types: &mut Vec<TypeFact>,
     members: &mut Vec<MemberFact>,
-) {
-    let constant_name = constant
-        .named_child(0)
-        .expect("RBS constant declaration must have a name");
-    let name = direct_child(constant_name, "constant")
-        .map(|node| node_text(node, source).to_owned())
-        .expect("RBS constant name must contain a constant");
+) -> Result<(), UnmodeledShape> {
+    let constant_name = required_child(constant, "const_name")?;
+    let name = node_text(required_child(constant_name, "constant")?, source).to_owned();
     let owner_name = if let Some(namespace) = direct_child(constant_name, "namespace") {
         normalize_name(node_text(namespace, source))
             .trim_end_matches("::")
@@ -287,6 +392,10 @@ fn project_constant(
         ecosystem: "rubygems",
         name: &owner_name,
     });
+    let return_type = match direct_child(constant, "type") {
+        Some(node) => type_ref(node, source, &[], 0, limits.max_signature_depth)?,
+        None => simple_type("untyped"),
+    };
     if owner_name == "Object" && !types.iter().any(|fact| fact.id == owner_id) {
         types.push(TypeFact {
             id: owner_id.clone(),
@@ -309,9 +418,6 @@ fn project_constant(
             },
         });
     }
-    let return_type = direct_child(constant, "type")
-        .map(|node| type_ref(node, source, &[], 0, limits.max_signature_depth))
-        .unwrap_or_else(|| simple_type("untyped"));
     let signature = Signature {
         type_parameters: Vec::new(),
         parameters: Vec::new(),
@@ -346,6 +452,7 @@ fn project_constant(
             symbol: name,
         },
     });
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -362,13 +469,11 @@ fn project_class(
     partial: &mut bool,
     aliases: &mut Vec<RubyMemberAlias>,
     cancellation: Option<&CancellationToken>,
-) -> String {
-    let name = declaration_name(class, parent_namespace, source);
+) -> Result<String, UnmodeledShape> {
+    let name = declaration_name(class, parent_namespace, source)?;
     let mut hierarchy = Vec::new();
     if let Some(super_class) = class.child_by_field_name("superclass") {
-        let super_name = super_class
-            .child_by_field_name("name")
-            .expect("RBS superclass must have a name");
+        let super_name = required_field(super_class, "name")?;
         hierarchy.push(HierarchyFact {
             hierarchy_kind: HierarchyKind::Extends,
             target: named_type(
@@ -377,12 +482,12 @@ fn project_class(
                 source,
                 &type_parameters(class.child_by_field_name("type_parameters"), source),
                 limits.max_signature_depth,
-            ),
+            )?,
             declaration_ordinal: None,
         });
     }
     project_type(
-        name,
+        name.clone(),
         TypeKind::Class,
         class.child_by_field_name("type_parameters"),
         class.child_by_field_name("body"),
@@ -398,7 +503,7 @@ fn project_class(
         aliases,
         cancellation,
     );
-    declaration_name(class, parent_namespace, source)
+    Ok(name)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -415,8 +520,8 @@ fn project_module(
     partial: &mut bool,
     aliases: &mut Vec<RubyMemberAlias>,
     cancellation: Option<&CancellationToken>,
-) -> String {
-    let name = declaration_name(module, parent_namespace, source);
+) -> Result<String, UnmodeledShape> {
+    let name = declaration_name(module, parent_namespace, source)?;
     let parameters = type_parameters(module.child_by_field_name("type_parameters"), source);
     let mut hierarchy = Vec::new();
     if let Some(self_types) = module.child_by_field_name("self_type_binds") {
@@ -432,7 +537,7 @@ fn project_module(
                     source,
                     &parameters,
                     limits.max_signature_depth,
-                ),
+                )?,
                 declaration_ordinal: None,
             });
         }
@@ -454,7 +559,7 @@ fn project_module(
         aliases,
         cancellation,
     );
-    name
+    Ok(name)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -510,37 +615,53 @@ fn project_type(
             *partial = true;
             break;
         }
-        let member = member_body(member);
-        match member.kind() {
-            "visibility_member" => {
-                visibility = visibility_from_node(member, source).unwrap_or(visibility);
+        let member = match declaration_body(member) {
+            Ok(member) => member,
+            Err(miss) => {
+                report_unmodeled_shape(diagnostics, archive_sha256, entry_path, "member", miss);
+                *partial = true;
+                continue;
             }
+        };
+        if is_trivia(member.kind()) {
+            continue;
+        }
+        let projected = match member.kind() {
+            // An unmodeled visibility token leaves the running visibility on
+            // its previous value. The warning the caller records demotes the
+            // pack, so the members that follow cannot be read as proven.
+            "visibility_member" => visibility_from_node(member, source).map(|modeled| {
+                visibility = modeled.unwrap_or(visibility);
+            }),
             "include_member" => {
-                let target = hierarchy_target(member, source, &type_parameters, limits);
-                hierarchy.push(HierarchyFact {
-                    hierarchy_kind: HierarchyKind::MixinInclude,
-                    target,
-                    declaration_ordinal: Some(ordinal),
-                });
-                ordinal = ordinal.saturating_add(1);
+                hierarchy_target(member, source, &type_parameters, limits).map(|target| {
+                    push_mixin(
+                        &mut hierarchy,
+                        &mut ordinal,
+                        HierarchyKind::MixinInclude,
+                        target,
+                    );
+                })
             }
             "prepend_member" => {
-                let target = hierarchy_target(member, source, &type_parameters, limits);
-                hierarchy.push(HierarchyFact {
-                    hierarchy_kind: HierarchyKind::MixinPrepend,
-                    target,
-                    declaration_ordinal: Some(ordinal),
-                });
-                ordinal = ordinal.saturating_add(1);
+                hierarchy_target(member, source, &type_parameters, limits).map(|target| {
+                    push_mixin(
+                        &mut hierarchy,
+                        &mut ordinal,
+                        HierarchyKind::MixinPrepend,
+                        target,
+                    );
+                })
             }
             "extend_member" => {
-                let target = hierarchy_target(member, source, &type_parameters, limits);
-                hierarchy.push(HierarchyFact {
-                    hierarchy_kind: HierarchyKind::MixinExtend,
-                    target,
-                    declaration_ordinal: Some(ordinal),
-                });
-                ordinal = ordinal.saturating_add(1);
+                hierarchy_target(member, source, &type_parameters, limits).map(|target| {
+                    push_mixin(
+                        &mut hierarchy,
+                        &mut ordinal,
+                        HierarchyKind::MixinExtend,
+                        target,
+                    );
+                })
             }
             "method_member" => project_method(
                 member,
@@ -557,25 +678,19 @@ fn project_type(
                 cancellation,
                 &type_parameters,
             ),
-            "alias_member" => aliases.push(project_alias(member, &owner_id, source)),
-            "attribute_member" => projected_members.push(property(
+            "alias_member" => {
+                project_alias(member, &owner_id, source).map(|alias| aliases.push(alias))
+            }
+            "attribute_member" => project_attribute(
+                member,
                 &owner_id,
-                member_name(member, source),
-                direct_child(member, "self").is_some(),
-                visibility_from_node(member, source).unwrap_or(visibility),
-                direct_child(member, "type")
-                    .map(|node| {
-                        type_ref(
-                            node,
-                            source,
-                            &type_parameters,
-                            0,
-                            limits.max_signature_depth,
-                        )
-                    })
-                    .unwrap_or_else(|| simple_type("untyped")),
+                visibility,
                 &locator,
-            )),
+                source,
+                &type_parameters,
+                limits,
+            )
+            .map(|property| projected_members.push(property)),
             "ivar_member" => {
                 diagnostics.warning(
                     "ruby.rbs.unsupported_member",
@@ -583,8 +698,9 @@ fn project_type(
                     "RBS variable member is not yet projected",
                 );
                 *partial = true;
+                Ok(())
             }
-            unsupported if is_declaration(unsupported) => {}
+            unsupported if is_declaration(unsupported) => Ok(()),
             unsupported => {
                 diagnostics.warning(
                     "ruby.rbs.unsupported_member",
@@ -592,7 +708,12 @@ fn project_type(
                     format!("RBS {unsupported} member is not yet projected"),
                 );
                 *partial = true;
+                Ok(())
             }
+        };
+        if let Err(miss) = projected {
+            report_unmodeled_shape(diagnostics, archive_sha256, entry_path, "member", miss);
+            *partial = true;
         }
     }
     types.push(TypeFact {
@@ -615,19 +736,83 @@ fn project_type(
     members.append(&mut projected_members);
 }
 
-fn project_alias(alias: Node<'_>, owner_id: &str, source: &str) -> RubyMemberAlias {
-    let new_name = alias
-        .child_by_field_name("name")
-        .expect("RBS alias must have a new name");
-    let old_name = alias
-        .child_by_field_name("origin_name")
-        .expect("RBS alias must have an origin name");
-    RubyMemberAlias {
+fn push_mixin(
+    hierarchy: &mut Vec<HierarchyFact>,
+    ordinal: &mut u32,
+    hierarchy_kind: HierarchyKind,
+    target: TypeRef,
+) {
+    hierarchy.push(HierarchyFact {
+        hierarchy_kind,
+        target,
+        declaration_ordinal: Some(*ordinal),
+    });
+    *ordinal = ordinal.saturating_add(1);
+}
+
+fn project_alias(
+    alias: Node<'_>,
+    owner_id: &str,
+    source: &str,
+) -> Result<RubyMemberAlias, UnmodeledShape> {
+    let new_name = required_field(alias, "name")?;
+    let old_name = required_field(alias, "origin_name")?;
+    Ok(RubyMemberAlias {
         owner: owner_id.to_owned(),
-        old_name: member_name(old_name, source).to_owned(),
-        new_name: member_name(new_name, source).to_owned(),
+        old_name: member_name(old_name, source)?.to_owned(),
+        new_name: member_name(new_name, source)?.to_owned(),
         is_static: direct_child(new_name, "self").is_some(),
-    }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_attribute(
+    attribute: Node<'_>,
+    owner_id: &str,
+    inherited_visibility: Visibility,
+    locator: &Locator,
+    source: &str,
+    type_parameters: &[String],
+    limits: &ArtifactProducerLimits,
+) -> Result<MemberFact, UnmodeledShape> {
+    let name = member_name(attribute, source)?;
+    let is_static = direct_child(attribute, "self").is_some();
+    let visibility = visibility_from_node(attribute, source)?.unwrap_or(inherited_visibility);
+    let property_type = match direct_child(attribute, "type") {
+        Some(node) => type_ref(node, source, type_parameters, 0, limits.max_signature_depth)?,
+        None => simple_type("untyped"),
+    };
+    let signature = Signature {
+        type_parameters: Vec::new(),
+        parameters: Vec::new(),
+        returns: Some(property_type),
+    };
+    Ok(MemberFact {
+        id: member_declaration_id(MemberIdentity {
+            owner_id,
+            kind: MemberKind::Property,
+            is_static,
+            parameter_arity: 0,
+            name,
+            generic_arity: 0,
+            parameter_types: &[],
+            parameter_variadics: &[],
+            return_type: signature.returns.as_ref(),
+        }),
+        owner: owner_id.to_owned(),
+        name: name.to_owned(),
+        member_kind: MemberKind::Property,
+        visibility,
+        is_static,
+        is_abstract: false,
+        is_virtual: true,
+        signature: Some(signature),
+        receiver: None,
+        extension_receiver: None,
+        extension_receiver_constraints: Vec::new(),
+        aliases: Vec::new(),
+        locator: locator.clone(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -645,10 +830,10 @@ fn project_method(
     max_members: usize,
     cancellation: Option<&CancellationToken>,
     owner_type_parameters: &[String],
-) {
-    let name = member_name(method, source).to_owned();
+) -> Result<(), UnmodeledShape> {
+    let name = member_name(method, source)?.to_owned();
     let is_static = direct_child(method, "self").is_some();
-    let visibility = visibility_from_node(method, source).unwrap_or(inherited_visibility);
+    let visibility = visibility_from_node(method, source)?.unwrap_or(inherited_visibility);
     let Some(overloads) = direct_child(method, "method_types") else {
         diagnostics.warning(
             "ruby.rbs.untyped_method",
@@ -656,7 +841,7 @@ fn project_method(
             format!("RBS method {owner_name}::{name} has no structured function type"),
         );
         *partial = true;
-        return;
+        return Ok(());
     };
     let overloads = direct_children(overloads, "method_type");
     if overloads.is_empty() {
@@ -667,6 +852,9 @@ fn project_method(
         );
         *partial = true;
     }
+    // Overloads land in `projected` first so that a shape miss in a later
+    // overload skips the whole method instead of publishing a truncated set.
+    let mut projected = Vec::new();
     for overload in overloads {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             diagnostics.error(
@@ -677,7 +865,7 @@ fn project_method(
             *partial = true;
             break;
         }
-        if members.len() >= max_members {
+        if members.len().saturating_add(projected.len()) >= max_members {
             diagnostics.error(
                 "limit.records",
                 Some(owner_name.to_owned()),
@@ -686,9 +874,7 @@ fn project_method(
             *partial = true;
             break;
         }
-        let function = overload
-            .child_by_field_name("body")
-            .expect("RBS method type must have a body");
+        let function = required_field(overload, "body")?;
         if direct_child(function, "block").is_some() {
             diagnostics.warning(
                 "ruby.rbs.unsupported_block_signature",
@@ -706,7 +892,7 @@ fn project_method(
             owner_type_parameters,
             source,
             limits,
-        );
+        )?;
         let parameter_types = signature
             .parameters
             .iter()
@@ -723,7 +909,7 @@ fn project_method(
             parameter_variadics: &[],
             return_type: signature.returns.as_ref(),
         });
-        members.push(MemberFact {
+        projected.push(MemberFact {
             id,
             owner: owner_id.to_owned(),
             name: name.clone(),
@@ -740,6 +926,8 @@ fn project_method(
             locator: locator.clone(),
         });
     }
+    members.append(&mut projected);
+    Ok(())
 }
 
 fn function_signature(
@@ -748,7 +936,7 @@ fn function_signature(
     owner_type_parameters: &[String],
     source: &str,
     limits: &ArtifactProducerLimits,
-) -> Signature {
+) -> Result<Signature, UnmodeledShape> {
     let mut parameters = Vec::new();
     let method_type_parameters = type_parameters(method_type_parameters, source);
     let mut scoped_type_parameters = owner_type_parameters.to_vec();
@@ -760,21 +948,23 @@ fn function_signature(
             &scoped_type_parameters,
             limits,
             &mut parameters,
-        );
+        )?;
     }
-    Signature {
+    let returns = match direct_child(function, "type") {
+        Some(node) => Some(type_ref(
+            node,
+            source,
+            &scoped_type_parameters,
+            0,
+            limits.max_signature_depth,
+        )?),
+        None => None,
+    };
+    Ok(Signature {
         type_parameters: method_type_parameters,
         parameters,
-        returns: direct_child(function, "type").map(|node| {
-            type_ref(
-                node,
-                source,
-                &scoped_type_parameters,
-                0,
-                limits.max_signature_depth,
-            )
-        }),
-    }
+        returns,
+    })
 }
 
 fn project_parameters(
@@ -783,31 +973,20 @@ fn project_parameters(
     type_parameters: &[String],
     limits: &ArtifactProducerLimits,
     parameters: &mut Vec<Parameter>,
-) {
+) -> Result<(), UnmodeledShape> {
     for group in named_children(parameter_list) {
         match group.kind() {
-            "required_positionals" | "trailing_positionals" => {
+            "required_positionals" | "trailing_positionals" | "optional_positionals" => {
+                let optional = group.kind() == "optional_positionals";
                 for parameter in direct_children(group, "parameter") {
                     parameters.push(function_parameter(
                         parameter,
                         source,
                         type_parameters,
-                        false,
-                        false,
-                        limits,
-                    ));
-                }
-            }
-            "optional_positionals" => {
-                for parameter in direct_children(group, "parameter") {
-                    parameters.push(function_parameter(
-                        parameter,
-                        source,
-                        type_parameters,
-                        true,
+                        optional,
                         false,
                         limits,
-                    ));
+                    )?);
                 }
             }
             "rest_positional" => {
@@ -819,10 +998,12 @@ fn project_parameters(
                         true,
                         true,
                         limits,
-                    ));
+                    )?);
                 }
             }
-            "keywords" => project_keywords(group, source, type_parameters, limits, parameters),
+            "keywords" => {
+                project_keywords(group, source, type_parameters, limits, parameters)?;
+            }
             "unnamed_parameter" => parameters.push(Parameter {
                 name: None,
                 r#type: simple_type("untyped"),
@@ -832,6 +1013,7 @@ fn project_parameters(
             _ => {}
         }
     }
+    Ok(())
 }
 
 fn project_keywords(
@@ -840,7 +1022,7 @@ fn project_keywords(
     type_parameters: &[String],
     limits: &ArtifactProducerLimits,
     parameters: &mut Vec<Parameter>,
-) {
+) -> Result<(), UnmodeledShape> {
     let mut stack = named_children(keywords)
         .into_iter()
         .rev()
@@ -851,11 +1033,12 @@ fn project_keywords(
                 let optional = keyword.kind() == "optional_keywords";
                 let name =
                     direct_child(keyword, "keyword").map(|node| node_text(node, source).to_owned());
-                let r#type = direct_child(keyword, "type")
-                    .map(|node| {
-                        type_ref(node, source, type_parameters, 0, limits.max_signature_depth)
-                    })
-                    .unwrap_or_else(|| simple_type("untyped"));
+                let r#type = match direct_child(keyword, "type") {
+                    Some(node) => {
+                        type_ref(node, source, type_parameters, 0, limits.max_signature_depth)?
+                    }
+                    None => simple_type("untyped"),
+                };
                 parameters.push(Parameter {
                     name,
                     r#type,
@@ -872,13 +1055,14 @@ fn project_keywords(
                         true,
                         true,
                         limits,
-                    ));
+                    )?);
                 }
             }
             _ => {}
         }
         stack.extend(named_children(keyword).into_iter().rev());
     }
+    Ok(())
 }
 
 fn function_parameter(
@@ -888,15 +1072,17 @@ fn function_parameter(
     optional: bool,
     variadic: bool,
     limits: &ArtifactProducerLimits,
-) -> Parameter {
-    Parameter {
+) -> Result<Parameter, UnmodeledShape> {
+    let r#type = match direct_child(parameter, "type") {
+        Some(node) => type_ref(node, source, type_parameters, 0, limits.max_signature_depth)?,
+        None => simple_type("untyped"),
+    };
+    Ok(Parameter {
         name: direct_child(parameter, "var_name").map(|node| node_text(node, source).to_owned()),
-        r#type: direct_child(parameter, "type")
-            .map(|node| type_ref(node, source, type_parameters, 0, limits.max_signature_depth))
-            .unwrap_or_else(|| simple_type("untyped")),
+        r#type,
         optional,
         variadic,
-    }
+    })
 }
 
 fn type_ref(
@@ -905,13 +1091,9 @@ fn type_ref(
     type_parameters: &[String],
     depth: usize,
     max_depth: usize,
-) -> TypeRef {
+) -> Result<TypeRef, UnmodeledShape> {
     if depth >= max_depth {
-        return TypeRef::Named {
-            name: "untyped".to_owned(),
-            arguments: Vec::new(),
-            nullable: false,
-        };
+        return Ok(simple_type("untyped"));
     }
     let node = unwrap_type(node);
     match node.kind() {
@@ -919,38 +1101,37 @@ fn type_ref(
             let name = named_type_name(node, source);
             let arguments = direct_child(node, "type_arguments");
             if arguments.is_none() && type_parameters.iter().any(|parameter| parameter == &name) {
-                TypeRef::TypeParameter { name }
+                Ok(TypeRef::TypeParameter { name })
             } else {
                 named_type_at_depth(name, arguments, source, type_parameters, depth, max_depth)
             }
         }
-        "optional_type" => nullable_type(type_ref(
-            direct_child(node, "type").expect("RBS optional type must wrap a type"),
+        "optional_type" => Ok(nullable_type(type_ref(
+            required_child(node, "type")?,
             source,
             type_parameters,
             depth.saturating_add(1),
             max_depth,
-        )),
-        "tuple_type" => TypeRef::Tuple {
-            elements: direct_children(node, "type")
-                .into_iter()
-                .map(|node| {
-                    type_ref(
-                        node,
-                        source,
-                        type_parameters,
-                        depth.saturating_add(1),
-                        max_depth,
-                    )
-                })
-                .collect(),
-        },
-        "builtin_type" => match node_text(node, source) {
+        )?)),
+        "tuple_type" => {
+            let mut elements = Vec::new();
+            for element in direct_children(node, "type") {
+                elements.push(type_ref(
+                    element,
+                    source,
+                    type_parameters,
+                    depth.saturating_add(1),
+                    max_depth,
+                )?);
+            }
+            Ok(TypeRef::Tuple { elements })
+        }
+        "builtin_type" => Ok(match node_text(node, source) {
             "bot" => simple_type("bottom"),
             "__todo__" => simple_type("untyped"),
             name => simple_type(name),
-        },
-        "union_type" => TypeRef::Named {
+        }),
+        "union_type" => Ok(TypeRef::Named {
             name: "union".to_owned(),
             arguments: compound_type_arguments(
                 node,
@@ -959,10 +1140,10 @@ fn type_ref(
                 type_parameters,
                 depth,
                 max_depth,
-            ),
+            )?,
             nullable: false,
-        },
-        "intersection_type" => TypeRef::Named {
+        }),
+        "intersection_type" => Ok(TypeRef::Named {
             name: "intersection".to_owned(),
             arguments: compound_type_arguments(
                 node,
@@ -971,14 +1152,14 @@ fn type_ref(
                 type_parameters,
                 depth,
                 max_depth,
-            ),
+            )?,
             nullable: false,
-        },
-        "record_type" => simple_type("record"),
-        "string_literal" | "symbol_literal" | "integer_literal" => simple_type("literal"),
-        "proc" => simple_type("proc"),
-        "singleton_type" => simple_type("class"),
-        _ => simple_type("untyped"),
+        }),
+        "record_type" => Ok(simple_type("record")),
+        "string_literal" | "symbol_literal" | "integer_literal" => Ok(simple_type("literal")),
+        "proc" => Ok(simple_type("proc")),
+        "singleton_type" => Ok(simple_type("class")),
+        _ => Ok(simple_type("untyped")),
     }
 }
 
@@ -988,7 +1169,7 @@ fn named_type(
     source: &str,
     type_parameters: &[String],
     max_depth: usize,
-) -> TypeRef {
+) -> Result<TypeRef, UnmodeledShape> {
     named_type_at_depth(name, arguments, source, type_parameters, 0, max_depth)
 }
 
@@ -999,25 +1180,25 @@ fn named_type_at_depth(
     type_parameters: &[String],
     depth: usize,
     max_depth: usize,
-) -> TypeRef {
-    TypeRef::Named {
-        name,
-        arguments: arguments
-            .map(|node| direct_children(node, "type"))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|argument| {
-                type_ref(
-                    argument,
-                    source,
-                    type_parameters,
-                    depth.saturating_add(1),
-                    max_depth,
-                )
-            })
-            .collect(),
-        nullable: false,
+) -> Result<TypeRef, UnmodeledShape> {
+    let mut projected = Vec::new();
+    for argument in arguments
+        .map(|node| direct_children(node, "type"))
+        .unwrap_or_default()
+    {
+        projected.push(type_ref(
+            argument,
+            source,
+            type_parameters,
+            depth.saturating_add(1),
+            max_depth,
+        )?);
     }
+    Ok(TypeRef::Named {
+        name,
+        arguments: projected,
+        nullable: false,
+    })
 }
 
 fn nullable_type(type_ref: TypeRef) -> TypeRef {
@@ -1057,18 +1238,14 @@ fn compound_type_arguments(
     type_parameters: &[String],
     depth: usize,
     max_depth: usize,
-) -> Vec<TypeRef> {
+) -> Result<Vec<TypeRef>, UnmodeledShape> {
     let mut arguments = Vec::new();
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
         let unwrapped = unwrap_type(node);
         if unwrapped.kind() == compound_kind {
-            let right = unwrapped
-                .child_by_field_name("right")
-                .expect("RBS compound type must have a right operand");
-            let left = unwrapped
-                .child_by_field_name("left")
-                .expect("RBS compound type must have a left operand");
+            let right = required_field(unwrapped, "right")?;
+            let left = required_field(unwrapped, "left")?;
             stack.push(right);
             stack.push(left);
         } else {
@@ -1078,10 +1255,10 @@ fn compound_type_arguments(
                 type_parameters,
                 depth.saturating_add(1),
                 max_depth,
-            ));
+            )?);
         }
     }
-    arguments
+    Ok(arguments)
 }
 
 fn type_name(name: Node<'_>, source: &str) -> String {
@@ -1092,57 +1269,13 @@ fn logical_path(archive_sha256: &str, entry_path: &str) -> String {
     format!("gem+sha256:{archive_sha256}!/{entry_path}")
 }
 
-fn property(
-    owner_id: &str,
-    name: &str,
-    is_static: bool,
-    visibility: Visibility,
-    property_type: TypeRef,
-    locator: &Locator,
-) -> MemberFact {
-    let signature = Signature {
-        type_parameters: Vec::new(),
-        parameters: Vec::new(),
-        returns: Some(property_type),
-    };
-    let id = member_declaration_id(MemberIdentity {
-        owner_id,
-        kind: MemberKind::Property,
-        is_static,
-        parameter_arity: 0,
-        name,
-        generic_arity: 0,
-        parameter_types: &[],
-        parameter_variadics: &[],
-        return_type: signature.returns.as_ref(),
-    });
-    MemberFact {
-        id,
-        owner: owner_id.to_owned(),
-        name: name.to_owned(),
-        member_kind: MemberKind::Property,
-        visibility,
-        is_static,
-        is_abstract: false,
-        is_virtual: true,
-        signature: Some(signature),
-        receiver: None,
-        extension_receiver: None,
-        extension_receiver_constraints: Vec::new(),
-        aliases: Vec::new(),
-        locator: locator.clone(),
-    }
-}
-
 fn hierarchy_target(
     member: Node<'_>,
     source: &str,
     type_parameters: &[String],
     limits: &ArtifactProducerLimits,
-) -> TypeRef {
-    let name = member
-        .child_by_field_name("name")
-        .expect("RBS hierarchy member must have a name");
+) -> Result<TypeRef, UnmodeledShape> {
+    let name = required_field(member, "name")?;
     named_type(
         type_name(name, source),
         direct_child(member, "type_arguments"),
@@ -1152,18 +1285,20 @@ fn hierarchy_target(
     )
 }
 
-fn declaration_name(declaration: Node<'_>, parent_namespace: &str, source: &str) -> String {
-    let name = declaration
-        .child_by_field_name("name")
-        .expect("RBS type declaration must have a name");
+fn declaration_name(
+    declaration: Node<'_>,
+    parent_namespace: &str,
+    source: &str,
+) -> Result<String, UnmodeledShape> {
+    let name = required_field(declaration, "name")?;
     let normalized = type_name(name, source).trim_start_matches("::").to_owned();
     if parent_namespace.is_empty()
         || direct_child(name, "namespace").is_some()
         || node_text(name, source).starts_with("::")
     {
-        normalized
+        Ok(normalized)
     } else {
-        format!("{parent_namespace}::{normalized}")
+        Ok(format!("{parent_namespace}::{normalized}"))
     }
 }
 
@@ -1183,7 +1318,10 @@ fn type_parameters(node: Option<Node<'_>>, source: &str) -> Vec<String> {
         .collect()
 }
 
-fn member_name<'source>(node: Node<'_>, source: &'source str) -> &'source str {
+fn member_name<'source>(
+    node: Node<'_>,
+    source: &'source str,
+) -> Result<&'source str, UnmodeledShape> {
     (node.kind() == "method_name")
         .then_some(node)
         .or_else(|| {
@@ -1192,28 +1330,64 @@ fn member_name<'source>(node: Node<'_>, source: &'source str) -> &'source str {
                 .next()
         })
         .map(|node| node_text(node, source))
-        .expect("RBS member must have a method name")
+        .ok_or_else(|| UnmodeledShape {
+            node_kind: node.kind(),
+            expected: "a method_name descendant".to_owned(),
+        })
 }
 
-fn visibility_from_node(node: Node<'_>, source: &str) -> Option<Visibility> {
-    direct_child(node, "visibility").map(|visibility| match node_text(visibility, source) {
-        "private" => Visibility::Private,
-        "public" => Visibility::Public,
-        unexpected => panic!("unexpected RBS visibility {unexpected}"),
-    })
+fn visibility_from_node(
+    node: Node<'_>,
+    source: &str,
+) -> Result<Option<Visibility>, UnmodeledShape> {
+    let Some(visibility) = direct_child(node, "visibility") else {
+        return Ok(None);
+    };
+    modeled_visibility(node.kind(), node_text(visibility, source)).map(Some)
 }
 
-fn declaration_body(node: Node<'_>) -> Node<'_> {
-    if matches!(node.kind(), "decl" | "member" | "interface_member") {
-        node.child_by_field_name("body")
-            .expect("RBS wrapper must contain a body")
-    } else {
-        node
+/// The grammar in use spells only `public` and `private`, but the projection
+/// reads the token text rather than the node kind, so a grammar that adds a
+/// third spelling would otherwise reach an unhandled arm on gem-supplied bytes.
+fn modeled_visibility(node_kind: &'static str, token: &str) -> Result<Visibility, UnmodeledShape> {
+    match token {
+        "private" => Ok(Visibility::Private),
+        "public" => Ok(Visibility::Public),
+        unmodeled => Err(UnmodeledShape {
+            node_kind,
+            expected: format!("a modeled visibility, but its token is {unmodeled}"),
+        }),
     }
 }
 
-fn member_body(node: Node<'_>) -> Node<'_> {
-    declaration_body(node)
+fn declaration_body(node: Node<'_>) -> Result<Node<'_>, UnmodeledShape> {
+    if matches!(node.kind(), "decl" | "member" | "interface_member") {
+        required_field(node, "body")
+    } else {
+        Ok(node)
+    }
+}
+
+fn required_field<'tree>(node: Node<'tree>, field: &str) -> Result<Node<'tree>, UnmodeledShape> {
+    node.child_by_field_name(field)
+        .ok_or_else(|| UnmodeledShape {
+            node_kind: node.kind(),
+            expected: format!("a {field} field"),
+        })
+}
+
+fn required_child<'tree>(node: Node<'tree>, kind: &str) -> Result<Node<'tree>, UnmodeledShape> {
+    direct_child(node, kind).ok_or_else(|| UnmodeledShape {
+        node_kind: node.kind(),
+        expected: format!("a {kind} child"),
+    })
+}
+
+/// tree-sitter keeps comments as named siblings of declarations and members.
+/// They carry no declared surface, so skipping one loses nothing and must not
+/// demote the pack the way an unmodeled construct does.
+fn is_trivia(kind: &str) -> bool {
+    kind == "comment"
 }
 
 fn is_declaration(kind: &str) -> bool {
@@ -1237,7 +1411,10 @@ fn unsupported_declaration_kind(kind: &str) -> &str {
 
 fn unwrap_type(mut node: Node<'_>) -> Node<'_> {
     while node.kind() == "type" {
-        let Some(child) = node.named_child(0) else {
+        let Some(child) = named_children(node)
+            .into_iter()
+            .find(|child| !is_trivia(child.kind()))
+        else {
             break;
         };
         node = child;
@@ -1253,6 +1430,8 @@ fn normalize_name(value: &str) -> String {
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    // tree-sitter reports byte ranges on character boundaries of the `&str` it
+    // was handed, so this cannot depend on the archive's contents.
     node.utf8_text(source.as_bytes())
         .expect("tree-sitter RBS ranges must be valid UTF-8")
 }
@@ -1494,5 +1673,194 @@ end
                 .iter()
                 .any(|diagnostic| diagnostic.code == "ruby.rbs.unsupported_block_signature")
         );
+    }
+
+    #[test]
+    fn comments_are_trivia_that_neither_demote_the_pack_nor_hide_a_type() {
+        let projection = project_rbs(
+            &"6".repeat(64),
+            "sig/commented.rbs",
+            r#"# a gem's own copyright header
+class Widget
+  # a comment before the first member
+  def call: (String value) -> Integer
+  # a comment between two members
+  def self.build: () -> (
+    # a comment inside a parenthesised type
+    Widget)
+end
+"#,
+            &ArtifactProducerLimits::default(),
+            None,
+        );
+
+        assert!(projection.complete, "{:?}", projection.diagnostics);
+        assert!(projection.diagnostics.is_empty());
+        assert_eq!(projection.types.len(), 1);
+        assert_eq!(projection.members.len(), 2);
+        let build = projection
+            .members
+            .iter()
+            .find(|member| member.name == "build")
+            .unwrap();
+        assert_eq!(
+            build.signature.as_ref().unwrap().returns,
+            Some(simple_type("Widget"))
+        );
+    }
+
+    #[test]
+    fn unmodeled_visibility_degrades_instead_of_aborting_the_producer() {
+        let miss = modeled_visibility("visibility_member", "protected").unwrap_err();
+        assert_eq!(miss.node_kind, "visibility_member");
+        assert!(miss.expected.contains("protected"), "{miss:?}");
+        assert_eq!(
+            modeled_visibility("method_member", "private"),
+            Ok(Visibility::Private)
+        );
+        assert_eq!(
+            modeled_visibility("attribute_member", "public"),
+            Ok(Visibility::Public)
+        );
+    }
+
+    #[test]
+    fn every_grammar_shape_lookup_reports_a_miss_instead_of_panicking() {
+        // The pinned grammar cannot emit these arrangements without also
+        // raising a parse error, so each lookup is driven with a node of a kind
+        // that lacks the field or child the projection reads. That is exactly
+        // the state a grammar change or a newer RBS construct would produce.
+        let source =
+            "class Widget\n  def call: (String value) -> Integer\n  alias invoke call\nend\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rbs::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let class = declaration_body(tree.root_node().named_child(0).unwrap()).unwrap();
+        let class_name = required_field(class, "name").unwrap();
+        let members = class.child_by_field_name("body").unwrap();
+        let method = declaration_body(members.named_child(0).unwrap()).unwrap();
+        let alias = declaration_body(members.named_child(1).unwrap()).unwrap();
+        let limits = ArtifactProducerLimits::default();
+
+        // A class, module, or interface whose name field moved or was renamed.
+        let miss = declaration_name(class_name, "", source).unwrap_err();
+        assert_eq!(miss.node_kind, "class_name");
+        assert_eq!(miss.expected, "a name field");
+        // A `decl`, `member`, or `interface_member` wrapper with no body, and
+        // the identical lookup a method overload makes for its function type.
+        assert_eq!(
+            required_field(class_name, "body").unwrap_err().expected,
+            "a body field"
+        );
+        // An alias member missing either of its two names.
+        assert_eq!(
+            project_alias(class_name, "owner", source)
+                .unwrap_err()
+                .expected,
+            "a name field"
+        );
+        // A union or intersection type with no operands.
+        assert_eq!(
+            compound_type_arguments(class_name, "class_name", source, &[], 0, 8)
+                .unwrap_err()
+                .expected,
+            "a right field"
+        );
+        // A constant declaration with no const_name, both where the record
+        // budget reads it and where the projection reads it.
+        assert_eq!(
+            constant_record_cost(class, "", &[]).unwrap_err().node_kind,
+            "class_decl"
+        );
+        assert_eq!(
+            required_child(class, "const_name").unwrap_err().expected,
+            "a const_name child"
+        );
+        // An optional type that wraps nothing.
+        assert_eq!(
+            required_child(class_name, "type").unwrap_err().expected,
+            "a type child"
+        );
+        // A method or attribute member with no method name beneath it.
+        assert_eq!(
+            member_name(class_name, source).unwrap_err().expected,
+            "a method_name descendant"
+        );
+        assert_eq!(
+            project_attribute(
+                class_name,
+                "owner",
+                Visibility::Public,
+                &Locator::Artifact {
+                    path: "gem".to_owned(),
+                    symbol: "Widget".to_owned(),
+                },
+                source,
+                &[],
+                &limits,
+            )
+            .unwrap_err()
+            .expected,
+            "a method_name descendant"
+        );
+        // An include, prepend, or extend member with no name field.
+        assert_eq!(
+            hierarchy_target(class_name, source, &[], &limits)
+                .unwrap_err()
+                .expected,
+            "a name field"
+        );
+        // The shapes that are present still project.
+        assert!(member_name(method, source).is_ok());
+        assert!(project_alias(alias, "owner", source).is_ok());
+    }
+
+    #[test]
+    fn adversarial_rbs_entries_never_abort_and_never_claim_completeness_with_a_diagnostic() {
+        // Gem archives are untrusted, so a crafted or merely unusual entry has
+        // to leave the producer with a projection it can still publish.
+        let adversarial = [
+            "",
+            "\u{0}\u{0}\u{0}",
+            "end\n",
+            "Integer\n",
+            "#: () -> void\n#: () -> void\n",
+            "$hostile: untyped\n",
+            "type shadow = Integer\n",
+            "class Widget = Other\n",
+            "module Widget = Other\n",
+            "use Foo::Bar\n",
+            "class Widget\n  @hidden: untyped\nend\n",
+            "class Widget\n  def call: ...\nend\n",
+            "class Widget\n  def call: () -> ((((((Integer))))))\nend\n",
+            "class Widget\n  def call: () -> (Integer | String | Symbol | bot)?\nend\n",
+            "class Widget\n  def call: () -> [Integer, [String, [Symbol]]]\nend\n",
+            "class Widget\n  def call: () -> { a: Integer }\nend\n",
+            "class Widget\n  def call: () -> ^(Integer) -> void\nend\n",
+            "class Widget\n  def self?.call: () -> void\nend\n",
+            "class ::A::B::C\n  def []=: (Integer, String) -> void\nend\n",
+            "class Widget\n  attr_accessor self.name(@n): String\nend\n",
+            "interface _Widget\n  include _Other\n  alias self.a self.b\nend\n",
+        ];
+        for source in adversarial {
+            let projection = project_rbs(
+                &"7".repeat(64),
+                "sig/adversarial.rbs",
+                source,
+                &ArtifactProducerLimits::default(),
+                None,
+            );
+            assert!(
+                projection.diagnostics.is_empty() || !projection.complete,
+                "{source:?} claimed completeness with {:?}",
+                projection.diagnostics
+            );
+            assert!(
+                !projection.complete || projection.suppressed_diagnostics == 0,
+                "{source:?}"
+            );
+        }
     }
 }

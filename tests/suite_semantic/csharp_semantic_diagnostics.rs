@@ -767,3 +767,66 @@ fn changed_dependency_inputs_withdraw_a_previously_proven_absence() {
     );
     assert_eq!(after.status(), SemanticDiagnosticReportStatus::Incomplete);
 }
+
+// ---------------------------------------------------------------------------
+// Search cost
+// ---------------------------------------------------------------------------
+
+/// The workspace searches one request performs, counted at the store.
+fn workspace_searches(fixture: &CSharpFixture, rel_path: &str) -> usize {
+    let hooks = fixture.analyzer.analyzer().test_hooks();
+    hooks.reset_definition_candidates_query_count_for_test();
+    let report = fixture.report(rel_path);
+    assert_eq!(
+        report.status(),
+        SemanticDiagnosticReportStatus::Incomplete,
+        "the fixture must exercise the miss path, where a search costs the most: {report:#?}"
+    );
+    hooks.definition_candidates_query_count_for_test()
+}
+
+/// A request searches the workspace once per distinct spelling, and never
+/// through a namespace the workspace declares nothing in.
+///
+/// Both halves are counted rather than timed, because both regressions are
+/// recomputation and a wall clock would only catch them on a large enough file.
+/// Before #1806 a file that named one absent type ten times searched for it ten
+/// times, and every search qualified the name with each `using` and each
+/// ancestor namespace whether or not the workspace held anything there. That is
+/// what made one 34-line file in `tests/fixtures/testcode-cs` cost 540 ms a
+/// request, cold and warm alike.
+#[test]
+fn a_request_searches_once_per_spelling_and_skips_namespaces_the_workspace_lacks() {
+    const NAMESPACE: &str = "App.Platform.Services.Handlers.Queries";
+
+    let one_reference = CSharpFixture::new(&[(
+        APP,
+        &format!("namespace {NAMESPACE} {{ public class Host {{ Absent A; }} }}\n"),
+    )]);
+    let repeated_fields = (0..10)
+        .map(|field| format!("Absent F{field}; "))
+        .collect::<String>();
+    let ten_references = CSharpFixture::new(&[(
+        APP,
+        &format!("namespace {NAMESPACE} {{ public class Host {{ {repeated_fields} }} }}\n"),
+    )]);
+    assert_eq!(
+        workspace_searches(&ten_references, APP),
+        workspace_searches(&one_reference, APP),
+        "naming one absent type ten times must search for it once"
+    );
+
+    let unknown_usings = CSharpFixture::new(&[(
+        APP,
+        &format!(
+            "using Vendor.One;\nusing Vendor.Two;\nusing Vendor.Three;\nusing Vendor.Four;\n\
+             namespace {NAMESPACE} {{ public class Host {{ Absent A; }} }}\n"
+        ),
+    )]);
+    assert_eq!(
+        workspace_searches(&unknown_usings, APP),
+        workspace_searches(&one_reference, APP),
+        "a `using` of a namespace the workspace declares nothing in cannot hold the name, \
+         so qualifying with it must not cost a search"
+    );
+}

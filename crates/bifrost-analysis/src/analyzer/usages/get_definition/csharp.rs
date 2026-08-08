@@ -152,6 +152,13 @@ impl<'a> CSharpDefinitionProvider<'a> {
             let namespaces = self.using_namespaces(file);
             self.observe_cancellation().then_some(namespaces)
         };
+        // Not `package_exists`: that answers `false` for a namespace the budget
+        // could not check, and a `false` here drops a probe. The gate must
+        // answer `true` when it does not know.
+        let mut namespace_exists = |namespace: &str| {
+            self.query(|| self.csharp.workspace_namespace_exists(namespace))
+                .unwrap_or(true)
+        };
         let mut type_candidates_by_fqn = |fqn: &str| {
             let candidates = self
                 .fqn(fqn)
@@ -166,6 +173,7 @@ impl<'a> CSharpDefinitionProvider<'a> {
             &mut using_aliases,
             &mut namespace_of_file,
             &mut using_namespaces,
+            &mut namespace_exists,
             &mut type_candidates_by_fqn,
         )
     }
