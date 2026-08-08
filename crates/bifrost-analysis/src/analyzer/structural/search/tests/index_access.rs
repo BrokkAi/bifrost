@@ -235,6 +235,103 @@ fn indexed_postings_match_scan_results_in_every_structural_language() {
 }
 
 #[test]
+fn scan_only_kotlin_seed_hydrates_from_durable_facts_after_workspace_reopen() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let source = "package example\n\nopen class Table {\n    fun column() = 1\n}\n";
+    ProjectFile::new(root.clone(), ".gitignore")
+        .write(".bifrost/cache/\n")
+        .expect("write gitignore");
+    ProjectFile::new(root.clone(), "src/main/kotlin/example/Table.kt")
+        .write(source)
+        .expect("write Kotlin source");
+    let repository = git2::Repository::init(&root).expect("initialize Git repository");
+    let mut config = repository.config().expect("Git config");
+    config
+        .set_str("user.name", "Bifrost Test")
+        .expect("Git user name");
+    config
+        .set_str("user.email", "bifrost@example.com")
+        .expect("Git user email");
+    let mut index = repository.index().expect("Git index");
+    index
+        .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+        .expect("stage fixture");
+    index.write().expect("write Git index");
+    let tree_id = index.write_tree().expect("write Git tree");
+    let tree = repository.find_tree(tree_id).expect("read Git tree");
+    let signature =
+        git2::Signature::now("Bifrost Test", "bifrost@example.com").expect("Git signature");
+    repository
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "Kotlin structural fixture",
+            &tree,
+            &[],
+        )
+        .expect("commit fixture");
+
+    let project: Arc<dyn crate::analyzer::Project> =
+        Arc::new(TestProject::new(root, Language::Kotlin));
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["kotlin"],
+        "where": ["src/main/kotlin/example/Table.kt"],
+        "match": { "kind": "class", "name": "Table" },
+    }))
+    .expect("Kotlin class query");
+
+    let primed =
+        WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+            .expect("build persisted Kotlin workspace");
+    let prewarm = execute_code_query_with_access_mode(
+        primed.analyzer(),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        StructuralAccessMode::ScanOnly,
+        true,
+    )
+    .expect("scan-only Kotlin prewarm");
+    assert_eq!(prewarm.result.results.len(), 1, "{:#?}", prewarm.result);
+    let prewarm_profile = prewarm.profile.expect("prewarm profile");
+    assert_eq!(prewarm_profile.cache.seed_structural_facts.extractions, 1);
+    assert_eq!(
+        prewarm_profile
+            .cache
+            .seed_structural_facts
+            .persisted_hydrations,
+        0
+    );
+    drop(primed);
+
+    let reopened = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
+        .expect("reopen persisted Kotlin workspace");
+    let hydrated = execute_code_query_with_access_mode(
+        reopened.analyzer(),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        StructuralAccessMode::ScanOnly,
+        true,
+    )
+    .expect("scan-only Kotlin query after reopen");
+    assert_eq!(hydrated.result.results.len(), 1, "{:#?}", hydrated.result);
+    let hydrated_profile = hydrated.profile.expect("hydrated profile");
+    assert_eq!(
+        hydrated_profile
+            .cache
+            .seed_structural_facts
+            .persisted_hydrations,
+        1,
+        "reopened scan-only query must hydrate its Kotlin fact snapshot"
+    );
+    assert_eq!(
+        hydrated_profile.cache.seed_structural_facts.extractions, 0,
+        "reopened scan-only query must not re-extract its Kotlin fact snapshot"
+    );
+}
+
+#[test]
 fn anchored_alternation_regex_uses_role_name_postings_and_skips_candidate_free_files() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical root");
