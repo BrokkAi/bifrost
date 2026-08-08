@@ -789,6 +789,7 @@ pub(super) fn parse_import_info(node: Node<'_>, source: &str, raw: String) -> Im
     ImportInfo {
         raw_snippet: raw,
         is_wildcard,
+        is_global: false,
         identifier,
         alias: None,
         path: (!segments.is_empty()).then_some(StructuredImportPath {

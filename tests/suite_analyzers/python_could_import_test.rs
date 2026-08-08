@@ -11,6 +11,7 @@ fn import_info(
     ImportInfo {
         raw_snippet: raw_snippet.to_string(),
         is_wildcard: false,
+        is_global: false,
         identifier: identifier.map(str::to_string),
         alias: None,
         path: Some(StructuredImportPath {

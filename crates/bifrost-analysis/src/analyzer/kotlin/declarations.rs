@@ -117,13 +117,6 @@ fn collect_kotlin_imports(root: Node<'_>, source: &str, parsed: &mut ParsedFile)
             .into_iter()
             .filter(|child| child.kind() == "import_header")
         {
-            // The display string keeps the source's own spelling for
-            // `import_statements()`; the structured fact is what resolution
-            // reads, so neither has to be recovered from the other.
-            let raw = collapse_whitespace(node_text(import, source));
-            if !raw.is_empty() {
-                parsed.import_statements.push(raw);
-            }
             if let Some(info) = super::imports::kotlin_import_info_from_node(import, source) {
                 parsed.imports.push(info);
             }
@@ -933,7 +926,14 @@ typealias Rows = List<String>
 "#;
         let (_, parsed) = parse(source);
         assert_eq!(parsed.package_name, "com.example");
-        assert_eq!(parsed.import_statements, vec!["import kotlin.math.abs"]);
+        assert_eq!(
+            parsed
+                .imports
+                .iter()
+                .map(|import| import.raw_snippet.as_str())
+                .collect::<Vec<_>>(),
+            vec!["import kotlin.math.abs"]
+        );
         let names = fq_names(&parsed);
         for expected in [
             "com.example.Outer",

@@ -1,6 +1,6 @@
 use crate::analyzer::{
     CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile,
-    build_reverse_file_index,
+    StructuredImportPath, StructuredImportPathKind, build_reverse_file_index,
 };
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
@@ -140,7 +140,7 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         let source_imports = self.using_namespaces_of(source_file);
         imports
             .iter()
-            .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
+            .filter_map(csharp_using_namespace)
             .chain(source_imports)
             .any(|namespace| target_namespaces.contains(&namespace))
             || source_aliases.values().any(|alias_target| {
@@ -244,30 +244,17 @@ impl CSharpAnalyzer {
     }
 }
 
-pub(super) fn csharp_using_namespace(raw: &str) -> Option<String> {
-    let trimmed = raw.trim().trim_end_matches(';').trim();
-    let rest = trimmed
-        .strip_prefix("global ")
-        .unwrap_or(trimmed)
-        .strip_prefix("using ")?
-        .trim();
-    if rest.starts_with("static ") || rest.contains('=') || rest.is_empty() {
-        return None;
-    }
-    Some(rest.to_string())
-}
-
-pub(super) fn csharp_import_info(raw: String) -> ImportInfo {
-    let identifier = csharp_using_namespace(&raw)
-        .and_then(|namespace| namespace.rsplit('.').next().map(str::to_string));
-    ImportInfo {
-        raw_snippet: raw,
-        is_wildcard: true,
-        identifier,
-        alias: None,
-        path: None,
-        binder_span: None,
-    }
+/// The namespace a plain `using` directive imports, from its structured path.
+///
+/// A plain `using System.Text;` is the only form that names a namespace: a
+/// `using static` names a type and a `using A = X;` names an alias target, and
+/// each records its own `path_kind`. The value is the path's segments rejoined
+/// with '.', which is the spelling the parser saw.
+pub(super) fn csharp_using_namespace(import: &ImportInfo) -> Option<String> {
+    let path = import.path.as_ref()?;
+    (path.kind == Some(StructuredImportPathKind::Namespace))
+        .then(|| path.render_segments("."))
+        .filter(|namespace| !namespace.is_empty())
 }
 
 pub(super) fn csharp_import_info_from_using_directive(
@@ -275,57 +262,71 @@ pub(super) fn csharp_import_info_from_using_directive(
     source: &str,
     raw: String,
 ) -> Option<ImportInfo> {
-    if csharp_using_namespace(&raw).is_some() {
-        return Some(csharp_import_info(raw));
-    }
-    if super::csharp_using_directive_is_static(node) {
-        let mut cursor = node.walk();
-        let target = node
-            .named_children(&mut cursor)
-            .find(|child| {
-                matches!(
-                    child.kind(),
-                    "identifier" | "qualified_name" | "alias_qualified_name" | "generic_name"
-                )
-            })
-            .map(|target| super::csharp_type_node_identity(target, source))?;
-        return (!target.is_empty()).then_some(ImportInfo {
+    let is_global = super::csharp_using_directive_is_global(node);
+    let declaration_start_byte = node.start_byte();
+    let structured_path = |segments: Vec<String>, kind: StructuredImportPathKind| {
+        StructuredImportPath {
+            segments,
+            kind: Some(kind),
+            // A C# using directive sits at file or namespace level, and the
+            // namespace it sits in is already each unit's own package, so there
+            // is no prefix or enclosing block extent to record here.
+            lexical_prefixes: Vec::new(),
+            lexical_scopes: Vec::new(),
+            declaration_start_byte,
+        }
+    };
+
+    if let Some(target) = super::csharp_using_directive_namespace_node(node) {
+        let segments = super::csharp_type_node_segments(target, source);
+        if segments.is_empty() {
+            return None;
+        }
+        // A plain `using` imports every name under the namespace, so it binds
+        // no single token, and its `identifier` is the namespace's own tail.
+        let identifier = segments.last().cloned();
+        return Some(ImportInfo {
             raw_snippet: raw,
-            is_wildcard: false,
-            identifier: Some(target),
+            is_wildcard: true,
+            is_global,
+            identifier,
             alias: None,
-            path: None,
+            path: Some(structured_path(
+                segments,
+                StructuredImportPathKind::Namespace,
+            )),
             binder_span: None,
         });
     }
-    csharp_using_alias_from_node(node, source).map(|(alias, target)| ImportInfo {
-        raw_snippet: raw,
-        is_wildcard: false,
-        identifier: Some(target),
-        alias: Some(alias),
-        path: None,
-        binder_span: None,
-    })
-}
 
-pub(super) fn csharp_static_using_from_import(import: &ImportInfo) -> Option<&str> {
-    if !import.is_wildcard && import.alias.is_none() {
-        import.identifier.as_deref()
-    } else {
-        None
+    if super::csharp_using_directive_is_static(node) {
+        let mut cursor = node.walk();
+        let target = node.named_children(&mut cursor).find(|child| {
+            matches!(
+                child.kind(),
+                "identifier" | "qualified_name" | "alias_qualified_name" | "generic_name"
+            )
+        })?;
+        let segments = super::csharp_type_node_segments(target, source);
+        if segments.is_empty() {
+            return None;
+        }
+        return Some(ImportInfo {
+            raw_snippet: raw,
+            is_wildcard: false,
+            is_global,
+            identifier: Some(segments.join(".")),
+            alias: None,
+            path: Some(structured_path(
+                segments,
+                StructuredImportPathKind::StaticMember,
+            )),
+            binder_span: None,
+        });
     }
-}
 
-pub(super) fn csharp_using_alias_from_import(import: &ImportInfo) -> Option<(String, String)> {
-    Some((import.alias.clone()?, import.identifier.clone()?))
-}
-
-pub(super) fn csharp_using_alias_from_node(
-    node: Node<'_>,
-    source: &str,
-) -> Option<(String, String)> {
     let alias_node = node.child_by_field_name("name")?;
-    let alias = node_text(alias_node, source).trim().to_string();
+    let alias = node_text(alias_node, source).trim();
     if alias.is_empty() {
         return None;
     }
@@ -333,8 +334,35 @@ pub(super) fn csharp_using_alias_from_node(
     let target_node = node.named_children(&mut cursor).find(|child| {
         child.start_byte() >= alias_node.end_byte() && child.id() != alias_node.id()
     })?;
-    let target = super::csharp_type_node_identity(target_node, source);
-    (!target.is_empty()).then_some((alias, target))
+    let segments = super::csharp_type_node_segments(target_node, source);
+    if segments.is_empty() {
+        return None;
+    }
+    // `using A = X.Y;` binds exactly one name, spelled by the alias token.
+    Some(ImportInfo {
+        raw_snippet: raw,
+        is_wildcard: false,
+        is_global,
+        identifier: Some(segments.join(".")),
+        alias: Some(alias.to_string()),
+        path: Some(structured_path(
+            segments,
+            StructuredImportPathKind::ImportFrom,
+        )),
+        binder_span: Some(crate::analyzer::common::node_span(alias_node)),
+    })
+}
+
+/// The type a `using static` directive imports, from its structured path.
+pub(super) fn csharp_static_using_from_import(import: &ImportInfo) -> Option<&str> {
+    let path = import.path.as_ref()?;
+    (path.kind == Some(StructuredImportPathKind::StaticMember))
+        .then_some(import.identifier.as_deref())
+        .flatten()
+}
+
+pub(super) fn csharp_using_alias_from_import(import: &ImportInfo) -> Option<(String, String)> {
+    Some((import.alias.clone()?, import.identifier.clone()?))
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {

@@ -933,7 +933,10 @@ fn import_bindings(
     collect_go_import_infos(root, source)
         .into_iter()
         .filter_map(|info| {
-            let path = info.path?.segments.into_iter().next()?;
+            let path = info.path.as_ref()?.render_segments("/");
+            if path.is_empty() {
+                return None;
+            }
             let local = info
                 .alias
                 .or_else(|| package_names.get(&path).cloned())

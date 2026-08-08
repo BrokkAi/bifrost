@@ -1,3 +1,4 @@
+use crate::analyzer::go::imports::go_import_path;
 use crate::analyzer::go::packages::{GoWorkspacePathIndex, canonical_go_package_name};
 use crate::analyzer::go::{go_embedded_type_nodes, go_field_declaration_is_embedded};
 use crate::analyzer::usages::common::language_for_file;
@@ -906,7 +907,7 @@ fn namespace_packages_from_imports(
         if alias == Some("_") {
             continue;
         }
-        let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+        let Some(path) = go_import_path(import) else {
             continue;
         };
         let resolved = resolve_go_module(file, &path, dir_index, workspace_paths);
@@ -1088,7 +1089,7 @@ fn import_binder_of(
         if import.alias.as_deref() == Some("_") {
             continue;
         }
-        let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+        let Some(path) = go_import_path(&import) else {
             continue;
         };
         match import.alias.as_deref() {
@@ -1880,20 +1881,6 @@ fn same_go_package(graph: &GoProjectGraph, left: &ProjectFile, right: &ProjectFi
         return false;
     };
     left_parsed.package_name == right_parsed.package_name
-}
-
-pub(crate) fn extract_go_import_path(raw_import: &str) -> Option<String> {
-    let trimmed = raw_import.trim();
-    trimmed
-        .split_whitespace()
-        .next_back()
-        .map(|path| {
-            path.trim_matches('"')
-                .trim_matches('`')
-                .trim_matches('\'')
-                .to_string()
-        })
-        .filter(|path| !path.is_empty())
 }
 
 pub(crate) fn default_go_import_local_name(import_path_or_identifier: &str) -> String {

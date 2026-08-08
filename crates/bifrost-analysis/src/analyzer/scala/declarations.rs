@@ -105,7 +105,6 @@ fn collect_scala_imports(
                         source,
                         &package_prefixes,
                     ));
-                parsed.import_statements.push(raw);
             }
         }
 

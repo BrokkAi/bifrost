@@ -2620,6 +2620,29 @@ pub enum StructuredImportPathKind {
     StaticMember,
 }
 
+impl StructuredImportPathKind {
+    /// The spelling this variant is stored under in
+    /// `import_statements.path_kind`. That column's `CHECK` lists exactly these
+    /// three strings, so the enum and the schema's closed vocabulary stay one
+    /// declaration apart instead of drifting.
+    pub const fn persist_tag(self) -> &'static str {
+        match self {
+            Self::Namespace => "namespace",
+            Self::ImportFrom => "import_from",
+            Self::StaticMember => "static_member",
+        }
+    }
+
+    pub fn from_persist_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "namespace" => Some(Self::Namespace),
+            "import_from" => Some(Self::ImportFrom),
+            "static_member" => Some(Self::StaticMember),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructuredImportScope {
     pub start_byte: usize,
@@ -2630,6 +2653,12 @@ pub struct StructuredImportScope {
 pub struct ImportInfo {
     pub raw_snippet: String,
     pub is_wildcard: bool,
+    /// The import binds beyond its own file. C#'s `global using` is the only
+    /// language form that sets this; every other adapter leaves it false.
+    /// It is recorded by the parser because consumers otherwise detect the
+    /// form by matching the prefix `global using ` against `raw_snippet`.
+    #[serde(default)]
+    pub is_global: bool,
     pub identifier: Option<String>,
     pub alias: Option<String>,
     /// Parser-derived path components. Language adapters should populate this

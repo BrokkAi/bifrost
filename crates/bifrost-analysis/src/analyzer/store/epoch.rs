@@ -25,9 +25,13 @@ use std::sync::OnceLock;
 use tree_sitter::Language as TsLanguage;
 
 const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
-// v7: `ImportInfo` gained `binder_span` (#1600), which changes the bincode
-// layout of every persisted import row.
-const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v7-import-binder-span";
+// v8: migration 0018 merged `import_details` into `import_statements`, so an
+// import is one row per binding instead of a raw statement plus a bincode
+// `ImportInfo`. What the writer records changed as well as where: Go segments
+// its import path, C# records a structured path and its `global using` flag,
+// and Scala and TypeScript now emit one row per binding rather than one per
+// declaration.
+const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v8-import-bindings";
 
 /// Returns the analysis epoch for a language as a hex string.
 ///

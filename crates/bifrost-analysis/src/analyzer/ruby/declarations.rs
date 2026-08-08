@@ -365,7 +365,6 @@ impl RubyVisitor<'_> {
         match method_name {
             "require" | "require_relative" | "load" | "autoload" => {
                 if let Some(info) = parse_ruby_require_call(node, self.source) {
-                    self.parsed.import_statements.push(info.raw_snippet.clone());
                     self.parsed.imports.push(info);
                 }
             }

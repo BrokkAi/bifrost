@@ -6,7 +6,7 @@ mod declarations;
 mod dependency_discovery;
 pub(crate) mod diagnostics;
 mod hierarchy;
-mod imports;
+pub(crate) mod imports;
 pub(crate) mod packages;
 mod semantic;
 pub(crate) mod structural;

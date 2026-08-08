@@ -575,7 +575,6 @@ impl<'a> PythonVisitor<'a> {
 
     fn visit_import_statement(&mut self, node: Node<'_>) {
         for info in python_import_infos_from_node(node, self.source) {
-            self.parsed.import_statements.push(info.raw_snippet.clone());
             self.parsed.imports.push(info);
         }
     }

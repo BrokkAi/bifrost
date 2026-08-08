@@ -98,10 +98,7 @@ fn visit_go_imports(
 ) {
     let mut imports = Vec::new();
     collect_go_import_infos_from_declaration(node, source, &mut imports);
-    for info in imports {
-        parsed.import_statements.push(info.raw_snippet.clone());
-        parsed.imports.push(info);
-    }
+    parsed.imports.extend(imports);
 }
 
 fn collect_go_import_infos_from_declaration(
@@ -182,13 +179,20 @@ fn parse_go_import_spec(node: Node<'_>, source: &str) -> Option<ImportInfo> {
         .child_by_field_name("name")
         .map(crate::analyzer::common::node_span);
 
+    // A Go import path is one string literal, and '/' is Go's own separator
+    // inside it, so splitting there IS the parse of that literal's structure.
+    // `StructuredImportPath::render_segments("/")` puts it back together, which
+    // is how consumers read the path instead of re-scanning the snippet text.
+    let segments = path.split('/').map(str::to_string).collect();
+
     Some(ImportInfo {
         raw_snippet,
         is_wildcard: false,
+        is_global: false,
         identifier,
         alias,
         path: Some(StructuredImportPath {
-            segments: vec![path],
+            segments,
             kind: Some(StructuredImportPathKind::Namespace),
             lexical_prefixes: Vec::new(),
             lexical_scopes: Vec::new(),

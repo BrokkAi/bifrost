@@ -593,6 +593,7 @@ impl RustUseDeclaration {
             info: ImportInfo {
                 raw_snippet,
                 is_wildcard,
+                is_global: false,
                 identifier,
                 alias,
                 path: Some(StructuredImportPath {

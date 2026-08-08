@@ -20,6 +20,7 @@ pub(crate) fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> V
         return vec![ImportInfo {
             raw_snippet: raw,
             is_wildcard: false,
+            is_global: false,
             identifier: None,
             alias: None,
             path: None,
@@ -37,6 +38,7 @@ pub(crate) fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> V
                     imports.push(ImportInfo {
                         raw_snippet: raw.clone(),
                         is_wildcard: false,
+                        is_global: false,
                         identifier: Some(identifier.to_string()),
                         alias: None,
                         path: None,
@@ -51,6 +53,7 @@ pub(crate) fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> V
                         imports.push(ImportInfo {
                             raw_snippet: raw.clone(),
                             is_wildcard: true,
+                            is_global: false,
                             identifier: None,
                             alias: Some(alias),
                             path: None,
@@ -77,6 +80,7 @@ pub(crate) fn parse_commonjs_require_import_infos_from_node(
             .map(|binding| ImportInfo {
                 raw_snippet: binding.raw_snippet,
                 is_wildcard: false,
+                is_global: false,
                 identifier: Some(binding.imported_name),
                 alias: binding.alias,
                 path: None,
@@ -93,6 +97,7 @@ pub(crate) fn parse_commonjs_require_import_infos_from_node(
         return vec![ImportInfo {
             raw_snippet: raw.to_string(),
             is_wildcard: false,
+            is_global: false,
             identifier: None,
             alias: None,
             path: None,
@@ -312,6 +317,7 @@ fn collect_named_es_imports(
         imports.push(ImportInfo {
             raw_snippet: raw.to_string(),
             is_wildcard: false,
+            is_global: false,
             identifier,
             alias,
             path: None,

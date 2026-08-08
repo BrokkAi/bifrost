@@ -1,7 +1,7 @@
 use super::GoAnalyzer;
 use super::declarations::{determine_go_package_name, go_node_text};
 use super::go_field_declaration_is_embedded;
-use super::imports::extract_go_import_path;
+use super::imports::go_import_path;
 use crate::analyzer::type_relations::{MethodKey, MethodSet};
 #[cfg(test)]
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
@@ -775,7 +775,7 @@ fn import_packages(
         if alias == Some("_") {
             continue;
         }
-        let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+        let Some(path) = go_import_path(&import) else {
             continue;
         };
         let mut packages: Vec<_> = package_index

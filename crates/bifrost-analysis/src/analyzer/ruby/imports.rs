@@ -24,6 +24,7 @@ pub(super) fn parse_ruby_require_call(node: Node<'_>, source: &str) -> Option<Im
     Some(ImportInfo {
         raw_snippet,
         is_wildcard: false,
+        is_global: false,
         identifier: Some(path),
         alias: None,
         path: None,
@@ -378,6 +379,7 @@ fn collect_ruby_autoload_edges(
                     .trim()
                     .to_string(),
                 is_wildcard: false,
+                is_global: false,
                 identifier: Some(path),
                 alias: None,
                 path: None,

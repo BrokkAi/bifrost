@@ -113,6 +113,7 @@ pub(crate) fn kotlin_import_info_from_node(node: Node<'_>, source: &str) -> Opti
     Some(ImportInfo {
         raw_snippet: render_kotlin_import(&segments, is_wildcard, alias.as_deref()),
         is_wildcard,
+        is_global: false,
         identifier,
         alias,
         path: Some(StructuredImportPath {

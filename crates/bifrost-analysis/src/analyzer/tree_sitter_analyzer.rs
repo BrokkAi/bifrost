@@ -615,7 +615,6 @@ pub struct FileState {
     pub(crate) top_level_declarations: Vec<CodeUnit>,
     pub(crate) declarations: HashSet<CodeUnit>,
     pub(crate) definition_lookup_units: HashSet<CodeUnit>,
-    pub(crate) import_statements: Vec<String>,
     pub(crate) imports: Vec<ImportInfo>,
     pub(crate) scala_exports: HashMap<CodeUnit, Vec<crate::analyzer::scala::ScalaExportInfo>>,
     /// Per-file Rust usage facts on their way to the `rust_*` fact tables (see
@@ -1487,7 +1486,6 @@ pub struct ParsedFile {
     declarations: HashSet<CodeUnit>,
     declaration_identities: HashMap<DeclarationIdentity, usize>,
     pub definition_lookup_units: HashSet<CodeUnit>,
-    pub import_statements: Vec<String>,
     pub imports: Vec<ImportInfo>,
     pub(crate) scala_exports: HashMap<CodeUnit, Vec<crate::analyzer::scala::ScalaExportInfo>>,
     /// Per-file Rust usage facts (exports, import targets, modules, identifier
@@ -1589,7 +1587,6 @@ impl ParsedFile {
             declarations: HashSet::default(),
             declaration_identities: HashMap::default(),
             definition_lookup_units: HashSet::default(),
-            import_statements: Vec::new(),
             imports: Vec::new(),
             scala_exports: HashMap::default(),
             rust_usage_facts: crate::analyzer::rust::facts::RustUsageFacts::default(),
@@ -2532,7 +2529,6 @@ where
             top_level_declarations: parsed.top_level_declarations,
             declarations: parsed.declarations,
             definition_lookup_units: parsed.definition_lookup_units,
-            import_statements: parsed.import_statements,
             imports: parsed.imports,
             scala_exports: parsed.scala_exports,
             rust_usage_facts: parsed.rust_usage_facts,
@@ -8729,10 +8725,29 @@ where
         self.adapter.extract_call_receiver(reference)
     }
 
+    /// The file's import statements in source order, one entry per statement.
+    ///
+    /// Since migration 0018 the store holds one row per import BINDING, and a
+    /// declaration that binds several names (`import { A, B } from 'm'`) gives
+    /// each binding the same snippet. Collapsing runs of equal adjacent
+    /// snippets restores "one entry per statement" without keeping a second
+    /// stored list: bindings of one declaration are always contiguous because
+    /// every adapter emits them together while walking that declaration.
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.fetch_file_state(file)
-            .map(|state| state.import_statements.clone())
-            .unwrap_or_default()
+        let Some(state) = self.fetch_file_state(file) else {
+            return Vec::new();
+        };
+        let mut statements: Vec<String> = Vec::with_capacity(state.imports.len());
+        for import in &state.imports {
+            if statements
+                .last()
+                .is_some_and(|last| last == &import.raw_snippet)
+            {
+                continue;
+            }
+            statements.push(import.raw_snippet.clone());
+        }
+        statements
     }
 
     fn structural_search_providers(
@@ -9909,7 +9924,6 @@ mod tests {
             top_level_declarations: Vec::new(),
             declarations: HashSet::default(),
             definition_lookup_units: HashSet::default(),
-            import_statements: Vec::new(),
             imports: Vec::new(),
             scala_exports: HashMap::default(),
             rust_usage_facts: crate::analyzer::rust::facts::RustUsageFacts::default(),
@@ -10885,6 +10899,7 @@ mod tests {
         state.imports.push(ImportInfo {
             raw_snippet: "import { value } from './value';".to_string(),
             is_wildcard: false,
+            is_global: false,
             identifier: Some("value".to_string()),
             alias: None,
             path: None,
@@ -11673,6 +11688,7 @@ mod tests {
             .map(|snippet| ImportInfo {
                 raw_snippet: (*snippet).to_string(),
                 is_wildcard: false,
+                is_global: false,
                 identifier: None,
                 alias: None,
                 path: None,

@@ -15,7 +15,7 @@ impl ImportAnalysisProvider for GoAnalyzer {
             if import.alias.as_deref() == Some("_") {
                 continue;
             }
-            let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+            let Some(path) = go_import_path(&import) else {
                 continue;
             };
             for target_file in self.matching_import_files(file, &path) {
@@ -66,7 +66,7 @@ impl ImportAnalysisProvider for GoAnalyzer {
         Some(
             imports
                 .iter()
-                .filter_map(|import| extract_go_import_path(&import.raw_snippet))
+                .filter_map(go_import_path)
                 .flat_map(|path| self.direct_import_files(file, &path))
                 .collect(),
         )
@@ -102,7 +102,7 @@ impl ImportAnalysisProvider for GoAnalyzer {
     ) -> bool {
         let target_pkg = self.go_package_of(target);
         imports.iter().any(|import| {
-            let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+            let Some(path) = go_import_path(import) else {
                 return false;
             };
             target_pkg.as_deref() == Some(path.as_str()) || dir_suffix_matches(target, &path)
@@ -128,7 +128,7 @@ impl GoAnalyzer {
             if alias == Some("_") {
                 continue;
             }
-            let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+            let Some(path) = go_import_path(&import) else {
                 continue;
             };
             let vendor_suffix = format!("/vendor/{path}");
@@ -349,16 +349,14 @@ fn path_suffixes(path: &str) -> impl Iterator<Item = &str> {
     suffixes.into_iter()
 }
 
-pub(super) fn extract_go_import_path(raw_import: &str) -> Option<String> {
-    let trimmed = raw_import.trim();
-    trimmed
-        .split_whitespace()
-        .next_back()
-        .map(|path| {
-            path.trim_matches('"')
-                .trim_matches('`')
-                .trim_matches('\'')
-                .to_string()
-        })
-        .filter(|path| !path.is_empty())
+/// The import path a Go `import` binds, from its structured path.
+///
+/// `parse_go_import_spec` splits the path literal on Go's own '/' separator, so
+/// rejoining the segments reproduces the literal's value exactly. This replaced
+/// re-scanning `raw_snippet` for its last whitespace-delimited word and
+/// trimming quote characters off it.
+pub(crate) fn go_import_path(import: &ImportInfo) -> Option<String> {
+    let path = import.path.as_ref()?;
+    let rendered = path.render_segments("/");
+    (!rendered.is_empty()).then_some(rendered)
 }

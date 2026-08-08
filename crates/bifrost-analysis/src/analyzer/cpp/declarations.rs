@@ -3198,10 +3198,10 @@ impl<'a> CppVisitor<'a> {
 
     fn visit_include(&mut self, node: Node<'_>) {
         let raw = normalize_cpp_whitespace(node_text(node, self.source));
-        self.parsed.import_statements.push(raw.clone());
         self.parsed.imports.push(ImportInfo {
             raw_snippet: raw,
             is_wildcard: false,
+            is_global: false,
             identifier: None,
             alias: None,
             path: None,
@@ -3336,14 +3336,21 @@ pub(crate) fn recover_quoted_includes(
         }
 
         let raw = normalize_cpp_whitespace(trimmed);
-        if parsed.import_statements.contains(&raw) {
+        // The tree-sitter walk already recorded every `#include` it could see;
+        // this line scan only recovers the ones a parse error hid, so skip a
+        // snippet that is already an import binding.
+        if parsed
+            .imports
+            .iter()
+            .any(|import| import.raw_snippet == raw)
+        {
             continue;
         }
 
-        parsed.import_statements.push(raw.clone());
         parsed.imports.push(ImportInfo {
             raw_snippet: raw,
             is_wildcard: false,
+            is_global: false,
             identifier: None,
             alias: None,
             path: None,

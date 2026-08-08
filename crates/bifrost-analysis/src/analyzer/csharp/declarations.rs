@@ -163,7 +163,6 @@ impl<'a> CSharpVisitor<'a> {
         if raw.is_empty() {
             return;
         }
-        self.parsed.import_statements.push(raw.clone());
         if let Some(info) = csharp_import_info_from_using_directive(node, self.source, raw) {
             self.parsed.imports.push(info);
         }
