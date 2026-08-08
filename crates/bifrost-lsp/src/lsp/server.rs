@@ -3006,9 +3006,14 @@ impl ServerState {
     }
 
     /// Withdraw published pack proof for the ecosystems whose declared
-    /// dependency inputs `changed` touches, then re-activate. Returns whether
-    /// anything was invalidated.
-    fn invalidate_dependency_packs_for(&mut self, changed: &BTreeSet<ProjectFile>) -> bool {
+    /// dependency inputs `changed` touches.
+    ///
+    /// The caller schedules a re-activation regardless, because the analyzer
+    /// generation the change installed already carries no proof. This exists
+    /// for the stronger case: a changed lockfile or manifest also invalidates
+    /// whatever a concurrent activation is about to publish from its previous
+    /// content.
+    fn invalidate_dependency_packs_for(&mut self, changed: &BTreeSet<ProjectFile>) {
         let mut ecosystems = BTreeSet::new();
         for file in changed {
             let Some(name) = file.rel_path().file_name().and_then(|name| name.to_str()) else {
@@ -3017,10 +3022,10 @@ impl ServerState {
             ecosystems.extend(dependency_packs::ecosystems_for_dependency_input(name));
         }
         if ecosystems.is_empty() {
-            return false;
+            return;
         }
         let ecosystems = ecosystems.into_iter().collect::<Vec<_>>();
-        self.workspace.invalidate_dependency_pack_state(&ecosystems)
+        self.workspace.invalidate_dependency_pack_state(&ecosystems);
     }
 
     fn register_runtime_configuration(&mut self, connection: &Connection) -> Result<(), String> {
