@@ -20,7 +20,9 @@
 use crate::imports::{
     npm_package_of_module_specifier, require_call_module_specifier, resolve_js_ts_module_specifier,
 };
-use crate::parse::js_ts_tree_sitter_language_for_file;
+use crate::parse::{
+    FLOW_UNSUPPORTED_DETAIL, flow_dialect_blocks_extraction, js_ts_tree_sitter_language_for_file,
+};
 use crate::syntax::{
     compute_import_binder, is_declaration_identifier, is_object_in_member_expression,
     is_property_key_in_member, slice,
@@ -140,24 +142,28 @@ pub fn collect_js_ts_semantic_diagnostics(
         );
         return report;
     };
+    let root = tree.root_node();
     let mut parse_errors = Vec::new();
-    collect_parse_errors(tree.root_node(), &mut parse_errors);
+    collect_parse_errors(root, &mut parse_errors);
     if !parse_errors.is_empty() {
         // A malformed file's scope surface is not the one the author meant.
         // Parse errors travel the separate LSP path; the semantic report
         // records that this file could not be judged, so an empty result is
-        // not mistaken for clean.
+        // not mistaken for clean. A Flow file says *why* no JS/TS grammar
+        // could read it, which is a different fact from a typo (#1786).
+        let detail = if flow_dialect_blocks_extraction(file, root, source) {
+            FLOW_UNSUPPORTED_DETAIL.to_string()
+        } else {
+            "JS/TS source has parse errors".to_string()
+        };
         report.push_incomplete(
             None,
-            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
-                detail: "JS/TS source has parse errors".to_string(),
-            }],
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics { detail }],
         );
         return report;
     }
 
     let line_starts = compute_line_starts(source);
-    let root = tree.root_node();
     let import_binder = compute_import_binder(source, &tree);
     let known_imports = import_binder
         .names()
