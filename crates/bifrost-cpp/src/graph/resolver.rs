@@ -1066,7 +1066,7 @@ impl<'a> VisibilityIndex<'a> {
     ) -> Self {
         let include_targets = cpp.include_target_index();
         let VisibilityData {
-            visible_by_file,
+            mut visible_by_file,
             visible_source_files_by_root,
         } = build_visibility_data(
             roots,
@@ -1082,6 +1082,7 @@ impl<'a> VisibilityIndex<'a> {
             },
             |file| analyzer.declarations(file),
         );
+        extend_with_out_of_line_owner_bindings(cpp, &mut visible_by_file);
         let mut global_field_internal_linkage = HashMap::default();
         let visible_by_identifier = build_visible_identifier_index(
             analyzer,
@@ -5235,6 +5236,52 @@ where
     VisibilityData {
         visible_by_file,
         visible_source_files_by_root,
+    }
+}
+
+/// Admit the class that an out-of-line definition proves is in scope.
+///
+/// `Owner::member(...) { ... }` in a file is structured proof that `Owner`
+/// names a class-like entity in that file's scope: a member declaration can
+/// live in a file other than its class's only when it is written out of line.
+/// A file a build concatenates rather than compiles carries no `#include` edge
+/// to the header declaring `Owner` -- google/wuffs
+/// `internal/cgen/auxiliary/image.cc` defines
+/// `DecodeImageResult::DecodeImageResult` and never includes `image.hh` -- so
+/// every unqualified member and constructor reference in it had no candidate at
+/// all (#1832).
+///
+/// The evidence is the indexed declaration's own owner name, taken from its
+/// `FqName`, so this stays a structured answer rather than a text fallback.
+/// Only an owner the file cannot already see is admitted: that is what keeps a
+/// header declaring its own class from additionally seeing every same-named
+/// class in the workspace, and it makes the pass free for the ordinary file
+/// whose owners are all visible.
+fn extend_with_out_of_line_owner_bindings(
+    cpp: &dyn CppSource,
+    visible_by_file: &mut HashMap<ProjectFile, HashSet<CodeUnit>>,
+) {
+    for (file, visible) in visible_by_file.iter_mut() {
+        // The include-closure walk seeds every root with its own declarations,
+        // so the file's members are already here; re-reading them from the
+        // analyzer would pay for the same declaration set twice.
+        let mut unseen_owners: HashSet<String> = visible
+            .iter()
+            .filter(|unit| unit.source() == file && (unit.is_function() || unit.is_field()))
+            .filter_map(brokk_bifrost_core::analyzer::default_parent_fq_name)
+            .collect();
+        if unseen_owners.is_empty() {
+            continue;
+        }
+        for unit in visible.iter().filter(|unit| unit.is_class()) {
+            unseen_owners.remove(&unit.fq_name());
+        }
+        let admitted = unseen_owners
+            .iter()
+            .flat_map(|owner| cpp.definitions(owner))
+            .filter(CodeUnit::is_class)
+            .collect::<Vec<_>>();
+        visible.extend(admitted);
     }
 }
 
