@@ -2928,13 +2928,35 @@ class Spec extends FixtureTestSuite {
         assert_eq!(result["status"], "resolved", "{value}");
         assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
     }
-    for result in &results[2..] {
-        assert_eq!(result["status"], "no_definition", "{value}");
-    }
+    // A constructed argument that matches no overload is a proven absence.
+    assert_eq!(results[2]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[2]["diagnostics"][0]["kind"], "no_applicable_scala_typed_overload",
+        "{value}"
+    );
+    // An argument whose type cannot be constructed leaves the selection
+    // undecided, and #1850 answers an undecided selection with the contenders
+    // rather than with an empty verdict.
+    assert_eq!(results[3]["status"], "ambiguous", "{value}");
+    let mut undecided = results[3]["definitions"]
+        .as_array()
+        .expect("undecided overload candidates")
+        .iter()
+        .map(|definition| definition["fqn"].as_str().expect("candidate fqn"))
+        .collect::<Vec<_>>();
+    undecided.sort();
+    assert_eq!(
+        undecided,
+        [
+            "app.FixtureTestSuite.withFixture",
+            "app.TestSuite.withFixture"
+        ],
+        "{value}"
+    );
 }
 
 #[test]
-fn scala_inherited_same_arity_overloads_fail_closed_for_duplicate_argument_types() {
+fn scala_inherited_same_arity_overloads_report_contenders_for_duplicate_argument_types() {
     let source = r#"package app
 import duplicate.DuplicateArg
 trait NoArgTest
@@ -2966,7 +2988,25 @@ class Spec extends FixtureTestSuite {
         &json!({"references": [location_in("app/Fixture.scala", source, start)]}).to_string(),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    // The argument type is not constructible, so no overload can be selected -
+    // but both overloads are proven declarations of the called name, and #1850
+    // reports them instead of an empty verdict.
+    assert_eq!(value["results"][0]["status"], "ambiguous", "{value}");
+    let mut undecided = value["results"][0]["definitions"]
+        .as_array()
+        .expect("undecided overload candidates")
+        .iter()
+        .map(|definition| definition["fqn"].as_str().expect("candidate fqn"))
+        .collect::<Vec<_>>();
+    undecided.sort();
+    assert_eq!(
+        undecided,
+        [
+            "app.FixtureTestSuite.withFixture",
+            "app.TestSuite.withFixture"
+        ],
+        "{value}"
+    );
 }
 
 #[test]

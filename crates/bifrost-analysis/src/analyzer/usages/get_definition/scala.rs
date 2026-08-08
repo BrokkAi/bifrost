@@ -31,13 +31,14 @@ use brokk_bifrost_jvm::scala::graph::resolver::{
 };
 use brokk_bifrost_jvm::scala::graph::syntax::{
     ScalaCallArgumentListKind, ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole,
-    ScalaCallableSiteRole, ScalaCallableSourceAlternative, ScalaFunctionParameterShape,
-    ScalaParameterListKind, ScalaParameterTypeIdentity, ScalaQualifiedStableTypeRole,
-    applied_expression_for_reference, call_arities_for_reference, call_site_shape_for_reference,
-    is_extractor_reference, is_infix_type_operator_reference, is_scala_case_pattern_binder,
-    is_scala_class_reference, is_scala_named_argument_assignment, named_argument_invocation_owner,
-    qualified_stable_type_reference, scala_callable_alternative_is_candidate,
-    scala_callable_alternative_matches, scala_pattern_binder_names, scala_source_facts,
+    ScalaCallableSiteRole, ScalaCallableSourceAlternative, ScalaDeclaredResult,
+    ScalaFunctionParameterShape, ScalaParameterListKind, ScalaParameterTypeIdentity,
+    ScalaQualifiedStableTypeRole, applied_expression_for_reference, call_arities_for_reference,
+    call_site_shape_for_reference, is_extractor_reference, is_infix_type_operator_reference,
+    is_scala_case_pattern_binder, is_scala_class_reference, is_scala_named_argument_assignment,
+    named_argument_invocation_owner, qualified_stable_type_reference,
+    scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
+    scala_pattern_binder_names, scala_source_facts,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -55,6 +56,7 @@ struct ForwardScalaExtensionMethod {
 struct ForwardScalaCallableAlternative {
     role: ScalaCallableRole,
     shape: Vec<ScalaCallableParameterList>,
+    result: ScalaDeclaredResult,
     parameter_types: Vec<Vec<Option<ScalaParameterTypeIdentity>>>,
     parameter_function_shapes: Vec<Vec<Option<ScalaFunctionParameterShape>>>,
 }
@@ -6264,6 +6266,7 @@ fn scala_forward_method_value_arity(
             scala_callable_alternative_matches(
                 alternative.role,
                 &alternative.shape,
+                alternative.result,
                 Some(&actual),
                 ScalaCallableSiteRole::Ordinary,
                 true,
@@ -6635,6 +6638,10 @@ fn resolve_scala_call(
             {
                 return candidates_outcome(vec![unit]);
             }
+            // Set when the enclosing owner's supertype closure is not fully
+            // indexed here. That is a last-resort answer, never a pre-emption:
+            // an unindexed parent cannot hide a target this workspace owns.
+            let mut incomplete_hierarchy_owner = None;
             if function.kind() == "identifier"
                 && let Some(owner) = scala_enclosing_class(
                     ctx.analyzer,
@@ -6663,13 +6670,11 @@ fn resolve_scala_call(
                             ),
                         );
                     }
-                    ScalaTypedOverloadResolution::Ambiguous => {
-                        return no_definition(
-                            "ambiguous_scala_typed_overload",
-                            format!(
-                                "`{name}` overloads cannot be selected from exact argument type identity"
-                            ),
-                        );
+                    ScalaTypedOverloadResolution::Ambiguous(candidates) => {
+                        return candidates_outcome(candidates);
+                    }
+                    ScalaTypedOverloadResolution::IncompleteHierarchy => {
+                        incomplete_hierarchy_owner = Some(owner.clone());
                     }
                     ScalaTypedOverloadResolution::NotNeeded => {}
                 }
@@ -6839,6 +6844,15 @@ fn resolve_scala_call(
                     name,
                     call_shape.as_ref(),
                 );
+            }
+            if let Some(owner) = incomplete_hierarchy_owner {
+                // gated upstream: every workspace tier above has already failed
+                // to bind `name`, and the owner's supertype closure is provably
+                // not fully indexed, so the declaration can only be outside it.
+                return boundary_unchecked(format!(
+                    "`{name}` may be declared by a supertype of `{}` that is not indexed in this workspace",
+                    owner.fq_name()
+                ));
             }
             gated_boundary(
                 || !scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, name),
@@ -7089,6 +7103,7 @@ fn resolve_scala_constructor(
             &[ScalaCallableParameterList::explicit(
                 crate::analyzer::CallableArity::exact(0),
             )],
+            ScalaDeclaredResult::UNDECLARED,
             call_shape.as_ref(),
             ScalaCallableSiteRole::ExplicitConstruction,
             false,
@@ -7098,6 +7113,7 @@ fn resolve_scala_constructor(
             scala_callable_alternative_matches(
                 alternative.role,
                 &alternative.shape,
+                alternative.result,
                 call_shape.as_ref(),
                 ScalaCallableSiteRole::ExplicitConstruction,
                 false,
@@ -7684,7 +7700,16 @@ enum ScalaTypedOverloadResolution {
     NotNeeded,
     Found(Vec<CodeUnit>),
     NoApplicable,
-    Ambiguous,
+    /// Overload selection ran over two or more visible declarations and could
+    /// not choose. The contenders travel with the verdict: the caller answers
+    /// with them, never with an empty ambiguity.
+    Ambiguous(Vec<CodeUnit>),
+    /// The enclosing owner has a supertype this workspace cannot resolve to a
+    /// single indexed declaration, and no visible level declared the member.
+    /// The declaration may live in the part of the hierarchy that is missing,
+    /// so the answer is a boundary - but only once every other tier has failed,
+    /// because an unindexed parent never hides a target the workspace does own.
+    IncompleteHierarchy,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -7797,9 +7822,15 @@ fn scala_exact_owner_typed_overload_resolution(
         return ScalaTypedOverloadResolution::NotNeeded;
     }
 
+    // An ancestor the workspace cannot walk carries no information about the
+    // overloads it CAN see, so neither an unindexed nor a multiply declared
+    // supertype ends this walk. Collect the levels that do resolve, so the
+    // `callable_count < 2` guard below sees the real candidates and the
+    // ordinary fallback chain still gets its turn.
     let mut levels = Vec::new();
     let mut level = vec![owner.clone()];
     let mut seen = HashSet::default();
+    let mut unindexed_supertype = false;
     while !level.is_empty() {
         let mut candidates = Vec::new();
         let mut next = Vec::new();
@@ -7815,9 +7846,14 @@ fn scala_exact_owner_typed_overload_resolution(
             ));
             match ctx.direct_ancestors_for_owner(&current) {
                 ScalaDirectAncestorResolution::Resolved(ancestors) => next.extend(ancestors),
-                ScalaDirectAncestorResolution::Ambiguous => {
-                    return ScalaTypedOverloadResolution::Ambiguous;
+                ScalaDirectAncestorResolution::Incomplete(ancestors) => {
+                    next.extend(ancestors);
+                    unindexed_supertype = true;
                 }
+                // A multiply declared supertype is not a boundary: the
+                // workspace holds those declarations, and the chain below
+                // reports the conflict where it can name it.
+                ScalaDirectAncestorResolution::Ambiguous => {}
             }
         }
         sort_units(&mut candidates);
@@ -7828,26 +7864,36 @@ fn scala_exact_owner_typed_overload_resolution(
 
     let callable_count = levels.iter().map(Vec::len).sum::<usize>();
     if callable_count < 2 {
-        return ScalaTypedOverloadResolution::NotNeeded;
+        // Fewer than two visible overloads is not an overload problem. A walk
+        // that saw nothing at all and could not see the whole hierarchy is a
+        // separate, honest answer the caller only uses as a last resort.
+        return if callable_count == 0 && unindexed_supertype {
+            ScalaTypedOverloadResolution::IncompleteHierarchy
+        } else {
+            ScalaTypedOverloadResolution::NotNeeded
+        };
     }
+    // Every remaining verdict carries the overloads it could not choose between.
+    // An answer that lists nothing gives a caller nothing to act on (#1811),
+    // and these candidates are proven declarations of the called name.
     let Some(arguments) = scala_exact_constructed_call_arguments(ctx, resolver, call) else {
-        return ScalaTypedOverloadResolution::Ambiguous;
+        return ScalaTypedOverloadResolution::Ambiguous(levels.concat());
     };
 
     for candidates in levels {
         let mut matching = Vec::new();
         let mut unknown = false;
-        for candidate in candidates {
+        for candidate in &candidates {
             match scala_callable_matches_constructed_arguments(
-                ctx, &candidate, call_shape, &arguments,
+                ctx, candidate, call_shape, &arguments,
             ) {
-                ScalaTypedCandidateMatch::Match => matching.push(candidate),
+                ScalaTypedCandidateMatch::Match => matching.push(candidate.clone()),
                 ScalaTypedCandidateMatch::Mismatch => {}
                 ScalaTypedCandidateMatch::Unknown => unknown = true,
             }
         }
         if unknown {
-            return ScalaTypedOverloadResolution::Ambiguous;
+            return ScalaTypedOverloadResolution::Ambiguous(candidates);
         }
         sort_units(&mut matching);
         matching.dedup();
@@ -7859,7 +7905,7 @@ fn scala_exact_owner_typed_overload_resolution(
             return if physical_owners.len() == 1 {
                 ScalaTypedOverloadResolution::Found(matching)
             } else {
-                ScalaTypedOverloadResolution::Ambiguous
+                ScalaTypedOverloadResolution::Ambiguous(matching)
             };
         }
     }
@@ -7933,6 +7979,7 @@ fn scala_callable_matches_constructed_arguments(
         scala_callable_alternative_is_candidate(
             alternative.role,
             &alternative.shape,
+            alternative.result,
             call_shape,
             ScalaCallableSiteRole::Ordinary,
         )
@@ -8038,6 +8085,7 @@ fn scala_exact_subtype_relation(
 ) -> ScalaTypedCandidateMatch {
     let mut stack = vec![actual.clone()];
     let mut seen = HashSet::default();
+    let mut incomplete = false;
     while let Some(current) = stack.pop() {
         if !seen.insert(current.clone()) {
             continue;
@@ -8047,10 +8095,20 @@ fn scala_exact_subtype_relation(
         }
         match ctx.direct_ancestors_for_owner(&current) {
             ScalaDirectAncestorResolution::Resolved(ancestors) => stack.extend(ancestors),
+            // The resolved part of the hierarchy can still PROVE the relation,
+            // so keep walking; only an exhausted walk has to admit it did not
+            // see everything.
+            ScalaDirectAncestorResolution::Incomplete(ancestors) => {
+                stack.extend(ancestors);
+                incomplete = true;
+            }
             ScalaDirectAncestorResolution::Ambiguous => {
                 return ScalaTypedCandidateMatch::Unknown;
             }
         }
+    }
+    if incomplete {
+        return ScalaTypedCandidateMatch::Unknown;
     }
     ScalaTypedCandidateMatch::Mismatch
 }
@@ -8358,7 +8416,8 @@ fn scala_exact_owner_member_candidate_units(
     }
 
     let mut level = match ctx.direct_ancestors_for_owner(owner) {
-        ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
+        ScalaDirectAncestorResolution::Resolved(ancestors)
+        | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
         ScalaDirectAncestorResolution::Ambiguous => {
             return ScalaExactMemberResolution::Ambiguous;
         }
@@ -8383,7 +8442,8 @@ fn scala_exact_owner_member_candidate_units(
             }
             matches.extend(found);
             match ctx.direct_ancestors_for_owner(&ancestor) {
-                ScalaDirectAncestorResolution::Resolved(ancestors) => {
+                ScalaDirectAncestorResolution::Resolved(ancestors)
+                | ScalaDirectAncestorResolution::Incomplete(ancestors) => {
                     if let Some(state) = member_trace.as_mut() {
                         state.record_supertypes(ctx.scala, &ancestor, &ancestors);
                     }
@@ -8519,6 +8579,7 @@ fn scala_forward_callable_alternatives(
         .map(|facts| ForwardScalaCallableAlternative {
             role: facts.role,
             shape: facts.shape.clone(),
+            result: facts.result,
             parameter_types: facts
                 .parameter_type_paths
                 .iter()
@@ -8607,6 +8668,7 @@ fn scala_filter_callable_units(
                             scala_callable_alternative_is_candidate(
                                 alternative.role,
                                 &alternative.shape,
+                                alternative.result,
                                 call_shape,
                                 site_role,
                             )
@@ -8621,6 +8683,7 @@ fn scala_filter_callable_units(
                 return usize::from(scala_callable_alternative_is_candidate(
                     scala_fallback_callable_role(scala, unit),
                     &fallback,
+                    ScalaDeclaredResult::UNDECLARED,
                     call_shape,
                     site_role,
                 ));
@@ -8760,6 +8823,7 @@ fn scala_member_unit_applies(
             scala_callable_alternative_matches(
                 alternative.role,
                 &alternative.shape,
+                alternative.result,
                 call_shape,
                 site_role,
                 unique_callable,
@@ -8774,6 +8838,7 @@ fn scala_member_unit_applies(
     scala_callable_alternative_matches(
         scala_fallback_callable_role(scala, unit),
         &fallback,
+        ScalaDeclaredResult::UNDECLARED,
         call_shape,
         site_role,
         unique_callable,
@@ -8960,8 +9025,13 @@ fn scala_wildcard_imported_member_outcome(
     call_shape: Option<&ScalaCallSiteShape>,
 ) -> Option<DefinitionLookupOutcome> {
     let file_package = scala_package_name_of(ctx.scala, ctx.file).unwrap_or_default();
-    let mut contributing_imports = 0_usize;
-    let mut candidates = Vec::new();
+    // One entry per distinct exporter, identified by the member units the
+    // import resolves to (#1852). Two spellings of one target
+    // (`import UciCharPair.implementation.*` beside `import implementation.*`)
+    // and the same statement repeated in sibling templates both land on the
+    // same units, and a name exported by one object is not ambiguous however
+    // many times the file imports that object.
+    let mut exporters: Vec<Vec<CodeUnit>> = Vec::new();
     for import in ctx.scala.import_info_of(ctx.file) {
         if !import.is_wildcard {
             continue;
@@ -8994,7 +9064,8 @@ fn scala_wildcard_imported_member_outcome(
             .as_ref()
             .map(|structured_path| structured_path.segments.as_slice())
             .unwrap_or(&[]);
-        let import_candidates = scala_wildcard_imported_member_units(
+        let mut import_candidates = scala_wildcard_imported_member_units(
+            ctx.scala,
             ctx.support,
             &path,
             &file_package,
@@ -9006,27 +9077,60 @@ fn scala_wildcard_imported_member_outcome(
         .filter(|unit| !ctx.scala.is_type_alias(unit))
         .filter(|unit| scala_member_candidate_applies(ctx, unit, call_shape, false))
         .collect::<Vec<_>>();
-        if !import_candidates.is_empty() {
-            contributing_imports += 1;
-            candidates.extend(import_candidates);
+        if import_candidates.is_empty() {
+            continue;
         }
-        if contributing_imports > 1 {
-            return Some(no_definition(
-                "ambiguous_scala_wildcard_import",
-                format!("Scala wildcard imports expose multiple `{member}` definitions"),
-            ));
+        sort_units(&mut import_candidates);
+        import_candidates.dedup();
+        if !exporters.contains(&import_candidates) {
+            exporters.push(import_candidates);
         }
     }
-    sort_units(&mut candidates);
-    candidates.dedup();
-    if candidates.is_empty() {
-        None
-    } else {
-        Some(candidates_outcome(candidates))
+    if exporters.len() > 1 {
+        return Some(no_definition(
+            "ambiguous_scala_wildcard_import",
+            format!("Scala wildcard imports expose multiple `{member}` definitions"),
+        ));
     }
+    exporters.pop().map(candidates_outcome)
+}
+
+/// Whether a wildcard import written over `base` exports the declarations
+/// indexed directly under that undecorated name.
+///
+/// `import X._` names a *term*. When `X` also names a Scala class or trait, the
+/// term is that type's companion object, whose members carry the `$` decoration
+/// (`X$.member`); the class's own members need an instance and are not exported.
+/// Before #1856 the `$`-blind spelling let `import Conf._` hand out the case
+/// class's constructor parameters as bare names.
+///
+/// Everything else that legitimately lives under the undecorated name still
+/// exports: a package, a Scala 3 `enum` (whose cases are indexed as `Color.Red`)
+/// and a Java class reached from Scala (whose statics are indexed the same way).
+fn scala_wildcard_base_exports_undecorated_members(
+    scala: &ScalaAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    base: &str,
+) -> bool {
+    let types: Vec<CodeUnit> = support
+        .fqn(base)
+        .into_iter()
+        .filter(|unit| {
+            unit.is_class()
+                && unit.fq_name() == base
+                && brokk_bifrost_core::analyzer::common::language_for_target(unit)
+                    == Language::Scala
+        })
+        .collect();
+    if types.is_empty() {
+        return true;
+    }
+    let project_types = scala.project_types();
+    types.iter().all(|unit| project_types.is_enum(scala, unit))
 }
 
 fn scala_wildcard_imported_member_units(
+    scala: &ScalaAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     path: &str,
     file_package: &str,
@@ -9036,17 +9140,25 @@ fn scala_wildcard_imported_member_units(
 ) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
     for imported_fqn in import_candidate_fq_names(path, file_package) {
+        let singleton_fqn = format!("{}$", imported_fqn.trim_end_matches('$'));
+        candidates.extend(
+            support
+                .fqn_direct_children(&singleton_fqn)
+                .into_iter()
+                .filter(|unit| unit.identifier() == member),
+        );
+        if !scala_wildcard_base_exports_undecorated_members(scala, support, &imported_fqn) {
+            continue;
+        }
         candidates.extend(
             support
                 .fqn(&format!("{imported_fqn}.{member}"))
                 .into_iter()
                 .filter(|unit| unit.identifier() == member),
         );
-    }
-    for owner_fqn in import_candidate_owner_fq_names(path, file_package) {
         candidates.extend(
             support
-                .fqn_direct_children(&owner_fqn)
+                .fqn_direct_children(&imported_fqn)
                 .into_iter()
                 .filter(|unit| unit.identifier() == member),
         );
@@ -9054,16 +9166,19 @@ fn scala_wildcard_imported_member_units(
     if !segments.is_empty() {
         for tier in scala_owner_qualified_import_candidate_tiers(enclosing_owners, segments) {
             for candidate in tier {
-                candidates.extend(
-                    support
-                        .fqn(&format!("{candidate}.{member}"))
-                        .into_iter()
-                        .filter(|unit| unit.identifier() == member),
-                );
                 let owner_fqn = format!("{}$", candidate.trim_end_matches('$'));
                 candidates.extend(
                     support
                         .fqn_direct_children(&owner_fqn)
+                        .into_iter()
+                        .filter(|unit| unit.identifier() == member),
+                );
+                if !scala_wildcard_base_exports_undecorated_members(scala, support, &candidate) {
+                    continue;
+                }
+                candidates.extend(
+                    support
+                        .fqn(&format!("{candidate}.{member}"))
                         .into_iter()
                         .filter(|unit| unit.identifier() == member),
                 );
@@ -9126,7 +9241,8 @@ fn scala_ancestor_owners(
     let mut discovered = HashSet::from_iter([owner.fq_name()]);
     let mut ancestors = Vec::new();
     while let Some((current, depth)) = queue.pop_front() {
-        let ScalaDirectAncestorResolution::Resolved(direct) =
+        let (ScalaDirectAncestorResolution::Resolved(direct)
+        | ScalaDirectAncestorResolution::Incomplete(direct)) =
             scala_forward_direct_ancestor_resolution(scala, support, &current)
         else {
             break;
@@ -9157,6 +9273,14 @@ fn scala_forward_direct_ancestor_resolution(
     };
     let resolver = scala_name_resolver_for_unit(scala, support, owner);
     let mut ancestors = Vec::new();
+    // `extends Actor`, `extends Serializable`, `extends AnyVal`: the supertype
+    // is real but nothing in this workspace declares it. It contributes no
+    // member a caller could ever name here, so it does not make the owner's
+    // hierarchy AMBIGUOUS - it makes it INCOMPLETE. The distinction matters:
+    // ambiguity must fail closed because the workspace does hold the answer,
+    // while incompleteness must not, or one unindexed library type silences
+    // every member and type lookup made from inside the class (#1849, #1851).
+    let mut unindexed_supertype = false;
     for path in facts.supertype_lookup_paths {
         let identity = match resolver
             .resolve_explicit_owner_segments(path.segments(), ScalaOwnerKind::Class)
@@ -9186,6 +9310,10 @@ fn scala_forward_direct_ancestor_resolution(
                         sort_units(&mut same_source);
                         same_source.dedup();
                         let [ancestor] = same_source.as_slice() else {
+                            // The resolver proved the name has more than one
+                            // indexed declaration and this source does not
+                            // single one out. The workspace holds the
+                            // supertype; it cannot say which one.
                             return ScalaDirectAncestorResolution::Ambiguous;
                         };
                         ancestors.push(ancestor.clone());
@@ -9196,7 +9324,8 @@ fn scala_forward_direct_ancestor_resolution(
                     }
                     ScalaNameResolution::MissingExplicitImport => continue,
                     ScalaNameResolution::Unresolved => {
-                        return ScalaDirectAncestorResolution::Ambiguous;
+                        unindexed_supertype = true;
+                        continue;
                     }
                 }
             }
@@ -9205,7 +9334,11 @@ fn scala_forward_direct_ancestor_resolution(
     }
     sort_units(&mut ancestors);
     ancestors.dedup();
-    ScalaDirectAncestorResolution::Resolved(ancestors)
+    if unindexed_supertype {
+        ScalaDirectAncestorResolution::Incomplete(ancestors)
+    } else {
+        ScalaDirectAncestorResolution::Resolved(ancestors)
+    }
 }
 
 fn scala_direct_member_candidate_units(
@@ -9948,18 +10081,13 @@ fn scala_is_direct_member_value_definition_bounded(
         if !session.scope_step() {
             return None;
         }
-        match ancestor.kind() {
-            "function_definition"
-            | "block"
-            | "block_expression"
-            | "indented_block"
-            | "case_clause"
-            | "lambda_expression" => return Some(false),
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
-                return Some(true);
-            }
-            _ => current = ancestor.parent(),
+        if SCALA_LOCAL_DEFINITION_BOUNDARIES.contains(&ancestor.kind()) {
+            return Some(false);
         }
+        if SCALA_TEMPLATE_MEMBER_BOUNDARIES.contains(&ancestor.kind()) {
+            return Some(true);
+        }
+        current = ancestor.parent();
     }
     Some(false)
 }
@@ -9973,18 +10101,13 @@ fn scala_is_local_function_definition_bounded(
         if !session.scope_step() {
             return None;
         }
-        match ancestor.kind() {
-            "function_definition"
-            | "block"
-            | "block_expression"
-            | "indented_block"
-            | "case_clause"
-            | "lambda_expression" => return Some(true),
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
-                return Some(false);
-            }
-            _ => current = ancestor.parent(),
+        if SCALA_LOCAL_DEFINITION_BOUNDARIES.contains(&ancestor.kind()) {
+            return Some(true);
         }
+        if SCALA_TEMPLATE_MEMBER_BOUNDARIES.contains(&ancestor.kind()) {
+            return Some(false);
+        }
+        current = ancestor.parent();
     }
     Some(false)
 }
@@ -10473,7 +10596,8 @@ fn scala_exact_owner_namespace_children(
     }
 
     let mut level = match ctx.direct_ancestors_for_owner(owner) {
-        ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
+        ScalaDirectAncestorResolution::Resolved(ancestors)
+        | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
         ScalaDirectAncestorResolution::Ambiguous => {
             return ScalaExactMemberResolution::Ambiguous;
         }
@@ -10490,7 +10614,8 @@ fn scala_exact_owner_namespace_children(
                 ctx, &ancestor, name, None,
             ));
             match ctx.direct_ancestors_for_owner(&ancestor) {
-                ScalaDirectAncestorResolution::Resolved(ancestors) => next.extend(ancestors),
+                ScalaDirectAncestorResolution::Resolved(ancestors)
+                | ScalaDirectAncestorResolution::Incomplete(ancestors) => next.extend(ancestors),
                 ScalaDirectAncestorResolution::Ambiguous => {
                     return ScalaExactMemberResolution::Ambiguous;
                 }
@@ -10874,6 +10999,7 @@ fn scala_imported_member_shadows_bare_call(
                 .map(|structured_path| structured_path.segments.as_slice())
                 .unwrap_or(&[]);
             if scala_wildcard_imported_member_units(
+                scala,
                 support,
                 &path,
                 &file_package,
@@ -11500,21 +11626,46 @@ fn scala_seed_typed(
     seed_scala_binding(name, resolved, None, bindings);
 }
 
+/// The ancestor kinds that end the "is this declaration a template member or a
+/// local?" walk with *member*.
+///
+/// `template_body` and `instance_expression` carry the anonymous class of
+/// `new T { ... }`, which owns its members exactly like a named template does.
+/// Without them the walk sailed past the anonymous body and reached whatever
+/// block the layout happened to wrap the `new` in. A continuation-line
+/// `val x =` followed by an indented `new T { ... }` gets an `indented_block`,
+/// and a same-line one does not, so the same code was called local or not
+/// depending on where the line broke (#1857). Modelling those members is issue
+/// #1860; this only keeps the boundary honest and keeps them out of the
+/// enclosing scope.
+const SCALA_TEMPLATE_MEMBER_BOUNDARIES: [&str; 6] = [
+    "class_definition",
+    "object_definition",
+    "trait_definition",
+    "enum_definition",
+    "template_body",
+    "instance_expression",
+];
+
+const SCALA_LOCAL_DEFINITION_BOUNDARIES: [&str; 6] = [
+    "function_definition",
+    "block",
+    "block_expression",
+    "indented_block",
+    "case_clause",
+    "lambda_expression",
+];
+
 fn scala_is_direct_member_definition(node: Node<'_>) -> bool {
     let mut current = node.parent();
     while let Some(ancestor) = current {
-        match ancestor.kind() {
-            "function_definition"
-            | "block"
-            | "block_expression"
-            | "indented_block"
-            | "case_clause"
-            | "lambda_expression" => return false,
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
-                return true;
-            }
-            _ => current = ancestor.parent(),
+        if SCALA_LOCAL_DEFINITION_BOUNDARIES.contains(&ancestor.kind()) {
+            return false;
         }
+        if SCALA_TEMPLATE_MEMBER_BOUNDARIES.contains(&ancestor.kind()) {
+            return true;
+        }
+        current = ancestor.parent();
     }
     false
 }
@@ -11526,18 +11677,13 @@ fn scala_is_direct_member_value_definition(node: Node<'_>) -> bool {
 fn scala_is_local_function_definition(node: Node<'_>) -> bool {
     let mut current = node.parent();
     while let Some(ancestor) = current {
-        match ancestor.kind() {
-            "function_definition"
-            | "block"
-            | "block_expression"
-            | "indented_block"
-            | "case_clause"
-            | "lambda_expression" => return true,
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
-                return false;
-            }
-            _ => current = ancestor.parent(),
+        if SCALA_LOCAL_DEFINITION_BOUNDARIES.contains(&ancestor.kind()) {
+            return true;
         }
+        if SCALA_TEMPLATE_MEMBER_BOUNDARIES.contains(&ancestor.kind()) {
+            return false;
+        }
+        current = ancestor.parent();
     }
     false
 }

@@ -1,6 +1,7 @@
 //! Scala language knowledge.
 
 pub mod adapter;
+pub mod bare_name_scopes;
 pub mod clones;
 pub mod declarations;
 pub mod diagnostics;

@@ -74,10 +74,21 @@ pub enum ScalaQualifiedTypeRootResolution {
     AuthoritativeMiss,
 }
 
+/// Outcome of resolving one owner's direct supertypes to exact declarations.
+///
+/// The two negative outcomes are not the same thing, and conflating them was
+/// the #1849/#1851 defect. `Ambiguous` means a supertype NAME has more than one
+/// indexed declaration: the workspace holds the member, it just cannot say
+/// which declaration owns it, so a walk that needs that level must fail closed.
+/// `Incomplete` means a supertype is not indexed here at all: it can never
+/// contribute a member this workspace could name, so a walk carries on over the
+/// ancestors it did resolve. Only a caller that must report why an answer is
+/// unproven needs to tell `Incomplete` from `Resolved`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScalaDirectAncestorResolution {
     Resolved(Vec<CodeUnit>),
     Ambiguous,
+    Incomplete(Vec<CodeUnit>),
 }
 
 /// Resolve an unqualified Scala type name against exact enclosing owners.
@@ -115,7 +126,8 @@ where
         }
 
         let mut level = match direct_ancestors(&owner) {
-            ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
+            ScalaDirectAncestorResolution::Resolved(ancestors)
+            | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
             ScalaDirectAncestorResolution::Ambiguous => {
                 return ScalaTypeNamespaceResolution::Ambiguous;
             }
@@ -131,7 +143,10 @@ where
                 }
                 matches.extend(direct_members(&ancestor, name));
                 match direct_ancestors(&ancestor) {
-                    ScalaDirectAncestorResolution::Resolved(ancestors) => next.extend(ancestors),
+                    ScalaDirectAncestorResolution::Resolved(ancestors)
+                    | ScalaDirectAncestorResolution::Incomplete(ancestors) => {
+                        next.extend(ancestors)
+                    }
                     ScalaDirectAncestorResolution::Ambiguous => next_is_ambiguous = true,
                 }
             }

@@ -37,19 +37,20 @@ use super::resolver::{
 };
 use super::syntax::{
     ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole, ScalaCallableSiteRole,
-    ScalaCallableUsePolicy, ScalaFunctionParameterShape, ScalaGenericOwnerSourceFacts,
-    ScalaImportContextIndex, ScalaMethodValueContext, ScalaPackageContextIndex,
-    ScalaParameterTypeIdentity, ScalaQualifiedStableTypeRole, ScalaSourceFacts,
-    ScalaTypeExpressionPath, call_arities_for_reference, call_site_shape_for_reference,
-    enclosing_template_declarations, intermediate_field_qualifier_reference,
-    invocation_function_reference, is_bare_companion_method_value_reference,
-    is_call_function_reference, is_constructor_like_reference, is_declaration_name,
-    is_extractor_reference, is_field_expression_value, is_identifier_node,
-    is_infix_pattern_operator, is_owner_qualified_this, is_qualified_stable_root,
-    is_scala_case_pattern_binder, is_scala_class_reference, is_scala_named_argument_assignment,
-    is_scala_object_reference, is_semantic_call_argument, is_stable_type_qualifier,
-    is_terminal_stable_field_reference, named_argument_invocation_owner, node_text,
-    parenthesized_arity, qualified_stable_type_reference, resolve_stable_object_expression,
+    ScalaCallableUsePolicy, ScalaDeclaredResult, ScalaFunctionParameterShape,
+    ScalaGenericOwnerSourceFacts, ScalaImportContextIndex, ScalaMethodValueContext,
+    ScalaPackageContextIndex, ScalaParameterTypeIdentity, ScalaQualifiedStableTypeRole,
+    ScalaSourceFacts, ScalaTypeExpressionPath, call_arities_for_reference,
+    call_site_shape_for_reference, enclosing_template_declarations,
+    intermediate_field_qualifier_reference, invocation_function_reference,
+    is_bare_companion_method_value_reference, is_call_function_reference,
+    is_constructor_like_reference, is_declaration_name, is_extractor_reference,
+    is_field_expression_value, is_identifier_node, is_infix_pattern_operator,
+    is_owner_qualified_this, is_qualified_stable_root, is_scala_case_pattern_binder,
+    is_scala_class_reference, is_scala_named_argument_assignment, is_scala_object_reference,
+    is_semantic_call_argument, is_stable_type_qualifier, is_terminal_stable_field_reference,
+    named_argument_invocation_owner, node_text, parenthesized_arity,
+    qualified_stable_type_reference, resolve_stable_object_expression,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
     scala_callable_shape_matches, scala_import_is_visible_at_byte, scala_pattern_binder_names,
     scala_source_facts, scala_union_type_alternative_paths, stable_identifier_prefix_reference,
@@ -971,10 +972,14 @@ impl ProjectTypes {
                 return true;
             }
             let ancestors = match self.exact_direct_ancestor_resolution(scala, &current) {
-                ScalaDirectAncestorResolution::Resolved(ancestors) if !ancestors.is_empty() => {
+                ScalaDirectAncestorResolution::Resolved(ancestors)
+                | ScalaDirectAncestorResolution::Incomplete(ancestors)
+                    if !ancestors.is_empty() =>
+                {
                     ancestors
                 }
-                ScalaDirectAncestorResolution::Resolved(_) => {
+                ScalaDirectAncestorResolution::Resolved(_)
+                | ScalaDirectAncestorResolution::Incomplete(_) => {
                     self.direct_ancestors_for_declaration(scala, &current)
                 }
                 ScalaDirectAncestorResolution::Ambiguous => return false,
@@ -1136,10 +1141,14 @@ impl ProjectTypes {
                         .cloned(),
                 );
                 let ancestors = match self.exact_direct_ancestor_resolution(scala, &owner) {
-                    ScalaDirectAncestorResolution::Resolved(ancestors) if !ancestors.is_empty() => {
+                    ScalaDirectAncestorResolution::Resolved(ancestors)
+                    | ScalaDirectAncestorResolution::Incomplete(ancestors)
+                        if !ancestors.is_empty() =>
+                    {
                         ancestors
                     }
-                    ScalaDirectAncestorResolution::Resolved(_) => {
+                    ScalaDirectAncestorResolution::Resolved(_)
+                    | ScalaDirectAncestorResolution::Incomplete(_) => {
                         // The forward hierarchy resolver deliberately fails closed on
                         // ambiguity, but its bounded fallback cannot currently recover
                         // every nested lexical supertype. The analyzer hierarchy retains
@@ -1236,7 +1245,8 @@ impl ProjectTypes {
                         matches.push((*exported).clone());
                     }
                     let ancestors = match self.exact_direct_ancestor_resolution(scala, &owner) {
-                        ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
+                        ScalaDirectAncestorResolution::Resolved(ancestors)
+                        | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
                         ScalaDirectAncestorResolution::Ambiguous => {
                             next_is_ambiguous = true;
                             Vec::new()
@@ -1484,6 +1494,7 @@ impl ProjectTypes {
                         usize::from(scala_callable_alternative_is_candidate(
                             self.fallback_callable_role(scala, method),
                             &fallback,
+                            ScalaDeclaredResult::UNDECLARED,
                             shape,
                             site_role,
                         ))
@@ -1524,6 +1535,7 @@ impl ProjectTypes {
                         scala_callable_alternative_matches(
                             self.fallback_callable_role(scala, method),
                             &fallback,
+                            ScalaDeclaredResult::UNDECLARED,
                             Some(shape),
                             site_role,
                             unique_callable,
@@ -1850,7 +1862,7 @@ impl ProjectTypes {
         let mut resolved = None;
         for alternative in alternatives.iter().filter(|alternative| {
             alternative.role == ScalaCallableRole::Ordinary
-                && ordinary_callable_shape_matches(&alternative.shape, Some(call_arities), true)
+                && ordinary_callable_shape_matches(alternative, Some(call_arities), true)
         }) {
             let shape = alternative
                 .parameter_function_shapes
@@ -2160,7 +2172,8 @@ impl ProjectTypes {
             let environment = environments.get(&owner)?.clone();
             let owner_facts = self.generic_owner_source_facts(scala, &owner)?;
             let direct_ancestors = match self.exact_direct_ancestor_resolution(scala, &owner) {
-                ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
+                ScalaDirectAncestorResolution::Resolved(ancestors)
+                | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
                 ScalaDirectAncestorResolution::Ambiguous => return None,
             };
             for ancestor in direct_ancestors {
@@ -2288,6 +2301,7 @@ impl ProjectTypes {
                     scala_callable_alternative_is_candidate(
                         alternative.role,
                         &alternative.shape,
+                        alternative.result,
                         shape,
                         ScalaCallableSiteRole::Ordinary,
                     )
@@ -2302,6 +2316,7 @@ impl ProjectTypes {
             if !scala_callable_alternative_matches(
                 alternative.role,
                 &alternative.shape,
+                alternative.result,
                 call_shape,
                 ScalaCallableSiteRole::Ordinary,
                 unique_callable,
@@ -2537,6 +2552,7 @@ impl ProjectTypes {
                                     scala_callable_alternative_is_candidate(
                                         alternative.role,
                                         &alternative.shape,
+                                        alternative.result,
                                         actual,
                                         ScalaCallableSiteRole::Ordinary,
                                     )
@@ -2560,6 +2576,7 @@ impl ProjectTypes {
                 if !scala_callable_alternative_matches(
                     self.fallback_callable_role(scala, method),
                     &fallback_shape,
+                    ScalaDeclaredResult::UNDECLARED,
                     call_shape,
                     ScalaCallableSiteRole::Ordinary,
                     unique_callable,
@@ -2581,6 +2598,7 @@ impl ProjectTypes {
                 scala_callable_alternative_matches(
                     alternative.role,
                     &alternative.shape,
+                    alternative.result,
                     call_shape,
                     ScalaCallableSiteRole::Ordinary,
                     unique_callable,
@@ -3814,6 +3832,7 @@ impl ProjectTypes {
                 &[ScalaCallableParameterList::explicit(CallableArity::exact(
                     0,
                 ))],
+                ScalaDeclaredResult::UNDECLARED,
                 call_shape,
                 site_role,
                 false,
@@ -3823,6 +3842,7 @@ impl ProjectTypes {
             scala_callable_alternative_matches(
                 alternative.role,
                 &alternative.shape,
+                alternative.result,
                 call_shape,
                 site_role,
                 false,
@@ -3861,6 +3881,7 @@ impl ProjectTypes {
                             CallableAlternative {
                             role: facts.role,
                             shape: facts.shape.clone(),
+                            result: facts.result,
                             parameter_defaults: facts.parameter_defaults.clone(),
                             parameter_types: facts
                                 .parameter_type_paths
@@ -3984,6 +4005,9 @@ impl ProjectTypes {
                             ScalaCallableRole::Ordinary
                         },
                         shape: vec![ScalaCallableParameterList::explicit(arity)],
+                        // A signature-only fallback carries no declared result,
+                        // so nothing beyond its parameter list is admitted.
+                        result: ScalaDeclaredResult::UNDECLARED,
                         parameter_defaults: Vec::new(),
                         parameter_types: Vec::new(),
                         parameter_function_shapes: Vec::new(),
@@ -4006,6 +4030,7 @@ impl ProjectTypes {
                         ScalaCallableRole::Ordinary
                     },
                     shape: vec![ScalaCallableParameterList::explicit(arity)],
+                    result: ScalaDeclaredResult::UNDECLARED,
                     parameter_defaults: Vec::new(),
                     parameter_types: Vec::new(),
                     parameter_function_shapes: Vec::new(),
@@ -4090,7 +4115,8 @@ impl ProjectTypes {
                 continue;
             }
             match self.exact_direct_ancestor_resolution(scala, &owner) {
-                ScalaDirectAncestorResolution::Resolved(ancestors) => pending.extend(ancestors),
+                ScalaDirectAncestorResolution::Resolved(ancestors)
+                | ScalaDirectAncestorResolution::Incomplete(ancestors) => pending.extend(ancestors),
                 ScalaDirectAncestorResolution::Ambiguous => return false,
             }
         }
@@ -4911,7 +4937,7 @@ impl ProjectTypes {
             .filter(|alternative| {
                 alternative.role == ScalaCallableRole::Ordinary
                     && contextual_arities.is_none_or(|arities| {
-                        ordinary_callable_shape_matches(&alternative.shape, Some(arities), false)
+                        ordinary_callable_shape_matches(alternative, Some(arities), false)
                     })
             })
             .count();
@@ -5160,6 +5186,7 @@ impl ProjectTypes {
 pub struct CallableAlternative {
     pub role: ScalaCallableRole,
     pub shape: Vec<ScalaCallableParameterList>,
+    pub result: ScalaDeclaredResult,
     pub parameter_defaults: Vec<Vec<bool>>,
     pub parameter_types: Vec<Vec<Option<ScalaParameterTypeIdentity>>>,
     pub parameter_function_shapes: Vec<Vec<Option<ScalaFunctionParameterShape>>>,
@@ -5263,8 +5290,13 @@ pub fn callable_alternative_is_candidate(
     actual: &ScalaCallSiteShape,
     site_role: ScalaCallableSiteRole,
 ) -> bool {
-    scala_callable_alternative_is_candidate(alternative.role, &alternative.shape, actual, site_role)
-        && method_value_parameter_types_match(alternative, actual)
+    scala_callable_alternative_is_candidate(
+        alternative.role,
+        &alternative.shape,
+        alternative.result,
+        actual,
+        site_role,
+    ) && method_value_parameter_types_match(alternative, actual)
 }
 
 pub fn callable_alternative_matches(
@@ -5276,6 +5308,7 @@ pub fn callable_alternative_matches(
     scala_callable_alternative_matches(
         alternative.role,
         &alternative.shape,
+        alternative.result,
         actual,
         site_role,
         unique_callable,
@@ -6564,6 +6597,7 @@ fn callable_call_shape_matches(
         return scala_callable_alternative_matches(
             fallback_role,
             &fallback_shape,
+            ScalaDeclaredResult::UNDECLARED,
             actual.as_ref(),
             site_role,
             unique_callable,
@@ -6573,6 +6607,7 @@ fn callable_call_shape_matches(
         scala_callable_alternative_matches(
             alternative.role,
             &alternative.shape,
+            alternative.result,
             actual.as_ref(),
             site_role,
             unique_callable,
@@ -6581,13 +6616,14 @@ fn callable_call_shape_matches(
 }
 
 fn ordinary_callable_shape_matches(
-    declared: &[ScalaCallableParameterList],
+    declared: &CallableAlternative,
     call_arities: Option<&[usize]>,
     unique_callable: bool,
 ) -> bool {
     let actual = call_arities.map(ScalaCallSiteShape::ordinary);
     scala_callable_shape_matches(
-        declared,
+        &declared.shape,
+        declared.result,
         actual.as_ref(),
         ScalaCallableUsePolicy::OrdinaryMethod,
         unique_callable,
@@ -10564,7 +10600,7 @@ fn record_extension_scope_parameterless_method(
                         alternative,
                         Some(&receiver_owner),
                     )
-                    && ordinary_callable_shape_matches(&alternative.shape, None, unique_callable)
+                    && ordinary_callable_shape_matches(alternative, None, unique_callable)
             })
         });
         match methods.as_slice() {
@@ -10883,12 +10919,13 @@ fn seed_declaration(
         }
         "extension_definition" => seed_parameters(node, ctx, bindings),
         "function_definition" => {
-            if let Some(name) = node.child_by_field_name("name") {
-                let name = node_text(name, ctx.source).trim();
-                if !name.is_empty() {
-                    bindings.declare_shadow(name.to_string());
-                }
-            }
+            // #1854: a method's own name is NOT a local binding inside its own
+            // body. Declaring it here made every bare `name(..)` inside
+            // `def name(..)` opaque, so recursion and same-name overload
+            // siblings were dropped before any owner, import, or overload
+            // lookup. A genuinely nested `def` still shadows, because
+            // `seed_parent_scope_declaration` declares it in the ENCLOSING
+            // scope, where the shadow belongs.
             preseed_enclosing_owner_fields(node, ctx, bindings);
             if let Some(extension) = node
                 .parent()
@@ -11737,11 +11774,7 @@ fn visible_extensions(
                     alternative,
                     receiver_owner,
                 )
-                && ordinary_callable_shape_matches(
-                    &alternative.shape,
-                    call_arities,
-                    unique_callable,
-                )
+                && ordinary_callable_shape_matches(alternative, call_arities, unique_callable)
         })
     });
     matches

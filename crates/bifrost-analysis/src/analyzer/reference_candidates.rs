@@ -2,6 +2,7 @@ use crate::analyzer::cpp::cpp_is_range_for_binding_name;
 use crate::analyzer::{Language, Range};
 use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
 use brokk_bifrost_js_ts::syntax::JsTsLexicalBindingIndex;
+use brokk_bifrost_jvm::scala::bare_name_scopes::ScalaBareNameDeclarationScopes;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,28 +127,47 @@ pub fn census_identifier_ranges(
 /// call: in JavaScript a `Lexer.prototype.isNumber` member is reachable only
 /// through a receiver, so it is not evidence for a bare `isNumber(value)` that
 /// could never bind to it. Scope, not name, decides -- and scope is a
-/// per-language question, so a language without a lexical index says so by
+/// per-language question, so a language without a scope index says so by
 /// answering `None` here instead of pretending nothing is bound.
 pub struct CensusBareNameBindings {
-    lexical: JsTsLexicalBindingIndex,
+    scopes: CensusBareNameScopes,
+}
+
+/// The per-language index that answers the bindability question. Each language
+/// contributes the notion of scope its own binding rules use: a lexical binder
+/// index where a bare name binds lexically and nothing else, a
+/// declaration-visibility index where it also reaches the enclosing type's
+/// members.
+enum CensusBareNameScopes {
+    JsTsLexical(JsTsLexicalBindingIndex),
+    ScalaDeclarations(ScalaBareNameDeclarationScopes),
 }
 
 impl CensusBareNameBindings {
-    /// `None` when the language has no lexical-binding index. JavaScript and
-    /// TypeScript share the one the forward resolver already uses, so the
-    /// census grades bare calls against the same notion of scope the resolver
-    /// binds them with.
+    /// `None` when the language has no scope index. JavaScript and TypeScript
+    /// share the lexical one the forward resolver already uses, so the census
+    /// grades bare calls against the same notion of scope the resolver binds
+    /// them with. Scala answers with declaration visibility instead, because a
+    /// bare Scala call also reaches the enclosing template's own, inherited,
+    /// self-typed and imported members (#1858).
     pub fn build(root: Node<'_>, source: &str, language: Language) -> Option<Self> {
-        match language {
-            Language::JavaScript | Language::TypeScript => Some(Self {
-                lexical: JsTsLexicalBindingIndex::build(root, source),
-            }),
-            _ => None,
-        }
+        let scopes = match language {
+            Language::JavaScript | Language::TypeScript => {
+                CensusBareNameScopes::JsTsLexical(JsTsLexicalBindingIndex::build(root, source))
+            }
+            Language::Scala => CensusBareNameScopes::ScalaDeclarations(
+                ScalaBareNameDeclarationScopes::build(root, source),
+            ),
+            _ => return None,
+        };
+        Some(Self { scopes })
     }
 
     pub fn is_bound_at(&self, name: &str, byte: usize) -> bool {
-        self.lexical.is_bound_at(name, byte)
+        match &self.scopes {
+            CensusBareNameScopes::JsTsLexical(lexical) => lexical.is_bound_at(name, byte),
+            CensusBareNameScopes::ScalaDeclarations(scopes) => scopes.is_bound_at(name, byte),
+        }
     }
 }
 
