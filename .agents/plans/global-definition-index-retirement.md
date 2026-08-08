@@ -52,6 +52,10 @@ the store's normal per-blob row replacement.
   each exactly once; `usage_facts_index` never builds on this path at all. Answering-regime peak
   RSS is 15.58 GB untimed / 17.49 GB timed, of which the index is ~2%. See
   `Surprises & Discoveries` for the corrections and Milestone 4 for the revised gate.
+- [x] (2026-08-08, pre-M1, taken independently) The duplicate normalized maps are gone: the
+  normalized views are now materialized only after a declaration actually renames, so an
+  identity-normalizing shard reads them off the exact maps. Removes the measured 54.6 MB of
+  the 185 MB Rust shard (30%) with no change to C#/Java/Scala lookup semantics.
 - [ ] Milestone 1: the package-catalog relation.
 - [ ] Milestone 2: consumer migration, cohort by cohort.
 - [ ] Milestone 3: `usage_facts_index` - same treatment or explicit retention decision.

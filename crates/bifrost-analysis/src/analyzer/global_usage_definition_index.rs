@@ -13,15 +13,39 @@ use std::cell::{Cell, OnceCell, RefCell};
 pub struct GlobalUsageDefinitionIndex {
     by_fqn: HashMap<String, Vec<CodeUnit>>,
     direct_children_by_fqn: HashMap<String, Vec<CodeUnit>>,
-    direct_children_by_normalized_fqn: HashMap<String, Vec<CodeUnit>>,
     by_file_identifier: HashMap<(ProjectFile, String), Vec<CodeUnit>>,
     by_identifier: HashMap<String, Vec<CodeUnit>>,
     packages: HashSet<String>,
     files_by_package: HashMap<String, Vec<ProjectFile>>,
     package_languages: HashMap<String, HashSet<Language>>,
     child_packages_by_parent: HashMap<String, HashSet<String>>,
-    by_normalized_fqn: HashMap<String, Vec<CodeUnit>>,
+    /// The normalized-key views of `by_fqn` and `direct_children_by_fqn`,
+    /// materialized only once some declaration actually normalizes to a key
+    /// other than its own.
+    ///
+    /// `LanguageAdapter::normalize_full_name` defaults to the identity, and
+    /// only the C#, Java and Scala adapters override it.  For every other
+    /// language the normalized maps used to be byte-for-byte copies of their
+    /// exact siblings.  The 2026-08-08 Milestone 0 baseline measured the Rust
+    /// shard's `by_fqn` and `by_normalized_fqn` at 266,834 keys / 45,895,885
+    /// bytes *each*, and `direct_children_by_fqn` / its normalized twin at
+    /// 44,948 / 8,713,422 each: 54.6 MB of a 185 MB shard was pure
+    /// duplication.
+    ///
+    /// `None` means the exact maps *are* the normalized view, and normalized
+    /// lookups read them directly.  The decision comes from the normalizer
+    /// itself rather than from a language list, so a shard of an overriding
+    /// language that happens never to rename anything also keeps the saving.
+    normalized: Option<NormalizedViews>,
     types_by_package_simple: HashMap<(String, String), Vec<CodeUnit>>,
+}
+
+/// The normalized-key sibling maps, kept only for a shard that needs them.
+/// See [`GlobalUsageDefinitionIndex::normalized`].
+#[derive(Debug, Clone)]
+struct NormalizedViews {
+    by_fqn: HashMap<String, Vec<CodeUnit>>,
+    direct_children_by_fqn: HashMap<String, Vec<CodeUnit>>,
 }
 
 /// Candidate-shaped declaration operations used by forward symbols queries.
@@ -365,6 +389,15 @@ impl GlobalUsageDefinitionIndex {
     {
         let fqn = unit.fq_name();
         let normalized_fqn = normalize(&fqn);
+        let parent_fqn = fqn.rsplit_once('.').map(|(parent, _)| parent.to_string());
+        let normalized_parent_fqn = parent_fqn.as_deref().map(normalize);
+        if normalized_fqn != fqn || normalized_parent_fqn != parent_fqn {
+            // Ask the normalizer, not a language list.  Promote before this
+            // unit reaches the exact maps so the seeded copy holds exactly the
+            // units whose normalized key was still their exact key; this unit
+            // then lands under its own normalized keys below.
+            self.materialize_normalized_views();
+        }
         let package = unit.package_name();
         let language = language_for_file(unit.source());
         self.packages.insert(package.to_string());
@@ -393,10 +426,13 @@ impl GlobalUsageDefinitionIndex {
                 child = parent;
             }
         }
-        self.by_normalized_fqn
-            .entry(normalized_fqn.clone())
-            .or_default()
-            .push(unit.clone());
+        if let Some(normalized) = self.normalized.as_mut() {
+            normalized
+                .by_fqn
+                .entry(normalized_fqn)
+                .or_default()
+                .push(unit.clone());
+        }
         if unit.is_class() {
             self.types_by_package_simple
                 .entry((unit.package_name().to_string(), simple_type_name(unit)))
@@ -409,23 +445,26 @@ impl GlobalUsageDefinitionIndex {
         // csharp_issue701_structured_expression_type_roots_have_inverted_graph_parity`.
         // The pop is *more* structurally correct for a `$`-nested C# type --
         // `Demo.InheritedOuter$Nested`'s immediate owner is `Demo.InheritedOuter`,
-        // not `Demo` -- but this index's `direct_children_by_fqn`/
-        // `direct_children_by_normalized_fqn` are relied upon elsewhere to key
+        // not `Demo` -- but this index's `direct_children_by_fqn` and its
+        // normalized view are relied upon elsewhere to key
         // nested types under their NAMESPACE (the naive rightmost-`.` cut,
         // which skips over a `$` boundary) for csharp's using-namespace nested-
         // type visibility resolution; switching to the immediate-owner cut is
         // a real behavior change there, not merely a representation change.
         // Revisit together with that consumer if this file is touched again.
-        if let Some((parent_fqn, _)) = fqn.rsplit_once('.') {
-            let parent_fqn = parent_fqn.to_string();
+        if let (Some(parent_fqn), Some(normalized_parent_fqn)) = (parent_fqn, normalized_parent_fqn)
+        {
             self.direct_children_by_fqn
-                .entry(parent_fqn.clone())
+                .entry(parent_fqn)
                 .or_default()
                 .push(unit.clone());
-            self.direct_children_by_normalized_fqn
-                .entry(normalize(&parent_fqn))
-                .or_default()
-                .push(unit.clone());
+            if let Some(normalized) = self.normalized.as_mut() {
+                normalized
+                    .direct_children_by_fqn
+                    .entry(normalized_parent_fqn)
+                    .or_default()
+                    .push(unit.clone());
+            }
         }
         self.by_fqn.entry(fqn).or_default().push(unit.clone());
         self.by_file_identifier
@@ -438,9 +477,31 @@ impl GlobalUsageDefinitionIndex {
             .push(unit.clone());
     }
 
+    /// Give the shard its own normalized-key maps, seeded from the exact maps.
+    ///
+    /// Every declaration inserted so far normalized to its own key, so the
+    /// exact maps *are* the normalized view of those units and cloning them is
+    /// the whole backfill.  Peak footprint matches the old unconditional build
+    /// -- two full maps either way -- and a shard that never renames never
+    /// pays it at all.
+    fn materialize_normalized_views(&mut self) {
+        if self.normalized.is_some() {
+            return;
+        }
+        self.normalized = Some(NormalizedViews {
+            by_fqn: self.by_fqn.clone(),
+            direct_children_by_fqn: self.direct_children_by_fqn.clone(),
+        });
+    }
+
     pub(crate) fn sort_entries(&mut self) {
+        // `by_fqn` dedups like every other lookup map: it now doubles as the
+        // normalized view for a shard that never renames, and that view has
+        // always dropped exact duplicates.  A repeated identical unit is noise
+        // for the exact readers too.
         for units in self.by_fqn.values_mut() {
             sort_units(units);
+            units.dedup();
         }
         for units in self.by_file_identifier.values_mut() {
             sort_units(units);
@@ -449,19 +510,21 @@ impl GlobalUsageDefinitionIndex {
             sort_units(units);
             units.dedup();
         }
-        for units in self.by_normalized_fqn.values_mut() {
-            sort_units(units);
-            units.dedup();
+        if let Some(normalized) = self.normalized.as_mut() {
+            for units in normalized.by_fqn.values_mut() {
+                sort_units(units);
+                units.dedup();
+            }
+            for units in normalized.direct_children_by_fqn.values_mut() {
+                sort_units(units);
+                units.dedup();
+            }
         }
         for units in self.types_by_package_simple.values_mut() {
             sort_units(units);
             units.dedup();
         }
         for units in self.direct_children_by_fqn.values_mut() {
-            sort_units(units);
-            units.dedup();
-        }
-        for units in self.direct_children_by_normalized_fqn.values_mut() {
             sort_units(units);
             units.dedup();
         }
@@ -524,8 +587,39 @@ impl GlobalUsageDefinitionIndex {
         self.by_fqn.contains_key(fqn)
     }
 
+    /// The normalized-key view of `by_fqn`: the separately materialized map
+    /// when this shard renames anything, otherwise the exact map itself.
+    fn normalized_by_fqn_map(&self) -> &HashMap<String, Vec<CodeUnit>> {
+        self.normalized
+            .as_ref()
+            .map_or(&self.by_fqn, |normalized| &normalized.by_fqn)
+    }
+
+    /// The normalized-key view of `direct_children_by_fqn`; see
+    /// [`Self::normalized_by_fqn_map`].
+    fn normalized_direct_children_map(&self) -> &HashMap<String, Vec<CodeUnit>> {
+        self.normalized
+            .as_ref()
+            .map_or(&self.direct_children_by_fqn, |normalized| {
+                &normalized.direct_children_by_fqn
+            })
+    }
+
+    /// Entry counts of the separately materialized normalized maps, `(0, 0)`
+    /// when the exact maps serve as the normalized view.  The structural
+    /// handle on the duplication saving; see [`Self::normalized`].
+    #[cfg(test)]
+    pub(crate) fn normalized_view_key_counts(&self) -> (usize, usize) {
+        self.normalized.as_ref().map_or((0, 0), |normalized| {
+            (
+                normalized.by_fqn.len(),
+                normalized.direct_children_by_fqn.len(),
+            )
+        })
+    }
+
     pub(crate) fn by_normalized_fqn(&self, normalized: &str) -> &[CodeUnit] {
-        self.by_normalized_fqn
+        self.normalized_by_fqn_map()
             .get(normalized)
             .map(Vec::as_slice)
             .unwrap_or(&[])
@@ -560,7 +654,7 @@ impl GlobalUsageDefinitionIndex {
         if !exact.is_empty() {
             return exact;
         }
-        self.direct_children_by_normalized_fqn
+        self.normalized_direct_children_map()
             .get(normalized_owner_fqn)
             .into_iter()
             .flat_map(|units| units.iter())
@@ -1023,6 +1117,97 @@ mod tests {
         let normalized = index.members_for_owner_name("example.Helpers", "example.Helpers", "run");
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized[0].fq_name(), "example.Helpers$.run");
+    }
+
+    /// The Milestone 0 baseline measured the Rust shard's normalized maps as
+    /// byte-identical copies of their exact siblings (266,834 keys /
+    /// 45,895,885 bytes for `by_fqn`, 44,948 / 8,713,422 for the children
+    /// map, each duplicated).  A shard whose declarations all normalize to
+    /// themselves must keep no copy at all, and must still answer every
+    /// normalized query from the exact maps.
+    #[test]
+    fn identity_normalization_keeps_no_copy_of_the_exact_maps() {
+        let root = std::env::temp_dir().join("bifrost-defindex-identity-normalization-test");
+        let units = vec![
+            unit(&root, "src/lib.rs", "crate::model", "Widget"),
+            unit(&root, "src/other.rs", "crate::model", "Gadget"),
+            member_unit(
+                &root,
+                "src/lib.rs",
+                "crate::model",
+                "Widget",
+                SegmentKind::Type,
+                "render",
+            ),
+        ];
+        let index = GlobalUsageDefinitionIndex::from_declarations(&units, str::to_string, |unit| {
+            unit.identifier().to_string()
+        });
+
+        assert_eq!(index.normalized_view_key_counts(), (0, 0));
+
+        assert_eq!(
+            index.by_normalized_fqn("crate::model.Widget")[0].fq_name(),
+            "crate::model.Widget"
+        );
+        assert_eq!(
+            index.by_normalized_fqn("crate::model.Gadget")[0].fq_name(),
+            "crate::model.Gadget"
+        );
+        assert!(index.by_normalized_fqn("crate::model.Absent").is_empty());
+        let members =
+            index.members_for_owner_name("crate::model.Widget", "crate::model.Widget", "render");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].fq_name(), "crate::model.Widget.render");
+    }
+
+    /// The counterpart: a normalizer that really renames keeps its own maps,
+    /// and the units inserted *before* the first rename are still reachable
+    /// under their normalized keys.  Uses the real C# normalizer so the arity
+    /// spelling is the production one.
+    #[test]
+    fn renaming_normalization_materializes_and_backfills_the_normalized_maps() {
+        use crate::analyzer::csharp::csharp_normalize_full_name;
+
+        let root = std::env::temp_dir().join("bifrost-defindex-renaming-normalization-test");
+        let units = vec![
+            // Inserted before any rename: only the promotion backfill can put
+            // this one into the normalized map.
+            unit(&root, "src/Plain.cs", "Demo", "Plain"),
+            unit(&root, "src/Box.cs", "Demo", "Box`1"),
+            member_unit(
+                &root,
+                "src/Box.cs",
+                "Demo",
+                "Box`1",
+                SegmentKind::Type,
+                "Unwrap",
+            ),
+        ];
+        let index = GlobalUsageDefinitionIndex::from_declarations(
+            &units,
+            csharp_normalize_full_name,
+            |unit| unit.identifier().to_string(),
+        );
+
+        let (normalized_keys, normalized_child_keys) = index.normalized_view_key_counts();
+        assert!(normalized_keys > 0 && normalized_child_keys > 0);
+
+        assert_eq!(
+            index.by_normalized_fqn("Demo.Plain")[0].fq_name(),
+            "Demo.Plain"
+        );
+        assert_eq!(
+            index.by_normalized_fqn("Demo.Box")[0].fq_name(),
+            "Demo.Box`1"
+        );
+        assert!(index.by_normalized_fqn("Demo.Box`1").is_empty());
+
+        // Exact owner misses (the children key is the arity spelling), so the
+        // normalized owner fallback has to answer.
+        let members = index.members_for_owner_name("Demo.Box", "Demo.Box", "Unwrap");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].fq_name(), "Demo.Box`1.Unwrap");
     }
 
     #[test]
