@@ -8,7 +8,7 @@ use crate::graph::resolver::{
     unbound_browser_global_property,
 };
 use crate::imports::require_call_module_specifier;
-use crate::parse::js_ts_tree_sitter_language_for_file;
+use crate::parse::{flow_dialect_blocks_extraction, js_ts_tree_sitter_language_for_file};
 use crate::providers::JsTsSource;
 use crate::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, JsTsLexicalBindingScope,
@@ -132,6 +132,12 @@ pub fn scan_files_for_seeds(
             return;
         }
         let source_str = source.as_str();
+        if flow_dialect_blocks_extraction(file, tree.root_node(), source_str) {
+            // Recovery over Flow syntax demotes real call tokens into `ERROR`
+            // soup, where a reference is graded against a program the author
+            // never wrote. A named-but-unproven hit is worse than none (#1786).
+            return;
+        }
         let tree_ref = &tree;
 
         let imports = index.binders_by_file.get(file).cloned().unwrap_or_default();

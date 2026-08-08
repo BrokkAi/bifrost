@@ -17,6 +17,7 @@ use crate::imports::{
     parse_commonjs_require_import_infos_from_node, parse_es_import_infos_from_node,
 };
 use crate::model::*;
+use crate::parse::flow_dialect_blocks_extraction;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ParameterMetadata, SignatureMetadata};
@@ -34,6 +35,12 @@ use tree_sitter::{Node, Parser, Tree};
 pub fn parse_javascript_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
     let root = tree.root_node();
     let mut parsed = ParsedFile::new(String::new());
+    if flow_dialect_blocks_extraction(file, root, source) {
+        // Error recovery over Flow syntax invents declarations the file does
+        // not have -- a `boolean` field out of `{bailout: boolean}` -- so this
+        // file spells nothing this walk can honestly record (#1786).
+        return parsed;
+    }
     let module = module_code_unit(file);
     let mut module_has_imports = false;
     let exported_roots = js_exported_binding_roots(root, source);

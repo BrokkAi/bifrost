@@ -22,6 +22,7 @@ use super::receiver_analysis::JsTsReceiverFactProvider;
 use super::resolver::{
     JsTsUsageIndex, browser_global_property_shape, unbound_browser_global_property,
 };
+use crate::parse::flow_dialect_blocks_extraction;
 use crate::providers::JsTsSource;
 use crate::syntax::{
     JsTsLexicalBindingIndex, compute_import_binder, is_declaration_identifier,
@@ -64,6 +65,11 @@ pub fn scan_file(
     input: &FileEdgeScanInput<'_>,
 ) -> PerFileEdges {
     let source = input.source;
+    if flow_dialect_blocks_extraction(file, input.root(), source) {
+        // A call token error recovery demoted into `ERROR` soup is not a call
+        // this file makes; no edge from it is worth having (#1786).
+        return PerFileEdges::default();
+    }
 
     // Per-file resolution context: which bare names resolve to which
     // exported name, and which locals are namespace imports.
@@ -193,6 +199,9 @@ pub fn scan_scoped_file(
     file: &ProjectFile,
     input: &FileEdgeScanInput<'_, UsageNodeKey>,
 ) -> PerFileEdges<UsageNodeKey> {
+    if flow_dialect_blocks_extraction(file, input.root(), input.source) {
+        return PerFileEdges::default();
+    }
     let mut ctx = ScopedTsScan {
         source: input.source,
         receiver_provider: JsTsReceiverFactProvider::new(
