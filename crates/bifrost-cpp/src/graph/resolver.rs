@@ -1086,6 +1086,17 @@ impl<'a> VisibilityIndex<'a> {
                 .or_default()
                 .push(unit.clone());
         }
+        // `cpp_template_metadata` is hash-keyed on `CodeUnit`, so the push
+        // order above is a function of those hashes. Two mirrored headers can
+        // declare one specialization; `select_template_specialization` treats
+        // them as interchangeable and returns the family's first entry, so an
+        // unsorted family made the reported declaration depend on the
+        // workspace's absolute path and on unrelated files (#1836). Order the
+        // family exactly as `build_visible_identifier_index` orders its
+        // per-identifier candidate lists.
+        for family in cpp_template_families.values_mut() {
+            sort_lookup_units(family);
+        }
         Self {
             cpp,
             visible_by_file,
