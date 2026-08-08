@@ -22,6 +22,7 @@
 //! type is not proven, a `dynamic` value -- is left unchecked rather than
 //! guessed at, because an outcome is a claim about a lookup that happened.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 use brokk_bifrost_core::analyzer::model::{
@@ -43,7 +44,7 @@ use crate::imports::{csharp_using_alias_from_node, csharp_using_namespace};
 use crate::syntax::{
     csharp_type_node_identity, csharp_using_directive_is_static, normalize_csharp_type_fragment,
 };
-use brokk_bifrost_core::hash::HashSet;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 pub const CSHARP_UNRECOGNIZED_SYMBOL: &str = "csharp_unrecognized_symbol";
 pub const CSHARP_UNRECOGNIZED_MEMBER: &str = "csharp_unrecognized_member";
@@ -189,6 +190,7 @@ pub fn collect_csharp_semantic_diagnostics(
         scope_is_visible: true,
         type_parameters: Vec::new(),
         partial_declarations: HashSet::default(),
+        visible_types: RefCell::new(HashMap::default()),
         report,
         diagnostic_count: 0,
     };
@@ -230,6 +232,19 @@ struct CSharpDiagnosticCollector<'a> {
     /// Short names this file declares `partial`, whose member surface a
     /// generated half may extend.
     partial_declarations: HashSet<String>,
+    /// The visible-type search's answer for each spelling this request has
+    /// already looked up.
+    ///
+    /// [`visible_type_candidates`] is a function of the analyzer generation, the
+    /// file and the spelling, and a diagnostic request reads one fixed
+    /// generation and one file, so the first answer is the only answer. The
+    /// four ladders below -- type references, member owners, the enclosing-type
+    /// lookup and the supertype walk -- each asked independently, so a file that
+    /// names one type in ten positions searched the workspace ten times. That
+    /// search costs a store query per candidate spelling per namespace it
+    /// probes, which is what made repetition expensive rather than merely
+    /// redundant (#1806).
+    visible_types: RefCell<HashMap<String, Vec<CodeUnit>>>,
     report: SemanticDiagnosticReport,
     diagnostic_count: usize,
 }
@@ -492,11 +507,24 @@ impl CSharpDiagnosticCollector<'_> {
         }
     }
 
-    fn workspace_types(&self, identity: &str) -> WorkspaceTypes {
-        // The same helper `get_definition` resolves a C# type reference with,
-        // so a name this pass calls absent is one the definition route also
-        // fails to find.
+    /// The visible-type search for `identity`, answered once per request.
+    ///
+    /// The same helper `get_definition` resolves a C# type reference with, so a
+    /// name this pass calls absent is one the definition route also fails to
+    /// find.
+    fn visible_types(&self, identity: &str) -> Vec<CodeUnit> {
+        if let Some(known) = self.visible_types.borrow().get(identity) {
+            return known.clone();
+        }
         let candidates = visible_type_candidates(self.csharp, self.file, identity);
+        self.visible_types
+            .borrow_mut()
+            .insert(identity.to_string(), candidates.clone());
+        candidates
+    }
+
+    fn workspace_types(&self, identity: &str) -> WorkspaceTypes {
+        let candidates = self.visible_types(identity);
         match logical_type_count(&candidates) {
             0 => WorkspaceTypes::None,
             1 => WorkspaceTypes::One,
@@ -721,7 +749,7 @@ impl CSharpDiagnosticCollector<'_> {
 
     /// The unique declaration a type name identifies, workspace first.
     fn type_owner(&self, identity: &str) -> Option<MemberOwner> {
-        let candidates = visible_type_candidates(self.csharp, self.file, identity);
+        let candidates = self.visible_types(identity);
         if logical_type_count(&candidates) == 1 {
             return first_logical_type_fqn(&candidates).map(|fqn| MemberOwner::Workspace { fqn });
         }
@@ -910,7 +938,7 @@ impl CSharpDiagnosticCollector<'_> {
                 }
             };
             for raw in self.csharp.raw_supertypes_of(&unit) {
-                let candidates = visible_type_candidates(self.csharp, self.file, &raw);
+                let candidates = self.visible_types(&raw);
                 match logical_type_count(&candidates) {
                     1 => {
                         let Some(fqn) = first_logical_type_fqn(&candidates) else {
@@ -952,7 +980,7 @@ impl CSharpDiagnosticCollector<'_> {
     }
 
     fn workspace_type_unit(&self, fqn: &str) -> Option<CodeUnit> {
-        let candidates = visible_type_candidates(self.csharp, self.file, fqn);
+        let candidates = self.visible_types(fqn);
         (logical_type_count(&candidates) == 1)
             .then(|| {
                 candidates

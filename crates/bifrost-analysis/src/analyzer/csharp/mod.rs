@@ -212,7 +212,14 @@ impl CSharpAnalyzer {
     }
 
     pub(crate) fn workspace_namespace_exists(&self, namespace: &str) -> bool {
-        self.inner.persisted_package_exists(namespace)
+        if let Some(known) = self.memo_caches.namespace_exists.get(namespace) {
+            return known;
+        }
+        let exists = self.inner.persisted_package_exists(namespace);
+        self.memo_caches
+            .namespace_exists
+            .insert(namespace.to_string(), exists);
+        exists
     }
 
     pub fn namespace_of_file(&self, file: &ProjectFile) -> String {

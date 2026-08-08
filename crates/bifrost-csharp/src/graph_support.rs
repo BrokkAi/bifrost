@@ -11,8 +11,8 @@
 //! One tier is enough here, unlike Rust's `RustSource`/`RustUsageSource`
 //! split: no `OnceLock` in the C# memo web re-enters the cell it is filling.
 //! The deepest recursion, `visible_type_candidates_with_lookups`, was already
-//! written as a function of four injected lookups and stays that way -- it
-//! needs no source at all.
+//! written as a function of its injected lookups and stays that way -- it needs
+//! no source at all.
 //!
 //! `CSharpAnalyzer` lives in `brokk-bifrost-analysis`; this crate never names it.
 
@@ -1048,6 +1048,7 @@ fn visible_type_candidates_inner(
     let mut using_aliases = || Some(source.using_aliases_of(file));
     let mut namespace_of_file = || Some(source.namespace_of_file(file));
     let mut using_namespaces = || Some(source.using_namespaces_of(file));
+    let mut namespace_exists = |namespace: &str| source.workspace_namespace_exists(namespace);
     let mut type_candidates = |fqn: &str| Some(type_candidates_by_fqn(source, fqn, usage));
     visible_type_candidates_with_lookups(
         name,
@@ -1055,25 +1056,40 @@ fn visible_type_candidates_inner(
         &mut using_aliases,
         &mut namespace_of_file,
         &mut using_namespaces,
+        &mut namespace_exists,
         &mut type_candidates,
     )
 }
 
-/// C#'s visible-type search, as a function of the four lookups it needs. Each
-/// returns `None` when its own bounded budget ran out, which aborts the search
-/// rather than reporting a miss.
-pub fn visible_type_candidates_with_lookups<Aliases, Namespace, Usings, Candidates>(
+/// C#'s visible-type search, as a function of the lookups it needs. Each
+/// `Option`-returning one answers `None` when its own bounded budget ran out,
+/// which aborts the search rather than reporting a miss.
+///
+/// `namespace_exists` is the exception: it has no `None`, and a caller that
+/// cannot determine an answer must say `true`. It only ever *skips* a probe, so
+/// a wrong `false` would silently lose a candidate while a wrong `true` costs
+/// nothing but the probe that would have run anyway.
+#[allow(clippy::too_many_arguments)]
+pub fn visible_type_candidates_with_lookups<
+    Aliases,
+    Namespace,
+    Usings,
+    NamespaceExists,
+    Candidates,
+>(
     name: &str,
     resolve_aliases: bool,
     using_aliases: &mut Aliases,
     namespace_of_file: &mut Namespace,
     using_namespaces: &mut Usings,
+    namespace_exists: &mut NamespaceExists,
     type_candidates_by_fqn: &mut Candidates,
 ) -> Vec<CodeUnit>
 where
     Aliases: FnMut() -> Option<Arc<HashMap<String, String>>>,
     Namespace: FnMut() -> Option<String>,
     Usings: FnMut() -> Option<Vec<String>>,
+    NamespaceExists: FnMut(&str) -> bool,
     Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
 {
     let mut normalized = normalize_csharp_type_fragment(name);
@@ -1109,14 +1125,28 @@ where
             using_aliases,
             namespace_of_file,
             using_namespaces,
+            namespace_exists,
             type_candidates_by_fqn,
         );
     }
 
+    // A `{qualifier}.{normalized}` probe only ever matches a class whose own
+    // namespace is exactly `qualifier`, as long as `normalized` names a single
+    // type: `csharp_normalize_full_name` turns the whole fq name into
+    // `{namespace}.{type chain}`, so one trailing segment leaves the namespace
+    // equal to the qualifier. A qualifier the workspace declares nothing in can
+    // therefore be skipped rather than probed, which is what stops a file with
+    // a deep namespace from paying a store query per candidate spelling per
+    // ancestor namespace for a name that is plainly external (#1806).
+    //
+    // A `normalized` that carries its own separators is not gated: it can put
+    // any number of segments between the qualifier and the type, so the
+    // namespace that would hold the match is not the qualifier.
+    let qualifier_decides_namespace = !normalized.contains(['.', '$', '+']);
     let Some(mut namespace) = namespace_of_file() else {
         return Vec::new();
     };
-    if !namespace.is_empty() {
+    if !namespace.is_empty() && (!qualifier_decides_namespace || namespace_exists(&namespace)) {
         let Some(candidates) = type_candidates_by_fqn(&format!("{namespace}.{normalized}")) else {
             return Vec::new();
         };
@@ -1130,6 +1160,11 @@ where
         return Vec::new();
     };
     for using_namespace in namespaces {
+        // This one is gated whatever `normalized` looks like: the filter below
+        // already keeps only candidates whose namespace is the `using` itself.
+        if !namespace_exists(&using_namespace) {
+            continue;
+        }
         let Some(candidates) = type_candidates_by_fqn(&format!("{using_namespace}.{normalized}"))
         else {
             return Vec::new();
@@ -1146,6 +1181,9 @@ where
 
     while let Some(separator) = namespace.rfind('.') {
         namespace.truncate(separator);
+        if qualifier_decides_namespace && !namespace_exists(&namespace) {
+            continue;
+        }
         let Some(candidates) = type_candidates_by_fqn(&format!("{namespace}.{normalized}")) else {
             return Vec::new();
         };

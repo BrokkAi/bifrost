@@ -160,3 +160,130 @@ zero-confirmed-false-positive review in the runbook, not a latency concern.
 - It does not measure a release build.
 - It does not set or propose a p95 threshold.
 - It carries no variance estimate.
+
+## Addendum, 2026-08-08: the `testcode-cs` outlier (#1806)
+
+The numbers above stay as they are. This section records the follow-up the
+`testcode-cs` row named, and re-measures that one fixture. Nothing else in this
+document changes.
+
+### Which file, and what it was doing
+
+The 540 ms file is `GetTerminationRecordByIdHandler.cs`: 34 lines, four `using`
+directives, and a six-segment namespace
+(`ConsumerCentricityPermission.Core.Business.Handlers.TerminationRecordHandlers.Queries`).
+It is not generated, not large, and has no deep supertype chain. It is the only
+file in the fixture with a realistic .NET namespace depth; every sibling sits in
+a namespace of zero to three segments.
+
+Section timing inside the collector put the whole cost in one place. Of 536 ms
+of tree walk, `visible_type_candidates` accounted for about 450 ms across 19
+calls and the local-binding seeder for the remaining 84 ms -- and the seeder
+resolves declared types through the same search. The retained assembly index was
+never built during the run, so no external path ran at all; the cost was
+entirely the workspace-side type search.
+
+That search costs one store query per candidate short name, per namespace it
+qualifies the name with. Three things multiplied:
+
+1. **The candidate spellings were exponential.** C# writes type nesting into a
+   `short_name` with `$`, so a dotted spelling could be stored several ways.
+   `csharp_nested_owner_short_name_candidates` enumerated *every* `.`/`$` mask,
+   `2^(n-1)` per candidate, so a seven-segment probe expanded to 127 spellings
+   and each became its own SQL query. Since `csharp_normalize_full_name` maps
+   `$` back to `.`, all of them normalize to one name: they were alternate
+   lookup keys for a single target, and the mixed ones -- a spelling that
+   returns to `$` after a `.` -- match nothing the analyzer can persist.
+2. **Every namespace was probed whether or not it existed.** The search
+   qualified each name with the file's namespace, each `using`, and each
+   ancestor namespace: eleven probes for this file. The workspace declares
+   nothing in nine of them.
+3. **Nothing was reused within a request.** The type-reference ladder, the
+   member-owner ladder, the enclosing-type lookup and the supertype walk each
+   ran the search independently, so `PermissionTerminationRecord` was searched
+   for five times and `BaseClass` in `ClassUsagePatterns.cs` ten times.
+
+Multiplied out, one `Guid` lookup in this file issued about 347 store queries
+and the file issued roughly 15,000 per request. Measured cost tracked predicted
+query count at about 35 microseconds per query across every identity, which is
+why the file did not improve when warm: nothing was being populated, the work
+was simply being redone.
+
+### What changed
+
+- `csharp_nested_owner_short_name_candidates` returns one spelling per
+  nesting-run length instead of one per separator mask. The result is a subset
+  of the old set at every length, so no lookup that could match was dropped.
+- The visible-type search skips a qualifying namespace the workspace declares
+  nothing in. The `using` case was already filtered on exactly that condition
+  after the fact; the file-namespace and ancestor cases are gated only for a
+  spelling with no separators of its own, where the qualifier is provably the
+  namespace a match would sit in. `CSharpAnalyzer::workspace_namespace_exists`
+  is memoized per generation so the gate is not itself a query per probe.
+- The C# diagnostic collector answers each spelling's search once per request.
+
+### Re-measured
+
+Same command, same fixture, same `default-analyzer-config`, debug build. The
+host was busy (load average 17-19), so before and after were built as two
+binaries and run alternately, three runs each, rather than compared against the
+pinned numbers above. Milliseconds, median of three:
+
+| File | Cold before | Cold after | Cold | Warm before | Warm after | Warm |
+|---|---:|---:|---:|---:|---:|---:|
+| `GetTerminationRecordByIdHandler.cs` | 540.3 | 51.3 | 10.5x | 538.3 | 47.2 | 11.4x |
+| `ClassUsagePatterns.cs` | 22.2 | 5.4 | 4.1x | 19.2 | 2.9 | 6.6x |
+| `AssetRegistrySA.cs` | 20.8 | 5.7 | 3.6x | 17.9 | 2.7 | 6.6x |
+| `MixedScope.cs` | 4.1 | 4.0 | 1.0x | 2.5 | 2.0 | 1.2x |
+| `A.cs` | 4.2 | 4.2 | 1.0x | 0.5 | 0.5 | 1.0x |
+| `NestedNamespaces.cs` | 1.6 | 1.6 | 1.0x | 0.4 | 0.4 | 1.0x |
+
+The outlier is 10.5x faster cold and 11.4x faster warm. It is no longer two
+orders of magnitude above its siblings; it is about ten times the fixture's next
+slowest file, and the fixture's other namespace-bearing files improved by three
+to seven times as a side effect. The two files that name no type at all are
+unchanged, as expected.
+
+Outcomes are identical. Every one of the eighteen samples in all six artifacts
+matches on status, emitted errors, proof classes and suppression classes; the
+fixture still publishes 51 resolved, 114 incomplete, 99
+`missing_dependency_discovery` and 15 `unsupported_semantics`, and zero errors.
+
+### What still costs 47 ms, and why it is not fixed here
+
+Under instrumentation -- which inflates the total, so read these as shares
+rather than absolute times -- the remainder splits roughly into four parts:
+
+- **A resolved fq name searched as if it were a written spelling (largest
+  share).** For a member access through a local, the binding seeder resolves the
+  declared type to a workspace fq name, and the collector then hands that fq
+  name back to the *relative* visible-name search. The search dutifully
+  qualifies an already-absolute name with the file namespace and each ancestor,
+  producing probes like `A.B.C.A.B.C.Type`, and only reaches the absolute
+  spelling last. Trying the absolute spelling first would change C#'s
+  relative-before-absolute lookup order, which is a proof-semantics change, so
+  the fix is to stop discarding what the seeder resolved rather than to reorder
+  the ladder. Not attempted here.
+- **A non-name expression's source text used as a type spelling.** The receiver
+  of `.ConfigureAwait(false)` is an `invocation_expression`;
+  `csharp_type_node_identity` falls back to raw node text, so the resolver is
+  asked to look up
+  `` `_terminationRecordDL.GetByIdAsync(request.TerminationRecordId, new Graph` ``.
+  This is the source-text-instead-of-AST pattern `CLAUDE.md` prohibits, and it
+  is a guaranteed miss. Fixing it changes the `detail` string of an
+  `UnsupportedSemantics` suppression -- not its class, and no diagnostic -- so
+  it was left out of a change whose gate was outcome equality.
+- **The binding seeder re-walks the file per member access.** `seed_bindings_before`
+  restarts at the file root for every identifier receiver and re-resolves every
+  binding's declared type, so cost grows with member accesses times bindings.
+  Two accesses here; a real C# file has many more. The collector's per-request
+  memo does not reach inside the seeder.
+- **The file-namespace probe itself.** A six-segment namespace still expands to
+  about 28 candidate short names for one simple type name. That is the true size
+  of the set of short names a C# declaration could be stored under, so cutting it
+  further needs a store lookup keyed on the fq name rather than on the short
+  name.
+
+The first three are collector-level defects with the same shape as the ones
+fixed here. The fourth is a store schema question. None is a reason to hold the
+measured improvement.
