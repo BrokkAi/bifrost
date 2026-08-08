@@ -9011,6 +9011,7 @@ fn scala_wildcard_imported_member_outcome(
             .map(|structured_path| structured_path.segments.as_slice())
             .unwrap_or(&[]);
         let mut import_candidates = scala_wildcard_imported_member_units(
+            ctx.scala,
             ctx.support,
             &path,
             &file_package,
@@ -9040,7 +9041,42 @@ fn scala_wildcard_imported_member_outcome(
     exporters.pop().map(candidates_outcome)
 }
 
+/// Whether a wildcard import written over `base` exports the declarations
+/// indexed directly under that undecorated name.
+///
+/// `import X._` names a *term*. When `X` also names a Scala class or trait, the
+/// term is that type's companion object, whose members carry the `$` decoration
+/// (`X$.member`); the class's own members need an instance and are not exported.
+/// Before #1856 the `$`-blind spelling let `import Conf._` hand out the case
+/// class's constructor parameters as bare names.
+///
+/// Everything else that legitimately lives under the undecorated name still
+/// exports: a package, a Scala 3 `enum` (whose cases are indexed as `Color.Red`)
+/// and a Java class reached from Scala (whose statics are indexed the same way).
+fn scala_wildcard_base_exports_undecorated_members(
+    scala: &ScalaAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    base: &str,
+) -> bool {
+    let types: Vec<CodeUnit> = support
+        .fqn(base)
+        .into_iter()
+        .filter(|unit| {
+            unit.is_class()
+                && unit.fq_name() == base
+                && brokk_bifrost_core::analyzer::common::language_for_target(unit)
+                    == Language::Scala
+        })
+        .collect();
+    if types.is_empty() {
+        return true;
+    }
+    let project_types = scala.project_types();
+    types.iter().all(|unit| project_types.is_enum(scala, unit))
+}
+
 fn scala_wildcard_imported_member_units(
+    scala: &ScalaAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     path: &str,
     file_package: &str,
@@ -9050,17 +9086,25 @@ fn scala_wildcard_imported_member_units(
 ) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
     for imported_fqn in import_candidate_fq_names(path, file_package) {
+        let singleton_fqn = format!("{}$", imported_fqn.trim_end_matches('$'));
+        candidates.extend(
+            support
+                .fqn_direct_children(&singleton_fqn)
+                .into_iter()
+                .filter(|unit| unit.identifier() == member),
+        );
+        if !scala_wildcard_base_exports_undecorated_members(scala, support, &imported_fqn) {
+            continue;
+        }
         candidates.extend(
             support
                 .fqn(&format!("{imported_fqn}.{member}"))
                 .into_iter()
                 .filter(|unit| unit.identifier() == member),
         );
-    }
-    for owner_fqn in import_candidate_owner_fq_names(path, file_package) {
         candidates.extend(
             support
-                .fqn_direct_children(&owner_fqn)
+                .fqn_direct_children(&imported_fqn)
                 .into_iter()
                 .filter(|unit| unit.identifier() == member),
         );
@@ -9068,16 +9112,19 @@ fn scala_wildcard_imported_member_units(
     if !segments.is_empty() {
         for tier in scala_owner_qualified_import_candidate_tiers(enclosing_owners, segments) {
             for candidate in tier {
-                candidates.extend(
-                    support
-                        .fqn(&format!("{candidate}.{member}"))
-                        .into_iter()
-                        .filter(|unit| unit.identifier() == member),
-                );
                 let owner_fqn = format!("{}$", candidate.trim_end_matches('$'));
                 candidates.extend(
                     support
                         .fqn_direct_children(&owner_fqn)
+                        .into_iter()
+                        .filter(|unit| unit.identifier() == member),
+                );
+                if !scala_wildcard_base_exports_undecorated_members(scala, support, &candidate) {
+                    continue;
+                }
+                candidates.extend(
+                    support
+                        .fqn(&format!("{candidate}.{member}"))
                         .into_iter()
                         .filter(|unit| unit.identifier() == member),
                 );
@@ -10888,6 +10935,7 @@ fn scala_imported_member_shadows_bare_call(
                 .map(|structured_path| structured_path.segments.as_slice())
                 .unwrap_or(&[]);
             if scala_wildcard_imported_member_units(
+                scala,
                 support,
                 &path,
                 &file_package,

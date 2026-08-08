@@ -776,6 +776,15 @@ fn scala_enumerator_binding_visible_at(enumerator: Node<'_>, focus_start: usize)
     else {
         return false;
     };
+    // A focus inside the binder pattern is the binding's own declaration site.
+    // `alpha` in `alpha <- xs` and in `both = f(alpha)` declares `alpha`, so it
+    // answers the enumerator itself; before #1856 it fell through to the
+    // enclosing scope and to the file's wildcard imports instead.
+    if pattern.start_byte() <= focus_start && focus_start < pattern.end_byte() {
+        return true;
+    }
+    // Elsewhere the binder is in scope only after its right-hand side ends, so
+    // `for { alpha <- f(alpha) }` still reads the outer `alpha`.
     enumerator
         .named_children(&mut enumerator.walk())
         .find(|child| child.start_byte() >= pattern.end_byte() && child.kind() != "guard")
