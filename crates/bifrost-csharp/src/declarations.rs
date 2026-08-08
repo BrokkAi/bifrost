@@ -65,15 +65,27 @@ pub fn parse_csharp_file(file: &ProjectFile, source: &str, tree: &Tree) -> Parse
         source,
         parsed: &mut parsed,
     };
-    visitor.visit_container(tree.root_node(), "", None);
+    visitor.visit_container(tree.root_node(), "");
     parsed
+}
+
+/// The type declaration whose body is currently being walked.
+#[derive(Clone)]
+struct CSharpEnclosingType {
+    unit: CodeUnit,
+    /// The type declaration's own `name` field text, exactly as written. This is
+    /// neither `unit.short_name()` (which carries the `Outer$` nesting prefix)
+    /// nor the identity name (which carries the generic-arity suffix, so that
+    /// `class Box<T>` is spelled ``Box`1``), so it is the only spelling a
+    /// `constructor_declaration`'s name can be compared against.
+    declared_name: String,
 }
 
 #[derive(Clone)]
 struct CSharpScope {
     package_name: String,
     lexical_scope: Vec<String>,
-    class_unit: Option<CodeUnit>,
+    enclosing_type: Option<CSharpEnclosingType>,
 }
 
 struct CSharpWork<'tree> {
@@ -88,19 +100,14 @@ struct CSharpVisitor<'a> {
 }
 
 impl<'a> CSharpVisitor<'a> {
-    fn visit_container(
-        &mut self,
-        node: Node<'_>,
-        package_name: &str,
-        class_unit: Option<CodeUnit>,
-    ) {
+    fn visit_container(&mut self, node: Node<'_>, package_name: &str) {
         let mut stack = Vec::new();
         self.push_children(
             node,
             CSharpScope {
                 package_name: package_name.to_string(),
                 lexical_scope: Vec::new(),
-                class_unit,
+                enclosing_type: None,
             },
             &mut stack,
         );
@@ -133,7 +140,7 @@ impl<'a> CSharpVisitor<'a> {
                     current = CSharpScope {
                         package_name,
                         lexical_scope,
-                        class_unit: current.class_unit.clone(),
+                        enclosing_type: current.enclosing_type.clone(),
                     };
                 }
                 continue;
@@ -208,7 +215,7 @@ impl<'a> CSharpVisitor<'a> {
                 CSharpScope {
                     package_name,
                     lexical_scope,
-                    class_unit: scope.class_unit.clone(),
+                    enclosing_type: scope.enclosing_type.clone(),
                 },
                 stack,
             );
@@ -238,8 +245,8 @@ impl<'a> CSharpVisitor<'a> {
         } else {
             format!("{name}`{arity}")
         };
-        let short_name = if let Some(parent) = &scope.class_unit {
-            format!("{}${identity_name}", parent.short_name())
+        let short_name = if let Some(enclosing) = &scope.enclosing_type {
+            format!("{}${identity_name}", enclosing.unit.short_name())
         } else {
             identity_name.clone()
         };
@@ -248,8 +255,9 @@ impl<'a> CSharpVisitor<'a> {
         // JVM-derived binary names), which is exactly what `SegmentKind::Nested`
         // renders regardless of the preceding segment's kind; a top-level type
         // hangs off the namespace-path `Package` chain as a plain `Type`.
-        let fq = match &scope.class_unit {
-            Some(parent) => parent
+        let fq = match &scope.enclosing_type {
+            Some(enclosing) => enclosing
+                .unit
                 .fq()
                 .clone()
                 .with_pushed(cs_segment(&identity_name, SegmentKind::Nested)),
@@ -267,7 +275,10 @@ impl<'a> CSharpVisitor<'a> {
             code_unit.clone(),
             node,
             self.source,
-            scope.class_unit.clone(),
+            scope
+                .enclosing_type
+                .as_ref()
+                .map(|enclosing| enclosing.unit.clone()),
             None,
         );
         self.parsed.add_raw_supertypes(
@@ -288,7 +299,10 @@ impl<'a> CSharpVisitor<'a> {
                 CSharpScope {
                     package_name: scope.package_name.clone(),
                     lexical_scope,
-                    class_unit: Some(code_unit),
+                    enclosing_type: Some(CSharpEnclosingType {
+                        unit: code_unit,
+                        declared_name: name.to_string(),
+                    }),
                 },
                 stack,
             );
@@ -296,9 +310,10 @@ impl<'a> CSharpVisitor<'a> {
     }
 
     fn visit_method(&mut self, node: Node<'_>, scope: &CSharpScope) {
-        let Some(parent) = &scope.class_unit else {
+        let Some(enclosing) = &scope.enclosing_type else {
             return;
         };
+        let parent = &enclosing.unit;
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
@@ -335,14 +350,23 @@ impl<'a> CSharpVisitor<'a> {
     }
 
     fn visit_constructor(&mut self, node: Node<'_>, scope: &CSharpScope) {
-        let Some(parent) = &scope.class_unit else {
+        let Some(enclosing) = &scope.enclosing_type else {
             return;
         };
+        let parent = &enclosing.unit;
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
         let name = cs_node_text(name_node, self.source).trim();
-        if name.is_empty() {
+        // C# requires a constructor to be named after the type that declares it,
+        // so a mismatch never occurs in source the compiler accepts. It is still
+        // reachable through parse recovery: an `#if !DEBUG` region between a
+        // `try` block and its `catch` chain makes tree-sitter re-parse trailing
+        // catch clauses at class-body level as `constructor_declaration` nodes
+        // named `catch` (issue #1800), which used to reach the index as real
+        // `Function` members. Skip silently rather than assert -- this is a
+        // misparse of otherwise valid source, not a broken internal invariant.
+        if name != enclosing.declared_name {
             return;
         }
         let fq = parent
@@ -373,9 +397,10 @@ impl<'a> CSharpVisitor<'a> {
     }
 
     fn visit_property(&mut self, node: Node<'_>, scope: &CSharpScope) {
-        let Some(parent) = &scope.class_unit else {
+        let Some(enclosing) = &scope.enclosing_type else {
             return;
         };
+        let parent = &enclosing.unit;
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
@@ -409,9 +434,10 @@ impl<'a> CSharpVisitor<'a> {
     }
 
     fn visit_field_declaration(&mut self, node: Node<'_>, scope: &CSharpScope) {
-        let Some(parent) = &scope.class_unit else {
+        let Some(enclosing) = &scope.enclosing_type else {
             return;
         };
+        let parent = &enclosing.unit;
         let Some(declaration) = node
             .child_by_field_name("declaration")
             .or_else(|| first_named_child_of_kind(node, "variable_declaration"))
@@ -472,9 +498,10 @@ impl<'a> CSharpVisitor<'a> {
     }
 
     fn visit_enum_member(&mut self, node: Node<'_>, scope: &CSharpScope) {
-        let Some(parent) = &scope.class_unit else {
+        let Some(enclosing) = &scope.enclosing_type else {
             return;
         };
+        let parent = &enclosing.unit;
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
