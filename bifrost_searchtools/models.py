@@ -5229,6 +5229,30 @@ class CommitSymbol:
 
 
 @dataclass(frozen=True)
+class CalleeChange:
+    """One outgoing call edge a patch symbol gained or lost.
+
+    This is :class:`CallEdgeChange` without ``from_fqn`` and ``change``: the
+    caller is the record holding the list, and the direction is which of the
+    record's lists it lands in.
+    """
+
+    to_fqn: str
+    language: str
+    weight: int
+    sites: list[UsageGraphCallSite]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CalleeChange:
+        return cls(
+            to_fqn=data["to"],
+            language=data["language"],
+            weight=int(data["weight"]),
+            sites=[UsageGraphCallSite.from_dict(item) for item in data.get("sites", [])],
+        )
+
+
+@dataclass(frozen=True)
 class EditedSymbolPair:
     """A symbol present at both endpoints that some hunk touched.
 
@@ -5241,6 +5265,8 @@ class EditedSymbolPair:
     after: CommitSymbol
     touched_old_lines: list[int]
     touched_new_lines: list[int]
+    added_calls: list[CalleeChange]
+    removed_calls: list[CalleeChange]
 
     @classmethod
     def from_dict(cls, data: dict) -> EditedSymbolPair:
@@ -5249,6 +5275,10 @@ class EditedSymbolPair:
             after=CommitSymbol.from_dict(data["after"]),
             touched_old_lines=[int(item) for item in data.get("touched_old_lines", [])],
             touched_new_lines=[int(item) for item in data.get("touched_new_lines", [])],
+            added_calls=[CalleeChange.from_dict(item) for item in data.get("added_calls", [])],
+            removed_calls=[
+                CalleeChange.from_dict(item) for item in data.get("removed_calls", [])
+            ],
         )
 
 
@@ -5258,12 +5288,15 @@ class IntroducedSymbol:
 
     after: CommitSymbol
     touched_new_lines: list[int]
+    calls: list[CalleeChange]
+    """Everything the new symbol calls; a symbol the preimage lacks can only add edges."""
 
     @classmethod
     def from_dict(cls, data: dict) -> IntroducedSymbol:
         return cls(
             after=CommitSymbol.from_dict(data["after"]),
             touched_new_lines=[int(item) for item in data.get("touched_new_lines", [])],
+            calls=[CalleeChange.from_dict(item) for item in data.get("calls", [])],
         )
 
 
@@ -5273,25 +5306,41 @@ class DeletedSymbol:
 
     before: CommitSymbol
     touched_old_lines: list[int]
+    called: list[CalleeChange]
+    """Everything the symbol used to call; the mirror of :attr:`IntroducedSymbol.calls`."""
 
     @classmethod
     def from_dict(cls, data: dict) -> DeletedSymbol:
         return cls(
             before=CommitSymbol.from_dict(data["before"]),
             touched_old_lines=[int(item) for item in data.get("touched_old_lines", [])],
+            called=[CalleeChange.from_dict(item) for item in data.get("called", [])],
         )
 
 
 @dataclass(frozen=True)
 class MovedSymbol:
+    """A symbol both endpoints hold at a different location, or under a
+    different fully-qualified name because its file moved.
+
+    A pure move reports both call lists empty: the preimage graph is compared
+    under the postimage names, so relocating a symbol is not a call-edge change.
+    """
+
     before: CommitSymbol
     after: CommitSymbol
+    added_calls: list[CalleeChange]
+    removed_calls: list[CalleeChange]
 
     @classmethod
     def from_dict(cls, data: dict) -> MovedSymbol:
         return cls(
             before=CommitSymbol.from_dict(data["before"]),
             after=CommitSymbol.from_dict(data["after"]),
+            added_calls=[CalleeChange.from_dict(item) for item in data.get("added_calls", [])],
+            removed_calls=[
+                CalleeChange.from_dict(item) for item in data.get("removed_calls", [])
+            ],
         )
 
 
@@ -5353,6 +5402,8 @@ class ImportChange:
 
 @dataclass(frozen=True)
 class CallEdgeChange:
+    """A call edge the patch added or removed whose caller is no patch symbol."""
+
     change: str
     from_fqn: str
     to_fqn: str
@@ -5396,7 +5447,9 @@ class DiffAnalysisResult:
     patch_symbols: PatchSymbols
     dependency_symbols: list[CommitSymbol]
     import_changes: list[ImportChange]
-    call_edge_changes: list[CallEdgeChange]
+    unattributed_call_edge_changes: list[CallEdgeChange]
+    """Call-edge changes left over after every patch symbol took the edges it calls."""
+
     large_callsite_symbols: list[LargeCallsiteSymbol]
 
     @classmethod
@@ -5409,8 +5462,9 @@ class DiffAnalysisResult:
                 CommitSymbol.from_dict(item) for item in data.get("dependency_symbols", [])
             ],
             import_changes=[ImportChange.from_dict(item) for item in data.get("import_changes", [])],
-            call_edge_changes=[
-                CallEdgeChange.from_dict(item) for item in data.get("call_edge_changes", [])
+            unattributed_call_edge_changes=[
+                CallEdgeChange.from_dict(item)
+                for item in data.get("unattributed_call_edge_changes", [])
             ],
             large_callsite_symbols=[
                 LargeCallsiteSymbol.from_dict(item)
