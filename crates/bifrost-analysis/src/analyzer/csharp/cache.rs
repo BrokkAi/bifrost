@@ -14,6 +14,13 @@ pub(super) struct CSharpMemoCaches {
     /// its own answer would be served the other's from here (#1726).
     pub(super) namespace_by_file: Cache<ProjectFile, Arc<String>>,
     pub(super) using_namespaces: Cache<ProjectFile, Arc<Vec<String>>>,
+    /// Whether the workspace declares anything in a namespace, by namespace.
+    ///
+    /// The visible-type search asks this of every namespace a probe would
+    /// qualify a name with, which is one store query per ancestor namespace and
+    /// per `using` of every file it resolves a name in. The answer depends on
+    /// the generation alone, and this analyzer is one generation (#1806).
+    pub(super) namespace_exists: Cache<String, bool>,
     pub(super) using_aliases: Cache<ProjectFile, Arc<HashMap<String, String>>>,
     pub(super) imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     pub(super) referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
@@ -39,6 +46,19 @@ impl CSharpMemoCaches {
             budget_bytes,
             namespace_by_file: build_weighted_cache(budget_bytes / 16, weight_string),
             using_namespaces: build_weighted_cache(budget_bytes / 8, weight_string_vec),
+            // Inline because moka's weigher takes the key as `&K`, and `K` here
+            // is `String`: a named function would have to spell `&String`,
+            // which `clippy::ptr_arg` rejects.
+            namespace_exists: build_weighted_cache(
+                budget_bytes / 16,
+                |namespace: &String, _: &bool| {
+                    weight_bytes(
+                        size_of::<String>() as u64
+                            + namespace.len() as u64
+                            + size_of::<bool>() as u64,
+                    )
+                },
+            ),
             using_aliases: build_weighted_cache(budget_bytes / 8, weight_string_map),
             imported_code_units: build_weighted_cache(
                 budget_bytes / 4,
