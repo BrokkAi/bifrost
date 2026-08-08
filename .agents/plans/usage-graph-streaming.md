@@ -70,6 +70,15 @@ measurement is a separate task run after review; it is not part of this plan's a
       same 11 -- 4/4, 10/8 and 8/8 -- so the count tracks work done, not lineage, and in the one
       pair that separates them it is HEAD that finds *more*.
       See `Outcomes & Retrospective` for the evidence and for the 300 s budget ceiling it exposed.
+- [x] (2026-08-08) **D4 re-measured after the stampede fix (`1272c7d7`). The verdict is unchanged
+      and better understood: the marginal-RSS target passes with more margin, the graph-phase
+      latency target still FAILS.** Report: `usage-graph-d4-remeasure-v1.md` (session scratchpad).
+      Measured at `37540fb3` at loadavg 22-58, the quietest large-tree run since run 3. The fix
+      reaches the theoretical minimum -- **100,890 store reads for 100,847 distinct keys** -- and
+      `usages::graph_find_usages` is still **90.9% of the backend**, because the duplicated work it
+      removed was concurrent rather than serial. The dominant term is now the per-read cost of a
+      hot short name (5-11 s each) times a 100,847-distinct-name fan-out. See
+      `Outcomes & Retrospective`.
 
 ## Surprises & Discoveries
 
@@ -320,12 +329,92 @@ Two further results worth carrying:
   284.7 CPU-seconds at HEAD against 474.5 and 488.8 on the comparator, for the identical 11-hit
   answer. That is the first CPU-normalized confirmation of the stampede fix at rustc scale.
 
+### The D4 gate re-measured after the stampede fix (run 6, 2026-08-08)
+
+Run 4 identified a cache stampede in `definition_candidate_rows` and estimated ~940 s of a 1,322 s
+graph phase as recoverable. `1272c7d7` single-flighted that read. This is the clean-conditions
+re-measure the fix's own issue comment queued. Measured at `37540fb3`, on the same rustc tree and
+the same cells, at **loadavg 22-58** -- the quietest large-tree run since run 3 (3.8-4.7) and far
+better than run 4 (84-486). Full report: `usage-graph-d4-remeasure-v1.md` in the session scratchpad.
+Verdicts are read off CPU time, span proportions, RSS and counts; wall clock is context only.
+
+**The fix works exactly as specified, and the graph phase did not move.** A probe binary counting
+every store read inside `definition_candidate_rows` charges **100,890 reads for 100,847 distinct
+keys -- 1.0004 reads per key, the theoretical minimum.** In-flight duplication is gone.
+`usages::graph_find_usages` nevertheless measures **1,271.99 s, 90.9% of the scan backend**, the
+same share it held in run 3 (90.3%) and run 4 (90.3%).
+
+**D4 target "graph phase from 1,034 s to seconds": still FAIL, by two orders of magnitude** -- but
+now for a diagnosed reason rather than a suspected one.
+
+**D4 target "marginal RSS to O(bounded caches)": PASS, with more margin.** Peak RSS **10.69 GB**
+untimed (11.74 timed) against run 4's 15.58/17.49 and run 3's 23.42. Most of the further drop is
+`37540fb3`, which stopped copying the definition index into a normalized twin.
+
+**Why the ~940 s did not materialise, measured.** Of the 1,255.1 s of
+`sql_definition_candidates.rows[*]` span time, **at most 664.3 s (52.9%) is real read time and at
+least 590.8 s (47.1%) is followers parked on a leader** (per-name maxima bound the leader from
+above; the span opens before the memo, so a follower's span *is* its park time). The duplicated
+work was **concurrent, not serial**: eight threads running the same 10 s read finish in about 10 s
+of wall, and one thread running it while seven wait also finishes in about 10 s. The fix recovers
+CPU and store I/O -- the parallel triage measures **1.7-2.1x less CPU on a completing cell** -- and
+recovers no wall clock on the truncated one.
+
+**Run 4's reading of the duration histogram needs one correction.** It called the sub-0.1 ms bucket
+(68.5%) "memo hits". It cannot be: there are 100,847 *distinct* keys against 146,212 calls, so at
+least 69% of all calls are a key's first ask and must read. That bucket is overwhelmingly **fast
+reads of rare names**. This is why "more memoization" was never the lever, and why the lever that
+was pulled could not pay what was estimated.
+
+**The new dominant term is per-read cost and name volume, not duplication.** One read of a hot short
+name genuinely costs 5-11 s (`foo` 11.16 s, `main` 10.97 s, `bar` 10.15 s), and one query reads
+**100,847 distinct short names**. The slowest 1% of names carry **74.1%** of all real read time; the
+slowest 0.1% carry 41.8%. Two separable follow-ups: the cost of a single
+`declaration_order_candidate_rows_by_short_name_for_langs` on a high-cardinality short name, and the
+name volume the scan generates. Both want their own issue; both are adjacent to #1748/#1774 without
+being what those describe.
+
+**`workspace_module_walk` is not implicated at this scale.** It carries no span, but it is reached
+from candidate discovery, and `usages::candidate_discovery` is **119.26 s, 8.5% of the backend**
+(down from 9.4-9.5%). There is no room inside 8.5% for a term that explains a 1,272 s graph phase.
+Inference from the share, not proof. The second-largest named item inside the phase is
+`RustAnalyzer::export_index_of_declarations`, n=3,076 / 533.85 s / 38.1%; its call count is flat
+across runs 3, 4 and 6 while its thread-summed time is not, so one sample should not be read as a
+regression, but it is now the largest item after the row reads.
+
+**Gate cells, on a CPU-adjusted reading.** Cell (a) warm 5.31 s wall / **4.21 s user CPU**, against
+4.69 s (run 4) and 4.93 s (run 3): user CPU is flat to falling, so the work has not changed and run
+3's quiet-host verdict carries -- **gate 1(a) still FAILS its 5 s bar, by about 6%**. Cell (b) warm
+5.31 s, listing count 12: the watcher fix holds (run 3: 653.78 s, 1,487 listings), **gate 1(b) fails
+the same 5 s bar by the same ~6%**. Cell (c) edited 6.11 s / 4.41 s user CPU: **gate 2 PASSES** at
+39% inside its 10 s bar, and no load factor can flip it. Gate cell peak RSS 0.43-0.74 GB: **gate 3
+PASSES at the gate budget**, and still fails in the answering regime at 10.69 GB. All eight gate
+cells return `resolved=0 failure=1 time_budget`, for the fifth run running: the gate table measures
+how fast the pipeline gives up, not answering latency. `workspace_file_listing_count` is 11 cold /
+12 warm, identical to run 4.
+
+**Method note worth carrying: on this host, user CPU is load-independent and system CPU is not.**
+Run 6's gate cells charge 7.5-9.1 s of sys against run 3's 2.9-3.7 s while user CPU is flat; the
+difference tracks host memory pressure and background I/O, not the query.
+
+**Independent corroboration of the closed hit flag.** The probe binary's answering run returned
+**eleven hits, run 3's set entry for entry**, on an ordinary full-scope truncated sweep with no
+`paths` narrowing -- while the unprobed binary returned eight twice, a strict subset. That is a
+third line of evidence for the deadline-artifact conclusion already recorded above, and the only one
+that did not need a narrowed query to reach the full set.
+
 Two lessons. First, the frozen equivalence pin was not ceremony: it caught two behavioral
 differences in `bare_names_resolving_to` that reading the code did not reveal, and both would have
 silently narrowed the scan's name gate. A fixture written before the rewrite, probing every name
 against every path prefix over every file in both directions, is worth more than a set of
 hand-picked assertions. Second, writing counter pins before the change and recording their failing
 output made the difference between "the design says this should be cheaper" and "21 became 0".
+
+A third, from run 6: **an estimate built from span time is an estimate of waiting, not of work.**
+The ~940 s figure came from summing the durations of concurrent same-key spans. Those durations
+overlapped, and the span opened before the memo, so the sum measured neither the duplicated work nor
+the phase's critical path. The counter that settled it -- reads per distinct key -- cost two lines
+of instrumentation and should have been the first measurement, not the last.
 
 ## Note on revisions
 
