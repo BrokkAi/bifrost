@@ -1,8 +1,13 @@
 # Design: relational schema for the opaque-blob cleanup
 
-Status: DESIGN FOR OWNER REVIEW. No implementation until approved. Author: Fable, 2026-08-08.
-Substrate: `opaque-blob-inventory-v1.md` (session artifact; check into `.agents/docs/` with the
-first implementation commit). Governing direction: AGENTS.md "SQL and the analyzer store"
+Status: APPROVED, IMPLEMENTING (owner approval on record). Author: Fable, 2026-08-08.
+Per-step tracking lives in the ExecPlan `.agents/plans/store-schema-cleanup.md`, seeded for all
+seven steps and maintained per `.agents/PLANS.md`. This file stays the design of record: it
+states what the schema should become and why. The ExecPlan states where each step stands, what
+was decided while landing it, and what surprised us.
+Substrate: `.agents/docs/opaque-blob-inventory-2026-08.md` (checked in with the first
+implementation commit; it was the session artifact `opaque-blob-inventory-v1.md`).
+Governing direction: AGENTS.md "SQL and the analyzer store"
 (commit 9263e2a5). Style brief from the owner: Celko-clean where it does not cost performance;
 Lukas Eder pragmatism where Celko's dogmatism should soften -- every softening below is named
 as such.
