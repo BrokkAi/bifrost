@@ -128,6 +128,83 @@ fn a_diagnostic_request_never_activates_dependency_packs() {
     );
 }
 
+/// A budget the activation cannot fit inside is not proof about a name either.
+///
+/// Cancellation and budget exhaustion reach the host by different routes, but
+/// both must land in the same place: discovery that did not complete stops the
+/// transaction before publication, so nothing is published and the collectors
+/// keep reporting suppressions. This pins the budget route because it is the
+/// one a real workspace can hit without anyone asking for it.
+#[test]
+fn a_budget_exhausted_activation_publishes_nothing_and_keeps_reports_incomplete() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(".gitignore", "node_modules/\n")
+        .file(
+            "package-lock.json",
+            r#"{
+              "lockfileVersion": 3,
+              "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/widget": { "version": "2.1.0" }
+              }
+            }"#,
+        )
+        .file(
+            "node_modules/widget/package.json",
+            r#"{ "name": "widget", "version": "2.1.0", "types": "index.d.ts" }"#,
+        )
+        .file(
+            "node_modules/widget/index.d.ts",
+            "export declare function create(value: string): string;\n",
+        )
+        .file(
+            "app.ts",
+            "import { create } from \"widget\";\n\nexport const made = create(\"x\");\n",
+        )
+        .build();
+    let config = AnalyzerConfig::default();
+    let analyzer = project.workspace_analyzer(config.clone());
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let activation = activation_request();
+    let live = CancellationToken::default();
+    let exhausted = DependencyPackLimits {
+        max_dependencies: 0,
+        ..DependencyPackLimits::default()
+    };
+
+    let outcome = analyzer.activate_dependency_packs(
+        &config,
+        &[DependencyPackEcosystem::Npm],
+        DependencyPackWorkspaceContext {
+            catalog: &catalog,
+            persistence: None,
+            activation: &activation,
+            limits: exhausted,
+            cancellation: &live,
+        },
+    );
+    assert!(!outcome.complete(), "{outcome:#?}");
+    assert!(
+        !outcome.diagnostic_refresh_required,
+        "an activation that exhausted its budget published nothing to refresh for: {outcome:#?}"
+    );
+    assert!(analyzer.analyzer().semantic_model_overlay().is_none());
+
+    let file = project.file("app.ts");
+    let source = std::fs::read_to_string(file.abs_path()).unwrap();
+    let report = analyzer.analyzer().semantic_diagnostics(&file, &source);
+
+    assert_eq!(
+        report.status(),
+        SemanticDiagnosticReportStatus::Incomplete,
+        "an exhausted budget must not read as a complete answer: {report:#?}"
+    );
+    assert!(
+        report.diagnostics().is_empty(),
+        "an incomplete report must publish no error: {report:#?}"
+    );
+}
+
 /// A complete activation is not by itself proof about a name.
 ///
 /// A host activates every ecosystem whose languages are present, and an
