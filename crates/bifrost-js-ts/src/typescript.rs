@@ -16,6 +16,7 @@ use crate::imports::{
     parse_commonjs_require_import_infos_from_node, parse_es_import_infos_from_node,
 };
 use crate::model::*;
+use crate::parse::flow_dialect_blocks_extraction;
 use crate::providers::JsTsSource;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind};
@@ -30,6 +31,12 @@ use tree_sitter::{Node, Tree};
 pub fn parse_typescript_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
     let root = tree.root_node();
     let mut parsed = ParsedFile::new(String::new());
+    if flow_dialect_blocks_extraction(file, root, source) {
+        // Flow is a JavaScript dialect, so this is all but unreachable from a
+        // `.ts` path. It is asked anyway because the graph and diagnostic
+        // surfaces ask it for both dialects, and the three must agree (#1786).
+        return parsed;
+    }
     let module = module_code_unit(file);
     let mut module_has_imports = false;
     let exported_roots = ts_es_named_exported_roots(root, source);

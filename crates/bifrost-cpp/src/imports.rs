@@ -6,6 +6,7 @@
 //! include map on the analyzer; every decision they make is a function here.
 
 use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::model::ImportInfo;
 use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use regex::Regex;
@@ -226,6 +227,55 @@ fn project_relative_include_path(project_root: &Path, include_path: &Path) -> Op
         .ok()
         .or_else(|| lexical_project_relative_include_path(&canonical_root, &canonical_include))
         .or_else(|| lexical_project_relative_include_path(project_root, include_path))
+}
+
+/// The claim edges `sources` contribute: for each source file, the workspace
+/// files it pulls in by quoted `#include` that no language's extension registry
+/// claims (#1837).
+///
+/// `sources` pairs each already-analyzed C++ file with the `ImportInfo` rows
+/// recorded for it; `claimable` is the caller's set of workspace files with an
+/// extension no language owns. `abseil`'s `.inc` translation-unit fragments are
+/// the motivating case: nothing indexes them today, so every declaration they
+/// hold is invisible in both directions.
+///
+/// Only quoted includes participate. An angled include names a search path the
+/// analyzer does not model, so resolving one against workspace file names would
+/// claim files the compiler would never reach.
+///
+/// Edges rather than a flat set, because the caller both closes the relation
+/// transitively and drops a claim when the last `#include` naming it goes away;
+/// both need to know which source contributed which target. A source with no
+/// claimable include contributes no entry.
+///
+/// The result depends only on `sources`, `claimable` and the resolution rules
+/// in this module -- never on the order either collection arrives in.
+pub fn included_claimable_files(
+    sources: &[(ProjectFile, Vec<ImportInfo>)],
+    claimable: &BTreeSet<ProjectFile>,
+) -> HashMap<ProjectFile, BTreeSet<ProjectFile>> {
+    let mut edges: HashMap<ProjectFile, BTreeSet<ProjectFile>> = HashMap::default();
+    if claimable.is_empty() || sources.is_empty() {
+        return edges;
+    }
+    let index = IncludeTargetIndex::build(claimable.iter());
+    for (source_file, imports) in sources {
+        let mut targets = BTreeSet::new();
+        for include in imports
+            .iter()
+            .filter_map(|import| parse_quoted_include(&import.raw_snippet))
+        {
+            targets.extend(resolve_include_targets_with_index(
+                source_file,
+                &include,
+                &index,
+            ));
+        }
+        if !targets.is_empty() {
+            edges.insert(source_file.clone(), targets);
+        }
+    }
+    edges
 }
 
 pub fn quoted_include_paths(parsed: &[String]) -> Vec<String> {

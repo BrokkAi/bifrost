@@ -16,6 +16,7 @@ mod issue_1416_scan_name_gate;
 mod issue_1450_cross_request_prepared_syntax;
 mod issue_1451_cross_request_import_infos;
 mod issue_1785_js_file_scope_enclosing;
+mod issue_1786_flow_usage_suppression;
 mod issue_1854_scala_enclosing_def_shadow;
 mod issue_1855_scala_site_java_declaration;
 mod kotlin_member_dispatch_trace;

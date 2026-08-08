@@ -9,6 +9,7 @@ use crate::analyzer::cognitive_complexity;
 use brokk_bifrost_cpp::adapter::{
     CPP_COGNITIVE_CONFIG, CPP_FILE_EXTENSION, cpp_extract_call_receiver, parse_cpp_file,
 };
+use brokk_bifrost_cpp::imports::included_claimable_files;
 use brokk_bifrost_cpp::queries::CPP_QUERY_DIRECTORY;
 use brokk_bifrost_cpp::test_detection::cpp_contains_tests;
 use tree_sitter::Tree;
@@ -56,5 +57,21 @@ impl LanguageAdapter for CppAdapter {
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&CPP_COGNITIVE_CONFIG)
+    }
+
+    /// C++ is the one language that adopts files by include (#1837): `.inc`
+    /// translation-unit fragments (abseil's `absl/.../*.inc`) hold real
+    /// declarations but carry an extension no language owns, so nothing would
+    /// index them otherwise.
+    fn claims_included_files(&self) -> bool {
+        true
+    }
+
+    fn infer_claimed_files(
+        &self,
+        sources: &[(ProjectFile, Vec<ImportInfo>)],
+        claimable: &BTreeSet<ProjectFile>,
+    ) -> HashMap<ProjectFile, BTreeSet<ProjectFile>> {
+        included_claimable_files(sources, claimable)
     }
 }

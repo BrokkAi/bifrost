@@ -11952,6 +11952,259 @@ function shadowed(Promise) { return Promise; }
     );
 }
 
+/// The angular.js shape: script files share one global scope, so a bare call
+/// reaches a program-scope declaration in another script (#1787).
+#[test]
+fn javascript_bare_name_resolves_through_the_shared_script_global_scope() {
+    let angular = r#"function isNumber(value) { return typeof value === 'number'; }
+class Registry {}
+var isFunction = function(value) { return typeof value === 'function'; };
+"#;
+    let parse = r#"function parse(value) {
+  return isNumber(value) && isFunction(value) && Registry;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("src/Angular.js", angular)
+        .file("src/ng/parse.js", parse)
+        .build();
+
+    for (needle, fqn, kind, start_line) in [
+        ("isNumber(value) &&", "isNumber", "function", 1),
+        ("isFunction(value) &&", "isFunction", "function", 3),
+        ("Registry;", "Registry", "class", 2),
+    ] {
+        let start = parse.find(needle).expect("script global reference");
+        let value = lookup(
+            project.root(),
+            &location_reference("src/ng/parse.js", parse, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{needle}: {value}");
+        assert_eq!(result["definitions"][0]["fqn"], fqn, "{needle}: {value}");
+        assert_eq!(result["definitions"][0]["kind"], kind, "{needle}: {value}");
+        assert_eq!(
+            result["definitions"][0]["path"], "src/Angular.js",
+            "{needle}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["start_line"], start_line,
+            "{needle}: {value}"
+        );
+    }
+}
+
+/// A module's top-level binding is file-private, so neither side of a
+/// script-global read may be a module (#1787).
+#[test]
+fn javascript_module_files_stay_outside_the_script_global_scope() {
+    let script_declaration = "function isNumber(value) { return typeof value === 'number'; }\n";
+    let module_declaration =
+        "export function isString(value) { return typeof value === 'string'; }\n";
+    let importing_module = r#"import { unrelated } from "./other.js";
+
+function parse(value) {
+  return isNumber(value);
+}
+"#;
+    let exporting_module = r#"export function parse(value) {
+  return isNumber(value);
+}
+"#;
+    let commonjs_module = r#"module.exports = function parse(value) {
+  return isNumber(value);
+};
+"#;
+    let script_reading_module = r#"function parse(value) {
+  return isString(value);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("src/Angular.js", script_declaration)
+        .file("src/strings.js", module_declaration)
+        .file("src/other.js", "export function unrelated() {}\n")
+        .file("src/importing.js", importing_module)
+        .file("src/exporting.js", exporting_module)
+        .file("src/commonjs.js", commonjs_module)
+        .file("src/reader.js", script_reading_module)
+        .build();
+
+    for (path, source, needle) in [
+        ("src/importing.js", importing_module, "isNumber(value)"),
+        ("src/exporting.js", exporting_module, "isNumber(value)"),
+        ("src/commonjs.js", commonjs_module, "isNumber(value)"),
+        ("src/reader.js", script_reading_module, "isString(value)"),
+    ] {
+        let start = source.find(needle).expect("cross-file bare reference");
+        let value = lookup(project.root(), &location_reference(path, source, start));
+        assert_eq!(
+            value["results"][0]["status"], "no_definition",
+            "{path}: {value}"
+        );
+        assert!(
+            value["results"][0]["definitions"].is_null(),
+            "{path}: {value}"
+        );
+    }
+}
+
+/// The workspace is the program, so two scripts that declare the same global
+/// really are two contenders and both are reported (#1787, #1811).
+#[test]
+fn javascript_competing_script_globals_report_every_contender() {
+    let first = "function isNumber(value) { return typeof value === 'number'; }\n";
+    let second = "function isNumber(value) { return value === +value; }\n";
+    let parse = r#"function parse(value) {
+  return isNumber(value);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("src/a.js", first)
+        .file("src/b.js", second)
+        .file("src/ng/parse.js", parse)
+        .build();
+
+    let start = parse.find("isNumber(value)").expect("ambiguous reference");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/ng/parse.js", parse, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    assert_eq!(
+        result["definitions"]
+            .as_array()
+            .expect("definition array")
+            .iter()
+            .map(|definition| definition["path"].as_str().expect("definition path"))
+            .collect::<Vec<_>>(),
+        vec!["src/a.js", "src/b.js"],
+        "{value}"
+    );
+}
+
+/// Only a program-scope binding joins the shared global scope: a member and a
+/// function nested in another function do not (#1787).
+#[test]
+fn javascript_script_global_scope_excludes_members_and_nested_functions() {
+    let members = r#"function Ctor() {}
+Ctor.prototype.isNumber = function(value) { return typeof value === 'number'; };
+var holder = { isString: function(value) { return typeof value === 'string'; } };
+function outer() {
+  function isArray(value) { return Array.isArray(value); }
+  return isArray;
+}
+"#;
+    let parse = r#"function parse(value) {
+  return isNumber(value) || isString(value) || isArray(value);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("src/Angular.js", members)
+        .file("src/ng/parse.js", parse)
+        .build();
+
+    for needle in ["isNumber(value)", "isString(value)", "isArray(value)"] {
+        let start = parse.find(needle).expect("member-shaped reference");
+        let value = lookup(
+            project.root(),
+            &location_reference("src/ng/parse.js", parse, start),
+        );
+        assert_eq!(
+            value["results"][0]["status"], "no_definition",
+            "{needle}: {value}"
+        );
+        assert!(
+            value["results"][0]["definitions"].is_null(),
+            "{needle}: {value}"
+        );
+    }
+}
+
+/// A lexically visible binding shadows the shared global (#1787).
+#[test]
+fn javascript_local_binding_shadows_the_script_global() {
+    let angular = "function isNumber(value) { return typeof value === 'number'; }\n";
+    let parse = r#"function parse(value) {
+  function isNumber(candidate) { return candidate === 0; }
+  return isNumber(value);
+}
+
+function check(value, isNumber) {
+  return isNumber(value);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("src/Angular.js", angular)
+        .file("src/ng/parse.js", parse)
+        .build();
+
+    let nested_declaration = parse
+        .find("return isNumber(value);")
+        .expect("nested-declaration read")
+        + "return ".len();
+    let parameter = parse
+        .rfind("return isNumber(value);")
+        .expect("parameter read")
+        + "return ".len();
+    assert_ne!(nested_declaration, parameter);
+    for start in [nested_declaration, parameter] {
+        let value = lookup(
+            project.root(),
+            &location_reference("src/ng/parse.js", parse, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{start}: {value}");
+        assert!(
+            result["definitions"][0].get("fqn").is_none(),
+            "{start}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["path"], "src/ng/parse.js",
+            "{start}: {value}"
+        );
+    }
+}
+
+/// A `.ts` file without an import or an export is a script too, so the same
+/// route serves both languages and both spaces (#1787).
+#[test]
+fn typescript_script_global_scope_serves_values_and_types() {
+    let globals = r#"interface Numeric { value: number; }
+function isNumber(value: unknown): boolean { return typeof value === 'number'; }
+"#;
+    let parse = r#"function parse(value: Numeric): boolean {
+  return isNumber(value.value);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/globals.ts", globals)
+        .file("src/ng/parse.ts", parse)
+        .build();
+
+    for (needle, fqn, start_line) in [
+        ("Numeric)", "Numeric", 1),
+        ("isNumber(value.value)", "isNumber", 2),
+    ] {
+        let start = parse.find(needle).expect("script global reference");
+        let value = lookup(
+            project.root(),
+            &location_reference("src/ng/parse.ts", parse, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{needle}: {value}");
+        assert_eq!(result["definitions"][0]["fqn"], fqn, "{needle}: {value}");
+        assert_eq!(
+            result["definitions"][0]["path"], "src/globals.ts",
+            "{needle}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["start_line"], start_line,
+            "{needle}: {value}"
+        );
+    }
+}
+
 #[test]
 fn javascript_unbound_namespace_assignments_do_not_become_exact_dotted_definitions() {
     let defs = r#"
