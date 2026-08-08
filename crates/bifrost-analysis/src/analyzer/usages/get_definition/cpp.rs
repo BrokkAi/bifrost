@@ -3779,11 +3779,61 @@ fn cpp_type_definition_candidates(
     );
     sort_units(&mut indexed);
     indexed.dedup();
+    collapse_same_fqn_alias_spellings(analyzer, visibility, file, &mut indexed);
     if indexed.is_empty() {
         vec![target]
     } else {
         indexed
     }
+}
+
+/// Answer one navigation target per identical type alias, preferring the
+/// spelling the reference file's include closure reaches.
+///
+/// One alias can be declared identically in several headers - log4cxx declares
+/// `typedef std::shared_ptr<Level> LevelPtr;` in both `level.h` and
+/// `helpers/optionconverter.h` - and `support.fqn` answers every declaration in
+/// the workspace. A consumer that includes only `level.h` was offered the
+/// `optionconverter.h` twin, a file its include closure never reaches, as a
+/// navigation target (#1844); when both were reachable the two spellings read
+/// as an ambiguity. Identical aliases of one FQN are alternate spellings of one
+/// entity, so they answer as one target, and the reference names the spelling
+/// its own closure supplies.
+///
+/// This is deliberately restricted to aliases. A class has a declaration/
+/// definition split under one signature: a forward declaration inside the
+/// closure must not stand for the definition in a header the file does not
+/// include. An alias carries its whole meaning in its own declaration, so an
+/// identical one is fully interchangeable.
+///
+/// A family the closure reaches nowhere still answers - an out-of-closure
+/// target is better than none.
+fn collapse_same_fqn_alias_spellings(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    candidates: &mut Vec<CodeUnit>,
+) {
+    let mut kept: Vec<CodeUnit> = Vec::with_capacity(candidates.len());
+    for candidate in candidates.drain(..) {
+        if !cpp_unit_is_type_alias(analyzer, &candidate) {
+            kept.push(candidate);
+            continue;
+        }
+        let Some(spelling) = kept
+            .iter_mut()
+            .find(|kept| same_logical_symbol(kept, &candidate))
+        else {
+            kept.push(candidate);
+            continue;
+        };
+        if !visibility.is_physically_visible(file, spelling)
+            && visibility.is_physically_visible(file, &candidate)
+        {
+            *spelling = candidate;
+        }
+    }
+    *candidates = kept;
 }
 
 fn cpp_selected_type_definition_candidates(
