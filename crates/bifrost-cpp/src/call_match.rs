@@ -245,7 +245,8 @@ pub fn cpp_split_top_level_commas(value: &str) -> impl Iterator<Item = &str> {
     .filter(|item| !item.is_empty())
 }
 
-fn cpp_signature_parameter_text(signature: &str) -> Option<&str> {
+/// The byte offsets of a signature's outermost parameter-list parentheses.
+fn cpp_signature_parameter_span(signature: &str) -> Option<(usize, usize)> {
     let open = signature.find('(')?;
     let mut depth = 0i32;
     for (offset, ch) in signature[open..].char_indices() {
@@ -254,13 +255,33 @@ fn cpp_signature_parameter_text(signature: &str) -> Option<&str> {
             ')' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some(signature[open + 1..open + offset].trim());
+                    return Some((open, open + offset));
                 }
             }
             _ => {}
         }
     }
     None
+}
+
+fn cpp_signature_parameter_text(signature: &str) -> Option<&str> {
+    let (open, close) = cpp_signature_parameter_span(signature)?;
+    Some(signature[open + 1..close].trim())
+}
+
+/// What a signature carries after its parameter list: the trailing
+/// cv-/ref-qualifiers and `noexcept` that the signature identity records
+/// (#1827).
+///
+/// Two member declarations with the same parameter types but different
+/// trailing qualifiers are distinct declarations, so a caller deciding whether
+/// one declaration hides another has to compare this alongside the parameter
+/// types.
+pub fn cpp_signature_trailing_qualifiers(signature: &str) -> &str {
+    match cpp_signature_parameter_span(signature) {
+        Some((_, close)) => signature[close + 1..].trim(),
+        None => "",
+    }
 }
 
 fn cpp_parameter_name_token(token: &str) -> bool {

@@ -29017,7 +29017,7 @@ object Controller {
 }
 
 #[test]
-fn scala_compound_infix_dispatch_fails_closed_without_precedence_reconstruction() {
+fn scala_compound_infix_dispatch_uses_structured_precedence() {
     let source = r#"
 package app
 
@@ -29038,13 +29038,9 @@ object Controller {
         &location_reference("app/Compound.scala", source, start),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
-    assert!(
-        value["results"][0]["diagnostics"][0]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("precedence-aware receiver reconstruction")),
-        "{value}"
-    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.B.*", "{value}");
 }
 
 #[test]

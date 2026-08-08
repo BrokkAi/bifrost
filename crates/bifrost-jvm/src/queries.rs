@@ -38,13 +38,8 @@ pub const KOTLIN_QUERY_DIRECTORY: &str = "resources/treesitter/kotlin";
 pub const KOTLIN_HIGHLIGHTS_QUERY: &str =
     include_str!("../resources/treesitter/kotlin/highlights.scm");
 
-/// Scala's highlight query, embedded for `ScalaSupport::highlight_query`.
-///
-/// Read from the vendored grammar's own `queries/` directory rather than from
-/// `resources/`, which is why the manifest's `exclude` list re-includes exactly
-/// this one file out of `vendor/tree-sitter-scala/queries/**`.
-pub const SCALA_HIGHLIGHTS_QUERY: &str =
-    include_str!("../vendor/tree-sitter-scala/queries/highlights.scm");
+/// Scala's released highlight query, embedded for `ScalaSupport::highlight_query`.
+pub const SCALA_HIGHLIGHTS_QUERY: &str = tree_sitter_scala::HIGHLIGHTS_QUERY;
 
 /// Compile-time embedded `.scm` query files as `(relative_path, contents)`.
 pub const JVM_QUERY_ASSETS: &[(&str, &str)] = &[

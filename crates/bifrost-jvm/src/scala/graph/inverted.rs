@@ -10096,7 +10096,9 @@ fn companion_method_value_context(
     ctx: &ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> ScalaMethodValueContext {
-    if let Some(generic) = node.parent().filter(|parent| {
+    if let Some(method_value) = scala_method_value_wrapper(node) {
+        node = method_value;
+    } else if let Some(generic) = node.parent().filter(|parent| {
         parent.kind() == "generic_function" && parent.child_by_field_name("function") == Some(node)
     }) {
         node = generic;
@@ -10333,6 +10335,9 @@ fn record_exact_callable_reference(method: CodeUnit, node: Node<'_>, ctx: &mut S
 }
 
 fn is_explicit_eta_reference(mut node: Node<'_>, source: &str) -> bool {
+    if scala_method_value_wrapper(node).is_some() {
+        return true;
+    }
     if let Some(generic) = node.parent().filter(|parent| {
         parent.kind() == "generic_function" && parent.child_by_field_name("function") == Some(node)
     }) {
@@ -10349,6 +10354,19 @@ fn is_explicit_eta_reference(mut node: Node<'_>, source: &str) -> bool {
     };
     node_text(operator, source).trim() == "_"
         && scala_postfix_receiver_node(postfix, operator) == Some(node)
+}
+
+/// The released grammar represents `method _` as `method_value`, while older
+/// grammars use a postfix expression. Preserve the whole value node so callers
+/// can read its expected function type from the surrounding context.
+fn scala_method_value_wrapper(mut node: Node<'_>) -> Option<Node<'_>> {
+    if let Some(generic) = node.parent().filter(|parent| {
+        parent.kind() == "generic_function" && parent.child_by_field_name("function") == Some(node)
+    }) {
+        node = generic;
+    }
+    node.parent()
+        .filter(|parent| parent.kind() == "method_value")
 }
 
 fn record_lexically_visible_call(

@@ -14552,14 +14552,10 @@ fn scala_match_guards_are_ordered_and_unmatched_flow_is_exceptional() {
                     case firstCandidate if firstGuard(firstCandidate) => first(firstCandidate)
                     case secondCandidate if secondGuard(secondCandidate) => second(secondCandidate)
                   }"#;
-    let first_case_source = concat!(
-        "case firstCandidate if firstGuard(firstCandidate) => first(firstCandidate)",
-        "\n                    ",
-    );
-    let second_case_source = concat!(
-        "case secondCandidate if secondGuard(secondCandidate) => second(secondCandidate)",
-        "\n                  ",
-    );
+    let first_case_source =
+        "case firstCandidate if firstGuard(firstCandidate) => first(firstCandidate)";
+    let second_case_source =
+        "case secondCandidate if secondGuard(secondCandidate) => second(secondCandidate)";
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
             "scala/GuardedMatch.scala",

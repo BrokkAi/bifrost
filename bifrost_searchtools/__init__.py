@@ -8,6 +8,7 @@ from .client import (
 from .models import (
     AmbiguousPath,
     AmbiguousSymbol,
+    CalleeChange,
     CallEdgeChange,
     CodeQualityReport,
     CommitSymbol,
@@ -184,6 +185,7 @@ from .models import (
 __all__ = [
     "AmbiguousPath",
     "AmbiguousSymbol",
+    "CalleeChange",
     "CallEdgeChange",
     "CodeQualityReport",
     "CommitSymbol",
