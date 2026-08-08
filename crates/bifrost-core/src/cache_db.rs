@@ -24,7 +24,7 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 pub const STORE_FILE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
-const CURRENT_MIGRATION_VERSION: i64 = 16;
+const CURRENT_MIGRATION_VERSION: i64 = 17;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
 const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
@@ -52,6 +52,8 @@ const SEMANTIC_FILE_DOCUMENTS_SQL: &str =
 const MATERIALIZATION_RECORDS_SQL: &str =
     include_str!("../migrations/cache/0015-materialization-records.sql");
 const RUST_USAGE_FACTS_SQL: &str = include_str!("../migrations/cache/0016-rust-usage-facts.sql");
+const RUST_MODULE_ROUTES_SQL: &str =
+    include_str!("../migrations/cache/0017-rust-module-routes.sql");
 const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CURRENT_BASELINE_SQL,
     PATH_SYMBOL_UNITS_SQL,
@@ -69,6 +71,7 @@ const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     SEMANTIC_FILE_DOCUMENTS_SQL,
     MATERIALIZATION_RECORDS_SQL,
     RUST_USAGE_FACTS_SQL,
+    RUST_MODULE_ROUTES_SQL,
 ];
 // The store file is named for the schema version that wrote it, and that
 // version is the migration count. Tie the two at compile time so a migration
@@ -121,6 +124,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("apply materialization records migration");
     conn.execute_batch(RUST_USAGE_FACTS_SQL)
         .expect("apply Rust usage facts migration");
+    conn.execute_batch(RUST_MODULE_ROUTES_SQL)
+        .expect("apply Rust module routes migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);

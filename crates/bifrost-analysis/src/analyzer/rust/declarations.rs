@@ -221,7 +221,8 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
     // The per-file usage facts persisted to the `rust_*` fact tables. Extracted
     // here, from the tree this pass already holds, so nothing re-parses later
     // to answer a usage query (ExecPlan `.agents/plans/rust-usage-index-v2.md`).
-    parsed.rust_usage_facts = super::facts::extract_rust_usage_facts(root, source);
+    parsed.rust_usage_facts =
+        super::facts::extract_rust_usage_facts(root, source, &item_macro_definitions);
 
     parsed
 }
@@ -953,16 +954,23 @@ fn rust_is_identifier_like(node: Node<'_>) -> bool {
     )
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct RustRulesItemMacroDefinition {
-    pub(super) name: String,
-    pub(super) visible_after: usize,
-    pub(super) scope_start: usize,
-    pub(super) scope_end: usize,
-    pub(super) passthrough: bool,
+/// A `macro_rules!` definition at an item position, with the lexical window it
+/// is visible in.
+///
+/// Persisted per blob as `rust_item_macros` (issue #1793): the Cargo route
+/// index propagates these along `#[macro_use]` edges to decide which item-macro
+/// invocations expand to `mod` declarations, and it must not re-parse every
+/// workspace file to recover them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RustRulesItemMacroDefinition {
+    pub(crate) name: String,
+    pub(crate) visible_after: usize,
+    pub(crate) scope_start: usize,
+    pub(crate) scope_end: usize,
+    pub(crate) passthrough: bool,
 }
 
-pub(super) fn rust_rules_item_macro_definitions(
+pub(crate) fn rust_rules_item_macro_definitions(
     root: Node<'_>,
     source: &str,
 ) -> Vec<RustRulesItemMacroDefinition> {

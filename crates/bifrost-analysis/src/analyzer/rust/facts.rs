@@ -20,6 +20,7 @@ use tree_sitter::Node;
 use crate::analyzer::common::{rust_identifier_like_node_kind, strip_raw_identifier_prefix};
 use crate::hash::HashMap;
 
+pub(crate) use super::declarations::RustRulesItemMacroDefinition;
 use super::imports::{
     RustImportOwner, RustVisibility, rust_import_projection, rust_module_extents,
 };
@@ -88,6 +89,91 @@ pub(crate) struct RustIdentifierOccurrence {
     pub(crate) context_mask: u32,
 }
 
+/// One lexical scope that `mod` items are declared in: the file root, or a
+/// `mod name { ... }` body reachable from it.
+///
+/// Persisted as `rust_module_scopes`. See that table's comment for why
+/// `path_attribute` and `imports_macros` cannot be folded into the route row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RustModuleScopeFact {
+    /// Index of the enclosing scope in [`RustModuleRouteFacts::scopes`]. `None`
+    /// only for the file root, which is always index 0.
+    pub(crate) parent: Option<usize>,
+    /// The inline module's own name; empty for the file root.
+    pub(crate) module_name: String,
+    /// The decoded `#[path = "..."]` value written on this inline module.
+    pub(crate) path_attribute: Option<String>,
+    /// Whether an unbroken `#[macro_use]` chain reaches this scope from the
+    /// file root, which is what lets a `mod` item below it import macros into
+    /// file scope.
+    pub(crate) imports_macros: bool,
+    pub(crate) body_start: usize,
+    pub(crate) body_end: usize,
+}
+
+/// One `mod name;` declaration whose body lives in another file, as written.
+///
+/// Persisted as `rust_module_routes`. Which file it names is a question about
+/// the declaring file's path and the file system, so it is answered by the
+/// reader, not stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RustModuleRouteFact {
+    /// Index into [`RustModuleRouteFacts::scopes`].
+    pub(crate) scope: usize,
+    pub(crate) module_name: String,
+    /// The decoded `#[path = "..."]` value on this declaration. When present it
+    /// names exactly one file instead of the two conventional candidates.
+    pub(crate) path_attribute: Option<String>,
+    pub(crate) visibility: RustVisibility,
+    /// `#[macro_use]` on this declaration, with the scope's chain applied.
+    pub(crate) imports_macros: bool,
+    /// A bare `#[cfg(test)]` on this declaration; see
+    /// `rust_declaration_is_bare_cfg_test_gated` for why only the bare
+    /// predicate counts.
+    pub(crate) test_gated: bool,
+    pub(crate) declaration_start: usize,
+    pub(crate) declaration_end: usize,
+    /// The item macro invocations this declaration was found inside, outermost
+    /// first. Empty for a declaration written directly in the source.
+    pub(crate) gates: Vec<RustMacroGateFact>,
+}
+
+/// One item-macro invocation a route was expanded out of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RustMacroGateFact {
+    pub(crate) macro_name: String,
+    /// The invocation's start byte in the declaring file.
+    pub(crate) invocation_start: usize,
+}
+
+/// What the Cargo route index reads from one file.
+///
+/// Split out of the usage facts because it is read wholesale for every analyzed
+/// file when the route index composes, where the usage facts are read one
+/// candidate file at a time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RustModuleRouteFacts {
+    /// Pre-order, so a scope's parent always precedes it. Index 0 is the file
+    /// root and is present for every analyzed Rust blob.
+    pub(crate) scopes: Vec<RustModuleScopeFact>,
+    pub(crate) routes: Vec<RustModuleRouteFact>,
+    /// The `macro_rules!` definitions at item positions, as
+    /// `rust_rules_item_macro_definitions` derives them.
+    pub(crate) item_macros: Vec<RustRulesItemMacroDefinition>,
+}
+
+impl RustModuleRouteFacts {
+    /// The file's own byte extent, recorded on the root scope.
+    ///
+    /// `None` only for facts that were never extracted, which the route index
+    /// treats as "this file contributes no module edges" exactly as a failed
+    /// hydration did.
+    pub(crate) fn file_extent(&self) -> Option<(usize, usize)> {
+        let root = self.scopes.first()?;
+        Some((root.body_start, root.body_end))
+    }
+}
+
 /// Everything the Rust walk records about one file for usage analysis.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RustUsageFacts {
@@ -97,6 +183,8 @@ pub(crate) struct RustUsageFacts {
     /// Sorted by identifier, so the persisted row order is deterministic and a
     /// re-analysis of unchanged bytes produces byte-identical rows.
     pub(crate) identifier_occurrences: Vec<RustIdentifierOccurrence>,
+    /// What the Cargo route index needs from this file (issue #1793).
+    pub(crate) module_routes: RustModuleRouteFacts,
 }
 
 /// The `visibility` column of `rust_import_targets`.
@@ -140,16 +228,23 @@ pub(crate) fn decode_rust_visibility(encoded: &str) -> Option<RustVisibility> {
 /// Called from `parse_rust_file` with the tree that pass already holds; nothing
 /// here re-parses, and nothing here consults the analyzer, the file system, or
 /// the file's path.
-pub(crate) fn extract_rust_usage_facts(root: Node<'_>, source: &str) -> RustUsageFacts {
+pub(crate) fn extract_rust_usage_facts(
+    root: Node<'_>,
+    source: &str,
+    item_macros: &[RustRulesItemMacroDefinition],
+) -> RustUsageFacts {
     let modules = extract_modules(root, source);
     let import_targets = extract_import_targets(root, source);
     let exports = extract_exports(&import_targets);
     let identifier_occurrences = extract_identifier_occurrences(root, source);
+    let module_routes =
+        super::cargo_routes::extract_rust_module_route_facts(root, source, item_macros);
     RustUsageFacts {
         exports,
         import_targets,
         modules,
         identifier_occurrences,
+        module_routes,
     }
 }
 
@@ -395,7 +490,9 @@ mod tests {
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .expect("load rust grammar");
         let tree = parser.parse(source, None).expect("parse rust source");
-        extract_rust_usage_facts(tree.root_node(), source)
+        let item_macros =
+            super::super::declarations::rust_rules_item_macro_definitions(tree.root_node(), source);
+        extract_rust_usage_facts(tree.root_node(), source, &item_macros)
     }
 
     #[test]

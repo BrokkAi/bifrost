@@ -23,6 +23,7 @@ The design transliterates IntelliJ's indexing architecture, verified against `/h
 - [x] (2026-08-07 23:55Z) Milestone 2c: migrate the cross-file group (`module_files`, `module_aliases`, `physical_owners`, `actual_crate_roots`, export chains) to memoized bounded walks, add the `module_resolution` / `export_chain` / `resolve` caches, and finish the consumer switch so `RustUsageIndex` is unused. Now also carries `module_importers` and `importer_reverse`, whose verification step IS the forward-edge computation 2c introduces. Decomposition and dependency order recorded in the Decision Log.
 - [x] (2026-08-08 02:40Z) Milestone 3: invalidation and readiness. The v1 warm is gone from every path: `warm_usage_index` is deleted, `warm_query_indexes` and the MCP `StartupIndexWarm` thread run the new per-file fact catch-up instead, and `usage_index_ready` reports the catch-up set rather than the unread index. Catch-up policy implemented with the threshold constant (20), inline below it and on the dedicated build pool at or above it. `update` / `update_all` audited: they already rotate every v2 cache correctly, and the pinning test proves it.
 - [ ] Milestone 4: kill-gate benchmark on a large Rust workspace; gates defined below must pass. RUN 1 (2026-08-07): all three gates FAIL for v2, and fail identically for v1. The failure is not attributable to v2 -- `RustAnalyzer::build_cargo_routes` consumes 87-97% of every cell. Numbers and decomposition in Outcomes; the plan stops here pending an owner decision.
+  - [x] (2026-08-08) Milestone 4 prerequisite, issue #1793: `RustCargoRouteIndex` no longer hydrates and parses every analyzed Rust file. The three things the build read out of each file's tree are per-blob rows written at analysis time (migration `0017-rust-module-routes.sql`, cache schema 16 -> 17, four tables, extraction in `parse_rust_file`), and the build is one batched read of them plus the Cargo manifests, which measurement showed are cheap. Cargo manifests stay on disk. The rerun of the gate itself is a separate task.
 - [ ] Milestone 5: delete v1 (the seventeen-map struct and its warm machinery), close out issues and docs. BLOCKED by the Milestone 4 gate.
 
 ## Surprises & Discoveries
@@ -66,6 +67,13 @@ The design transliterates IntelliJ's indexing architecture, verified against `/h
   Evidence: v2i cell (a) warm, `build_cargo_routes` 41.914 s of a 43.456 s scan backend (96%); cell (c) 34.160 s of 35.488 s (96%); `ScanUsagesExecutionContext::with_cancellation_and_max_duration` in `searchtools/scan_usages.rs`.
 - Observation (Milestone 4): the benchmark did not compare v1's index against v2's walks, and the absent spans are how you can tell. `RustUsageIndex::build` never appears in any v1 run, and `RustAnalyzer::rust_fact_catch_up` never appears in any v2 run. Neither implementation's usage layer was reached; both runs measured the same shared Cargo-route rebuild. Any future attempt to attribute a Milestone 4 number to this plan has to check for those two spans first -- their absence means the number says nothing about v1 versus v2.
 - Observation (Milestone 4): the costs sitting behind `cargo_routes` are shared machinery, not v2's, and the naive reading of the evidence gets this backwards. With the budget raised to 120 s, the largest span in all four binaries is `usages::candidate_discovery` (`usages/finder.rs:173`, byte-identical at `b86e575a` and HEAD) at 75-92 s, inside which `project::collect_workspace_files` -- a whole-workspace listing -- runs 64 to 137 times in a single query and `sql_definition_candidates.rows` runs 397k to 662k times. Seeing the repeated listing on v2 first invites blaming repeated `RustUsageWalks` construction, since the Milestone 3 Decision Log notes that the walk constructor lists the workspace for `RustPackageFileIndex`. The v1 runs refute that: v1 has no `RustUsageWalks` and re-lists MORE often (137 versus 64). Peak RSS also tracks how long the scan is allowed to run -- 14 GB at the 3 s default, 26-27 GB at 120 s, on both implementations -- so the gate-3 figure is not a plateau.
+- Observation (#1793): the Cargo-route build reads exactly three things out of a file's syntax tree, and everything else it does is Cargo manifest topology. The three are the lexical scopes that `mod` items are written in (their names, their `#[path]` attributes, and the `#[macro_use]` chain that reaches them), the external `mod name;` declarations themselves (name, own `#[path]`, visibility, `#[macro_use]`, bare `#[cfg(test)]`, and the declaration's byte extent), and the `macro_rules!` definitions at item positions with their visibility windows and their replay verdict. Nothing else in `RustCargoRouteIndex` touches a tree. That is what made the whole build persistable as four narrow tables.
+  Evidence: `rust_external_module_child_edges` and `rust_rules_item_macro_definitions` were the only two tree consumers in `cargo_routes.rs`; the frozen copies of both are still in the file under `#[cfg(test)]` for the equivalence pin.
+- Observation (#1793): one of those three is NOT a function of the file's bytes, and it is the reason the row shape has a gate table. An item macro can expand to `mod name;`, but whether the invoked name resolves to a macro that replays its item parameters verbatim depends on the `#[macro_use]` graph across files -- exactly the fixed point the route build computes. Extraction therefore expands EVERY item-position macro invocation optimistically and records, per produced route, the chain of invocations it came out of; the reader keeps the route only when every gate resolves, at its recorded byte, to a proven passthrough definition. The alternative -- persisting the fragment text and expanding at query time -- would have put a parse back on the query path for the same files, which is what this change exists to remove.
+- Observation (#1793): a `#[path]` chain cannot be collapsed into one stored directory string, and the reason is symbolic links. `workspace_relative_path` normalizes `..` lexically but then calls `canonicalize` on the result, so resolving `a/../b` in one step and in two steps differ whenever `a` is a symlink whose target sits in another directory -- and this file has a test that specifically requires symlinked paths to be rejected. The rows therefore carry a scope TREE (`rust_module_scopes`, parent pointer plus own `#[path]`) and the reader walks it step by step, reproducing the syntax walk's own sequence of resolutions.
+- Observation (#1793): the manifest half of the build is measured cheap, so it stays on disk. The rustc tree has 347 `Cargo.toml` files totalling 207 KB, which read and TOML-parse in 4.9 ms warm (89 ms on a cold page cache), against 35,370 `.rs` files whose hydration and parsing cost 34-44 s. The build parses the manifest set about three times (`discover_cargo_manifest_directories` plus two `build_from_module_children_while` passes), so the whole manifest cost is on the order of 15 ms. Persisting manifests would have added a table keyed by a hash of a file that is not an analyzed blob, for no measurable gain.
+  Evidence: measured with the workspace's own `toml` crate over `/mnt/T9/repo-clones/.codescale-sources/rust--01f6ddf7`, read-only, three repetitions.
+- Observation (#1793): byte-identical files share one blob, and that shows up immediately in the new read. The structural-pin fixture has sixteen files but only three distinct blobs, because most of its module files have identical bodies. The batched read is therefore keyed by oid and fanned back out to files by the live snapshot, and "no rows for this blob" is the only missing-data case there is.
 - Observation: only three of the seventeen `RustUsageIndex` products are genuinely cross-file (module-file resolution, alias routes, transitive export chains), and each is a bounded walk from a seed, not a closure. Everything else is a per-file fact or a per-file fact plus a SQL index.
   Evidence: classification table in research report section 7.3.
 
@@ -191,6 +199,28 @@ The design transliterates IntelliJ's indexing architecture, verified against `/h
 - Decision (Milestone 4): the cell-(c) figure after subtracting the cargo-routes span (7.70 s, under the 10 s bar) is recorded as a decomposition and NOT as a conditional pass.
   Rationale: the residual is analyzer construction plus 1.33 s of scan work, and the scan had not resolved the symbol when its deadline fired. A subtraction can show where the time went; it cannot show that the remaining code would have met the bar, because that code did not run. Recording it as "passes once cargo_routes is discounted" would license Milestone 5 on the strength of work that was never measured.
   Date/Author: 2026-08-07 / Opus (measurement).
+
+- Decision (#1793): four narrow tables (`rust_module_scopes`, `rust_module_routes`, `rust_module_route_gates`, `rust_item_macros`), not one route table with an encoded route string.
+  Rationale: the reader needs an ordered chain -- the enclosing inline modules, each with its own optional `#[path]` -- and the chain has to be walked step by step (see Surprises). Encoding that chain in a TEXT column would have meant inventing an escape for arbitrary `#[path]` values and a parser for it, which is the hand-rolled source-text parser the conventions prohibit. A parent-pointer scope tree is the same information in the store's own vocabulary, and it deduplicates: one scope row serves every declaration written in it. The gate chain is a child table for the same reason.
+  Date/Author: 2026-08-08 / Opus (implementation).
+- Decision (#1793): Cargo manifests are read from disk at build time and not persisted.
+  Rationale: the measurement above. The plan direction asked for a measurement rather than a guess, and 4.9 ms against 34-44 s settles it. Manifests are also not analyzed blobs, so persisting them would have needed a second keying scheme in a store whose whole discipline is content-hashed blob rows.
+  Date/Author: 2026-08-08 / Opus (implementation).
+- Decision (#1793): item-position macro invocations are expanded optimistically at analysis time and gated at read time, rather than persisting the fragment text or re-parsing the invoking files during the build.
+  Rationale: the passthrough verdict is cross-file, so no per-file row can carry it; the gate is the smallest thing that can. The cost is that analysis now re-parses every item-level macro token tree, which is work `parse_rust_file` largely already does for `#1015`'s macro-interior reparse, and it is paid once per blob instead of once per process generation.
+  Date/Author: 2026-08-08 / Opus (implementation).
+- Decision (#1793): a blob with no module-route rows is repaired by parsing that one file inside the build, NOT by calling the Milestone 3 catch-up first.
+  Rationale: the catch-up's above-threshold policy defers to the background pool and returns, which is correct for a usage query (the readiness probe reports the wait) and wrong for the route index: the index would be built and memoized for the whole generation from an incomplete row set, and it answers forward queries too, where nothing reports a wait. A per-file parse is bounded by the shortfall -- normally zero, because analysis writes these rows -- and it degrades to exactly the old behavior in the worst case instead of to a silently empty index. It is also the gate `0b35bb12` used for the scan path: recover per item, count the recoveries, and pin the count.
+  Date/Author: 2026-08-08 / Opus (implementation).
+- Decision (#1793): the equivalence pin is at the module-edge boundary, and the pre-#1793 syntax walk stays in `cargo_routes.rs` behind `#[cfg(test)]` to be the reference it compares against.
+  Rationale: the edge function is the whole substituted seam -- `build_while`'s orchestration (the manifest topology, the macro-visibility fixed point, the reachability walks, the test-only complement) is unchanged apart from where its edges come from. Pinning at that boundary compares the two derivations directly, over both values of `is_crate_root` and with and without a visible passthrough macro, where an index-level A/B would have needed a second copy of the whole orchestration to compare against. The index level is covered instead by the existing suites, which all reach `analyzer.cargo_routes()`, plus one new multi-crate behavior test. The frozen walk also still backs `build_from_disk`, whose fixtures have no store.
+  Date/Author: 2026-08-08 / Opus (implementation).
+- Decision (#1793): the route facts travel inside `RustUsageFacts` and are written by the existing `insert_rust_fact_rows`, but the build reads them through a separate batched reader rather than through `rust_usage_facts`.
+  Rationale: one transport, one write path and one cascade means the Milestone 1 witness rule still holds -- a blob with `rust_modules` rows has these rows too -- and the two write paths cannot diverge. The read is different in kind: the route index is a whole-workspace product that needs every file's rows at once, where the usage layer reads one candidate at a time. `AnalyzerStore::rust_module_route_facts` is four chunked `IN` seeks per 400 blobs; asking per blob would have been tens of thousands of round trips, and going through `rust_usage_facts` would have dragged every file's identifier-occurrence rows along with it.
+  Date/Author: 2026-08-08 / Opus (implementation).
+- Decision (#1793): the fallback counter lives on `RustAnalyzer`, not as a process-global static.
+  Rationale: the two idioms both exist in this tree (`full_declaration_scan_count_for_test` is per-analyzer, `rust_tree_parse_count_for_test` is global). Per-analyzer is the one that does not depend on nextest's process-per-test isolation to stay meaningful, and the question is per-generation anyway.
+  Date/Author: 2026-08-08 / Opus (implementation).
 
 ## Outcomes & Retrospective
 
@@ -342,6 +372,75 @@ the open-issue search before new issues are filed; #1758 names neither. The
 owner's call is whether fixing them becomes a prerequisite of this plan or a
 separate track that Milestone 4 waits on.
 
+Milestone 4 prerequisite, issue #1793 (2026-08-08). `RustCargoRouteIndex` no
+longer parses anything. It composes from per-blob rows plus the Cargo manifests,
+and every Rust usage query stops paying the 34-44 s the kill-gate run above
+attributed to it.
+
+What the build actually consumed from each file was small: the lexical scopes
+`mod` items are written in, the external `mod name;` declarations, and the
+`macro_rules!` item macros. Migration
+`crates/bifrost-core/migrations/cache/0017-rust-module-routes.sql` gives each of
+those a table (`rust_module_scopes`, `rust_module_routes`,
+`rust_module_route_gates`, `rust_item_macros`), cache schema version 16 -> 17,
+and the Rust analysis-epoch salt gains `cargo-route-facts-2026-08`. Extraction
+is `extract_rust_module_route_facts` in `cargo_routes.rs`, called from
+`extract_rust_usage_facts` with the tree `parse_rust_file` already holds; the
+rows travel on `RustUsageFacts` and are written by the same
+`insert_rust_fact_rows` both write paths share, so they cascade with their blob
+and are counted in the same `logical_rows` / `string_bytes` accounting.
+
+Everything path-derived stayed with the reader, which is what makes the rows
+content-stable: `module_child_edges` computes the file's base directory from
+`is_crate_root` and the file's stem, resolves each scope's `#[path]` against the
+previous one, composes `declaring_module` from the live file's package name, and
+performs the `exists()` check that turns a declaration into an edge. The two
+things that could not be per-file facts are recorded rather than papered over --
+the macro-passthrough verdict becomes a gate the reader evaluates, and the
+`#[path]` chain stays a chain because `canonicalize` resolves symlinks at every
+step. Both are in Surprises.
+
+Cost shape. Before: `O(analyzed files)` hydrations plus `O(total source bytes)`
+of tree-sitter parsing, per analyzer generation, every generation, inside the
+scan's three-second budget. After: `O(rows)` -- four chunked `IN` seeks per 400
+blobs over tables whose row count tracks `mod` declarations, not source bytes --
+plus the manifest set (347 files, 207 KB, 4.9 ms warm on the rustc tree) and one
+`exists()` per candidate, which the old build also paid. On the inline
+multi-crate fixtures the whole `analyzer.cargo_routes()` call is inside the
+0.1-0.2 s a test takes end to end, and the structural pin
+`composing_the_cargo_route_index_parses_no_workspace_file` asserts the parse
+count is exactly zero -- it reports 16 when the row read is disabled
+(demonstrated), while still answering correctly, so the pin is about the cost
+and not the answer.
+
+Equivalence. The pre-#1793 syntax walk is frozen in the same file under
+`#[cfg(test)]`, and `module_child_edges_reproduce_the_frozen_syntax_walk`
+requires the new extraction plus reader to reproduce it edge for edge -- byte
+offsets, the `#[macro_use]` visibility point, the test gate and the duplicate
+merge included -- over a fixture with plain, directory-backed, `#[path]`,
+`#[macro_use]`, `#[cfg(test)]`, composed-cfg, nested-inline, relocated-inline,
+duplicate and macro-expanded declarations, for both values of `is_crate_root`
+and with and without a visible passthrough macro. It fails when the gate filter
+is removed and when a declaration's `#[path]` is resolved against the wrong base
+(both demonstrated). `the_module_route_fixture_exercises_every_declaration_shape`
+is what stops that comparison holding vacuously.
+
+The other new tests: `cargo_routes_compose_from_rows_across_a_multi_crate_workspace`
+(target membership, cross-crate path-dependency resolution, target relation, the
+external-module-declaration list the usage walks read, and test-only
+reachability), and in the store
+`rust_module_route_tables_record_scopes_routes_gates_and_item_macros`,
+`rust_module_route_rows_cascade_with_their_blob`,
+`rust_module_route_rows_are_stable_across_a_re_analysis_of_the_same_content`
+(the same bytes at `src/lib.rs` and `src/deep/nested/mod.rs`) and
+`batched_module_route_facts_match_the_per_blob_read`. All four store tests fail
+when the extraction call is removed from `extract_rust_usage_facts`
+(demonstrated).
+
+Every existing Rust usage and Cargo-route suite passes unchanged, including
+`passthrough_macro_routes_require_faithful_item_replay_and_lexical_visibility`,
+which is the densest coverage of the part of this that is not per-file.
+
 ## Context and Orientation
 
 The repository is Bifrost, a multi-language code analyzer at `/mnt/optane/bifrost-nlp` (branch `bifrost-nlp-ft`). The per-workspace analysis cache is a SQLite database whose schema lives in numbered migrations under `crates/bifrost-core/migrations/cache/` (baseline `0001-current-baseline.sql`; later migrations add to it). The database file name carries the schema version (`bifrost_cache.v15.db` today); find the constant that produces that number and the migration-registration mechanism before adding a migration, and follow the existing pattern exactly. Adding tables bumps the cache version, which invalidates existing prewarmed caches -- acceptable now, because the next benchmark campaign re-prewarms with per-repository caches anyway (see `.agents/plans/codescalebench-grep-hard-cleanup-eval.md` Decision Log).
@@ -484,6 +583,7 @@ No new crates. At the end: four new store tables as specified in Milestone 1 (fi
 
 ## Revision notes
 
+- 2026-08-08 (Milestone 4 prerequisite, issue #1793): added a sub-entry under Milestone 4 in Progress recording that the Cargo-route rebuild the kill-gate run blamed is fixed, and that the gate rerun is a separate task. Added five observations to Surprises & Discoveries -- the three-item list of what the route build actually read from a tree, the macro-passthrough verdict being the one thing that is not a per-file fact and the gate that carries it, the symlink reason a `#[path]` chain cannot be collapsed, the manifest measurement that kept manifests on disk, and the shared-blob effect on the batched read. Added seven decisions covering the four-table shape, the manifest call, optimistic macro expansion, the per-file parse recovery instead of the Milestone 3 catch-up, the edge-level equivalence pin with the frozen syntax walk, the batched reader beside the per-blob one, and the per-analyzer fallback counter. Wrote the prerequisite entry in Outcomes & Retrospective. Milestone 5 stays blocked; nothing in this change licenses it.
 - 2026-08-07 (Milestone 4 run 1, measurement only): recorded the kill-gate result in Progress and Outcomes & Retrospective, and added three observations to Surprises & Discoveries -- that `build_cargo_routes` is charged inside the scan's own three-second budget and consumes 87-97% of every cell rather than only cell (c), that neither implementation reaches its usage layer at all so the benchmark did not compare them, and that the costs behind cargo_routes belong to shared candidate discovery rather than to v2. Added one decision recording why two extra instrumented binaries were built and why the cell-(c) subtraction is not a passing verdict. No source file changed; the instrumented binaries were built in throwaway detached worktrees, which were removed. Milestone 5 is marked blocked.
 - 2026-08-08 (Milestone 3 implementation): checked off Milestone 3 in Progress. Added six observations to Surprises & Discoveries -- that the staleness bug the milestone was told to look for does not exist and why the pinning test is still worth having, that the real gap is invisibility rather than staleness, the duplicate-blob-key trap for a batch of files, the content-drift rule that forbids persisting a file whose bytes moved on, the readiness/warmth split the v1 probe conflated, and the out-of-scope finding that `cargo_routes` is still dropped and rebuilt on every edit and will dominate Milestone 4's cell (c). Added seven decisions covering the untouched `update` constructors, the choice of hook site, the per-generation full scan and why the narrowed alternative is not correct alone, the `rust_modules` witness rule, the dedicated-pool scheduling, the probe split with the unchanged tool field, and the test barrier. Wrote the Milestone 3 entry in Outcomes & Retrospective. The Milestone 3 section in Plan of Work is left as authored; the two places where the as-built differs from it -- the hook site and the two-predicate probe -- are recorded in the Decision Log rather than by editing the milestone text.
 - 2026-08-07 (Milestone 2c implementation): checked off 2c in Progress. Added five implementation observations to Surprises & Discoveries -- the `definitions(fq_name)` collapse that makes the recorded `inline_by_name` equivalence wrong, the path half of the physical-owner child computation having no index to invert through, the v1 alias fixed point not being the least fixed point of the recursion, the length-one export-chain cycle, and the analyzer growing past the `AnalyzerDelegate` size lint. Added seven decisions covering cache keying, the cache count, keeping v1 compiling, the importer candidate sources and their known gap, the recursion depth of `bindings_at`, leaving the warm wired to the unread index, and the one existing test whose text changed. Wrote the Milestone 2c entry in Outcomes & Retrospective. The `Milestone 2c work breakdown` section is left as authored, because it was the design this implementation followed; the two places where it was wrong are corrected in Surprises rather than by editing the breakdown.

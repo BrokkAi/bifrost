@@ -79,15 +79,21 @@ pub struct RustAnalyzer {
     forward_reference_contexts: Cache<ProjectFile, Arc<RustReferenceContext>>,
     export_indexes: Cache<ProjectFile, Arc<crate::analyzer::usages::ExportIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
-    // PoolSafeMemo, not OnceLock: the build hydrates and parses every file on
-    // rayon, and this cache is reached from inside rayon workers (see
-    // `pool_memo`). A blocking get_or_init there can deadlock the pool.
+    // PoolSafeMemo, not OnceLock: this cache is reached from inside rayon
+    // workers (see `pool_memo`), where a blocking `get_or_init` can deadlock
+    // the pool. Since issue #1793 the build itself is a batched store read
+    // rather than a rayon fan-out over every file's syntax tree, so the two
+    // builder closures are the same closure.
     cargo_routes: Arc<PoolSafeMemo<RustCargoRouteIndex>>,
     package_file_index: Arc<OnceLock<Arc<RustPackageFileIndex>>>,
     /// `resolve_module_files` calls. A use-path's module files are invariant in
     /// the export name being resolved, so this count is what proves the
     /// per-export-name recomputation is gone (#1230 item 4).
     module_file_resolution_count: Arc<AtomicUsize>,
+    /// Files the Cargo-route build had to parse because their blob carried no
+    /// persisted module-route facts. Zero is the structural claim of issue
+    /// #1793: the index composes from rows, never from a workspace parse.
+    module_route_fact_fallback_count: Arc<AtomicUsize>,
     usage_index: Arc<PoolSafeMemo<RustUsageIndex>>,
     /// One blob's persisted per-file usage facts, memoized per
     /// `(analysis generation, blob)`. Content-hash keys make the entry
@@ -345,10 +351,8 @@ impl RustAnalyzer {
     /// Explicit inverse-analysis support. Forward definition and type queries
     /// resolve only the importing file's manifest route.
     fn cargo_routes(&self) -> Arc<RustCargoRouteIndex> {
-        self.cargo_routes.get_or_build(
-            || self.build_cargo_routes(true),
-            || self.build_cargo_routes(false),
-        )
+        self.cargo_routes
+            .get_or_build(|| self.build_cargo_routes(), || self.build_cargo_routes())
     }
 
     fn cargo_routes_while(
@@ -357,33 +361,113 @@ impl RustAnalyzer {
     ) -> Option<Arc<RustCargoRouteIndex>> {
         self.cargo_routes.get_or_build_while(
             keep_going,
-            || self.build_cargo_routes_while(true, keep_going),
-            || self.build_cargo_routes_while(false, keep_going),
+            || self.build_cargo_routes_while(keep_going),
+            || self.build_cargo_routes_while(keep_going),
         )
     }
 
-    fn build_cargo_routes(&self, parallel: bool) -> RustCargoRouteIndex {
-        self.build_cargo_routes_while(parallel, &|| true)
+    fn build_cargo_routes(&self) -> RustCargoRouteIndex {
+        self.build_cargo_routes_while(&|| true)
             .expect("uninterrupted Rust Cargo-route construction")
     }
 
     fn build_cargo_routes_while(
         &self,
-        parallel: bool,
         keep_going: &(impl Fn() -> bool + Sync),
     ) -> Option<RustCargoRouteIndex> {
+        let _scope = crate::profiling::scope("RustAnalyzer::build_cargo_routes");
         let files: Vec<_> = self.get_analyzed_files().into_iter().collect();
-        RustCargoRouteIndex::build_while(
-            &files,
-            |file| self.prepared_syntax(file),
-            parallel,
-            keep_going,
-        )
+        let facts = self.rust_module_route_facts(&files, keep_going)?;
+        RustCargoRouteIndex::build_while(&files, &facts, keep_going)
+    }
+
+    /// The persisted module-route facts of every analyzed Rust file, in one
+    /// batched read (issue #1793).
+    ///
+    /// This replaced hydrating and parsing every file, which was 34-44 s on the
+    /// rustc tree and was charged inside the three-second `scan_usages` budget.
+    /// The cost is now one chunked index seek per fact table over the live
+    /// blobs, so it grows with rows read rather than with source bytes parsed.
+    ///
+    /// A live blob with no rows is repaired the only way it can be: by parsing
+    /// that file. It is a per-file recovery, never a whole-workspace one --
+    /// analysis writes these rows, so the shortfall is normally empty and
+    /// `rust_module_route_fact_fallback_count_for_test` pins that.
+    fn rust_module_route_facts(
+        &self,
+        files: &[ProjectFile],
+        keep_going: &(impl Fn() -> bool + Sync),
+    ) -> Option<HashMap<ProjectFile, facts::RustModuleRouteFacts>> {
+        keep_going().then_some(())?;
+        let snapshot = self.live_path_snapshot();
+        let oids: Vec<(ProjectFile, git2::Oid)> = files
+            .iter()
+            .filter_map(|file| Some((file.clone(), snapshot.oid_for_path(file)?)))
+            .collect();
+        // A failed read is not a separate error path: every file it did not
+        // answer for takes the same per-file recovery a missing row takes, and
+        // the fallback counter is where that shows up.
+        let stored = self
+            .analyzer_store()
+            .rust_module_route_facts(
+                "rust",
+                &oids.iter().map(|(_, oid)| *oid).collect::<Vec<_>>(),
+            )
+            .unwrap_or_default();
+        let mut by_file = HashMap::default();
+        let mut missing = Vec::new();
+        let mut oid_by_file: HashMap<&ProjectFile, git2::Oid> = HashMap::default();
+        for (file, oid) in &oids {
+            oid_by_file.insert(file, *oid);
+        }
+        for file in files {
+            keep_going().then_some(())?;
+            match oid_by_file.get(file).and_then(|oid| stored.get(oid)) {
+                Some(found) => {
+                    by_file.insert(file.clone(), found.clone());
+                }
+                None => missing.push(file.clone()),
+            }
+        }
+        for file in missing {
+            keep_going().then_some(())?;
+            let Some(prepared) = self.prepared_syntax(&file) else {
+                continue;
+            };
+            self.module_route_fact_fallback_count
+                .fetch_add(1, Ordering::Relaxed);
+            let root = prepared.tree().root_node();
+            let item_macros =
+                declarations::rust_rules_item_macro_definitions(root, prepared.source());
+            by_file.insert(
+                file,
+                cargo_routes::extract_rust_module_route_facts(
+                    root,
+                    prepared.source(),
+                    &item_macros,
+                ),
+            );
+        }
+        Some(by_file)
     }
 
     #[cfg(test)]
     pub(crate) fn cargo_routes_ready_for_test(&self) -> bool {
         self.cargo_routes.is_ready()
+    }
+
+    /// Files the Cargo-route build recovered by parsing. See
+    /// [`Self::module_route_fact_fallback_count`].
+    #[cfg(test)]
+    pub(crate) fn module_route_fact_fallback_count_for_test(&self) -> usize {
+        self.module_route_fact_fallback_count
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_module_route_fact_fallback_count_for_test(&self) {
+        self.module_route_fact_fallback_count
+            .store(0, Ordering::Relaxed);
     }
 
     pub(crate) fn candidates_in_same_cargo_target_root(
@@ -461,6 +545,7 @@ impl RustAnalyzer {
             export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(PoolSafeMemo::new()),
+            module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(PoolSafeMemo::new()),
@@ -500,6 +585,7 @@ impl RustAnalyzer {
             export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(PoolSafeMemo::new()),
+            module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(PoolSafeMemo::new()),
@@ -754,6 +840,7 @@ impl IAnalyzer for RustAnalyzer {
             export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(PoolSafeMemo::new()),
+            module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(PoolSafeMemo::new()),
@@ -783,6 +870,7 @@ impl IAnalyzer for RustAnalyzer {
             export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(PoolSafeMemo::new()),
+            module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(PoolSafeMemo::new()),
