@@ -595,10 +595,125 @@ pub(super) fn resolve_js_ts(
         return js_ts_candidates_outcome(analyzer, same_file);
     }
 
+    // Last resort for a bare name, symmetric with the dotted one above (#1787).
+    // Script files share one global scope -- Angular concatenates `src/*.js` at
+    // build time, so `src/ng/parse.js` calls the `isNumber` that
+    // `src/Angular.js` declares without importing it -- while a module's
+    // top-level binding is file-private. So both sides must be scripts, which
+    // is the same `js_program_is_external_module` question the dotted route
+    // asks of its receiver. A lexically visible binding never reaches here:
+    // `resolve_lexical_binding` answers a local before this route runs, and the
+    // `local_binding` guard above rejects a bare name bound in any narrower
+    // scope than the program.
+    if !js_program_is_external_module(tree.root_node(), source) {
+        let script_global =
+            jsts_script_global_bare_candidates(analyzer, host, support, reference, value_position);
+        if !script_global.is_empty() {
+            return js_ts_candidates_outcome(analyzer, script_global);
+        }
+    }
+
     no_definition(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed JS/TS definition"),
     )
+}
+
+/// Bare names another script contributes to the shared script global scope.
+///
+/// The project-wide question is the one `jsts_exact_dotted_candidates` asks --
+/// `support.fqn` on the reference as written -- and the declaration-side gate
+/// is the one `jsts_cross_file_dotted_receiver_has_global_identity` applies:
+/// the declaring file must be a script, and the name must bind at that script's
+/// program scope, the only scope the shared global has.
+///
+/// Every surviving candidate is reported. The workspace is the program, so two
+/// scripts that both declare the name really are two contenders, and the shared
+/// outcome machinery calls that Ambiguous (#1811).
+///
+/// The reach is exactly what the JS/TS indexer gives a bare fq name: a
+/// program-scope function, class, or function-valued binder. A top-level
+/// plain-value `const`/`var` is indexed as the file-scoped field
+/// `<file name>.<name>` instead, so it has no bare fq to look up and stays
+/// invisible across scripts.
+fn jsts_script_global_bare_candidates(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    reference: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let candidates = support
+        .fqn(reference)
+        .into_iter()
+        .filter(|candidate| jsts_candidate_is_script_global_binding(analyzer, candidate, reference))
+        .collect();
+    if value_position {
+        jsts_value_space_candidates(host, candidates)
+    } else {
+        jsts_type_space_candidates(host, candidates)
+    }
+}
+
+/// Whether `candidate` is a program-scope binding of `name` in a script file.
+///
+/// The scope is read from the declaration through the same
+/// `jsts_binding_scope_for_declaration` the local routes use, not from the
+/// shape of the fq name: a member (`Ctor.prototype.isNumber`,
+/// `holder.isNumber`) carries its owner in its fq name and a function nested in
+/// another function is not indexed at all, so neither reaches this filter
+/// today, but a name that binds anywhere narrower than the program is not part
+/// of the shared global scope even if it does.
+fn jsts_candidate_is_script_global_binding(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+    name: &str,
+) -> bool {
+    let language = crate::analyzer::common::language_for_file(candidate.source());
+    if !matches!(language, Language::JavaScript | Language::TypeScript) {
+        return false;
+    }
+    let Ok(source) = candidate.source().read_to_string() else {
+        return false;
+    };
+    let Some(tree) = parse_js_ts_tree(candidate.source(), &source, language) else {
+        return false;
+    };
+    let root = tree.root_node();
+    if js_program_is_external_module(root, &source) {
+        return false;
+    }
+    let program = JstsReceiverBindingScope {
+        start_byte: root.start_byte(),
+        end_byte: root.end_byte(),
+    };
+    analyzer.ranges(candidate).iter().any(|range| {
+        smallest_named_node_covering(root, range.start_byte, range.end_byte)
+            .map(|node| jsts_declaration_binder(node, &source, name))
+            .and_then(|binder| jsts_binding_scope_for_declaration(binder, &source))
+            == Some(program)
+    })
+}
+
+/// The node whose binding scope decides where a declaration binds `name`.
+///
+/// A declaration statement is not always the binder: `var isNumber = function
+/// () {}` binds through its `variable_declarator`, which hoists to the
+/// enclosing function or program, while a function, class, interface, or type
+/// declaration binds where the declaration itself sits.
+fn jsts_declaration_binder<'tree>(node: Node<'tree>, source: &str, name: &str) -> Node<'tree> {
+    if !matches!(node.kind(), "variable_declaration" | "lexical_declaration") {
+        return node;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| {
+            child.kind() == "variable_declarator"
+                && child
+                    .child_by_field_name("name")
+                    .is_some_and(|binder| node_text(binder, source) == name)
+        })
+        .unwrap_or(node)
 }
 
 #[allow(clippy::too_many_arguments)]
