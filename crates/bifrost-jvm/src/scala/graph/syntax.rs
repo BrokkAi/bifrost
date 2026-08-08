@@ -53,6 +53,7 @@ pub struct ScalaGenericOwnerSourceFacts {
 pub struct ScalaCallableSourceAlternative {
     pub role: ScalaCallableRole,
     pub shape: Vec<ScalaCallableParameterList>,
+    pub result: ScalaDeclaredResult,
     pub parameter_defaults: Vec<Vec<bool>>,
     pub parameter_function_arities: Vec<Vec<Option<usize>>>,
     pub parameter_type_paths: Vec<Vec<Option<Vec<String>>>>,
@@ -240,6 +241,45 @@ impl ScalaCallableParameterList {
     }
 }
 
+/// How many application lists a callable's declared RESULT can consume once the
+/// site has filled every declared parameter list (#1853).
+///
+/// `def transform(flag: Boolean): Int => Int` is written `transform(true)(x)`:
+/// the second list applies the returned function, not the method. The
+/// declaration is the only structure that can decide such a site, so this is
+/// read from the return-type node beside the parameter lists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScalaDeclaredResult {
+    /// Application lists the declared result type supplies directly: `A => B`
+    /// supplies one, `A => B => C` two.
+    function_lists: usize,
+    /// Whether what remains after those lists can still be applied. An inferred
+    /// result is unknown, and a named result can alias a function type or carry
+    /// an `apply` member, so both stay open; a value type such as `Int` and an
+    /// absent declaration do not.
+    open: bool,
+}
+
+impl ScalaDeclaredResult {
+    /// No declaration structure was available (an arity-only fallback shape),
+    /// so nothing beyond the declared parameter lists is admitted. This is the
+    /// `Default`.
+    pub const UNDECLARED: Self = Self {
+        function_lists: 0,
+        open: false,
+    };
+
+    /// A declared result that could be a function value under some type.
+    pub const OPEN: Self = Self {
+        function_lists: 0,
+        open: true,
+    };
+
+    pub fn accepts_application_lists(self, lists: usize) -> bool {
+        self.open || lists <= self.function_lists
+    }
+}
+
 pub fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
     let mut parser = Parser::new();
     parser
@@ -327,6 +367,7 @@ pub fn scala_source_facts_from_tree(tree: &tree_sitter::Tree, source: &str) -> S
                                 ScalaCallableRole::SecondaryConstructor
                             }),
                         shape,
+                        result: declared_result(node.child_by_field_name("return_type"), source),
                         parameter_defaults,
                         parameter_function_arities,
                         parameter_type_paths,
@@ -393,6 +434,10 @@ pub fn scala_source_facts_from_tree(tree: &tree_sitter::Tree, source: &str) -> S
                     ScalaCallableSourceAlternative {
                         role: ScalaCallableRole::PrimaryConstructor,
                         shape: lists,
+                        // A constructor's result is the class being defined,
+                        // and construction syntax consumes exactly the class's
+                        // parameter lists.
+                        result: ScalaDeclaredResult::UNDECLARED,
                         parameter_defaults,
                         parameter_function_arities,
                         parameter_type_paths,
@@ -932,6 +977,36 @@ fn function_type_arity(type_node: Node<'_>) -> Option<usize> {
 
 fn contains_repeated_parameter_type(node: Node<'_>) -> bool {
     subtree_contains(node, |current| current.kind() == "repeated_parameter_type")
+}
+
+/// Scala value types that no application list can consume. Every other named
+/// type stays applicable: it can alias a function type, and `Seq`, `Map`,
+/// `String` and friends carry an `apply` member of their own.
+const NON_APPLICABLE_RESULT_TYPES: [&str; 9] = [
+    "Unit", "Boolean", "Byte", "Short", "Int", "Long", "Float", "Double", "Char",
+];
+
+/// Read from the declaration how many application lists its result can consume
+/// beyond the declared parameter lists (#1853).
+fn declared_result(return_type: Option<Node<'_>>, source: &str) -> ScalaDeclaredResult {
+    // An inferred result rules nothing out.
+    let Some(return_type) = return_type else {
+        return ScalaDeclaredResult::OPEN;
+    };
+    let mut result = return_type;
+    let mut function_lists = 0usize;
+    while result.kind() == "function_type" {
+        let Some(next) = result.child_by_field_name("return_type") else {
+            break;
+        };
+        function_lists += 1;
+        result = next;
+    }
+    ScalaDeclaredResult {
+        function_lists,
+        open: result.kind() != "type_identifier"
+            || !NON_APPLICABLE_RESULT_TYPES.contains(&node_text(result, source).trim()),
+    }
 }
 
 pub fn parenthesized_arity(source: &str) -> Option<usize> {
@@ -2043,6 +2118,7 @@ pub fn is_semantic_call_argument(node: Node<'_>) -> bool {
 
 pub fn scala_call_shape_relation(
     declared: &[ScalaCallableParameterList],
+    result: ScalaDeclaredResult,
     actual: &ScalaCallSiteShape,
 ) -> ScalaCallShapeRelation {
     if actual.type_arguments_only {
@@ -2066,8 +2142,21 @@ pub fn scala_call_shape_relation(
         return ScalaCallShapeRelation::Complete;
     }
 
+    // Every declared parameter list is filled, so the lists that are left apply
+    // the RESULT of the call (#1853): `def transform(flag: Boolean): Int => Int`
+    // is written `transform(true)(x)`, and `def transform: Int => Int` is
+    // written `transform(x)`. Only a result no type could make applicable
+    // rejects the site.
+    let applies_result = |remaining: usize| {
+        if result.accepts_application_lists(remaining) {
+            ScalaCallShapeRelation::Complete
+        } else {
+            ScalaCallShapeRelation::Incompatible
+        }
+    };
+
     let mut declared_index = 0usize;
-    for actual_list in &actual.lists {
+    for (position, actual_list) in actual.lists.iter().enumerate() {
         match actual_list.kind {
             ScalaCallArgumentListKind::Ordinary | ScalaCallArgumentListKind::Block => {
                 while declared.get(declared_index).is_some_and(|list| {
@@ -2079,7 +2168,7 @@ pub fn scala_call_shape_relation(
                     declared_index += 1;
                 }
                 let Some(declared_list) = declared.get(declared_index) else {
-                    return ScalaCallShapeRelation::Incompatible;
+                    return applies_result(actual.lists.len() - position);
                 };
                 if !matches!(
                     declared_list.kind,
@@ -2091,7 +2180,7 @@ pub fn scala_call_shape_relation(
             }
             ScalaCallArgumentListKind::Contextual => {
                 let Some(declared_list) = declared.get(declared_index) else {
-                    return ScalaCallShapeRelation::Incompatible;
+                    return applies_result(actual.lists.len() - position);
                 };
                 if declared_list.kind != ScalaParameterListKind::Contextual
                     || !declared_list.arity.accepts(actual_list.arity)
@@ -2126,6 +2215,7 @@ pub fn scala_call_shape_relation(
 
 pub fn scala_callable_shape_matches(
     declared: &[ScalaCallableParameterList],
+    result: ScalaDeclaredResult,
     actual: Option<&ScalaCallSiteShape>,
     policy: ScalaCallableUsePolicy,
     unique_callable: bool,
@@ -2134,10 +2224,10 @@ pub fn scala_callable_shape_matches(
         return declared.first().is_none_or(|list| list.arity.total() == 0)
             || policy == ScalaCallableUsePolicy::OrdinaryMethod && unique_callable;
     };
-    if !scala_callable_shape_is_candidate(declared, actual, policy) {
+    if !scala_callable_shape_is_candidate(declared, result, actual, policy) {
         return false;
     }
-    match scala_call_shape_relation(declared, actual) {
+    match scala_call_shape_relation(declared, result, actual) {
         ScalaCallShapeRelation::Incompatible => false,
         ScalaCallShapeRelation::Complete => true,
         ScalaCallShapeRelation::Partial { .. } => unique_callable,
@@ -2147,6 +2237,7 @@ pub fn scala_callable_shape_matches(
 pub fn scala_callable_alternative_matches(
     declared_role: ScalaCallableRole,
     declared_shape: &[ScalaCallableParameterList],
+    declared_result: ScalaDeclaredResult,
     actual: Option<&ScalaCallSiteShape>,
     site_role: ScalaCallableSiteRole,
     unique_callable: bool,
@@ -2154,6 +2245,7 @@ pub fn scala_callable_alternative_matches(
     site_role.accepts(declared_role)
         && scala_callable_shape_matches(
             declared_shape,
+            declared_result,
             actual,
             site_role.use_policy(),
             unique_callable,
@@ -2163,28 +2255,41 @@ pub fn scala_callable_alternative_matches(
 pub fn scala_callable_alternative_is_candidate(
     declared_role: ScalaCallableRole,
     declared_shape: &[ScalaCallableParameterList],
+    declared_result: ScalaDeclaredResult,
     actual: &ScalaCallSiteShape,
     site_role: ScalaCallableSiteRole,
 ) -> bool {
     site_role.accepts(declared_role)
-        && scala_callable_shape_is_candidate(declared_shape, actual, site_role.use_policy())
+        && scala_callable_shape_is_candidate(
+            declared_shape,
+            declared_result,
+            actual,
+            site_role.use_policy(),
+        )
 }
 
 pub fn scala_callable_shape_is_candidate(
     declared: &[ScalaCallableParameterList],
+    result: ScalaDeclaredResult,
     actual: &ScalaCallSiteShape,
     policy: ScalaCallableUsePolicy,
 ) -> bool {
-    match scala_call_shape_relation(declared, actual) {
+    match scala_call_shape_relation(declared, result, actual) {
         ScalaCallShapeRelation::Incompatible => false,
         ScalaCallShapeRelation::Complete => true,
         ScalaCallShapeRelation::Partial {
             next_explicit_arity,
         } => {
+            // Fewer application lists than declared is partial application, and
+            // the site's expected function arity refutes it only when that
+            // arity is known (#1853): `xs.map(render("p"))` on an unresolved
+            // receiver proves nothing about the function `map` wants, and an
+            // unproven arity is not a mismatch. `scala_callable_shape_matches`
+            // still requires the partially applied callable to be the only one.
             policy == ScalaCallableUsePolicy::OrdinaryMethod
                 && actual
                     .method_value_arity
-                    .is_some_and(|arity| next_explicit_arity.accepts(arity))
+                    .is_none_or(|arity| next_explicit_arity.accepts(arity))
         }
     }
 }
@@ -2473,16 +2578,25 @@ mod tests {
             type_arguments_only: false,
         };
         assert_eq!(
-            scala_call_shape_relation(&[contextual(1), explicit(1), contextual(2)], &supplied),
+            scala_call_shape_relation(
+                &[contextual(1), explicit(1), contextual(2)],
+                ScalaDeclaredResult::UNDECLARED,
+                &supplied,
+            ),
             ScalaCallShapeRelation::Complete
         );
         assert_eq!(
-            scala_call_shape_relation(&[contextual(1), explicit(1)], &supplied),
+            scala_call_shape_relation(
+                &[contextual(1), explicit(1)],
+                ScalaDeclaredResult::UNDECLARED,
+                &supplied,
+            ),
             ScalaCallShapeRelation::Complete
         );
         assert_eq!(
             scala_call_shape_relation(
                 &[contextual(1)],
+                ScalaDeclaredResult::UNDECLARED,
                 &ScalaCallSiteShape {
                     lists: vec![empty],
                     leading_literal_argument_types: None,
@@ -2497,6 +2611,7 @@ mod tests {
         assert_eq!(
             scala_call_shape_relation(
                 &[contextual(1)],
+                ScalaDeclaredResult::UNDECLARED,
                 &ScalaCallSiteShape {
                     lists: vec![ordinary],
                     leading_literal_argument_types: None,
@@ -2511,6 +2626,7 @@ mod tests {
         assert_eq!(
             scala_call_shape_relation(
                 &[explicit(1), contextual(1)],
+                ScalaDeclaredResult::UNDECLARED,
                 &ScalaCallSiteShape {
                     lists: vec![ordinary, ordinary],
                     leading_literal_argument_types: None,
@@ -2525,6 +2641,7 @@ mod tests {
         assert_eq!(
             scala_call_shape_relation(
                 &[contextual(1), explicit(1)],
+                ScalaDeclaredResult::UNDECLARED,
                 &ScalaCallSiteShape {
                     lists: vec![ordinary],
                     leading_literal_argument_types: None,
@@ -2546,25 +2663,32 @@ mod tests {
             type_arguments_only: false,
         };
         assert_eq!(
-            scala_call_shape_relation(&[explicit(1), explicit(1)], &partial),
+            scala_call_shape_relation(
+                &[explicit(1), explicit(1)],
+                ScalaDeclaredResult::UNDECLARED,
+                &partial,
+            ),
             ScalaCallShapeRelation::Partial {
                 next_explicit_arity: CallableArity::exact(1)
             }
         );
         assert!(scala_callable_shape_matches(
             &[explicit(1), explicit(1)],
+            ScalaDeclaredResult::UNDECLARED,
             Some(&partial),
             ScalaCallableUsePolicy::OrdinaryMethod,
             true,
         ));
         assert!(!scala_callable_shape_matches(
             &[explicit(1), explicit(1)],
+            ScalaDeclaredResult::UNDECLARED,
             Some(&partial),
             ScalaCallableUsePolicy::OrdinaryMethod,
             false,
         ));
         assert!(!scala_callable_shape_matches(
             &[explicit(1), explicit(1)],
+            ScalaDeclaredResult::UNDECLARED,
             Some(&partial),
             ScalaCallableUsePolicy::CompleteCall,
             true,
@@ -2707,6 +2831,7 @@ object Roleful { def apply(using String): Roleful = new Roleful(0) }
         assert!(scala_callable_alternative_matches(
             ScalaCallableRole::SecondaryConstructor,
             &declared,
+            ScalaDeclaredResult::UNDECLARED,
             Some(&zero),
             ScalaCallableSiteRole::ExplicitConstruction,
             false,
@@ -2714,6 +2839,7 @@ object Roleful { def apply(using String): Roleful = new Roleful(0) }
         assert!(!scala_callable_alternative_matches(
             ScalaCallableRole::SecondaryConstructor,
             &declared,
+            ScalaDeclaredResult::UNDECLARED,
             Some(&zero),
             ScalaCallableSiteRole::PrimaryConstruction,
             false,
@@ -2721,6 +2847,7 @@ object Roleful { def apply(using String): Roleful = new Roleful(0) }
         assert!(!scala_callable_alternative_matches(
             ScalaCallableRole::SecondaryConstructor,
             &declared,
+            ScalaDeclaredResult::UNDECLARED,
             Some(&zero),
             ScalaCallableSiteRole::Ordinary,
             false,

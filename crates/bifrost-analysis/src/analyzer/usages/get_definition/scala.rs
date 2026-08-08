@@ -31,13 +31,14 @@ use brokk_bifrost_jvm::scala::graph::resolver::{
 };
 use brokk_bifrost_jvm::scala::graph::syntax::{
     ScalaCallArgumentListKind, ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole,
-    ScalaCallableSiteRole, ScalaCallableSourceAlternative, ScalaFunctionParameterShape,
-    ScalaParameterListKind, ScalaParameterTypeIdentity, ScalaQualifiedStableTypeRole,
-    applied_expression_for_reference, call_arities_for_reference, call_site_shape_for_reference,
-    is_extractor_reference, is_infix_type_operator_reference, is_scala_case_pattern_binder,
-    is_scala_class_reference, is_scala_named_argument_assignment, named_argument_invocation_owner,
-    qualified_stable_type_reference, scala_callable_alternative_is_candidate,
-    scala_callable_alternative_matches, scala_pattern_binder_names, scala_source_facts,
+    ScalaCallableSiteRole, ScalaCallableSourceAlternative, ScalaDeclaredResult,
+    ScalaFunctionParameterShape, ScalaParameterListKind, ScalaParameterTypeIdentity,
+    ScalaQualifiedStableTypeRole, applied_expression_for_reference, call_arities_for_reference,
+    call_site_shape_for_reference, is_extractor_reference, is_infix_type_operator_reference,
+    is_scala_case_pattern_binder, is_scala_class_reference, is_scala_named_argument_assignment,
+    named_argument_invocation_owner, qualified_stable_type_reference,
+    scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
+    scala_pattern_binder_names, scala_source_facts,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -55,6 +56,7 @@ struct ForwardScalaExtensionMethod {
 struct ForwardScalaCallableAlternative {
     role: ScalaCallableRole,
     shape: Vec<ScalaCallableParameterList>,
+    result: ScalaDeclaredResult,
     parameter_types: Vec<Vec<Option<ScalaParameterTypeIdentity>>>,
     parameter_function_shapes: Vec<Vec<Option<ScalaFunctionParameterShape>>>,
 }
@@ -6264,6 +6266,7 @@ fn scala_forward_method_value_arity(
             scala_callable_alternative_matches(
                 alternative.role,
                 &alternative.shape,
+                alternative.result,
                 Some(&actual),
                 ScalaCallableSiteRole::Ordinary,
                 true,
@@ -7089,6 +7092,7 @@ fn resolve_scala_constructor(
             &[ScalaCallableParameterList::explicit(
                 crate::analyzer::CallableArity::exact(0),
             )],
+            ScalaDeclaredResult::UNDECLARED,
             call_shape.as_ref(),
             ScalaCallableSiteRole::ExplicitConstruction,
             false,
@@ -7098,6 +7102,7 @@ fn resolve_scala_constructor(
             scala_callable_alternative_matches(
                 alternative.role,
                 &alternative.shape,
+                alternative.result,
                 call_shape.as_ref(),
                 ScalaCallableSiteRole::ExplicitConstruction,
                 false,
@@ -7933,6 +7938,7 @@ fn scala_callable_matches_constructed_arguments(
         scala_callable_alternative_is_candidate(
             alternative.role,
             &alternative.shape,
+            alternative.result,
             call_shape,
             ScalaCallableSiteRole::Ordinary,
         )
@@ -8519,6 +8525,7 @@ fn scala_forward_callable_alternatives(
         .map(|facts| ForwardScalaCallableAlternative {
             role: facts.role,
             shape: facts.shape.clone(),
+            result: facts.result,
             parameter_types: facts
                 .parameter_type_paths
                 .iter()
@@ -8607,6 +8614,7 @@ fn scala_filter_callable_units(
                             scala_callable_alternative_is_candidate(
                                 alternative.role,
                                 &alternative.shape,
+                                alternative.result,
                                 call_shape,
                                 site_role,
                             )
@@ -8621,6 +8629,7 @@ fn scala_filter_callable_units(
                 return usize::from(scala_callable_alternative_is_candidate(
                     scala_fallback_callable_role(scala, unit),
                     &fallback,
+                    ScalaDeclaredResult::UNDECLARED,
                     call_shape,
                     site_role,
                 ));
@@ -8760,6 +8769,7 @@ fn scala_member_unit_applies(
             scala_callable_alternative_matches(
                 alternative.role,
                 &alternative.shape,
+                alternative.result,
                 call_shape,
                 site_role,
                 unique_callable,
@@ -8774,6 +8784,7 @@ fn scala_member_unit_applies(
     scala_callable_alternative_matches(
         scala_fallback_callable_role(scala, unit),
         &fallback,
+        ScalaDeclaredResult::UNDECLARED,
         call_shape,
         site_role,
         unique_callable,
