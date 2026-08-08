@@ -20633,9 +20633,10 @@ void wrong_namespace() {
         "the resolved single candidate must be a proven usage hit: {hits_by_overload:#?}"
     );
 
-    // The class temporary keeps the conservative answer: a bare `Widget(...)`
-    // with an unknown argument count is still resolved through the type tier,
-    // which this scan cannot prove without the call shape.
+    // #1812: the direct-type tier never consulted the argument count, so the
+    // unknown-arity guard in front of it only discarded the one type the name
+    // binds to. `model::Widget` is that type, so the temporary resolves and the
+    // scan records it as a proven type hit.
     let class_call_line = "    Widget(UNKNOWN_ARGS); // unproven-unknown-class-arity";
     let class_call = fixture_token_range(&unknown_source, class_call_line, widget.identifier());
     let class_forward = forward_in(
@@ -20644,13 +20645,13 @@ void wrong_namespace() {
         class_call_line,
         widget.identifier(),
     );
-    assert_ne!("resolved", class_forward.status, "{class_forward:#?}");
+    assert_eq!("resolved", class_forward.status, "{class_forward:#?}");
     assert!(
         class_forward
             .declarations
             .iter()
-            .all(|definition| definition.fqn.as_deref() != Some(widget.fq_name().as_str())),
-        "unknown arity must not produce an exact forward target: {class_forward:#?}"
+            .any(|definition| definition.fqn.as_deref() == Some(widget.fq_name().as_str())),
+        "the single visible type must survive unproven arity: {class_forward:#?}"
     );
 
     let class_provider =
@@ -20666,9 +20667,7 @@ void wrong_namespace() {
         )
         .result;
     let FuzzyResult::Success {
-        hits_by_overload,
-        unproven_total_by_overload,
-        ..
+        hits_by_overload, ..
     } = class_targeted
     else {
         panic!("expected targeted unknown-arity success: {class_targeted:#?}");
@@ -20677,16 +20676,14 @@ void wrong_namespace() {
         hits_by_overload
             .values()
             .flatten()
-            .all(|hit| (hit.start_offset, hit.end_offset) != class_call)
+            .any(|hit| (hit.start_offset, hit.end_offset) == class_call),
+        "the resolved single type must be a proven usage hit: {hits_by_overload:#?}"
     );
-    assert!(unproven_total_by_overload.values().sum::<usize>() > 0);
 
     let class_whole =
         UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&widget));
     let FuzzyResult::Success {
-        hits_by_overload,
-        unproven_total_by_overload,
-        ..
+        hits_by_overload, ..
     } = class_whole
     else {
         panic!("expected whole unknown-arity success: {class_whole:#?}");
@@ -20696,9 +20693,9 @@ void wrong_namespace() {
             .values()
             .flatten()
             .filter(|hit| hit.file == unknown_file)
-            .all(|hit| (hit.start_offset, hit.end_offset) != class_call)
+            .any(|hit| (hit.start_offset, hit.end_offset) == class_call),
+        "the whole-workspace scan must prove the same site: {hits_by_overload:#?}"
     );
-    assert!(unproven_total_by_overload.values().sum::<usize>() > 0);
 
     let wrong = project.file("wrong.cc");
     assert!(

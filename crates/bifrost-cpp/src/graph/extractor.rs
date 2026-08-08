@@ -2235,9 +2235,10 @@ pub fn resolve_bare_call_target(
             })
             .collect::<Vec<_>>();
         if !direct_types.is_empty() {
-            if call_arity.is_none() {
-                return BareCallTargetResolution::Ambiguous;
-            }
+            // `resolve_direct_type_candidates` never consults the argument
+            // count: it answers the one type the name binds to, or reports the
+            // competing types. An unknown count therefore cannot make this
+            // ambiguous (#1812).
             return resolve_direct_type_candidates(direct_types, analyzer, visibility, file);
         }
         let directives = at_tier
@@ -2340,9 +2341,10 @@ pub fn resolve_bare_call_target(
             direct_types.push((unit.clone(), components.clone()));
         }
         if !direct_types.is_empty() {
-            if call_arity.is_none() {
-                return BareCallTargetResolution::Ambiguous;
-            }
+            // `resolve_direct_type_candidates` never consults the argument
+            // count: it answers the one type the name binds to, or reports the
+            // competing types. An unknown count therefore cannot make this
+            // ambiguous (#1812).
             return resolve_direct_type_candidates(direct_types, analyzer, visibility, file);
         }
         let directives = at_tier
@@ -2370,9 +2372,9 @@ pub fn resolve_bare_call_target(
             );
         }
         if type_components.is_some_and(|components| components == qualified.as_slice()) {
-            if call_arity.is_none() {
-                return BareCallTargetResolution::Ambiguous;
-            }
+            // The lexical type resolution below already answers with the single
+            // type, or with its own ambiguity verdict; the argument count adds
+            // nothing to that decision (#1812).
             return match type_resolution {
                 LexicalTypeResolution::Resolved { unit, .. } => {
                     BareCallTargetResolution::Type(unit)
@@ -2382,9 +2384,14 @@ pub fn resolve_bare_call_target(
             };
         }
     }
-    if call_arity.is_none() {
-        return BareCallTargetResolution::Ambiguous;
-    }
+    // Every lookup tier is exhausted: no callable and no type candidate was
+    // found. Reporting that as `Ambiguous` claimed an ambiguity between nothing
+    // at all, and its early return in get_definition preempted the same-file
+    // macro fallback - so a call to a macro defined in the referencing file
+    // (libyang's `RBN_RIGHT`, glpk's `#define error dmx_error`) could never
+    // resolve once an unresolvable include made the argument count unknown.
+    // A no-candidate outcome is Missing, which is what makes the fallback
+    // reachable (#1812).
     match type_resolution {
         LexicalTypeResolution::Resolved { unit, .. } => BareCallTargetResolution::Type(unit),
         LexicalTypeResolution::Ambiguous => BareCallTargetResolution::Ambiguous,
