@@ -102,7 +102,6 @@ brokk-bifrost-jvm = { path = "../bifrost-jvm", version = "=0.8.24", features = [
 brokk-bifrost-python = { path = "../bifrost-python", version = "=0.8.24", features = ["test-support"] }
 brokk-bifrost-rust = { path = "../bifrost-rust", version = "=0.8.24", features = ["test-support"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
-tree-sitter-scala = "=0.25.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

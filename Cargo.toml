@@ -204,9 +204,6 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 syn = { version = "2", features = ["extra-traits", "full", "visit"] }
 tar = { version = "0.4.44", default-features = false }
-# Proves Bifrost's private native symbols coexist with the published grammar.
-tree-sitter-scala = "=0.25.1"
-
 # Unix: process-group kill for the embedding sidecar (and the peak-RSS bench).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

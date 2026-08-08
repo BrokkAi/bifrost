@@ -18,9 +18,10 @@ use crate::analyzer::{SignatureMetadata, StructuredTypeName};
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_cpp::call_match::{
     CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_parameter_type_text,
-    cpp_signature_param_types, cpp_type_text_pointer_depth, normalize_cpp_type_name,
+    cpp_signature_param_types, cpp_signature_trailing_qualifiers, cpp_type_text_pointer_depth,
+    normalize_cpp_type_name,
 };
-use brokk_bifrost_cpp::graph::resolver::cpp_alias_declaration_target_text;
+use brokk_bifrost_cpp::graph::resolver::{cpp_alias_declaration_target_text, same_logical_symbol};
 
 pub(crate) const CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC: &str = "unproven_cpp_link_unit";
 
@@ -130,7 +131,7 @@ pub(super) fn select_navigation_targets(
     for candidate in candidates {
         let Some(tree) = context.cpp_indexed_tree(candidate.source()) else {
             if operation == NavigationOperation::Declaration {
-                classified.push((candidate.clone(), None, CppOccurrenceRole::Unknown));
+                classified.push((candidate.clone(), None, CppOccurrenceRole::Unknown, None));
             }
             structure_unavailable = true;
             continue;
@@ -138,7 +139,7 @@ pub(super) fn select_navigation_targets(
         let root = tree.root_node();
         let Some(index) = context.cpp_navigation_index(candidate.source()) else {
             if operation == NavigationOperation::Declaration {
-                classified.push((candidate.clone(), None, CppOccurrenceRole::Unknown));
+                classified.push((candidate.clone(), None, CppOccurrenceRole::Unknown, None));
             }
             structure_unavailable = true;
             continue;
@@ -146,20 +147,25 @@ pub(super) fn select_navigation_targets(
         let ranges = index.ranges(candidate);
         source_ranges_truncated |= index.is_truncated(candidate);
         if ranges.is_empty() && !candidate.is_callable() && !candidate.is_class() {
-            classified.push((candidate.clone(), None, CppOccurrenceRole::Both));
+            classified.push((candidate.clone(), None, CppOccurrenceRole::Both, None));
             continue;
         }
         classified.extend(ranges.iter().copied().map(|range| {
             let kind = cpp_occurrence_role_for_range(root, candidate, &range);
-            (candidate.clone(), Some(range), kind)
+            let family = brokk_bifrost_cpp::graph::resolver::preprocessor_conditional_family_range(
+                root,
+                range.start_byte,
+                range.end_byte,
+            );
+            (candidate.clone(), Some(range), kind, family)
         }));
     }
     let has_declaration_only = classified
         .iter()
-        .any(|(_, _, kind)| *kind == CppOccurrenceRole::DeclarationOnly);
+        .any(|(_, _, kind, _)| *kind == CppOccurrenceRole::DeclarationOnly);
     let mut selected: Vec<_> = classified
         .into_iter()
-        .filter(|(_, _, kind)| match operation {
+        .filter(|(_, _, kind, _)| match operation {
             NavigationOperation::Declaration => {
                 if has_declaration_only {
                     *kind == CppOccurrenceRole::DeclarationOnly
@@ -175,6 +181,25 @@ pub(super) fn select_navigation_targets(
         .collect();
     selected.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
     selected.dedup();
+    // The branches of one #if/#elif/#else chain are alternate spellings of a
+    // single declaration: at most one of them is compiled. Keep the first
+    // branch so a completed conditional family answers with one target instead
+    // of an ambiguity between build configurations.
+    let mut seen_families = HashSet::default();
+    selected.retain(|(candidate, _, _, family)| {
+        family.is_none_or(|family| {
+            seen_families.insert((
+                candidate.source().clone(),
+                definition_symbol_key(candidate),
+                candidate.signature().map(str::to_owned),
+                family,
+            ))
+        })
+    });
+    let mut selected: Vec<_> = selected
+        .into_iter()
+        .map(|(candidate, range, kind, _)| (candidate, range, kind))
+        .collect();
     let unproven_link_unit = operation == NavigationOperation::Definition
         && selected
             .iter()
@@ -3076,9 +3101,27 @@ fn resolve_cpp_type_without_focused_qualifier(
                 }
             }
         }
+        // This walk composes the reference onto each enclosing scope prefix and
+        // answers the *first* indexed declaration of the composed name. When one
+        // name has several declarations that is a pick by index order, with no
+        // reachability test at all: log4cxx declares `LevelPtr` in both
+        // `level.h` and `helpers/optionconverter.h`, `helpers/optionconverter.h`
+        // sorts first, and `logger.cpp` - which includes only `level.h` - was
+        // sent to a file its include closure never reaches (#1844).
+        //
+        // Ask for a declaration the closure reaches first. A file only ever
+        // names declarations its own translation unit supplies, so a reachable
+        // one is the better answer wherever the walk finds it. Keep the
+        // scope-blind answer when the closure reaches none: an out-of-closure
+        // target beats no target.
+        let accepts_type =
+            |unit: &CodeUnit| unit.is_class() || cpp_unit_is_type_alias(analyzer, unit);
         if let Some(unit) =
             resolve_in_enclosing_scopes(analyzer, file, text, node.start_byte(), |unit| {
-                unit.is_class() || cpp_unit_is_type_alias(analyzer, unit)
+                accepts_type(unit) && visibility.is_physically_visible(file, unit)
+            })
+            .or_else(|| {
+                resolve_in_enclosing_scopes(analyzer, file, text, node.start_byte(), accepts_type)
             })
         {
             let candidates = if cpp_unit_is_type_alias(analyzer, &unit) {
@@ -3754,11 +3797,61 @@ fn cpp_type_definition_candidates(
     );
     sort_units(&mut indexed);
     indexed.dedup();
+    collapse_same_fqn_alias_spellings(analyzer, visibility, file, &mut indexed);
     if indexed.is_empty() {
         vec![target]
     } else {
         indexed
     }
+}
+
+/// Answer one navigation target per identical type alias, preferring the
+/// spelling the reference file's include closure reaches.
+///
+/// One alias can be declared identically in several headers - log4cxx declares
+/// `typedef std::shared_ptr<Level> LevelPtr;` in both `level.h` and
+/// `helpers/optionconverter.h` - and `support.fqn` answers every declaration in
+/// the workspace. A consumer that includes only `level.h` was offered the
+/// `optionconverter.h` twin, a file its include closure never reaches, as a
+/// navigation target (#1844); when both were reachable the two spellings read
+/// as an ambiguity. Identical aliases of one FQN are alternate spellings of one
+/// entity, so they answer as one target, and the reference names the spelling
+/// its own closure supplies.
+///
+/// This is deliberately restricted to aliases. A class has a declaration/
+/// definition split under one signature: a forward declaration inside the
+/// closure must not stand for the definition in a header the file does not
+/// include. An alias carries its whole meaning in its own declaration, so an
+/// identical one is fully interchangeable.
+///
+/// A family the closure reaches nowhere still answers - an out-of-closure
+/// target is better than none.
+fn collapse_same_fqn_alias_spellings(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    candidates: &mut Vec<CodeUnit>,
+) {
+    let mut kept: Vec<CodeUnit> = Vec::with_capacity(candidates.len());
+    for candidate in candidates.drain(..) {
+        if !cpp_unit_is_type_alias(analyzer, &candidate) {
+            kept.push(candidate);
+            continue;
+        }
+        let Some(spelling) = kept
+            .iter_mut()
+            .find(|kept| same_logical_symbol(kept, &candidate))
+        else {
+            kept.push(candidate);
+            continue;
+        };
+        if !visibility.is_physically_visible(file, spelling)
+            && visibility.is_physically_visible(file, &candidate)
+        {
+            *spelling = candidate;
+        }
+    }
+    *candidates = kept;
 }
 
 fn cpp_selected_type_definition_candidates(
@@ -4020,7 +4113,9 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     )
                 };
                 if !member_candidates.is_empty() {
-                    if call_arity.is_none() {
+                    if call_arity.is_none()
+                        && !cpp_candidates_are_one_logical_symbol(&member_candidates)
+                    {
                         // The competing members are in hand; an ambiguous answer
                         // must carry them rather than drop them (#1811).
                         return ambiguous_candidates_outcome(
@@ -4410,8 +4505,20 @@ fn resolve_cpp_field(
         field,
         receiver,
     );
+    // Two unrelated failures used to share one message. Claiming the receiver
+    // is unresolved when it typed perfectly well sent the whole class-template
+    // inherited-lookup family's triage at receiver analysis instead of at the
+    // base walk that actually came up empty (#1833). The bounded provider
+    // already draws this line; use its vocabulary.
+    let receiver_resolved = !owners.is_empty();
     let candidates = cpp_member_candidates(ctx, owners, member, arity, arg_types);
     if candidates.is_empty() {
+        if receiver_resolved {
+            return no_definition(
+                "no_indexed_definition",
+                format!("C++ member `{member}` is not indexed for the resolved receiver"),
+            );
+        }
         no_definition(
             "unsupported_cpp_receiver",
             format!("receiver for C++ member `{member}` is not resolved"),
@@ -4502,6 +4609,21 @@ fn cpp_visible_name_candidates(
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
+}
+
+/// Whether every candidate names the same logical C++ entity.
+///
+/// A declaration and its out-of-line body share `(kind, fq_name, signature)`;
+/// they are one member, not an overload set. Unproven call arity must only
+/// preserve an ambiguity that already exists and never manufacture one out of
+/// a lone member declaration (#1826) - the same rule the free-function branch
+/// gets from `resolve_callable_candidates` (#1811). A genuine overload set
+/// differs in signature, including by a trailing cv- or ref-qualifier, so it
+/// stays ambiguous.
+fn cpp_candidates_are_one_logical_symbol(candidates: &[CodeUnit]) -> bool {
+    candidates
+        .split_first()
+        .is_some_and(|(first, rest)| rest.iter().all(|other| same_logical_symbol(first, other)))
 }
 
 /// Cross-file C/C++ callable bodies selected from include evidence are useful
@@ -5111,10 +5233,304 @@ fn cpp_member_lookup(
         0,
     );
     if !candidates.is_empty() {
-        return candidates;
+        return cpp_merge_using_introduced_members(
+            ctx,
+            owners,
+            member,
+            0,
+            candidates,
+            member_trace,
+        );
     }
     let mut seen = HashSet::default();
     cpp_inherited_member_candidates(ctx, owners, member, &mut seen, member_trace)
+}
+
+/// Fold in the overloads a member `using <Base>::<member>;` declaration on
+/// `owners` re-exposes.
+///
+/// C++ name hiding removes a base overload as soon as a derived class declares
+/// the same name, and the walk models that by stopping at the first level that
+/// declares it. A member using-declaration switches hiding off for the named
+/// base, but nothing re-added what it un-hid, so a call that selected the base
+/// signature reported `no_applicable_overload` even though the overload was
+/// indexed, visible, and explicitly re-exposed by the source (#1835).
+///
+/// What the using-declaration re-exposes is bounded by [namespace.udecl]/14:
+/// a member of the deriving class with the same name *and the same
+/// parameter-type-list* hides the base member the using-declaration would
+/// otherwise introduce. Merging without that exclusion turned a call that had
+/// resolved to a derived `override` into an ambiguity between the override and
+/// the very base declaration it overrides (#1843). Hiding is per deriving-class
+/// relationship, so each worklist entry carries the deriving class's own
+/// declarations of the name.
+///
+/// `depth` is the base-class depth `declared` was found at, so the trace can
+/// keep reporting an exact route. The walk is an explicit worklist: a
+/// using-declaration can name a base that re-exposes the member through a
+/// using-declaration of its own, and a recovered hierarchy can be cyclic.
+fn cpp_merge_using_introduced_members(
+    ctx: CppLookupCtx<'_, '_>,
+    owners: &[CodeUnit],
+    member: &str,
+    depth: usize,
+    mut declared: Vec<CodeUnit>,
+    mut member_trace: Option<&mut CppMemberTrace>,
+) -> Vec<CodeUnit> {
+    let mut pending: Vec<(CodeUnit, CodeUnit, CppHidingSet, usize)> = Vec::new();
+    for owner in owners {
+        let bases = cpp_member_using_declaration_bases(ctx.analyzer, owner, member);
+        if bases.is_empty() {
+            continue;
+        }
+        let hiding = CppHidingSet::declared_by(ctx, owner, &declared);
+        for base in bases {
+            pending.push((base, owner.clone(), hiding.clone(), depth + 1));
+        }
+    }
+    if pending.is_empty() {
+        return declared;
+    }
+    let mut visited: HashSet<String> = owners.iter().map(CodeUnit::fq_name).collect();
+    while let Some((base, deriving, hiding, base_depth)) = pending.pop() {
+        if !visited.insert(base.fq_name()) {
+            continue;
+        }
+        if let Some(state) = member_trace.as_deref_mut() {
+            state.parents.entry(base.clone()).or_insert(deriving);
+        }
+        let introduced = cpp_direct_member_candidates_traced(
+            ctx.analyzer,
+            ctx.support,
+            std::slice::from_ref(&base),
+            member,
+            member_trace.as_deref_mut(),
+            base_depth,
+        );
+        let chained = cpp_member_using_declaration_bases(ctx.analyzer, &base, member);
+        if !chained.is_empty() {
+            // What `base` re-exposes in turn is hidden by `base`'s own
+            // declarations as well as by everything nearer the call already
+            // hides, so the chained set accumulates rather than replaces.
+            let mut next_hiding = hiding.clone();
+            next_hiding.extend(CppHidingSet::declared_by(ctx, &base, &introduced));
+            for next in chained {
+                pending.push((next, base.clone(), next_hiding.clone(), base_depth + 1));
+            }
+        }
+        declared.extend(
+            introduced
+                .into_iter()
+                .filter(|unit| !hiding.hides(ctx, unit)),
+        );
+    }
+    sort_units(&mut declared);
+    declared.dedup();
+    declared
+}
+
+/// One declaration's parameter-type-list, in the terms [namespace.udecl]/14
+/// measures a using-introduced base overload against.
+///
+/// The trailing cv-/ref-qualifiers travel with the types because the #1827
+/// signature identity records them and they are part of what makes two member
+/// declarations the same declaration: a `const` member does not hide a
+/// non-`const` one of the same shape.
+#[derive(Clone, PartialEq, Eq)]
+enum CppParameterTypeList {
+    Types {
+        types: Vec<String>,
+        trailing: String,
+    },
+    /// A parameter list spelled with a macro whose replacement the file's macro
+    /// environment cannot pin down - log4cxx's
+    /// `LOG4CXX_FORMAT_EVENT_FORMAL_PARAMETERS` under its ABI-version `#if` is
+    /// the witness. Read as an ordinary type name it would compare unequal to
+    /// every base overload and let all of them through, which is the failure
+    /// #1843 reports; it is an unknown, and an unknown in the deriving class
+    /// hides rather than defers.
+    Opaque,
+}
+
+/// The parameter-type-lists one deriving class declares for the member.
+#[derive(Clone)]
+struct CppHidingSet(Vec<CppParameterTypeList>);
+
+impl CppHidingSet {
+    /// The lists `declarations` contributes for `owner` - the members of
+    /// `owner` itself, which is the only class whose declarations hide what
+    /// `owner`'s using-declaration introduces.
+    fn declared_by(ctx: CppLookupCtx<'_, '_>, owner: &CodeUnit, declarations: &[CodeUnit]) -> Self {
+        Self(
+            declarations
+                .iter()
+                // The unit's owner is a segment pop on its structured `fq()`
+                // (`default_parent_fq_name`), not a re-split of its rendered
+                // fqn string.
+                .filter(|unit| {
+                    crate::analyzer::default_parent_fq_name(unit) == Some(owner.fq_name())
+                })
+                .filter_map(|unit| cpp_parameter_type_list(ctx, unit))
+                .collect(),
+        )
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
+    /// Whether the deriving class declares `introduced`'s parameter-type-list,
+    /// so [namespace.udecl]/14 keeps the base member out of the overload set.
+    fn hides(&self, ctx: CppLookupCtx<'_, '_>, introduced: &CodeUnit) -> bool {
+        if self.0.is_empty() {
+            return false;
+        }
+        if self.0.contains(&CppParameterTypeList::Opaque) {
+            return true;
+        }
+        cpp_parameter_type_list(ctx, introduced)
+            .is_some_and(|introduced| self.0.contains(&introduced))
+    }
+}
+
+/// A declaration's parameter-type-list, read from the signature identity the
+/// index stores and with any object-like macro standing in for a type expanded
+/// in that declaration's own macro environment.
+fn cpp_parameter_type_list(
+    ctx: CppLookupCtx<'_, '_>,
+    unit: &CodeUnit,
+) -> Option<CppParameterTypeList> {
+    let signature = unit.signature()?;
+    let types = cpp_signature_param_types(signature)?;
+    let trailing = cpp_signature_trailing_qualifiers(signature).to_string();
+    if !types
+        .iter()
+        .any(|text| cpp_type_text_is_bare_identifier(text))
+    {
+        return Some(CppParameterTypeList::Types { types, trailing });
+    }
+    // Only a bare identifier can be an object-like macro rather than a type,
+    // and only then is the macro environment worth building.
+    let Some(range) = ctx.analyzer.ranges_of(unit).into_iter().next() else {
+        return Some(CppParameterTypeList::Types { types, trailing });
+    };
+    let mut expanded = Vec::with_capacity(types.len());
+    for text in types {
+        if !cpp_type_text_is_bare_identifier(&text) {
+            expanded.push(text);
+            continue;
+        }
+        match ctx
+            .visibility
+            .object_macro_replacement_at(unit.source(), &text, range.start_byte)
+        {
+            Some(replacement) => match cpp_signature_param_types(&format!("({replacement})")) {
+                Some(replacement_types) => expanded.extend(replacement_types),
+                None => return Some(CppParameterTypeList::Opaque),
+            },
+            None if ctx
+                .visibility
+                .names_a_macro_at(unit.source(), &text, range.start_byte) =>
+            {
+                return Some(CppParameterTypeList::Opaque);
+            }
+            None => expanded.push(text),
+        }
+    }
+    Some(CppParameterTypeList::Types {
+        types: expanded,
+        trailing,
+    })
+}
+
+/// Whether a normalized parameter type is one unqualified identifier, which is
+/// the only shape an object-like macro can wear.
+fn cpp_type_text_is_bare_identifier(text: &str) -> bool {
+    text.chars()
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && text
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// The base classes a member `using <Base>::<member>;` declaration in `owner`'s
+/// body names for `member`.
+///
+/// An in-class using-declaration is not indexed as a member of its class, so
+/// the declaration node in `owner`'s own source is the only structural record
+/// of it. That parse is the cheap gate: a class that declares no
+/// `using <Base>::<member>;` never touches the hierarchy provider, whose
+/// ancestor computation classifies every visible alias on first use.
+fn cpp_member_using_declaration_bases(
+    analyzer: &dyn IAnalyzer,
+    owner: &CodeUnit,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let Some(source) = analyzer.get_source(owner, false) else {
+        return Vec::new();
+    };
+    let Some(tree) = parse_cpp_tree(&source) else {
+        return Vec::new();
+    };
+    let mut scopes: Vec<String> = Vec::new();
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "using_declaration" {
+            if let Some(scope) = cpp_using_declaration_member_scope(node, &source, member) {
+                scopes.push(scope);
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    if scopes.is_empty() {
+        return Vec::new();
+    }
+    let Some(hierarchy) = analyzer.type_hierarchy_provider() else {
+        return Vec::new();
+    };
+    let ancestors = hierarchy.get_ancestors(owner);
+    if ancestors.is_empty() {
+        return Vec::new();
+    }
+    ancestors
+        .into_iter()
+        .filter(|ancestor| {
+            let qualified = cpp_name_for(ancestor);
+            scopes
+                .iter()
+                .any(|scope| cpp_qualified_name_has_scope_suffix(&qualified, scope))
+        })
+        .collect()
+}
+
+/// The `<Base>` scope of a `using <Base>::<member>;` declaration.
+///
+/// `None` for a using-directive (`using namespace X;`), a using-enum, and any
+/// using-declaration that imports some other name: all three leave no scope
+/// once the trailing component is taken off, or leave a trailing component
+/// that is not `member`.
+fn cpp_using_declaration_member_scope(
+    node: Node<'_>,
+    source: &str,
+    member: &str,
+) -> Option<String> {
+    let imported = node.named_child(0)?;
+    let mut components = cpp_type_name_components(imported, source)?;
+    let imported_member = components.pop()?;
+    (imported_member == member && !components.is_empty()).then(|| components.join("::"))
+}
+
+/// Whether the qualified C++ name `qualified` ends with `scope` at a `::`
+/// boundary, so that `ns::Base` is named by both `Base` and `ns::Base` but
+/// never by `seBase`.
+fn cpp_qualified_name_has_scope_suffix(qualified: &str, scope: &str) -> bool {
+    qualified == scope
+        || qualified
+            .strip_suffix(scope)
+            .is_some_and(|prefix| prefix.ends_with("::"))
 }
 
 fn cpp_member_candidates(
@@ -5325,7 +5741,7 @@ fn cpp_inherited_member_candidates(
     loop {
         let mut bases = Vec::new();
         for owner in &level {
-            for base in cpp_direct_base_types(ctx.analyzer, ctx.visibility, ctx.file, owner) {
+            for base in cpp_direct_base_types(ctx.analyzer, owner) {
                 if seen.insert(base.fq_name()) {
                     if let Some(state) = member_trace.as_deref_mut() {
                         state
@@ -5350,7 +5766,14 @@ fn cpp_inherited_member_candidates(
             depth,
         );
         if !direct.is_empty() {
-            return direct;
+            return cpp_merge_using_introduced_members(
+                ctx,
+                &bases,
+                member,
+                depth,
+                direct,
+                member_trace,
+            );
         }
         level = bases;
     }
@@ -5424,16 +5847,7 @@ fn cpp_filter_candidates_by_call_arg_types(
         candidates,
         &shared_arg_types,
         &|name| cpp_resolve_type_unit(analyzer, visibility, file, name),
-        &|arg_type, param_type| {
-            cpp_type_assignable_to(
-                analyzer,
-                visibility,
-                file,
-                arg_type,
-                param_type,
-                &mut HashSet::default(),
-            )
-        },
+        &|arg_type, param_type| cpp_type_assignable_to(analyzer, arg_type, param_type),
     )
 }
 
@@ -5519,73 +5933,47 @@ fn cpp_known_callable_arity(
     )))
 }
 
+/// Whether `arg_type` is `param_type` or derives from it.
+///
+/// The derivation walk is an explicit worklist rather than a recursion: a
+/// chain can be long, and a recovered translation unit can describe a cyclic
+/// derivation. `visited` closes the cycle and bounds the walk.
 fn cpp_type_assignable_to(
     analyzer: &dyn IAnalyzer,
-    visibility: &CppVisibilityIndex,
-    file: &ProjectFile,
     arg_type: &CodeUnit,
     param_type: &CodeUnit,
-    seen: &mut HashSet<String>,
 ) -> bool {
-    if arg_type.fq_name() == param_type.fq_name() {
-        return true;
+    let mut visited = HashSet::default();
+    let mut pending = vec![arg_type.clone()];
+    while let Some(current) = pending.pop() {
+        if current.fq_name() == param_type.fq_name() {
+            return true;
+        }
+        if !visited.insert(current.fq_name()) {
+            continue;
+        }
+        pending.extend(cpp_direct_base_types(analyzer, &current));
     }
-    if !seen.insert(arg_type.fq_name()) {
-        return false;
-    }
-    cpp_direct_base_types(analyzer, visibility, file, arg_type)
-        .into_iter()
-        .any(|base| {
-            base.fq_name() == param_type.fq_name()
-                || cpp_type_assignable_to(analyzer, visibility, file, &base, param_type, seen)
-        })
+    false
 }
 
-fn cpp_direct_base_types(
-    analyzer: &dyn IAnalyzer,
-    visibility: &CppVisibilityIndex,
-    file: &ProjectFile,
-    unit: &CodeUnit,
-) -> Vec<CodeUnit> {
-    let signature = unit
-        .signature()
-        .map(str::to_string)
-        .or_else(|| analyzer.get_source(unit, false));
-    let Some(signature) = signature else {
-        return Vec::new();
-    };
-    let Some((_, bases)) = signature.split_once(':') else {
-        return Vec::new();
-    };
-    let bases = bases.split('{').next().unwrap_or(bases);
-    // Base-class specifiers are frequently written relative to the enclosing namespace
-    // (`struct Derived : PCM::Base` inside `namespace Outer`, meaning `Outer::PCM::Base`).
-    // Resolve them the same namespace-relative way `cpp_resolve_type_unit_in_namespace`
-    // already resolves other qualified type references in this file (issue #939) --
-    // without this, a relatively-qualified base silently fails to resolve and every
-    // inherited-member lookup through it (bare calls here, and overload-assignability
-    // checks in `cpp_type_assignable_to`) fails forward.
-    let lexical_namespace = (!unit.package_name().is_empty()).then(|| unit.package_name());
-    cpp_split_top_level_commas(bases)
-        .filter_map(|base| {
-            cpp_resolve_type_unit_in_namespace(
-                analyzer,
-                visibility,
-                file,
-                &cpp_base_type_text(base),
-                lexical_namespace,
-            )
-        })
-        .collect()
-}
-
-fn cpp_base_type_text(base: &str) -> String {
-    let filtered = base
-        .split_whitespace()
-        .filter(|token| !matches!(*token, "public" | "private" | "protected" | "virtual"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    normalize_cpp_type_text(&filtered)
+/// The direct base classes of `unit`, read from the analyzer's supertype edges.
+///
+/// Those edges are built from the `base_class_clause` the C++ declaration walk
+/// took off the AST, so they are correct for every class head shape, and they
+/// already resolve a base spelled relative to an enclosing namespace by
+/// searching the same namespace chain (issue #939).
+///
+/// The previous implementation recovered the base list by splitting the class's
+/// *rendered signature* at its first `:`. A class template renders with a
+/// `template <...>` prefix, so that colon belongs to the template head and the
+/// base list came back empty: every inherited member of every class template
+/// was unreachable, while the identical non-template class resolved (#1833).
+fn cpp_direct_base_types(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<CodeUnit> {
+    analyzer
+        .type_hierarchy_provider()
+        .map(|hierarchy| hierarchy.get_direct_ancestors(unit))
+        .unwrap_or_default()
 }
 
 /// A C++ value type paired with its pointer indirection depth: 0 for a value or
@@ -6371,18 +6759,30 @@ fn cpp_enclosing_local_scope(mut node: Node<'_>) -> Option<Node<'_>> {
             // function declaration in its body.  The wrapper's declarator is
             // not callable, so keep the narrower recovered declaration as
             // the local scope instead of letting the wrapper swallow it.
+            //
+            // With no narrower scope the wrapper is pure parser recovery -- a
+            // namespace-opening macro token, an export-macro class head -- and
+            // what it encloses is namespace or class scoped.  Walk past it
+            // instead of binding those declarations as block-local values.
             if parent.kind() == "function_definition"
                 && cpp_malformed_wrapper_function_definition(parent)
-                && fallback.is_some()
             {
-                return fallback;
+                if fallback.is_some() {
+                    return fallback;
+                }
+                node = parent;
+                continue;
             }
             return Some(parent);
         }
-        if fallback.is_none() && cpp_local_scope_node(parent) {
-            fallback = Some(parent);
-        }
-        if fallback.is_none() && parent.kind() == "compound_statement" {
+        let recovered_wrapper_body = parent.kind() == "compound_statement"
+            && parent
+                .parent()
+                .is_some_and(cpp_malformed_wrapper_function_definition);
+        if fallback.is_none()
+            && !recovered_wrapper_body
+            && (cpp_local_scope_node(parent) || parent.kind() == "compound_statement")
+        {
             fallback = Some(parent);
         }
         node = parent;

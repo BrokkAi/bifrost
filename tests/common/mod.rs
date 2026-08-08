@@ -54,7 +54,8 @@ pub use scratch_cache::{FixtureCorpus, ScratchCacheDir};
 
 #[allow(unused_imports)]
 pub use search_tools::{
-    call_tool, definition_reference_status, sorted_source_paths, symbol_sources,
+    call_tool, definition_at, definition_paths, definition_reference_status, sorted_source_paths,
+    symbol_sources,
 };
 
 #[allow(dead_code)]

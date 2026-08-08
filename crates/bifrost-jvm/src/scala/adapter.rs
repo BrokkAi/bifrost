@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 pub const SCALA_FILE_EXTENSION: &str = "scala";
 
 /// Tree-sitter node-kind mapping used by the cognitive-complexity scorer for
-/// Scala. Node names are from the vendored tree-sitter-scala grammar.
+/// Scala. Node names are from the tree-sitter-scala grammar.
 pub static SCALA_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
     LazyLock::new(|| cognitive_complexity::Config {
         if_types: &["if_expression"],

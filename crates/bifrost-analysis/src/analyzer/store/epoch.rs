@@ -279,11 +279,17 @@ lang_epoch!(
 // longer duplicated into the persisted top-level declaration list, and an
 // ERROR-envelope sentinel class recovery no longer drops the envelope's
 // sibling declarations after the recovered class close.
+// Salt bumped again (#1827): the C++ identity signature now reads a callable's
+// trailing cv/ref/noexcept qualifiers from the declarator's grammar fields
+// instead of splitting its text, and drops the top-level cv-qualifiers on a
+// value parameter per [dcl.fct]/5. Both change persisted signatures, and rows
+// written under the old rules would keep a declaration and its out-of-line
+// definition apart.
 lang_epoch!(
     Cpp,
     "cpp",
     "treesitter/cpp/",
-    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;conditional-alias-physical-ranges-2026-08;macro-argument-typedef-declarator-2026-08;enum-enumerator-child-ownership-2026-08;sentinel-error-envelope-sibling-recovery-2026-08;cpp-query-assets-in-brokk-bifrost-cpp-2026-08"
+    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;conditional-alias-physical-ranges-2026-08;macro-argument-typedef-declarator-2026-08;enum-enumerator-child-ownership-2026-08;sentinel-error-envelope-sibling-recovery-2026-08;cpp-query-assets-in-brokk-bifrost-cpp-2026-08;structural-declarator-qualifier-suffix-and-top-level-parameter-cv-2026-08"
 );
 
 #[cfg(test)]
@@ -355,6 +361,14 @@ pub(super) fn scala_epoch_before_scalachess_fqn_recovery() -> String {
     compute_epoch::<Scala>(
         &crate::analyzer::scala::language::LANGUAGE.into(),
         "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07",
+    )
+}
+
+#[cfg(test)]
+pub(super) fn scala_epoch_before_tree_sitter_scala_0_26_2() -> String {
+    compute_epoch::<Scala>(
+        &crate::analyzer::scala::language::LANGUAGE.into(),
+        "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08",
     )
 }
 
@@ -464,11 +478,11 @@ pub(super) fn php_epoch_before_conditional_free_function_declarations() -> Strin
         "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07",
     )
 }
-// The live grammar fingerprint does not include parser tables. Keep the
-// vendored Scala revision in the salt so conflict-resolution-only grammar
-// changes cannot reuse analysis produced by an older parser.
+// The live grammar fingerprint does not include parser tables. Keep the Scala
+// release revision in the salt so grammar changes cannot reuse analysis
+// produced by an older parser.
 // Salt bumped (#1548 stage 3 fleet): the Scala `.scm` query assets and the
-// vendored grammar itself moved from this crate into `brokk-bifrost-jvm`, so
+// Scala grammar itself moved from this crate into `brokk-bifrost-jvm`, so
 // the salted content now comes from a different crate's `include_str!`. The
 // bytes are unchanged, which is exactly why the salt has to carry the
 // relocation.
@@ -476,7 +490,7 @@ lang_epoch!(
     Scala,
     "scala",
     "treesitter/scala/",
-    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08"
+    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;tree-sitter-scala-0.26.2-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the C# `.scm` query assets moved from this
 // crate's `resources/treesitter/c_sharp/` into `brokk-bifrost-csharp`, so the

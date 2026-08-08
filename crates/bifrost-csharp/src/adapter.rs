@@ -112,6 +112,26 @@ pub fn csharp_extract_call_receiver(reference: &str) -> Option<String> {
         .map(|(receiver, _)| receiver.to_string())
 }
 
+/// The `short_name` spellings a dotted C# path can have been stored under, one
+/// per length of its leading type-nesting run.
+///
+/// A declaration's `short_name` is assembled in `declarations.rs`: a nested type
+/// joins its owner with `$`, and a member joins its owning type with `.`. The
+/// `$` run is therefore always a *prefix* of the separators -- `Outer$Inner`,
+/// `Outer$Inner.Method` -- and a spelling that returns to `$` after a `.`, such
+/// as `Outer.Inner$Method`, names nothing this analyzer can persist.
+///
+/// So the reachable spellings of an `n`-part path are the `n - 1` prefix runs,
+/// not the `2^(n-1)` free choices of separator. The mask enumeration this
+/// replaced spent the difference on store lookups that could never match: since
+/// [`crate::syntax::csharp_normalize_full_name`] maps `$` back to `.`, every
+/// mask normalizes to the same name, so the extra spellings were alternate
+/// lookup keys for one target rather than distinct candidates. Each one still
+/// cost its own SQL query, which made a single visible-type search over a file
+/// with a deep namespace cost thousands of them (#1806).
+///
+/// Paths longer than nine parts keep the single collapsed spelling the mask
+/// walk used, so this returns a subset of what it returned at every length.
 pub fn csharp_nested_owner_short_name_candidates(normalized: &str) -> Vec<String> {
     let parts: Vec<_> = normalized
         .split('.')
@@ -129,22 +149,16 @@ pub fn csharp_nested_owner_short_name_candidates(normalized: &str) -> Vec<String
         return vec![encoded];
     }
 
-    let mut out = Vec::new();
-    for mask in 1..(1_usize << separator_count) {
-        let mut encoded = String::new();
-        for (index, part) in parts.iter().enumerate() {
-            if index > 0 {
-                encoded.push(if (mask & (1 << (index - 1))) != 0 {
-                    '$'
-                } else {
-                    '.'
-                });
+    (1..=separator_count)
+        .map(|nested_run| {
+            let mut encoded = String::from(parts[0]);
+            for (index, part) in parts.iter().enumerate().skip(1) {
+                encoded.push(if index <= nested_run { '$' } else { '.' });
+                encoded.push_str(part);
             }
-            encoded.push_str(part);
-        }
-        out.push(encoded);
-    }
-    out
+            encoded
+        })
+        .collect()
 }
 
 pub fn csharp_callable_return_type_text(signature: &str) -> Option<&str> {
@@ -159,4 +173,63 @@ pub fn csharp_callable_return_type_text(signature: &str) -> Option<&str> {
         let end = start + return_type.len();
         &signature[start..end]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::csharp_nested_owner_short_name_candidates;
+
+    /// Every spelling is a leading `$` run followed by `.` for the rest, and
+    /// there is exactly one per run length.
+    ///
+    /// The count is the point. Each spelling becomes its own store lookup, so a
+    /// walk that returned every `.`/`$` mask cost `2^(n-1)` lookups per probe,
+    /// which made one visible-type search over a six-segment namespace issue
+    /// thousands of them (#1806). A short name never returns to `$` after a
+    /// `.`, so the mixed spellings could match nothing and were pure cost.
+    #[test]
+    fn nested_owner_spellings_are_one_per_nesting_run_not_one_per_separator_mask() {
+        assert_eq!(
+            csharp_nested_owner_short_name_candidates("Outer.Inner.Member"),
+            vec!["Outer$Inner.Member", "Outer$Inner$Member"]
+        );
+
+        for parts in 2..=9 {
+            let path = (0..parts)
+                .map(|part| format!("P{part}"))
+                .collect::<Vec<_>>()
+                .join(".");
+            let candidates = csharp_nested_owner_short_name_candidates(&path);
+            assert_eq!(
+                candidates.len(),
+                parts - 1,
+                "a {parts}-part path must yield one spelling per nesting run, not 2^(n-1): {candidates:?}"
+            );
+            for candidate in &candidates {
+                let last_dollar = candidate.rfind('$');
+                let first_dot = candidate.find('.');
+                assert!(
+                    match (last_dollar, first_dot) {
+                        (Some(dollar), Some(dot)) => dollar < dot,
+                        _ => true,
+                    },
+                    "`{candidate}` returns to `$` after a `.`, which no C# short name does"
+                );
+            }
+        }
+    }
+
+    /// A path too deep to enumerate keeps the single collapsed spelling, so the
+    /// candidate set is a subset of the mask walk's at every length.
+    #[test]
+    fn a_path_deeper_than_nine_parts_keeps_one_collapsed_spelling() {
+        let path = (0..12)
+            .map(|part| format!("P{part}"))
+            .collect::<Vec<_>>()
+            .join(".");
+        assert_eq!(
+            csharp_nested_owner_short_name_candidates(&path),
+            vec!["P0$P1$P2$P3$P4$P5$P6$P7$P8$P9$P10.P11"]
+        );
+    }
 }

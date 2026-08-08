@@ -90,6 +90,7 @@ pub use config::{
     RustPackageApiArtifact, RustSelectedTarget,
 };
 pub use cpp::CppAnalyzer;
+pub use cpp::cpp_is_constructor_or_destructor_declarator_name;
 pub(crate) use cpp::{
     CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole,
     cpp_callable_definitions_share_identity_evidence, cpp_header_body_files_are_related,

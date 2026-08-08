@@ -850,6 +850,13 @@ fn visible_type_candidates_in_session(
         let namespaces = using_namespaces_for_file_in_session(csharp, file, session);
         session.observe_cancellation().then_some(namespaces)
     };
+    // No budget of its own: a namespace this cannot decide answers `true`, which
+    // leaves the probe in place and the search exactly as wide as before.
+    let mut namespace_exists = |namespace: &str| {
+        session
+            .query(|| csharp.workspace_namespace_exists(namespace))
+            .unwrap_or(true)
+    };
     let mut type_candidates_by_fqn = |fqn: &str| {
         let candidates = forward_type_declarations_for_fq_name_in_session(csharp, fqn, session);
         session.observe_cancellation().then_some(candidates)
@@ -860,6 +867,7 @@ fn visible_type_candidates_in_session(
         &mut using_aliases,
         &mut namespace_of_file,
         &mut using_namespaces,
+        &mut namespace_exists,
         &mut type_candidates_by_fqn,
     )
 }

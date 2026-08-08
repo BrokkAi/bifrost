@@ -15,47 +15,8 @@
 //! candidates in `definitions`: an ambiguity that shows nothing gives the
 //! caller nothing to choose between.
 
-use crate::common::{InlineTestProject, call_tool};
+use crate::common::{InlineTestProject, definition_at, definition_paths};
 use brokk_bifrost::Language;
-use serde_json::{Value, json};
-
-/// The `get_definitions_by_location` result for the first byte of `needle` in
-/// `source`, which the caller must have written to `path`.
-fn definition_at(
-    project: &crate::common::BuiltInlineTestProject,
-    path: &str,
-    source: &str,
-    needle: &str,
-) -> Value {
-    let start = source
-        .find(needle)
-        .unwrap_or_else(|| panic!("`{needle}` is not present in {path}"));
-    let prefix = &source[..start];
-    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
-    let column = prefix
-        .rsplit_once('\n')
-        .map_or(prefix, |(_, current_line)| current_line)
-        .chars()
-        .count()
-        + 1;
-    let args = json!({"references": [{"path": path, "line": line, "column": column}]}).to_string();
-    call_tool(project, "get_definitions_by_location", &args)["results"][0].clone()
-}
-
-fn definition_paths(result: &Value) -> Vec<String> {
-    result["definitions"]
-        .as_array()
-        .map(|definitions| {
-            definitions
-                .iter()
-                .filter_map(|definition| {
-                    definition["file"].as_str().or(definition["path"].as_str())
-                })
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
 
 /// fx5: poisoned include + one static helper + identifier argument. The single
 /// candidate must win even though the argument count is unknown.

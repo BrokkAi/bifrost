@@ -1955,8 +1955,10 @@ void Missing::run() {
     );
     assert_eq!(
         analyzer.sql_definitions_query_count_for_test(),
-        1,
-        "the shared enclosing-owner lookup may miss once, but must not repeat within the batch"
+        2,
+        "one visibility-build lookup for the out-of-line owner `Missing` (#1832) plus the \
+         shared enclosing-owner lookup; each may miss once, but neither may repeat within \
+         the batch"
     );
 }
 
