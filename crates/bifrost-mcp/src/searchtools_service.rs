@@ -1447,6 +1447,27 @@ impl SearchToolsService {
         render_options: RenderOptions,
         cancellation: Option<&CancellationToken>,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
+        self.call_tool_output_with_transport_queue_wait(
+            name,
+            arguments,
+            render_options,
+            cancellation,
+            Duration::ZERO,
+        )
+    }
+
+    /// Execute a tool after an MCP host waited for analyzer capacity.
+    ///
+    /// The host measures this phase before it enters the synchronous service.
+    /// Profiled `query_code` responses retain the delay as request timing.
+    pub(crate) fn call_tool_output_with_transport_queue_wait(
+        &self,
+        name: &str,
+        arguments: Value,
+        render_options: RenderOptions,
+        cancellation: Option<&CancellationToken>,
+        transport_queue_wait: Duration,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
         // Lifecycle tools bypass watcher delta application: refresh rebuilds
         // explicitly, activate replaces the whole workspace, and get is cheap.
         match name {
@@ -1481,7 +1502,11 @@ impl SearchToolsService {
         }
         if name == "query_code" {
             let prepared = self.prepare_query_code(arguments, cancellation)?;
-            return self.execute_prepared_query_code(prepared, cancellation);
+            return self.execute_prepared_query_code_with_transport_queue_wait(
+                prepared,
+                cancellation,
+                transport_queue_wait,
+            );
         }
         if name == "list_policies" {
             let catalog = built_in_policy_catalog().map_err(|error| {
@@ -1792,6 +1817,7 @@ impl SearchToolsService {
                     request_timing,
                     execution_timing,
                     0,
+                    Duration::ZERO,
                 );
                 response
             });
@@ -1849,10 +1875,24 @@ impl SearchToolsService {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn execute_prepared_query_code(
         &self,
         prepared: PreparedQueryCode,
         cancellation: Option<&CancellationToken>,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
+        self.execute_prepared_query_code_with_transport_queue_wait(
+            prepared,
+            cancellation,
+            Duration::ZERO,
+        )
+    }
+
+    pub(crate) fn execute_prepared_query_code_with_transport_queue_wait(
+        &self,
+        prepared: PreparedQueryCode,
+        cancellation: Option<&CancellationToken>,
+        transport_queue_wait: Duration,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
         let PreparedQueryCode {
             snapshot,
@@ -1897,6 +1937,7 @@ impl SearchToolsService {
                 request_timing,
                 execution_timing,
                 rendering_ns.saturating_add(serialization_ns),
+                transport_queue_wait,
             );
             let structured = serde_json::to_value(&output).map_err(|err| {
                 SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
@@ -1955,17 +1996,20 @@ impl SearchToolsService {
         prepared: PreparedQueryCodeTiming,
         execution: QueryCodeExecutionTiming,
         rendering_serialization_ns: u64,
+        transport_queue_wait: Duration,
     ) {
         let crate::analyzer::structural::CodeQueryResponse::Profile(profile) = response else {
             return;
         };
         profile.request_timings_ns = crate::analyzer::structural::CodeQueryProfileRequestTimings {
+            transport_queue_wait: duration_ns(transport_queue_wait),
             workspace_ready: prepared.workspace_ready_ns,
             preparation: prepared.preparation_ns,
             input_decode: execution.input_decode_ns,
             query_execution: execution.query_execution_ns,
             rendering_serialization: rendering_serialization_ns,
-            total: duration_ns(prepared.started.elapsed()),
+            total: duration_ns(prepared.started.elapsed())
+                .saturating_add(duration_ns(transport_queue_wait)),
         };
     }
 
@@ -4243,6 +4287,41 @@ mod watcher_startup_tests {
                     .saturating_add(query_execution)
                     .saturating_add(rendering_serialization),
             "request total must cover every measured phase: {timings}"
+        );
+    }
+
+    #[test]
+    fn profiled_query_charges_transport_queue_wait_to_request_timing() {
+        let (_temp, root) = workspace("Queued.java", "class Queued {}\n");
+        let service = SearchToolsService::new_manual_without_semantic_index(root)
+            .expect("manual service should start");
+        let output = service
+            .call_tool_output_with_transport_queue_wait(
+                "query_code",
+                json!({
+                    "schema_version": 1,
+                    "match": {"kind": "class", "name": "Queued"},
+                    "execution_mode": "profile",
+                }),
+                RenderOptions::default(),
+                None,
+                Duration::from_millis(7),
+            )
+            .expect("profiled query should succeed");
+        let ToolOutput::Structured { structured, .. } = output else {
+            panic!("query_code should return structured output");
+        };
+        let timings = &structured["request_timings_ns"];
+        assert_eq!(
+            timings["transport_queue_wait"].as_u64(),
+            Some(7_000_000),
+            "profile should retain the host queue wait"
+        );
+        assert!(
+            timings["total"]
+                .as_u64()
+                .is_some_and(|total| total >= 7_000_000),
+            "request total should include the host queue wait: {timings}"
         );
     }
 

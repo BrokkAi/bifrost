@@ -133,6 +133,8 @@ pub struct QueryCodeProfileMetrics {
     pub truncated: bool,
     pub diagnostic_codes: Vec<String>,
     pub total_ns: u64,
+    #[serde(default)]
+    pub request_timings: QueryCodeRequestTimingMetrics,
     pub scanned_files: u64,
     pub scanned_source_bytes: u64,
     pub fact_nodes: u64,
@@ -145,6 +147,17 @@ pub struct QueryCodeProfileMetrics {
     pub direct_import_topology: QueryCodeDerivedLayerMetrics,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_path: Option<QueryCodeAccessPathMetrics>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCodeRequestTimingMetrics {
+    pub transport_queue_wait: u64,
+    pub workspace_ready: u64,
+    pub preparation: u64,
+    pub input_decode: u64,
+    pub query_execution: u64,
+    pub rendering_serialization: u64,
+    pub total: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

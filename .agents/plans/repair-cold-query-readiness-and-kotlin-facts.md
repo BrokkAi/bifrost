@@ -37,8 +37,20 @@ or accept cold failures as baseline values.
 - [x] (2026-08-07 13:26Z) Ran policy discovery and attempted the required
   built-in code-smells policy request. The request was blocked by the known
   stale Java analyzer generation, not by a policy result.
-- [ ] Run a benchmark profile with the new request timings when a local Exposed
-  checkout is available. Do not change a baseline from one profile.
+- [x] (2026-08-08 06:31Z) Reran the built-in code-smells policy. The tool ran,
+  but its report was unreliable because five existing rules had partial source
+  discovery. The changed files did not add a reported finding.
+- [x] (2026-08-08 06:05Z) Rebased the work on `origin/master` at
+  `46e7bf58c` and reran the featureless analysis and MCP library suites.
+- [x] (2026-08-08 06:12Z) Ran the Exposed exact query locally with the new
+  timing fields. It showed that the MCP host queue wait, not service
+  preparation, contains the deferred workspace build.
+- [x] (2026-08-08 06:18Z) Added `transport_queue_wait` to the profile and
+  benchmark report. The first profiled Exposed request now accounts for
+  975.6 ms of queue wait and 109.1 ms of query execution.
+- [x] (2026-08-08 06:25Z) Deferred Git blob header and attribute checks to
+  requested clean paths. The Exposed first request fell from 1,086 ms to
+  677 ms in the same local benchmark setup.
 
 ## Surprises & Discoveries
 
@@ -71,12 +83,31 @@ or accept cold failures as baseline values.
   Evidence: `scan_only_kotlin_seed_hydrates_from_durable_facts_after_workspace_reopen`
   passed on 2026-08-07.
 
-- Observation: The complete featureless library validation passed. The
-  code-smells policy could not run because the navigation service reported a
-  stale Java generation while it checked live files.
+- Observation: The deferred workspace build begins before the service sees the
+  `query_code` request. Therefore the service's `workspace_ready` field is
+  near zero in a first MCP request. The MCP host queue interval contains that
+  wait and must be part of the request total.
+  Evidence: the local Exposed profile reported 975.6 ms of
+  `transport_queue_wait`, 109.1 ms of query execution, and 1,085.1 ms total.
+
+- Observation: JavaScript and Kotlin did not run two Git identity scans. One
+  language waited for the shared identity mutex while the other read 5,329
+  blob headers. The full identity scan cost 588.1 ms.
+  Evidence: the timing log contains one `git_identity_scan` note and two
+  overlapping `resolve_live_oids` scopes.
+
+- Observation: A startup scan only needs index and dirty-tree data. Blob sizes
+  and transform attributes only matter when an analyzer requests a clean path.
+  Evidence: after deferred checks, Exposed reported a 63.1 ms identity scan,
+  a 557.3 ms queue wait, and a 676.9 ms first request.
+
+- Observation: The complete featureless library validation passed. The latest
+  code-smells policy run was unreliable due partial source discovery in five
+  existing rules, not due a changed-file finding.
   Evidence: `cargo test -p brokk-bifrost-analysis -p brokk-bifrost-mcp --lib`
-  passed 1,676 analysis tests and 112 MCP tests. `run_policy` reported
-  `captured 149, current 216`.
+  passed 1,707 analysis tests and 115 MCP tests. `cargo test --lib` passed 78
+  tests with normal host access. `run_policy` reported partial discovery for
+  nested expensive operations, file reads, parsing, serialization, and sorts.
 
 ## Decision Log
 
@@ -95,18 +126,30 @@ or accept cold failures as baseline values.
   candidate-selection design after request timing separates readiness cost.
   Date/Author: 2026-08-07 / Codex
 
+- Decision: Charge MCP host queue time to the query profile.
+  Rationale: it is user-visible request time and includes deferred workspace
+  readiness before the service starts preparing the request.
+  Date/Author: 2026-08-08 / Codex
+
+- Decision: Validate blob identity lazily, without weakening content checks.
+  Rationale: reading every repository blob header adds cold-start time for
+  files and languages that the workspace does not analyze.
+  Date/Author: 2026-08-08 / Codex
+
 ## Outcomes & Retrospective
 
-The implemented profile adds `request_timings_ns` with workspace readiness,
-preparation, input decoding, query execution, rendering and serialization, and
-total request time. The field is additive, so the profile format remains v2.
-The service test blocks a deferred build and proves that this wait appears in
-`workspace_ready`. The Kotlin test proves the scan-only durable-facts contract.
+The implemented profile adds `request_timings_ns` with transport queue wait,
+workspace readiness, preparation, input decoding, query execution, rendering
+and serialization, and total request time. The field is additive, so the
+profile format remains v2. A service test proves readiness accounting. A host
+handoff test proves that queue wait is included in the total. The Kotlin test
+proves the scan-only durable-facts contract.
 
 No Kotlin persistence code changed. The new test shows the benchmark symptom
-does not reproduce in the durable structural-facts layer. A future benchmark
-profile must split the remaining Exposed workspace-build phases before a speed
-change is selected. Dapper candidate-planning work remains out of scope.
+does not reproduce in the durable structural-facts layer. The local Exposed
+profile identified and removed the broad Git object-header scan. Dapper
+candidate-planning work remains out of scope. Do not promote Exposed or Dapper
+baseline values from this single local profile.
 
 ## Context and Orientation
 
@@ -138,8 +181,9 @@ First, read the query profile model and the request preparation code. Add a
 small request timing value at the service boundary. Start its clock before
 snapshot preparation. Record readiness after the snapshot is available. Record
 execution after structural query execution. Record total after result rendering
-and serialization. Use the same monotonic clock type as the existing profile.
-Do not change the existing execution timing meaning.
+and serialization. The MCP host must pass its accepted-to-execution queue wait
+to the service profile. Use the same monotonic clock type as the existing
+profile. Do not change the existing execution timing meaning.
 
 Add tests at the service boundary. One test must start a service with a pending
 deferred build and request profile mode. It must show that readiness is nonzero
@@ -185,7 +229,7 @@ From `/Users/dave/.codex/worktrees/5cb0/bifrost`:
 
 The implementation is accepted when all conditions hold:
 
-- A profiled first request reports readiness, execution, and total timing.
+- A profiled first request reports queue wait, readiness, execution, and total timing.
   Total is at least the sum of the measured request phases.
 - A ready request reports the same fields with a small readiness value and
   correct ordering.
@@ -203,7 +247,7 @@ temporary target directory.
 
 ## Artifacts and Notes
 
-Fresh benchmark artifact:
+Fresh scheduled benchmark artifact:
 
     /private/tmp/bifrost-benchmark-31170861236/benchmark-31170861236/
     run-20260807T111857Z.json
@@ -211,6 +255,16 @@ Fresh benchmark artifact:
 The fresh compare reported ten entries before the approved Gin baseline update.
 The work in this plan keeps the cold Dapper, Exposed, and Scala observations
 visible.
+
+Local Exposed profile before lazy identity validation:
+
+    /private/tmp/bifrost-exposed-query-profile-queue-accounting-20260808/
+    run-20260808T055813Z.json
+
+Local Exposed profile after lazy identity validation:
+
+    /private/tmp/bifrost-exposed-query-profile-lazy-identity-20260808/
+    run-20260808T060526Z.json
 
 ## Interfaces and Dependencies
 
@@ -222,5 +276,5 @@ The service must retain `SearchToolsServiceError` for request preparation
 failures. Do not add string parsing or source-text fallbacks. Use the
 structural facts store and codec already used by the analyzer.
 
-Plan updated on 2026-08-07: created after the fresh benchmark identified cold
-request accounting and Kotlin persisted-facts gaps.
+Plan updated on 2026-08-08: account for MCP host queue time and avoid the
+repository-wide Git object-header scan during deferred workspace startup.

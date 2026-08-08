@@ -842,6 +842,8 @@ pub struct CodeQueryProfileTimings {
 /// input decoding. Core CodeQuery timings remain in `timings_ns`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct CodeQueryProfileRequestTimings {
+    /// Time from MCP request acceptance until analyzer execution starts.
+    pub transport_queue_wait: u64,
     pub workspace_ready: u64,
     pub preparation: u64,
     pub input_decode: u64,
