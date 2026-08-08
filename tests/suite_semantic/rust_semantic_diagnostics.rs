@@ -28,20 +28,39 @@ use serde_json::{Value, json};
 
 /// The package the fixture packs describe, and the name its own code spells.
 const PACKAGE: &str = "widget";
-/// What the consuming Cargo.toml renames it to, published as a pack alias
-/// exactly as `add_cargo_dependency_aliases` does for a real rustdoc pack.
+/// What a consuming Cargo.toml renames it to with `package = "widget"`.
 const RENAMED: &str = "renamed_widget";
+
+/// How the consuming workspace reaches the crate the fixture pack describes.
+///
+/// This is the distinction `apply_cargo_dependency_spellings` draws for a real
+/// rustdoc pack, reproduced here so the offline packs model both workspaces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CrateSpelling {
+    /// Declared under its own name, so that name is what source writes.
+    Own,
+    /// Declared with `package = "..."`, so only [`RENAMED`] reaches it. The
+    /// crate's own name stays on the inner facts, where the pack's own
+    /// recorded type paths are spelled with it, and leaves the crate root.
+    Renamed,
+}
 
 fn locator(symbol: &str) -> Value {
     json!({ "kind": "artifact", "path": "rustdoc/api.json", "symbol": symbol })
 }
 
 /// A pack publishing crate `widget`: its root module, a `Widget` struct with an
-/// inherent `render`, and a nested `widget::nested::Deep`. Every fact also
-/// carries the renamed spelling as an alias, which is how a Cargo `package =`
-/// rename reaches the overlay.
-fn widget_pack(completeness: &str) -> CompiledSemanticModelPack {
-    let aliased = |name: &str| json!([name.replacen(PACKAGE, RENAMED, 1)]);
+/// inherent `render`, and a nested `widget::nested::Deep`.
+///
+/// Under [`CrateSpelling::Renamed`] every fact also carries the renamed
+/// spelling as an alias and the root module fact is published under the
+/// renamed spelling alone, which is how a Cargo `package =` rename reaches the
+/// overlay.
+fn widget_pack(completeness: &str, spelling: CrateSpelling) -> CompiledSemanticModelPack {
+    let aliased = |name: &str| match spelling {
+        CrateSpelling::Own => json!([]),
+        CrateSpelling::Renamed => json!([name.replacen(PACKAGE, RENAMED, 1)]),
+    };
     let type_fact = |id: &str, name: &str, kind: &str| {
         json!({
             "id": id,
@@ -51,6 +70,19 @@ fn widget_pack(completeness: &str) -> CompiledSemanticModelPack {
             "aliases": aliased(name),
             "locator": locator(name)
         })
+    };
+    // The crate root is the one fact whose name plays only the "what source
+    // writes" role, so a rename replaces it rather than aliasing it.
+    let root_fact = |id: &str| match spelling {
+        CrateSpelling::Own => type_fact(id, PACKAGE, "module"),
+        CrateSpelling::Renamed => json!({
+            "id": id,
+            "name": RENAMED,
+            "type_kind": "module",
+            "visibility": "public",
+            "aliases": json!([]),
+            "locator": locator(PACKAGE)
+        }),
     };
     let value = json!({
         "schema_version": 1,
@@ -70,7 +102,7 @@ fn widget_pack(completeness: &str) -> CompiledSemanticModelPack {
             "payload": {
                 "kind": "declaration_facts",
                 "types": [
-                    type_fact("type.widget.root", PACKAGE, "module"),
+                    root_fact("type.widget.root"),
                     type_fact("type.widget.widget", "widget.Widget", "struct"),
                     type_fact("type.widget.nested", "widget.nested", "module"),
                     type_fact("type.widget.deep", "widget.nested.Deep", "struct"),
@@ -341,9 +373,25 @@ impl RustFixture {
         Self { project, analyzer }
     }
 
+    /// A workspace that declares `widget` under its own name.
     fn with_pack(files: &[(&str, &str)], completeness: &str) -> Self {
         let fixture = Self::new(files);
-        activate(&fixture.analyzer, &widget_pack(completeness), None);
+        activate(
+            &fixture.analyzer,
+            &widget_pack(completeness, CrateSpelling::Own),
+            None,
+        );
+        fixture
+    }
+
+    /// A workspace whose Cargo.toml renames `widget` to `renamed_widget`.
+    fn with_renamed_pack(files: &[(&str, &str)], completeness: &str) -> Self {
+        let fixture = Self::new(files);
+        activate(
+            &fixture.analyzer,
+            &widget_pack(completeness, CrateSpelling::Renamed),
+            None,
+        );
         fixture
     }
 
@@ -351,7 +399,7 @@ impl RustFixture {
         let fixture = Self::new(files);
         activate(
             &fixture.analyzer,
-            &widget_pack("complete"),
+            &widget_pack("complete", CrateSpelling::Own),
             Some(declared_crate_evidence(crate_name)),
         );
         fixture
@@ -492,7 +540,7 @@ fn a_partial_crate_surface_suppresses_instead_of_proving_absence() {
 /// spelling resolves and diagnostics and definitions share one crate identity.
 #[test]
 fn a_renamed_dependency_resolves_under_the_spelling_the_source_uses() {
-    let fixture = RustFixture::with_pack(
+    let fixture = RustFixture::with_renamed_pack(
         &[(
             "src/lib.rs",
             "use renamed_widget::Widget;\npub fn consume() {\n    Widget;\n    renamed_widget::nested::Deep;\n}\n",
@@ -825,23 +873,22 @@ fn a_pack_for_the_workspace_target_proves_absence() {
 
 /// The rename end to end, both halves.
 ///
-/// A Cargo `package = "..."` rename reaches the overlay as an *alias* added
-/// beside the crate's own name (`add_cargo_dependency_aliases`), so the renamed
-/// spelling resolves and a name absent under it is still proved absent against
-/// the same complete surface. The alias is additive, so the crate's original
-/// spelling keeps resolving too.
+/// A Cargo `package = "..."` rename reaches the overlay as an *alias* on every
+/// inner fact and as a *replacement* at the crate root
+/// (`apply_cargo_dependency_spellings`), so the renamed spelling resolves and a
+/// name absent under it is still proved absent against the same complete
+/// surface.
 ///
-/// That second fact is a deliberate record of current behaviour, not an
-/// endorsement. Under a rename, `widget::Widget` is not a path Cargo accepts,
-/// and rustc would reject it; the ladder resolves it because the pack still
-/// publishes the crate's own name, which the pack needs for its own internal
-/// type references. The consequence is a missed error, never a false one, so
-/// it errs in the safe direction -- but it is a gap, and this test will fail
-/// the moment anyone makes the aliasing replace rather than add, which is the
-/// point of pinning it.
+/// The crate's own spelling is the other half. Under a rename `widget::Widget`
+/// is not a path Cargo accepts and rustc would reject it, so the ladder must
+/// not resolve it. It does not claim absence either: the crate root the source
+/// named is unpublished, which is the same rung an entirely unknown crate
+/// stops on. This is the behaviour #1795 asked for, and it replaces the
+/// deliberate both-spellings record this test carried before (commit
+/// 86c8cd0a), which pinned the gap so this change would have to flip it.
 #[test]
-fn a_cargo_rename_resolves_the_renamed_spelling_and_still_answers_the_original() {
-    let fixture = RustFixture::with_pack(
+fn a_cargo_rename_resolves_the_renamed_spelling_and_refuses_the_original() {
+    let fixture = RustFixture::with_renamed_pack(
         &[(
             "src/lib.rs",
             "pub fn consume() {\n    renamed_widget::Widget;\n    renamed_widget::Missing;\n}\n",
@@ -873,22 +920,76 @@ fn a_cargo_rename_resolves_the_renamed_spelling_and_still_answers_the_original()
         report.diagnostics()
     );
 
-    // The crate's own spelling still answers, because the rename is published
-    // as an added alias rather than a replacement.
-    let original = RustFixture::with_pack(
+    // The crate's own spelling is not a path this workspace can write, so it
+    // resolves to nothing and proves nothing.
+    let original = RustFixture::with_renamed_pack(
         &[("src/lib.rs", "pub fn consume() {\n    widget::Widget;\n}\n")],
         "complete",
     );
     let original_report = original.report("src/lib.rs");
     assert!(
         original_report.diagnostics().is_empty(),
-        "the original spelling resolves today: {:#?}",
+        "a renamed-away spelling accuses nothing: {:#?}",
         original_report.diagnostics()
     );
     assert!(
-        resolved_at(&original_report, BoundaryStatus::ExternalIndexed),
-        "{:#?}",
+        !resolved_at(&original_report, BoundaryStatus::ExternalIndexed),
+        "the crate's own spelling must not resolve under a rename: {:#?}",
         original_report.outcomes()
+    );
+    assert!(
+        missing_dependency_boundaries(&original_report).contains(&BoundaryStatus::ExternalUnknown),
+        "a renamed-away crate root is unindexed, exactly as an unknown crate is: {:#?}",
+        original_report.outcomes()
+    );
+}
+
+/// The pack keeps its own name for its own paths.
+///
+/// A rename replaces the crate root only. Every inner fact keeps the crate's
+/// own name, because that is how the rustdoc JSON spells the type paths the
+/// pack recorded -- a signature naming `widget::Error`, a hierarchy target, a
+/// member's owner path -- and those must keep resolving against the pack after
+/// the workspace can no longer write `widget` itself.
+#[test]
+fn a_rename_leaves_the_packs_own_type_paths_resolvable() {
+    let fixture = RustFixture::with_renamed_pack(
+        &[(
+            "src/lib.rs",
+            "pub fn consume() {\n    renamed_widget::nested::Deep;\n}\n",
+        )],
+        "complete",
+    );
+    let overlay = fixture
+        .analyzer
+        .analyzer()
+        .semantic_model_overlay()
+        .expect("the renamed pack must publish an overlay");
+
+    for own_path in ["widget.Widget", "widget.nested", "widget.nested.Deep"] {
+        assert_eq!(
+            overlay.symbols_named(own_path).records.len(),
+            1,
+            "the pack's own recorded path `{own_path}` must stay resolvable: {:#?}",
+            overlay.symbols()
+        );
+    }
+    let publishes_crate_root = |spelling: &str| {
+        overlay
+            .symbols_named(spelling)
+            .records
+            .iter()
+            .any(|symbol| symbol.qualified_name == spelling)
+    };
+    assert!(
+        !publishes_crate_root(PACKAGE),
+        "the renamed-away crate root must not be published: {:#?}",
+        overlay.symbols_named(PACKAGE).records
+    );
+    assert!(
+        publishes_crate_root(RENAMED),
+        "the crate root is published under the spelling the workspace writes: {:#?}",
+        overlay.symbols_named(RENAMED).records
     );
 }
 

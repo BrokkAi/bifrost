@@ -75,7 +75,7 @@ impl DependencyPackAdapter for RustDependencyPackAdapter {
                 pack,
                 &format!("sha256-{}.rustdoc.json", artifact.sha256()),
             );
-            add_cargo_dependency_aliases(pack, dependency);
+            apply_cargo_dependency_spellings(pack, dependency);
             if let Some(missing) = features_the_pack_never_saw(dependency) {
                 diagnostics.push(ProducerDiagnostic {
                     code: "rust.rustdoc.feature_set_narrower_than_resolved".to_owned(),
@@ -132,7 +132,29 @@ fn features_the_pack_never_saw(dependency: &ResolvedDependency) -> Option<Vec<St
     (!missing.is_empty()).then_some(missing)
 }
 
-fn add_cargo_dependency_aliases(
+/// Publish the pack under every spelling this workspace writes to reach the
+/// crate, and publish its crate root under those spellings only.
+///
+/// Cargo's `package = "..."` rename gives one crate two names with two
+/// different jobs. The renamed spelling is what source can write; the crate's
+/// own name is what the pack's own rustdoc-derived paths are spelled with -- a
+/// signature naming `widget::Error`, a hierarchy target, a member's owner
+/// path. Publishing the renamed spelling as an alias on every fact serves the
+/// first job. Leaving the crate's own name on every fact serves the second.
+///
+/// What must not survive is the crate's own name as a *crate root*: under a
+/// rename `widget::Widget` is a path Cargo and rustc both reject, so resolving
+/// it is a missed error (#1795). The root module fact is the one fact whose
+/// name plays only the first role -- nothing inside a pack refers to the crate
+/// by its bare root -- so the rename replaces it there and extends it
+/// everywhere else. `rust::crate_identity` reads exactly that distinction.
+///
+/// The workspace's spellings come from `cargo metadata`'s resolve graph, where
+/// `deps[].name` is the dependency's library target name and therefore equals
+/// the crate's own name unless the manifest renamed it. Renaming is thus the
+/// precise condition "the resolve graph binds this package under names, none
+/// of which is its own".
+fn apply_cargo_dependency_spellings(
     pack: &mut AuthoredSemanticModelPack,
     dependency: &ResolvedDependency,
 ) {
@@ -144,11 +166,16 @@ fn add_cargo_dependency_aliases(
     else {
         return;
     };
-    let aliases = dependency
+    let written = dependency
         .provenance
         .iter()
-        .filter(|entry| entry.key == "cargo.dependency_name" && entry.value != *crate_name)
+        .filter(|entry| entry.key == "cargo.dependency_name")
         .map(|entry| entry.value.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let aliases = written
+        .iter()
+        .copied()
+        .filter(|name| *name != crate_name.as_str())
         .collect::<Vec<_>>();
     for shard in &mut pack.shards {
         let AuthoredPayload::DeclarationFacts { types, members, .. } = &mut shard.payload else {
@@ -190,6 +217,36 @@ fn add_cargo_dependency_aliases(
             }
         }
     }
+
+    // Every remaining spelling is an added one. The crate's own name stays on
+    // the facts above, where the pack's own paths need it, but it stops being
+    // a crate root the moment the resolve graph binds this package only under
+    // other names.
+    if written.is_empty() || written.contains(crate_name.as_str()) {
+        return;
+    }
+    let Some(root_spelling) = aliases.first().copied() else {
+        return;
+    };
+    let mut shadowed_roots = Vec::new();
+    for shard in &mut pack.shards {
+        let AuthoredPayload::DeclarationFacts { types, .. } = &mut shard.payload else {
+            continue;
+        };
+        for fact in types.iter_mut().filter(|fact| fact.name == *crate_name) {
+            fact.name = root_spelling.to_owned();
+            fact.aliases.retain(|alias| alias != root_spelling);
+            shadowed_roots.push(fact.id.clone());
+        }
+    }
+    debug_assert!(
+        !shadowed_roots.is_empty(),
+        "a rustdoc pack publishes its crate root as a fact named exactly `{crate_name}`, but no shard of {:?} carried one",
+        pack.shards
+            .iter()
+            .map(|shard| shard.id.as_str())
+            .collect::<Vec<_>>()
+    );
 }
 
 fn rust_dependency_production_request(
@@ -652,5 +709,120 @@ mod tests {
             artifact_result.packs[0].production,
             first.packs[0].production
         );
+    }
+
+    /// The same crate, reached by a workspace that spells it `spelling`.
+    ///
+    /// `cargo metadata`'s resolve graph records that spelling as the
+    /// dependency edge's name, which discovery pushes here as
+    /// `cargo.dependency_name`: the crate's own name where the manifest
+    /// declares it plainly, the renamed one where `package = "widget"` renames
+    /// it.
+    fn dependency_spelled(path: PathBuf, spelling: &str) -> ResolvedDependency {
+        let mut dependency = dependency(path, "default");
+        dependency.provenance.push(DependencyProvenance {
+            key: "cargo.dependency_name".to_owned(),
+            value: spelling.to_owned(),
+        });
+        dependency
+    }
+
+    /// A Cargo rename is a fact about one workspace, and the production cache
+    /// already keeps it that way (#1795).
+    ///
+    /// `dependency_input_digest` hashes a dependency's whole provenance list,
+    /// and the rename reaches it as `cargo.dependency_name`. So two workspaces
+    /// sharing one catalog and reading byte-identical rustdoc JSON still
+    /// generate separate productions: neither can be served the other's
+    /// crate-root spelling on a cache hit, and neither activates the other's
+    /// shards. That is what makes it correct to bake the spelling into the
+    /// pack at production time instead of applying it per activation.
+    #[test]
+    fn a_rename_forks_the_production_so_workspaces_never_share_a_crate_root() {
+        let root = tempfile::tempdir().unwrap();
+        let plain_path = root.path().join("workspace-plain/widget.json");
+        let renamed_path = root.path().join("workspace-renamed/widget.json");
+        let artifact = serde_json::to_vec(&rustdoc_document(false)).unwrap();
+        for path in [&plain_path, &renamed_path] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, &artifact).unwrap();
+        }
+        let project = TestProject::new(root.path(), Language::Rust);
+        let analyzer = RustAnalyzer::from_project(project);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let limits = DependencyPackLimits::default();
+
+        let prepare = |dependency: ResolvedDependency| {
+            prepare_dependency_semantic_packs(
+                &catalog,
+                &RustDependencyPackAdapter,
+                &[dependency],
+                &limits,
+                None,
+            )
+        };
+        let plain = prepare(dependency_spelled(plain_path, "widget"));
+        let renamed = prepare(dependency_spelled(renamed_path, "renamed_widget"));
+
+        assert!(plain.complete, "{:#?}", plain.diagnostics);
+        assert!(renamed.complete, "{:#?}", renamed.diagnostics);
+        assert_eq!(
+            plain.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert_eq!(
+            renamed.packs[0].status,
+            DependencyPackPreparationStatus::Generated,
+            "a rename must not be served the plain workspace's cached production"
+        );
+        assert_ne!(plain.packs[0].production, renamed.packs[0].production);
+
+        // Each workspace sees its own spelling as the crate root, and only its
+        // own. The crate's own inner paths stay published either way, because
+        // that is what the pack's recorded rustdoc paths are spelled with.
+        let cancellation = CancellationToken::new();
+        for (outcome, written, unwritable) in [
+            (plain, "widget", "renamed_widget"),
+            (renamed, "renamed_widget", "widget"),
+        ] {
+            let request = outcome
+                .compose_activation_request(SemanticModelActivationRequest {
+                    bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                    evidence: Vec::new(),
+                    controls: Vec::new(),
+                    limits: Default::default(),
+                })
+                .unwrap();
+            let active = match resolve_active_semantic_models(&catalog, &request, &cancellation) {
+                SemanticModelResolutionOutcome::Ready(active) => active,
+                outcome => panic!("expected ready Rust dependency model, got {outcome:#?}"),
+            };
+            let overlay =
+                SemanticModelOverlay::build(&analyzer, &active, &cancellation, 64 * 1024 * 1024)
+                    .unwrap();
+            let publishes_crate_root = |spelling: &str| {
+                overlay
+                    .symbols_named(spelling)
+                    .records
+                    .iter()
+                    .any(|symbol| symbol.qualified_name == spelling)
+            };
+            assert!(
+                publishes_crate_root(written),
+                "`{written}` is the spelling this workspace writes: {:#?}",
+                overlay.symbols()
+            );
+            assert!(
+                !publishes_crate_root(unwritable),
+                "`{unwritable}` is not a crate root this workspace can write: {:#?}",
+                overlay.symbols()
+            );
+            assert_eq!(
+                overlay.symbols_named("widget.Widget").records.len(),
+                1,
+                "the pack's own recorded path stays resolvable: {:#?}",
+                overlay.symbols()
+            );
+        }
     }
 }

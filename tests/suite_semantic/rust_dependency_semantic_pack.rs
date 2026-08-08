@@ -174,6 +174,48 @@ fn exact_cargo_evidence_activates_registry_git_and_path_dependency_apis() {
         1,
         "Cargo dependency renames must be navigable aliases"
     );
+    // The rename's two halves, through the real producer (#1795). Inner facts
+    // keep the crate's own name, because the rustdoc type paths this pack
+    // recorded are spelled with it -- `widget.Widget` above is one. The crate
+    // root does not: `widget::Widget` is a path Cargo rejects in this
+    // workspace, so nothing publishes `widget` as a crate to write.
+    //
+    // The question is asked of a spelling that *names* a root module, not of
+    // the bare overlay index: this crate contains a module `widget::widget`,
+    // whose terminal name is indexed under `widget` too and which stays
+    // published because it is one of the pack's own paths.
+    let publishes_crate_root = |spelling: &str| {
+        overlay
+            .symbols_named(spelling)
+            .records
+            .iter()
+            .any(|symbol| symbol.qualified_name == spelling)
+    };
+    assert!(
+        !publishes_crate_root("widget"),
+        "a renamed-away crate root must not be published: {:#?}",
+        overlay.symbols_named("widget").records
+    );
+    assert_eq!(
+        overlay.symbols_named("widget.widget").records.len(),
+        1,
+        "the crate's own inner paths survive the rename: {:#?}",
+        overlay.symbols_named("widget.widget").records
+    );
+    assert!(
+        publishes_crate_root("renamed_widget"),
+        "the crate root is published under the spelling Cargo binds: {:#?}",
+        overlay.symbols_named("renamed_widget").records
+    );
+    // A dependency this workspace did not rename keeps its own name as its
+    // crate root, which is the regression guard for the rule above.
+    for unrenamed in ["git_api", "path_api"] {
+        assert!(
+            publishes_crate_root(unrenamed),
+            "an unrenamed dependency stays reachable under its own name: {:#?}",
+            overlay.symbols_named(unrenamed).records
+        );
+    }
     let members = overlay.members_of(&widget.records[0].id);
     let render = members
         .records

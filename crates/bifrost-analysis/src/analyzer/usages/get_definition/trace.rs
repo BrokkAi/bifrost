@@ -718,11 +718,14 @@ pub(in crate::analyzer::usages) fn boundary_evidence(
             // identity so a trace, a definition, and a diagnostic classify one
             // crate path identically. A path is spelled with `::` and a pack
             // records it dotted, and a Cargo rename is published as an alias,
-            // so the written spelling is the lookup key either way.
+            // so the written spelling is the lookup key either way. The lookup
+            // is gated on its crate root, so a name reaching a crate the
+            // workspace renamed away is unindexed here exactly as it is in
+            // diagnostics (#1795).
             let overlay = analyzer.semantic_model_overlay();
             let crates =
                 crate::analyzer::rust::crate_identity::RustOverlayCrates::new(overlay.as_deref());
-            if let Some(symbol) = crates.unique_symbol(name) {
+            if let Some(symbol) = crates.referenceable_symbol(name) {
                 return (BoundaryStatus::ExternalIndexed, Some(symbol.id.clone()));
             }
             let declared = analyzer
