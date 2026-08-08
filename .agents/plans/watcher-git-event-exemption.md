@@ -45,8 +45,8 @@ server on a git repo) shows the triggered walks for the touch itself and then si
 
 - [x] (2026-08-08) Runtime confirmation, mechanism chain, counterfactual, consumer census, and
   option analysis completed (investigation report; issue #1848).
-- [ ] Milestone 1: `.git`-internal event exemption in the watcher, with the loop reproduced in a
-  test and pinned by a walk counter. (2026-08-08: owner approved; implementation in progress.)
+- [x] (2026-08-08) Milestone 1: `.git`-internal event exemption in the watcher, with the loop
+  reproduced in a test and pinned by a walk counter. Owner approved, implemented, validated.
 - [ ] Milestone 2 (evidence-gated, separate approval): path-rule classification that does not
   materialize the listing.
 
@@ -58,6 +58,20 @@ server on a git repo) shows the triggered walks for the touch itself and then si
   still loops. Recorded so nobody re-proposes debounce.
 - Observation: the unconditional `all_files()` is in `is_bifrostignored`, not `is_gitignored` as
   issue #1848's initial text guessed; the issue was corrected by the investigation.
+- (2026-08-08, Milestone 1) The loop reproduces on a **two-file** repository, and faster than on
+  the investigation's clone: one external `git status` into a watched two-file temp repo produced
+  **156 whole-workspace walks in 500 ms** and was still climbing when the assertion read the
+  counter (`git_bookkeeping_in_a_watched_repository_never_walks_the_workspace`, run against HEAD
+  in a scratch worktree). Walk-bound as predicted -- the smaller the tree, the faster the loop.
+- (2026-08-08, Milestone 1) The loop also *fights the user's own git*. The first fail-before run
+  drove `git status` and then `git add -A`; the `git add` aborted with "Unable to create
+  `.git/index.lock`: File exists", because the watcher thread was inside its own `git status` at
+  that moment. So the defect is not only wasted I/O: a watched session can make ordinary git
+  commands fail. Not previously recorded anywhere.
+- (2026-08-08, Milestone 1) The two existing `.git/HEAD` tests pass unchanged, but note what they
+  do *not* pin: neither asserts a listing invalidation, so the new "ref state skips the listing"
+  behavior is invisible to them. The new `git_ref_state_events_refresh_the_workspace_without_walking_it`
+  is what holds that half.
 
 ## Decision Log
 
@@ -79,10 +93,58 @@ server on a git repo) shows the triggered walks for the touch itself and then si
   so the project-file universe cannot contain `.git` paths by construction -- the watcher
   claiming otherwise is the inconsistency.
   Date/Author: 2026-08-08 / Fable.
+- Decision: the `.git` boundary is *any* directory component named `.git`, not only
+  `<root>/.git`. Rationale: match the workspace walk exactly. `collect_workspace_files`'s
+  `filter_entry` refuses to descend every entry named `.git` at any depth, so a vendored
+  sub-repository's internals are already outside the project-file universe; a watcher rule that
+  exempted only the root repository would keep classifying paths that can never be listed. A
+  nested `HEAD` therefore also reaches the full-refresh decision, which is what the pre-change
+  code did for it (via `RefreshFallback`). Comparison is per path component, so `.github` is
+  untouched -- pinned by
+  `nested_repository_internals_follow_the_same_boundary_as_the_workspace_walk`.
+  Date/Author: 2026-08-08 / Opus (Milestone 1).
+- Decision: the bare `.git` entry itself (the directory, or the file in a linked worktree) is
+  churn, not ref state. Rationale: a repository appearing or disappearing also creates or removes
+  its `HEAD`, which *is* ref state, so the parent-entry event carries nothing of its own; routing
+  it to ref state would instead risk a full refresh on every backend that reports a parent-
+  directory modification alongside `index.lock` churn -- which is the loop again, one level up.
+  Date/Author: 2026-08-08 / Opus (Milestone 1).
+- Decision: keep the plan's "ref state skips listing invalidation", considered and confirmed.
+  Rationale: the concern is a `requires_full_refresh` that then re-analyzes against a stale
+  cached listing. It cannot bite: the listing's membership can only differ if working-tree files
+  differ, and those files produce their own (non-`.git`) events, which do invalidate. Invalidating
+  on ref state would also have been safe (nothing writes `HEAD` during a listing, so it cannot
+  loop), so this is a cost decision, not a correctness one, and it is revisitable in isolation.
+  Date/Author: 2026-08-08 / Opus (Milestone 1).
 
 ## Outcomes & Retrospective
 
-(To be written at milestone completion.)
+Milestone 1 landed 2026-08-08 (`.git` split in `handle_event`,
+`crates/bifrost-mcp/src/project_watcher.rs`).
+
+What the change is: `handle_event` partitions the event batch through
+`git_internal_disposition` before the listing invalidation. `GitInternalPath::Churn` paths are
+dropped outright; `GitInternalPath::RefState` paths (`GIT_REF_STATE_FILE_NAMES` = `HEAD`,
+`packed-refs`, `MERGE_HEAD`, `ORIG_HEAD`, plus everything under `refs/`) mark
+`requires_full_refresh` on the same event kinds as before and are then dropped. The surviving
+paths take the pre-change route unchanged. The refresh-kind test both sites share is now
+`triggers_refresh_fallback`.
+
+Evidence, fail-before measured at HEAD in a scratch worktree carrying only the new tests
+(`git worktree add`, never a stash -- a second agent held uncommitted work in this checkout):
+5 of the 6 new tests failed, and the sixth (`source_events_still_invalidate_the_listing_and_classify`)
+passed before and after, which is exactly its job. The live loop test read 156 walks in 500 ms
+before, 0 after. The service-level #1847 pin failed with "Git bookkeeping must not replace the
+session snapshot" before, passes after.
+
+Residual, unchanged by this milestone and the subject of Milestone 2: a *legitimate* single-file
+event still costs one whole-tree walk plus one `git status` on the watcher thread, because
+`classify_project_path` still answers "is this ignored" by materializing the listing. What is
+gone is the feedback: that walk's `git status` no longer produces the next event.
+
+Not measured here: the resident-index rebuild rate in a real session now that the loop no longer
+drives `snapshot.update`. That is the #1847 plan's baseline, and taking it was the reason for
+sequencing this milestone first.
 
 ## Context and Orientation
 
@@ -109,6 +171,16 @@ Root-relative containment must be correct for nested-repo layouts: only the work
 `.git` is exempt; a vendored sub-repository's `.git` inside the tree follows the same rule
 relative to itself only if the walker also skips it (it does; match that boundary).
 
+As built (2026-08-08): the split is `git_internal_disposition(project, path)` in
+`project_watcher.rs`, called from `handle_event` before the listing invalidation. It strips the
+project root, finds the first path component named `.git` (the walker's boundary, so nested
+repositories are covered), and reads the remainder: `refs` and the four names in
+`GIT_REF_STATE_FILE_NAMES` are `RefState`, the bare `.git` entry and everything else are `Churn`.
+`RefState` marks `requires_full_refresh` through the shared `triggers_refresh_fallback` kind test
+that the existing `RefreshFallback` route also uses, so the refresh semantics are literally the
+same predicate. Paths outside the root are not `.git`-internal and keep feeding the refresh
+fallback, as before.
+
 Tests, fail-before mandatory:
 1. Loop reproduction: a watched service on a temp git repo; drive `git status` (or synthesize
    the three `index.lock` events); assert via the existing `workspace_file_listing_count` that
@@ -118,6 +190,24 @@ Tests, fail-before mandatory:
 3. A source-file event still invalidates and classifies (non-regression).
 4. `.git/index.lock` no longer reaches `snapshot.update` (pin: the definition-index `OnceLock`
    survives a `git status` in a watched session -- this is the #1847 coupling made testable).
+
+As built (2026-08-08), in `project_watcher.rs` unless noted:
+1. `git_bookkeeping_in_a_watched_repository_never_walks_the_workspace` -- a real
+   `ProjectChangeWatcher` over a real two-file repository, driven only by `git status` and
+   `git add -A`; asserts zero walks and an empty `ChangeDelta`. Fail-before: 156 walks in 500 ms.
+2. Unchanged, plus `git_ref_state_events_refresh_the_workspace_without_walking_it` for the half
+   they do not cover (`HEAD`, `ORIG_HEAD`, `MERGE_HEAD`, `packed-refs`, `refs/heads/main`:
+   refresh, no walk, no project file) and `git_churn_events_neither_walk_the_workspace_nor_update_the_project`
+   for `index`, `index.lock`, an object, a reflog, and the bare `.git` entry.
+3. `source_events_still_invalidate_the_listing_and_classify` -- the only new test that passes
+   before the change, which is what makes it the non-regression pin. Boundary non-regression
+   (`.github`, nested repositories) is in
+   `nested_repository_internals_follow_the_same_boundary_as_the_workspace_walk`.
+4. `git_bookkeeping_in_a_watched_session_keeps_the_definition_index`
+   (`searchtools_service.rs`, `watcher_startup_tests`): warms the index in a watched session,
+   drives Git bookkeeping, then asserts the session snapshot is the same `Arc` and the index was
+   not rebuilt. Snapshot identity is the observable form of "the `OnceLock` survived": `update`
+   allocates a fresh one, a query's `clone` shares it.
 
 ### Milestone 2 (separate approval): classify without the listing
 
@@ -135,6 +225,19 @@ warnings). Documented pre-existing failures per the existing plans; stash-verify
 Acceptance is behavioral: the loop-reproduction test fails before and passes after; the HEAD
 whitelist tests hold; the #1847-coupling pin holds.
 
+Milestone 1 results (2026-08-08): `cargo fmt`; `cargo check -p brokk-bifrost-mcp
+-p brokk-bifrost-core --all-targets` clean; `cargo nextest run -p brokk-bifrost-mcp` 165 tests,
+164 pass, the one failure being `bifrost_searchtools_server_speaks_mcp_stdio`, verified failing
+at HEAD in the scratch worktree too; the workspace selection
+`-E 'test(/watcher|project_watcher|searchtools_service/)'` 261 tests, 260 pass, the one failure
+being the documented `manual_service_sees_change_after_explicit_update_paths`;
+`cargo clippy -p brokk-bifrost-mcp -p brokk-bifrost-core --all-targets -- -D warnings` clean.
+The full `--workspace` clippy could not be scored for this change: a concurrent unrelated change
+to `brokk-bifrost-analysis` was uncommitted in the same checkout and failed four lints of its own
+(`usages/rust_graph.rs` doc lints); nothing in `bifrost-mcp` or `bifrost-core` was reported.
+Re-run the full gate once that work lands. Verification used `git worktree add` at HEAD, never
+`git stash`, because a stash would have swept that concurrent work.
+
 ## Idempotence and Recovery
 
 Milestone 1 is one focused change plus tests; revert by commit. No schema, no cache, no
@@ -143,10 +246,11 @@ the tree.
 
 ## Artifacts and Notes
 
-Investigation: `fenced-followups-investigation-v1.md` (session scratchpad; check into
-`.agents/docs/` with Milestone 1's first commit) and `followup-evidence/` (inotify event log,
-counterfactual). Issue #1848 carries the summary. Rate arithmetic: 156 events/s / 3 per status
-= 52 walks/s observed; 2,611 of 2,613 events were `.git/index.lock`.
+Investigation: `.agents/docs/fenced-followups-investigation-2026-08.md` (checked in with the
+plans) and the session's `followup-evidence/` (inotify event log, counterfactual). Issue #1848
+carries the summary. Rate arithmetic: 156 events/s / 3 per status = 52 walks/s observed; 2,611
+of 2,613 events were `.git/index.lock`. Milestone 1's own reproduction lives in the tree as a
+test, so it needs no external harness.
 
 ## Interfaces and Dependencies
 
@@ -154,3 +258,25 @@ No new types expected; the change extends the existing exemption logic in `handl
 disposition routing. The whitelist is one constant list next to it. Sequencing: this plan lands
 BEFORE the #1847 retirement plan so that plan's baseline measurements exclude loop-driven
 rebuilds.
+
+As built (2026-08-08): one private enum (`GitInternalPath`), one private function
+(`git_internal_disposition`), one extracted predicate (`triggers_refresh_fallback`), and three
+constants, all in `project_watcher.rs`. No public API and no cross-crate change. The exemption
+did *not* extend `is_internal_state_rel_path` as Option 1 first sketched: that hook answers one
+question ("analyzer-owned state, do not invalidate the listing") and `.git` needs two answers,
+one of which still has to reach the full-refresh decision. A separate classifier keeps both
+readable.
+
+## Revision note
+
+2026-08-08 (Opus, Milestone 1 implementation): status flipped to APPROVED, IMPLEMENTING and then
+Milestone 1 checked off in `Progress`; added the as-built descriptions of the split and of the
+six tests to `Plan of Work`; added three decisions (the `.git` boundary is any component named
+`.git`, the bare `.git` entry is churn, and ref state keeps skipping listing invalidation --
+confirmed rather than changed) to the `Decision Log`; added three findings to `Surprises &
+Discoveries` (the loop is faster on small trees at 156 walks / 500 ms, it can make a user's own
+`git add` fail on the lock, and the two pre-existing HEAD tests never pinned listing
+invalidation); recorded results in `Validation and Acceptance` and wrote `Outcomes &
+Retrospective`; corrected the investigation's filename in `Artifacts and Notes`, which named a
+scratchpad file that was checked in under a different name. Reason: the plan must be restartable
+from itself, and the boundary and bare-entry decisions were choices the plan text left open.
