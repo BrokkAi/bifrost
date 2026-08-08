@@ -293,6 +293,171 @@ fn census_java_bare_call_keeps_owned_member_evidence() {
     );
 }
 
+fn cpp_census_differential(
+    files: &[(&str, &str)],
+) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {
+    let mut project = InlineTestProject::with_language(Language::Cpp);
+    for (path, source) in files {
+        project = project.file(path, *source);
+    }
+    let project = project.build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    run_reference_differential(
+        workspace.analyzer(),
+        &ReferenceDifferentialConfig {
+            corpus_language: "cpp".to_string(),
+            max_files: 20,
+            max_sites: 1_000,
+            max_candidates_per_file: 1_000,
+            max_source_bytes: 100_000,
+            max_targets: 1_000,
+            max_usage_files: 20,
+            max_usages: 1_000,
+            probe_seed: ProbeSeed::Census,
+            ..ReferenceDifferentialConfig::default()
+        },
+    )
+    .expect("run inline C++ census differential")
+}
+
+/// A constructor or destructor declarator is a declaration occurrence, so the
+/// census must not seed it (#1834). The log4cxx/brpc/abseil witnesses all sit in
+/// a class body the parse never recovered as one: an export macro between
+/// `class` and the class name turns the class into a `function_definition` whose
+/// body is a `compound_statement`, and every constructor declaration inside it
+/// into a call of the class's own name. Graded, each became a tier-1 forward gap
+/// against its own class -- while the same site is `inconclusive` under the
+/// index seed, which never proposes it.
+///
+/// The exclusion is confined to the declarators: the recovered body is still
+/// audited, and a real call inside a method body there stays a probe.
+#[test]
+fn census_seed_skips_a_constructor_declarator_the_parse_read_as_a_call() {
+    let properties = concat!(
+        "namespace helpers {\n",
+        "\n",
+        "class SAMPLE_EXPORT Properties {\n",
+        "\tpublic:\n",
+        "\t\tProperties();\n",
+        "\t\tProperties(const Properties&&) = delete;\n",
+        "\t\tint size() const;\n",
+        "\t\tint total() { return size(); }\n",
+        "};\n",
+        "\n",
+        "}\n",
+    );
+    let census = cpp_census_differential(&[("include/properties.h", properties)]);
+
+    for (label, declarator) in [
+        (
+            "default constructor",
+            properties.find("Properties();").expect("default ctor"),
+        ),
+        (
+            "deleted move constructor",
+            properties
+                .find("Properties(const Properties&&)")
+                .expect("deleted move ctor"),
+        ),
+    ] {
+        let seeded: Vec<_> = census
+            .sites
+            .iter()
+            .filter(|site| site.start_byte == declarator)
+            .map(|site| (&site.text, site.tier, site.classification, &site.note))
+            .collect();
+        assert!(
+            seeded.is_empty(),
+            "the {label} declarator at byte {declarator} must not be seeded: {seeded:#?}"
+        );
+    }
+
+    // The parameter type is a genuine reference to the class, and so is the
+    // `size()` call in the method body the recovery left intact.
+    let parameter_type = properties
+        .find("const Properties&&")
+        .expect("parameter type reference")
+        + "const ".len();
+    let member_call = properties.find("return size();").expect("member call") + "return ".len();
+    for kept in [parameter_type, member_call] {
+        assert!(
+            census.sites.iter().any(|site| site.start_byte == kept),
+            "the recovered class body stays audited at byte {kept}: {:#?}",
+            census
+                .sites
+                .iter()
+                .map(|site| (&site.text, site.start_byte))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// Constructor CALL sites are references and keep their probes: `new Foo(...)`,
+/// the direct-initialization `Foo value(...)` and the base-class member
+/// initializer are all genuine occurrences of the type name. Only the
+/// declarators -- here the out-of-line `Store::Store` definition name and the
+/// destructor name -- leave the seed.
+#[test]
+fn census_seed_keeps_constructor_call_sites_it_excludes_declarators_from() {
+    let header = concat!(
+        "struct Base {\n",
+        "  Base(int seed);\n",
+        "};\n",
+        "\n",
+        "struct Store : Base {\n",
+        "  Store(int seed);\n",
+        "  ~Store();\n",
+        "  int value_;\n",
+        "};\n",
+    );
+    let body = concat!(
+        "#include \"store.h\"\n",
+        "\n",
+        "Store::Store(int seed) : Base(seed), value_(seed) {}\n",
+        "\n",
+        "Store::~Store() {}\n",
+        "\n",
+        "Store* make(int seed) {\n",
+        "  Store direct(seed);\n",
+        "  return new Store(seed);\n",
+        "}\n",
+    );
+    let census = cpp_census_differential(&[("store.h", header), ("store.cpp", body)]);
+
+    let sites: Vec<usize> = census
+        .sites
+        .iter()
+        .filter(|site| site.path.ends_with("store.cpp"))
+        .map(|site| site.start_byte)
+        .collect();
+    let definition_name =
+        body.find("Store::Store").expect("out-of-line definition") + "Store::".len();
+    let destructor_name =
+        body.find("Store::~Store").expect("out-of-line destructor") + "Store::~".len();
+    for excluded in [definition_name, destructor_name] {
+        assert!(
+            !sites.contains(&excluded),
+            "an out-of-line declarator name at byte {excluded} must not be seeded: {sites:?}"
+        );
+    }
+
+    let owner_scope = body.find("Store::Store").expect("definition owner scope");
+    let base_initializer = body.find(": Base(seed)").expect("base initializer") + ": ".len();
+    let direct_initialization = body.find("Store direct").expect("direct initialization");
+    let new_expression = body.find("new Store(seed)").expect("new expression") + "new ".len();
+    for kept in [
+        owner_scope,
+        base_initializer,
+        direct_initialization,
+        new_expression,
+    ] {
+        assert!(
+            sites.contains(&kept),
+            "a constructor call or owner reference at byte {kept} must stay seeded: {sites:?}"
+        );
+    }
+}
+
 fn rust_differential(
     files: &[(&str, &str)],
 ) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {

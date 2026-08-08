@@ -14,7 +14,7 @@
 //!   stays on the analyzer, as does every other cache, so `IAnalyzer::update`
 //!   keeps rebuilding them wholesale.
 
-use crate::declarations::{cpp_file_using_namespaces, cpp_member_fq};
+use crate::declarations::{cpp_file_using_namespaces, cpp_member_fq, node_text};
 use crate::graph_support::CppSource;
 use crate::imports::{IncludeTargetIndex, include_paths, resolve_include_targets_with_index};
 use crate::reconcile::{ReconciledIdentity, VisibleClass, reconcile_out_of_line_member_identity};
@@ -155,6 +155,138 @@ pub fn cpp_is_range_for_binding_name(node: Node<'_>) -> bool {
                 });
         }
         current = Some(parent);
+    }
+    false
+}
+
+/// Return whether `node` is the declarator name of a constructor or destructor
+/// -- the declaration occurrence itself, never a reference to one.
+///
+/// A declaration site is not a usage probe, so the reference differential must
+/// not seed one (#1834). The indexed-declaration-name filter the seeder already
+/// applies misses these two shapes:
+///
+/// * The identifier inside a `destructor_name`. The census proposes both
+///   `~Foo` and its inner `Foo`, while the indexed declaration name range
+///   covers only the `~Foo` span, so the inner identifier survives the filter.
+/// * A declarator the parse never recovered as a declaration. `class MACRO Foo
+///   { ... }` and a bare `MACRO_NAMESPACE_BEGIN` before `class Foo { ... }`
+///   both recover as a `function_definition` whose declarator is a lone
+///   identifier -- a shape valid C++ cannot produce -- with the class body as
+///   its `compound_statement`. Every declaration inside it that the grammar can
+///   read as an expression becomes one, so `Foo();` reads as a call of `Foo`,
+///   which the census then grades as a tier-1 forward gap.
+///
+/// Both tests are structural. Constructor calls stay references: `new Foo(...)`
+/// is a `new_expression` type, `Foo x(...)` is a declaration whose type field
+/// holds the name, and `: base_(x)` is a `field_initializer`. None of them is a
+/// `function_declarator` declarator or a callee inside a recovered class body.
+pub fn cpp_is_constructor_or_destructor_declarator_name(node: Node<'_>, source: &str) -> bool {
+    cpp_is_declared_constructor_or_destructor_name(node)
+        || cpp_is_recovered_constructor_or_destructor_name(node, source)
+}
+
+/// The parsed-as-declared shape: the grammar's `constructor_or_destructor_
+/// declaration` and `constructor_or_destructor_definition`, both aliased to
+/// `declaration`/`function_definition` and both recognizable by the absence of
+/// a `type` field -- exactly what distinguishes a constructor or destructor
+/// from every other C++ callable, which must name a return type.
+fn cpp_is_declared_constructor_or_destructor_name(node: Node<'_>) -> bool {
+    let mut name = node;
+    if let Some(parent) = name.parent()
+        && parent.kind() == "destructor_name"
+    {
+        name = parent;
+    }
+    // `Foo::Foo`, `A::B::Foo` and `Foo<T>::~Foo` reach the declarator through
+    // the qualified name's `name` field. The `scope` segments stay references:
+    // they name the owning type.
+    while let Some(parent) = name.parent() {
+        if parent.kind() != "qualified_identifier"
+            || parent.child_by_field_name("name") != Some(name)
+        {
+            break;
+        }
+        name = parent;
+    }
+    let Some(declarator) = name.parent() else {
+        return false;
+    };
+    if declarator.kind() != "function_declarator"
+        || declarator.child_by_field_name("declarator") != Some(name)
+    {
+        return false;
+    }
+    let Some(owner) = declarator.parent() else {
+        return false;
+    };
+    matches!(owner.kind(), "declaration" | "function_definition")
+        && owner.child_by_field_name("declarator") == Some(declarator)
+        && owner.child_by_field_name("type").is_none()
+}
+
+/// The recovered shape: a callee that names the class whose body the parse
+/// turned into a `compound_statement`.
+///
+/// Two conditions hold together, and both are needed. The nearest enclosing
+/// `function_definition` must declare a bare `identifier` -- valid C++ always
+/// declares a `function_declarator` there, so this shape only ever comes out of
+/// the class-body recovery. And the callee must name one of the identifiers in
+/// that recovery's header, which is where the class name is: `class MACRO Foo`
+/// and `class MACRO Foo : public Base` both keep `Foo` in the header even
+/// though the second leaves `Base` as the recovered declarator.
+///
+/// Together they keep genuine calls references. A recursive `f(n - 1);` sits in
+/// a real body, whose declarator is a `function_declarator`. A method body
+/// inside the recovered class body is itself a real `function_definition`, so
+/// `RAPIDJSON_ASSERT(false)` inside one keeps its own nearest owner. A macro
+/// invocation such as `DISALLOW_COPY_AND_ASSIGN(Foo);` in the recovered body
+/// does not name the class, so it stays proposed.
+fn cpp_is_recovered_constructor_or_destructor_name(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "identifier" {
+        return false;
+    }
+    let Some(call) = node.parent() else {
+        return false;
+    };
+    if call.kind() != "call_expression" || call.child_by_field_name("function") != Some(node) {
+        return false;
+    }
+    let mut current = call.parent();
+    while let Some(ancestor) = current {
+        if ancestor.kind() == "function_definition" {
+            return ancestor
+                .child_by_field_name("declarator")
+                .is_some_and(|declarator| declarator.kind() == "identifier")
+                && cpp_recovered_class_header_names(ancestor, node_text(node, source), source);
+        }
+        current = ancestor.parent();
+    }
+    false
+}
+
+/// Whether `name` is spelled by an identifier in the recovered class header --
+/// everything the recovery kept before the body it mistook for a function body.
+fn cpp_recovered_class_header_names(definition: Node<'_>, name: &str, source: &str) -> bool {
+    let header_end = definition
+        .child_by_field_name("body")
+        .map_or_else(|| definition.end_byte(), |body| body.start_byte());
+    let mut stack = vec![definition];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= header_end {
+            continue;
+        }
+        if matches!(
+            node.kind(),
+            "identifier" | "type_identifier" | "namespace_identifier"
+        ) && node_text(node, source) == name
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
     }
     false
 }
@@ -567,4 +699,242 @@ fn cpp_reconcile_definition_identity(
         &namespace_candidates,
         &class_table,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_cpp(source: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("cpp language");
+        parser.parse(source, None).expect("cpp tree")
+    }
+
+    fn is_declarator_name(tree: &Tree, source: &str, start: usize, text: &str) -> bool {
+        let end = start + text.len();
+        assert_eq!(&source[start..end], text, "the probe must name the token");
+        let node = tree
+            .root_node()
+            .named_descendant_for_byte_range(start, end)
+            .expect("a node spans the probed range");
+        assert_eq!(
+            (node.start_byte(), node.end_byte()),
+            (start, end),
+            "the probed range must be exactly one node: {}",
+            node.to_sexp()
+        );
+        cpp_is_constructor_or_destructor_declarator_name(node, source)
+    }
+
+    /// The parsed-as-declared shape, in class and out of line. The names that
+    /// surround a declarator stay references: the owning scope of an out-of-line
+    /// definition, a parameter type that happens to be the class, and the class
+    /// name itself.
+    #[test]
+    fn declared_constructor_and_destructor_declarator_names_are_not_references() {
+        let source = concat!(
+            "class Foo {\n",
+            "public:\n",
+            "  Foo();\n",
+            "  Foo(const Foo&);\n",
+            "  ~Foo();\n",
+            "  void m();\n",
+            "};\n",
+            "Foo::Foo() {}\n",
+            "Foo::~Foo() {}\n",
+            "void Foo::m() {}\n",
+        );
+        let tree = parse_cpp(source);
+
+        for (label, start, text) in [
+            (
+                "constructor declaration",
+                source.find("Foo();").expect("ctor"),
+                "Foo",
+            ),
+            (
+                "copy constructor declaration",
+                source.find("Foo(const Foo&);").expect("copy ctor"),
+                "Foo",
+            ),
+            (
+                "destructor name",
+                source.find("~Foo();").expect("dtor"),
+                "~Foo",
+            ),
+            (
+                "identifier inside the destructor name",
+                source.find("~Foo();").expect("dtor") + "~".len(),
+                "Foo",
+            ),
+            (
+                "out-of-line constructor definition name",
+                source.find("Foo::Foo() {}").expect("out-of-line ctor") + "Foo::".len(),
+                "Foo",
+            ),
+            (
+                "out-of-line destructor definition name",
+                source.find("Foo::~Foo() {}").expect("out-of-line dtor") + "Foo::".len(),
+                "~Foo",
+            ),
+        ] {
+            assert!(
+                is_declarator_name(&tree, source, start, text),
+                "the {label} at byte {start} is a declaration occurrence"
+            );
+        }
+
+        for (label, start, text) in [
+            (
+                "class name",
+                source.find("class Foo {").expect("class") + "class ".len(),
+                "Foo",
+            ),
+            (
+                "parameter type",
+                source.find("const Foo&").expect("parameter type") + "const ".len(),
+                "Foo",
+            ),
+            (
+                "owning scope of an out-of-line constructor",
+                source.find("Foo::Foo() {}").expect("out-of-line ctor"),
+                "Foo",
+            ),
+            (
+                "owning scope of an out-of-line destructor",
+                source.find("Foo::~Foo() {}").expect("out-of-line dtor"),
+                "Foo",
+            ),
+            (
+                "out-of-line method name",
+                source.find("void Foo::m() {}").expect("out-of-line method") + "void Foo::".len(),
+                "m",
+            ),
+        ] {
+            assert!(
+                !is_declarator_name(&tree, source, start, text),
+                "the {label} at byte {start} stays a reference"
+            );
+        }
+    }
+
+    /// Constructor CALL sites are references. `new D(...)`, the direct
+    /// initialization `D x(...)`, a member initializer and a bare temporary
+    /// statement all name the type, and none of them is a declarator.
+    #[test]
+    fn constructor_call_sites_stay_references() {
+        let source = concat!(
+            "struct B { B(int); };\n",
+            "struct D : B {\n",
+            "  D(int x) : B(x), base_(x) {}\n",
+            "  int base_;\n",
+            "};\n",
+            "void g() {\n",
+            "  D* p = new D(1);\n",
+            "  D x(2);\n",
+            "  D(3);\n",
+            "  g();\n",
+            "}\n",
+        );
+        let tree = parse_cpp(source);
+
+        let inline_declarator = source.find("D(int x)").expect("inline constructor");
+        assert!(
+            is_declarator_name(&tree, source, inline_declarator, "D"),
+            "an inline constructor definition name is still a declarator"
+        );
+
+        for (label, start, text) in [
+            (
+                "base member initializer",
+                source.find(": B(x)").expect("base initializer") + ": ".len(),
+                "B",
+            ),
+            (
+                "field member initializer",
+                source.find("base_(x) {}").expect("field initializer"),
+                "base_",
+            ),
+            (
+                "new expression type",
+                source.find("new D(1)").expect("new expression") + "new ".len(),
+                "D",
+            ),
+            (
+                "direct initialization type",
+                source.find("D x(2)").expect("direct initialization"),
+                "D",
+            ),
+            (
+                "temporary construction statement",
+                source.find("D(3)").expect("temporary"),
+                "D",
+            ),
+            (
+                "recursive call in a real body",
+                source.find("g();").expect("recursive call"),
+                "g",
+            ),
+        ] {
+            assert!(
+                !is_declarator_name(&tree, source, start, text),
+                "the {label} at byte {start} is a reference"
+            );
+        }
+    }
+
+    /// The recovered shape (#1834): an export macro between `class` and the
+    /// class name makes the parse read the class body as a function body and
+    /// every constructor declaration in it as a call of the class's own name.
+    /// The bodies the recovery left intact keep their references.
+    #[test]
+    fn a_constructor_declarator_the_parse_read_as_a_call_is_not_a_reference() {
+        let source = concat!(
+            "class SAMPLE_EXPORT Properties {\n",
+            "  public:\n",
+            "    Properties();\n",
+            "    DISALLOW_COPY_AND_ASSIGN(Properties);\n",
+            "    int size() const;\n",
+            "    int total() { return size(); }\n",
+            "};\n",
+        );
+        let tree = parse_cpp(source);
+
+        let recovered = source.find("Properties();").expect("recovered constructor");
+        assert!(
+            is_declarator_name(&tree, source, recovered, "Properties"),
+            "a constructor declaration the parse read as a call is still a declarator"
+        );
+
+        for (label, start, text) in [
+            (
+                "class name in the recovered header",
+                source
+                    .find("class SAMPLE_EXPORT Properties")
+                    .expect("class")
+                    + "class SAMPLE_EXPORT ".len(),
+                "Properties",
+            ),
+            (
+                "macro invocation in the recovered body",
+                source
+                    .find("DISALLOW_COPY_AND_ASSIGN(Properties);")
+                    .expect("macro invocation"),
+                "DISALLOW_COPY_AND_ASSIGN",
+            ),
+            (
+                "call inside a method body the recovery kept",
+                source.find("return size();").expect("member call") + "return ".len(),
+                "size",
+            ),
+        ] {
+            assert!(
+                !is_declarator_name(&tree, source, start, text),
+                "the {label} at byte {start} stays a reference"
+            );
+        }
+    }
 }

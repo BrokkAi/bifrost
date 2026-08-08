@@ -16,7 +16,8 @@ use crate::analyzer::usages::{
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind,
 };
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range, rust_is_field_declaration_name,
+    CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range,
+    cpp_is_constructor_or_destructor_declarator_name, rust_is_field_declaration_name,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -674,6 +675,30 @@ fn collect_sampled_sites(
                     .descendant_for_byte_range(range.start_byte, range.end_byte)
                     .is_some_and(|node| {
                         rust_is_field_declaration_name(node, range.start_byte, range.end_byte)
+                    })
+            {
+                summary.declaration_sites_excluded =
+                    summary.declaration_sites_excluded.saturating_add(1);
+                continue;
+            }
+            // A constructor or destructor declarator is a declaration occurrence,
+            // never a reference (#1834). The indexed-name filter above misses two
+            // of them: the identifier inside a `~Foo` destructor name, whose
+            // indexed range covers the tilde too, and any declarator the parse
+            // recovered as something other than a declaration -- a macro between
+            // `class` and the class name turns the whole class body into a
+            // function body, and every constructor declaration in it into a call.
+            // Graded, they became tier-1 forward gaps against their own class.
+            if language == Language::Cpp
+                && root
+                    .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                    .is_some_and(|node| {
+                        node.start_byte() == range.start_byte
+                            && node.end_byte() == range.end_byte
+                            && cpp_is_constructor_or_destructor_declarator_name(
+                                node,
+                                context.content(),
+                            )
                     })
             {
                 summary.declaration_sites_excluded =
