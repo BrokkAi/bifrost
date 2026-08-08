@@ -44,6 +44,7 @@ mod cross_language_self_usages;
 mod language_reach_in_gate;
 mod member_dispatch_csharp;
 mod member_dispatch_php_ruby;
+mod scala_java_foreign_storage_key;
 mod structural_search_cross_language;
 mod structural_search_planner;
 mod structural_search_python;
