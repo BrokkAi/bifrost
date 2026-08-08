@@ -133,17 +133,15 @@ struct Derived : wuffs_aux::DecodeImageCallbacks {
         "    return wuffs_aux::Other::HandleMetadata(x, y);",
         "wuffs_aux::Other",
     );
+    // Issue #1814: the header resolves its own conditional before this file is
+    // parsed, so a compatible guard set proves the owner component.
     assert!(
-        unproven.contains(&call_owner),
-        "the guarded qualified call must retain its owner class component: {unproven:?}"
+        proven.contains(&call_owner),
+        "the guarded qualified call must retain its owner class component: proven={proven:?}, unproven={unproven:?}"
     );
     assert!(
         unproven.contains(&inheritance_owner) || proven.contains(&inheritance_owner),
         "the visible base owner must remain indexed: proven={proven:?}, unproven={unproven:?}"
-    );
-    assert!(
-        !proven.contains(&call_owner),
-        "the guarded owner cannot be proven: {proven:?}"
     );
     assert!(
         !proven.contains(&call_method) && !unproven.contains(&call_method),

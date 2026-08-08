@@ -1211,7 +1211,13 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     ref unit,
                     ref candidates,
                     ..
-                } if type_resolution_matches_target(hit_node, unit, candidates, ctx)
+                } if type_resolution_identifies_unit_target(
+                    hit_node,
+                    unit,
+                    candidates,
+                    &ctx.spec.target,
+                    ctx,
+                )
             );
             if raw_matches
                 || type_node_has_exact_target_identity_without_visibility(
@@ -2909,9 +2915,25 @@ fn type_resolution_matches_unit_target(
     target: &CodeUnit,
     ctx: &ScanCtx<'_>,
 ) -> bool {
-    if !template_alias_owner_matches_reference(node, target, ctx)
-        || !target_alias_candidates_visible(candidates, node, ctx)
-    {
+    target_alias_candidates_visible(candidates, node, ctx)
+        && type_resolution_identifies_unit_target(node, unit, candidates, target, ctx)
+}
+
+/// The identity half of the type-resolution match, without the alias
+/// visibility gate.
+///
+/// Use it only on the without-visibility fallback path, which reports an
+/// unproven hit. An alias spelling does not contain the target identifier, so
+/// the name-mention fallback can never recover a rejected alias reference: the
+/// site would disappear instead of degrading to a reviewable hit.
+fn type_resolution_identifies_unit_target(
+    node: Node<'_>,
+    unit: &CodeUnit,
+    candidates: &[CodeUnit],
+    target: &CodeUnit,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    if !template_alias_owner_matches_reference(node, target, ctx) {
         return false;
     }
     if ctx.visibility.is_template_specialization(target)

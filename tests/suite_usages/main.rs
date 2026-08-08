@@ -35,6 +35,7 @@ mod usage_graph_rust_test;
 mod usage_graph_scala_test;
 mod usage_graph_test;
 mod usage_graph_ts_test;
+mod usages_c_guarded_typedef_test;
 mod usages_cpp_abseil_member_pointer_test;
 mod usages_cpp_abseil_temporary_test;
 mod usages_cpp_behaviortree_alias_test;

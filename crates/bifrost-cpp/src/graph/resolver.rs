@@ -2402,6 +2402,51 @@ impl<'a> VisibilityIndex<'a> {
             .is_some_and(|activation| activation <= reference_byte)
     }
 
+    /// Decide whether a declaration that lives in another file reaches a
+    /// reference in `file`.
+    ///
+    /// An external header selects its declaration branch before the reference
+    /// file is parsed. Require compatible reference guards, but do not test
+    /// the header's guard expression for stability in the reference file: a
+    /// `.c` translation unit can never satisfy the `#ifdef __cplusplus` that
+    /// wraps every declaration of a portable C header, and demanding it would
+    /// hide the whole header. Guards that the reference file imposes on its
+    /// own `#include` still have to hold, and still have to be stable.
+    fn foreign_declaration_reachable_at_reference(
+        &self,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        declaration_source: &ProjectFile,
+        declaration_guards: &HashSet<PreprocessorGuard>,
+        reference_guards: Option<&HashSet<PreprocessorGuard>>,
+        reference_byte: usize,
+    ) -> bool {
+        if !guards_compatible_at_reference(declaration_guards, reference_guards) {
+            return false;
+        }
+        if self
+            .include_activation_for_source(self.cpp, file, prepared, declaration_source)
+            .is_some_and(|activation| activation <= reference_byte)
+        {
+            return true;
+        }
+        self.conditional_include_projections_for_source(file, prepared, declaration_source)
+            .iter()
+            .any(|projection| {
+                projection.activation_byte <= reference_byte
+                    && guard_requirements_hold_at_reference(
+                        &projection.required_guards,
+                        reference_guards,
+                    )
+                    && self.preprocessor_guards_stable_between(
+                        file,
+                        0,
+                        reference_byte,
+                        &projection.required_guards,
+                    )
+            })
+    }
+
     pub fn external_type_candidate_visible_in_context(
         &self,
         analyzer: &CppGraphSource<'_>,
@@ -2434,54 +2479,14 @@ impl<'a> VisibilityIndex<'a> {
                                     &declaration_guards,
                                 );
                         }
-                        if self
-                            .include_activation_for_source(
-                                self.cpp,
-                                file,
-                                prepared.as_ref(),
-                                peer.source(),
-                            )
-                            .is_some_and(|activation| {
-                                activation <= reference.start_byte()
-                                    && guard_requirements_hold_at_reference(
-                                        &declaration_guards,
-                                        reference_guards.as_ref(),
-                                    )
-                                    && self.preprocessor_guards_stable_between(
-                                        file,
-                                        0,
-                                        reference.start_byte(),
-                                        &declaration_guards,
-                                    )
-                            })
-                        {
-                            return true;
-                        }
-                        self.conditional_include_projections_for_source(
+                        self.foreign_declaration_reachable_at_reference(
                             file,
                             prepared.as_ref(),
                             peer.source(),
+                            &declaration_guards,
+                            reference_guards.as_ref(),
+                            reference.start_byte(),
                         )
-                        .iter()
-                        .any(|projection| {
-                            let Some(required_guards) = merge_preprocessor_guards(
-                                &projection.required_guards,
-                                &declaration_guards,
-                            ) else {
-                                return false;
-                            };
-                            projection.activation_byte <= reference.start_byte()
-                                && guard_requirements_hold_at_reference(
-                                    &required_guards,
-                                    reference_guards.as_ref(),
-                                )
-                                && self.preprocessor_guards_stable_between(
-                                    file,
-                                    0,
-                                    reference.start_byte(),
-                                    &required_guards,
-                                )
-                        })
                     })
             });
         let complementary = self
@@ -2647,7 +2652,7 @@ impl<'a> VisibilityIndex<'a> {
         // do not test the header's guard expression for stability in the
         // reference file. Same-file aliases still require that stability.
         if !candidate_guards.iter().any(|(_, target_guards)| {
-            merge_preprocessor_guards(target_guards, &reference_guards).is_some()
+            guards_compatible_at_reference(target_guards, Some(&reference_guards))
                 && (candidate.source() != file
                     || self.preprocessor_guards_stable_between(
                         file,
@@ -2705,54 +2710,14 @@ impl<'a> VisibilityIndex<'a> {
                                 &declaration_guards,
                             );
                         }
-                        if self
-                            .include_activation_for_source(
-                                self.cpp,
-                                file,
-                                prepared.as_ref(),
-                                peer.source(),
-                            )
-                            .is_some_and(|activation| {
-                                activation <= reference.start_byte()
-                                    && guard_requirements_hold_at_reference(
-                                        &declaration_guards,
-                                        reference_guards.as_ref(),
-                                    )
-                                    && self.preprocessor_guards_stable_between(
-                                        file,
-                                        0,
-                                        reference.start_byte(),
-                                        &declaration_guards,
-                                    )
-                            })
-                        {
-                            return true;
-                        }
-                        self.conditional_include_projections_for_source(
+                        self.foreign_declaration_reachable_at_reference(
                             file,
                             prepared.as_ref(),
                             peer.source(),
+                            &declaration_guards,
+                            reference_guards.as_ref(),
+                            reference.start_byte(),
                         )
-                        .iter()
-                        .any(|projection| {
-                            let Some(required_guards) = merge_preprocessor_guards(
-                                &projection.required_guards,
-                                &declaration_guards,
-                            ) else {
-                                return false;
-                            };
-                            projection.activation_byte <= reference.start_byte()
-                                && guard_requirements_hold_at_reference(
-                                    &required_guards,
-                                    reference_guards.as_ref(),
-                                )
-                                && self.preprocessor_guards_stable_between(
-                                    file,
-                                    0,
-                                    reference.start_byte(),
-                                    &required_guards,
-                                )
-                        })
                     })
             })
     }
@@ -6048,6 +6013,17 @@ fn guard_requirements_hold_at_reference(
     reference: Option<&HashSet<PreprocessorGuard>>,
 ) -> bool {
     reference.is_some_and(|active| required.is_subset(active))
+}
+
+/// Cross-file guard rule: two guard sets are compatible when neither one
+/// contradicts the other. Use this instead of the subset test whenever the
+/// guards come from a foreign file, which resolves its own conditionals
+/// independently of the reference.
+fn guards_compatible_at_reference(
+    declaration: &HashSet<PreprocessorGuard>,
+    reference: Option<&HashSet<PreprocessorGuard>>,
+) -> bool {
+    reference.is_some_and(|active| merge_preprocessor_guards(declaration, active).is_some())
 }
 
 fn preprocessor_conditional_family_for_declaration(node: Node<'_>) -> Option<Node<'_>> {

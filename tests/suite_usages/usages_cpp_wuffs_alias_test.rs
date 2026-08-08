@@ -106,7 +106,7 @@ void wrong_alias(wuffs_aux_wrong::IOBuffer& buffer) { (void)buffer; }
     let guarded = token_range(
         &source,
         "void guarded(wuffs_aux::IOBuffer& buffer) { (void)buffer; }",
-        "IOBuffer",
+        "wuffs_aux::IOBuffer",
     );
     let unguarded = token_range(
         &source,
@@ -118,17 +118,17 @@ void wrong_alias(wuffs_aux_wrong::IOBuffer& buffer) { (void)buffer; }
         "void wrong_alias(wuffs_aux_wrong::IOBuffer& buffer) { (void)buffer; }",
         "IOBuffer",
     );
+    // Issue #1814: a foreign header selects its own declaration branch before
+    // this file is parsed, so the cross-file rule is guard compatibility, not
+    // a demand that the reference restate the header's guard. The reference
+    // only compiles when the branch is active, so the hit is proven.
     assert!(
-        unproven.contains(&guarded),
-        "the guarded namespace alias must remain reviewable: {unproven:?}"
+        proven.contains(&guarded),
+        "a compatible guarded namespace alias is proven: proven={proven:?}, unproven={unproven:?}"
     );
     assert!(
         proven.contains(&unguarded),
         "the unguarded alias must stay proven: {proven:?}"
-    );
-    assert!(
-        !proven.contains(&guarded),
-        "guarded alias cannot be proven: {proven:?}"
     );
     assert!(!proven.contains(&wrong) && !unproven.contains(&wrong));
 

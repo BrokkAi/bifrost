@@ -11688,10 +11688,13 @@ void bind_nested_namespace(bool (absl::type_identity<T>::type::*method)()) {}
 
     let guarded_hits =
         authoritative_exact_ranges(&analyzer, std::slice::from_ref(&guarded_target), &consumer);
+    // Issue #1814: `traits.h` resolves its own conditional before `consumer.cc`
+    // is parsed. The guard set is compatible with the unguarded reference, so
+    // the nested alias terminal is proven - and only that terminal.
     assert_eq!(
         guarded_hits,
-        BTreeSet::new(),
-        "an extra nested guard must not inherit visibility from an unguarded owner"
+        BTreeSet::from([guarded]),
+        "the guarded nested alias resolves to its own terminal only"
     );
 }
 
