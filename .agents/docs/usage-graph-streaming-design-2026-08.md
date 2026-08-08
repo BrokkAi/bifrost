@@ -1,6 +1,8 @@
 # Design: usage-graph result assembly as per-site queries with streaming
 
-Status: DESIGN FOR OWNER REVIEW. Do not implement until approved. Author: Fable, 2026-08-08.
+Status: APPROVED, IMPLEMENTING. Author: Fable, 2026-08-08. Implementation tracking, progress,
+surprises, and decisions live in the ExecPlan `.agents/plans/usage-graph-streaming.md`, which owns
+this work from here; this document remains the authoritative statement of the design itself.
 Substrate: `graph-phase-investigation-v1.md` (session artifact; key findings restated here so this
 document stands alone) and `.agents/docs/intellij-indexing-research-2026-08.md` sections 3.2-3.5.
 
