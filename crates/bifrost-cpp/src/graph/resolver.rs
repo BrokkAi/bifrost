@@ -61,6 +61,29 @@ enum TypeCandidateResolution<'a> {
     PreserveTarget(&'a CodeUnit),
 }
 
+/// Why a name did not reduce to one indexed type declaration.
+///
+/// The two answers are not interchangeable. `Ambiguous` means the index holds
+/// several declarations and the caller must choose; `Unresolvable` means the
+/// index holds none, which is a boundary the workspace cannot see past. A
+/// `using`/`typedef` alias to a template parameter or to a standard-library
+/// type is unresolvable, and reporting it as ambiguity produced an `ambiguous`
+/// answer with an empty candidate list (#1828).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypeCandidateFailure {
+    Ambiguous,
+    Unresolvable,
+}
+
+impl TypeCandidateFailure {
+    fn lexical_resolution(self) -> LexicalTypeResolution {
+        match self {
+            Self::Ambiguous => LexicalTypeResolution::Ambiguous,
+            Self::Unresolvable => LexicalTypeResolution::Missing,
+        }
+    }
+}
+
 pub enum LexicalCallableValueResolution {
     Type(CodeUnit),
     FreeFunction(CodeUnit),
@@ -3180,14 +3203,16 @@ impl<'a> VisibilityIndex<'a> {
                 TypeCandidateResolution::PreserveTarget,
             )
         };
-        let Some(unit) = self.resolve_type_candidates(analyzer, file, &candidates, resolution)
-        else {
-            return LexicalTypeResolution::Ambiguous;
-        };
-        LexicalTypeResolution::Resolved {
-            unit,
-            components: target_components.to_vec(),
-            candidates: vec![target.clone()],
+        // One candidate goes in, so a failure here is never "choose one of
+        // these": it is the alias chain leaving the index, which must answer
+        // missing rather than ambiguous (#1828).
+        match self.resolve_type_candidates(analyzer, file, &candidates, resolution) {
+            Ok(unit) => LexicalTypeResolution::Resolved {
+                unit,
+                components: target_components.to_vec(),
+                candidates: vec![target.clone()],
+            },
+            Err(failure) => failure.lexical_resolution(),
         }
     }
 
@@ -3254,9 +3279,9 @@ impl<'a> VisibilityIndex<'a> {
                 }
                 continue;
             }
-            let unit = self.resolve_type_candidates(analyzer, file, &candidates, resolution);
-            let Some(unit) = unit else {
-                return LexicalTypeResolution::Ambiguous;
+            let unit = match self.resolve_type_candidates(analyzer, file, &candidates, resolution) {
+                Ok(unit) => unit,
+                Err(failure) => return failure.lexical_resolution(),
             };
             return LexicalTypeResolution::Resolved {
                 unit,
@@ -3326,14 +3351,14 @@ impl<'a> VisibilityIndex<'a> {
             return None;
         }
         let owner_components = lexical_scope[..owner_len].to_vec();
-        let resolved = self.resolve_type_candidates(analyzer, file, &matches, resolution);
-        let resolution = resolved.map_or(LexicalTypeResolution::Ambiguous, |unit| {
-            LexicalTypeResolution::Resolved {
+        let resolution = match self.resolve_type_candidates(analyzer, file, &matches, resolution) {
+            Ok(unit) => LexicalTypeResolution::Resolved {
                 unit,
                 components: owner_components,
                 candidates: matches.into_iter().cloned().collect(),
-            }
-        });
+            },
+            Err(failure) => failure.lexical_resolution(),
+        };
         Some((owner_len, resolution))
     }
 
@@ -3393,11 +3418,11 @@ impl<'a> VisibilityIndex<'a> {
                     }
                     continue;
                 }
-                let Some(unit) =
-                    self.resolve_type_candidates(analyzer, file, &candidates, resolution)
-                else {
-                    return LexicalTypeResolution::Ambiguous;
-                };
+                let unit =
+                    match self.resolve_type_candidates(analyzer, file, &candidates, resolution) {
+                        Ok(unit) => unit,
+                        Err(failure) => return failure.lexical_resolution(),
+                    };
                 level_matches.push((unit, candidates.into_iter().cloned().collect::<Vec<_>>()));
             }
             if let Some((unit, candidates)) = level_matches.first().cloned() {
@@ -3424,23 +3449,28 @@ impl<'a> VisibilityIndex<'a> {
         LexicalTypeResolution::Missing
     }
 
+    /// The one type the candidates name under `resolution`, or why they do not
+    /// name one. The two preserving modes only ever reject candidates that
+    /// disagree with each other, which is ambiguity; canonicalization can also
+    /// fail because the alias chain leaves the index (#1828).
     fn resolve_type_candidates(
         &self,
         analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         candidates: &[&CodeUnit],
         resolution: TypeCandidateResolution<'_>,
-    ) -> Option<CodeUnit> {
+    ) -> Result<CodeUnit, TypeCandidateFailure> {
         match resolution {
             TypeCandidateResolution::Canonical => {
-                self.unique_canonical_type_candidate(analyzer, file, candidates)
+                self.canonical_type_candidate_resolution(analyzer, file, candidates)
             }
             TypeCandidateResolution::PreserveAlias => {
                 unique_type_candidate_preserving_alias(analyzer, candidates)
+                    .ok_or(TypeCandidateFailure::Ambiguous)
             }
-            TypeCandidateResolution::PreserveTarget(target) => {
-                self.unique_type_candidate_preserving_target(analyzer, file, candidates, target)
-            }
+            TypeCandidateResolution::PreserveTarget(target) => self
+                .unique_type_candidate_preserving_target(analyzer, file, candidates, target)
+                .ok_or(TypeCandidateFailure::Ambiguous),
         }
     }
 
@@ -3552,19 +3582,42 @@ impl<'a> VisibilityIndex<'a> {
         visible_from: &ProjectFile,
         unit: &CodeUnit,
     ) -> Option<CodeUnit> {
+        self.canonical_type_resolution(analyzer, visible_from, unit)
+            .ok()
+    }
+
+    /// Follow `unit`'s alias chain to the class it names, or report why the
+    /// chain does not end at one indexed class.
+    ///
+    /// A chain that leaves the index - an alias to a template parameter, to a
+    /// standard-library type, or to any other declaration the workspace does
+    /// not hold - is `Unresolvable`, not `Ambiguous` (#1828). So is a cycle:
+    /// there is still nothing to choose between.
+    fn canonical_type_resolution(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        visible_from: &ProjectFile,
+        unit: &CodeUnit,
+    ) -> Result<CodeUnit, TypeCandidateFailure> {
         let mut current = unit.clone();
         let mut seen_aliases = HashSet::default();
         loop {
             let Some(target) = self.structured_alias_target(analyzer, &current) else {
-                return current.is_class().then_some(current);
+                return current
+                    .is_class()
+                    .then_some(current)
+                    .ok_or(TypeCandidateFailure::Unresolvable);
             };
             if matches!(target, StructuredAliasTarget::Builtin) {
-                return current.is_class().then_some(current);
+                return current
+                    .is_class()
+                    .then_some(current)
+                    .ok_or(TypeCandidateFailure::Unresolvable);
             }
             if !seen_aliases.insert(current.clone()) {
-                return None;
+                return Err(TypeCandidateFailure::Unresolvable);
             }
-            current = self.resolve_structured_alias_target(visible_from, &current, &target)?;
+            current = self.structured_alias_target_resolution(visible_from, &current, &target)?;
         }
     }
 
@@ -3607,15 +3660,31 @@ impl<'a> VisibilityIndex<'a> {
         declaration: &CodeUnit,
         target: &StructuredAliasTarget,
     ) -> Option<CodeUnit> {
-        let primary = self.resolve_structured_alias_primary(visible_from, declaration, target)?;
+        self.structured_alias_target_resolution(visible_from, declaration, target)
+            .ok()
+    }
+
+    fn structured_alias_target_resolution(
+        &self,
+        visible_from: &ProjectFile,
+        declaration: &CodeUnit,
+        target: &StructuredAliasTarget,
+    ) -> Result<CodeUnit, TypeCandidateFailure> {
+        let primary =
+            self.structured_alias_primary_resolution(visible_from, declaration, target)?;
         let StructuredAliasTarget::Named { arguments, .. } = target else {
-            return None;
+            return Err(TypeCandidateFailure::Unresolvable);
         };
         match arguments {
             Some(arguments) => self
                 .resolve_template_arguments(visible_from, primary, arguments)
-                .ok(),
-            None => Some(primary),
+                .map_err(|error| match error {
+                    CppTemplateResolutionError::AmbiguousSpecialization { .. } => {
+                        TypeCandidateFailure::Ambiguous
+                    }
+                    _ => TypeCandidateFailure::Unresolvable,
+                }),
+            None => Ok(primary),
         }
     }
 
@@ -3625,18 +3694,29 @@ impl<'a> VisibilityIndex<'a> {
         declaration: &CodeUnit,
         target: &StructuredAliasTarget,
     ) -> Option<CodeUnit> {
+        self.structured_alias_primary_resolution(visible_from, declaration, target)
+            .ok()
+    }
+
+    fn structured_alias_primary_resolution(
+        &self,
+        visible_from: &ProjectFile,
+        declaration: &CodeUnit,
+        target: &StructuredAliasTarget,
+    ) -> Result<CodeUnit, TypeCandidateFailure> {
         let StructuredAliasTarget::Named {
             components, global, ..
         } = target
         else {
-            return None;
+            return Err(TypeCandidateFailure::Unresolvable);
         };
         let qualified = components.join("::");
-        if *global {
-            unique_logical_type_candidate(self.type_candidates(visible_from, &qualified))
+        let candidates = if *global {
+            self.type_candidates(visible_from, &qualified)
         } else {
-            self.resolve_unique_type_for_declaration(visible_from, declaration, &qualified)
-        }
+            self.type_candidates_for_declaration(visible_from, declaration, &qualified)
+        };
+        logical_type_candidate(candidates)
     }
 
     pub fn structured_alias_primary_preserves_target(
@@ -3866,9 +3946,19 @@ impl<'a> VisibilityIndex<'a> {
         visible_from: &ProjectFile,
         candidates: &[&CodeUnit],
     ) -> Option<CodeUnit> {
+        self.canonical_type_candidate_resolution(analyzer, visible_from, candidates)
+            .ok()
+    }
+
+    fn canonical_type_candidate_resolution(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        visible_from: &ProjectFile,
+        candidates: &[&CodeUnit],
+    ) -> Result<CodeUnit, TypeCandidateFailure> {
         let mut canonical = Vec::new();
         for candidate in candidates {
-            let resolved = self.canonical_type_unit(analyzer, visible_from, candidate)?;
+            let resolved = self.canonical_type_resolution(analyzer, visible_from, candidate)?;
             if canonical
                 .iter()
                 .any(|existing| same_visible_symbol(existing, &resolved))
@@ -3877,10 +3967,10 @@ impl<'a> VisibilityIndex<'a> {
             }
             canonical.push(resolved);
             if canonical.len() > 1 {
-                return None;
+                return Err(TypeCandidateFailure::Ambiguous);
             }
         }
-        canonical.pop()
+        canonical.pop().ok_or(TypeCandidateFailure::Unresolvable)
     }
 
     pub fn unique_type_candidate_preserving_target(
@@ -4220,23 +4310,41 @@ impl<'a> VisibilityIndex<'a> {
         }
     }
 
+    /// Every indexed type declaration `raw_name` names when it is written in
+    /// `declaration`'s namespace: the innermost enclosing namespace that holds
+    /// the name wins, otherwise the name is looked up unqualified.
+    fn type_candidates_for_declaration<'b>(
+        &'b self,
+        visible_from: &ProjectFile,
+        declaration: &CodeUnit,
+        raw_name: &str,
+    ) -> Vec<&'b CodeUnit> {
+        let Some(normalized) = normalize_reference_name(raw_name) else {
+            return Vec::new();
+        };
+        if let Some(namespace) = cpp_namespace_for(declaration) {
+            for prefix in namespace_prefixes(&namespace) {
+                let qualified = format!("{prefix}::{normalized}");
+                let candidates = self.type_candidates(visible_from, &qualified);
+                if !candidates.is_empty() {
+                    return candidates;
+                }
+            }
+        }
+        self.type_candidates(visible_from, &normalized)
+    }
+
     fn resolve_unique_type_for_declaration(
         &self,
         visible_from: &ProjectFile,
         declaration: &CodeUnit,
         raw_name: &str,
     ) -> Option<CodeUnit> {
-        let normalized = normalize_reference_name(raw_name)?;
-        if let Some(namespace) = cpp_namespace_for(declaration) {
-            for prefix in namespace_prefixes(&namespace) {
-                let qualified = format!("{prefix}::{normalized}");
-                let candidates = self.type_candidates(visible_from, &qualified);
-                if !candidates.is_empty() {
-                    return unique_logical_type_candidate(candidates);
-                }
-            }
-        }
-        unique_logical_type_candidate(self.type_candidates(visible_from, &normalized))
+        unique_logical_type_candidate(self.type_candidates_for_declaration(
+            visible_from,
+            declaration,
+            raw_name,
+        ))
     }
 
     pub fn resolves_to_type(
@@ -6910,12 +7018,23 @@ pub fn field_declared_binding(
     ))
 }
 
-fn unique_logical_type_candidate(candidates: Vec<&CodeUnit>) -> Option<CodeUnit> {
-    let first = candidates.first()?;
-    candidates
+/// The one logical type the candidates name, or why they do not name one.
+fn logical_type_candidate(candidates: Vec<&CodeUnit>) -> Result<CodeUnit, TypeCandidateFailure> {
+    let Some(first) = candidates.first() else {
+        return Err(TypeCandidateFailure::Unresolvable);
+    };
+    if candidates
         .iter()
         .all(|candidate| candidate.kind() == first.kind() && candidate.fq_name() == first.fq_name())
-        .then(|| (*first).clone())
+    {
+        Ok((*first).clone())
+    } else {
+        Err(TypeCandidateFailure::Ambiguous)
+    }
+}
+
+fn unique_logical_type_candidate(candidates: Vec<&CodeUnit>) -> Option<CodeUnit> {
+    logical_type_candidate(candidates).ok()
 }
 
 fn unique_type_candidate_preserving_alias(
