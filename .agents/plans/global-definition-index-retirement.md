@@ -3,9 +3,14 @@
 This ExecPlan is a living document maintained per `.agents/PLANS.md`. Sections `Progress`,
 `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept current.
 
-STATUS: PLAN FOR OWNER REVIEW. Do not implement until approved. Sequenced AFTER the watcher
-plan (`watcher-git-event-exemption.md`): the watcher loop currently discards this index
-constantly, so honest baselines require the loop fixed first.
+STATUS: DEMOTED TO HYGIENE TRACK, SEQUENCED BEHIND THE SCHEMA CLEANUP (owner decision,
+2026-08-08, after Milestone 0 corrected the memory case by ~44x). The consumer-migration
+cohorts fold into the view-based query surface that the store schema cleanup
+(`.agents/docs/store-relational-schema-design-2026-08.md`) builds, rather than preceding it.
+Memory-motivated milestones are suspended: Milestone 3's premise is broken (usage_facts_index
+never builds on the scan path) and Milestone 4's gate targets ~2% of peak RSS; whether any
+memory milestone returns is decided by the RSS attribution investigation now in flight, not by
+this plan. The watcher-plan sequencing note below is satisfied (0bdfc37c landed).
 
 ## Purpose / Big Picture
 
