@@ -5123,10 +5123,152 @@ fn cpp_member_lookup(
         0,
     );
     if !candidates.is_empty() {
-        return candidates;
+        return cpp_merge_using_introduced_members(
+            ctx,
+            owners,
+            member,
+            0,
+            candidates,
+            member_trace,
+        );
     }
     let mut seen = HashSet::default();
     cpp_inherited_member_candidates(ctx, owners, member, &mut seen, member_trace)
+}
+
+/// Fold in the overloads a member `using <Base>::<member>;` declaration on
+/// `owners` re-exposes.
+///
+/// C++ name hiding removes a base overload as soon as a derived class declares
+/// the same name, and the walk models that by stopping at the first level that
+/// declares it. A member using-declaration switches hiding off for the named
+/// base, but nothing re-added what it un-hid, so a call that selected the base
+/// signature reported `no_applicable_overload` even though the overload was
+/// indexed, visible, and explicitly re-exposed by the source (#1835).
+///
+/// `depth` is the base-class depth `declared` was found at, so the trace can
+/// keep reporting an exact route. The walk is an explicit worklist: a
+/// using-declaration can name a base that re-exposes the member through a
+/// using-declaration of its own, and a recovered hierarchy can be cyclic.
+fn cpp_merge_using_introduced_members(
+    ctx: CppLookupCtx<'_, '_>,
+    owners: &[CodeUnit],
+    member: &str,
+    depth: usize,
+    mut declared: Vec<CodeUnit>,
+    mut member_trace: Option<&mut CppMemberTrace>,
+) -> Vec<CodeUnit> {
+    let mut pending: Vec<(CodeUnit, CodeUnit, usize)> = Vec::new();
+    for owner in owners {
+        for base in cpp_member_using_declaration_bases(ctx.analyzer, owner, member) {
+            pending.push((base, owner.clone(), depth + 1));
+        }
+    }
+    if pending.is_empty() {
+        return declared;
+    }
+    let mut visited: HashSet<String> = owners.iter().map(CodeUnit::fq_name).collect();
+    while let Some((base, deriving, base_depth)) = pending.pop() {
+        if !visited.insert(base.fq_name()) {
+            continue;
+        }
+        if let Some(state) = member_trace.as_deref_mut() {
+            state.parents.entry(base.clone()).or_insert(deriving);
+        }
+        declared.extend(cpp_direct_member_candidates_traced(
+            ctx.analyzer,
+            ctx.support,
+            std::slice::from_ref(&base),
+            member,
+            member_trace.as_deref_mut(),
+            base_depth,
+        ));
+        for next in cpp_member_using_declaration_bases(ctx.analyzer, &base, member) {
+            pending.push((next, base.clone(), base_depth + 1));
+        }
+    }
+    sort_units(&mut declared);
+    declared.dedup();
+    declared
+}
+
+/// The base classes a member `using <Base>::<member>;` declaration in `owner`'s
+/// body names for `member`.
+///
+/// An in-class using-declaration is not indexed as a member of its class, so
+/// the declaration node in `owner`'s own source is the only structural record
+/// of it. Only a derived class can re-expose a base member, so the memoized
+/// ancestor edges gate the read: a class with no ancestors never pays for a
+/// parse, and the ancestor set is also what a named scope is matched against.
+fn cpp_member_using_declaration_bases(
+    analyzer: &dyn IAnalyzer,
+    owner: &CodeUnit,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let Some(hierarchy) = analyzer.type_hierarchy_provider() else {
+        return Vec::new();
+    };
+    let ancestors = hierarchy.get_ancestors(owner);
+    if ancestors.is_empty() {
+        return Vec::new();
+    }
+    let Some(source) = analyzer.get_source(owner, false) else {
+        return Vec::new();
+    };
+    let Some(tree) = parse_cpp_tree(&source) else {
+        return Vec::new();
+    };
+    let mut scopes: Vec<String> = Vec::new();
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "using_declaration" {
+            if let Some(scope) = cpp_using_declaration_member_scope(node, &source, member) {
+                scopes.push(scope);
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    if scopes.is_empty() {
+        return Vec::new();
+    }
+    ancestors
+        .into_iter()
+        .filter(|ancestor| {
+            let qualified = cpp_name_for(ancestor);
+            scopes
+                .iter()
+                .any(|scope| cpp_qualified_name_has_scope_suffix(&qualified, scope))
+        })
+        .collect()
+}
+
+/// The `<Base>` scope of a `using <Base>::<member>;` declaration.
+///
+/// `None` for a using-directive (`using namespace X;`), a using-enum, and any
+/// using-declaration that imports some other name: all three leave no scope
+/// once the trailing component is taken off, or leave a trailing component
+/// that is not `member`.
+fn cpp_using_declaration_member_scope(
+    node: Node<'_>,
+    source: &str,
+    member: &str,
+) -> Option<String> {
+    let imported = node.named_child(0)?;
+    let mut components = cpp_type_name_components(imported, source)?;
+    let imported_member = components.pop()?;
+    (imported_member == member && !components.is_empty()).then(|| components.join("::"))
+}
+
+/// Whether the qualified C++ name `qualified` ends with `scope` at a `::`
+/// boundary, so that `ns::Base` is named by both `Base` and `ns::Base` but
+/// never by `seBase`.
+fn cpp_qualified_name_has_scope_suffix(qualified: &str, scope: &str) -> bool {
+    qualified == scope
+        || qualified
+            .strip_suffix(scope)
+            .is_some_and(|prefix| prefix.ends_with("::"))
 }
 
 fn cpp_member_candidates(
@@ -5362,7 +5504,14 @@ fn cpp_inherited_member_candidates(
             depth,
         );
         if !direct.is_empty() {
-            return direct;
+            return cpp_merge_using_introduced_members(
+                ctx,
+                &bases,
+                member,
+                depth,
+                direct,
+                member_trace,
+            );
         }
         level = bases;
     }
