@@ -20,7 +20,7 @@ use brokk_bifrost_cpp::call_match::{
     CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_parameter_type_text,
     cpp_signature_param_types, cpp_type_text_pointer_depth, normalize_cpp_type_name,
 };
-use brokk_bifrost_cpp::graph::resolver::cpp_alias_declaration_target_text;
+use brokk_bifrost_cpp::graph::resolver::{cpp_alias_declaration_target_text, same_logical_symbol};
 
 pub(crate) const CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC: &str = "unproven_cpp_link_unit";
 
@@ -4020,7 +4020,9 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     )
                 };
                 if !member_candidates.is_empty() {
-                    if call_arity.is_none() {
+                    if call_arity.is_none()
+                        && !cpp_candidates_are_one_logical_symbol(&member_candidates)
+                    {
                         // The competing members are in hand; an ambiguous answer
                         // must carry them rather than drop them (#1811).
                         return ambiguous_candidates_outcome(
@@ -4514,6 +4516,21 @@ fn cpp_visible_name_candidates(
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
+}
+
+/// Whether every candidate names the same logical C++ entity.
+///
+/// A declaration and its out-of-line body share `(kind, fq_name, signature)`;
+/// they are one member, not an overload set. Unproven call arity must only
+/// preserve an ambiguity that already exists and never manufacture one out of
+/// a lone member declaration (#1826) - the same rule the free-function branch
+/// gets from `resolve_callable_candidates` (#1811). A genuine overload set
+/// differs in signature, including by a trailing cv- or ref-qualifier, so it
+/// stays ambiguous.
+fn cpp_candidates_are_one_logical_symbol(candidates: &[CodeUnit]) -> bool {
+    candidates
+        .split_first()
+        .is_some_and(|(first, rest)| rest.iter().all(|other| same_logical_symbol(first, other)))
 }
 
 /// Cross-file C/C++ callable bodies selected from include evidence are useful
