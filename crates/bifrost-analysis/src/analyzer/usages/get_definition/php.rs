@@ -388,21 +388,21 @@ fn resolve_php_with_session(
         }
         Some(PhpReferenceNode::Function(name_node)) => {
             let raw = php_qualified_candidate_text_with_session(name_node, source, session);
-            let fqn = if let Some(session) = session {
+            let candidates = if let Some(session) = session {
                 resolve_php_function_node(name_node, source, &ctx, || session.scope_step())
             } else {
                 resolve_php_function(&raw, &ctx)
             };
-            php_fqn_outcome(support, fqn, &raw)
+            php_callable_outcome(support, candidates, &raw)
         }
         Some(PhpReferenceNode::Constant(name_node)) => {
             let raw = php_qualified_candidate_text_with_session(name_node, source, session);
-            let fqn = if let Some(session) = session {
+            let candidates = if let Some(session) = session {
                 resolve_php_constant_node(name_node, source, &ctx, || session.scope_step())
             } else {
                 resolve_php_constant(&raw, &ctx)
             };
-            php_fqn_outcome(support, fqn, &raw)
+            php_callable_outcome(support, candidates, &raw)
         }
         Some(PhpReferenceNode::StaticMember { scope, name }) => {
             let member = php_node_text(name, source).trim_start_matches('$');
@@ -870,17 +870,62 @@ fn php_fqn_outcome(
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
+    php_unindexed_fqn_outcome(support, &fqn, raw)
+}
+
+/// [`php_fqn_outcome`] over PHP's ordered function/constant candidates.
+///
+/// The candidates are tried in PHP's own lookup order, so a declaration in the
+/// caller's namespace shadows the global one. When the workspace indexes
+/// neither, the report names the LAST candidate, which is where PHP's lookup
+/// actually ends: a bare `substr(...)` inside `namespace Monolog` was reported
+/// against `Monolog.substr`, a name PHP never looks for (#1866).
+fn php_callable_outcome(
+    support: &dyn BoundedDefinitionLookup,
+    candidates: Option<PhpCallableCandidates>,
+    raw: &str,
+) -> DefinitionLookupOutcome {
+    let Some(candidates) = candidates else {
+        return no_definition(
+            "no_indexed_definition",
+            format!("`{raw}` did not resolve to a PHP definition name"),
+        );
+    };
+    for candidate in candidates.iter() {
+        let units = php_fqn_candidates(support, candidate);
+        if !units.is_empty() {
+            return candidates_outcome(units);
+        }
+    }
+    php_unindexed_fqn_outcome(support, candidates.last(), raw)
+}
+
+fn php_unindexed_fqn_outcome(
+    support: &dyn BoundedDefinitionLookup,
+    fqn: &str,
+    raw: &str,
+) -> DefinitionLookupOutcome {
     // `php_crosses_unindexed_boundary` fuses the external signal with the
     // workspace-namespace check, so its negation is exactly the workspace-
     // internal gate `gated_boundary` wants.
     gated_boundary(
-        || !php_crosses_unindexed_boundary(support, &fqn),
+        || !php_crosses_unindexed_boundary(support, fqn),
         format!(
             "`{raw}` resolves to `{fqn}`, which is outside this partial PHP workspace analysis"
         ),
         "no_indexed_definition",
         format!("`{raw}` resolved to `{fqn}`, but no indexed PHP definition was found"),
     )
+}
+
+/// The one candidate the workspace indexes, preferring the shadowing namespace
+/// spelling, so every non-definition consumer of a PHP callable reference reads
+/// the same target the definition lookup answers (#1866).
+fn php_bound_callable<'a>(
+    support: &dyn BoundedDefinitionLookup,
+    candidates: &'a PhpCallableCandidates,
+) -> &'a str {
+    candidates.first_indexed(|candidate| !php_fqn_candidates(support, candidate).is_empty())
 }
 
 /// The access form the PHP resolver reached a member through.
@@ -1688,12 +1733,12 @@ fn php_expression_type_fqn_bounded(
                 }
                 "function_call_expression" => {
                     let function = expression.child_by_field_name("function")?;
-                    let callable_fqn =
+                    let candidates =
                         resolve_php_function_node(function, source, ctx, || session.scope_step())?;
                     values.push(php_declared_callable_return_type_fqn(
                         php,
                         support,
-                        &callable_fqn,
+                        php_bound_callable(support, &candidates),
                         Some(session),
                     )?);
                 }
@@ -2197,8 +2242,13 @@ fn php_assignment_receiver_fqn(
         "function_call_expression" => {
             let function = right.child_by_field_name("function")?;
             let raw = php_qualified_candidate_text_with_session(function, source, session);
-            let callable_fqn = resolve_php_function(&raw, ctx)?;
-            php_declared_callable_return_type_fqn(php, support, &callable_fqn, session)
+            let candidates = resolve_php_function(&raw, ctx)?;
+            php_declared_callable_return_type_fqn(
+                php,
+                support,
+                php_bound_callable(support, &candidates),
+                session,
+            )
         }
         "scoped_call_expression" => {
             let (scope, name) = php_static_member_parts(right)?;

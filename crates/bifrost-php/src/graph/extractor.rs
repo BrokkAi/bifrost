@@ -1,5 +1,6 @@
 use crate::aliases::{
-    PhpFileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
+    PhpCallableCandidates, PhpFileContext, resolve_php_constant, resolve_php_function,
+    resolve_php_type,
 };
 use crate::graph::PhpGraphSource;
 use crate::graph::hits::{push_hit, push_hit_range, push_import_hit, push_self_receiver_hit_range};
@@ -256,12 +257,16 @@ fn handle_candidate(
         }
         TargetKind::Method | TargetKind::Field => {}
         TargetKind::Constant => {
-            if node.kind() != "namespace_name" && is_constant_reference(node, source, ctx, spec) {
+            if node.kind() != "namespace_name"
+                && is_constant_reference(node, analyzer, source, ctx, spec)
+            {
                 push_hit(node, analyzer, file, source, line_starts, spec, hits);
             }
         }
         TargetKind::Function => {
-            if node.kind() != "namespace_name" && is_function_reference(node, source, ctx, spec) {
+            if node.kind() != "namespace_name"
+                && is_function_reference(node, analyzer, source, ctx, spec)
+            {
                 push_hit(node, analyzer, file, source, line_starts, spec, hits);
             }
         }
@@ -319,6 +324,7 @@ fn is_constructor_reference(
 
 fn is_constant_reference(
     node: Node<'_>,
+    analyzer: PhpGraphSource<'_>,
     source: &str,
     ctx: &PhpFileContext,
     spec: &TargetSpec,
@@ -333,11 +339,13 @@ fn is_constant_reference(
     {
         return false;
     }
-    resolve_php_constant(&raw, ctx).is_some_and(|fq| fq == spec.target_fq_name)
+    resolve_php_constant(&raw, ctx)
+        .is_some_and(|candidates| bound_callable(&candidates, analyzer) == spec.target_fq_name)
 }
 
 fn is_function_reference(
     node: Node<'_>,
+    analyzer: PhpGraphSource<'_>,
     source: &str,
     ctx: &PhpFileContext,
     spec: &TargetSpec,
@@ -352,7 +360,19 @@ fn is_function_reference(
     if is_member_or_scoped_access_name(node) || is_function_declaration_name(node) {
         return false;
     }
-    resolve_php_function(&raw, ctx).is_some_and(|fq| fq == spec.target_fq_name)
+    resolve_php_function(&raw, ctx)
+        .is_some_and(|candidates| bound_callable(&candidates, analyzer) == spec.target_fq_name)
+}
+
+/// The one name a PHP function or constant reference binds to: the shadowing
+/// namespace candidate when the workspace declares it, otherwise the global
+/// fallback (#1866). Resolving the pair to a single answer here is what keeps
+/// the shadowed global declaration from also claiming the site.
+fn bound_callable<'a>(
+    candidates: &'a PhpCallableCandidates,
+    analyzer: PhpGraphSource<'_>,
+) -> &'a str {
+    candidates.first_indexed(|candidate| analyzer.index.definitions(candidate).next().is_some())
 }
 
 fn is_reference_context(node: Node<'_>) -> bool {
@@ -598,10 +618,11 @@ fn assignment_receiver_type(
         "function_call_expression" => {
             let function = node.child_by_field_name("function")?;
             let raw = qualified_candidate_text(function, source);
-            let callable_fqn = resolve_php_function(&raw, ctx)?;
+            let candidates = resolve_php_function(&raw, ctx)?;
+            let callable_fqn = bound_callable(&candidates, analyzer);
             let mut definitions = analyzer
                 .index
-                .definitions(&callable_fqn)
+                .definitions(callable_fqn)
                 .filter(|unit| unit.is_function());
             let callable = definitions.next()?;
             if definitions.next().is_some() {

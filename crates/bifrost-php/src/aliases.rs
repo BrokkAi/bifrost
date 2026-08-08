@@ -31,6 +31,69 @@ pub struct PhpFileContext {
     pub aliases: PhpUseAliases,
 }
 
+/// The ordered names one PHP function or constant reference can bind to.
+///
+/// PHP resolves an UNQUALIFIED single-segment function or constant name in the
+/// current namespace first and, finding nothing declared there, in the global
+/// namespace. A declaration in the current namespace therefore SHADOWS the
+/// global one, which is why the two candidates are ordered rather than a set
+/// (#1866). Every other spelling -- `\name`, a qualified path, `namespace\name`,
+/// a `use function` / `use const` alias -- names exactly one target and carries
+/// no fallback.
+///
+/// Types have no such fallback in PHP, so this shape belongs to the function and
+/// constant entry points only and never to [`resolve_php_type`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhpCallableCandidates {
+    primary: String,
+    global_fallback: Option<String>,
+}
+
+impl PhpCallableCandidates {
+    /// A spelling that names exactly one target.
+    fn exact(name: String) -> Self {
+        Self {
+            primary: name,
+            global_fallback: None,
+        }
+    }
+
+    /// An unqualified name in a namespaced file: the namespace-qualified
+    /// spelling shadows the global one.
+    fn shadowing(primary: String, global_fallback: String) -> Self {
+        debug_assert_ne!(
+            primary, global_fallback,
+            "a shadowing candidate pair must name two different targets"
+        );
+        Self {
+            primary,
+            global_fallback: Some(global_fallback),
+        }
+    }
+
+    /// The candidates in PHP's own lookup order, most specific first.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.primary.as_str()).chain(self.global_fallback.as_deref())
+    }
+
+    /// The name PHP's lookup ends on. An unresolved reference is reported
+    /// against this one, because it is where the search actually stopped:
+    /// naming `Monolog.substr` for a bare `substr(...)` invents a target PHP
+    /// never looked for.
+    pub fn last(&self) -> &str {
+        self.global_fallback.as_deref().unwrap_or(&self.primary)
+    }
+
+    /// The candidate the workspace indexes, preferring the shadowing one. When
+    /// it indexes neither, the namespaced spelling stands, so an unresolvable
+    /// reference keeps naming the namespace it was written in.
+    pub fn first_indexed(&self, is_indexed: impl Fn(&str) -> bool) -> &str {
+        self.iter()
+            .find(|candidate| is_indexed(candidate))
+            .unwrap_or(&self.primary)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PhpUseKind {
     Type,
@@ -307,7 +370,7 @@ pub fn resolve_php_function_node(
     source: &str,
     ctx: &PhpFileContext,
     mut step: impl FnMut() -> bool,
-) -> Option<String> {
+) -> Option<PhpCallableCandidates> {
     if !matches!(
         node.kind(),
         "name" | "qualified_name" | "namespace_name" | "fully_qualified_name"
@@ -315,7 +378,7 @@ pub fn resolve_php_function_node(
         return None;
     }
     let path = php_structured_path(node, source, &mut step)?;
-    resolve_php_structured_path(path, ctx, &ctx.aliases.function_aliases, &mut step)
+    resolve_php_structured_callable(path, ctx, &ctx.aliases.function_aliases, &mut step)
 }
 
 /// Resolves one literal PHP constant name from parser structure and maps the
@@ -325,7 +388,7 @@ pub fn resolve_php_constant_node(
     source: &str,
     ctx: &PhpFileContext,
     mut step: impl FnMut() -> bool,
-) -> Option<String> {
+) -> Option<PhpCallableCandidates> {
     if !matches!(
         node.kind(),
         "name" | "qualified_name" | "namespace_name" | "fully_qualified_name"
@@ -333,8 +396,17 @@ pub fn resolve_php_constant_node(
         return None;
     }
     let path = php_structured_path(node, source, &mut step)?;
-    let public = resolve_php_structured_path(path, ctx, &ctx.aliases.const_aliases, &mut step)?;
-    step().then(|| module_constant_fq(&public))
+    let public = resolve_php_structured_callable(path, ctx, &ctx.aliases.const_aliases, &mut step)?;
+    if !step() {
+        return None;
+    }
+    Some(match public.global_fallback {
+        Some(global) => PhpCallableCandidates::shadowing(
+            module_constant_fq(&public.primary),
+            module_constant_fq(&global),
+        ),
+        None => PhpCallableCandidates::exact(module_constant_fq(&public.primary)),
+    })
 }
 
 fn php_only_named_child<'tree>(
@@ -430,6 +502,31 @@ fn resolve_php_structured_path(
         return php_join_structured_segments(imported, &segments[1..], step);
     }
     php_join_structured_segments(&ctx.namespace, segments, step)
+}
+
+/// [`resolve_php_structured_path`] plus PHP's global-namespace fallback.
+///
+/// The base helper is shared with TYPE resolution, where PHP has no such
+/// fallback, so the extra candidate is added here -- on the function and
+/// constant entry points -- rather than in the shared walk (#1866).
+fn resolve_php_structured_callable(
+    path: PhpStructuredPath,
+    ctx: &PhpFileContext,
+    aliases: &HashMap<String, String>,
+    step: &mut impl FnMut() -> bool,
+) -> Option<PhpCallableCandidates> {
+    let unqualified = !path.absolute
+        && !path.namespace_relative
+        && path.segments.len() == 1
+        && !aliases.contains_key(&path.segments[0]);
+    let global = unqualified.then(|| path.segments[0].clone());
+    let primary = resolve_php_structured_path(path, ctx, aliases, step)?;
+    Some(match global {
+        Some(global) if !ctx.namespace.is_empty() => {
+            PhpCallableCandidates::shadowing(primary, global)
+        }
+        _ => PhpCallableCandidates::exact(primary),
+    })
 }
 
 fn php_join_structured_segments(
@@ -586,29 +683,49 @@ pub fn resolve_php_type(raw: &str, ctx: &PhpFileContext) -> Option<String> {
     Some(join_namespace(&ctx.namespace, &normalized))
 }
 
-pub fn resolve_php_function(raw: &str, ctx: &PhpFileContext) -> Option<String> {
+pub fn resolve_php_function(raw: &str, ctx: &PhpFileContext) -> Option<PhpCallableCandidates> {
     if raw.starts_with('\\') {
-        return Some(php_namespace_to_fq(raw));
+        return Some(PhpCallableCandidates::exact(php_namespace_to_fq(raw)));
     }
     let normalized = php_namespace_to_fq(raw);
     if let Some(imported) = ctx.aliases.function_aliases.get(&normalized) {
-        return Some(imported.clone());
+        return Some(PhpCallableCandidates::exact(imported.clone()));
     }
-    Some(join_namespace(&ctx.namespace, &normalized))
+    let namespaced = join_namespace(&ctx.namespace, &normalized);
+    Some(match php_global_fallback_applies(&normalized, ctx) {
+        true => PhpCallableCandidates::shadowing(namespaced, normalized),
+        false => PhpCallableCandidates::exact(namespaced),
+    })
 }
 
-pub fn resolve_php_constant(raw: &str, ctx: &PhpFileContext) -> Option<String> {
+pub fn resolve_php_constant(raw: &str, ctx: &PhpFileContext) -> Option<PhpCallableCandidates> {
     if raw.starts_with('\\') {
-        return Some(module_constant_fq(&php_namespace_to_fq(raw)));
+        return Some(PhpCallableCandidates::exact(module_constant_fq(
+            &php_namespace_to_fq(raw),
+        )));
     }
     let normalized = php_namespace_to_fq(raw);
     if let Some(imported) = ctx.aliases.const_aliases.get(&normalized) {
-        return Some(module_constant_fq(imported));
+        return Some(PhpCallableCandidates::exact(module_constant_fq(imported)));
     }
-    Some(join_namespace(
-        &ctx.namespace,
-        &format!("_module_.{normalized}"),
-    ))
+    let namespaced = join_namespace(&ctx.namespace, &format!("_module_.{normalized}"));
+    Some(match php_global_fallback_applies(&normalized, ctx) {
+        true => PhpCallableCandidates::shadowing(namespaced, module_constant_fq(&normalized)),
+        false => PhpCallableCandidates::exact(namespaced),
+    })
+}
+
+/// Whether PHP's global-namespace fallback applies to an already normalized,
+/// non-absolute, non-aliased function or constant name.
+///
+/// The rule is the one `diagnostics.rs` states: an unqualified -- that is,
+/// single-segment -- function or constant name reaches the global namespace
+/// after the current one. A qualified name (`Sub\name`), the `namespace\name`
+/// relative form and a file with no namespace at all each have exactly one
+/// candidate: the first two are not unqualified, and in the global namespace the
+/// two candidates coincide.
+fn php_global_fallback_applies(normalized: &str, ctx: &PhpFileContext) -> bool {
+    !ctx.namespace.is_empty() && !normalized.contains('.')
 }
 
 fn module_constant_fq(fq_name: &str) -> String {

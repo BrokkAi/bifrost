@@ -318,19 +318,21 @@ impl PhpDiagnosticCollector<'_> {
                 .push_resolved(range, BoundaryStatus::ExternalIndexed);
             return;
         }
-        if matches!(kind, SymbolKind::Function | SymbolKind::Constant)
-            && is_unqualified_php_name(&raw)
-        {
-            // PHP falls back to the global namespace for an unqualified
-            // function or constant. Bifrost does not index the whole built-in
-            // global surface, so this lookup is unfinished, not absent.
-            self.push_missing_discovery(range, BoundaryStatus::ExternalUnknown);
-            return;
-        }
+        // PHP falls back to the global namespace for an unqualified function or
+        // constant. The resolver now models that fallback (#1866), so the
+        // workspace gets the first answer; only when no candidate is indexed is
+        // the lookup unfinished -- Bifrost does not index the whole built-in
+        // global surface, so an unqualified name that reaches neither namespace
+        // is undiscovered rather than absent.
+        let unqualified_callable = matches!(kind, SymbolKind::Function | SymbolKind::Constant)
+            && is_unqualified_php_name(&raw);
+        let indexed = |candidate: &str| !self.support.fqn(candidate).is_empty();
         let fqn = match kind {
             SymbolKind::Type => resolve_php_type(&raw, &self.ctx),
-            SymbolKind::Function => resolve_php_function(&raw, &self.ctx),
-            SymbolKind::Constant => resolve_php_constant(&raw, &self.ctx),
+            SymbolKind::Function => resolve_php_function(&raw, &self.ctx)
+                .map(|candidates| candidates.first_indexed(indexed).to_string()),
+            SymbolKind::Constant => resolve_php_constant(&raw, &self.ctx)
+                .map(|candidates| candidates.first_indexed(indexed).to_string()),
         };
         let Some(fqn) = fqn else {
             return;
@@ -338,6 +340,10 @@ impl PhpDiagnosticCollector<'_> {
         if !self.support.fqn(&fqn).is_empty() {
             self.report
                 .push_resolved(range, BoundaryStatus::WorkspaceLocal);
+            return;
+        }
+        if unqualified_callable {
+            self.push_missing_discovery(range, BoundaryStatus::ExternalUnknown);
             return;
         }
         match self.external.lookup_type(&fqn) {

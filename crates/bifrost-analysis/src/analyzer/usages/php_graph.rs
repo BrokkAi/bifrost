@@ -8,7 +8,8 @@
 mod shared;
 
 pub(in crate::analyzer::usages) use brokk_bifrost_php::aliases::{
-    PhpFileContext as FileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
+    PhpCallableCandidates, PhpFileContext as FileContext, resolve_php_constant,
+    resolve_php_function, resolve_php_type,
 };
 pub(in crate::analyzer::usages) use brokk_bifrost_php::graph::resolver::{
     node_text as php_node_text, qualified_candidate_text as php_qualified_candidate_text,

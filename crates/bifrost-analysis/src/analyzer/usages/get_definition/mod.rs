@@ -40,8 +40,8 @@ use crate::analyzer::usages::local_inference::{
 };
 use crate::analyzer::usages::model::{ImportBinder, ImportKind};
 use crate::analyzer::usages::php_graph::{
-    FileContext, php_node_text, php_qualified_candidate_text, resolve_php_constant,
-    resolve_php_function, resolve_php_type,
+    FileContext, PhpCallableCandidates, php_node_text, php_qualified_candidate_text,
+    resolve_php_constant, resolve_php_function, resolve_php_type,
 };
 use crate::analyzer::usages::python_graph::{
     collect_assigned_identifiers, collect_module_binding_timeline,

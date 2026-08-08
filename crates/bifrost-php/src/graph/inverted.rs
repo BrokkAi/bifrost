@@ -36,7 +36,8 @@ use super::syntax::{
     seed_parameter_types, static_member_parts, static_scope_type_fq_name, variable_identifier,
 };
 use crate::aliases::{
-    PhpFileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
+    PhpCallableCandidates, PhpFileContext, resolve_php_constant, resolve_php_function,
+    resolve_php_type,
 };
 use crate::graph::PhpGraphSource;
 use crate::graph_support::PhpSource;
@@ -108,6 +109,16 @@ impl PhpScan<'_> {
         self.class_ranges.enclosing(byte)
     }
 
+    /// The one name a function or constant reference binds to. An unqualified
+    /// name reaches the current namespace and then the global one, so the
+    /// inverse index must pick the same candidate the forward resolver answers
+    /// or the two directions disagree about the same site (#1866).
+    fn bound_callable(&self, candidates: &PhpCallableCandidates) -> String {
+        candidates
+            .first_indexed(|candidate| self.analyzer.index.definitions(candidate).next().is_some())
+            .to_string()
+    }
+
     fn record(&mut self, callee: String, node: Node<'_>) {
         self.edges.record_kind(
             self.input,
@@ -172,9 +183,10 @@ fn record_reference(
         "function_call_expression" => {
             if let Some(name_node) = node.child_by_field_name("function")
                 && matches!(name_node.kind(), "name" | "qualified_name")
-                && let Some(fqn) =
+                && let Some(candidates) =
                     resolve_php_function(node_text(name_node, scan.source), &scan.ctx)
             {
+                let fqn = scan.bound_callable(&candidates);
                 scan.record(fqn, name_node);
             }
         }
@@ -336,8 +348,10 @@ fn record_reference(
             {
                 scan.record(fqn, node);
             } else if is_bare_constant_reference(node)
-                && let Some(fqn) = resolve_php_constant(node_text(node, scan.source), &scan.ctx)
+                && let Some(candidates) =
+                    resolve_php_constant(node_text(node, scan.source), &scan.ctx)
             {
+                let fqn = scan.bound_callable(&candidates);
                 scan.record(fqn, node);
             }
         }
@@ -424,7 +438,8 @@ fn assignment_receiver_type_fqn(right: Node<'_>, scan: &mut PhpScan<'_>) -> Opti
             if !matches!(function.kind(), "name" | "qualified_name") {
                 return None;
             }
-            let fqn = resolve_php_function(node_text(function, scan.source), &scan.ctx)?;
+            let candidates = resolve_php_function(node_text(function, scan.source), &scan.ctx)?;
+            let fqn = scan.bound_callable(&candidates);
             declared_callable_return_type_fqn(scan, &fqn)
         }
         "scoped_call_expression" => {
