@@ -3904,6 +3904,35 @@ fn csharp_nested_sibling_type_resolves_from_property_type_position() {
     );
 }
 
+// #1801 (nunit `TestNameGenerator`): a bare call to a member inherited from a
+// nested base type spelled by its simple name. Supertype resolution searched
+// only the file's namespace and `using` scopes, so `Derived : Base` inside
+// `Outer` had no ancestors at all and `Helper(a, b)` was unreachable.
+// `Other.Base.Helper` is the near miss: a same-short-name type in another
+// namespace must not supply the definition.
+#[test]
+fn csharp_bare_call_resolves_through_a_nested_base_spelled_by_simple_name() {
+    let source = "namespace N\n{\n    public class Outer\n    {\n        private abstract class Base\n        {\n            protected static string Helper(object a, int b) { return \"x\"; }\n        }\n\n        private sealed class Derived : Base\n        {\n            public void Use(object a, int b) { var s = Helper(a, b); }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .file(
+            "Other.cs",
+            "namespace Other\n{\n    public class Base\n    {\n        public static string Helper(object a, int b) { return \"y\"; }\n    }\n}\n",
+        )
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("inherited call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "N.Outer$Base.Helper",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "P.cs", "{value}");
+}
+
 // A bare field reference inside a method must resolve through the enclosing
 // class's members, not fall through to the type path and claim a using
 // boundary for a field declared in the same class (tier-3 CsvHelper:

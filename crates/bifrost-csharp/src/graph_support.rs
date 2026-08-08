@@ -1162,14 +1162,7 @@ pub fn resolve_visible_type(
     file: &ProjectFile,
     name: &str,
 ) -> Option<CodeUnit> {
-    let candidates = visible_type_candidates(source, file, name);
-    (logical_type_count(&candidates) == 1)
-        .then(|| {
-            let mut candidates = candidates;
-            sort_type_candidates(&mut candidates);
-            candidates.into_iter().next()
-        })
-        .flatten()
+    unique_logical_type(visible_type_candidates(source, file, name))
 }
 
 pub fn resolve_usage_visible_type(
@@ -1177,14 +1170,120 @@ pub fn resolve_usage_visible_type(
     file: &ProjectFile,
     name: &str,
 ) -> Option<CodeUnit> {
-    let candidates = usage_visible_type_candidates(source, file, name);
-    (logical_type_count(&candidates) == 1)
-        .then(|| {
-            let mut candidates = candidates;
-            sort_type_candidates(&mut candidates);
-            candidates.into_iter().next()
-        })
-        .flatten()
+    unique_logical_type(usage_visible_type_candidates(source, file, name))
+}
+
+/// The one declaration `candidates` names, or `None` when the spelling is
+/// ambiguous. Partial declarations of the same type count once, so a type
+/// split over several files still resolves.
+pub fn unique_logical_type(mut candidates: Vec<CodeUnit>) -> Option<CodeUnit> {
+    if logical_type_count(&candidates) != 1 {
+        return None;
+    }
+    sort_type_candidates(&mut candidates);
+    candidates.into_iter().next()
+}
+
+// ---------------------------------------------------------------------------
+// Enclosing-type scopes
+// ---------------------------------------------------------------------------
+
+/// The type scopes a spelling written inside `declaring_type_fqn` can name a
+/// type through, innermost first: the declaring type itself and then each type
+/// it is nested in. Namespace prefixes are deliberately excluded -- those are
+/// what [`visible_type_candidates_with_lookups`] already searches -- so the
+/// walk stops at the outermost nesting boundary.
+///
+/// C# writes a nesting boundary as `$` in a `CodeUnit` fq name and as `+` in
+/// reflection-style spellings, so both cut the scope.
+fn enclosing_type_scopes(declaring_type_fqn: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(
+        (!declaring_type_fqn.is_empty()).then_some(declaring_type_fqn),
+        |scope| scope.rfind(['$', '+']).map(|cut| &scope[..cut]),
+    )
+}
+
+/// C#'s enclosing-type stage of type lookup, missing from
+/// [`visible_type_candidates_with_lookups`] because that search is keyed on a
+/// `ProjectFile` and so only ever offers alias, namespace and `using` scopes.
+///
+/// A spelling written inside a type declaration -- including its base-type
+/// list -- first names a type nested in that type or in any type enclosing it,
+/// and that scope wins over every namespace scope. Supertype resolution had no
+/// such stage, so `class Derived : Base` where `Base` is a sibling nested type
+/// resolved to nothing at all and the derived type reported no ancestors
+/// (#1801).
+///
+/// `type_candidates_by_fqn` returns `None` when its own bounded budget ran out,
+/// which aborts the search rather than reporting a miss, exactly as the
+/// file-keyed search does. A `global::`- or alias-qualified spelling names an
+/// absolute scope and never reaches this stage.
+pub fn enclosing_type_candidates_with_lookups<Candidates>(
+    declaring_type_fqn: &str,
+    name: &str,
+    type_candidates_by_fqn: &mut Candidates,
+) -> Option<Vec<CodeUnit>>
+where
+    Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
+{
+    let normalized = normalize_csharp_type_fragment(name);
+    if normalized.is_empty() || normalized.contains("::") {
+        return Some(Vec::new());
+    }
+    for scope in enclosing_type_scopes(declaring_type_fqn) {
+        let candidates = type_candidates_by_fqn(&format!("{scope}.{normalized}"))?;
+        if !candidates.is_empty() {
+            return Some(candidates);
+        }
+    }
+    Some(Vec::new())
+}
+
+/// Every declaration a base-type spelling on `declaring_type_fqn` can name:
+/// the enclosing type chain first, then whatever the file-keyed search offers.
+///
+/// The four C# supertype walks -- the analyzer's `direct_ancestors`, its
+/// bounded session fork, and the two attribute-class evidence walks -- all
+/// resolve a raw supertype spelling this way, so the two stages are composed
+/// here once rather than at each of them.
+pub fn supertype_candidates_with_lookups<Candidates, Visible>(
+    declaring_type_fqn: &str,
+    raw: &str,
+    type_candidates_by_fqn: &mut Candidates,
+    visible_type_candidates: &mut Visible,
+) -> Vec<CodeUnit>
+where
+    Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
+    Visible: FnMut(&str) -> Vec<CodeUnit>,
+{
+    let nested =
+        enclosing_type_candidates_with_lookups(declaring_type_fqn, raw, type_candidates_by_fqn)
+            .unwrap_or_default();
+    if !nested.is_empty() {
+        return nested;
+    }
+    visible_type_candidates(raw)
+}
+
+/// [`supertype_candidates_with_lookups`] over an unbounded [`CSharpSource`].
+pub fn supertype_candidates(
+    source: &dyn CSharpSource,
+    part: &CodeUnit,
+    raw: &str,
+    usage: bool,
+) -> Vec<CodeUnit> {
+    supertype_candidates_with_lookups(
+        &part.fq_name(),
+        raw,
+        &mut |fqn| Some(type_candidates_by_fqn(source, fqn, usage)),
+        &mut |name| {
+            if usage {
+                usage_visible_type_candidates(source, part.source(), name)
+            } else {
+                visible_type_candidates(source, part.source(), name)
+            }
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

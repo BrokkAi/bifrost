@@ -11,9 +11,9 @@ use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
 
 use crate::graph_support::{
-    CSharpSource, logical_type_count, partial_type_parts, resolve_usage_visible_type,
-    resolve_visible_type, sort_dedup_type_candidates, sort_type_candidates,
-    usage_partial_type_parts, usage_visible_type_candidates, visible_type_candidates,
+    CSharpSource, logical_type_count, partial_type_parts, sort_dedup_type_candidates,
+    sort_type_candidates, supertype_candidates, unique_logical_type, usage_partial_type_parts,
+    usage_visible_type_candidates, visible_type_candidates,
 };
 use crate::syntax::csharp_normalize_full_name;
 
@@ -193,11 +193,7 @@ fn attribute_class_evidence(
                     decisive_non_attribute_base = true;
                     continue;
                 }
-                let ancestors = if usage {
-                    usage_visible_type_candidates(source, part.source(), &raw)
-                } else {
-                    visible_type_candidates(source, part.source(), &raw)
-                };
+                let ancestors = supertype_candidates(source, &part, &raw, usage);
                 if ancestors.is_empty() {
                     unresolved_ancestry = true;
                     continue;
@@ -241,11 +237,7 @@ pub fn logical_direct_ancestors(
     let mut ancestors = Vec::new();
     for part in parts {
         ancestors.extend(source.raw_supertypes_of(&part).iter().filter_map(|raw| {
-            if usage {
-                resolve_usage_visible_type(source, part.source(), raw)
-            } else {
-                resolve_visible_type(source, part.source(), raw)
-            }
+            unique_logical_type(supertype_candidates(source, &part, raw, usage))
         }));
     }
     sort_dedup_type_candidates(&mut ancestors);

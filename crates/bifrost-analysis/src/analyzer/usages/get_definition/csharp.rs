@@ -168,6 +168,26 @@ impl<'a> CSharpDefinitionProvider<'a> {
         )
     }
 
+    /// Every declaration a base-type spelling on `part` can name. C# looks in
+    /// the declaring type's enclosing type chain before the file's namespace
+    /// and `using` scopes, which is the only way a nested base spelled by its
+    /// simple name is reachable (#1801).
+    fn supertype_candidates(&self, part: &CodeUnit, raw: &str) -> Vec<CodeUnit> {
+        graph_support::supertype_candidates_with_lookups(
+            &part.fq_name(),
+            raw,
+            &mut |fqn| {
+                let candidates = self
+                    .fqn(fqn)
+                    .into_iter()
+                    .filter(CodeUnit::is_class)
+                    .collect();
+                self.observe_cancellation().then_some(candidates)
+            },
+            &mut |name| self.visible_type_candidates(part.source(), name),
+        )
+    }
+
     fn partial_type_parts(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
         match self.session {
             Some(session) => session.query_limited_rows(|limit| {
@@ -291,7 +311,7 @@ impl<'a> CSharpDefinitionProvider<'a> {
                     if matches!(normalized_raw.as_str(), "object" | "System.Object") {
                         continue;
                     }
-                    let ancestors = self.visible_type_candidates(part.source(), &raw);
+                    let ancestors = self.supertype_candidates(&part, &raw);
                     if !self.observe_cancellation() {
                         return None;
                     }
@@ -342,16 +362,11 @@ impl<'a> CSharpDefinitionProvider<'a> {
                 return Vec::new();
             }
             for raw in raw_supertypes {
-                let mut candidates = self.visible_type_candidates(part.source(), &raw);
+                let candidates = self.supertype_candidates(&part, &raw);
                 if !self.observe_cancellation() {
                     return Vec::new();
                 }
-                if graph_support::logical_type_count(&candidates) == 1 {
-                    graph_support::sort_type_candidates(&mut candidates);
-                    if let Some(ancestor) = candidates.into_iter().next() {
-                        ancestors.push(ancestor);
-                    }
-                }
+                ancestors.extend(graph_support::unique_logical_type(candidates));
             }
         }
         graph_support::sort_dedup_type_candidates(&mut ancestors);
