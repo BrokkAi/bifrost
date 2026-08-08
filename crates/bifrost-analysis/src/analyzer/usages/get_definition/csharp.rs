@@ -18,6 +18,7 @@ use crate::analyzer::{
     csharp_normalize_full_name, csharp_source_identifier,
 };
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
 use brokk_bifrost_csharp::syntax::{
     csharp_using_directive_is_static, csharp_using_directive_target_node,
 };
@@ -510,6 +511,12 @@ fn resolve_csharp_in_session(
         return no_definition(
             "declaration_or_import_site",
             format!("`{}` is not a C# reference site", site.text),
+        );
+    }
+    if csharp_is_statement_label(node) {
+        return no_definition(
+            "statement_label_site",
+            format!("`{}` is a C# statement label, not a reference", site.text),
         );
     }
 

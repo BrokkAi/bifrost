@@ -990,6 +990,39 @@ pub fn is_declaration_name(node: Node<'_>) -> bool {
     false
 }
 
+/// Whether `node` names a C# statement label: the label of a `labeled_statement`
+/// (`Render:`) or the target of a bare `goto Render;`.
+///
+/// A label lives in the method's own label namespace, so it is not a reference
+/// to a declaration. It must never resolve against the enclosing class the way
+/// a bare member reference does, and no declaration index will ever hold one
+/// (#1799).
+///
+/// `goto case <constant>;` and `goto default;` are deliberately not labels: the
+/// grammar admits any expression after `case`, and that expression names a real
+/// constant.
+pub fn is_statement_label(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        // `labeled_statement: seq($.identifier, ':', $.statement)` - the label is
+        // the first named child, the labelled statement is the second.
+        "labeled_statement" => parent
+            .named_child(0)
+            .is_some_and(|label| same_node(label, node)),
+        // `goto_statement: seq('goto', optional(choice('case', 'default')),
+        // optional($.expression), ';')`.
+        "goto_statement" => {
+            let mut cursor = parent.walk();
+            !parent
+                .children(&mut cursor)
+                .any(|child| matches!(child.kind(), "case" | "default"))
+        }
+        _ => false,
+    }
+}
+
 pub fn member_access_receiver(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("expression")
         .or_else(|| node.named_child(0))

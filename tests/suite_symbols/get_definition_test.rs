@@ -3928,6 +3928,98 @@ fn csharp_private_field_reference_resolves_via_enclosing_class() {
     );
 }
 
+// A C# statement label is not a member reference. `goto Render;` and the
+// `Render:` label declaration must not forward-resolve to a same-named method
+// of the enclosing class, while a real call to that method in the same body
+// still resolves (census-seeded FIRD on markdig RendererBase.cs, #1799).
+#[test]
+fn csharp_goto_label_and_label_declaration_are_not_member_references() {
+    let source = "namespace Demo\n{\n    public abstract class RendererBase\n    {\n        public abstract object Render(object o);\n\n        public object Write(object obj, bool flag)\n        {\n            if (flag)\n            {\n                goto Render;\n            }\n\n            obj = null;\n\n        Render:\n            return Render(obj);\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/RendererBase.cs", source)
+        .build();
+
+    let goto_target = source.find("goto Render;").expect("goto statement") + "goto ".len();
+    let label = source.find("\n        Render:").expect("label declaration") + "\n        ".len();
+    let call = source.find("return Render(obj);").expect("call") + "return ".len();
+
+    for (start, position) in [(goto_target, "goto target"), (label, "label declaration")] {
+        let value = lookup(
+            project.root(),
+            &location_reference("src/RendererBase.cs", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "no_definition", "{position}: {value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "statement_label_site",
+            "{position}: {value}"
+        );
+    }
+
+    let value = lookup(
+        project.root(),
+        &location_reference("src/RendererBase.cs", source, call),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.RendererBase.Render",
+        "{value}"
+    );
+}
+
+// The label answer must not depend on a same-named method existing: a label the
+// workspace has no member for is still a label site, not an unresolved member
+// reference (#1799).
+#[test]
+fn csharp_goto_label_without_a_same_named_member_is_still_a_label_site() {
+    let source = "namespace Demo\n{\n    public class Loader\n    {\n        public void Load(bool flag)\n        {\n            if (flag)\n            {\n                goto Cleanup;\n            }\n\n        Cleanup:\n            return;\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Loader.cs", source)
+        .build();
+
+    let goto_target = source.find("goto Cleanup;").expect("goto statement") + "goto ".len();
+    let label = source
+        .find("\n        Cleanup:")
+        .expect("label declaration")
+        + "\n        ".len();
+
+    for (start, position) in [(goto_target, "goto target"), (label, "label declaration")] {
+        let value = lookup(
+            project.root(),
+            &location_reference("src/Loader.cs", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "no_definition", "{position}: {value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "statement_label_site",
+            "{position}: {value}"
+        );
+    }
+}
+
+// `goto case <constant>;` names a constant, not a statement label, so the label
+// exclusion must leave that expression a live reference (#1799).
+#[test]
+fn csharp_goto_case_constant_stays_a_member_reference() {
+    let source = "namespace Demo\n{\n    public class Router\n    {\n        public const int Retry = 1;\n        public const int Fallback = 2;\n\n        public string Route(int value)\n        {\n            switch (value)\n            {\n                case Retry:\n                    goto case Fallback;\n                case Fallback:\n                    return \"fallback\";\n                default:\n                    return \"none\";\n            }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Router.cs", source)
+        .build();
+
+    let start = source.find("goto case Fallback;").expect("goto case") + "goto case ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/Router.cs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.Router.Fallback",
+        "{value}"
+    );
+}
+
 // A static import may name a nested type: `import static com.x.Tacos.Burritos`
 // followed by `Burritos.makeBurritos(1)` must resolve to the nested class,
 // not fail with a static-import boundary claim (tier-4 spoon/mockito,
