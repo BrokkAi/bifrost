@@ -2124,7 +2124,7 @@ struct RenderedCodeUnitName {
 
 impl RenderedCodeUnitName {
     fn new(source: &ProjectFile, fq: &FqName, package_segment_count: usize) -> Self {
-        let language = crate::analyzer::common::language_for_file(source);
+        let language = crate::analyzer::common::declaration_language_for_file(source);
         let interner = segment_interner();
         let package = fq
             .prefix(package_segment_count)
@@ -2234,7 +2234,7 @@ impl CodeUnit {
             !fq.is_empty() && !short_name.is_empty(),
             "short_name must not be empty (kind={kind:?}, package_name={package_name:?}, source={source}, signature={signature:?}, synthetic={synthetic})"
         );
-        let language = crate::analyzer::common::language_for_file(&source);
+        let language = crate::analyzer::common::declaration_language_for_file(&source);
         let interner = segment_interner();
         let package_segment_count = (0..=fq.len())
             .find(|&prefix_len| {

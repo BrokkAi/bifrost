@@ -72,6 +72,66 @@ fn cpp_namespace_fq(full_name: &str) -> FqName {
     fq
 }
 
+/// The per-level namespace components a `namespace_definition`'s `name` field
+/// declares.
+///
+/// A C++17 nested definition (`namespace a::b::c`) parses as a
+/// `nested_namespace_specifier` whose named children are the per-level
+/// `namespace_identifier`s plus, for three or more levels, a further
+/// `nested_namespace_specifier`; the `::` separators, the optional per-level
+/// `inline`, and the leading global `::` are all anonymous tokens the walk
+/// skips. Reading those nodes keeps the shorthand on the same one-level-per-
+/// segment path as the expanded `namespace a { namespace b { } }` form.
+///
+/// A shape outside that grammar is the deliberately ill-formed source the
+/// diagnostic corpora carry. Those keep their historical single-component
+/// reading of the raw name text, which the caller still joins to the lexical
+/// namespace exactly as before.
+fn cpp_namespace_name_components(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut components = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "namespace_identifier" | "identifier" => {
+                components.push(normalize_cpp_whitespace(node_text(current, source)));
+            }
+            "nested_namespace_specifier" => {
+                for index in (0..current.named_child_count()).rev() {
+                    stack.push(
+                        current
+                            .named_child(index)
+                            .expect("index below the node's own named child count"),
+                    );
+                }
+            }
+            _ => return cpp_raw_namespace_name_components(node, source),
+        }
+    }
+    if components.iter().any(String::is_empty) {
+        return cpp_raw_namespace_name_components(node, source);
+    }
+    components
+}
+
+/// The historical reading of a namespace name node: its whole source text as
+/// one component, with a leading global `::` marker dropped so the caller's
+/// global-scope handling stays the AST boundary rather than a text prefix.
+fn cpp_raw_namespace_name_components(node: Node<'_>, source: &str) -> Vec<String> {
+    let start = node
+        .child(0)
+        .filter(|child| !child.is_named() && child.kind() == "::")
+        .map_or(node.start_byte(), |marker| marker.end_byte());
+    let text = normalize_cpp_whitespace(
+        source
+            .get(start..node.end_byte())
+            .expect("namespace name node covers one source range"),
+    );
+    if text.is_empty() {
+        return Vec::new();
+    }
+    vec![text]
+}
+
 /// Return the named namespace path that structurally encloses `node`.
 ///
 /// This intentionally follows namespace AST ancestors rather than inspecting
@@ -2038,39 +2098,45 @@ impl<'a> CppVisitor<'a> {
         let explicitly_global = name_node
             .child(0)
             .is_some_and(|child| !child.is_named() && child.kind() == "::");
-        let name = if explicitly_global {
-            let marker = name_node.child(0).expect("checked global namespace marker");
-            normalize_cpp_whitespace(
-                self.source
-                    .get(marker.end_byte()..name_node.end_byte())
-                    .expect("namespace marker and name share one source range"),
-            )
-        } else {
-            normalize_cpp_whitespace(node_text(name_node, self.source))
-        };
-        if name.is_empty() {
+        let components = cpp_namespace_name_components(name_node, self.source);
+        if components.is_empty() {
             return;
         }
-        let full_name = if explicitly_global || scope.package_name.is_empty() {
-            name
+        // One Module per namespace level. C++17's `namespace a::b { ... }` is
+        // DEFINED to mean `namespace a { namespace b { ... } }`, so the
+        // shorthand must declare `a` as well as `a::b` -- extracting only the
+        // innermost level left the enclosing namespace undeclared and made the
+        // two spellings of one construct disagree (issue #1878).
+        let mut package_name = if explicitly_global {
+            String::new()
         } else {
-            format!("{}::{}", scope.package_name, name)
+            scope.package_name.clone()
         };
-        let module = CodeUnit::new_fq(
-            self.file.clone(),
-            CodeUnitType::Module,
-            "",
-            full_name.clone(),
-            cpp_namespace_fq(&full_name),
-        );
-        if !self.parsed.contains_declaration(&module) {
-            self.parsed
-                .add_code_unit(module.clone(), node, self.source, None, None);
+        let mut module = None;
+        for component in components {
+            let full_name = if package_name.is_empty() {
+                component
+            } else {
+                format!("{package_name}::{component}")
+            };
+            let level = CodeUnit::new_fq(
+                self.file.clone(),
+                CodeUnitType::Module,
+                "",
+                full_name.clone(),
+                cpp_namespace_fq(&full_name),
+            );
+            if !self.parsed.contains_declaration(&level) {
+                self.parsed
+                    .add_code_unit(level.clone(), node, self.source, None, None);
+            }
+            package_name = full_name;
+            module = Some(level);
         }
 
         let namespace_scope = ScopeInfo {
-            package_name: full_name,
-            module: Some(module),
+            package_name,
+            module,
             class_unit: scope.class_unit.clone(),
             template_signature: scope.template_signature.clone(),
             template_metadata: scope.template_metadata.clone(),

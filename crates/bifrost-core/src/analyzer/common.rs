@@ -22,7 +22,7 @@ pub fn node_span(node: Node<'_>) -> Span {
 }
 
 pub fn language_for_target(target: &CodeUnit) -> Language {
-    language_for_file(target.source())
+    declaration_language_for_file(target.source())
 }
 
 pub fn language_for_file(file: &ProjectFile) -> Language {
@@ -31,6 +31,40 @@ pub fn language_for_file(file: &ProjectFile) -> Language {
         .and_then(|ext| ext.to_str())
         .map(Language::from_extension)
         .unwrap_or(Language::None)
+}
+
+/// The single language whose adapter adopts files by include inference
+/// (#1837).
+///
+/// The CLAIMS SEAM registry that drives inference is
+/// `analyzer::languages::claim_inferring_languages` over in
+/// `brokk-bifrost-analysis`, which core cannot reach; core needs the same fact
+/// to name a declaration found in a claimed file. `core_claiming_language_
+/// matches_the_claims_seam` in that module asserts the two agree. The
+/// registry's own single-claimant invariant -- also what
+/// `LanguageAdapter::storage_language_key_for_file` rests on -- is what lets
+/// this be one language rather than a set.
+pub const INCLUDE_CLAIMING_LANGUAGE: Language = Language::Cpp;
+
+/// The language whose spelling rules name a declaration that lives in `file`.
+///
+/// This differs from [`language_for_file`] for exactly the files include-driven
+/// inference adopts (#1837). Those have, by construction, an extension no
+/// language's registry claims, so the extension answers `Language::None` -- yet
+/// a declaration only exists in such a file because the claiming analyzer
+/// parsed it, and its qualified name must be spelled in that analyzer's
+/// language. Rendering a C++ namespace head with `Language::None`'s neutral `.`
+/// join turned `tbb::interface5` into `tbb.interface5` and tripped the FqName
+/// round-trip assertion at construction, panicking the workspace build on
+/// midonet's extensionless vendored TBB headers (issue #1878).
+///
+/// Use [`language_for_file`] to ask which language's extension list owns a
+/// path; use this to ask how a declaration found in that path is named.
+pub fn declaration_language_for_file(file: &ProjectFile) -> Language {
+    match language_for_file(file) {
+        Language::None if has_unclaimed_extension(file) => INCLUDE_CLAIMING_LANGUAGE,
+        language => language,
+    }
 }
 
 /// Whether no analyzable language claims this file's extension.

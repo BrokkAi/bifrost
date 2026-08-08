@@ -712,6 +712,7 @@ mod tests {
         KotlinAnalyzer, PhpAnalyzer, PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
         TypescriptAnalyzer,
     };
+    use brokk_bifrost_core::analyzer::common::INCLUDE_CLAIMING_LANGUAGE;
     use std::collections::{BTreeMap, BTreeSet};
 
     const ANALYZABLE: [Language; 12] = [
@@ -1026,5 +1027,19 @@ Kotlin     | Jvm                  | Kotlin | .   | yes      | -      | yes  | - 
                 );
             }
         }
+    }
+
+    /// `brokk-bifrost-core` cannot reach this CLAIMS SEAM registry, but it has
+    /// to name declarations found in the files inference claims -- an
+    /// unclaimed-extension file renders its qualified name in the claiming
+    /// language rather than `Language::None` (#1878). Its copy of the fact must
+    /// track this one.
+    #[test]
+    fn core_claiming_language_matches_the_claims_seam() {
+        assert_eq!(
+            [INCLUDE_CLAIMING_LANGUAGE].as_slice(),
+            claim_inferring_languages(),
+            "core's INCLUDE_CLAIMING_LANGUAGE must name exactly the claim-inferring registry"
+        );
     }
 }

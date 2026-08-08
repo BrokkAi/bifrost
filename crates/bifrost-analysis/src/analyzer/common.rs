@@ -7,7 +7,8 @@ pub(crate) use brokk_bifrost_core::analyzer::common::{
 #[cfg(test)]
 pub(crate) use brokk_bifrost_core::analyzer::common::DEFAULT_MAX_LINE_LENGTH;
 pub use brokk_bifrost_core::analyzer::common::{
-    has_unclaimed_extension, is_unparseable_source, language_for_file, language_for_target,
+    declaration_language_for_file, has_unclaimed_extension, is_unparseable_source,
+    language_for_file, language_for_target,
 };
 // Each language's identifier sigil moved with the language: Rust's to
 // `brokk-bifrost-rust`, C#'s to `brokk-bifrost-csharp` (its one consumer,

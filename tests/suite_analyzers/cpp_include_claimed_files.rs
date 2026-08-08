@@ -250,3 +250,36 @@ fn claim_set_does_not_depend_on_file_presentation_order() {
     assert!(forward.contains("b.inc"), "{forward:?}");
     assert!(!forward.contains("orphan.inc"), "{forward:?}");
 }
+
+/// #1878: an include-claimed file's extension names no language by
+/// construction, so the CodeUnit naming boundary derived `Language::None` for
+/// it and rendered adjacent namespace (`Package`) segments with the neutral
+/// `.` join while the C++ extractor supplied the `::`-joined package
+/// projection. The FqName round-trip assertion then fired and panicked the
+/// whole workspace build. The real-world trigger was midonet's vendored
+/// TBB 2017 headers -- `tools/tbb-2017_U6/include/tbb/compat/condition_variable`
+/// is extensionless and opens `namespace tbb { namespace interface5 { ... } }`.
+#[test]
+fn claimed_extensionless_header_with_a_nested_namespace_keeps_cpp_spelling() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "main.cc",
+            "#include \"condition_variable\"\n\nint main() { return tbb::interface5::spin(); }\n",
+        )
+        .file(
+            "condition_variable",
+            "namespace tbb {\nnamespace interface5 {\nint spin() { return 1; }\n}\n}\n",
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let names = declaration_names(analyzer.get_declarations(&project.file("condition_variable")));
+    assert!(
+        names.contains("tbb::interface5"),
+        "a claimed file's namespace must keep the C++ `::` spelling: {names:?}"
+    );
+    assert!(
+        names.contains("tbb::interface5.spin"),
+        "a claimed file's member must keep the C++ `::` namespace head: {names:?}"
+    );
+}
