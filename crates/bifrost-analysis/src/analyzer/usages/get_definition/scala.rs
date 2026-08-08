@@ -6670,13 +6670,8 @@ fn resolve_scala_call(
                             ),
                         );
                     }
-                    ScalaTypedOverloadResolution::Ambiguous => {
-                        return no_definition(
-                            "ambiguous_scala_typed_overload",
-                            format!(
-                                "`{name}` overloads cannot be selected from exact argument type identity"
-                            ),
-                        );
+                    ScalaTypedOverloadResolution::Ambiguous(candidates) => {
+                        return candidates_outcome(candidates);
                     }
                     ScalaTypedOverloadResolution::IncompleteHierarchy => {
                         incomplete_hierarchy_owner = Some(owner.clone());
@@ -7705,7 +7700,10 @@ enum ScalaTypedOverloadResolution {
     NotNeeded,
     Found(Vec<CodeUnit>),
     NoApplicable,
-    Ambiguous,
+    /// Overload selection ran over two or more visible declarations and could
+    /// not choose. The contenders travel with the verdict: the caller answers
+    /// with them, never with an empty ambiguity.
+    Ambiguous(Vec<CodeUnit>),
     /// The enclosing owner has a supertype this workspace cannot resolve to a
     /// single indexed declaration, and no visible level declared the member.
     /// The declaration may live in the part of the hierarchy that is missing,
@@ -7875,24 +7873,27 @@ fn scala_exact_owner_typed_overload_resolution(
             ScalaTypedOverloadResolution::NotNeeded
         };
     }
+    // Every remaining verdict carries the overloads it could not choose between.
+    // An answer that lists nothing gives a caller nothing to act on (#1811),
+    // and these candidates are proven declarations of the called name.
     let Some(arguments) = scala_exact_constructed_call_arguments(ctx, resolver, call) else {
-        return ScalaTypedOverloadResolution::Ambiguous;
+        return ScalaTypedOverloadResolution::Ambiguous(levels.concat());
     };
 
     for candidates in levels {
         let mut matching = Vec::new();
         let mut unknown = false;
-        for candidate in candidates {
+        for candidate in &candidates {
             match scala_callable_matches_constructed_arguments(
-                ctx, &candidate, call_shape, &arguments,
+                ctx, candidate, call_shape, &arguments,
             ) {
-                ScalaTypedCandidateMatch::Match => matching.push(candidate),
+                ScalaTypedCandidateMatch::Match => matching.push(candidate.clone()),
                 ScalaTypedCandidateMatch::Mismatch => {}
                 ScalaTypedCandidateMatch::Unknown => unknown = true,
             }
         }
         if unknown {
-            return ScalaTypedOverloadResolution::Ambiguous;
+            return ScalaTypedOverloadResolution::Ambiguous(candidates);
         }
         sort_units(&mut matching);
         matching.dedup();
@@ -7904,7 +7905,7 @@ fn scala_exact_owner_typed_overload_resolution(
             return if physical_owners.len() == 1 {
                 ScalaTypedOverloadResolution::Found(matching)
             } else {
-                ScalaTypedOverloadResolution::Ambiguous
+                ScalaTypedOverloadResolution::Ambiguous(matching)
             };
         }
     }
