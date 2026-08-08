@@ -111,22 +111,173 @@ pub(super) struct RustUsageWalks<'a> {
     cargo_routes: Arc<RustCargoRouteIndex>,
     files: Arc<RustPackageFileIndex>,
     caches: Arc<RustWalkCaches>,
-    /// The best answer so far for each key whose computation is on this
-    /// walker's stack. The v1 builds reached a fixed point by iterating the
-    /// whole workspace; a recursion has to close its own cycles, and answering
-    /// a cycle with the partial result is what makes the local iteration below
-    /// converge on the same value.
-    alias_partial: RefCell<HashMap<ModuleKey, Arc<Vec<RustModuleAliasRoute>>>>,
-    /// Incremented whenever a cycle answered from a partial result. A value
-    /// derived from a partial is correct for the frame that closed the cycle
-    /// but not in general, so it must never reach the analyzer-level cache.
-    alias_truncations: Cell<usize>,
-    /// The same bookkeeping for the export-chain recursion: a re-export cycle
-    /// (`a` publishes `b`'s name, `b` publishes `a`'s) has to terminate, and a
+    /// The request's cooperative-cancellation predicate, when the caller
+    /// supplied one. Every unbounded loop below polls it, and no cache is
+    /// written after it trips: a scan whose budget expired must stop doing
+    /// work, and the truncated answer it was holding must not be memoized for
+    /// the rest of the generation.
+    keep_going: Option<&'a (dyn Fn() -> bool + Sync)>,
+    /// The alias recursion's cycle state. The v1 builds reached a fixed point
+    /// by iterating the whole workspace; a recursion has to close its own
+    /// cycles, which is what [`CycleWalk`] does.
+    alias_walk: RefCell<CycleWalk<ModuleKey, Arc<Vec<RustModuleAliasRoute>>>>,
+    /// The same for the export-chain recursion: a re-export cycle (`a`
+    /// publishes `b`'s name, `b` publishes `a`'s) has to terminate, and a
     /// module that imports from itself -- `pub(crate) use target_macro;` beside
     /// the `macro_rules!` it republishes -- is a cycle of length one.
-    binding_partial: RefCell<HashMap<RustModuleBindingKey, Arc<Vec<RustModuleBinding>>>>,
-    binding_truncations: Cell<usize>,
+    binding_walk: RefCell<CycleWalk<RustModuleBindingKey, Arc<Vec<RustModuleBinding>>>>,
+    /// How many times a recursion body ran, for the #1809 regression pin.
+    computations: Cell<usize>,
+}
+
+/// The state of one memoized recursion that has to survive cycles in the graph
+/// it walks.
+///
+/// The rule is chaotic iteration over everything the outermost frame reaches:
+/// a re-entry is answered with the value so far, each key costs one
+/// computation per round, and the outermost frame repeats the whole walk until
+/// a round changes nothing. Both recursions accumulate their results through
+/// `push_unique`, so a value only ever grows and a round that grew no value
+/// has reached the fixed point -- at which point every key that round
+/// recomputed is final and can be memoized.
+///
+/// What this replaces, and why it had to: the first form answered a re-entry
+/// from a partial and then iterated THAT frame to a local fixed point, keeping
+/// its result out of the analyzer cache because it came out of a partial. In a
+/// cycle every member does both, so every member re-runs its whole subtree
+/// twice or more and nothing is ever memoized -- the cost is exponential in
+/// the cycle. Measured on the synthetic fixture in this file's tests, one
+/// `bindings_at` on eight modules importing three neighbours each ran the
+/// recursion body 25,214 times and grew about fourfold per added module, which
+/// is issue #1809's ">600 s at twenty-four modules".
+struct CycleWalk<K, V> {
+    /// The value so far for every key this walk has reached.
+    partial: HashMap<K, V>,
+    /// Keys already recomputed in the current round.
+    resolved: HashSet<K>,
+    /// Keys whose computation is on the stack right now.
+    active: HashSet<K>,
+    /// Set when a re-entry was answered from a partial value, which is the
+    /// only reason to run another round.
+    hit_cycle: bool,
+    /// Bumped whenever a key's value grew, so the outermost frame can tell a
+    /// round that moved from a round that did not.
+    revision: u64,
+}
+
+impl<K, V> Default for CycleWalk<K, V> {
+    fn default() -> Self {
+        Self {
+            partial: HashMap::default(),
+            resolved: HashSet::default(),
+            active: HashSet::default(),
+            hit_cycle: false,
+            revision: 0,
+        }
+    }
+}
+
+/// What [`resolve_with_cycles`] hands back.
+enum CycleAnswer<K, V> {
+    /// The outermost frame closed its walk: `value` is final, and so is every
+    /// `(key, value)` in `settled`.
+    Settled { value: V, settled: Vec<(K, V)> },
+    /// A value from a walk that is still running, or one that cancellation cut
+    /// short. Correct for the frame that asked; not correct in general, so it
+    /// must not reach the analyzer cache.
+    Provisional(V),
+}
+
+/// Run `compute` for `key` under [`CycleWalk`]'s iteration rule.
+///
+/// `compute` re-enters this function for the keys it depends on, which is
+/// where cycles come from. `seed` supplies the answer a re-entry gets before
+/// `compute` has produced anything -- for the export chain that is the
+/// module's own declarations, which is what the v1 worklist had already seeded
+/// for every module in the workspace before it propagated anything.
+fn resolve_with_cycles<K, V>(
+    walk: &RefCell<CycleWalk<K, Arc<Vec<V>>>>,
+    key: &K,
+    cancelled: &dyn Fn() -> bool,
+    seed: &dyn Fn() -> Vec<V>,
+    compute: &dyn Fn() -> Vec<V>,
+) -> CycleAnswer<K, Arc<Vec<V>>>
+where
+    K: Clone + Eq + std::hash::Hash,
+{
+    {
+        let mut state = walk.borrow_mut();
+        if state.active.contains(key) {
+            state.hit_cycle = true;
+            return CycleAnswer::Provisional(Arc::clone(&state.partial[key]));
+        }
+        if state.resolved.contains(key) {
+            return CycleAnswer::Provisional(Arc::clone(&state.partial[key]));
+        }
+    }
+    let outermost = walk.borrow().active.is_empty();
+    let mut value = compute_cycle_frame(walk, key, seed, compute);
+    if !outermost {
+        return CycleAnswer::Provisional(value);
+    }
+    while walk.borrow().hit_cycle && !cancelled() {
+        let revision = {
+            let mut state = walk.borrow_mut();
+            state.hit_cycle = false;
+            state.resolved.clear();
+            state.revision
+        };
+        value = compute_cycle_frame(walk, key, seed, compute);
+        if walk.borrow().revision == revision {
+            break;
+        }
+    }
+    let mut state = walk.borrow_mut();
+    // A cancelled walk stopped mid-round, so its values are truncated rather
+    // than converged and nothing may be published.
+    let settled = if cancelled() {
+        Vec::new()
+    } else {
+        state
+            .resolved
+            .iter()
+            .map(|settled| (settled.clone(), Arc::clone(&state.partial[settled])))
+            .collect()
+    };
+    state.partial.clear();
+    state.resolved.clear();
+    state.active.clear();
+    state.hit_cycle = false;
+    CycleAnswer::Settled { value, settled }
+}
+
+/// One key's computation inside one round.
+fn compute_cycle_frame<K, V>(
+    walk: &RefCell<CycleWalk<K, Arc<Vec<V>>>>,
+    key: &K,
+    seed: &dyn Fn() -> Vec<V>,
+    compute: &dyn Fn() -> Vec<V>,
+) -> Arc<Vec<V>>
+where
+    K: Clone + Eq + std::hash::Hash,
+{
+    if !walk.borrow().partial.contains_key(key) {
+        let seeded = Arc::new(seed());
+        walk.borrow_mut().partial.insert(key.clone(), seeded);
+    }
+    walk.borrow_mut().active.insert(key.clone());
+    let value = Arc::new(compute());
+    let mut state = walk.borrow_mut();
+    state.active.remove(key);
+    state.resolved.insert(key.clone());
+    let grew = state
+        .partial
+        .insert(key.clone(), Arc::clone(&value))
+        .is_none_or(|previous| previous.len() != value.len());
+    if grew {
+        state.revision += 1;
+    }
+    value
 }
 
 /// One name bound in one module, with the declaration it really names.
@@ -147,19 +298,22 @@ pub(super) struct RustModuleBinding {
 
 impl<'a> RustUsageWalks<'a> {
     pub(super) fn new(analyzer: &'a RustAnalyzer) -> Self {
-        Self::with_cargo_routes(analyzer, analyzer.cargo_routes_for_usage())
+        Self::with_cargo_routes(analyzer, analyzer.cargo_routes_for_usage(), None)
     }
 
     /// The cancellable constructor. Cargo routes are the one input a walk
     /// cannot start without, and building them on a cold workspace is the step
-    /// a cancelled candidate discovery has to be able to abandon.
+    /// a cancelled candidate discovery has to be able to abandon -- but the
+    /// walks themselves are the longer unbounded region, so the predicate is
+    /// kept and polled by every loop below rather than being consumed here.
     pub(super) fn new_while(
         analyzer: &'a RustAnalyzer,
-        keep_going: &(impl Fn() -> bool + Sync),
+        keep_going: &'a (impl Fn() -> bool + Sync),
     ) -> Option<Self> {
         Some(Self::with_cargo_routes(
             analyzer,
             analyzer.cargo_routes_for_usage_while(keep_going)?,
+            Some(keep_going),
         ))
     }
 
@@ -170,6 +324,7 @@ impl<'a> RustUsageWalks<'a> {
     fn with_cargo_routes(
         analyzer: &'a RustAnalyzer,
         cargo_routes: Arc<RustCargoRouteIndex>,
+        keep_going: Option<&'a (dyn Fn() -> bool + Sync)>,
     ) -> Self {
         analyzer.ensure_rust_facts_caught_up();
         Self {
@@ -178,11 +333,29 @@ impl<'a> RustUsageWalks<'a> {
             cargo_routes,
             files: analyzer.package_file_index(),
             caches: Arc::clone(analyzer.walk_caches()),
-            alias_partial: RefCell::new(HashMap::default()),
-            alias_truncations: Cell::new(0),
-            binding_partial: RefCell::new(HashMap::default()),
-            binding_truncations: Cell::new(0),
+            keep_going,
+            alias_walk: RefCell::new(CycleWalk::default()),
+            binding_walk: RefCell::new(CycleWalk::default()),
+            computations: Cell::new(0),
         }
+    }
+
+    /// The request asked this walk to stop.
+    ///
+    /// Every loop that can visit an unbounded number of candidates polls this,
+    /// and every cache write is gated on it. A truncated answer is a correct
+    /// thing to return to a caller that is about to report `Cancelled`, and a
+    /// catastrophic thing to memoize for the rest of the generation.
+    fn cancelled(&self) -> bool {
+        self.keep_going.is_some_and(|keep_going| !keep_going())
+    }
+
+    /// How many times a cycle-closing recursion body ran on this walker. The
+    /// #1809 regression pin: on a cyclic module graph this used to grow
+    /// exponentially in the number of modules.
+    #[cfg(test)]
+    pub(super) fn recursion_computations(&self) -> usize {
+        self.computations.get()
     }
 
     pub(super) fn queries(&self) -> &RustUsageQueries<'a> {
@@ -393,47 +566,34 @@ impl<'a> RustUsageWalks<'a> {
         if let Some(cached) = self.caches.alias_routes.get(alias) {
             return cached;
         }
-        if let Some(partial) = self.alias_partial.borrow().get(alias) {
-            self.alias_truncations.set(self.alias_truncations.get() + 1);
-            return Arc::clone(partial);
-        }
-        let truncations_before = self.alias_truncations.get();
-        self.alias_partial
-            .borrow_mut()
-            .insert(alias.clone(), Arc::new(Vec::new()));
-        let mut routes = Arc::new(self.compute_alias_routes(alias));
-        // Only a cycle needs iterating: without one the recursion already saw
-        // every input, exactly as the converged fixed point did. Routes only
-        // accumulate, so equal length means the value stopped moving.
-        if self.alias_truncations.get() != truncations_before {
-            loop {
-                self.alias_partial
-                    .borrow_mut()
-                    .insert(alias.clone(), Arc::clone(&routes));
-                let next = Arc::new(self.compute_alias_routes(alias));
-                let converged = next.len() == routes.len();
-                routes = next;
-                if converged {
-                    break;
+        match resolve_with_cycles(
+            &self.alias_walk,
+            alias,
+            &|| self.cancelled(),
+            &Vec::new,
+            &|| self.compute_alias_routes(alias),
+        ) {
+            CycleAnswer::Provisional(routes) => routes,
+            CycleAnswer::Settled { value, settled } => {
+                for (key, routes) in settled {
+                    self.caches.alias_routes.insert(key, routes);
                 }
+                value
             }
         }
-        self.alias_partial.borrow_mut().remove(alias);
-        if self.alias_truncations.get() == truncations_before {
-            self.caches
-                .alias_routes
-                .insert(alias.clone(), Arc::clone(&routes));
-        }
-        routes
     }
 
     fn compute_alias_routes(&self, alias: &ModuleKey) -> Vec<RustModuleAliasRoute> {
+        self.computations.set(self.computations.get() + 1);
         let (Some(owner), Some(name)) = (alias.parent(), alias.components.last().cloned()) else {
             return Vec::new();
         };
         let owner_package = owner.package();
         let mut routes: Vec<RustModuleAliasRoute> = Vec::new();
         for file in self.files_for_module(&owner).iter() {
+            if self.cancelled() {
+                break;
+            }
             // Two files can share a package name across crates; only the file
             // whose own crate root matches declares this alias key.
             if ModuleKey::new(file, &owner_package) != owner {
@@ -678,6 +838,9 @@ impl<'a> RustUsageWalks<'a> {
         let mut visited = HashSet::default();
         let mut pending = vec![file.clone()];
         while let Some(current) = pending.pop() {
+            if self.cancelled() {
+                break;
+            }
             if !visited.insert(current.clone()) {
                 continue;
             }
@@ -693,9 +856,11 @@ impl<'a> RustUsageWalks<'a> {
         roots.sort();
         roots.dedup();
         let roots = Arc::new(roots);
-        self.caches
-            .owner_roots
-            .insert(file.clone(), Arc::clone(&roots));
+        if !self.cancelled() {
+            self.caches
+                .owner_roots
+                .insert(file.clone(), Arc::clone(&roots));
+        }
         roots
     }
 
@@ -752,7 +917,12 @@ impl<'a> RustUsageWalks<'a> {
                 );
             }
         }
+        // Every external `mod name;` in the workspace, so this is the one loop
+        // here whose length is the workspace rather than the walk.
         for declaration in self.cargo_routes.external_module_declarations() {
+            if self.cancelled() {
+                break;
+            }
             if !self.is_analyzed(&declaration.target_file)
                 || ModuleKey::new(
                     &declaration.target_file,
@@ -799,9 +969,11 @@ impl<'a> RustUsageWalks<'a> {
                     .collect::<Vec<_>>(),
             )
         });
-        self.caches
-            .module_domains
-            .insert(module.clone(), effective.clone());
+        if !self.cancelled() {
+            self.caches
+                .module_domains
+                .insert(module.clone(), effective.clone());
+        }
         effective
     }
     // ---------------------------------------------------------------- layer 3
@@ -817,6 +989,9 @@ impl<'a> RustUsageWalks<'a> {
         }
         let mut edges: Vec<RustImportEdge> = Vec::new();
         for binding in self.queries.import_bindings_of(file) {
+            if self.cancelled() {
+                break;
+            }
             let owner = &binding.owner_module;
             let propagate_alias = matches!(binding.extent, RustImportExtent::Module { .. });
             let Some(edge_domain) =
@@ -875,9 +1050,11 @@ impl<'a> RustUsageWalks<'a> {
             }
         }
         let edges = Arc::new(edges);
-        self.caches
-            .forward_import_edges
-            .insert(file.clone(), Arc::clone(&edges));
+        if !self.cancelled() {
+            self.caches
+                .forward_import_edges
+                .insert(file.clone(), Arc::clone(&edges));
+        }
         edges
     }
 
@@ -967,7 +1144,14 @@ impl<'a> RustUsageWalks<'a> {
         identity: &RustSymbolIdentity,
     ) -> Vec<RustImportEdge> {
         let mut edges = Vec::new();
+        // One candidate is one full forward-edge computation, and a common
+        // identifier offers thousands of them on a large workspace: this is
+        // the longest single region a usage query spends in the walk layer,
+        // so it is the one that most has to stop when the budget expires.
         for candidate in self.importer_candidates_for(identity) {
+            if self.cancelled() {
+                break;
+            }
             edges.extend(
                 self.forward_import_edges_of(&candidate)
                     .iter()
@@ -990,6 +1174,7 @@ impl<'a> RustUsageWalks<'a> {
         candidates.dedup();
         let mut importers: Vec<ProjectFile> = candidates
             .into_iter()
+            .take_while(|_| !self.cancelled())
             .filter(|candidate| {
                 self.forward_import_edges_of(candidate)
                     .iter()
@@ -1014,41 +1199,25 @@ impl<'a> RustUsageWalks<'a> {
         if let Some(cached) = self.caches.module_bindings.get(&key) {
             return cached;
         }
-        if let Some(partial) = self.binding_partial.borrow().get(&key) {
-            self.binding_truncations
-                .set(self.binding_truncations.get() + 1);
-            return Arc::clone(partial);
-        }
-        let truncations_before = self.binding_truncations.get();
         // The v1 worklist seeded every declaration in the workspace before it
         // propagated anything, so an import that republishes a name declared
         // beside it always found that declaration already present. Seeding the
         // cycle answer with the declared half reproduces that.
-        self.binding_partial.borrow_mut().insert(
-            key.clone(),
-            Arc::new(self.declared_bindings_at(file, module)),
-        );
-        let mut bindings = Arc::new(self.compute_bindings_at(file, module));
-        if self.binding_truncations.get() != truncations_before {
-            loop {
-                self.binding_partial
-                    .borrow_mut()
-                    .insert(key.clone(), Arc::clone(&bindings));
-                let next = Arc::new(self.compute_bindings_at(file, module));
-                let converged = next.len() == bindings.len();
-                bindings = next;
-                if converged {
-                    break;
+        match resolve_with_cycles(
+            &self.binding_walk,
+            &key,
+            &|| self.cancelled(),
+            &|| self.declared_bindings_at(file, module),
+            &|| self.compute_bindings_at(file, module),
+        ) {
+            CycleAnswer::Provisional(bindings) => bindings,
+            CycleAnswer::Settled { value, settled } => {
+                for (key, bindings) in settled {
+                    self.caches.module_bindings.insert(key, bindings);
                 }
+                value
             }
         }
-        self.binding_partial.borrow_mut().remove(&key);
-        if self.binding_truncations.get() == truncations_before {
-            self.caches
-                .module_bindings
-                .insert(key, Arc::clone(&bindings));
-        }
-        bindings
     }
 
     /// The half of `bindings_at` that needs no other module: what this file
@@ -1086,12 +1255,16 @@ impl<'a> RustUsageWalks<'a> {
         file: &ProjectFile,
         module: &ModuleKey,
     ) -> Vec<RustModuleBinding> {
+        self.computations.set(self.computations.get() + 1);
         let mut bindings = self.declared_bindings_at(file, module);
         for edge in self
             .forward_import_edges_of(file)
             .iter()
             .filter(|edge| edge.propagate_alias && edge.importer_module == *module)
         {
+            if self.cancelled() {
+                break;
+            }
             let name = match &edge.kind {
                 RustImportEdgeKind::Named(_) => Some(edge.local_name.clone()),
                 RustImportEdgeKind::Glob => None,
@@ -1184,6 +1357,9 @@ impl<'a> RustUsageWalks<'a> {
         }
         let mut routes: HashMap<String, Vec<RustOriginRoute>> = HashMap::default();
         for edge in self.forward_import_edges_of(file).iter() {
+            if self.cancelled() {
+                break;
+            }
             for (target, binding) in self.edge_targets(edge) {
                 let Some(effective) = self.effective_import_domain(&target, &binding.domain, edge)
                 else {
@@ -1216,9 +1392,11 @@ impl<'a> RustUsageWalks<'a> {
             }
         }
         let routes = Arc::new(routes);
-        self.caches
-            .origin_routes
-            .insert(file.clone(), Arc::clone(&routes));
+        if !self.cancelled() {
+            self.caches
+                .origin_routes
+                .insert(file.clone(), Arc::clone(&routes));
+        }
         routes
     }
 
@@ -1240,6 +1418,9 @@ impl<'a> RustUsageWalks<'a> {
             let root_module = ModuleKey::new(file, &rust_package_name(file));
             let mut pending = vec![(prepared.tree().root_node(), root_module)];
             while let Some((node, owner)) = pending.pop() {
+                if self.cancelled() {
+                    break;
+                }
                 let mut cursor = node.walk();
                 let children = node.named_children(&mut cursor).collect::<Vec<_>>();
                 for child in children.into_iter().rev() {
@@ -1298,9 +1479,11 @@ impl<'a> RustUsageWalks<'a> {
             }
         }
         let edges = Arc::new(edges);
-        self.caches
-            .macro_scope_edges
-            .insert(file.clone(), Arc::clone(&edges));
+        if !self.cancelled() {
+            self.caches
+                .macro_scope_edges
+                .insert(file.clone(), Arc::clone(&edges));
+        }
         edges
     }
 
@@ -1400,6 +1583,9 @@ impl<'a> RustUsageWalks<'a> {
                 definition_end,
             )];
             while let Some((scope, visible_after)) = pending.pop() {
+                if self.cancelled() {
+                    break;
+                }
                 if !visited.insert((scope.clone(), visible_after)) {
                     continue;
                 }
@@ -1434,9 +1620,11 @@ impl<'a> RustUsageWalks<'a> {
             }
         }
         let visible = Arc::new(visible);
-        self.caches
-            .macro_visible_ranges
-            .insert(declaration.clone(), Arc::clone(&visible));
+        if !self.cancelled() {
+            self.caches
+                .macro_visible_ranges
+                .insert(declaration.clone(), Arc::clone(&visible));
+        }
         visible
     }
 
@@ -1488,6 +1676,7 @@ impl<'a> RustUsageWalks<'a> {
         self.analyzer
             .lookup_candidates_by_identifier(name)
             .into_iter()
+            .take_while(|_| !self.cancelled())
             .filter(|candidate| {
                 self.is_analyzed(candidate.source()) && self.macro_identity_of(candidate).is_some()
             })
@@ -1594,6 +1783,32 @@ mod tests {
         // Force the analysis pass that persists the per-file fact rows.
         let _ = analyzer.get_analyzed_files();
         (temp, analyzer)
+    }
+
+    /// `modules` modules in one crate, each re-exporting a name from
+    /// `neighbours` of its successors modulo the count. The import graph is
+    /// therefore one strongly connected component of that size, which is the
+    /// shape issue #1809 measured.
+    fn cyclic_project(modules: usize, neighbours: usize) -> (tempfile::TempDir, RustAnalyzer) {
+        let mut lib = String::new();
+        for index in 0..modules {
+            lib.push_str(&format!("pub mod m{index};\n"));
+        }
+        let mut files: Vec<(String, String)> = vec![("src/lib.rs".to_string(), lib)];
+        for index in 0..modules {
+            let mut body = String::new();
+            for step in 1..=neighbours {
+                let neighbour = (index + step) % modules;
+                body.push_str(&format!("pub use crate::m{neighbour}::Item{neighbour};\n"));
+            }
+            body.push_str(&format!("pub struct Item{index};\n"));
+            files.push((format!("src/m{index}.rs"), body));
+        }
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(rel, body)| (rel.as_str(), body.as_str()))
+            .collect();
+        project(&borrowed)
     }
 
     fn file(analyzer: &RustAnalyzer, suffix: &str) -> ProjectFile {
@@ -1777,6 +1992,125 @@ mod tests {
                 .iter()
                 .any(|binding| matches!(binding.domain, Domain::Crate(_))),
             "`pub(crate) use` must widen the macro past its own module: {bindings:?}"
+        );
+    }
+
+    /// #1809: a cyclic module import graph must not cost exponential time.
+    ///
+    /// Twenty-four modules, each re-exporting a name from four of its
+    /// successors modulo the count, so the import graph is one strongly
+    /// connected component. The first cycle handling answered a re-entry from
+    /// the value so far and then iterated THAT frame to a local fixed point,
+    /// keeping the result out of the analyzer cache because it came out of a
+    /// partial. In a cycle every member does both, so every member re-runs
+    /// every other member's whole subtree and nothing is ever memoized: the
+    /// recursion body ran 25,214 times at eight modules with three neighbours,
+    /// growing about fourfold per added module. Measured on this exact fixture
+    /// against the previous implementation: 0.19 s at six modules, 3.05 s at
+    /// eight, 69.4 s at ten, and no result in 420 s at twelve. At the
+    /// twenty-four used here it does not finish at all, which is this test's
+    /// fail-before evidence and is what issue #1809 recorded as ">600 s at
+    /// twenty-four modules". The previous implementation answered with the
+    /// same names and origins this asserts, so the fix is a cost change only.
+    ///
+    /// The bound is on the recursion count rather than on the wall clock
+    /// because the count is what changed: it is now 6 per module, and a
+    /// timing assertion at that ratio would only be a slower way of saying so.
+    #[test]
+    fn a_cyclic_module_graph_costs_a_bounded_number_of_recursions() {
+        const MODULES: usize = 24;
+        const NEIGHBOURS: usize = 4;
+        let (_temp, analyzer) = cyclic_project(MODULES, NEIGHBOURS);
+        let walks = RustUsageWalks::new(&analyzer);
+        let head = file(&analyzer, "m0.rs");
+        let head_module = walks.physical_root_of(&head).expect("m0 is analyzed");
+
+        let bindings = walks.bindings_at(&head, &head_module);
+
+        // The cycle must still answer, and answer with the real declarations:
+        // `m0` publishes its own `Item0` and the four names it re-exports,
+        // each keeping the module that declares it as its origin.
+        let published: BTreeSet<(String, String)> = bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.name.clone(),
+                    binding
+                        .origin
+                        .file
+                        .rel_path()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            published,
+            (0..=NEIGHBOURS)
+                .map(|index| (format!("Item{index}"), format!("src/m{index}.rs")))
+                .collect::<BTreeSet<_>>(),
+            "the cycle must resolve every re-exported name to its declaration"
+        );
+        assert!(
+            walks.recursion_computations() <= 16 * MODULES,
+            "a cyclic module graph must cost a bounded number of recursions, \
+             not one per path through the cycle: {} for {MODULES} modules",
+            walks.recursion_computations()
+        );
+    }
+
+    /// A walk whose budget expired must stop doing work, and must publish
+    /// nothing. Bifrost treats an expired scan that keeps working as a defect
+    /// in its own right: the Milestone 4 rerun killed a v2 scan at 1800 s
+    /// under a 120 s budget with the walk layer still running.
+    ///
+    /// Both halves fail before the fix, demonstrated by removing them:
+    /// without the polls, the walk keeps recursing (10 computations rather
+    /// than the 1 it is allowed); without the cache gates, the truncated
+    /// answer is memoized for the generation and the second, uncancelled
+    /// walker reads it back as the complete one.
+    #[test]
+    fn a_cancelled_walk_stops_promptly_and_memoizes_nothing() {
+        let (_temp, analyzer) = cyclic_project(8, 3);
+        let head = file(&analyzer, "m0.rs");
+
+        let complete = {
+            let walks = RustUsageWalks::new(&analyzer);
+            let module = walks.physical_root_of(&head).expect("m0 is analyzed");
+            walks.bindings_at(&head, &module).as_ref().clone()
+        };
+        assert!(
+            complete.iter().any(|binding| binding.name == "Item1"),
+            "the uncancelled answer carries the re-exported names: {complete:?}"
+        );
+
+        let updated = analyzer.update_all();
+        // Warm the Cargo routes on the new generation: the constructor's own
+        // cancellation point is not what this test is about, and a cold build
+        // there would stop the walker before it ever walked.
+        let module = RustUsageWalks::new(&updated)
+            .physical_root_of(&head)
+            .expect("m0 is analyzed");
+        let keep_going = || false;
+        let walks =
+            RustUsageWalks::new_while(&updated, &keep_going).expect("routes build before the poll");
+        let truncated = walks.bindings_at(&head, &module);
+        assert_eq!(
+            walks.recursion_computations(),
+            1,
+            "a cancelled walk must stop after the frame it was already inside"
+        );
+        assert!(
+            !truncated.iter().any(|binding| binding.name == "Item1"),
+            "the cancelled walk did not get far enough to see the re-exports, \
+             which is what makes the next assertion meaningful: {truncated:?}"
+        );
+
+        let after = RustUsageWalks::new(&updated);
+        assert_eq!(
+            *after.bindings_at(&head, &module),
+            complete,
+            "a cancelled walk must not memoize its truncated answer"
         );
     }
 
