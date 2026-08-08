@@ -725,11 +725,10 @@ fn resolve_csharp_in_session(
                     format!("`{member}` is a local C# value or local function"),
                 );
             }
-            let owners = csharp_enclosing_class(analyzer, definitions, file, name.start_byte())
-                .into_iter()
-                .collect();
+            let owners =
+                csharp_enclosing_class_chain(analyzer, definitions, file, name.start_byte());
             let arity = csharp_invocation_arity(name, source, definitions);
-            let outcome = csharp_member_outcome(
+            let outcome = csharp_member_outcome_in_enclosing_chain(
                 analyzer,
                 definitions,
                 owners,
@@ -793,13 +792,17 @@ fn resolve_csharp_in_session(
             }
             if !bindings.is_shadowed(text) {
                 if csharp_is_unqualified_member_reference(identifier) {
-                    if let Some(owner) =
-                        csharp_enclosing_class(analyzer, definitions, file, identifier.start_byte())
-                    {
-                        let outcome = csharp_member_outcome(
+                    let owners = csharp_enclosing_class_chain(
+                        analyzer,
+                        definitions,
+                        file,
+                        identifier.start_byte(),
+                    );
+                    if !owners.is_empty() {
+                        let outcome = csharp_member_outcome_in_enclosing_chain(
                             analyzer,
                             definitions,
-                            vec![owner],
+                            owners,
                             text,
                             None,
                             None,
@@ -1411,37 +1414,41 @@ fn csharp_dynamic_binding_is_visible(
         return false;
     }
 
-    let Some(owner) = csharp_enclosing_class(
+    // A bare identifier can name a member of any enclosing type, not just the
+    // innermost one (#1802). Missing that member here reports a `dynamic`
+    // binding as statically typed.
+    let owners = csharp_enclosing_class_chain(
         csharp as &dyn IAnalyzer,
         definitions,
         file,
         identifier.start_byte(),
-    ) else {
-        return false;
-    };
-    for candidate in definitions.members_for_owner_name(&owner.fq_name(), name) {
-        if !definitions.scope_step() {
-            return false;
-        }
-        let metadata = definitions.signature_metadata(&candidate);
-        let is_dynamic = if let Some(session) = definitions.session() {
-            metadata.iter().any(|metadata| {
-                metadata
-                    .return_type_identity()
-                    .and_then(|identity| identity.nominal_name_with(|| session.scope_step()))
-                    .is_some_and(|name| {
-                        !name.is_absolute() && matches!(name.path(), [name] if name == "dynamic")
-                    })
-            })
-        } else {
-            metadata.iter().any(|metadata| {
-                metadata
-                    .return_type_text()
-                    .is_some_and(csharp_is_dynamic_type_reference)
-            })
-        };
-        if is_dynamic {
-            return true;
+    );
+    for owner in owners {
+        for candidate in definitions.members_for_owner_name(&owner.fq_name(), name) {
+            if !definitions.scope_step() {
+                return false;
+            }
+            let metadata = definitions.signature_metadata(&candidate);
+            let is_dynamic = if let Some(session) = definitions.session() {
+                metadata.iter().any(|metadata| {
+                    metadata
+                        .return_type_identity()
+                        .and_then(|identity| identity.nominal_name_with(|| session.scope_step()))
+                        .is_some_and(|name| {
+                            !name.is_absolute()
+                                && matches!(name.path(), [name] if name == "dynamic")
+                        })
+                })
+            } else {
+                metadata.iter().any(|metadata| {
+                    metadata
+                        .return_type_text()
+                        .is_some_and(csharp_is_dynamic_type_reference)
+                })
+            };
+            if is_dynamic {
+                return true;
+            }
         }
     }
     false
@@ -3277,34 +3284,40 @@ fn csharp_enclosing_member_types(
     if !definitions.scope_step() {
         return CSharpReceiverTypes::default();
     }
-    let Some(owner) = csharp_enclosing_class(analyzer, definitions, file, receiver.start_byte())
-    else {
-        return CSharpReceiverTypes::default();
-    };
-    let mut candidates = CSharpReceiverTypes::default();
-    csharp_collect_member_types(csharp, definitions, file, &owner, name, &mut candidates);
-    if let Some(provider) = analyzer.type_hierarchy_provider() {
-        let mut seen = HashSet::default();
-        let mut stack = definitions.direct_ancestors(provider, &owner);
-        while let Some(ancestor) = stack.pop() {
-            if !definitions.scope_step() {
-                return CSharpReceiverTypes::default();
+    // Same lexical scope chain as the member walk (#1802): a bare receiver may
+    // name a field or property of an enclosing type. One enclosing type and its
+    // whole base chain are searched before the next one outward, so a nearer
+    // base class's member still supplies the type.
+    for owner in csharp_enclosing_class_chain(analyzer, definitions, file, receiver.start_byte()) {
+        let mut candidates = CSharpReceiverTypes::default();
+        csharp_collect_member_types(csharp, definitions, file, &owner, name, &mut candidates);
+        if let Some(provider) = analyzer.type_hierarchy_provider() {
+            let mut seen = HashSet::default();
+            let mut stack = definitions.direct_ancestors(provider, &owner);
+            while let Some(ancestor) = stack.pop() {
+                if !definitions.scope_step() {
+                    return CSharpReceiverTypes::default();
+                }
+                if !seen.insert(ancestor.clone()) {
+                    continue;
+                }
+                csharp_collect_member_types(
+                    csharp,
+                    definitions,
+                    file,
+                    &ancestor,
+                    name,
+                    &mut candidates,
+                );
+                stack.extend(definitions.direct_ancestors(provider, &ancestor));
             }
-            if !seen.insert(ancestor.clone()) {
-                continue;
-            }
-            csharp_collect_member_types(
-                csharp,
-                definitions,
-                file,
-                &ancestor,
-                name,
-                &mut candidates,
-            );
-            stack.extend(definitions.direct_ancestors(provider, &ancestor));
+        }
+        let candidates = candidates.normalized();
+        if !candidates.units.is_empty() || !candidates.fq_names.is_empty() {
+            return candidates;
         }
     }
-    candidates.normalized()
+    CSharpReceiverTypes::default()
 }
 
 fn csharp_collect_member_types(
@@ -3387,6 +3400,88 @@ fn csharp_enclosing_class(
     let start = analyzer.enclosing_code_unit(file, &range)?;
     crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| analyzer.parent_of(unit))
         .find(CodeUnit::is_class)
+}
+
+/// Every class that lexically encloses `byte`, innermost first: the type the
+/// reference is written in, then the type that declares it, and so on out to
+/// the outermost type declaration.
+///
+/// C# simple-name lookup does not stop at the innermost type (#1802). After
+/// that type, its partial parts and its whole base chain are exhausted, the
+/// search continues in the type that encloses it, on the same terms.
+///
+/// Consume this in order through `csharp_member_outcome_in_enclosing_chain`.
+/// Never hand the whole chain to `csharp_member_outcome` as one owners vector:
+/// that walk sweeps every owner level by level, so an enclosing type's member
+/// would beat a nearer base class's member and invert C# lookup order.
+fn csharp_enclosing_class_chain(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    byte: usize,
+) -> Vec<CodeUnit> {
+    let Some(innermost) = csharp_enclosing_class(analyzer, definitions, file, byte) else {
+        return Vec::new();
+    };
+    crate::analyzer::usages::common::enclosing_owner_chain(innermost, |unit| {
+        definitions
+            .parent_of(analyzer, unit)
+            .filter(CodeUnit::is_class)
+    })
+    .map_while(|owner| definitions.scope_step().then_some(owner))
+    .collect()
+}
+
+/// The C# simple-name member walk over a lexical scope chain: run the full
+/// `csharp_member_outcome` walk -- the type, its partial parts, its whole base
+/// chain -- for one enclosing type before moving outward to the next, and
+/// answer with the first type that resolves the name (#1802).
+///
+/// A failure reports the innermost type's verdict, which is the scope the
+/// reference is actually written in.
+fn csharp_member_outcome_in_enclosing_chain(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    owners: Vec<CodeUnit>,
+    member: &str,
+    arity: Option<usize>,
+    explicit_generic_arity: Option<usize>,
+    fallback_when_inapplicable: bool,
+) -> DefinitionLookupOutcome {
+    if owners.is_empty() {
+        return csharp_member_outcome(
+            analyzer,
+            definitions,
+            owners,
+            member,
+            arity,
+            explicit_generic_arity,
+            fallback_when_inapplicable,
+        );
+    }
+    let mut innermost_failure = None;
+    for owner in owners {
+        if !definitions.scope_step() {
+            return no_definition(
+                "csharp_resolution_stopped",
+                "C# member resolution stopped before completion",
+            );
+        }
+        let outcome = csharp_member_outcome(
+            analyzer,
+            definitions,
+            vec![owner],
+            member,
+            arity,
+            explicit_generic_arity,
+            fallback_when_inapplicable,
+        );
+        if outcome.status != DefinitionLookupStatus::NoDefinition {
+            return outcome;
+        }
+        innermost_failure.get_or_insert(outcome);
+    }
+    innermost_failure.expect("a non-empty owner chain records the innermost type's verdict")
 }
 
 fn resolve_csharp_in_enclosing_scopes(

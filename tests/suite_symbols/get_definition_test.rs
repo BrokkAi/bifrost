@@ -3904,6 +3904,155 @@ fn csharp_nested_sibling_type_resolves_from_property_type_position() {
     );
 }
 
+// #1802 (naps2 `XmlSerializer.cs`): C# simple-name lookup continues into every
+// ENCLOSING type declaration after the innermost type and its base chain are
+// exhausted. The nested caller's own base chain is empty here, so only the
+// enclosing scope can supply `Helper`.
+#[test]
+fn csharp_bare_call_resolves_to_an_enclosing_types_member() {
+    let source = "namespace N\n{\n    public abstract class Outer\n    {\n        protected static object Helper(object a, object b) { return a; }\n\n        protected class Inner\n        {\n            public object Use(object a, object b) { return Helper(a, b); }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("enclosing-type call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "N.Outer.Helper", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "P.cs", "{value}");
+}
+
+// The same shape with an INSTANCE member on the enclosing type. C# puts the
+// name in scope and binds it; the call is an error only because a nested type
+// has no implicit outer instance (CS0120). get_definition answers the
+// declaration the name binds to, exactly as it does for an instance member
+// reached through the base chain from a static context, so this resolves.
+#[test]
+fn csharp_bare_call_resolves_to_an_enclosing_types_instance_member() {
+    let source = "namespace N\n{\n    public abstract class Outer\n    {\n        protected object Helper(object a, object b) { return a; }\n\n        protected class Inner\n        {\n            public object Use(object a, object b) { return Helper(a, b); }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("enclosing-type call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "N.Outer.Helper", "{value}");
+}
+
+// The walk continues past the first enclosing type: `Inner` is nested in `Mid`
+// which is nested in `Outer`, and only `Outer` declares `Helper`.
+#[test]
+fn csharp_bare_call_resolves_to_an_enclosing_type_two_levels_out() {
+    let source = "namespace N\n{\n    public abstract class Outer\n    {\n        protected static object Helper(object a, object b) { return a; }\n\n        protected class Mid\n        {\n            protected class Inner\n            {\n                public object Use(object a, object b) { return Helper(a, b); }\n            }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("enclosing-type call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "N.Outer.Helper", "{value}");
+}
+
+// The faithful naps2 shape: the nested caller DOES have a base class, and that
+// base edge resolves fine, but the base declares nothing named
+// `DeserializeInternal`. Only the enclosing type does. This removes the
+// confound with #1801's nested-base-resolution defect.
+#[test]
+fn csharp_bare_call_reaches_the_enclosing_type_past_an_unrelated_base() {
+    let source = "namespace NAPS2.Serialization;\n\npublic abstract class XmlSerializer\n{\n    protected static object DeserializeInternal(object element, System.Type type)\n    {\n        return element;\n    }\n\n    protected class CollectionSerializer : CustomXmlSerializer\n    {\n        public override object DeserializeObject(object element, System.Type type)\n        {\n            return DeserializeInternal(element, type);\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("XmlSerializer.cs", source)
+        .file(
+            "CustomXmlSerializer.cs",
+            "namespace NAPS2.Serialization;\n\npublic abstract class CustomXmlSerializer\n{\n    public abstract object DeserializeObject(object element, System.Type type);\n}\n",
+        )
+        .build();
+
+    let call = source
+        .rfind("DeserializeInternal(element, type)")
+        .expect("enclosing-type call");
+    let value = lookup(
+        project.root(),
+        &location_reference("XmlSerializer.cs", source, call),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "NAPS2.Serialization.XmlSerializer.DeserializeInternal",
+        "{value}"
+    );
+}
+
+// #1802's ordering constraint. `Helper` is declared BOTH on `Inner`'s base and
+// on the enclosing `Outer`. C# exhausts the innermost type's whole base chain
+// before it looks at any enclosing type, so the base member wins. Merging the
+// enclosing types into one owners vector would let `Outer.Helper` win at depth
+// 0 and break this.
+#[test]
+fn csharp_base_chain_member_beats_an_enclosing_types_member() {
+    let source = "namespace N\n{\n    public class Base\n    {\n        protected static object Helper(object a, object b) { return b; }\n    }\n\n    public class Outer\n    {\n        protected static object Helper(object a, object b) { return a; }\n\n        public class Inner : Base\n        {\n            public object Use(object a, object b) { return Helper(a, b); }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("shadowed call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "the base-chain member must win outright, not tie: {value}"
+    );
+    assert_eq!(result["definitions"][0]["fqn"], "N.Base.Helper", "{value}");
+}
+
+// The non-invocation half of the same rule: a bare FIELD read reaches the
+// enclosing type through the identifier branch, not the invocation branch.
+#[test]
+fn csharp_bare_field_read_resolves_to_an_enclosing_types_field() {
+    let source = "namespace N\n{\n    public class Outer\n    {\n        protected static int Counter = 1;\n\n        public class Inner\n        {\n            public int Use() { return Counter; }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let read = source.rfind("Counter;").expect("enclosing-type field read");
+    let value = lookup(project.root(), &location_reference("P.cs", source, read));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "N.Outer.Counter",
+        "{value}"
+    );
+}
+
+// Near miss: a SIBLING nested type is not an enclosing type. `Sibling.Helper`
+// is not in scope for a bare call written inside `Inner`.
+#[test]
+fn csharp_bare_call_does_not_reach_a_sibling_nested_types_member() {
+    let source = "namespace N\n{\n    public class Outer\n    {\n        public class Sibling\n        {\n            public static object Helper(object a, object b) { return a; }\n        }\n\n        public class Inner\n        {\n            public object Use(object a, object b) { return Helper(a, b); }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("sibling call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_ne!(result["status"], "resolved", "{value}");
+}
+
 // #1801 (nunit `TestNameGenerator`): a bare call to a member inherited from a
 // nested base type spelled by its simple name. Supertype resolution searched
 // only the file's namespace and `using` scopes, so `Derived : Base` inside
