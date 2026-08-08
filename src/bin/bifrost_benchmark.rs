@@ -152,12 +152,182 @@ fn run() -> Result<(), String> {
                 strict,
             )
         }
+        "rollout" => {
+            let mut fixture_id = None;
+            let mut fixture_root = None;
+            let mut fixture_revision = None;
+            let mut configuration_id = "default-analyzer-config".to_string();
+            let mut max_files = None;
+            let mut markdown_path = None;
+            let mut artifact_path = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--fixture-id" => {
+                        fixture_id = Some(
+                            args.next()
+                                .ok_or_else(|| "--fixture-id requires a name".to_string())?,
+                        );
+                    }
+                    "--fixture-root" => {
+                        fixture_root =
+                            Some(PathBuf::from(args.next().ok_or_else(|| {
+                                "--fixture-root requires a path".to_string()
+                            })?));
+                    }
+                    "--fixture-revision" => {
+                        fixture_revision =
+                            Some(args.next().ok_or_else(|| {
+                                "--fixture-revision requires a value".to_string()
+                            })?);
+                    }
+                    "--configuration-id" => {
+                        configuration_id = args
+                            .next()
+                            .ok_or_else(|| "--configuration-id requires a name".to_string())?;
+                    }
+                    "--max-files" => {
+                        let value = args
+                            .next()
+                            .ok_or_else(|| "--max-files requires a positive integer".to_string())?;
+                        let parsed = value.parse::<usize>().map_err(|_| {
+                            format!("--max-files expects a positive integer, got `{value}`")
+                        })?;
+                        if parsed == 0 {
+                            return Err("--max-files must be greater than zero".to_string());
+                        }
+                        max_files = Some(parsed);
+                    }
+                    "--output" => {
+                        markdown_path =
+                            Some(PathBuf::from(args.next().ok_or_else(|| {
+                                "--output requires a file path".to_string()
+                            })?));
+                    }
+                    "--artifact" => {
+                        artifact_path =
+                            Some(PathBuf::from(args.next().ok_or_else(|| {
+                                "--artifact requires a file path".to_string()
+                            })?));
+                    }
+                    "--help" | "-h" => {
+                        print_rollout_help();
+                        return Ok(());
+                    }
+                    other => return Err(format!("unknown rollout argument: {other}")),
+                }
+            }
+            run_rollout(
+                fixture_id.ok_or_else(|| "--fixture-id is required".to_string())?,
+                fixture_root.ok_or_else(|| "--fixture-root is required".to_string())?,
+                fixture_revision,
+                configuration_id,
+                max_files,
+                markdown_path,
+                artifact_path,
+            )
+        }
         "--help" | "-h" => {
             print_help();
             Ok(())
         }
         other => Err(format!("unknown subcommand: {other}")),
     }
+}
+
+/// Measure one semantic-diagnostic rollout against a pinned offline fixture
+/// and render its markdown report (#1628). Sets no threshold: it produces the
+/// numbers a team reviews before enabling unrecognized-symbol diagnostics by
+/// default.
+#[cfg(feature = "release-tooling")]
+#[allow(clippy::too_many_arguments)]
+fn run_rollout(
+    fixture_id: String,
+    fixture_root: PathBuf,
+    fixture_revision: Option<String>,
+    configuration_id: String,
+    max_files: Option<usize>,
+    markdown_path: Option<PathBuf>,
+    artifact_path: Option<PathBuf>,
+) -> Result<(), String> {
+    use brokk_bifrost::benchmark::semantic_diagnostic_rollout::{
+        aggregate_semantic_diagnostic_rollout, render_semantic_diagnostic_rollout_markdown,
+    };
+    use brokk_bifrost::benchmark::{
+        SemanticDiagnosticRolloutRequest, measure_semantic_diagnostic_rollout,
+    };
+
+    let (bifrost_revision, bifrost_dirty) = git_revision(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .ok_or_else(|| "could not read the Bifrost revision from git".to_string())?;
+    let fixture_revision = match fixture_revision {
+        Some(revision) => revision,
+        // An in-repo fixture is pinned by the commit that contains it.
+        None => bifrost_revision.clone(),
+    };
+    let request = SemanticDiagnosticRolloutRequest {
+        bifrost_revision,
+        bifrost_dirty,
+        fixture_id,
+        fixture_revision,
+        fixture_root,
+        configuration_id,
+        max_files,
+    };
+    let artifact = measure_semantic_diagnostic_rollout(&request)?;
+    let aggregate = aggregate_semantic_diagnostic_rollout(std::slice::from_ref(&artifact))
+        .map_err(|error| format!("rollout artifact is invalid: {error}"))?;
+    let markdown = render_semantic_diagnostic_rollout_markdown(&aggregate);
+
+    if let Some(path) = artifact_path {
+        let encoded = serde_json::to_string_pretty(&artifact)
+            .map_err(|error| format!("failed to encode the rollout artifact: {error}"))?;
+        std::fs::write(&path, encoded)
+            .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+    }
+    match markdown_path {
+        Some(path) => std::fs::write(&path, &markdown)
+            .map_err(|error| format!("failed to write {}: {error}", path.display()))?,
+        None => print!("{markdown}"),
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "release-tooling"))]
+#[allow(clippy::too_many_arguments)]
+fn run_rollout(
+    _fixture_id: String,
+    _fixture_root: PathBuf,
+    _fixture_revision: Option<String>,
+    _configuration_id: String,
+    _max_files: Option<usize>,
+    _markdown_path: Option<PathBuf>,
+    _artifact_path: Option<PathBuf>,
+) -> Result<(), String> {
+    Err("the rollout subcommand needs `--features release-tooling`".to_string())
+}
+
+/// The repository revision and whether the working tree carries changes.
+/// Reported separately so a rollout artifact records a dirty measurement as
+/// dirty rather than inventing a synthetic revision for it.
+#[cfg(feature = "release-tooling")]
+fn git_revision(repo_root: &Path) -> Option<(String, bool)> {
+    let revision = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !revision.status.success() {
+        return None;
+    }
+    let revision = String::from_utf8(revision.stdout).ok()?.trim().to_string();
+    if revision.is_empty() {
+        return None;
+    }
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    Some((revision, !status.stdout.is_empty()))
 }
 
 fn validate_query_code_access_mode() -> Result<(), String> {
@@ -491,6 +661,19 @@ fn print_help() {
         "  run [--manifest PATH] [--repo NAME] [--scenario NAME] [--output DIR] [--max-files N] [--profile]"
     );
     println!("  compare --baseline PATH --candidate PATH [--output PATH] [--strict]");
+    println!(
+        "  rollout --fixture-id NAME --fixture-root PATH [--fixture-revision REV] [--configuration-id NAME] [--max-files N] [--output PATH] [--artifact PATH]"
+    );
+}
+
+fn print_rollout_help() {
+    println!(
+        "Usage: bifrost_benchmark rollout --fixture-id NAME --fixture-root PATH [--fixture-revision REV] [--configuration-id NAME] [--max-files N] [--output PATH] [--artifact PATH]"
+    );
+    println!("  Needs `--features release-tooling`.");
+    println!("  Measures cold and warm dependency-pack activation and per-file");
+    println!("  unrecognized-symbol diagnostics against a pinned offline fixture,");
+    println!("  then validates and renders the rollout report. Sets no threshold.");
 }
 
 fn print_validate_help() {

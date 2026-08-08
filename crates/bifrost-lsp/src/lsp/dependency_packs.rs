@@ -105,7 +105,6 @@ struct ActivatorState {
 pub(crate) struct DependencyPackActivator {
     state: Mutex<ActivatorState>,
     wake: Condvar,
-    idle: Condvar,
     events: Sender<DependencyPackActivation>,
     completions: Receiver<DependencyPackActivation>,
 }
@@ -116,7 +115,6 @@ impl DependencyPackActivator {
         Arc::new(Self {
             state: Mutex::new(ActivatorState::default()),
             wake: Condvar::new(),
-            idle: Condvar::new(),
             events,
             completions,
         })
@@ -214,20 +212,6 @@ impl DependencyPackActivator {
         }
     }
 
-    /// Test support: block until no activation is queued or running.
-    #[cfg(test)]
-    pub(crate) fn wait_until_idle(&self) {
-        let state = self.lock();
-        let (state, timeout) = self
-            .idle
-            .wait_timeout_while(state, std::time::Duration::from_secs(60), |state| {
-                state.running.is_some() || state.pending.is_some()
-            })
-            .expect("dependency-pack activator lock poisoned while waiting for idle");
-        assert!(!timeout.timed_out(), "dependency-pack activation stalled");
-        assert!(state.running.is_none() && state.pending.is_none());
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, ActivatorState> {
         self.state
             .lock()
@@ -250,7 +234,6 @@ fn run_worker(activator: &Arc<DependencyPackActivator>) {
                     state.running = Some(job.cancellation.clone());
                     break job;
                 }
-                activator.idle.notify_all();
                 state = activator
                     .wake
                     .wait(state)
@@ -270,7 +253,6 @@ fn run_worker(activator: &Arc<DependencyPackActivator>) {
                 state.pending = None;
             }
         }
-        activator.idle.notify_all();
         if let Some(completion) = completion
             && activator.events.send(completion).is_err()
         {

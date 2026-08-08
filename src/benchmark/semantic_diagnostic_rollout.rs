@@ -945,6 +945,141 @@ mod tests {
     const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const SHA_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
+    /// One incomplete reason per declared suppression class. The array length
+    /// is tied to `SUPPRESSION_CLASSES`, so declaring a class without a sample
+    /// fails to compile, and `suppression_class` is an exhaustive match, so a
+    /// new core reason variant fails to compile until it is classified. The
+    /// assertions below close the remaining direction: every declared class
+    /// must be produced by exactly one reason.
+    const INCOMPLETE_REASON_SAMPLES: [SemanticDiagnosticIncompleteReason;
+        SUPPRESSION_CLASSES.len()] = [
+        SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+            boundary: BoundaryStatus::ExternalUnknown,
+        },
+        SemanticDiagnosticIncompleteReason::StaleGeneration {
+            expected: 1,
+            actual: 2,
+        },
+        SemanticDiagnosticIncompleteReason::Cancelled,
+        SemanticDiagnosticIncompleteReason::Truncated,
+        SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+            detail: String::new(),
+        },
+        SemanticDiagnosticIncompleteReason::DynamicBehavior {
+            detail: String::new(),
+        },
+        SemanticDiagnosticIncompleteReason::RuntimeUnavailable {
+            detail: String::new(),
+        },
+        SemanticDiagnosticIncompleteReason::CorruptSemanticPack {
+            detail: String::new(),
+        },
+        SemanticDiagnosticIncompleteReason::UnsupportedGeneratedSurface {
+            detail: String::new(),
+        },
+    ];
+
+    #[test]
+    fn every_declared_suppression_class_is_produced_by_exactly_one_core_reason() {
+        let produced = INCOMPLETE_REASON_SAMPLES
+            .iter()
+            .map(suppression_class)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            produced.iter().copied().collect::<BTreeSet<_>>(),
+            SUPPRESSION_CLASSES.into_iter().collect::<BTreeSet<_>>(),
+            "the telemetry class list and the core reason variants must agree"
+        );
+        assert_eq!(
+            produced.len(),
+            produced.iter().copied().collect::<BTreeSet<_>>().len(),
+            "two reasons must not share one suppression class: {produced:?}"
+        );
+    }
+
+    #[test]
+    fn every_declared_proof_class_is_produced_by_exactly_one_core_outcome() {
+        let range = range(0);
+        let outcomes: [SemanticDiagnosticOutcome; PROOF_CLASSES.len()] = [
+            SemanticDiagnosticOutcome::Resolved {
+                range,
+                boundary: BoundaryStatus::WorkspaceLocal,
+            },
+            SemanticDiagnosticOutcome::Ambiguous {
+                range,
+                boundaries: vec![BoundaryStatus::WorkspaceLocal],
+            },
+            SemanticDiagnosticOutcome::Absent(SemanticAbsenceProof {
+                range,
+                domain: SemanticDiagnosticDomain::LexicalScope {
+                    file: std::path::PathBuf::from("src/Main.java"),
+                    range,
+                },
+                boundary: BoundaryStatus::WorkspaceLocal,
+            }),
+            SemanticDiagnosticOutcome::Incomplete {
+                range: Some(range),
+                reasons: vec![SemanticDiagnosticIncompleteReason::Cancelled],
+            },
+        ];
+
+        let mut report = SemanticDiagnosticReport::new();
+        for outcome in outcomes {
+            match outcome {
+                SemanticDiagnosticOutcome::Resolved { range, boundary } => {
+                    report.push_resolved(range, boundary);
+                }
+                SemanticDiagnosticOutcome::Ambiguous { range, boundaries } => {
+                    report.push_ambiguous(range, boundaries);
+                }
+                SemanticDiagnosticOutcome::Absent(proof) => {
+                    let range = proof.range;
+                    report.push_absent(proof, diagnostic(range, "Missing"));
+                }
+                SemanticDiagnosticOutcome::Incomplete { range, reasons } => {
+                    report.push_incomplete(range, reasons);
+                }
+            }
+        }
+
+        let counts = SemanticDiagnosticReportCounts::from_report(&report);
+        assert_eq!(
+            counts
+                .proof_classes
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            PROOF_CLASSES
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>(),
+            "the telemetry proof classes and the core outcome variants must agree"
+        );
+        assert!(
+            counts.proof_classes.values().all(|count| *count == 1),
+            "each outcome must contribute exactly one proof class: {:#?}",
+            counts.proof_classes
+        );
+    }
+
+    fn range(start_byte: usize) -> Range {
+        Range {
+            start_byte,
+            end_byte: start_byte + 7,
+            start_line: 0,
+            end_line: 0,
+        }
+    }
+
+    fn diagnostic(range: Range, name: &str) -> SemanticDiagnostic {
+        SemanticDiagnostic {
+            range,
+            message: format!("Unrecognized symbol `{name}`"),
+            source: "bifrost-test",
+            kind: "test_unrecognized_symbol",
+        }
+    }
+
     #[test]
     fn artifact_round_trip_preserves_lifecycle_release_and_identity_metadata() {
         let artifact = complete_artifact();

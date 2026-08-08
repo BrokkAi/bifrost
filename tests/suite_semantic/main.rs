@@ -27,6 +27,7 @@ mod dataflow_clients;
 mod dataflow_ide;
 mod dataflow_summaries;
 mod dataflow_tabulation;
+mod dependency_pack_host_activation;
 mod dependency_pack_lifecycle;
 mod dependency_semantic_pack;
 mod external_artifact_pack;
