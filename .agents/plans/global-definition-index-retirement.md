@@ -41,8 +41,12 @@ the store's normal per-blob row replacement.
   replaceability table (5 operations already bounded in production; 5 more backed by existing
   store methods or existing schema indexes; package catalog needs one new relation;
   `package_types()` full enumeration needs an owner decision - 4 callers).
-- [ ] Milestone 0: baseline. With the watcher fix landed, measure build count, build time, and
-  resident size per shard on a large tree (confirm or correct the ~15.5 GB inference).
+- [x] (2026-08-08) Milestone 0: baseline measured on rustc with the watcher fix landed. Report:
+  `global-index-m0-baseline-v1.md` (session scratchpad). **The ~15.5 GB inference is CORRECTED:
+  the index costs ~350 MB and 3.35 s, about 44x less than inferred.** Five shards build (not 12),
+  each exactly once; `usage_facts_index` never builds on this path at all. Answering-regime peak
+  RSS is 15.58 GB untimed / 17.49 GB timed, of which the index is ~2%. See
+  `Surprises & Discoveries` for the corrections and Milestone 4 for the revised gate.
 - [ ] Milestone 1: the package-catalog relation.
 - [ ] Milestone 2: consumer migration, cohort by cohort.
 - [ ] Milestone 3: `usage_facts_index` - same treatment or explicit retention decision.
@@ -62,6 +66,43 @@ the store's normal per-blob row replacement.
 - Observation (Rust caveat, measured): `exact_fqn`, `normalized_fqn`, and `content_qualifier`
   are empty/NULL for every Rust row; Rust identity lives in `fq_segments` + `short_name`. The
   package-catalog relation must not assume `content_qualifier` for Rust.
+
+- **Correction (Milestone 0, measured 2026-08-08): the ~15.5 GB attribution is wrong by ~44x.**
+  On the rustc tree (35,370 files) the whole index costs **~350 MB resident and 3.35 s** to build.
+  Two independent methods agree: `/proc/self/statm` deltas measured around each shard build sum to
+  350 MB, and a structural walk of all eleven maps sums to 197 MB (the ~1.8x gap is the shared
+  `CodeUnitInner` payload the structural walk deliberately excludes to avoid double counting).
+  The decisive datum is `rss_before_kb=9753404` on the first shard build: **the process is already
+  resident at 9.3 GB before the index exists**, so an index contributing 350 MB cannot drive a
+  15.58-17.49 GB peak. The Purpose section's "dominant driver of the ~15.5 GB resident footprint"
+  should be read as retracted; it was flagged there as inferred and is now measured.
+
+- **Correction: five shards build, not twelve.** The `MultiAnalyzer` flat-map amplifier is real (a
+  Rust-only question does build four foreign shards) but it is bounded by workspace content, not by
+  the analyzer registry: Cpp, JavaScript, TypeScript, Python, Rust. Those four foreign shards cost
+  **36 ms and 1.3 MB in total**. The amplifier is a cleanliness argument, not a performance one.
+
+- **Correction: no rebuild churn.** Every shard reports `build_count=1`. The discard-on-update
+  defect is still in the code, but with the watcher loop fixed it is not being triggered
+  constantly, which is precisely why this plan sequenced Milestone 0 after the watcher plan.
+
+- **Correction: `usage_facts_index` never builds on the scan path.** Zero builds across an entire
+  answering-regime `scan_usages` query, instrumented at the sole `OnceLock` init
+  (`try_usage_facts_index_handle`), so absence means absence of a build, not a missed span. It
+  contributes no time and no memory here. **Milestone 3's premise needs re-checking against a query
+  shape that actually reaches it** before work is planned around it.
+
+- **Discovery: 30% of the Rust shard is duplicate maps.** `by_fqn` and `by_normalized_fqn` have
+  identical key counts and identical byte totals (266,834 keys / 45,895,885 bytes each), as do
+  `direct_children_by_fqn` and `direct_children_by_normalized_fqn` (44,948 / 8,713,422). For Rust
+  `normalize_full_name(fqn) == fqn`, so **54.6 MB of the 185 MB shard is pure duplication**. This is
+  a smaller, faster, lower-risk change than the retirement and can be taken independently of it.
+
+- **Open: the memory is somewhere else, and this baseline cannot name it.** Of the 15.58-17.49 GB
+  answering-regime peak, 9.3 GB is already resident before the first index touch, the index is
+  0.35 GB, `usage_facts_index` is 0.00 GB, and the graph phase adds only +0.75 GB across 880 s.
+  That leaves roughly 7 GB unattributed. Naming it needs its own instrumented pass; it is now the
+  dominant term and the place where memory work would actually pay.
 
 ## Decision Log
 
@@ -120,9 +161,30 @@ Milestone 0's first commit).
 
 ## Plan of Work
 
-Milestone 0 - baseline (measurement only): with the watcher fix landed, one large-tree session;
-record shard build counts/times/sizes and answering-regime RSS. This confirms the #1847
-attribution and sets the Milestone 4 gate numbers.
+Milestone 0 - baseline (measurement only): DONE, 2026-08-08. Report
+`global-index-m0-baseline-v1.md`. Measured on rustc (35,370 files) in an answering-regime
+`scan_usages`, at `9263e2a5`, with the watcher fix landed:
+
+| shard | builds | build time | RSS delta | structural | live blobs | units |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Rust | 1 | 3,317.4 ms | 349 MB | 185.4 MB | 34,935 | 316,099 |
+| Cpp | 1 | 15.9 ms | 0.72 MB | 1.44 MB | 101 | 3,036 |
+| Python | 1 | 9.8 ms | 0.25 MB | 0.60 MB | 33 | 990 |
+| JavaScript | 1 | 6.2 ms | 0.22 MB | 0.38 MB | 156 | 771 |
+| TypeScript | 1 | 4.4 ms | 0.13 MB | 0.41 MB | 27 | 795 |
+| **TOTAL** | **5** | **3.35 s** | **~350 MB** | **~188 MB** | 35,252 | 321,691 |
+
+`usage_facts_index`: **0 builds**. Answering-regime peak RSS: **15.58 GB untimed / 17.49 GB
+timed**, of which 9.3 GB is already resident before the first shard build. It did NOT confirm the
+#1847 attribution; it corrected it (see `Surprises & Discoveries`).
+
+**This result should be taken back to the owner before Milestone 1 starts.** The plan's
+justification rests on a footprint claim that is now measured at ~2% of the answering-regime peak.
+The design argument for retirement stands on its own (an unweighted, unbudgeted, whole-workspace
+`OnceLock` with no in-place invalidation is a real defect, and five operations already have
+production-proven bounded equivalents), but the expected payoff is ~350 MB and ~3.4 s, not
+~15.5 GB. Two cheaper items surfaced that may deserve priority: the 54.6 MB of duplicate Rust maps,
+and whatever owns the unattributed ~7 GB.
 
 Milestone 1 - package catalog relation: the four catalog maps (`packages`, `files_by_package`,
 `package_languages`, `child_packages_by_parent`) answer bounded questions
@@ -144,9 +206,21 @@ same bounded surface or, if its content is genuinely derived-and-small, keep it 
 bounds. Its build must stop consuming the definition index either way.
 
 Milestone 4 - delete the index and the `OnceLock` lifecycle, update the reuse/reset test, and
-gate: answering-regime RSS on the large tree at or below the Milestone 0 baseline minus the
-measured shard sizes; no scan-path latency regression on the standard cells; the two banned
-symbols absent from the tree. On gate failure, stop and report per house rule.
+gate. **Gate numbers, now set by the Milestone 0 baseline rather than left abstract:**
+
+- Answering-regime peak RSS on the rustc tree **at or below 15.23 GB untimed** (baseline 15.58 GB
+  minus the measured 0.35 GB of shards), same cell and same process model as Milestone 0.
+- **No scan-path latency regression** on the standard cells: cell (a) warm <= 5.7 s, cell (b) warm
+  <= 5.4 s, cell (c) edited <= 6.5 s, all at comparable host load, and index build time (3.35 s)
+  removed rather than relocated.
+- The two banned symbols absent from the tree.
+
+Two cautions carried from Milestone 0. First, **this gate is modest by construction** -- it is 2%
+of the peak, and it will be hard to distinguish from host noise unless the run is on a quiet box;
+budget for repetitions and a load-matched comparator. Second, the baseline was taken on a heavily
+loaded host (1-min loadavg 84-486), so the *latency* figures above should be re-taken quietly
+before they are used as a pass/fail bar; the RSS and count figures are load-insensitive and stand.
+On gate failure, stop and report per house rule.
 
 ## Validation and Acceptance
 

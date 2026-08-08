@@ -57,6 +57,11 @@ measurement is a separate task run after review; it is not part of this plan's a
       opened and `sample_hits` is a bounded prefix; the D2 counter pin passes (commit `5cb4f4c2`).
 - [x] (2026-08-08 19:30Z) Milestone 5: parity selections and featureless clippy run; every failure
       reproduced at the branch tip before this work. Results in `Validation and Acceptance`.
+- [x] (2026-08-08) **D4 large-tree gate measured on rustc. SPLIT RESULT: the marginal-RSS target
+      passes, the graph-phase latency target FAILS.** Report:
+      `usage-graph-d4-gate-v1.md` (session scratchpad). Measured at `9263e2a5`
+      (source-identical to `96e86c4e`) against run 3's `5c33701b` binary, on the same tree and
+      cells. **This plan should not be treated as closed** -- see `Outcomes & Retrospective`.
 
 ## Surprises & Discoveries
 
@@ -211,11 +216,64 @@ The numbers, all from the counter pins:
 - The same scan under a cancellation token tripping on its fourth check: 21 before, 0 after.
 - A 24-candidate scan with the cap at one: 24 of 24 candidates opened before, 2 of 24 after.
 
-What remains. The design's rustc measurement is a separate task; nothing here was measured on a
-large tree, and the numbers above are fixture-scale. The three exclusions the design fenced off are
-untouched: `global_usage_definition_index`, the watcher listing loop, and the ~87 s candidate walk
-in `edges_binding_identity`. The per-site machinery this built is the natural second application for
+What remains. The three exclusions the design fenced off are untouched:
+`global_usage_definition_index`, the watcher listing loop, and the ~87 s candidate walk in
+`edges_binding_identity`. The per-site machinery this built is the natural second application for
 the third of those, as the design says.
+
+### The D4 large-tree gate, measured (2026-08-08)
+
+The measurement this section previously deferred has now been run on rustc, at `9263e2a5`, against
+run 3's `5c33701b` binary, same tree and same cells. Full report:
+`usage-graph-d4-gate-v1.md` in the session scratchpad. **It is the first large-tree measurement
+taken after the watcher `.git` exemption (`0bdfc37c`), so it is also the first one not carrying the
+~2.2 whole-tree-walks-per-second parasite that contaminated runs 1-3.**
+
+**D4 target "marginal RSS of the graph phase from ~8 GB to O(bounded caches)": PASS.** Answering-cell
+peak RSS fell from 23.42 GB to 17.49 GB timed / **15.58 GB untimed**, and RSS is flat through the
+graph phase -- **+0.75 GB across 880 s** (17.2 GB at t=244 s, 17.95 GB at t=1,124 s). The
+unbounded-context memory cost is genuinely gone.
+
+**D4 target "graph phase from 1,034 s to seconds": FAIL, by about two orders of magnitude.**
+`usages::graph_find_usages` measures **1,321.77 s** (v4) and 1,388.01 s (v4i), still **90% of the
+scan backend** -- the same share it held in run 3. The host was heavily loaded (per-cell 1-min
+loadavg 84-486 against run 3's 3.8-4.7), so the wall clocks are not a controlled comparison; but no
+load factor explains "seconds" versus 1,322 s.
+
+The deletion itself is verified: `RustAnalyzer::build_reference_context` is **absent from the
+binary by symbol** and from every span log, where run 3 charged it n=1,115 at 1,062.51 s.
+
+**What now dominates is a cache stampede, and it is shared and pre-existing, not created here.**
+`sql_definition_candidates.rows[*]` fires n=146,678, thread-summed 1,070.9 s -- but the span opens
+before the per-request memo is consulted, and **68.5% of those calls return in under 0.1 ms**. The
+damage is a tail: **the slowest 1% (1,466 calls) carry 87.8% of the time**. Sorting individual
+durations shows eight-plus *concurrent* 9-11 s reads of the *same* short name (`foo` n=53/126.7 s,
+`Foo` n=96/125.6 s, `Bar` n=62/90.0 s). Many workers miss the memo simultaneously and all perform
+the same expensive store read. Run 3's v3 charged n=98,553 of these at a *higher* 24.7 ms mean, so
+the defect predates D1; it became dominant only because the eager build that used to dominate was
+deleted.
+
+Consequence for this plan's own risk register: **Risk 1's named mitigation is the wrong lever.** A
+`(file, name)` memo is already implemented (`graph_support.rs:79`), the per-request
+`QueryReadCache::definition_candidate_rows` memo sits underneath it, and two thirds of lookups are
+already free. The fix indicated is single-flight de-duplication of *concurrent* misses, which is
+local to `definition_candidate_rows` and targets ~940 s of a 1,322 s phase. That is a separate
+change and wants its own issue (search first; adjacent to #1748/#1774, but the concurrency angle is
+new).
+
+Two further results worth carrying:
+
+- **Gate cell (b) went from 653.78 s to 5.34 s (122x)** and its whole-workspace listing count from
+  1,487 to 12 -- **that is the watcher fix, not this plan.** Cell (a) warm and cell (c) edited are
+  at parity with run 3 (5.72 s vs 5.51 s; 6.42 s vs 6.91 s). Listing counts are 11-12 per query
+  against run 3's 11-15 for the cells that were never looping: the loop is gone, the startup floor
+  remains.
+- **The answering cell returned 8 hits where run 3 returned 11**, reproduced on both v4 and v4i.
+  Both runs are `complete=false`, so this may only be where the deadline truncated the sweep under
+  far heavier load -- but it may be a per-site resolver difference at a scale the fixture-based
+  equivalence pin cannot reach. **This wants a load-matched rerun and, if it survives, triage
+  before the per-site resolver is considered settled.** It is the one open question here that could
+  be correctness rather than performance.
 
 Two lessons. First, the frozen equivalence pin was not ceremony: it caught two behavioral
 differences in `bare_names_resolving_to` that reading the code did not reveal, and both would have
