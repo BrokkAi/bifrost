@@ -3249,4 +3249,3 @@ fn blob_index(
         .get(start..start.checked_add(len)?)
         .map(ToOwned::to_owned)
 }
-

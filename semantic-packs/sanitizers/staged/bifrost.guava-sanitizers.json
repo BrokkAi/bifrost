@@ -16,7 +16,7 @@
     "source": "audited k3 sanitizer content over com.google.guava:guava:33.6.0-jre (staged: artifact digest not pinned)",
     "revision": "k3-sanitizers"
   },
-  "license": "LGPL-3.0-or-later",
+  "license": "Apache-2.0",
   "completeness": "partial",
   "safety": {
     "generated_code_only": false,

@@ -21,7 +21,7 @@
     "source": "audited k3 sanitizer content over the JDK standard library",
     "revision": "k3-sanitizers"
   },
-  "license": "LGPL-3.0-or-later",
+  "license": "Apache-2.0",
   "completeness": "complete",
   "safety": {
     "generated_code_only": false,

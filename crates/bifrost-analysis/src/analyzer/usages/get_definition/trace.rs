@@ -1559,7 +1559,6 @@ mod boundary_evidence_tests {
         );
     }
 
-
     #[test]
     fn a_csharp_reference_into_a_declared_unindexed_package_reports_declared_unindexed() {
         let source = concat!(

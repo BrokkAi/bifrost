@@ -21,7 +21,7 @@
     "source": "hand-authored golden-core JDK flow-through summaries",
     "revision": "golden-core"
   },
-  "license": "LGPL-3.0-or-later",
+  "license": "Apache-2.0",
   "completeness": "complete",
   "safety": {
     "generated_code_only": false,

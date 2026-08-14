@@ -10,10 +10,16 @@ inputs:
     description: >-
       Bifrost release tag to install (see BrokkAi/bifrost releases). Pin an
       exact tag for reproducible gates. The special value `local` skips the
-      install and uses `target/release/bifrost` from the checkout when it
-      exists, otherwise the `bifrost` already on PATH.
+      install and uses a release or debug `bifrost` binary from the checkout,
+      otherwise the `bifrost` already on PATH.
     required: false
-    default: v0.9.1
+    default: v0.9.5
+  release-token:
+    description: >-
+      Optional GitHub token used to download release assets while the Bifrost
+      release repository is private. Leave unset for public releases.
+    required: false
+    default: ''
   policy-packs:
     description: Space-separated built-in pack IDs to run.
     required: false
@@ -83,6 +89,7 @@ runs:
       shell: bash
       env:
         BIFROST_VERSION: ${{ inputs.version }}
+        RELEASE_TOKEN: ${{ inputs.release-token }}
       run: |
         set -euo pipefail
         bin=bifrost
@@ -90,6 +97,8 @@ runs:
         if [ "${BIFROST_VERSION}" = local ]; then
           if [ -x "${GITHUB_WORKSPACE}/target/release/${bin}" ]; then
             echo "bifrost_bin=${GITHUB_WORKSPACE}/target/release/${bin}" >> "${GITHUB_OUTPUT}"
+          elif [ -x "${GITHUB_WORKSPACE}/target/debug/${bin}" ]; then
+            echo "bifrost_bin=${GITHUB_WORKSPACE}/target/debug/${bin}" >> "${GITHUB_OUTPUT}"
           else
             command -v bifrost >/dev/null || { echo "::error::version=local but no bifrost is available"; exit 1; }
             echo "bifrost_bin=$(command -v bifrost)" >> "${GITHUB_OUTPUT}"
@@ -109,8 +118,12 @@ runs:
         dir="${RUNNER_TEMP}/bifrost-install"
         mkdir -p "${dir}"
         cd "${dir}"
-        curl -fsSL -O "${url}/${stage}.${archive}"
-        curl -fsSL -O "${url}/${stage}.${archive}.sha256"
+        curl_args=(-fsSL -O)
+        if [ -n "${RELEASE_TOKEN}" ]; then
+          curl_args+=(-H "Authorization: Bearer ${RELEASE_TOKEN}")
+        fi
+        curl "${curl_args[@]}" "${url}/${stage}.${archive}"
+        curl "${curl_args[@]}" "${url}/${stage}.${archive}.sha256"
         # Windows release checksum files carry CRLF from Out-File, and sha256sum -c rejects the \r in the filename.
         tr -d '\r' < "${stage}.${archive}.sha256" > "${stage}.${archive}.sha256.lf"
         mv "${stage}.${archive}.sha256.lf" "${stage}.${archive}.sha256"

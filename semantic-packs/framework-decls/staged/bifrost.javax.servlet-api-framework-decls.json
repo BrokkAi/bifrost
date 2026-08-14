@@ -16,7 +16,7 @@
     "source": "hand-authored framework declarations over javax.servlet:javax.servlet-api:4.0.1",
     "revision": "framework-decls"
   },
-  "license": "LGPL-3.0-or-later",
+  "license": "Apache-2.0",
   "completeness": "partial",
   "safety": {
     "generated_code_only": false,
