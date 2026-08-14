@@ -1,0 +1,138 @@
+name: Package and publish npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing Bifrost release tag to package, in the form vX.Y.Z
+        required: true
+        type: string
+      publish:
+        description: Publish to npm after all package checks pass
+        required: true
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: publish-npm
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: verify and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@11.15.0
+
+      - name: Verify the published GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft --jq '.'
+
+      - name: Download release archives and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir release-assets
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --dir release-assets \
+            --pattern 'bifrost-v*.tar.gz' \
+            --pattern 'bifrost-v*.tar.gz.sha256' \
+            --pattern 'bifrost-v*.zip' \
+            --pattern 'bifrost-v*.zip.sha256'
+
+      - name: Test npm packaging code
+        run: npm test --prefix npm
+
+      - name: Verify release checksums and build npm tarballs
+        run: >-
+          npm run package-release --prefix npm --
+          --release-tag "$RELEASE_TAG" --assets ../release-assets
+
+      - name: Inspect npm tarballs
+        shell: bash
+        run: |
+          for tarball in npm/dist/*.tgz; do
+            if tar -tzf "$tarball" | grep -E '(^|/)([.]npmrc|[.]git|id_rsa|credentials)($|/)'; then
+              echo "unexpected sensitive path in $tarball" >&2
+              exit 1
+            fi
+          done
+
+      - name: Smoke-test the Linux npm installation
+        run: >-
+          npm run test-release --prefix npm --
+          --dist dist --release-tag "$RELEASE_TAG"
+
+      - name: Show the publication plan
+        run: >-
+          npm run publish-release --prefix npm --
+          --dist dist --release-tag "$RELEASE_TAG"
+
+      - name: Upload npm tarballs
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: npm-tarballs-${{ env.RELEASE_TAG }}
+          path: npm/dist/*.tgz
+          if-no-files-found: error
+
+  publish:
+    name: publish npm packages
+    needs: package
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@11.15.0
+
+      - name: Download validated npm packages
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: npm-tarballs-${{ env.RELEASE_TAG }}
+          path: npm-tarballs
+
+      - name: Publish missing platform packages before the root package
+        run: >-
+          npm run publish-release --prefix npm --
+          --dist ../npm-tarballs --release-tag "$RELEASE_TAG" --yes-publish

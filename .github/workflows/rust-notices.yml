@@ -1,0 +1,47 @@
+name: Rust notices
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Validated release tag to check out
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  notices:
+    name: generate Rust notices
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Install pinned cargo-about
+        run: cargo install --locked cargo-about --version 0.9.1 --features cli
+
+      - name: Fetch locked dependencies for offline notice report
+        run: cargo fetch --locked
+
+      - name: Generate Rust notice report
+        run: scripts/generate-rust-third-party-notices.sh dist/THIRD_PARTY_LICENSES.html
+
+      - name: Upload Rust notice report
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: rust-third-party-licenses
+          path: dist/THIRD_PARTY_LICENSES.html
+          if-no-files-found: error

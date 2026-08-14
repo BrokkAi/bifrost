@@ -1,0 +1,146 @@
+name: policy-scan-smoke
+
+# The dogfood workflow policy-sarif.yml scans the repository root with the same
+# bifrost.code-smells pack. A committed fixture with a planted finding would
+# therefore fail the dogfood or pollute its baseline. This workflow writes both
+# fixtures at run time into an untracked directory instead.
+
+on:
+  pull_request:
+    paths:
+      - .github/actions/policy-scan/**
+      - .github/workflows/policy-scan-smoke.yml
+  push:
+    branches: [master]
+    paths:
+      - .github/actions/policy-scan/**
+      - .github/workflows/policy-scan-smoke.yml
+  schedule:
+    # Sunday 04:17 UTC, off peak.
+    - cron: '17 4 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: policy-scan-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: policy action (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Cache Bifrost build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: policy-scan-smoke
+
+      - name: Build the policy runner
+        run: cargo build --locked --bin bifrost
+
+      - name: Write the fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p smoke-fixture/clean smoke-fixture/finding
+          cat > smoke-fixture/clean/main.py <<'EOF'
+          """Clean fixture. No policy in bifrost.code-smells matches this file."""
+
+
+          def total(values):
+              result = 0
+              for value in values:
+                  result = result + value
+              return result
+
+
+          def main():
+              print(total([1, 2, 3]))
+
+
+          if __name__ == "__main__":
+              main()
+          EOF
+          cat > smoke-fixture/finding/main.py <<'EOF'
+          """Planted fixture. The loop compiles a regex on every iteration."""
+
+          import re
+
+
+          def count_matches(lines):
+              total = 0
+              for line in lines:
+                  pattern = re.compile(r"[a-z]+")
+                  if pattern.search(line):
+                      total = total + 1
+              return total
+          EOF
+
+      # Leg A: a clean workspace must select the local binary, exit 0, and
+      # write a SARIF report.
+      - name: Scan the clean fixture
+        id: clean
+        uses: ./.github/actions/policy-scan
+        with:
+          version: local
+          working-directory: smoke-fixture/clean
+          sarif-file: clean.sarif
+          upload: 'false'
+          cache: 'false'
+
+      - name: Assert the clean result
+        shell: bash
+        env:
+          BIFROST_BIN: ${{ steps.clean.outputs.bifrost-bin }}
+          SARIF_FILE: ${{ steps.clean.outputs.sarif-file }}
+          CODE: ${{ steps.clean.outputs.exit-code }}
+        run: |
+          set -euo pipefail
+          # Regression guard for the local-binary path: bifrost-bin must be
+          # the executable, not the extracted stage directory.
+          test -f "${BIFROST_BIN}" || { echo "::error::bifrost-bin is not a regular file: ${BIFROST_BIN}"; exit 1; }
+          test -x "${BIFROST_BIN}" || { echo "::error::bifrost-bin is not executable: ${BIFROST_BIN}"; exit 1; }
+          test -f "${SARIF_FILE}" || { echo "::error::no SARIF report at ${SARIF_FILE}"; exit 1; }
+          # The Windows image names the interpreter python, not python3.
+          py=python3; command -v python3 >/dev/null 2>&1 || py=python
+          "${py}" -c "import json,sys; d=json.load(open(sys.argv[1])); assert isinstance(d['runs'], list), 'runs is not an array'" "${SARIF_FILE}"
+          test "${CODE}" = 0 || { echo "::error::clean fixture exit code is ${CODE}, expected 0"; exit 1; }
+
+      # Leg B: a planted finding must make the action's gate step fail with
+      # exit code 1.
+      - name: Scan the planted fixture
+        id: finding
+        continue-on-error: true
+        uses: ./.github/actions/policy-scan
+        with:
+          version: local
+          working-directory: smoke-fixture/finding
+          sarif-file: finding.sarif
+          upload: 'false'
+          cache: 'false'
+
+      - name: Assert the gate failed
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.finding.outcome }}
+          CODE: ${{ steps.finding.outputs.exit-code }}
+        run: |
+          set -euo pipefail
+          test "${OUTCOME}" = failure || { echo "::error::planted fixture step outcome is ${OUTCOME}, expected failure"; exit 1; }
+          test "${CODE}" = 1 || { echo "::error::planted fixture exit code is ${CODE}, expected 1"; exit 1; }

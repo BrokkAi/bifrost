@@ -1,0 +1,24 @@
+name: Feature request
+description: Suggest a capability or workflow Bifrost could support. A detailed design is not required.
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Bifrost. Describe the use case at whatever level of detail you have; you do not need to propose an implementation.
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: What would you like Bifrost to help you do?
+      description: Describe the problem, workflow, or capability that would be useful to you.
+      placeholder: I would like Bifrost to...
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Anything else?
+      description: Optionally share examples, possible approaches, relevant languages or interfaces, or related projects.
